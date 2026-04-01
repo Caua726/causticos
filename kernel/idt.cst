@@ -1,0 +1,322 @@
+// idt.cst — Interrupt Descriptor Table
+
+use "serial.cst" as serial;
+use "port.cst" as port;
+
+// ============================================================
+// IDT entries — 256 entries, each 16 bytes = 4096 bytes
+// ============================================================
+
+let is [4096]u8 as idt_data;
+
+// IDTR: 2 bytes limit + 8 bytes base
+let is i64 as idtr_lo with mut = 0;
+let is i64 as idtr_hi with mut = 0;
+
+// ISR stub addresses — filled by install_stubs()
+let is [48]i64 as isr_addrs;
+
+// ============================================================
+// Set an IDT entry
+// ============================================================
+
+fn set_gate(vector as i64, handler as i64, selector as i64, ist as i64, type_attr as i64) as void {
+    let is i64 as off = vector * 16;
+    let is *u8 as entry = cast(*u8, cast(i64, &idt_data) + off);
+
+    entry[0] = cast(u8, handler & 0xFF);
+    entry[1] = cast(u8, (handler >> 8) & 0xFF);
+    entry[2] = cast(u8, selector & 0xFF);
+    entry[3] = cast(u8, (selector >> 8) & 0xFF);
+    entry[4] = cast(u8, ist & 0x07);
+    entry[5] = cast(u8, type_attr);
+    entry[6] = cast(u8, (handler >> 16) & 0xFF);
+    entry[7] = cast(u8, (handler >> 24) & 0xFF);
+    entry[8] = cast(u8, (handler >> 32) & 0xFF);
+    entry[9] = cast(u8, (handler >> 40) & 0xFF);
+    entry[10] = cast(u8, (handler >> 48) & 0xFF);
+    entry[11] = cast(u8, (handler >> 56) & 0xFF);
+    entry[12] = 0;
+    entry[13] = 0;
+    entry[14] = 0;
+    entry[15] = 0;
+}
+
+// ============================================================
+// PIC
+// ============================================================
+
+fn remap_pic() as void {
+    port.outb(0x20, 0x11);
+    port.outb(0xA0, 0x11);
+    port.outb(0x21, 32);
+    port.outb(0xA1, 40);
+    port.outb(0x21, 4);
+    port.outb(0xA1, 2);
+    port.outb(0x21, 0x01);
+    port.outb(0xA1, 0x01);
+    port.outb(0x21, 0xFF);
+    port.outb(0xA1, 0xFF);
+}
+
+fn pic_eoi(irq as i64) as void {
+    if (irq >= 8) {
+        port.outb(0xA0, 0x20);
+    }
+    port.outb(0x20, 0x20);
+}
+
+fn pic_unmask(irq as i64) as void {
+    if (irq < 8) {
+        let is i64 as mask = port.inb(0x21);
+        let is i64 as bit = 1 << irq;
+        let is i64 as inv = bit ^ 0xFF;
+        port.outb(0x21, mask & inv);
+    } else {
+        let is i64 as mask = port.inb(0xA1);
+        let is i64 as bit = 1 << (irq - 8);
+        let is i64 as inv = bit ^ 0xFF;
+        port.outb(0xA1, mask & inv);
+    }
+}
+
+// ============================================================
+// Handlers (called from asm with proper ABI)
+// ============================================================
+
+fn exception_handler(vector as i64, error_code as i64, rip as i64) as void {
+    serial.println("", 0);
+    serial.print("EXCEPTION #", 11);
+    print_num(vector);
+    serial.print(" err=", 5);
+    print_num(error_code);
+    serial.print(" rip=", 5);
+    print_hex(rip);
+    serial.println("", 0);
+
+    asm("cli\n");
+    while (1 == 1) {
+        asm(".byte 0xF4\n");
+    }
+}
+
+fn irq_handler(irq as i64) as void {
+    if (irq == 1) {
+        let is i64 as scancode = port.inb(0x60);
+        serial.print("key: ", 5);
+        print_num(scancode);
+        serial.println("", 0);
+    }
+    pic_eoi(irq);
+}
+
+// ============================================================
+// Number printing
+// ============================================================
+
+fn print_num(n as i64) as void {
+    if (n == 0) {
+        serial.putc(48);
+        return;
+    }
+    let is [20]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as pos with mut = 19;
+    while (val > 0) {
+        buf[pos] = cast(u8, (val % 10) + 48);
+        val = val / 10;
+        pos = pos - 1;
+    }
+    let is i64 as start with mut = pos + 1;
+    while (start < 20) {
+        serial.putc(cast(i64, buf[start]));
+        start = start + 1;
+    }
+}
+
+fn print_hex(n as i64) as void {
+    serial.putc(48);
+    serial.putc(120);
+    let is [16]u8 as buf;
+    let is i64 as val with mut = n;
+    let is i64 as i with mut = 15;
+    while (i >= 0) {
+        let is i64 as digit = val & 0xF;
+        if (digit < 10) {
+            buf[i] = cast(u8, digit + 48);
+        } else {
+            buf[i] = cast(u8, digit + 87);
+        }
+        val = val >> 4;
+        i = i - 1;
+    }
+    i = 0;
+    while (i < 16) {
+        serial.putc(cast(i64, buf[i]));
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Install ISR/IRQ stub addresses into the isr_addrs table.
+// Each stub is emitted as raw asm with a label.
+// We use lea to capture each label's address.
+// ============================================================
+
+fn install_stubs() as void {
+    // Jump past all stubs
+    asm("jmp .Lstubs_end\n");
+
+    // --- Exception common handler ---
+    asm(".Lisr_common:\n");
+    asm("push r15\n"); asm("push r14\n"); asm("push r13\n"); asm("push r12\n");
+    asm("push r11\n"); asm("push r10\n"); asm("push r9\n");  asm("push r8\n");
+    asm("push rbp\n"); asm("push rdi\n"); asm("push rsi\n"); asm("push rdx\n");
+    asm("push rcx\n"); asm("push rbx\n"); asm("push rax\n");
+    asm("mov rdi, QWORD PTR [rsp+120]\n");
+    asm("mov rsi, QWORD PTR [rsp+128]\n");
+    asm("mov rdx, QWORD PTR [rsp+136]\n");
+    asm("call _kernel_idt_cst_exception_handler\n");
+    asm("pop rax\n"); asm("pop rbx\n"); asm("pop rcx\n"); asm("pop rdx\n");
+    asm("pop rsi\n"); asm("pop rdi\n"); asm("pop rbp\n");
+    asm("pop r8\n");  asm("pop r9\n");  asm("pop r10\n"); asm("pop r11\n");
+    asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
+    asm("add rsp, 16\n");
+    asm(".byte 0x48, 0xCF\n");     // iretq
+
+    // --- IRQ common handler ---
+    asm(".Lirq_common:\n");
+    asm("push r15\n"); asm("push r14\n"); asm("push r13\n"); asm("push r12\n");
+    asm("push r11\n"); asm("push r10\n"); asm("push r9\n");  asm("push r8\n");
+    asm("push rbp\n"); asm("push rdi\n"); asm("push rsi\n"); asm("push rdx\n");
+    asm("push rcx\n"); asm("push rbx\n"); asm("push rax\n");
+    asm("mov rdi, QWORD PTR [rsp+120]\n");
+    asm("call _kernel_idt_cst_irq_handler\n");
+    asm("pop rax\n"); asm("pop rbx\n"); asm("pop rcx\n"); asm("pop rdx\n");
+    asm("pop rsi\n"); asm("pop rdi\n"); asm("pop rbp\n");
+    asm("pop r8\n");  asm("pop r9\n");  asm("pop r10\n"); asm("pop r11\n");
+    asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
+    asm("add rsp, 8\n");
+    asm(".byte 0x48, 0xCF\n");     // iretq
+
+    // --- Exception stubs ---
+    asm(".Lisr0:  push 0\n"); asm("push 0\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr1:  push 0\n"); asm("push 1\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr2:  push 0\n"); asm("push 2\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr3:  push 0\n"); asm("push 3\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr4:  push 0\n"); asm("push 4\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr5:  push 0\n"); asm("push 5\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr6:  push 0\n"); asm("push 6\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr7:  push 0\n"); asm("push 7\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr8:  push 8\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr9:  push 0\n"); asm("push 9\n");  asm("jmp .Lisr_common\n");
+    asm(".Lisr10: push 10\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr11: push 11\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr12: push 12\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr13: push 13\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr14: push 14\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr15: push 0\n"); asm("push 15\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr16: push 0\n"); asm("push 16\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr17: push 17\n"); asm("jmp .Lisr_common\n");
+    asm(".Lisr18: push 0\n"); asm("push 18\n"); asm("jmp .Lisr_common\n");
+
+    // --- IRQ stubs ---
+    asm(".Lirq0:  push 0\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq1:  push 1\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq2:  push 2\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq3:  push 3\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq4:  push 4\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq5:  push 5\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq6:  push 6\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq7:  push 7\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq8:  push 8\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq9:  push 9\n");  asm("jmp .Lirq_common\n");
+    asm(".Lirq10: push 10\n"); asm("jmp .Lirq_common\n");
+    asm(".Lirq11: push 11\n"); asm("jmp .Lirq_common\n");
+    asm(".Lirq12: push 12\n"); asm("jmp .Lirq_common\n");
+    asm(".Lirq13: push 13\n"); asm("jmp .Lirq_common\n");
+    asm(".Lirq14: push 14\n"); asm("jmp .Lirq_common\n");
+    asm(".Lirq15: push 15\n"); asm("jmp .Lirq_common\n");
+
+    asm(".Lstubs_end:\n");
+
+    // Store all stub addresses using pure asm — rbx is clobbered but we
+    // use the global symbol directly
+    asm("lea rbx, [rip+_kernel_idt_cst_isr_addrs]\n");
+
+    asm("lea rax, [rip+.Lisr0]\n");  asm("mov QWORD PTR [rbx+0], rax\n");
+    asm("lea rax, [rip+.Lisr1]\n");  asm("mov QWORD PTR [rbx+8], rax\n");
+    asm("lea rax, [rip+.Lisr2]\n");  asm("mov QWORD PTR [rbx+16], rax\n");
+    asm("lea rax, [rip+.Lisr3]\n");  asm("mov QWORD PTR [rbx+24], rax\n");
+    asm("lea rax, [rip+.Lisr4]\n");  asm("mov QWORD PTR [rbx+32], rax\n");
+    asm("lea rax, [rip+.Lisr5]\n");  asm("mov QWORD PTR [rbx+40], rax\n");
+    asm("lea rax, [rip+.Lisr6]\n");  asm("mov QWORD PTR [rbx+48], rax\n");
+    asm("lea rax, [rip+.Lisr7]\n");  asm("mov QWORD PTR [rbx+56], rax\n");
+    asm("lea rax, [rip+.Lisr8]\n");  asm("mov QWORD PTR [rbx+64], rax\n");
+    asm("lea rax, [rip+.Lisr9]\n");  asm("mov QWORD PTR [rbx+72], rax\n");
+    asm("lea rax, [rip+.Lisr10]\n"); asm("mov QWORD PTR [rbx+80], rax\n");
+    asm("lea rax, [rip+.Lisr11]\n"); asm("mov QWORD PTR [rbx+88], rax\n");
+    asm("lea rax, [rip+.Lisr12]\n"); asm("mov QWORD PTR [rbx+96], rax\n");
+    asm("lea rax, [rip+.Lisr13]\n"); asm("mov QWORD PTR [rbx+104], rax\n");
+    asm("lea rax, [rip+.Lisr14]\n"); asm("mov QWORD PTR [rbx+112], rax\n");
+    asm("lea rax, [rip+.Lisr15]\n"); asm("mov QWORD PTR [rbx+120], rax\n");
+    asm("lea rax, [rip+.Lisr16]\n"); asm("mov QWORD PTR [rbx+128], rax\n");
+    asm("lea rax, [rip+.Lisr17]\n"); asm("mov QWORD PTR [rbx+136], rax\n");
+    asm("lea rax, [rip+.Lisr18]\n"); asm("mov QWORD PTR [rbx+144], rax\n");
+
+    asm("lea rax, [rip+.Lirq0]\n");  asm("mov QWORD PTR [rbx+152], rax\n");
+    asm("lea rax, [rip+.Lirq1]\n");  asm("mov QWORD PTR [rbx+160], rax\n");
+    asm("lea rax, [rip+.Lirq2]\n");  asm("mov QWORD PTR [rbx+168], rax\n");
+    asm("lea rax, [rip+.Lirq3]\n");  asm("mov QWORD PTR [rbx+176], rax\n");
+    asm("lea rax, [rip+.Lirq4]\n");  asm("mov QWORD PTR [rbx+184], rax\n");
+    asm("lea rax, [rip+.Lirq5]\n");  asm("mov QWORD PTR [rbx+192], rax\n");
+    asm("lea rax, [rip+.Lirq6]\n");  asm("mov QWORD PTR [rbx+200], rax\n");
+    asm("lea rax, [rip+.Lirq7]\n");  asm("mov QWORD PTR [rbx+208], rax\n");
+    asm("lea rax, [rip+.Lirq8]\n");  asm("mov QWORD PTR [rbx+216], rax\n");
+    asm("lea rax, [rip+.Lirq9]\n");  asm("mov QWORD PTR [rbx+224], rax\n");
+    asm("lea rax, [rip+.Lirq10]\n"); asm("mov QWORD PTR [rbx+232], rax\n");
+    asm("lea rax, [rip+.Lirq11]\n"); asm("mov QWORD PTR [rbx+240], rax\n");
+    asm("lea rax, [rip+.Lirq12]\n"); asm("mov QWORD PTR [rbx+248], rax\n");
+    asm("lea rax, [rip+.Lirq13]\n"); asm("mov QWORD PTR [rbx+256], rax\n");
+    asm("lea rax, [rip+.Lirq14]\n"); asm("mov QWORD PTR [rbx+264], rax\n");
+    asm("lea rax, [rip+.Lirq15]\n"); asm("mov QWORD PTR [rbx+272], rax\n");
+}
+
+// ============================================================
+// Init
+// ============================================================
+
+fn init() as void {
+    remap_pic();
+    install_stubs();
+
+    let is *i64 as addrs = cast(*i64, &isr_addrs);
+
+    // Exceptions 0-18
+    let is i64 as ei with mut = 0;
+    while (ei < 19) {
+        set_gate(ei, addrs[ei], 0x08, 0, 0x8E);
+        ei = ei + 1;
+    }
+
+    // IRQs 0-15 -> vectors 32-47
+    let is i64 as ii with mut = 0;
+    while (ii < 16) {
+        set_gate(32 + ii, addrs[19 + ii], 0x08, 0, 0x8E);
+        ii = ii + 1;
+    }
+
+    // Load IDTR
+    let is i64 as idt_base = cast(i64, &idt_data);
+    let is i64 as limit = 4095;
+    idtr_lo = limit + ((idt_base & 0xFFFFFFFFFFFF) << 16);
+    idtr_hi = (idt_base >> 48) & 0xFFFF;
+
+    asm("lea rax, [rip+_kernel_idt_cst_idtr_lo]\n");
+    asm(".byte 0x0F, 0x01, 0x18\n");  // lidt [rax]
+
+    pic_unmask(1);
+    asm(".byte 0xFB\n");  // sti
+
+    serial.println("idt: ok", 7);
+}
