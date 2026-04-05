@@ -159,6 +159,7 @@ fn user_as_set(idx as i64, v as i64) as void {
 // ============================================================
 
 fn kernel_pml4_sync(index as i64) as void {
+    virq_save();
     let is *i64 as ksrc = cast(*i64, kas_pml4_virt);
     let is i64 as entry = ksrc[index];
     let is i64 as i with mut = 0;
@@ -170,6 +171,7 @@ fn kernel_pml4_sync(index as i64) as void {
         }
         i = i + 1;
     }
+    virq_restore();
 }
 
 // ============================================================
@@ -177,18 +179,32 @@ fn kernel_pml4_sync(index as i64) as void {
 // Returns physical address of next-level table
 // ============================================================
 
-fn ensure_table(tphys as i64, tvirt as i64, idx as i64, flags as i64) as i64 {
+fn ensure_table(tphys as i64, tvirt as i64, idx as i64, flags as i64, is_kernel_as as i64) as i64 {
     let is i64 as pte = pte_read(tphys, idx);
     if (pte_present(pte) != 0) {
         return pte_addr(pte);
     }
+
+    // Guard: user AS must not create page tables in kernel PML4 range
+    if (is_kernel_as == 0) {
+        if (tvirt != 0) {
+            // This is a PML4-level insert (tvirt != 0 means we passed the PML4 virt)
+            if (idx >= PML4_KERNEL_START) {
+                pmm.panic("ensure_table: user AS creating kernel PT", 40);
+            }
+        }
+    }
+
     let is i64 as new_phys = alloc_table_page(cast(i32, 0));
     pte_write(tphys, idx, new_phys | flags);
+
     // Sync if this is a new kernel PML4 entry
-    if (tvirt == kas_pml4_virt) {
-        if (idx >= PML4_KERNEL_START) {
-            if (idx <= PML4_KERNEL_END) {
-                kernel_pml4_sync(idx);
+    if (is_kernel_as != 0) {
+        if (tvirt != 0) {
+            if (idx >= PML4_KERNEL_START) {
+                if (idx <= PML4_KERNEL_END) {
+                    kernel_pml4_sync(idx);
+                }
             }
         }
     }
@@ -206,6 +222,10 @@ fn vmm_map_page(pml4_phys as i64, vaddr as i64, phys as i64, flags as i64) as i6
     let is i64 as p1 = pt_index(vaddr);
 
     let is i64 as pml4_virt = pmm.phys_to_virt(pml4_phys);
+    let is i64 as is_kas with mut = 0;
+    if (pml4_phys == kas_pml4_phys) {
+        is_kas = 1;
+    }
 
     // Table flags: user-space addresses need PTE_USER at every level
     let is i64 as tflags with mut = PTE_TABLE;
@@ -213,9 +233,9 @@ fn vmm_map_page(pml4_phys as i64, vaddr as i64, phys as i64, flags as i64) as i6
         tflags = PTE_TABLE_USER;
     }
 
-    let is i64 as pdpt = ensure_table(pml4_phys, pml4_virt, p4, tflags);
-    let is i64 as pd = ensure_table(pdpt, 0, p3, tflags);
-    let is i64 as pt = ensure_table(pd, 0, p2, tflags);
+    let is i64 as pdpt = ensure_table(pml4_phys, pml4_virt, p4, tflags, is_kas);
+    let is i64 as pd = ensure_table(pdpt, 0, p3, tflags, is_kas);
+    let is i64 as pt = ensure_table(pd, 0, p2, tflags, is_kas);
 
     // Check double-map
     let is i64 as existing = pte_read(pt, p1);
@@ -332,6 +352,10 @@ fn as_create() as i64 {
     let is i64 as pml4_phys = alloc_table_page(cast(i32, 0));
     let is i64 as pml4_virt = pmm.phys_to_virt(pml4_phys);
 
+    // Lock: copy kernel entries + register atomically to prevent
+    // race with kernel_pml4_sync (new entry could be missed otherwise)
+    virq_save();
+
     // Copy kernel entries (256-511) from kernel AS
     let is *i64 as ksrc = cast(*i64, kas_pml4_virt);
     let is *i64 as udst = cast(*i64, pml4_virt);
@@ -347,7 +371,26 @@ fn as_create() as i64 {
         user_as_count = user_as_count + 1;
     }
 
+    virq_restore();
+
     return pml4_phys;
+}
+
+// Validate that a physical page is actually a page table page before freeing
+fn validate_pt_page(phys as i64) as void {
+    let is i32 as pfn = pmm.phys_to_pfn(phys);
+    let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn);
+    if (cast(i64, pi) != 0) {
+        let is i32 as usage = pmm.meta_get_usage(pi.meta);
+        if (usage != cast(i32, pmm.USAGE_PAGE_TABLE)) {
+            pmm.panic("as_free: not a PT page", 22);
+        }
+    }
+}
+
+fn free_pt_page(phys as i64) as void {
+    validate_pt_page(phys);
+    pmm.free_pages(pmm.phys_to_pfn(phys));
 }
 
 fn as_free_user_tables(pml4_phys as i64) as void {
@@ -367,20 +410,17 @@ fn as_free_user_tables(pml4_phys as i64) as void {
                             let is i64 as pte2 = pte_read(pd_phys, p2);
                             if (pte_present(pte2) != 0) {
                                 if ((pte2 & PTE_HUGE) == 0) {
-                                    // Free PT page
-                                    pmm.free_pages(pmm.phys_to_pfn(pte_addr(pte2)));
+                                    free_pt_page(pte_addr(pte2));
                                 }
                             }
                             p2 = p2 + 1;
                         }
-                        // Free PD page
-                        pmm.free_pages(pmm.phys_to_pfn(pd_phys));
+                        free_pt_page(pd_phys);
                     }
                 }
                 p3 = p3 + 1;
             }
-            // Free PDPT page
-            pmm.free_pages(pmm.phys_to_pfn(pdpt_phys));
+            free_pt_page(pdpt_phys);
         }
         p4 = p4 + 1;
     }
@@ -762,16 +802,73 @@ fn init() as void {
     kas_pml4_phys = alloc_table_page(cast(i32, 0));
     kas_pml4_virt = pmm.phys_to_virt(kas_pml4_phys);
 
-    // Copy ALL entries from Limine (preserves HHDM + kernel image)
-    let is *i64 as src = cast(*i64, pmm.phys_to_virt(limine_pml4));
-    let is *i64 as dst = cast(*i64, kas_pml4_virt);
-    let is i64 as i with mut = 0;
-    while (i < 512) {
-        dst[i] = src[i];
+    // Deep clone Limine's kernel page table tree (entries 256-511).
+    // Limine's PT pages may reside in bootloader-reclaimable memory
+    // which the PMM treats as usable. If we only copy PML4 entries
+    // (shallow clone), the underlying PDPT/PD/PT pages could be
+    // overwritten by buddy allocations. We must allocate our own
+    // copies of the entire tree.
+    let is *i64 as lsrc = cast(*i64, pmm.phys_to_virt(limine_pml4));
+    let is *i64 as kdst = cast(*i64, kas_pml4_virt);
+    let is i64 as i with mut = PML4_KERNEL_START;
+    while (i <= PML4_KERNEL_END) {
+        let is i64 as pml4e = lsrc[i];
+        if (pte_present(pml4e) != 0) {
+            // Clone PDPT
+            let is i64 as old_pdpt = pte_addr(pml4e);
+            let is i64 as new_pdpt = alloc_table_page(cast(i32, 0));
+            let is *i64 as osrc = cast(*i64, pmm.phys_to_virt(old_pdpt));
+            let is *i64 as ndst = cast(*i64, pmm.phys_to_virt(new_pdpt));
+            let is i64 as j with mut = 0;
+            while (j < 512) {
+                let is i64 as pdpte = osrc[j];
+                if (pte_present(pdpte) != 0) {
+                    if ((pdpte & PTE_HUGE) != 0) {
+                        // 1GB huge page — keep as-is (points to data, not a table)
+                        ndst[j] = pdpte;
+                    } else {
+                        // Clone PD
+                        let is i64 as old_pd = pte_addr(pdpte);
+                        let is i64 as new_pd = alloc_table_page(cast(i32, 0));
+                        let is *i64 as pd_src = cast(*i64, pmm.phys_to_virt(old_pd));
+                        let is *i64 as pd_dst = cast(*i64, pmm.phys_to_virt(new_pd));
+                        let is i64 as k with mut = 0;
+                        while (k < 512) {
+                            let is i64 as pde = pd_src[k];
+                            if (pte_present(pde) != 0) {
+                                if ((pde & PTE_HUGE) != 0) {
+                                    // 2MB huge page — keep as-is
+                                    pd_dst[k] = pde;
+                                } else {
+                                    // Clone PT
+                                    let is i64 as old_pt = pte_addr(pde);
+                                    let is i64 as new_pt = alloc_table_page(cast(i32, 0));
+                                    let is *i64 as pt_src = cast(*i64, pmm.phys_to_virt(old_pt));
+                                    let is *i64 as pt_dst = cast(*i64, pmm.phys_to_virt(new_pt));
+                                    let is i64 as m with mut = 0;
+                                    while (m < 512) {
+                                        pt_dst[m] = pt_src[m];
+                                        m = m + 1;
+                                    }
+                                    // Rewrite PD entry to point to cloned PT
+                                    pd_dst[k] = new_pt | (pde & 0xFFF);
+                                }
+                            }
+                            k = k + 1;
+                        }
+                        // Rewrite PDPT entry to point to cloned PD
+                        ndst[j] = new_pd | (pdpte & 0xFFF);
+                    }
+                }
+                j = j + 1;
+            }
+            // Rewrite PML4 entry to point to cloned PDPT
+            kdst[i] = new_pdpt | (pml4e & 0xFFF);
+        }
         i = i + 1;
     }
 
-    // Switch to our PML4
+    // Switch to our fully-cloned PML4
     write_cr3(kas_pml4_phys);
     serial.print("  kernel cr3=", 13);
     idt.print_hex(kas_pml4_phys);
