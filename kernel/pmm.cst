@@ -67,6 +67,9 @@ let is [2]i32 as zone_atomic_reserve;
 // IRQ lock state
 let is i64 as saved_flags with mut = 0;
 
+// Interrupt context tracking (set by IRQ handler, cleared on return)
+let is i32 as in_irq_context with mut = 0;
+
 // HHDM offset — physical-to-virtual: virt = phys + hhdm
 let is i64 as hhdm with mut = 0;
 
@@ -737,6 +740,26 @@ fn seed_buddy() as void {
     }
 }
 
+// Merge optimization: when absorbed buddy is upper, only rewrite
+// the absorbed half's pages as tails. Existing tails are already correct.
+fn extend_free_up(hpfn as i32, old_order as i32) as void {
+    let is i32 as new_order = old_order + cast(i32, 1);
+    // Update head's order
+    let is *PageInfo as h = pfn_to_pageinfo(hpfn);
+    h.meta = meta_build(PAGE_FREE, USAGE_NONE, new_order, PAGEF_HEAD);
+    // Mark only the absorbed upper half as tails
+    let is i32 as buddy_start = hpfn + (cast(i32, 1) << old_order);
+    let is i32 as count = cast(i32, 1) << old_order;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is *PageInfo as t = pfn_to_pageinfo(buddy_start + i);
+        t.meta = meta_build(PAGE_FREE, USAGE_NONE, cast(i32, 0), PAGEF_TAIL);
+        t.aux0 = hpfn;
+        t.aux1 = cast(i32, 0);
+        i = i + cast(i32, 1);
+    }
+}
+
 // ============================================================
 // Merge check
 // ============================================================
@@ -774,6 +797,13 @@ fn zone_has_budget(zone as i32, flags as i32, need as i32) as i32 {
 
 fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as i32) as i32 {
     if (order > MAX_BLOCK_ORDER) { return PFN_NONE; }
+
+    // ALLOC_EMERGENCY enforcement: panic if used outside permitted context
+    if ((flags & ALLOC_EMERGENCY) != cast(i32, 0)) {
+        if (in_irq_context == cast(i32, 0)) {
+            panic("ALLOC_EMERGENCY outside IRQ/panic context", 41);
+        }
+    }
 
     // Bug #4 fix: correct zone fallback policy
     // DMA32 request: only DMA32
@@ -867,10 +897,17 @@ fn merge_insert(zone as i32, pfn as i32, order as i32) as void {
             } else {
                 remove_free(zone, co, buddy);
                 if (buddy < cp) {
+                    // Absorbed buddy is LOWER — head moves down
+                    // Must rewrite all tails because head_pfn changed
                     cp = buddy;
+                    co = co + cast(i32, 1);
+                    mark_free(cp, co);
+                } else {
+                    // Absorbed buddy is UPPER — head stays same
+                    // Only rewrite the absorbed half (optimization)
+                    extend_free_up(cp, co);
+                    co = co + cast(i32, 1);
                 }
-                co = co + cast(i32, 1);
-                mark_free(cp, co);
             }
         }
     }
