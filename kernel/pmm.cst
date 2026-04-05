@@ -1,0 +1,948 @@
+// pmm.cst — Physical Memory Manager (buddy allocator)
+// Based on causticos_pmm_spec_v1
+
+use "serial.cst" as serial;
+use "limine.cst" as limine;
+use "idt.cst" as idt;
+
+// ============================================================
+// Constants
+// ============================================================
+
+let is i64 as PAGE_SIZE         = 4096;
+let is i64 as PAGE_SHIFT        = 12;
+let is i32 as NUM_ORDERS        = 11;
+let is i32 as MAX_BLOCK_ORDER   = 10;
+
+let is i32 as SECTION_PAGE_SHIFT = 15;
+let is i32 as SECTION_PAGE_MASK = 32767;
+let is i32 as PAGES_PER_SECTION = 32768;
+let is i32 as MAX_SECTIONS      = 32;
+
+let is i32 as PFN_NONE with mut = 0;   // set to -1 (0xFFFFFFFF) in init
+
+// Page states (i32)
+let is i32 as PAGE_ABSENT       = 0;
+let is i32 as PAGE_FREE         = 1;
+let is i32 as PAGE_ALLOCATED    = 2;
+let is i32 as PAGE_RESERVED     = 3;
+
+// Page usage (i32)
+let is i32 as USAGE_NONE        = 0;
+let is i32 as USAGE_KERNEL      = 1;
+let is i32 as USAGE_PAGE_TABLE  = 2;
+let is i32 as USAGE_KERNEL_HEAP = 3;
+let is i32 as USAGE_BOOT_RESERVED = 5;
+
+// Page flags (i32)
+let is i32 as PAGEF_HEAD        = 1;
+let is i32 as PAGEF_TAIL        = 2;
+
+// Meta bit layout — packed into i32
+// Bits [1:0]   state (2 bits)
+// Bits [7:2]   usage (6 bits)
+// Bits [12:8]  order (5 bits)
+// Bits [17:13] flags (5 bits)
+let is i32 as META_STATE_SHIFT  = 0;
+let is i32 as META_USAGE_SHIFT  = 2;
+let is i32 as META_ORDER_SHIFT  = 8;
+let is i32 as META_FLAGS_SHIFT  = 13;
+
+// Zones
+let is i32 as ZONE_DMA32         = 0;
+let is i32 as ZONE_NORMAL        = 1;
+let is i32 as NUM_ZONES          = 2;
+let is i32 as ZONE_DMA32_END_PFN with mut = 0; // set to 1048576 in init
+
+// Alloc flags
+let is i32 as ALLOC_ZERO           = 1;
+let is i32 as ALLOC_ALLOW_FALLBACK = 2;
+let is i32 as ALLOC_DMA32_ONLY     = 4;
+let is i32 as ALLOC_EMERGENCY      = 8;
+
+// Zone reserves (i32 page counts)
+let is [2]i32 as zone_min_reserve;
+let is [2]i32 as zone_atomic_reserve;
+
+// IRQ lock state
+let is i64 as saved_flags with mut = 0;
+
+// HHDM offset — physical-to-virtual: virt = phys + hhdm
+let is i64 as hhdm with mut = 0;
+
+fn phys_to_virt(phys as i64) as i64 {
+    return phys + hhdm;
+}
+
+// ============================================================
+// Meta helpers (all i32)
+// ============================================================
+
+fn meta_get_state(meta as i32) as i32 {
+    return (meta >> META_STATE_SHIFT) & cast(i32, 3);
+}
+
+fn meta_get_usage(meta as i32) as i32 {
+    return (meta >> META_USAGE_SHIFT) & cast(i32, 63);
+}
+
+fn meta_get_order(meta as i32) as i32 {
+    return (meta >> META_ORDER_SHIFT) & cast(i32, 31);
+}
+
+fn meta_get_flags(meta as i32) as i32 {
+    return (meta >> META_FLAGS_SHIFT) & cast(i32, 31);
+}
+
+fn meta_has_flag(meta as i32, flag as i32) as i32 {
+    let is i32 as f = (meta >> META_FLAGS_SHIFT) & flag;
+    if (f != cast(i32, 0)) {
+        return cast(i32, 1);
+    }
+    return cast(i32, 0);
+}
+
+fn meta_build(state as i32, usage as i32, order as i32, flags as i32) as i32 {
+    return (state << META_STATE_SHIFT)
+         | (usage << META_USAGE_SHIFT)
+         | (order << META_ORDER_SHIFT)
+         | (flags << META_FLAGS_SHIFT);
+}
+
+// ============================================================
+// PageInfo — 12 bytes per page (3 x i32)
+// ============================================================
+
+struct PageInfo {
+    meta as i32;
+    aux0 as i32;    // next_free / refcount / head_pfn
+    aux1 as i32;    // prev_free / owner_id / 0
+}
+
+// ============================================================
+// Section table
+// ============================================================
+
+struct MemSection {
+    present as i32;
+    base_pfn as i32;
+    present_pages as i32;
+    pad0 as i32;
+    pages as i64;       // physical address of PageInfo array
+}
+
+// 32 sections * 20 bytes = 640 bytes (pad to 32*24=768 for alignment)
+let is [768]u8 as section_table_raw;
+
+fn section_get(idx as i32) as *MemSection {
+    let is i64 as off = cast(i64, idx) * 24;
+    return cast(*MemSection, cast(i64, &section_table_raw) + off);
+}
+
+// ============================================================
+// Zone free lists — flat array [NUM_ZONES * NUM_ORDERS]
+// Each entry is a PFN (i32). PFN_NONE = empty.
+// ============================================================
+
+let is [22]i32 as free_list_heads;
+let is [2]i32 as zone_free_totals;
+
+fn fl_idx(zone as i32, order as i32) as i64 {
+    return cast(i64, zone) * cast(i64, NUM_ORDERS) + cast(i64, order);
+}
+
+fn fl_get(zone as i32, order as i32) as i32 {
+    let is *i32 as heads = cast(*i32, &free_list_heads);
+    return heads[fl_idx(zone, order)];
+}
+
+fn fl_set(zone as i32, order as i32, pfn as i32) as void {
+    let is *i32 as heads = cast(*i32, &free_list_heads);
+    heads[fl_idx(zone, order)] = pfn;
+}
+
+// ============================================================
+// Memblock — bootstrap allocator (i64 for addresses)
+// ============================================================
+
+let is i64 as MEMBLOCK_MAX = 64;
+
+// Ranges: base(i64) + length(i64) = 16 bytes each, 64 entries = 1024 bytes
+let is [1024]u8 as mb_mem_raw;
+let is [1024]u8 as mb_res_raw;
+let is i64 as mb_mem_count with mut = 0;
+let is i64 as mb_res_count with mut = 0;
+let is i64 as mb_frozen with mut = 0;
+
+let is i64 as mb_bump with mut = 0;
+let is i64 as mb_bump_end with mut = 0;
+
+fn mb_mem_get(idx as i64, field as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &mb_mem_raw) + idx * 16);
+    return p[field];
+}
+
+fn mb_mem_set(idx as i64, base as i64, len as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, &mb_mem_raw) + idx * 16);
+    p[0] = base;
+    p[1] = len;
+}
+
+fn mb_res_get(idx as i64, field as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &mb_res_raw) + idx * 16);
+    return p[field];
+}
+
+fn mb_res_set(idx as i64, base as i64, len as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, &mb_res_raw) + idx * 16);
+    p[0] = base;
+    p[1] = len;
+}
+
+fn mb_add_mem(base as i64, len as i64) as void {
+    if (mb_mem_count < MEMBLOCK_MAX) {
+        mb_mem_set(mb_mem_count, base, len);
+        mb_mem_count = mb_mem_count + 1;
+    }
+}
+
+fn mb_add_res(base as i64, len as i64) as void {
+    if (mb_res_count < MEMBLOCK_MAX) {
+        mb_res_set(mb_res_count, base, len);
+        mb_res_count = mb_res_count + 1;
+    }
+}
+
+fn align_up(addr as i64, align as i64) as i64 {
+    return (addr + align - 1) & (0 - align);
+}
+
+fn panic(msg as *u8, len as i64) as void {
+    serial.print("PANIC: ", 7);
+    serial.println(msg, len);
+    asm("cli\n");
+    while (1 == 1) { asm(".byte 0xF4\n"); }
+}
+
+// IRQ save/restore for buddy ops (Bug #2 fix)
+fn irq_save() as void {
+    // pushfq=0x9C; pop rax; store to global; cli=0xFA
+    asm(".byte 0x9C\n");       // pushfq
+    asm("pop rax\n");
+    asm("lea rbx, [rip+_kernel_pmm_cst_saved_flags]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    asm(".byte 0xFA\n");       // cli
+}
+
+fn irq_restore() as void {
+    // load from global; push; popfq=0x9D
+    asm("lea rbx, [rip+_kernel_pmm_cst_saved_flags]\n");
+    asm("mov rax, QWORD PTR [rbx]\n");
+    asm("push rax\n");
+    asm(".byte 0x9D\n");       // popfq
+}
+
+fn mb_alloc(size as i64) as i64 {
+    if (mb_frozen != 0) {
+        panic("mb_alloc after freeze", 21);
+    }
+
+    let is i64 as asize = align_up(size, PAGE_SIZE);
+
+    // Init bump from largest usable region
+    if (mb_bump == 0) {
+        let is i64 as best_base with mut = 0;
+        let is i64 as best_len with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < mb_mem_count) {
+            let is i64 as len = mb_mem_get(i, 1);
+            if (len > best_len) {
+                best_base = mb_mem_get(i, 0);
+                best_len = len;
+            }
+            i = i + 1;
+        }
+        mb_bump = align_up(best_base, PAGE_SIZE);
+        mb_bump_end = best_base + best_len;
+    }
+
+    // Find non-overlapping slot
+    let is i64 as addr with mut = mb_bump;
+    let is i64 as found with mut = 0;
+    while (found == 0) {
+        if (addr + asize > mb_bump_end) {
+            panic("mb_alloc OOM", 12);
+        }
+        let is i64 as overlap with mut = 0;
+        let is i64 as r with mut = 0;
+        while (r < mb_res_count) {
+            let is i64 as rbase = mb_res_get(r, 0);
+            let is i64 as rend = rbase + mb_res_get(r, 1);
+            if (addr < rend) {
+                if (addr + asize > rbase) {
+                    addr = align_up(rend, PAGE_SIZE);
+                    overlap = 1;
+                }
+            }
+            r = r + 1;
+        }
+        if (overlap == 0) {
+            found = 1;
+        }
+    }
+
+    // Zero (must use virtual address via HHDM)
+    let is *u8 as ptr = cast(*u8, phys_to_virt(addr));
+    let is i64 as z with mut = 0;
+    while (z < asize) {
+        ptr[z] = 0;
+        z = z + 1;
+    }
+
+    mb_add_res(addr, asize);
+    mb_bump = addr + asize;
+    return addr;
+}
+
+fn mb_freeze() as void {
+    mb_frozen = 1;
+}
+
+// ============================================================
+// Phase A: Parse Limine memory map
+// ============================================================
+
+fn parse_mmap() as void {
+    if (limine.mmap_req_response == 0) {
+        panic("no mmap response", 16);
+    }
+
+    let is *limine.LimineMmapResponse as resp = cast(*limine.LimineMmapResponse, limine.mmap_req_response);
+    let is i64 as count = resp.entry_count;
+    let is *i64 as eptrs = cast(*i64, resp.entries);
+
+    serial.print("mmap: ", 6);
+    idt.print_num(count);
+    serial.println(" entries", 8);
+
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is *limine.LimineMmapEntry as e = cast(*limine.LimineMmapEntry, eptrs[i]);
+        let is i64 as base = e.base;
+        let is i64 as len = e.length;
+        let is i64 as t = e.entry_type;
+
+        serial.print("  ", 2);
+        idt.print_hex(base);
+        serial.print(" +", 2);
+        idt.print_hex(len);
+        serial.print(" t=", 3);
+        idt.print_num(t);
+        serial.println("", 0);
+
+        if (t == limine.MMAP_USABLE) {
+            mb_add_mem(base, len);
+        }
+        if (t == limine.MMAP_BOOTLOADER_RECLAIM) {
+            mb_add_mem(base, len);
+        }
+        if (t == limine.MMAP_KERNEL_AND_MODULES) {
+            mb_add_res(base, len);
+        }
+        i = i + 1;
+    }
+
+    serial.print("memblock: ", 10);
+    idt.print_num(mb_mem_count);
+    serial.print(" mem, ", 6);
+    idt.print_num(mb_res_count);
+    serial.println(" res", 4);
+}
+
+// ============================================================
+// PFN helpers
+// ============================================================
+
+fn pfn_to_phys(pfn as i32) as i64 {
+    return cast(i64, pfn) << PAGE_SHIFT;
+}
+
+fn phys_to_pfn(addr as i64) as i32 {
+    return cast(i32, addr >> PAGE_SHIFT);
+}
+
+fn pfn_to_pageinfo(pfn as i32) as *PageInfo {
+    let is i32 as sid = pfn >> SECTION_PAGE_SHIFT;
+    if (sid >= MAX_SECTIONS) {
+        return cast(*PageInfo, 0);
+    }
+    let is *MemSection as sec = section_get(sid);
+    if (sec.present == cast(i32, 0)) {
+        return cast(*PageInfo, 0);
+    }
+    let is i64 as idx = cast(i64, pfn & SECTION_PAGE_MASK);
+    return cast(*PageInfo, phys_to_virt(sec.pages) + idx * 12);
+}
+
+fn pfn_to_zone(pfn as i32) as i32 {
+    if (pfn < ZONE_DMA32_END_PFN) {
+        return ZONE_DMA32;
+    }
+    return ZONE_NORMAL;
+}
+
+// ============================================================
+// Phase B+C: Create sections
+// ============================================================
+
+fn init_sections() as void {
+    // Zero section table
+    let is *u8 as st = cast(*u8, &section_table_raw);
+    let is i64 as z with mut = 0;
+    while (z < 768) {
+        st[z] = 0;
+        z = z + 1;
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < mb_mem_count) {
+        let is i64 as base = mb_mem_get(i, 0);
+        let is i64 as end = base + mb_mem_get(i, 1);
+        let is i32 as start_pfn = phys_to_pfn(base);
+        let is i32 as end_pfn = phys_to_pfn(align_up(end, PAGE_SIZE));
+
+        let is i32 as pfn with mut = start_pfn;
+        while (pfn < end_pfn) {
+            let is i32 as sid = pfn >> SECTION_PAGE_SHIFT;
+            if (sid < MAX_SECTIONS) {
+                let is *MemSection as sec = section_get(sid);
+                if (sec.present == cast(i32, 0)) {
+                    let is i64 as pi_size = cast(i64, PAGES_PER_SECTION) * 12;
+                    let is i64 as pi_addr = mb_alloc(pi_size);
+                    sec.present = cast(i32, 1);
+                    sec.base_pfn = sid << SECTION_PAGE_SHIFT;
+                    sec.present_pages = cast(i32, 0);
+                    sec.pages = pi_addr;
+
+                    serial.print("section ", 8);
+                    idt.print_num(cast(i64, sid));
+                    serial.print(": pages@", 8);
+                    idt.print_hex(pi_addr);
+                    serial.println("", 0);
+                }
+            }
+            pfn = ((pfn >> SECTION_PAGE_SHIFT) + cast(i32, 1)) << SECTION_PAGE_SHIFT;
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Phase D: Mark PageInfo entries
+// ============================================================
+
+fn addr_in_reserved(phys as i64) as i32 {
+    let is i64 as r with mut = 0;
+    while (r < mb_res_count) {
+        let is i64 as rbase = mb_res_get(r, 0);
+        let is i64 as rend = rbase + mb_res_get(r, 1);
+        if (phys >= rbase) {
+            if (phys < rend) {
+                return cast(i32, 1);
+            }
+        }
+        r = r + 1;
+    }
+    return cast(i32, 0);
+}
+
+fn addr_in_usable(phys as i64) as i32 {
+    let is i64 as m with mut = 0;
+    while (m < mb_mem_count) {
+        let is i64 as mbase = mb_mem_get(m, 0);
+        let is i64 as mend = mbase + mb_mem_get(m, 1);
+        if (phys >= mbase) {
+            if (phys < mend) {
+                return cast(i32, 1);
+            }
+        }
+        m = m + 1;
+    }
+    return cast(i32, 0);
+}
+
+let is i64 as stat_free with mut = 0;
+let is i64 as stat_reserved with mut = 0;
+
+fn init_pageinfo() as void {
+    let is i64 as free_n with mut = 0;
+    let is i64 as res_n with mut = 0;
+
+    let is i32 as sid with mut = 0;
+    while (sid < MAX_SECTIONS) {
+        let is *MemSection as sec = section_get(sid);
+        if (sec.present != cast(i32, 0)) {
+            let is i32 as bpfn = sec.base_pfn;
+            let is i32 as ppages with mut = 0;
+
+            let is i32 as p with mut = 0;
+            while (p < PAGES_PER_SECTION) {
+                let is i32 as pfn = bpfn + p;
+                let is i64 as phys = pfn_to_phys(pfn);
+                let is *PageInfo as pi = pfn_to_pageinfo(pfn);
+
+                if (cast(i64, pi) != 0) {
+                    if (addr_in_usable(phys) != cast(i32, 0)) {
+                        ppages = ppages + cast(i32, 1);
+                        if (addr_in_reserved(phys) != cast(i32, 0)) {
+                            pi.meta = meta_build(PAGE_RESERVED, USAGE_BOOT_RESERVED, cast(i32, 0), cast(i32, 0));
+                            pi.aux0 = cast(i32, 1);
+                            pi.aux1 = cast(i32, 0);
+                            res_n = res_n + 1;
+                        } else {
+                            pi.meta = meta_build(PAGE_FREE, USAGE_NONE, cast(i32, 0), PAGEF_HEAD);
+                            pi.aux0 = PFN_NONE;
+                            pi.aux1 = PFN_NONE;
+                            free_n = free_n + 1;
+                        }
+                    }
+                }
+                p = p + cast(i32, 1);
+            }
+            sec.present_pages = ppages;
+        }
+        sid = sid + cast(i32, 1);
+    }
+
+    stat_free = free_n;
+    stat_reserved = res_n;
+    serial.print("pages: ", 7);
+    idt.print_num(free_n);
+    serial.print(" free, ", 7);
+    idt.print_num(res_n);
+    serial.println(" reserved", 9);
+}
+
+// ============================================================
+// Free list operations
+// ============================================================
+
+fn insert_free(zone as i32, order as i32, pfn as i32) as void {
+    let is *PageInfo as pg = pfn_to_pageinfo(pfn);
+    let is i32 as old = fl_get(zone, order);
+    pg.aux0 = old;
+    pg.aux1 = PFN_NONE;
+    if (old != PFN_NONE) {
+        let is *PageInfo as opg = pfn_to_pageinfo(old);
+        opg.aux1 = pfn;
+    }
+    fl_set(zone, order, pfn);
+}
+
+fn remove_free(zone as i32, order as i32, pfn as i32) as void {
+    let is *PageInfo as pg = pfn_to_pageinfo(pfn);
+    let is i32 as nxt = pg.aux0;
+    let is i32 as prv = pg.aux1;
+    if (prv != PFN_NONE) {
+        let is *PageInfo as pp = pfn_to_pageinfo(prv);
+        pp.aux0 = nxt;
+    } else {
+        fl_set(zone, order, nxt);
+    }
+    if (nxt != PFN_NONE) {
+        let is *PageInfo as np = pfn_to_pageinfo(nxt);
+        np.aux1 = prv;
+    }
+    pg.aux0 = PFN_NONE;
+    pg.aux1 = PFN_NONE;
+}
+
+// ============================================================
+// Block marking
+// ============================================================
+
+fn mark_free(hpfn as i32, order as i32) as void {
+    let is *PageInfo as h = pfn_to_pageinfo(hpfn);
+    h.meta = meta_build(PAGE_FREE, USAGE_NONE, order, PAGEF_HEAD);
+    h.aux0 = PFN_NONE;
+    h.aux1 = PFN_NONE;
+    if (order > cast(i32, 0)) {
+        let is i32 as cnt = cast(i32, 1) << order;
+        let is i32 as i with mut = cast(i32, 1);
+        while (i < cnt) {
+            let is *PageInfo as t = pfn_to_pageinfo(hpfn + i);
+            t.meta = meta_build(PAGE_FREE, USAGE_NONE, cast(i32, 0), PAGEF_TAIL);
+            t.aux0 = hpfn;
+            t.aux1 = cast(i32, 0);
+            i = i + cast(i32, 1);
+        }
+    }
+}
+
+fn mark_alloc(hpfn as i32, order as i32, usage as i32, owner as i32) as void {
+    let is *PageInfo as h = pfn_to_pageinfo(hpfn);
+    h.meta = meta_build(PAGE_ALLOCATED, usage, order, PAGEF_HEAD);
+    h.aux0 = cast(i32, 1);     // refcount
+    h.aux1 = owner;
+    if (order > cast(i32, 0)) {
+        let is i32 as cnt = cast(i32, 1) << order;
+        let is i32 as i with mut = cast(i32, 1);
+        while (i < cnt) {
+            let is *PageInfo as t = pfn_to_pageinfo(hpfn + i);
+            t.meta = meta_build(PAGE_ALLOCATED, usage, cast(i32, 0), PAGEF_TAIL);
+            t.aux0 = hpfn;
+            t.aux1 = cast(i32, 0);
+            i = i + cast(i32, 1);
+        }
+    }
+}
+
+// ============================================================
+// Phase E: Seed buddy
+// ============================================================
+
+fn ctz(val as i32) as i32 {
+    if (val == cast(i32, 0)) { return cast(i32, 32); }
+    let is i32 as n with mut = 0;
+    let is i32 as v with mut = val;
+    while ((v & cast(i32, 1)) == cast(i32, 0)) {
+        n = n + cast(i32, 1);
+        v = v >> cast(i32, 1);
+    }
+    return n;
+}
+
+fn floor_log2(val as i32) as i32 {
+    if (val <= cast(i32, 0)) { return cast(i32, 0); }
+    let is i32 as n with mut = 0;
+    let is i32 as v with mut = val >> cast(i32, 1);
+    while (v > cast(i32, 0)) {
+        n = n + cast(i32, 1);
+        v = v >> cast(i32, 1);
+    }
+    return n;
+}
+
+fn min3(a as i32, b as i32, c as i32) as i32 {
+    let is i32 as m with mut = a;
+    if (b < m) { m = b; }
+    if (c < m) { m = c; }
+    return m;
+}
+
+fn seed_range(zone as i32, start as i32, end as i32) as void {
+    let is i32 as pfn with mut = start;
+    let is i32 as blocks with mut = 0;
+    let is *i32 as totals = cast(*i32, &zone_free_totals);
+
+    while (pfn < end) {
+        let is i32 as left = end - pfn;
+        let is i32 as ord = min3(floor_log2(left), ctz(pfn), MAX_BLOCK_ORDER);
+        let is i32 as bsize = cast(i32, 1) << ord;
+
+        // Bug #6 fix: defensive check — all pages in block must be PAGE_FREE
+        let is i32 as ok with mut = cast(i32, 1);
+        let is i32 as chk with mut = 0;
+        while (chk < bsize) {
+            let is *PageInfo as cpi = pfn_to_pageinfo(pfn + chk);
+            if (cast(i64, cpi) == 0) {
+                ok = cast(i32, 0);
+                chk = bsize;
+            } else {
+                if (meta_get_state(cpi.meta) != PAGE_FREE) {
+                    ok = cast(i32, 0);
+                    chk = bsize;
+                }
+            }
+            chk = chk + cast(i32, 1);
+        }
+
+        if (ok != cast(i32, 0)) {
+            mark_free(pfn, ord);
+            insert_free(zone, ord, pfn);
+            totals[cast(i64, zone)] = totals[cast(i64, zone)] + bsize;
+            blocks = blocks + cast(i32, 1);
+        }
+        pfn = pfn + bsize;
+    }
+
+    serial.print("  zone ", 7);
+    idt.print_num(cast(i64, zone));
+    serial.print(": ", 2);
+    idt.print_num(cast(i64, blocks));
+    serial.print(" blocks, ", 9);
+    idt.print_num(cast(i64, totals[cast(i64, zone)]));
+    serial.println(" pages", 6);
+}
+
+// Bug #5 fix: split run at zone boundary before seeding
+fn flush_run(start as i32, end as i32) as void {
+    let is i32 as zs = pfn_to_zone(start);
+    let is i32 as ze = pfn_to_zone(end - cast(i32, 1));
+    if (zs != ze) {
+        // Run crosses DMA32/NORMAL boundary — split
+        seed_range(ZONE_DMA32, start, ZONE_DMA32_END_PFN);
+        seed_range(ZONE_NORMAL, ZONE_DMA32_END_PFN, end);
+    } else {
+        seed_range(zs, start, end);
+    }
+}
+
+fn seed_buddy() as void {
+    // Init free lists to PFN_NONE
+    let is *i32 as heads = cast(*i32, &free_list_heads);
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, NUM_ZONES) * cast(i64, NUM_ORDERS)) {
+        heads[i] = PFN_NONE;
+        i = i + 1;
+    }
+    let is *i32 as totals = cast(*i32, &zone_free_totals);
+    totals[0] = cast(i32, 0);
+    totals[1] = cast(i32, 0);
+
+    serial.println("seeding buddy:", 14);
+
+    // Scan sections for contiguous free runs
+    let is i32 as sid with mut = 0;
+    while (sid < MAX_SECTIONS) {
+        let is *MemSection as sec = section_get(sid);
+        if (sec.present != cast(i32, 0)) {
+            let is i32 as bpfn = sec.base_pfn;
+            let is i32 as run with mut = PFN_NONE;
+
+            let is i32 as p with mut = 0;
+            while (p < PAGES_PER_SECTION) {
+                let is i32 as pfn = bpfn + p;
+                let is *PageInfo as pi = pfn_to_pageinfo(pfn);
+                let is i32 as st = meta_get_state(pi.meta);
+
+                if (st == PAGE_FREE) {
+                    if (run == PFN_NONE) {
+                        run = pfn;
+                    }
+                } else {
+                    if (run != PFN_NONE) {
+                        flush_run(run, pfn);
+                        run = PFN_NONE;
+                    }
+                }
+                p = p + cast(i32, 1);
+            }
+            if (run != PFN_NONE) {
+                let is i32 as ep = bpfn + PAGES_PER_SECTION;
+                flush_run(run, ep);
+            }
+        }
+        sid = sid + cast(i32, 1);
+    }
+}
+
+// ============================================================
+// Merge check
+// ============================================================
+
+fn can_merge(zone as i32, bpfn as i32, order as i32) as i32 {
+    let is *PageInfo as b = pfn_to_pageinfo(bpfn);
+    if (cast(i64, b) == 0) { return cast(i32, 0); }
+    if (meta_get_state(b.meta) != PAGE_FREE) { return cast(i32, 0); }
+    if (meta_has_flag(b.meta, PAGEF_HEAD) == cast(i32, 0)) { return cast(i32, 0); }
+    if (meta_get_order(b.meta) != order) { return cast(i32, 0); }
+    if (pfn_to_zone(bpfn) != zone) { return cast(i32, 0); }
+    return cast(i32, 1);
+}
+
+// ============================================================
+// Allocation
+// ============================================================
+
+// Bug #3 fix: zone budget check with reserves
+fn zone_has_budget(zone as i32, flags as i32, need as i32) as i32 {
+    let is *i32 as totals = cast(*i32, &zone_free_totals);
+    let is *i32 as minres = cast(*i32, &zone_min_reserve);
+    let is *i32 as atomres = cast(*i32, &zone_atomic_reserve);
+    let is i64 as zi = cast(i64, zone);
+
+    let is i32 as avail with mut = totals[zi] - minres[zi];
+    if ((flags & ALLOC_EMERGENCY) != cast(i32, 0)) {
+        avail = avail + atomres[zi];
+    }
+    if (avail >= need) {
+        return cast(i32, 1);
+    }
+    return cast(i32, 0);
+}
+
+fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as i32) as i32 {
+    if (order > MAX_BLOCK_ORDER) { return PFN_NONE; }
+
+    // Bug #4 fix: correct zone fallback policy
+    // DMA32 request: only DMA32
+    // DMA32_ONLY flag: only DMA32
+    // NORMAL request: try NORMAL, fallback to DMA32 if allowed
+    let is i32 as zone with mut = zpref;
+    let is i32 as att with mut = 0;
+
+    while (att < NUM_ZONES) {
+        let is i32 as need = cast(i32, 1) << order;
+
+        irq_save();
+
+        if (zone_has_budget(zone, flags, need) != cast(i32, 0)) {
+            // Find smallest sufficient order
+            let is i32 as so with mut = order;
+            let is i32 as fo with mut = cast(i32, 0 - 1);
+            while (so <= MAX_BLOCK_ORDER) {
+                if (fl_get(zone, so) != PFN_NONE) {
+                    fo = so;
+                    so = MAX_BLOCK_ORDER + cast(i32, 1);
+                }
+                so = so + cast(i32, 1);
+            }
+
+            if (fo >= cast(i32, 0)) {
+                let is *i32 as totals = cast(*i32, &zone_free_totals);
+                let is i32 as pfn = fl_get(zone, fo);
+                remove_free(zone, fo, pfn);
+
+                // Split
+                let is i32 as co with mut = fo;
+                while (co > order) {
+                    co = co - cast(i32, 1);
+                    let is i32 as upper = pfn + (cast(i32, 1) << co);
+                    mark_free(upper, co);
+                    insert_free(zone, co, upper);
+                }
+
+                mark_alloc(pfn, order, usage, owner);
+                totals[cast(i64, zone)] = totals[cast(i64, zone)] - need;
+
+                irq_restore();
+
+                // Zero OUTSIDE lock (spec section 16.1)
+                if ((flags & ALLOC_ZERO) != cast(i32, 0)) {
+                    let is i64 as phys = pfn_to_phys(pfn);
+                    let is *u8 as ptr = cast(*u8, phys_to_virt(phys));
+                    let is i64 as zlen = cast(i64, need) << PAGE_SHIFT;
+                    let is i64 as zz with mut = 0;
+                    while (zz < zlen) {
+                        ptr[zz] = 0;
+                        zz = zz + 1;
+                    }
+                }
+
+                return pfn;
+            }
+        }
+
+        irq_restore();
+
+        // Bug #4 fix: DMA32 never falls back to NORMAL
+        if (zone == ZONE_DMA32) { return PFN_NONE; }
+        if ((flags & ALLOC_DMA32_ONLY) != cast(i32, 0)) { return PFN_NONE; }
+        if ((flags & ALLOC_ALLOW_FALLBACK) == cast(i32, 0)) { return PFN_NONE; }
+        // NORMAL -> fallback to DMA32
+        zone = ZONE_DMA32;
+        att = att + cast(i32, 1);
+    }
+
+    return PFN_NONE;
+}
+
+// ============================================================
+// Free with merge
+// ============================================================
+
+fn merge_insert(zone as i32, pfn as i32, order as i32) as void {
+    let is i32 as cp with mut = pfn;
+    let is i32 as co with mut = order;
+    let is i32 as merging with mut = cast(i32, 1);
+
+    while (merging != cast(i32, 0)) {
+        if (co >= MAX_BLOCK_ORDER) {
+            merging = cast(i32, 0);
+        } else {
+            let is i32 as buddy = cp ^ (cast(i32, 1) << co);
+            if (can_merge(zone, buddy, co) == cast(i32, 0)) {
+                merging = cast(i32, 0);
+            } else {
+                remove_free(zone, co, buddy);
+                if (buddy < cp) {
+                    cp = buddy;
+                }
+                co = co + cast(i32, 1);
+                mark_free(cp, co);
+            }
+        }
+    }
+
+    insert_free(zone, co, cp);
+}
+
+fn free_pages(pfn as i32) as void {
+    let is *PageInfo as pg = pfn_to_pageinfo(pfn);
+    if (cast(i64, pg) == 0) { panic("free: bad pfn", 13); }
+    if (meta_get_state(pg.meta) != PAGE_ALLOCATED) { panic("free: not alloc", 15); }
+    if (meta_has_flag(pg.meta, PAGEF_HEAD) == cast(i32, 0)) { panic("free: not head", 14); }
+    if (pg.aux0 != cast(i32, 1)) { panic("free: refcount!=1", 17); }
+
+    let is i32 as order = meta_get_order(pg.meta);
+    let is i32 as zone = pfn_to_zone(pfn);
+
+    irq_save();
+
+    let is *i32 as totals = cast(*i32, &zone_free_totals);
+    mark_free(pfn, order);
+    totals[cast(i64, zone)] = totals[cast(i64, zone)] + (cast(i32, 1) << order);
+    merge_insert(zone, pfn, order);
+
+    irq_restore();
+}
+
+// ============================================================
+// Init
+// ============================================================
+
+fn init() as void {
+    // Init constants that can't use expressions in global scope
+    PFN_NONE = cast(i32, 0 - 1);
+    ZONE_DMA32_END_PFN = cast(i32, 1048576);
+
+    // Get HHDM offset from Limine
+    if (limine.hhdm_req_response == 0) {
+        panic("no hhdm response", 16);
+    }
+    let is *limine.LimineHhdmResponse as hresp = cast(*limine.LimineHhdmResponse, limine.hhdm_req_response);
+    hhdm = hresp.offset;
+    serial.print("hhdm: ", 6);
+    idt.print_hex(hhdm);
+    serial.println("", 0);
+
+    serial.println("pmm: init", 9);
+    parse_mmap();
+    init_sections();
+    init_pageinfo();
+    seed_buddy();
+    mb_freeze();
+
+    // Set zone reserves (1% of zone free pages, min 16 pages)
+    let is *i32 as totals = cast(*i32, &zone_free_totals);
+    let is *i32 as minres = cast(*i32, &zone_min_reserve);
+    let is *i32 as atomres = cast(*i32, &zone_atomic_reserve);
+
+    let is i32 as i with mut = 0;
+    while (i < NUM_ZONES) {
+        let is i32 as total = totals[cast(i64, i)];
+        let is i32 as res with mut = total >> cast(i32, 7);  // ~0.8%
+        if (res < cast(i32, 16)) {
+            res = cast(i32, 16);
+        }
+        if (res > total) {
+            res = cast(i32, 0);
+        }
+        minres[cast(i64, i)] = res;
+        atomres[cast(i64, i)] = res >> cast(i32, 2);  // 1/4 of min
+        i = i + cast(i32, 1);
+    }
+
+    serial.println("pmm: ready", 10);
+}

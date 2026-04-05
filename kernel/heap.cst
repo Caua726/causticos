@@ -1,0 +1,926 @@
+// heap.cst — Kernel slab allocator + kmalloc
+// Based on causticos_kheap_spec_v1
+
+use "serial.cst" as serial;
+use "pmm.cst" as pmm;
+use "idt.cst" as idt;
+
+// ============================================================
+// Constants
+// ============================================================
+
+let is i32 as SLAB_NONE         = 0;
+let is i32 as SLAB_TABLE_MAX    = 1024;   // max concurrent slabs (v1 conservative)
+let is i32 as CACHE_TABLE_MAX   = 64;     // max concurrent caches
+let is i64 as KMALLOC_MAX_SIZE  = 4096;
+
+// Slab list states
+let is i32 as SLAB_LIST_NONE    = 0;
+let is i32 as SLAB_LIST_ACTIVE  = 1;
+let is i32 as SLAB_LIST_PARTIAL = 2;
+let is i32 as SLAB_LIST_FULL    = 3;
+let is i32 as SLAB_LIST_EMPTY   = 4;
+
+// Number of kmalloc size classes
+let is i32 as NUM_CLASSES       = 10;
+
+// ============================================================
+// KmemCache — slab cache descriptor (128 bytes, manual layout)
+// ============================================================
+// Offset  Field              Type   Size
+// 0       object_size        i64    8
+// 8       effective_size     i64    8
+// 16      align              i64    8
+// 24      first_obj_offset   i64    8
+// 32      slab_order         i32    4
+// 36      objects_per_slab   i32    4
+// 40      cache_id           i32    4
+// 44      flags              i32    4
+// 48      active_slab_id     i32    4  (slab_id of active slab, 0=none)
+// 52      partial_head_id    i32    4  (slab_id of partial list head)
+// 56      full_head_id       i32    4
+// 60      empty_head_id      i32    4
+// 64      empty_count        i32    4
+// 68      max_empty          i32    4
+// 72      total_allocs       i32    4
+// 76      total_frees        i32    4
+// 80      active_objects     i32    4
+// 84      total_slabs        i32    4
+// 88      pad                       40
+// Total: 128 bytes
+
+let is i64 as CACHE_SIZE = 128;
+
+// Accessors via raw pointer arithmetic
+fn cache_get_obj_size(c as i64) as i64 {
+    let is *i64 as p = cast(*i64, c);
+    return p[0];
+}
+fn cache_set_obj_size(c as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, c);
+    p[0] = v;
+}
+fn cache_get_eff_size(c as i64) as i64 {
+    let is *i64 as p = cast(*i64, c + 8);
+    return p[0];
+}
+fn cache_set_eff_size(c as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, c + 8);
+    p[0] = v;
+}
+fn cache_get_align(c as i64) as i64 {
+    let is *i64 as p = cast(*i64, c + 16);
+    return p[0];
+}
+fn cache_set_align(c as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, c + 16);
+    p[0] = v;
+}
+fn cache_get_fobj_off(c as i64) as i64 {
+    let is *i64 as p = cast(*i64, c + 24);
+    return p[0];
+}
+fn cache_set_fobj_off(c as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, c + 24);
+    p[0] = v;
+}
+
+// i32 fields at offset 32+
+fn cache_get_i32(c as i64, off as i64) as i32 {
+    let is *i32 as p = cast(*i32, c + off);
+    return p[0];
+}
+fn cache_set_i32(c as i64, off as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, c + off);
+    p[0] = v;
+}
+
+// Named accessors for clarity
+fn cache_slab_order(c as i64) as i32    { return cache_get_i32(c, 32); }
+fn cache_objs_per_slab(c as i64) as i32 { return cache_get_i32(c, 36); }
+fn cache_id(c as i64) as i32            { return cache_get_i32(c, 40); }
+fn cache_active_id(c as i64) as i32     { return cache_get_i32(c, 48); }
+fn cache_partial_id(c as i64) as i32    { return cache_get_i32(c, 52); }
+fn cache_full_id(c as i64) as i32       { return cache_get_i32(c, 56); }
+fn cache_empty_id(c as i64) as i32      { return cache_get_i32(c, 60); }
+fn cache_empty_count(c as i64) as i32   { return cache_get_i32(c, 64); }
+fn cache_max_empty(c as i64) as i32     { return cache_get_i32(c, 68); }
+fn cache_active_objs(c as i64) as i32   { return cache_get_i32(c, 80); }
+fn cache_total_slabs(c as i64) as i32   { return cache_get_i32(c, 84); }
+
+// ============================================================
+// SlabPage descriptor (48 bytes, manual layout)
+// ============================================================
+// Offset  Field          Type  Size
+// 0       cache_addr     i64   8    (vaddr of KmemCache)
+// 8       slab_pfn       i32   4
+// 12      slab_id        i32   4
+// 16      free_ptr       i64   8    (vaddr of first free slot)
+// 24      inuse          i32   4
+// 28      total          i32   4
+// 32      list_state     i32   4
+// 36      next_id        i32   4    (slab_id of next in list)
+// 40      prev_id        i32   4    (slab_id of prev in list)
+// 44      pad            i32   4
+// Total: 48 bytes
+
+let is i64 as SLAB_SIZE = 48;
+
+fn slab_cache_addr(s as i64) as i64 {
+    let is *i64 as p = cast(*i64, s);
+    return p[0];
+}
+fn slab_set_cache_addr(s as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, s);
+    p[0] = v;
+}
+fn slab_pfn(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 8);
+    return p[0];
+}
+fn slab_set_pfn(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 8);
+    p[0] = v;
+}
+fn slab_id(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 12);
+    return p[0];
+}
+fn slab_set_id(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 12);
+    p[0] = v;
+}
+fn slab_free_ptr(s as i64) as i64 {
+    let is *i64 as p = cast(*i64, s + 16);
+    return p[0];
+}
+fn slab_set_free_ptr(s as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, s + 16);
+    p[0] = v;
+}
+fn slab_inuse(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 24);
+    return p[0];
+}
+fn slab_set_inuse(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 24);
+    p[0] = v;
+}
+fn slab_total(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 28);
+    return p[0];
+}
+fn slab_set_total(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 28);
+    p[0] = v;
+}
+fn slab_list_state(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 32);
+    return p[0];
+}
+fn slab_set_list_state(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 32);
+    p[0] = v;
+}
+fn slab_next_id(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 36);
+    return p[0];
+}
+fn slab_set_next_id(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 36);
+    p[0] = v;
+}
+fn slab_prev_id(s as i64) as i32 {
+    let is *i32 as p = cast(*i32, s + 40);
+    return p[0];
+}
+fn slab_set_prev_id(s as i64, v as i32) as void {
+    let is *i32 as p = cast(*i32, s + 40);
+    p[0] = v;
+}
+
+// ============================================================
+// Static bootstrap pools (BSS)
+// ============================================================
+
+// 32 KmemCache structs * 128 bytes = 4096 bytes
+let is [4096]u8 as static_cache_pool;
+let is i32 as static_cache_used with mut = 0;
+
+// 128 SlabPage structs * 48 bytes = 6144 bytes
+let is [6144]u8 as static_slab_pool;
+let is i32 as static_slab_used with mut = 0;
+
+// Slab table: array of pointers (i64) to SlabPage descriptors
+// 1024 * 8 = 8192 bytes
+let is [8192]u8 as slab_table_raw;
+
+// Cache table: array of pointers (i64) to KmemCache descriptors
+// 64 * 8 = 512 bytes
+let is [512]u8 as cache_table_raw;
+
+// Slab ID allocator
+let is i32 as next_slab_id with mut = 1;
+
+// Cache ID allocator
+let is i32 as next_cache_id with mut = 1;
+
+// Meta-cache addresses (i64 vaddrs)
+let is i64 as cache_cache with mut = 0;
+let is i64 as slabpage_cache with mut = 0;
+
+// kmalloc size class caches (i64 vaddrs)
+let is [80]u8 as kmalloc_caches_raw;  // 10 * 8 bytes
+
+// IRQ lock
+let is i64 as heap_saved_flags with mut = 0;
+
+// ============================================================
+// Table accessors
+// ============================================================
+
+fn slab_table_get(id as i32) as i64 {
+    if (id <= cast(i32, 0)) { return 0; }
+    if (id >= SLAB_TABLE_MAX) { return 0; }
+    let is *i64 as t = cast(*i64, &slab_table_raw);
+    return t[cast(i64, id)];
+}
+
+fn slab_table_set(id as i32, addr as i64) as void {
+    let is *i64 as t = cast(*i64, &slab_table_raw);
+    t[cast(i64, id)] = addr;
+}
+
+fn cache_table_get(id as i32) as i64 {
+    if (id <= cast(i32, 0)) { return 0; }
+    if (id >= CACHE_TABLE_MAX) { return 0; }
+    let is *i64 as t = cast(*i64, &cache_table_raw);
+    return t[cast(i64, id)];
+}
+
+fn cache_table_set(id as i32, addr as i64) as void {
+    let is *i64 as t = cast(*i64, &cache_table_raw);
+    t[cast(i64, id)] = addr;
+}
+
+fn kmalloc_cache_get(cls as i32) as i64 {
+    let is *i64 as t = cast(*i64, &kmalloc_caches_raw);
+    return t[cast(i64, cls)];
+}
+
+fn kmalloc_cache_set(cls as i32, addr as i64) as void {
+    let is *i64 as t = cast(*i64, &kmalloc_caches_raw);
+    t[cast(i64, cls)] = addr;
+}
+
+// ============================================================
+// IRQ save/restore
+// ============================================================
+
+fn hirq_save() as void {
+    asm(".byte 0x9C\n");       // pushfq
+    asm("pop rax\n");
+    asm("lea rbx, [rip+_kernel_heap_cst_heap_saved_flags]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    asm(".byte 0xFA\n");       // cli
+}
+
+fn hirq_restore() as void {
+    asm("lea rbx, [rip+_kernel_heap_cst_heap_saved_flags]\n");
+    asm("mov rax, QWORD PTR [rbx]\n");
+    asm("push rax\n");
+    asm(".byte 0x9D\n");       // popfq
+}
+
+// ============================================================
+// ID allocators
+// ============================================================
+
+fn alloc_slab_id() as i32 {
+    if (next_slab_id >= SLAB_TABLE_MAX) {
+        pmm.panic("slab table exhausted", 20);
+    }
+    let is i32 as id = next_slab_id;
+    next_slab_id = next_slab_id + cast(i32, 1);
+    return id;
+}
+
+fn alloc_cache_id() as i32 {
+    if (next_cache_id >= CACHE_TABLE_MAX) {
+        pmm.panic("cache table exhausted", 21);
+    }
+    let is i32 as id = next_cache_id;
+    next_cache_id = next_cache_id + cast(i32, 1);
+    return id;
+}
+
+// ============================================================
+// Static pool allocators (bootstrap only)
+// ============================================================
+
+fn alloc_static_cache() as i64 {
+    if (static_cache_used >= cast(i32, 32)) {
+        pmm.panic("static cache pool exhausted", 27);
+    }
+    let is i64 as addr = cast(i64, &static_cache_pool) + cast(i64, static_cache_used) * CACHE_SIZE;
+    static_cache_used = static_cache_used + cast(i32, 1);
+    // Zero it
+    let is *u8 as p = cast(*u8, addr);
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) {
+        p[i] = 0;
+        i = i + 1;
+    }
+    return addr;
+}
+
+fn alloc_static_slab() as i64 {
+    if (static_slab_used >= cast(i32, 128)) {
+        pmm.panic("static slab pool exhausted", 26);
+    }
+    let is i64 as addr = cast(i64, &static_slab_pool) + cast(i64, static_slab_used) * SLAB_SIZE;
+    static_slab_used = static_slab_used + cast(i32, 1);
+    let is *u8 as p = cast(*u8, addr);
+    let is i64 as i with mut = 0;
+    while (i < SLAB_SIZE) {
+        p[i] = 0;
+        i = i + 1;
+    }
+    return addr;
+}
+
+fn is_static_slab(addr as i64) as i32 {
+    let is i64 as pool_start = cast(i64, &static_slab_pool);
+    let is i64 as pool_end = pool_start + 6144;
+    if (addr >= pool_start) {
+        if (addr < pool_end) {
+            return cast(i32, 1);
+        }
+    }
+    return cast(i32, 0);
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+fn align_up64(v as i64, a as i64) as i64 {
+    return (v + a - 1) & (0 - a);
+}
+
+fn virt_to_phys(vaddr as i64) as i64 {
+    return vaddr - pmm.hhdm;
+}
+
+fn virt_to_pfn(vaddr as i64) as i32 {
+    return cast(i32, virt_to_phys(vaddr) >> pmm.PAGE_SHIFT);
+}
+
+// ============================================================
+// Slab list management (by slab_id, doubly-linked)
+// ============================================================
+
+// Get list head ID from cache by list state
+fn cache_list_head(c as i64, ls as i32) as i32 {
+    if (ls == SLAB_LIST_PARTIAL) { return cache_partial_id(c); }
+    if (ls == SLAB_LIST_FULL) { return cache_full_id(c); }
+    if (ls == SLAB_LIST_EMPTY) { return cache_empty_id(c); }
+    return SLAB_NONE;
+}
+
+fn cache_set_list_head(c as i64, ls as i32, id as i32) as void {
+    if (ls == SLAB_LIST_PARTIAL) { cache_set_i32(c, 52, id); }
+    if (ls == SLAB_LIST_FULL)    { cache_set_i32(c, 56, id); }
+    if (ls == SLAB_LIST_EMPTY)   { cache_set_i32(c, 60, id); }
+}
+
+fn list_insert(c as i64, sid as i32, new_state as i32) as void {
+    let is i64 as s = slab_table_get(sid);
+    let is i32 as old_head = cache_list_head(c, new_state);
+
+    slab_set_list_state(s, new_state);
+    slab_set_prev_id(s, SLAB_NONE);
+    slab_set_next_id(s, old_head);
+
+    if (old_head != SLAB_NONE) {
+        let is i64 as oh = slab_table_get(old_head);
+        slab_set_prev_id(oh, sid);
+    }
+    cache_set_list_head(c, new_state, sid);
+}
+
+fn list_remove(c as i64, sid as i32) as void {
+    let is i64 as s = slab_table_get(sid);
+    let is i32 as ls = slab_list_state(s);
+    let is i32 as nxt = slab_next_id(s);
+    let is i32 as prv = slab_prev_id(s);
+
+    if (prv != SLAB_NONE) {
+        let is i64 as ps = slab_table_get(prv);
+        slab_set_next_id(ps, nxt);
+    } else {
+        cache_set_list_head(c, ls, nxt);
+    }
+    if (nxt != SLAB_NONE) {
+        let is i64 as ns = slab_table_get(nxt);
+        slab_set_prev_id(ns, prv);
+    }
+    slab_set_next_id(s, SLAB_NONE);
+    slab_set_prev_id(s, SLAB_NONE);
+    slab_set_list_state(s, SLAB_LIST_NONE);
+}
+
+fn list_move(c as i64, sid as i32, new_state as i32) as void {
+    list_remove(c, sid);
+    list_insert(c, sid, new_state);
+}
+
+// ============================================================
+// Register/unregister slab pages in PMM PageInfo
+// ============================================================
+
+fn register_slab_pages(pfn as i32, order as i32, sid as i32) as void {
+    let is i32 as count = cast(i32, 1) << order;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn + i);
+        if (cast(i64, pi) != 0) {
+            pi.aux1 = sid;
+        }
+        i = i + cast(i32, 1);
+    }
+}
+
+fn unregister_slab_pages(pfn as i32, order as i32) as void {
+    let is i32 as count = cast(i32, 1) << order;
+    let is i32 as i with mut = 0;
+    while (i < count) {
+        let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn + i);
+        if (cast(i64, pi) != 0) {
+            pi.aux1 = cast(i32, 0);
+        }
+        i = i + cast(i32, 1);
+    }
+}
+
+// ============================================================
+// kcache_create
+// ============================================================
+
+fn kcache_create(obj_size as i64, al as i64) as i64 {
+    let is i64 as align with mut = al;
+    if (align < 16) { align = 16; }
+    if (obj_size >= 64) {
+        if (align < 64) { align = 64; }
+    }
+
+    let is i64 as effective with mut = align_up64(obj_size, align);
+    if (effective < 16) { effective = 16; }
+
+    // Choose slab order: want at least 8 objects per slab
+    let is i32 as slab_order with mut = 0;
+    let is i32 as objs with mut = 0;
+    let is i32 as found with mut = 0;
+    while (found == cast(i32, 0)) {
+        let is i64 as slab_bytes = pmm.PAGE_SIZE << cast(i64, slab_order);
+        objs = cast(i32, slab_bytes / effective);
+        if (objs >= cast(i32, 8)) {
+            found = cast(i32, 1);
+        } else {
+            slab_order = slab_order + cast(i32, 1);
+            if (slab_order > pmm.MAX_BLOCK_ORDER) {
+                pmm.panic("obj too large for slab", 22);
+            }
+        }
+    }
+
+    // Allocate cache struct from static pool (bootstrap) or cache_cache
+    let is i64 as c with mut = 0;
+    if (cache_cache == 0) {
+        c = alloc_static_cache();
+    } else {
+        c = kcache_alloc(cache_cache, cast(i32, 0));
+    }
+
+    cache_set_obj_size(c, obj_size);
+    cache_set_eff_size(c, effective);
+    cache_set_align(c, align);
+    cache_set_fobj_off(c, 0);
+    cache_set_i32(c, 32, slab_order);        // slab_order
+    cache_set_i32(c, 36, objs);              // objects_per_slab
+    let is i32 as cid = alloc_cache_id();
+    cache_set_i32(c, 40, cid);              // cache_id
+    cache_set_i32(c, 44, cast(i32, 0));     // flags
+    cache_set_i32(c, 48, SLAB_NONE);        // active
+    cache_set_i32(c, 52, SLAB_NONE);        // partial
+    cache_set_i32(c, 56, SLAB_NONE);        // full
+    cache_set_i32(c, 60, SLAB_NONE);        // empty
+    cache_set_i32(c, 64, cast(i32, 0));     // empty_count
+    cache_set_i32(c, 68, cast(i32, 2));     // max_empty
+    cache_set_i32(c, 72, cast(i32, 0));     // total_allocs
+    cache_set_i32(c, 76, cast(i32, 0));     // total_frees
+    cache_set_i32(c, 80, cast(i32, 0));     // active_objects
+    cache_set_i32(c, 84, cast(i32, 0));     // total_slabs
+
+    cache_table_set(cid, c);
+    return c;
+}
+
+// ============================================================
+// init_slab — create a new slab for a cache
+// ============================================================
+
+fn init_slab(c as i64) as i32 {
+    // Allocate physical pages
+    let is i32 as order = cache_slab_order(c);
+    let is i32 as aflags = pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK;
+    let is i32 as pfn = pmm.alloc_pages(pmm.ZONE_DMA32, aflags, order, pmm.USAGE_KERNEL_HEAP, cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) {
+        return SLAB_NONE;
+    }
+
+    // Allocate SlabPage descriptor
+    // Bootstrap guard: use static pool if slabpage_cache isn't self-hosting yet
+    let is i64 as s with mut = 0;
+    if (slabpage_cache == 0) {
+        s = alloc_static_slab();
+    } else {
+        if (cache_total_slabs(slabpage_cache) == cast(i32, 0)) {
+            s = alloc_static_slab();
+        } else {
+            s = kcache_alloc(slabpage_cache, cast(i32, 0));
+        }
+    }
+    if (s == 0) {
+        pmm.free_pages(pfn);
+        return SLAB_NONE;
+    }
+
+    let is i32 as sid = alloc_slab_id();
+    slab_set_cache_addr(s, c);
+    slab_set_pfn(s, pfn);
+    slab_set_id(s, sid);
+    slab_set_inuse(s, cast(i32, 0));
+    slab_set_total(s, cache_objs_per_slab(c));
+    slab_set_list_state(s, SLAB_LIST_NONE);
+    slab_set_next_id(s, SLAB_NONE);
+    slab_set_prev_id(s, SLAB_NONE);
+
+    // Register in slab table and page metadata
+    slab_table_set(sid, s);
+    register_slab_pages(pfn, order, sid);
+
+    // Build free list within the slab
+    let is i64 as base = pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
+    let is i64 as eff = cache_get_eff_size(c);
+    let is i32 as total = cache_objs_per_slab(c);
+    let is i64 as ptr with mut = base;
+    let is i32 as i with mut = 0;
+    while (i < total - cast(i32, 1)) {
+        let is i64 as next_slot = ptr + eff;
+        let is *i64 as fp = cast(*i64, ptr);
+        fp[0] = next_slot;
+        ptr = next_slot;
+        i = i + cast(i32, 1);
+    }
+    // Last slot: null terminator
+    let is *i64 as lastp = cast(*i64, ptr);
+    lastp[0] = 0;
+
+    slab_set_free_ptr(s, base);
+    cache_set_i32(c, 84, cache_total_slabs(c) + cast(i32, 1));
+
+    return sid;
+}
+
+// ============================================================
+// kcache_alloc
+// ============================================================
+
+fn kcache_alloc(c as i64, flags as i32) as i64 {
+    hirq_save();
+
+    let is i32 as active_sid with mut = cache_active_id(c);
+
+    // Try active slab
+    if (active_sid != SLAB_NONE) {
+        let is i64 as s = slab_table_get(active_sid);
+        if (slab_free_ptr(s) != 0) {
+            // Fast path: alloc from active
+            let is i64 as ptr = slab_free_ptr(s);
+            let is *i64 as fp = cast(*i64, ptr);
+            slab_set_free_ptr(s, fp[0]);
+            slab_set_inuse(s, slab_inuse(s) + cast(i32, 1));
+            cache_set_i32(c, 80, cache_active_objs(c) + cast(i32, 1));
+            cache_set_i32(c, 72, cache_get_i32(c, 72) + cast(i32, 1));
+            hirq_restore();
+            return ptr;
+        }
+        // Active is full — move to full list
+        slab_set_list_state(slab_table_get(active_sid), SLAB_LIST_NONE);
+        list_insert(c, active_sid, SLAB_LIST_FULL);
+        cache_set_i32(c, 48, SLAB_NONE);
+        active_sid = SLAB_NONE;
+    }
+
+    // Try partial list
+    let is i32 as partial = cache_partial_id(c);
+    if (partial != SLAB_NONE) {
+        list_remove(c, partial);
+        cache_set_i32(c, 48, partial);
+        slab_set_list_state(slab_table_get(partial), SLAB_LIST_ACTIVE);
+
+        let is i64 as s = slab_table_get(partial);
+        let is i64 as ptr = slab_free_ptr(s);
+        let is *i64 as fp = cast(*i64, ptr);
+        slab_set_free_ptr(s, fp[0]);
+        slab_set_inuse(s, slab_inuse(s) + cast(i32, 1));
+        cache_set_i32(c, 80, cache_active_objs(c) + cast(i32, 1));
+        cache_set_i32(c, 72, cache_get_i32(c, 72) + cast(i32, 1));
+        hirq_restore();
+        return ptr;
+    }
+
+    // Try empty list
+    let is i32 as empty = cache_empty_id(c);
+    if (empty != SLAB_NONE) {
+        list_remove(c, empty);
+        cache_set_i32(c, 64, cache_empty_count(c) - cast(i32, 1));
+        cache_set_i32(c, 48, empty);
+        slab_set_list_state(slab_table_get(empty), SLAB_LIST_ACTIVE);
+
+        let is i64 as s = slab_table_get(empty);
+        let is i64 as ptr = slab_free_ptr(s);
+        let is *i64 as fp = cast(*i64, ptr);
+        slab_set_free_ptr(s, fp[0]);
+        slab_set_inuse(s, slab_inuse(s) + cast(i32, 1));
+        cache_set_i32(c, 80, cache_active_objs(c) + cast(i32, 1));
+        cache_set_i32(c, 72, cache_get_i32(c, 72) + cast(i32, 1));
+        hirq_restore();
+        return ptr;
+    }
+
+    // Must allocate new slab — release lock
+    hirq_restore();
+
+    let is i32 as new_sid = init_slab(c);
+    if (new_sid == SLAB_NONE) {
+        return 0;
+    }
+
+    hirq_save();
+
+    cache_set_i32(c, 48, new_sid);
+    slab_set_list_state(slab_table_get(new_sid), SLAB_LIST_ACTIVE);
+
+    let is i64 as s = slab_table_get(new_sid);
+    let is i64 as ptr = slab_free_ptr(s);
+    let is *i64 as fp = cast(*i64, ptr);
+    slab_set_free_ptr(s, fp[0]);
+    slab_set_inuse(s, slab_inuse(s) + cast(i32, 1));
+    cache_set_i32(c, 80, cache_active_objs(c) + cast(i32, 1));
+    cache_set_i32(c, 72, cache_get_i32(c, 72) + cast(i32, 1));
+
+    hirq_restore();
+    return ptr;
+}
+
+// ============================================================
+// kcache_free
+// ============================================================
+
+fn kcache_free(c as i64, ptr as i64) as void {
+    if (ptr == 0) { return; }
+
+    // Find slab via PageInfo
+    let is i32 as pfn = virt_to_pfn(ptr);
+    let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn);
+    if (cast(i64, pi) == 0) {
+        pmm.panic("kcache_free: bad ptr", 20);
+    }
+    let is i32 as sid = pi.aux1;
+    if (sid == SLAB_NONE) {
+        pmm.panic("kcache_free: not slab page", 26);
+    }
+    let is i64 as s = slab_table_get(sid);
+    if (s == 0) {
+        pmm.panic("kcache_free: null slab", 22);
+    }
+
+    hirq_save();
+
+    // Push onto slab's free list
+    let is *i64 as fp = cast(*i64, ptr);
+    fp[0] = slab_free_ptr(s);
+    slab_set_free_ptr(s, ptr);
+
+    let is i32 as was_full with mut = 0;
+    if (slab_inuse(s) == slab_total(s)) {
+        was_full = cast(i32, 1);
+    }
+    slab_set_inuse(s, slab_inuse(s) - cast(i32, 1));
+    cache_set_i32(c, 80, cache_active_objs(c) - cast(i32, 1));
+    cache_set_i32(c, 76, cache_get_i32(c, 76) + cast(i32, 1));
+
+    let is i32 as ls with mut = slab_list_state(s);
+
+    // Full -> partial transition
+    if (was_full != cast(i32, 0)) {
+        if (ls == SLAB_LIST_FULL) {
+            list_move(c, sid, SLAB_LIST_PARTIAL);
+        }
+    }
+
+    // Re-read after potential move
+    ls = slab_list_state(s);
+
+    // Empty slab (not active) -> empty list or destroy
+    if (slab_inuse(s) == cast(i32, 0)) {
+        if (ls != SLAB_LIST_ACTIVE) {
+            if (cache_empty_count(c) < cache_max_empty(c)) {
+                list_move(c, sid, SLAB_LIST_EMPTY);
+                cache_set_i32(c, 64, cache_empty_count(c) + cast(i32, 1));
+            } else {
+                // Return to PMM
+                list_remove(c, sid);
+                cache_set_i32(c, 84, cache_total_slabs(c) - cast(i32, 1));
+                hirq_restore();
+                destroy_slab(c, sid);
+                return;
+            }
+        }
+    }
+
+    hirq_restore();
+}
+
+// ============================================================
+// destroy_slab
+// ============================================================
+
+fn destroy_slab(c as i64, sid as i32) as void {
+    let is i64 as s = slab_table_get(sid);
+    let is i32 as pfn = slab_pfn(s);
+    let is i32 as order = cache_slab_order(c);
+
+    unregister_slab_pages(pfn, order);
+    slab_table_set(sid, 0);
+    pmm.free_pages(pfn);
+
+    // Free SlabPage descriptor (unless static)
+    if (is_static_slab(s) == cast(i32, 0)) {
+        if (slabpage_cache != 0) {
+            kcache_free(slabpage_cache, s);
+        }
+    }
+}
+
+// ============================================================
+// kmalloc size classes
+// ============================================================
+
+// Classes: 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
+// Plus: 96 not included for simplicity (spec has it but we simplify)
+// Index: 0=16, 1=32, 2=64, 3=128, 4=256, 5=512, 6=1024, 7=2048, 8=4096
+
+fn size_to_class(size as i64) as i32 {
+    if (size <= 16)   { return cast(i32, 0); }
+    if (size <= 32)   { return cast(i32, 1); }
+    if (size <= 64)   { return cast(i32, 2); }
+    if (size <= 128)  { return cast(i32, 3); }
+    if (size <= 256)  { return cast(i32, 4); }
+    if (size <= 512)  { return cast(i32, 5); }
+    if (size <= 1024) { return cast(i32, 6); }
+    if (size <= 2048) { return cast(i32, 7); }
+    if (size <= 4096) { return cast(i32, 8); }
+    return cast(i32, 0 - 1);
+}
+
+fn class_size(cls as i32) as i64 {
+    if (cls == cast(i32, 0)) { return 16; }
+    if (cls == cast(i32, 1)) { return 32; }
+    if (cls == cast(i32, 2)) { return 64; }
+    if (cls == cast(i32, 3)) { return 128; }
+    if (cls == cast(i32, 4)) { return 256; }
+    if (cls == cast(i32, 5)) { return 512; }
+    if (cls == cast(i32, 6)) { return 1024; }
+    if (cls == cast(i32, 7)) { return 2048; }
+    if (cls == cast(i32, 8)) { return 4096; }
+    return 0;
+}
+
+// ============================================================
+// ceil_log2
+// ============================================================
+
+fn ceil_log2(v as i64) as i32 {
+    if (v <= 1) { return cast(i32, 0); }
+    let is i32 as n with mut = 0;
+    let is i64 as x with mut = v - 1;
+    while (x > 0) {
+        n = n + cast(i32, 1);
+        x = x >> 1;
+    }
+    return n;
+}
+
+// ============================================================
+// kmalloc / kfree
+// ============================================================
+
+fn kmalloc(size as i64, flags as i32) as i64 {
+    if (size == 0) { return 0; }
+
+    if (size > KMALLOC_MAX_SIZE) {
+        // Large kmalloc: direct buddy allocation
+        let is i64 as pages_needed = pmm.align_up(size, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
+        let is i32 as order = ceil_log2(pages_needed);
+        let is i32 as pfn = pmm.alloc_pages(pmm.ZONE_DMA32, flags, order, pmm.USAGE_KERNEL, cast(i32, 0));
+        if (pfn == pmm.PFN_NONE) { return 0; }
+        let is i64 as ptr = pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
+        return ptr;
+    }
+
+    let is i32 as cls = size_to_class(size);
+    if (cls < cast(i32, 0)) { return 0; }
+    let is i64 as c = kmalloc_cache_get(cls);
+    if (c == 0) { return 0; }
+    return kcache_alloc(c, flags);
+}
+
+fn kfree(ptr as i64) as void {
+    if (ptr == 0) { return; }
+
+    let is i32 as pfn = virt_to_pfn(ptr);
+    let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn);
+    if (cast(i64, pi) == 0) {
+        pmm.panic("kfree: bad ptr", 14);
+    }
+
+    let is i32 as usage = pmm.meta_get_usage(pi.meta);
+
+    if (usage == cast(i32, pmm.USAGE_KERNEL)) {
+        // Large kmalloc — return to buddy
+        pmm.free_pages(pfn);
+        return;
+    }
+
+    if (usage == cast(i32, pmm.USAGE_KERNEL_HEAP)) {
+        let is i32 as sid = pi.aux1;
+        if (sid == SLAB_NONE) {
+            pmm.panic("kfree: no slab_id", 17);
+        }
+        let is i64 as s = slab_table_get(sid);
+        if (s == 0) {
+            pmm.panic("kfree: null slab", 16);
+        }
+        let is i64 as c = slab_cache_addr(s);
+        kcache_free(c, ptr);
+        return;
+    }
+
+    pmm.panic("kfree: bad usage", 16);
+}
+
+// ============================================================
+// Init
+// ============================================================
+
+fn init() as void {
+    serial.println("heap: init", 10);
+
+    // Zero tables
+    let is *u8 as st = cast(*u8, &slab_table_raw);
+    let is i64 as i with mut = 0;
+    while (i < 8192) {
+        st[i] = 0;
+        i = i + 1;
+    }
+    let is *u8 as ct = cast(*u8, &cache_table_raw);
+    i = 0;
+    while (i < 512) {
+        ct[i] = 0;
+        i = i + 1;
+    }
+
+    // Phase 2: Create meta-caches from static pool
+    cache_cache = kcache_create(CACHE_SIZE, 64);
+    serial.println("  cache_cache ok", 16);
+
+    slabpage_cache = kcache_create(SLAB_SIZE, 16);
+    // Set max_empty high to prevent recursive destruction
+    cache_set_i32(slabpage_cache, 68, cast(i32, 8));
+    serial.println("  slabpage_cache ok", 19);
+
+    // Phase 3: Create kmalloc caches
+    let is i32 as cls with mut = 0;
+    while (cls <= cast(i32, 8)) {
+        let is i64 as sz = class_size(cls);
+        let is i64 as c = kcache_create(sz, 16);
+        kmalloc_cache_set(cls, c);
+        cls = cls + cast(i32, 1);
+    }
+    serial.println("  kmalloc caches ok", 19);
+
+    serial.println("heap: ready", 11);
+}
