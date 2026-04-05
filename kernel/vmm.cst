@@ -1,0 +1,291 @@
+// vmm.cst — Virtual Memory Manager
+// x86_64 4-level paging: PML4 → PDPT → PD → PT → 4KB page
+
+use "serial.cst" as serial;
+use "pmm.cst" as pmm;
+use "idt.cst" as idt;
+
+// ============================================================
+// Page table entry flags
+// ============================================================
+
+let is i64 as PTE_PRESENT   = 1;
+let is i64 as PTE_WRITE     = 2;
+let is i64 as PTE_USER      = 4;
+let is i64 as PTE_PWT       = 8;       // write-through
+let is i64 as PTE_PCD       = 16;      // cache disable
+let is i64 as PTE_ACCESSED  = 32;
+let is i64 as PTE_DIRTY     = 64;
+let is i64 as PTE_HUGE      = 128;     // 2MB/1GB page
+let is i64 as PTE_GLOBAL    = 256;
+let is i64 as PTE_NX with mut = 0;       // set at init (bit 63)
+
+// Address mask for PTE → physical address (bits 12..51)
+let is i64 as PTE_ADDR_MASK with mut = 0;  // set at init
+
+// ============================================================
+// Paging index extraction
+// ============================================================
+
+fn pml4_index(vaddr as i64) as i64 {
+    return (vaddr >> 39) & 511;
+}
+
+fn pdpt_index(vaddr as i64) as i64 {
+    return (vaddr >> 30) & 511;
+}
+
+fn pd_index(vaddr as i64) as i64 {
+    return (vaddr >> 21) & 511;
+}
+
+fn pt_index(vaddr as i64) as i64 {
+    return (vaddr >> 12) & 511;
+}
+
+// ============================================================
+// CR3 read/write (caustic-as doesn't support mov cr3)
+// ============================================================
+
+let is i64 as cr3_val with mut = 0;
+
+fn read_cr3() as i64 {
+    // mov rax, cr3 = 0x0F 0x20 0xD8
+    asm(".byte 0x0F, 0x20, 0xD8\n");
+    asm("lea rbx, [rip+_kernel_vmm_cst_cr3_val]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return cr3_val;
+}
+
+fn write_cr3(val as i64) as void {
+    // mov cr3, rdi = 0x0F 0x22 0xDF
+    asm(".byte 0x0F, 0x22, 0xDF\n");
+}
+
+fn invlpg(vaddr as i64) as void {
+    // invlpg [rdi] = 0x0F 0x01 0x3F
+    asm(".byte 0x0F, 0x01, 0x3F\n");
+}
+
+// ============================================================
+// Kernel PML4 physical address
+// ============================================================
+
+let is i64 as kernel_pml4_phys with mut = 0;
+
+// ============================================================
+// Page table walk helpers
+// ============================================================
+
+// Read a PTE from a page table at physical address
+fn pte_read(table_phys as i64, index as i64) as i64 {
+    let is *i64 as table = cast(*i64, pmm.phys_to_virt(table_phys));
+    return table[index];
+}
+
+// Write a PTE to a page table at physical address
+fn pte_write(table_phys as i64, index as i64, val as i64) as void {
+    let is *i64 as table = cast(*i64, pmm.phys_to_virt(table_phys));
+    table[index] = val;
+}
+
+// Extract physical address from PTE
+fn pte_addr(pte as i64) as i64 {
+    return pte & PTE_ADDR_MASK;
+}
+
+// Check if PTE is present
+fn pte_present(pte as i64) as i64 {
+    return pte & PTE_PRESENT;
+}
+
+// Allocate a new zeroed page table page, return its physical address
+fn alloc_table_page() as i64 {
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ZONE_DMA32,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        cast(i32, 0),
+        pmm.USAGE_PAGE_TABLE,
+        cast(i32, 0)
+    );
+    if (pfn == pmm.PFN_NONE) {
+        pmm.panic("vmm: alloc_table_page failed", 28);
+    }
+    return pmm.pfn_to_phys(pfn);
+}
+
+// ============================================================
+// Ensure page table entry exists at each level, creating if needed
+// Returns the physical address of the next-level table
+// ============================================================
+
+fn ensure_table(table_phys as i64, index as i64, flags as i64) as i64 {
+    let is i64 as pte = pte_read(table_phys, index);
+    if (pte_present(pte) != 0) {
+        return pte_addr(pte);
+    }
+    // Allocate new table page
+    let is i64 as new_table = alloc_table_page();
+    // Set entry with given flags (PRESENT + WRITE + optional USER)
+    pte_write(table_phys, index, new_table | flags | PTE_PRESENT | PTE_WRITE);
+    return new_table;
+}
+
+// ============================================================
+// map_page — map a single 4KB virtual page to a physical address
+// ============================================================
+
+fn map_page(vaddr as i64, phys as i64, flags as i64) as void {
+    let is i64 as p4 = pml4_index(vaddr);
+    let is i64 as p3 = pdpt_index(vaddr);
+    let is i64 as p2 = pd_index(vaddr);
+    let is i64 as p1 = pt_index(vaddr);
+
+    // Walk/create intermediate tables
+    // For kernel mappings: no PTE_USER
+    let is i64 as tflags with mut = PTE_PRESENT | PTE_WRITE;
+    if ((flags & PTE_USER) != 0) {
+        tflags = tflags | PTE_USER;
+    }
+
+    let is i64 as pdpt_phys = ensure_table(kernel_pml4_phys, p4, tflags);
+    let is i64 as pd_phys = ensure_table(pdpt_phys, p3, tflags);
+    let is i64 as pt_phys = ensure_table(pd_phys, p2, tflags);
+
+    // Set the final PT entry
+    pte_write(pt_phys, p1, phys | flags);
+}
+
+// ============================================================
+// unmap_page — remove a 4KB virtual page mapping
+// ============================================================
+
+fn unmap_page(vaddr as i64) as void {
+    let is i64 as p4 = pml4_index(vaddr);
+    let is i64 as p3 = pdpt_index(vaddr);
+    let is i64 as p2 = pd_index(vaddr);
+    let is i64 as p1 = pt_index(vaddr);
+
+    // Walk existing tables — don't create
+    let is i64 as pte4 = pte_read(kernel_pml4_phys, p4);
+    if (pte_present(pte4) == 0) { return; }
+    let is i64 as pdpt_phys = pte_addr(pte4);
+
+    let is i64 as pte3 = pte_read(pdpt_phys, p3);
+    if (pte_present(pte3) == 0) { return; }
+    let is i64 as pd_phys = pte_addr(pte3);
+
+    let is i64 as pte2 = pte_read(pd_phys, p2);
+    if (pte_present(pte2) == 0) { return; }
+    let is i64 as pt_phys = pte_addr(pte2);
+
+    // Clear the PT entry
+    pte_write(pt_phys, p1, 0);
+    invlpg(vaddr);
+}
+
+// ============================================================
+// virt_to_phys_walk — translate virtual to physical via page walk
+// Returns physical address or 0 if not mapped
+// ============================================================
+
+fn virt_to_phys_walk(vaddr as i64) as i64 {
+    let is i64 as pte4 = pte_read(kernel_pml4_phys, pml4_index(vaddr));
+    if (pte_present(pte4) == 0) { return 0; }
+
+    let is i64 as pte3 = pte_read(pte_addr(pte4), pdpt_index(vaddr));
+    if (pte_present(pte3) == 0) { return 0; }
+    // 1GB huge page?
+    if ((pte3 & PTE_HUGE) != 0) {
+        return pte_addr(pte3) + (vaddr & 0x3FFFFFFF);
+    }
+
+    let is i64 as pte2 = pte_read(pte_addr(pte3), pd_index(vaddr));
+    if (pte_present(pte2) == 0) { return 0; }
+    // 2MB huge page?
+    if ((pte2 & PTE_HUGE) != 0) {
+        return pte_addr(pte2) + (vaddr & 0x1FFFFF);
+    }
+
+    let is i64 as pte1 = pte_read(pte_addr(pte2), pt_index(vaddr));
+    if (pte_present(pte1) == 0) { return 0; }
+    return pte_addr(pte1) + (vaddr & 0xFFF);
+}
+
+// ============================================================
+// Init — clone Limine's PML4 into our own
+// ============================================================
+
+fn init() as void {
+    serial.println("vmm: init", 9);
+
+    // Init constants
+    // PTE_ADDR_MASK: bits 12..51 (40 bits of physical address)
+    // = 0x000FFFFFFFFFF000
+    PTE_ADDR_MASK = 0x000FFFFFFFFFF000;
+    // PTE_NX: bit 63
+    PTE_NX = 1 << 63;
+
+    // Read Limine's current page tables
+    let is i64 as limine_pml4 = read_cr3() & PTE_ADDR_MASK;
+    serial.print("  limine cr3=", 13);
+    idt.print_hex(limine_pml4);
+    serial.println("", 0);
+
+    // Allocate our own PML4
+    kernel_pml4_phys = alloc_table_page();
+
+    // Copy ALL entries from Limine's PML4 to ours
+    // This preserves: HHDM, kernel higher-half, any other mappings
+    let is *i64 as src = cast(*i64, pmm.phys_to_virt(limine_pml4));
+    let is *i64 as dst = cast(*i64, pmm.phys_to_virt(kernel_pml4_phys));
+    let is i64 as i with mut = 0;
+    while (i < 512) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+
+    // Load our PML4
+    write_cr3(kernel_pml4_phys);
+
+    serial.print("  kernel cr3=", 13);
+    idt.print_hex(kernel_pml4_phys);
+    serial.println("", 0);
+
+    // Test: verify our kernel code is still accessible
+    let is i64 as test_vaddr = cast(i64, &kernel_pml4_phys);
+    let is i64 as test_phys = virt_to_phys_walk(test_vaddr);
+    serial.print("  walk test: ", 13);
+    idt.print_hex(test_vaddr);
+    serial.print(" -> ", 4);
+    idt.print_hex(test_phys);
+    serial.println("", 0);
+
+    // Test: map a new page, write to it, unmap
+    let is i32 as test_pfn = pmm.alloc_pages(
+        pmm.ZONE_DMA32, cast(i32, 0), cast(i32, 0),
+        pmm.USAGE_KERNEL, cast(i32, 0)
+    );
+    if (test_pfn != pmm.PFN_NONE) {
+        let is i64 as test_phys2 = pmm.pfn_to_phys(test_pfn);
+        // Map at a specific virtual address in kernel space
+        // Use an address in the upper region that's likely unused
+        let is i64 as test_va = 0xFFFFFFFFC0000000;
+        map_page(test_va, test_phys2, PTE_PRESENT | PTE_WRITE);
+        // Write through the new mapping
+        let is *i64 as tp = cast(*i64, test_va);
+        tp[0] = 0xDEADBEEF;
+        // Verify via HHDM
+        let is *i64 as hp = cast(*i64, pmm.phys_to_virt(test_phys2));
+        if (hp[0] == 0xDEADBEEF) {
+            serial.println("  map/write test: ok", 20);
+        } else {
+            serial.println("  map/write test: FAIL", 22);
+        }
+        // Unmap and free
+        unmap_page(test_va);
+        pmm.free_pages(test_pfn);
+    }
+
+    serial.println("vmm: ready", 10);
+}
