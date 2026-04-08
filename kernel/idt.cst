@@ -4,6 +4,7 @@ use "serial.cst" as serial;
 use "port.cst" as port;
 use "timer.cst" as timer;
 use "sched.cst" as sched;
+use "lapic.cst" as lapic;
 
 // ============================================================
 // IDT entries — 256 entries, each 16 bytes = 4096 bytes
@@ -115,8 +116,14 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64, fault_rsp as 
 
 fn irq_handler(irq as i64) as void {
     if (irq == 0) {
+        // PIT tick — used for early boot + LAPIC calibration
         timer.on_tick();
-        sched.on_timer_tick();
+        if (lapic.calibrated == 0) {
+            lapic.pit_calibration_irq();
+        }
+        if (timer.using_lapic == 0) {
+            sched.on_timer_tick();
+        }
     }
     if (irq == 1) {
         let is i64 as scancode = port.inb(0x60);
@@ -125,6 +132,16 @@ fn irq_handler(irq as i64) as void {
         serial.println("", 0);
     }
     pic_eoi(irq);
+}
+
+// LAPIC timer handler — called from vector 0x40 (64)
+fn lapic_timer_handler() as void {
+    timer.on_lapic_tick();
+    sched.on_timer_tick();
+    // Reprogram LAPIC for next event BEFORE potential schedule in stub
+    // (schedule's program_next_tick is unreachable when switching to new thread)
+    sched.program_next_tick();
+    lapic.eoi();
 }
 
 // ============================================================
@@ -283,6 +300,32 @@ fn install_stubs() as void {
     asm(".Lirq14:\n"); asm(".byte 0x6A,14\n"); asm("jmp .Lirq_common\n");
     asm(".Lirq15:\n"); asm(".byte 0x6A,15\n"); asm("jmp .Lirq_common\n");
 
+    // --- LAPIC timer stub (vector 0x40 = 64) ---
+    asm(".Llapic_timer:\n");
+    asm("push r15\n"); asm("push r14\n"); asm("push r13\n"); asm("push r12\n");
+    asm("push r11\n"); asm("push r10\n"); asm("push r9\n");  asm("push r8\n");
+    asm("push rbp\n"); asm("push rdi\n"); asm("push rsi\n"); asm("push rdx\n");
+    asm("push rcx\n"); asm("push rbx\n"); asm("push rax\n");
+    asm("mov rbp, rsp\n");
+    asm("and rsp, -16\n");
+    asm("call _kernel_idt_cst_lapic_timer_handler\n");
+    asm("mov rsp, rbp\n");
+    // Check need_resched
+    asm("lea rbx, [rip+_kernel_timer_cst_need_resched]\n");
+    asm("mov rax, QWORD PTR [rbx]\n");
+    asm("test rax, rax\n");
+    asm("jz .Llapic_no_resched\n");
+    asm("mov rbp, rsp\n");
+    asm("and rsp, -16\n");
+    asm("call _kernel_sched_cst_schedule\n");
+    asm("mov rsp, rbp\n");
+    asm(".Llapic_no_resched:\n");
+    asm("pop rax\n"); asm("pop rbx\n"); asm("pop rcx\n"); asm("pop rdx\n");
+    asm("pop rsi\n"); asm("pop rdi\n"); asm("pop rbp\n");
+    asm("pop r8\n");  asm("pop r9\n");  asm("pop r10\n"); asm("pop r11\n");
+    asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
+    asm(".byte 0x48, 0xCF\n");    // iretq
+
     asm(".Lstubs_end:\n");
 
     // Store all stub addresses using pure asm — rbx is clobbered but we
@@ -325,6 +368,8 @@ fn install_stubs() as void {
     asm("lea rax, [rip+.Lirq13]\n"); asm("mov QWORD PTR [rbx+256], rax\n");
     asm("lea rax, [rip+.Lirq14]\n"); asm("mov QWORD PTR [rbx+264], rax\n");
     asm("lea rax, [rip+.Lirq15]\n"); asm("mov QWORD PTR [rbx+272], rax\n");
+    // LAPIC timer stub at index 35 (offset 280)
+    asm("lea rax, [rip+.Llapic_timer]\n"); asm("mov QWORD PTR [rbx+280], rax\n");
 }
 
 // ============================================================
@@ -350,6 +395,9 @@ fn init() as void {
         set_gate(32 + ii, addrs[19 + ii], 0x08, 0, 0x8E);
         ii = ii + 1;
     }
+
+    // LAPIC timer -> vector 64 (0x40)
+    set_gate(64, addrs[35], 0x08, 0, 0x8E);
 
     // Load IDTR
     let is i64 as idt_base = cast(i64, &idt_data);

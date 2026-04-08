@@ -1,0 +1,231 @@
+// lapic.cst — Local APIC timer driver
+// LAPIC is memory-mapped at 0xFEE00000 (accessed via HHDM)
+
+use "pmm.cst" as pmm;
+use "serial.cst" as serial;
+use "port.cst" as port;
+use "util.cst" as util;
+use "vmm.cst" as vmm;
+
+// ============================================================
+// LAPIC register offsets
+// ============================================================
+
+let is i64 as LAPIC_BASE_PHYS    = 0xFEE00000;
+
+let is i64 as LAPIC_ID           = 0x020;
+let is i64 as LAPIC_VERSION      = 0x030;
+let is i64 as LAPIC_EOI          = 0x0B0;
+let is i64 as LAPIC_SPURIOUS     = 0x0F0;
+let is i64 as LAPIC_ICR_LO       = 0x300;
+let is i64 as LAPIC_ICR_HI       = 0x310;
+let is i64 as LAPIC_LVT_TIMER    = 0x320;
+let is i64 as LAPIC_TIMER_INIT   = 0x380;
+let is i64 as LAPIC_TIMER_CUR    = 0x390;
+let is i64 as LAPIC_TIMER_DIV    = 0x3E0;
+
+// Timer modes (bits 17:18 of LVT_TIMER)
+let is i64 as TIMER_ONESHOT      = 0;          // bits 17:18 = 00
+let is i64 as TIMER_PERIODIC     = 0x20000;    // bit 17 = 1
+let is i64 as LVT_MASKED         = 0x10000;    // bit 16 = masked
+
+// Timer vector (must not conflict with PIC IRQs 32-47)
+let is i64 as TIMER_VECTOR       = 0x40;       // vector 64
+
+// Calibration
+let is i64 as lapic_base with mut = 0;         // HHDM vaddr
+let is i64 as ticks_per_ns with mut = 0;       // fixed-point: ticks * 1000 / ns (to avoid floats)
+let is i64 as ticks_per_ms with mut = 0;
+let is i64 as calibrated with mut = 0;
+
+// ============================================================
+// Register access
+// ============================================================
+
+fn lapic_read(reg as i64) as i64 {
+    let is *i64 as p = cast(*i64, lapic_base + reg);
+    // Need to read as 32-bit, but i64 read is fine (upper bits ignored)
+    let is *i32 as p32 = cast(*i32, lapic_base + reg);
+    return cast(i64, p32[0]) & 0xFFFFFFFF;
+}
+
+fn lapic_write(reg as i64, val as i64) as void {
+    let is *i32 as p = cast(*i32, lapic_base + reg);
+    p[0] = cast(i32, val & 0xFFFFFFFF);
+}
+
+// ============================================================
+// EOI
+// ============================================================
+
+fn eoi() as void {
+    lapic_write(LAPIC_EOI, 0);
+}
+
+// ============================================================
+// Enable LAPIC
+// ============================================================
+
+fn enable() as void {
+    // Set spurious interrupt vector and enable APIC (bit 8)
+    let is i64 as spur = lapic_read(LAPIC_SPURIOUS);
+    lapic_write(LAPIC_SPURIOUS, spur | 0x1FF);  // vector 0xFF + enable bit
+}
+
+// ============================================================
+// Timer configuration
+// ============================================================
+
+fn set_divisor(div as i64) as void {
+    // Divisor register encoding: div=1→0xB, div=2→0x0, div=4→0x1, etc.
+    // Use divisor 1 for maximum resolution
+    lapic_write(LAPIC_TIMER_DIV, 0x0B);  // divide by 1
+}
+
+fn set_initial_count(count as i64) as void {
+    lapic_write(LAPIC_TIMER_INIT, count);
+}
+
+fn current_count() as i64 {
+    return lapic_read(LAPIC_TIMER_CUR);
+}
+
+fn set_oneshot(vector as i64) as void {
+    lapic_write(LAPIC_LVT_TIMER, vector | TIMER_ONESHOT);
+}
+
+fn mask_timer() as void {
+    let is i64 as v = lapic_read(LAPIC_LVT_TIMER);
+    lapic_write(LAPIC_LVT_TIMER, v | LVT_MASKED);
+}
+
+// ============================================================
+// Calibration via PIT (§12.1)
+// ============================================================
+
+// PIT one-shot for calibration
+let is i64 as pit_fired with mut = 0;
+
+fn pit_oneshot_50ms() as void {
+    // PIT channel 0, mode 0 (interrupt on terminal count), lobyte/hibyte
+    // 0x30 = channel 0, lobyte/hibyte, mode 0, binary
+    let is i64 as count = 1193182 * 50 / 1000;  // ~59659 ticks = 50ms
+    port.outb(0x43, 0x30);
+    port.outb(0x40, count & 0xFF);
+    port.outb(0x40, (count >> 8) & 0xFF);
+    pit_fired = 0;
+}
+
+// Called by PIT IRQ handler during calibration
+fn pit_calibration_irq() as void {
+    pit_fired = 1;
+}
+
+fn calibrate() as void {
+    serial.println("  lapic: calibrating...", 23);
+
+    // Enable LAPIC timer in free-running mode (periodic, max count)
+    set_divisor(1);
+    lapic_write(LAPIC_LVT_TIMER, TIMER_PERIODIC | LVT_MASKED | 0xFF);
+    set_initial_count(0xFFFFFFFF);
+    // Unmask to let it count
+    lapic_write(LAPIC_LVT_TIMER, TIMER_PERIODIC | 0xFF);
+
+    let is i64 as start_count = current_count();
+
+    // Fire PIT one-shot 50ms
+    pit_oneshot_50ms();
+
+    // Wait for PIT interrupt
+    // PIT fires IRQ 0, which calls pit_calibration_irq() setting pit_fired=1
+    // Enable interrupts briefly for this
+    asm(".byte 0xFB\n");  // sti
+    while (pit_fired == 0) {
+        asm(".byte 0xF3, 0x90\n");  // pause
+    }
+    asm(".byte 0xFA\n");  // cli
+
+    let is i64 as end_count = current_count();
+
+    // LAPIC counts DOWN, so elapsed = start - end
+    let is i64 as elapsed with mut = start_count - end_count;
+    if (elapsed < 0) { elapsed = 0 - elapsed; }
+
+    // Mask LAPIC timer
+    mask_timer();
+
+    // ticks in 50ms → ticks per ms
+    ticks_per_ms = elapsed / 50;
+    // ticks per ns (scaled by 1000 to keep integer precision)
+    // ticks_per_ns_x1000 = elapsed * 1000 / 50_000_000
+    ticks_per_ns = elapsed / 50000;  // approximate: ticks per µs
+
+    serial.print("  lapic: ", 9);
+    util.print_num(ticks_per_ms);
+    serial.print(" ticks/ms, ", 11);
+    util.print_num(elapsed);
+    serial.println(" in 50ms", 8);
+
+    calibrated = 1;
+}
+
+// ============================================================
+// Program next tick (§12.2)
+// ============================================================
+
+fn program_tick_ns(delta_ns as i64) as void {
+    if (calibrated == 0) { return; }
+    let is i64 as dns with mut = delta_ns;
+    if (dns < 1000000) { dns = 1000000; }  // min 1ms
+    // ticks = delta_ns * ticks_per_ns / 1000 (since ticks_per_ns is per µs)
+    let is i64 as ticks with mut = dns / 1000 * ticks_per_ns;
+    if (ticks < 1000) { ticks = 1000; }
+    set_initial_count(ticks);
+}
+
+fn program_tick_ms(ms as i64) as void {
+    if (calibrated == 0) { return; }
+    set_initial_count(ms * ticks_per_ms);
+}
+
+// ============================================================
+// Init
+// ============================================================
+
+fn init() as void {
+    serial.println("lapic: init", 11);
+
+    // Map LAPIC MMIO page into kernel address space
+    // LAPIC is at 0xFEE00000 physical — not in memory map, so HHDM doesn't cover it
+    // Map at a fixed kernel virtual address
+    let is i64 as lapic_vaddr = 0xFFFFFFFFFEE00000;
+    vmm.vmm_map_page(vmm.kas_pml4_phys, lapic_vaddr, LAPIC_BASE_PHYS,
+        vmm.PTE_PRESENT | vmm.PTE_WRITE | vmm.PTE_PCD | vmm.PTE_PWT);
+    lapic_base = lapic_vaddr;
+
+    // Enable LAPIC
+    enable();
+
+    let is i64 as ver = lapic_read(LAPIC_VERSION);
+    serial.print("  version=", 10);
+    util.print_num(ver & 0xFF);
+    serial.println("", 0);
+
+    // Calibrate via PIT
+    calibrate();
+
+    // Mask PIT permanently (IRQ 0) — LAPIC takes over timing
+    let is i64 as mask = port.inb(0x21);
+    port.outb(0x21, cast(i64, cast(i32, mask)) | 1);  // set bit 0 = mask IRQ0
+
+    // Configure LAPIC timer: one-shot, our vector
+    set_oneshot(TIMER_VECTOR);
+
+    // Program first tick (5ms default quantum)
+    program_tick_ms(5);
+
+    // Re-enable interrupts (calibrate() left cli)
+    asm(".byte 0xFB\n");  // sti
+
+    serial.println("lapic: ready", 12);
+}

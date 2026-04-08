@@ -1,0 +1,460 @@
+// rbtree.cst — Red-black tree implementation
+// Used by scheduler for deadline list and per-band EEVDF runqueues.
+// Keys are i64, values are i64 (tid).
+// Nodes allocated via kmalloc.
+
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+
+// ============================================================
+// Node layout (64 bytes)
+// ============================================================
+// 0   key        i64
+// 8   value      i64   (tid)
+// 16  left       i64   (node addr, 0 = nil)
+// 24  right      i64   (node addr, 0 = nil)
+// 32  parent     i64   (node addr, 0 = nil)
+// 40  color      i64   (0 = black, 1 = red)
+// 48  reserved   16
+
+let is i64 as RB_NODE_SIZE = 64;
+let is i64 as RB_BLACK = 0;
+let is i64 as RB_RED   = 1;
+
+// Tree: just a root pointer (i64)
+// 0 = empty tree
+
+fn nd_key(n as i64) as i64     { let is *i64 as p = cast(*i64, n); return p[0]; }
+fn nd_val(n as i64) as i64     { let is *i64 as p = cast(*i64, n + 8); return p[0]; }
+fn nd_left(n as i64) as i64    { let is *i64 as p = cast(*i64, n + 16); return p[0]; }
+fn nd_right(n as i64) as i64   { let is *i64 as p = cast(*i64, n + 24); return p[0]; }
+fn nd_parent(n as i64) as i64  { let is *i64 as p = cast(*i64, n + 32); return p[0]; }
+fn nd_color(n as i64) as i64   { let is *i64 as p = cast(*i64, n + 40); return p[0]; }
+
+fn nd_set_key(n as i64, v as i64) as void    { let is *i64 as p = cast(*i64, n); p[0] = v; }
+fn nd_set_val(n as i64, v as i64) as void    { let is *i64 as p = cast(*i64, n + 8); p[0] = v; }
+fn nd_set_left(n as i64, v as i64) as void   { let is *i64 as p = cast(*i64, n + 16); p[0] = v; }
+fn nd_set_right(n as i64, v as i64) as void  { let is *i64 as p = cast(*i64, n + 24); p[0] = v; }
+fn nd_set_parent(n as i64, v as i64) as void { let is *i64 as p = cast(*i64, n + 32); p[0] = v; }
+fn nd_set_color(n as i64, v as i64) as void  { let is *i64 as p = cast(*i64, n + 40); p[0] = v; }
+
+fn nd_is_red(n as i64) as i64 {
+    if (n == 0) { return 0; }
+    return nd_color(n);
+}
+
+// ============================================================
+// Allocate / free node
+// ============================================================
+
+fn rb_alloc_node(key as i64, val as i64) as i64 {
+    let is i64 as n = heap.kmalloc(RB_NODE_SIZE, pmm.ALLOC_ZERO);
+    if (n == 0) { pmm.panic("rbtree: alloc fail", 18); }
+    nd_set_key(n, key);
+    nd_set_val(n, val);
+    nd_set_color(n, RB_RED);
+    return n;
+}
+
+fn rb_free_node(n as i64) as void {
+    heap.kfree(n);
+}
+
+// ============================================================
+// Rotations
+// ============================================================
+
+fn rotate_left(root_ptr as i64, x as i64) as void {
+    let is i64 as y = nd_right(x);
+    nd_set_right(x, nd_left(y));
+    if (nd_left(y) != 0) {
+        nd_set_parent(nd_left(y), x);
+    }
+    nd_set_parent(y, nd_parent(x));
+    if (nd_parent(x) == 0) {
+        let is *i64 as rp = cast(*i64, root_ptr);
+        rp[0] = y;
+    } else {
+        if (x == nd_left(nd_parent(x))) {
+            nd_set_left(nd_parent(x), y);
+        } else {
+            nd_set_right(nd_parent(x), y);
+        }
+    }
+    nd_set_left(y, x);
+    nd_set_parent(x, y);
+}
+
+fn rotate_right(root_ptr as i64, x as i64) as void {
+    let is i64 as y = nd_left(x);
+    nd_set_left(x, nd_right(y));
+    if (nd_right(y) != 0) {
+        nd_set_parent(nd_right(y), x);
+    }
+    nd_set_parent(y, nd_parent(x));
+    if (nd_parent(x) == 0) {
+        let is *i64 as rp = cast(*i64, root_ptr);
+        rp[0] = y;
+    } else {
+        if (x == nd_right(nd_parent(x))) {
+            nd_set_right(nd_parent(x), y);
+        } else {
+            nd_set_left(nd_parent(x), y);
+        }
+    }
+    nd_set_right(y, x);
+    nd_set_parent(x, y);
+}
+
+// ============================================================
+// Insert fixup
+// ============================================================
+
+fn rb_insert_fixup(root_ptr as i64, z as i64) as void {
+    let is i64 as node with mut = z;
+    let is i64 as fixing with mut = 1;
+
+    while (fixing != 0) {
+        let is i64 as p with mut = nd_parent(node);
+        if (p == 0) { fixing = 0; }
+        else {
+            if (nd_is_red(p) == 0) { fixing = 0; }
+            else {
+                let is i64 as gp with mut = nd_parent(p);
+                if (gp == 0) { fixing = 0; }
+                else {
+                    if (p == nd_left(gp)) {
+                        let is i64 as uncle = nd_right(gp);
+                        if (nd_is_red(uncle) != 0) {
+                            nd_set_color(p, RB_BLACK);
+                            nd_set_color(uncle, RB_BLACK);
+                            nd_set_color(gp, RB_RED);
+                            node = gp;
+                        } else {
+                            if (node == nd_right(p)) {
+                                node = p;
+                                rotate_left(root_ptr, node);
+                                p = nd_parent(node);
+                                gp = nd_parent(p);
+                            }
+                            nd_set_color(p, RB_BLACK);
+                            nd_set_color(gp, RB_RED);
+                            rotate_right(root_ptr, gp);
+                        }
+                    } else {
+                        let is i64 as uncle = nd_left(gp);
+                        if (nd_is_red(uncle) != 0) {
+                            nd_set_color(p, RB_BLACK);
+                            nd_set_color(uncle, RB_BLACK);
+                            nd_set_color(gp, RB_RED);
+                            node = gp;
+                        } else {
+                            if (node == nd_left(p)) {
+                                node = p;
+                                rotate_right(root_ptr, node);
+                                p = nd_parent(node);
+                                gp = nd_parent(p);
+                            }
+                            nd_set_color(p, RB_BLACK);
+                            nd_set_color(gp, RB_RED);
+                            rotate_left(root_ptr, gp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let is *i64 as rp = cast(*i64, root_ptr);
+    if (rp[0] != 0) {
+        nd_set_color(rp[0], RB_BLACK);
+    }
+}
+
+// ============================================================
+// Insert (key, value) into tree. root_ptr = address of root variable.
+// ============================================================
+
+fn rb_insert(root_ptr as i64, key as i64, val as i64) as i64 {
+    let is i64 as n = rb_alloc_node(key, val);
+    let is *i64 as rp = cast(*i64, root_ptr);
+
+    if (rp[0] == 0) {
+        rp[0] = n;
+        nd_set_color(n, RB_BLACK);
+        return n;
+    }
+
+    let is i64 as cur with mut = rp[0];
+    let is i64 as par with mut = 0;
+    let is i64 as done with mut = 0;
+
+    while (done == 0) {
+        par = cur;
+        if (key < nd_key(cur)) {
+            cur = nd_left(cur);
+            if (cur == 0) { done = 1; }
+        } else {
+            cur = nd_right(cur);
+            if (cur == 0) { done = 1; }
+        }
+    }
+
+    nd_set_parent(n, par);
+    if (key < nd_key(par)) {
+        nd_set_left(par, n);
+    } else {
+        nd_set_right(par, n);
+    }
+
+    rb_insert_fixup(root_ptr, n);
+    return n;
+}
+
+// ============================================================
+// Leftmost (minimum key)
+// ============================================================
+
+fn rb_leftmost(root as i64) as i64 {
+    if (root == 0) { return 0; }
+    let is i64 as cur with mut = root;
+    let is i64 as done with mut = 0;
+    while (done == 0) {
+        if (nd_left(cur) == 0) { done = 1; }
+        else { cur = nd_left(cur); }
+    }
+    return cur;
+}
+
+// ============================================================
+// Successor (next in-order)
+// ============================================================
+
+fn rb_next(n as i64) as i64 {
+    if (n == 0) { return 0; }
+    if (nd_right(n) != 0) {
+        return rb_leftmost(nd_right(n));
+    }
+    let is i64 as cur with mut = n;
+    let is i64 as par with mut = nd_parent(n);
+    let is i64 as done with mut = 0;
+    while (done == 0) {
+        if (par == 0) { done = 1; cur = 0; }
+        else {
+            if (cur == nd_left(par)) { done = 1; cur = par; }
+            else { cur = par; par = nd_parent(par); }
+        }
+    }
+    return cur;
+}
+
+// ============================================================
+// Transplant (replace u with v in tree)
+// ============================================================
+
+fn rb_transplant(root_ptr as i64, u as i64, v as i64) as void {
+    let is i64 as up = nd_parent(u);
+    if (up == 0) {
+        let is *i64 as rp = cast(*i64, root_ptr);
+        rp[0] = v;
+    } else {
+        if (u == nd_left(up)) {
+            nd_set_left(up, v);
+        } else {
+            nd_set_right(up, v);
+        }
+    }
+    if (v != 0) {
+        nd_set_parent(v, up);
+    }
+}
+
+// ============================================================
+// Delete fixup
+// ============================================================
+
+fn rb_delete_fixup(root_ptr as i64, x as i64, xp as i64) as void {
+    let is *i64 as rp = cast(*i64, root_ptr);
+    let is i64 as node with mut = x;
+    let is i64 as parent with mut = xp;
+    let is i64 as fixing with mut = 1;
+
+    while (fixing != 0) {
+        if (node == rp[0]) { fixing = 0; }
+        else {
+            if (nd_is_red(node) != 0) { fixing = 0; }
+            else {
+                if (node == nd_left(parent)) {
+                    let is i64 as w with mut = nd_right(parent);
+                    if (nd_is_red(w) != 0) {
+                        nd_set_color(w, RB_BLACK);
+                        nd_set_color(parent, RB_RED);
+                        rotate_left(root_ptr, parent);
+                        w = nd_right(parent);
+                    }
+                    if (w == 0) { node = parent; parent = nd_parent(node); }
+                    else {
+                        if (nd_is_red(nd_left(w)) == 0) {
+                            if (nd_is_red(nd_right(w)) == 0) {
+                                nd_set_color(w, RB_RED);
+                                node = parent;
+                                parent = nd_parent(node);
+                            } else {
+                                if (nd_is_red(nd_right(w)) == 0) {
+                                    if (nd_left(w) != 0) { nd_set_color(nd_left(w), RB_BLACK); }
+                                    nd_set_color(w, RB_RED);
+                                    rotate_right(root_ptr, w);
+                                    w = nd_right(parent);
+                                }
+                                nd_set_color(w, nd_color(parent));
+                                nd_set_color(parent, RB_BLACK);
+                                if (nd_right(w) != 0) { nd_set_color(nd_right(w), RB_BLACK); }
+                                rotate_left(root_ptr, parent);
+                                node = rp[0];
+                                fixing = 0;
+                            }
+                        } else {
+                            if (nd_is_red(nd_right(w)) == 0) {
+                                if (nd_left(w) != 0) { nd_set_color(nd_left(w), RB_BLACK); }
+                                nd_set_color(w, RB_RED);
+                                rotate_right(root_ptr, w);
+                                w = nd_right(parent);
+                            }
+                            nd_set_color(w, nd_color(parent));
+                            nd_set_color(parent, RB_BLACK);
+                            if (nd_right(w) != 0) { nd_set_color(nd_right(w), RB_BLACK); }
+                            rotate_left(root_ptr, parent);
+                            node = rp[0];
+                            fixing = 0;
+                        }
+                    }
+                } else {
+                    // Mirror case
+                    let is i64 as w with mut = nd_left(parent);
+                    if (nd_is_red(w) != 0) {
+                        nd_set_color(w, RB_BLACK);
+                        nd_set_color(parent, RB_RED);
+                        rotate_right(root_ptr, parent);
+                        w = nd_left(parent);
+                    }
+                    if (w == 0) { node = parent; parent = nd_parent(node); }
+                    else {
+                        if (nd_is_red(nd_right(w)) == 0) {
+                            if (nd_is_red(nd_left(w)) == 0) {
+                                nd_set_color(w, RB_RED);
+                                node = parent;
+                                parent = nd_parent(node);
+                            } else {
+                                if (nd_is_red(nd_left(w)) == 0) {
+                                    if (nd_right(w) != 0) { nd_set_color(nd_right(w), RB_BLACK); }
+                                    nd_set_color(w, RB_RED);
+                                    rotate_left(root_ptr, w);
+                                    w = nd_left(parent);
+                                }
+                                nd_set_color(w, nd_color(parent));
+                                nd_set_color(parent, RB_BLACK);
+                                if (nd_left(w) != 0) { nd_set_color(nd_left(w), RB_BLACK); }
+                                rotate_right(root_ptr, parent);
+                                node = rp[0];
+                                fixing = 0;
+                            }
+                        } else {
+                            if (nd_is_red(nd_left(w)) == 0) {
+                                if (nd_right(w) != 0) { nd_set_color(nd_right(w), RB_BLACK); }
+                                nd_set_color(w, RB_RED);
+                                rotate_left(root_ptr, w);
+                                w = nd_left(parent);
+                            }
+                            nd_set_color(w, nd_color(parent));
+                            nd_set_color(parent, RB_BLACK);
+                            if (nd_left(w) != 0) { nd_set_color(nd_left(w), RB_BLACK); }
+                            rotate_right(root_ptr, parent);
+                            node = rp[0];
+                            fixing = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (node != 0) {
+        nd_set_color(node, RB_BLACK);
+    }
+}
+
+// ============================================================
+// Delete node from tree
+// ============================================================
+
+fn rb_delete(root_ptr as i64, z as i64) as void {
+    let is i64 as y with mut = z;
+    let is i64 as y_orig_color = nd_color(y);
+    let is i64 as x with mut = 0;
+    let is i64 as xp with mut = 0;
+
+    if (nd_left(z) == 0) {
+        x = nd_right(z);
+        xp = nd_parent(z);
+        rb_transplant(root_ptr, z, nd_right(z));
+    } else {
+        if (nd_right(z) == 0) {
+            x = nd_left(z);
+            xp = nd_parent(z);
+            rb_transplant(root_ptr, z, nd_left(z));
+        } else {
+            y = rb_leftmost(nd_right(z));
+            let is i64 as yoc = nd_color(y);
+            x = nd_right(y);
+            if (nd_parent(y) == z) {
+                xp = y;
+            } else {
+                xp = nd_parent(y);
+                rb_transplant(root_ptr, y, nd_right(y));
+                nd_set_right(y, nd_right(z));
+                nd_set_parent(nd_right(y), y);
+            }
+            rb_transplant(root_ptr, z, y);
+            nd_set_left(y, nd_left(z));
+            nd_set_parent(nd_left(y), y);
+            nd_set_color(y, nd_color(z));
+            // Use yoc for fixup decision
+            if (yoc == RB_BLACK) {
+                rb_delete_fixup(root_ptr, x, xp);
+            }
+            rb_free_node(z);
+            return;
+        }
+    }
+
+    if (y_orig_color == RB_BLACK) {
+        rb_delete_fixup(root_ptr, x, xp);
+    }
+    rb_free_node(z);
+}
+
+// ============================================================
+// Find node by value (linear scan — used for remove-by-tid)
+// ============================================================
+
+fn rb_find_by_val(root as i64, val as i64) as i64 {
+    if (root == 0) { return 0; }
+    let is i64 as n with mut = rb_leftmost(root);
+    while (n != 0) {
+        if (nd_val(n) == val) { return n; }
+        n = rb_next(n);
+    }
+    return 0;
+}
+
+// ============================================================
+// Count nodes (for debug)
+// ============================================================
+
+fn rb_count_from(n as i64) as i64 {
+    if (n == 0) { return 0; }
+    return 1 + rb_count_from(nd_left(n)) + rb_count_from(nd_right(n));
+}
+
+fn rb_count(root as i64) as i64 {
+    return rb_count_from(root);
+}

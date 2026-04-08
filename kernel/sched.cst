@@ -1,24 +1,21 @@
 // sched.cst — Full scheduler: EEVDF, deadline (EDF+CBS), anti-abuse, preemption
 // Based on causticos_sched_spec_v1
 //
+// Lock ordering (§17):
+//   deadline_tree.lock < qos_band.lock < cpu_runqueue.lock < global_capabilities.lock
+//   V1 single-CPU: all protected by IRQ disable. Locks become spinlocks for SMP.
+//
 // V1 accepted tradeoffs:
-// - Sorted linked lists instead of red-black trees for both deadline list
-//   and per-band EEVDF runqueues. O(n) insert/find vs O(log n).
-//   Adequate for V1 thread counts (<64). Migrate to RB tree if profiling
-//   shows this is a bottleneck.
-// - PIT timer at 1 kHz instead of LAPIC one-shot. Consequences:
-//   * MIN_SLICE_NS (0.5ms) cannot be honored — resolution is 1ms
-//   * Deadline replenishment can be delayed up to 1ms
-//   * No exact next-event programming (periodic ticks only)
-//   LAPIC is a backend swap when deadline precision matters.
-// - Thread table is static [64 * 384] in BSS. Migrate to dynamic
-//   kmalloc allocation when process model arrives.
+// - Thread table is static [64 * 384] in BSS. TODO: migrate to kcache
+//   allocation when process model arrives.
 
 use "serial.cst" as serial;
 use "pmm.cst" as pmm;
 use "heap.cst" as heap;
 use "timer.cst" as timer;
 use "util.cst" as util;
+use "rbtree.cst" as rb;
+use "lapic.cst" as lapic;
 
 // ============================================================
 // Constants
@@ -48,16 +45,15 @@ let is i64 as NUM_QOS_BANDS    = 6;
 // EEVDF (§5)
 let is i64 as BASE_WEIGHT      = 1024;
 let is i64 as DEFAULT_SLICE_NS = 5000000;
-let is i64 as SLEEPER_BONUS_NS = 2500000;
+let is i64 as SLEEPER_BONUS_NS with mut = 2500000;  // configurable (§5.4)
 
-// Quantum (§13)
+// Quantum (§13) — mutable, configurable
 let is i64 as MIN_QUANTUM_NS   = 1000000;
 let is i64 as MAX_QUANTUM_NS   = 100000000;
 let is i64 as quantum_ns with mut = 5000000;
 
-// Deadline (§6)
-// MAX_DEADLINE_UTILIZATION as percentage * 100 (70% = 70)
-let is i64 as MAX_DL_UTIL_PCT  = 70;
+// Deadline (§6) — configurable
+let is i64 as MAX_DL_UTIL_PCT with mut = 70;
 
 // Capabilities (§8)
 let is i64 as CAP_SCHED_REALTIME = 1;
@@ -154,19 +150,20 @@ fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
 // Per-band data
 // ============================================================
 
-let is [48]u8 as band_heads_raw;
-let is [48]u8 as band_counts_raw;
-let is [48]u8 as band_min_vrt_raw;
+// Per-band RB trees (keyed by virtual_deadline, value = tid) — §5
+let is [48]u8 as band_roots_raw;     // 6 * i64 (RB tree roots)
+let is [48]u8 as band_counts_raw;    // 6 * i64
+let is [48]u8 as band_min_vrt_raw;   // 6 * i64
 
-fn band_head(b as i64) as i64      { let is *i64 as p = cast(*i64, &band_heads_raw); return p[b]; }
-fn band_set_head(b as i64, v as i64) as void { let is *i64 as p = cast(*i64, &band_heads_raw); p[b] = v; }
-fn band_count(b as i64) as i64     { let is *i64 as p = cast(*i64, &band_counts_raw); return p[b]; }
+fn band_root_ptr(b as i64) as i64 { return cast(i64, &band_roots_raw) + b * 8; }
+fn band_root(b as i64) as i64     { let is *i64 as p = cast(*i64, &band_roots_raw); return p[b]; }
+fn band_count(b as i64) as i64    { let is *i64 as p = cast(*i64, &band_counts_raw); return p[b]; }
 fn band_set_count(b as i64, v as i64) as void { let is *i64 as p = cast(*i64, &band_counts_raw); p[b] = v; }
 fn band_min_vruntime(b as i64) as i64 { let is *i64 as p = cast(*i64, &band_min_vrt_raw); return p[b]; }
 fn band_set_min_vruntime(b as i64, v as i64) as void { let is *i64 as p = cast(*i64, &band_min_vrt_raw); p[b] = v; }
 
-// Deadline list (sorted by dl_abs_deadline, ascending)
-let is i64 as dl_head with mut = 0 - 1;
+// Deadline RB tree (keyed by dl_abs_deadline, value = tid) — §6.5
+let is i64 as dl_root with mut = 0;
 let is i64 as dl_count with mut = 0;
 
 // ============================================================
@@ -244,45 +241,17 @@ fn cond_resched() as void {
 // Run list operations (QoS bands, sorted by virtual_deadline)
 // ============================================================
 
+// RB tree insert/remove for QoS bands (keyed by virtual_deadline)
 fn runlist_insert(band as i64, tid as i64) as void {
-    let is i64 as vd = thr_vdeadline(tid);
-    let is i64 as head = band_head(band);
-
-    if (head < 0) {
-        thr_set(tid, 96, 0 - 1);
-        thr_set(tid, 104, 0 - 1);
-        band_set_head(band, tid);
-        band_set_count(band, band_count(band) + 1);
-        return;
-    }
-
-    let is i64 as cur with mut = head;
-    let is i64 as prev_tid with mut = 0 - 1;
-    let is i64 as found with mut = 0;
-    while (found == 0) {
-        if (cur < 0) { found = 1; }
-        else {
-            if (thr_vdeadline(cur) > vd) { found = 1; }
-            else { prev_tid = cur; cur = thr_next(cur); }
-        }
-    }
-
-    thr_set(tid, 96, cur);
-    thr_set(tid, 104, prev_tid);
-    if (prev_tid >= 0) { thr_set(prev_tid, 96, tid); }
-    else { band_set_head(band, tid); }
-    if (cur >= 0) { thr_set(cur, 104, tid); }
+    rb.rb_insert(band_root_ptr(band), thr_vdeadline(tid), tid);
     band_set_count(band, band_count(band) + 1);
 }
 
 fn runlist_remove(band as i64, tid as i64) as void {
-    let is i64 as nxt = thr_next(tid);
-    let is i64 as prv = thr_prev(tid);
-    if (prv >= 0) { thr_set(prv, 96, nxt); }
-    else { band_set_head(band, nxt); }
-    if (nxt >= 0) { thr_set(nxt, 104, prv); }
-    thr_set(tid, 96, 0 - 1);
-    thr_set(tid, 104, 0 - 1);
+    let is i64 as node = rb.rb_find_by_val(band_root(band), tid);
+    if (node != 0) {
+        rb.rb_delete(band_root_ptr(band), node);
+    }
     band_set_count(band, band_count(band) - 1);
 }
 
@@ -291,41 +260,17 @@ fn runlist_remove(band as i64, tid as i64) as void {
 // Reuses next_tid/prev_tid fields (a thread is in ONE list at a time)
 // ============================================================
 
+// RB tree insert/remove for deadline class (keyed by dl_abs_deadline)
 fn dl_insert(tid as i64) as void {
-    let is i64 as dl = thr_dl_abs_dl(tid);
-    if (dl_head < 0) {
-        thr_set(tid, 96, 0 - 1);
-        thr_set(tid, 104, 0 - 1);
-        dl_head = tid;
-        dl_count = dl_count + 1;
-        return;
-    }
-    let is i64 as cur with mut = dl_head;
-    let is i64 as prv with mut = 0 - 1;
-    let is i64 as found with mut = 0;
-    while (found == 0) {
-        if (cur < 0) { found = 1; }
-        else {
-            if (thr_dl_abs_dl(cur) > dl) { found = 1; }
-            else { prv = cur; cur = thr_next(cur); }
-        }
-    }
-    thr_set(tid, 96, cur);
-    thr_set(tid, 104, prv);
-    if (prv >= 0) { thr_set(prv, 96, tid); }
-    else { dl_head = tid; }
-    if (cur >= 0) { thr_set(cur, 104, tid); }
+    rb.rb_insert(cast(i64, &dl_root), thr_dl_abs_dl(tid), tid);
     dl_count = dl_count + 1;
 }
 
 fn dl_remove(tid as i64) as void {
-    let is i64 as nxt = thr_next(tid);
-    let is i64 as prv = thr_prev(tid);
-    if (prv >= 0) { thr_set(prv, 96, nxt); }
-    else { dl_head = nxt; }
-    if (nxt >= 0) { thr_set(nxt, 104, prv); }
-    thr_set(tid, 96, 0 - 1);
-    thr_set(tid, 104, 0 - 1);
+    let is i64 as node = rb.rb_find_by_val(dl_root, tid);
+    if (node != 0) {
+        rb.rb_delete(cast(i64, &dl_root), node);
+    }
     dl_count = dl_count - 1;
 }
 
@@ -334,9 +279,10 @@ fn dl_remove(tid as i64) as void {
 // ============================================================
 
 fn update_band_min_vruntime(band as i64) as void {
-    let is i64 as head = band_head(band);
-    if (head >= 0) {
-        let is i64 as hv = thr_vruntime(head);
+    let is i64 as lm = rb.rb_leftmost(band_root(band));
+    if (lm != 0) {
+        let is i64 as tid = rb.nd_val(lm);
+        let is i64 as hv = thr_vruntime(tid);
         if (hv > band_min_vruntime(band)) {
             band_set_min_vruntime(band, hv);
         }
@@ -359,16 +305,17 @@ fn update_vruntime(tid as i64, elapsed_ns as i64) as void {
 // ============================================================
 
 fn dl_total_utilization() as i64 {
-    // Returns utilization * 100 (percentage)
+    // Returns utilization as percentage (walk all deadline threads)
     let is i64 as total with mut = 0;
-    let is i64 as cur with mut = dl_head;
-    while (cur >= 0) {
-        let is i64 as rt = thr_get(cur, 136);   // dl_runtime_ns
-        let is i64 as pd = thr_get(cur, 144);   // dl_period_ns
+    let is i64 as n with mut = rb.rb_leftmost(dl_root);
+    while (n != 0) {
+        let is i64 as tid = rb.nd_val(n);
+        let is i64 as rt = thr_get(tid, 136);
+        let is i64 as pd = thr_get(tid, 144);
         if (pd > 0) {
             total = total + (rt * 100 / pd);
         }
-        cur = thr_next(cur);
+        n = rb.rb_next(n);
     }
     return total;
 }
@@ -765,21 +712,28 @@ fn thread_entry_trampoline() as void {
 // ============================================================
 
 fn pick_next_deadline() as i64 {
-    let is i64 as cur with mut = dl_head;
-    while (cur >= 0) {
-        if (thr_dl_budget(cur) > 0) { return cur; }
-        cur = thr_next(cur);
+    // Walk RB tree from leftmost (earliest deadline) — §6.2
+    let is i64 as n with mut = rb.rb_leftmost(dl_root);
+    while (n != 0) {
+        let is i64 as tid = rb.nd_val(n);
+        if (thr_dl_budget(tid) > 0) { return tid; }
+        n = rb.rb_next(n);
     }
     return 0 - 1;
 }
 
 fn pick_next_in_band(band as i64) as i64 {
-    let is i64 as cur with mut = band_head(band);
-    while (cur >= 0) {
-        if (thr_lag(cur) >= 0) { return cur; }
-        cur = thr_next(cur);
+    // Walk RB tree from leftmost (smallest virtual_deadline) — §5.2
+    // Find first eligible thread (lag >= 0)
+    let is i64 as n with mut = rb.rb_leftmost(band_root(band));
+    let is i64 as fallback with mut = 0 - 1;
+    while (n != 0) {
+        let is i64 as tid = rb.nd_val(n);
+        if (fallback < 0) { fallback = tid; }  // smallest vdeadline as fallback
+        if (thr_lag(tid) >= 0) { return tid; }
+        n = rb.rb_next(n);
     }
-    return band_head(band);  // fallback: smallest vdeadline
+    return fallback;  // all ineligible — return smallest vdeadline
 }
 
 fn pick_next() as i64 {
@@ -903,6 +857,9 @@ fn schedule() as void {
     } else {
         asm(".byte 0xFB\n");  // sti
     }
+
+    // Program LAPIC for next event (§12.2)
+    program_next_tick();
 }
 
 // ============================================================
@@ -936,6 +893,42 @@ fn on_timer_tick() as void {
 // yield
 // ============================================================
 
+// ============================================================
+// Program next LAPIC tick (§12.2)
+// ============================================================
+
+fn program_next_tick() as void {
+    if (lapic.calibrated == 0) { return; }
+
+    let is i64 as now = timer.current_time_ns();
+    let is i64 as next_event with mut = now + quantum_ns;
+
+    // Check deadline class for sooner events
+    if (dl_count > 0) {
+        let is i64 as lm = rb.rb_leftmost(dl_root);
+        if (lm != 0) {
+            let is i64 as dl = rb.nd_key(lm);
+            if (dl < next_event) { next_event = dl; }
+        }
+    }
+
+    // Check for pending deadline replenishments
+    let is i64 as tid with mut = 0;
+    while (tid < next_tid) {
+        if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
+            if (thr_state(tid) == THREAD_SUSPENDED) {
+                let is i64 as replenish_at = thr_get(tid, 168) + thr_get(tid, 144);
+                if (replenish_at < next_event) { next_event = replenish_at; }
+            }
+        }
+        tid = tid + 1;
+    }
+
+    let is i64 as delta with mut = next_event - now;
+    if (delta < MIN_QUANTUM_NS) { delta = MIN_QUANTUM_NS; }
+    lapic.program_tick_ns(delta);
+}
+
 fn yield_cpu() as void { schedule(); }
 
 // ============================================================
@@ -959,7 +952,8 @@ fn init() as void {
     // Zero band lists
     let is i64 as b with mut = 0;
     while (b < NUM_QOS_BANDS) {
-        band_set_head(b, 0 - 1);
+        let is *i64 as rp = cast(*i64, &band_roots_raw);
+        rp[b] = 0;  // empty RB tree
         band_set_count(b, 0);
         band_set_min_vruntime(b, 0);
         b = b + 1;
