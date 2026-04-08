@@ -110,13 +110,24 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
+let is i64 as MAX_TID = 256;    // expandable; lookup table limit
 
-let is [24576]u8 as thread_table_raw;  // 64 * 384
+// Dynamic thread allocation via kcache
+let is i64 as thread_cache with mut = 0;   // kcache for Thread structs
+
+// TID → thread pointer lookup table (256 * 8 = 2048 bytes)
+let is [2048]u8 as tid_table_raw;
 let is i64 as thread_count with mut = 0;
 let is i64 as next_tid with mut = 0;
 
+fn tid_set_ptr(tid as i64, ptr as i64) as void {
+    let is *i64 as t = cast(*i64, &tid_table_raw);
+    t[tid] = ptr;
+}
+
 fn thread_ptr(tid as i64) as i64 {
-    return cast(i64, &thread_table_raw) + tid * THREAD_SIZE;
+    let is *i64 as t = cast(*i64, &tid_table_raw);
+    return t[tid];
 }
 
 fn thr_get(tid as i64, off as i64) as i64 {
@@ -150,48 +161,98 @@ fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
 // Per-band data
 // ============================================================
 
-// Per-band RB trees (keyed by virtual_deadline, value = tid) — §5
-let is [48]u8 as band_roots_raw;     // 6 * i64 (RB tree roots)
-let is [48]u8 as band_counts_raw;    // 6 * i64
-let is [48]u8 as band_min_vrt_raw;   // 6 * i64
-
-fn band_root_ptr(b as i64) as i64 { return cast(i64, &band_roots_raw) + b * 8; }
-fn band_root(b as i64) as i64     { let is *i64 as p = cast(*i64, &band_roots_raw); return p[b]; }
-fn band_count(b as i64) as i64    { let is *i64 as p = cast(*i64, &band_counts_raw); return p[b]; }
-fn band_set_count(b as i64, v as i64) as void { let is *i64 as p = cast(*i64, &band_counts_raw); p[b] = v; }
-fn band_min_vruntime(b as i64) as i64 { let is *i64 as p = cast(*i64, &band_min_vrt_raw); return p[b]; }
-fn band_set_min_vruntime(b as i64, v as i64) as void { let is *i64 as p = cast(*i64, &band_min_vrt_raw); p[b] = v; }
-
-// Deadline RB tree (keyed by dl_abs_deadline, value = tid) — §6.5
-let is i64 as dl_root with mut = 0;
-let is i64 as dl_count with mut = 0;
-
 // ============================================================
-// Band budget table (§7.2)
-// Each band: max_cpu_pct, window_ns, promo_thresh, demo_thresh (4 * i64 = 32 bytes)
+// CpuRunqueue (§9) — per-CPU scheduling state
+// V1: single instance. SMP: array indexed by cpu_id.
 // ============================================================
+// Layout (512 bytes):
+// 0    cpu_id           i64
+// 8    dl_root          i64   (RB tree root)
+// 16   dl_count         i64
+// 24   current_tid      i64
+// 32   current_start_ns i64
+// 40   idle_tid         i64
+// 48   nr_running       i64
+// 56   nr_switches      i64
+// 64   fpu_owner_tid    i64
+// 72   band_roots[6]    48 bytes (6 * i64, RB tree roots)
+// 120  band_counts[6]   48 bytes
+// 168  band_min_vrt[6]  48 bytes
+// 216  band_budgets[6]  192 bytes (6 * 4 * i64)
+// 408  reserved         104 bytes
+// Total: 512
 
-let is [192]u8 as band_budgets_raw;  // 6 * 32
+let is i64 as RQ_SIZE = 512;
+let is [512]u8 as cpu_rq_raw;    // single CPU runqueue
 
-fn bb_get(band as i64, field as i64) as i64 {
-    let is *i64 as p = cast(*i64, cast(i64, &band_budgets_raw) + band * 32);
-    return p[field];
+fn rq_ptr() as i64 { return cast(i64, &cpu_rq_raw); }
+
+fn rq_get(off as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr() + off);
+    return p[0];
 }
 
+fn rq_set(off as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr() + off);
+    p[0] = v;
+}
+
+// Named accessors
+fn dl_root() as i64          { return rq_get(8); }
+fn dl_root_ptr() as i64      { return rq_ptr() + 8; }
+fn dl_count() as i64         { return rq_get(16); }
+fn dl_set_count(v as i64) as void { rq_set(16, v); }
+
+fn current_tid() as i64      { return rq_get(24); }
+fn set_current_tid(v as i64) as void { rq_set(24, v); }
+fn current_start_ns() as i64 { return rq_get(32); }
+fn set_current_start_ns(v as i64) as void { rq_set(32, v); }
+fn idle_tid() as i64         { return rq_get(40); }
+fn set_idle_tid(v as i64) as void { rq_set(40, v); }
+fn nr_running() as i64       { return rq_get(48); }
+fn set_nr_running(v as i64) as void { rq_set(48, v); }
+fn nr_switches() as i64      { return rq_get(56); }
+fn set_nr_switches(v as i64) as void { rq_set(56, v); }
+fn fpu_owner_tid() as i64    { return rq_get(64); }
+fn set_fpu_owner_tid(v as i64) as void { rq_set(64, v); }
+
+// Per-band accessors (within runqueue)
+fn band_root_ptr(b as i64) as i64 { return rq_ptr() + 72 + b * 8; }
+fn band_root(b as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr() + 72);
+    return p[b];
+}
+fn band_count(b as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr() + 120);
+    return p[b];
+}
+fn band_set_count(b as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr() + 120);
+    p[b] = v;
+}
+fn band_min_vruntime(b as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr() + 168);
+    return p[b];
+}
+fn band_set_min_vruntime(b as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr() + 168);
+    p[b] = v;
+}
+
+// Band budgets (within runqueue, 4 i64 per band)
+fn bb_get(band as i64, field as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr() + 216 + band * 32);
+    return p[field];
+}
 fn bb_set(band as i64, field as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, cast(i64, &band_budgets_raw) + band * 32);
+    let is *i64 as p = cast(*i64, rq_ptr() + 216 + band * 32);
     p[field] = v;
 }
 
 // ============================================================
-// Scheduling state
+// Global scheduling state (not per-CPU)
 // ============================================================
 
-let is i64 as current_tid with mut = 0 - 1;
-let is i64 as current_start_ns with mut = 0;
-let is i64 as nr_running with mut = 0;
-let is i64 as nr_switches with mut = 0;
-let is i64 as idle_tid with mut = 0 - 1;
 let is i64 as sched_active with mut = 0;
 
 let is i64 as switch_rsp with mut = 0;
@@ -200,9 +261,6 @@ let is i64 as ctx_new_rsp with mut = 0;
 
 // Preemption control (§11.5)
 let is i64 as preempt_count with mut = 0;
-
-// FPU owner (-1 = nobody)
-let is i64 as fpu_owner_tid with mut = 0 - 1;
 
 fn band_weight(b as i64) as i64 {
     if (b == QOS_BATCH) { return 512; }
@@ -262,16 +320,16 @@ fn runlist_remove(band as i64, tid as i64) as void {
 
 // RB tree insert/remove for deadline class (keyed by dl_abs_deadline)
 fn dl_insert(tid as i64) as void {
-    rb.rb_insert(cast(i64, &dl_root), thr_dl_abs_dl(tid), tid);
-    dl_count = dl_count + 1;
+    rb.rb_insert(dl_root_ptr(), thr_dl_abs_dl(tid), tid);
+    dl_set_count(dl_count() + 1);
 }
 
 fn dl_remove(tid as i64) as void {
-    let is i64 as node = rb.rb_find_by_val(dl_root, tid);
+    let is i64 as node = rb.rb_find_by_val(dl_root(), tid);
     if (node != 0) {
-        rb.rb_delete(cast(i64, &dl_root), node);
+        rb.rb_delete(dl_root_ptr(), node);
     }
-    dl_count = dl_count - 1;
+    dl_set_count(dl_count() - 1);
 }
 
 // ============================================================
@@ -307,7 +365,7 @@ fn update_vruntime(tid as i64, elapsed_ns as i64) as void {
 fn dl_total_utilization() as i64 {
     // Returns utilization as percentage (walk all deadline threads)
     let is i64 as total with mut = 0;
-    let is i64 as n with mut = rb.rb_leftmost(dl_root);
+    let is i64 as n with mut = rb.rb_leftmost(dl_root());
     while (n != 0) {
         let is i64 as tid = rb.nd_val(n);
         let is i64 as rt = thr_get(tid, 136);
@@ -388,7 +446,7 @@ fn dl_check_replenish() as void {
                     thr_set(tid, 176, now + thr_get(tid, 152));      // new abs_deadline
                     thr_set(tid, 8, THREAD_RUNNABLE);
                     dl_insert(tid);
-                    nr_running = nr_running + 1;
+                    set_nr_running(nr_running() + 1);
                     timer.need_resched = 1;
                 }
             }
@@ -537,13 +595,13 @@ fn fpu_restore(addr as i64) as void {
 fn handle_nm_fault() as void {
     cr0_clear_ts();
 
-    let is i64 as cur = current_tid;
+    let is i64 as cur = current_tid();
     if (cur < 0) { return; }
 
     // Save previous owner's FPU state
-    if (fpu_owner_tid >= 0) {
-        if (fpu_owner_tid != cur) {
-            let is i64 as prev_fpu_addr = thr_get(fpu_owner_tid, 240);
+    if (fpu_owner_tid() >= 0) {
+        if (fpu_owner_tid() != cur) {
+            let is i64 as prev_fpu_addr = thr_get(fpu_owner_tid(), 240);
             if (prev_fpu_addr != 0) {
                 fpu_save(prev_fpu_addr);
             }
@@ -556,7 +614,7 @@ fn handle_nm_fault() as void {
         fpu_restore(cur_fpu_addr);
     }
 
-    fpu_owner_tid = cur;
+    set_fpu_owner_tid(cur);
     thr_set(cur, 232, 1);  // fpu_dirty = 1
 }
 
@@ -565,14 +623,24 @@ fn handle_nm_fault() as void {
 // ============================================================
 
 fn create_thread(entry as i64, band as i64) as i64 {
-    if (next_tid >= MAX_THREADS) {
+    if (next_tid >= MAX_TID) {
         pmm.panic("too many threads", 16);
     }
 
     let is i64 as tid = next_tid;
     next_tid = next_tid + 1;
 
-    let is *u8 as tp = cast(*u8, thread_ptr(tid));
+    // Allocate thread struct via kcache (dynamic)
+    let is i64 as tptr with mut = 0;
+    if (thread_cache != 0) {
+        tptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
+    } else {
+        tptr = heap.kmalloc(THREAD_SIZE, pmm.ALLOC_ZERO);
+    }
+    if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
+    tid_set_ptr(tid, tptr);
+
+    let is *u8 as tp = cast(*u8, tptr);
     let is i64 as z with mut = 0;
     while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
 
@@ -622,7 +690,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     thr_set(tid, 240, fpu_addr);      // fpu_state_addr
 
     runlist_insert(band, tid);
-    nr_running = nr_running + 1;
+    set_nr_running(nr_running() + 1);
     thread_count = thread_count + 1;
 
     return tid;
@@ -659,15 +727,15 @@ fn wakeup_thread(tid as i64) as void {
     } else {
         runlist_insert(band, tid);
     }
-    nr_running = nr_running + 1;
+    set_nr_running(nr_running() + 1);
 
-    if (current_tid >= 0) {
-        if (thr_class(current_tid) == SCHED_CLASS_IDLE) { timer.need_resched = 1; }
+    if (current_tid() >= 0) {
+        if (thr_class(current_tid()) == SCHED_CLASS_IDLE) { timer.need_resched = 1; }
         else {
             if (thr_class(tid) == SCHED_CLASS_DEADLINE) { timer.need_resched = 1; }
             else {
-                if (thr_class(current_tid) == SCHED_CLASS_QOS) {
-                    if (band < thr_band(current_tid)) { timer.need_resched = 1; }
+                if (thr_class(current_tid()) == SCHED_CLASS_QOS) {
+                    if (band < thr_band(current_tid())) { timer.need_resched = 1; }
                 }
             }
         }
@@ -686,7 +754,7 @@ fn resume_thread(tid as i64) as void {
     let is i64 as band = thr_band(tid);
     if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dl_insert(tid); }
     else { runlist_insert(band, tid); }
-    nr_running = nr_running + 1;
+    set_nr_running(nr_running() + 1);
 }
 
 // ============================================================
@@ -697,12 +765,12 @@ let is i64 as trampoline_entry with mut = 0;
 
 fn thread_entry_trampoline() as void {
     asm(".byte 0xFB\n");  // sti
-    trampoline_entry = thr_entry(current_tid);
+    trampoline_entry = thr_entry(current_tid());
     asm("lea rax, [rip+_kernel_sched_cst_trampoline_entry]\n");
     asm("mov rax, QWORD PTR [rax]\n");
     asm("call rax\n");
-    thr_set(current_tid, 8, THREAD_DEAD);
-    nr_running = nr_running - 1;
+    thr_set(current_tid(), 8, THREAD_DEAD);
+    set_nr_running(nr_running() - 1);
     schedule();
     while (1 == 1) { asm(".byte 0xF4\n"); }
 }
@@ -713,7 +781,7 @@ fn thread_entry_trampoline() as void {
 
 fn pick_next_deadline() as i64 {
     // Walk RB tree from leftmost (earliest deadline) — §6.2
-    let is i64 as n with mut = rb.rb_leftmost(dl_root);
+    let is i64 as n with mut = rb.rb_leftmost(dl_root());
     while (n != 0) {
         let is i64 as tid = rb.nd_val(n);
         if (thr_dl_budget(tid) > 0) { return tid; }
@@ -738,7 +806,7 @@ fn pick_next_in_band(band as i64) as i64 {
 
 fn pick_next() as i64 {
     // Deadline class first (§4.1)
-    if (dl_count > 0) {
+    if (dl_count() > 0) {
         let is i64 as dl = pick_next_deadline();
         if (dl >= 0) { return dl; }
     }
@@ -751,7 +819,7 @@ fn pick_next() as i64 {
         }
         b = b + 1;
     }
-    return idle_tid;
+    return idle_tid();
 }
 
 // ============================================================
@@ -779,12 +847,12 @@ fn schedule() as void {
     asm(".byte 0xFA\n");  // cli
 
     let is i64 as now = timer.current_time_ns();
-    let is i64 as prev = current_tid;
+    let is i64 as prev = current_tid();
 
     // Account and re-insert
     if (prev >= 0) {
         if (thr_state(prev) == THREAD_RUNNING) {
-            let is i64 as elapsed = now - current_start_ns;
+            let is i64 as elapsed = now - current_start_ns();
             if (elapsed > 0) {
                 account_runtime(prev, elapsed);
             }
@@ -805,16 +873,16 @@ fn schedule() as void {
     dl_check_replenish();
 
     let is i64 as next with mut = pick_next();
-    if (next < 0) { next = idle_tid; }
+    if (next < 0) { next = idle_tid(); }
 
     // Remove from list
     if (thr_class(next) == SCHED_CLASS_DEADLINE) { dl_remove(next); }
     if (thr_class(next) == SCHED_CLASS_QOS) { runlist_remove(thr_band(next), next); }
 
     thr_set(next, 8, THREAD_RUNNING);
-    current_tid = next;
-    current_start_ns = timer.current_time_ns();
-    nr_switches = nr_switches + 1;
+    set_current_tid(next);
+    set_current_start_ns(timer.current_time_ns());
+    set_nr_switches(nr_switches() + 1);
     timer.need_resched = 0;
 
     // Context switch
@@ -870,12 +938,12 @@ fn on_timer_tick() as void {
     if (sched_active == 0) { return; }
 
     let is i64 as now = timer.current_time_ns();
-    let is i64 as elapsed = now - current_start_ns;
+    let is i64 as elapsed = now - current_start_ns();
 
     // Always resched if idle and threads available
-    if (current_tid >= 0) {
-        if (thr_class(current_tid) == SCHED_CLASS_IDLE) {
-            if (nr_running > 0) { timer.need_resched = 1; }
+    if (current_tid() >= 0) {
+        if (thr_class(current_tid()) == SCHED_CLASS_IDLE) {
+            if (nr_running() > 0) { timer.need_resched = 1; }
             return;
         }
     }
@@ -904,8 +972,8 @@ fn program_next_tick() as void {
     let is i64 as next_event with mut = now + quantum_ns;
 
     // Check deadline class for sooner events
-    if (dl_count > 0) {
-        let is i64 as lm = rb.rb_leftmost(dl_root);
+    if (dl_count() > 0) {
+        let is i64 as lm = rb.rb_leftmost(dl_root());
         if (lm != 0) {
             let is i64 as dl = rb.nd_key(lm);
             if (dl < next_event) { next_event = dl; }
@@ -949,43 +1017,58 @@ fn idle_fn() as void {
 fn init() as void {
     serial.println("sched: init", 11);
 
-    // Zero band lists
+    // Zero runqueue
+    let is *u8 as rqz = cast(*u8, &cpu_rq_raw);
+    let is i64 as zi with mut = 0;
+    while (zi < RQ_SIZE) { rqz[zi] = 0; zi = zi + 1; }
+
+    // Zero tid table
+    let is *u8 as tz = cast(*u8, &tid_table_raw);
+    zi = 0;
+    while (zi < 2048) { tz[zi] = 0; zi = zi + 1; }
+
+    // Create thread cache for dynamic allocation
+    thread_cache = heap.kcache_create(THREAD_SIZE, 64, cast(i32, 0));
+
+    // Init band data
     let is i64 as b with mut = 0;
     while (b < NUM_QOS_BANDS) {
-        let is *i64 as rp = cast(*i64, &band_roots_raw);
-        rp[b] = 0;  // empty RB tree
         band_set_count(b, 0);
         band_set_min_vruntime(b, 0);
         b = b + 1;
     }
+    rq_set(24, 0 - 1);  // current_tid = -1
+    rq_set(40, 0 - 1);  // idle_tid = -1
+    rq_set(64, 0 - 1);  // fpu_owner_tid = -1
 
-    // Band budgets (§7.2): max_pct, window_ns, promo_thresh, demo_thresh
-    bb_set(0, 0, 20);  bb_set(0, 1, 1000000000); bb_set(0, 2, 5); bb_set(0, 3, 3);  // input
-    bb_set(1, 0, 70);  bb_set(1, 1, 1000000000); bb_set(1, 2, 5); bb_set(1, 3, 3);  // render
-    bb_set(2, 0, 100); bb_set(2, 1, 1000000000); bb_set(2, 2, 0); bb_set(2, 3, 0);  // active
-    bb_set(3, 0, 100); bb_set(3, 1, 1000000000); bb_set(3, 2, 0); bb_set(3, 3, 0);  // normal
-    bb_set(4, 0, 100); bb_set(4, 1, 1000000000); bb_set(4, 2, 0); bb_set(4, 3, 0);  // batch
-    bb_set(5, 0, 100); bb_set(5, 1, 1000000000); bb_set(5, 2, 0); bb_set(5, 3, 0);  // lazy
+    // Band budgets (§7.2)
+    bb_set(0, 0, 20);  bb_set(0, 1, 1000000000); bb_set(0, 2, 5); bb_set(0, 3, 3);
+    bb_set(1, 0, 70);  bb_set(1, 1, 1000000000); bb_set(1, 2, 5); bb_set(1, 3, 3);
+    bb_set(2, 0, 100); bb_set(2, 1, 1000000000); bb_set(2, 2, 0); bb_set(2, 3, 0);
+    bb_set(3, 0, 100); bb_set(3, 1, 1000000000); bb_set(3, 2, 0); bb_set(3, 3, 0);
+    bb_set(4, 0, 100); bb_set(4, 1, 1000000000); bb_set(4, 2, 0); bb_set(4, 3, 0);
+    bb_set(5, 0, 100); bb_set(5, 1, 1000000000); bb_set(5, 2, 0); bb_set(5, 3, 0);
 
-    // Create idle thread
-    idle_tid = next_tid;
+    // Create idle thread (allocated dynamically)
     let is i64 as itid = next_tid;
     next_tid = next_tid + 1;
+    let is i64 as iptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
+    if (iptr == 0) { pmm.panic("idle alloc fail", 15); }
+    tid_set_ptr(itid, iptr);
 
-    let is *u8 as tp = cast(*u8, thread_ptr(itid));
-    let is i64 as z with mut = 0;
-    while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
+    let is *u8 as tp = cast(*u8, iptr);
+    let is i64 as izi with mut = 0;
+    while (izi < THREAD_SIZE) { tp[izi] = 0; izi = izi + 1; }
 
     thr_set(itid, 0, itid);
     thr_set(itid, 8, THREAD_RUNNING);
     thr_set(itid, 16, SCHED_CLASS_IDLE);
     thr_set(itid, 32, BASE_WEIGHT);
     thr_set(itid, 40, DEFAULT_SLICE_NS);
-    thr_set(itid, 96, 0 - 1);
-    thr_set(itid, 104, 0 - 1);
 
-    current_tid = itid;
-    current_start_ns = timer.current_time_ns();
+    set_idle_tid(itid);
+    set_current_tid(itid);
+    set_current_start_ns(timer.current_time_ns());
 
     serial.println("sched: ready", 12);
 }
