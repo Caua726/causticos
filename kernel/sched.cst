@@ -1,4 +1,4 @@
-// sched.cst — Scheduler: threads, context switch, QoS bands
+// sched.cst — Scheduler: threads, context switch, QoS bands, EEVDF
 // Based on causticos_sched_spec_v1 (V1: single CPU, sorted lists, no RB tree)
 
 use "serial.cst" as serial;
@@ -11,17 +11,18 @@ use "util.cst" as util;
 // Constants
 // ============================================================
 
-// Thread states
+// Thread states (§15)
 let is i64 as THREAD_RUNNING   = 1;
 let is i64 as THREAD_RUNNABLE  = 2;
 let is i64 as THREAD_SLEEPING  = 3;
+let is i64 as THREAD_SUSPENDED = 4;
 let is i64 as THREAD_DEAD      = 5;
 
-// Scheduling classes
+// Scheduling classes (§4)
 let is i64 as SCHED_CLASS_QOS  = 1;
 let is i64 as SCHED_CLASS_IDLE = 2;
 
-// QoS bands (lower = higher priority)
+// QoS bands (§4.2.1)
 let is i64 as QOS_INPUT        = 0;
 let is i64 as QOS_RENDER       = 1;
 let is i64 as QOS_ACTIVE       = 2;
@@ -30,12 +31,17 @@ let is i64 as QOS_BATCH        = 4;
 let is i64 as QOS_LAZY         = 5;
 let is i64 as NUM_QOS_BANDS    = 6;
 
-// EEVDF
+// EEVDF (§5)
 let is i64 as BASE_WEIGHT      = 1024;
 let is i64 as DEFAULT_SLICE_NS = 5000000;    // 5 ms
+let is i64 as SLEEPER_BONUS_NS = 2500000;    // 2.5 ms (slice/2 per §5.4)
+
+// Quantum (§13) — mutable, configurable at runtime
+let is i64 as MIN_QUANTUM_NS   = 1000000;    // 1 ms
+let is i64 as MAX_QUANTUM_NS   = 100000000;  // 100 ms
+let is i64 as quantum_ns with mut = 5000000; // 5 ms default
 
 // Kernel stack: 2 pages (8 KB)
-let is i64 as KSTACK_PAGES     = 2;
 let is i64 as KSTACK_SIZE      = 8192;
 
 // Max threads
@@ -59,11 +65,14 @@ let is i64 as MAX_THREADS      = 64;
 // 88      total_runtime_ns    i64    8
 // 96      next_tid            i64    8     next thread in run list (-1 = none)
 // 104     prev_tid            i64    8     prev thread in run list (-1 = none)
-// 112-199 reserved                  88
+// 112     lag                 i64    8     EEVDF lag (§5.1)
+// 120     voluntary_switches  i64    8
+// 128     forced_switches     i64    8
+// 136-199 reserved                  64
 
 let is i64 as THREAD_SIZE = 200;
 
-// Thread table: MAX_THREADS * 200 = 12800 bytes
+// Thread table
 let is [12800]u8 as thread_table_raw;
 let is i64 as thread_count with mut = 0;
 let is i64 as next_tid with mut = 0;
@@ -72,7 +81,6 @@ fn thread_ptr(tid as i64) as i64 {
     return cast(i64, &thread_table_raw) + tid * THREAD_SIZE;
 }
 
-// Field accessors
 fn thr_get(tid as i64, off as i64) as i64 {
     let is *i64 as p = cast(*i64, thread_ptr(tid) + off);
     return p[0];
@@ -83,8 +91,6 @@ fn thr_set(tid as i64, off as i64, v as i64) as void {
     p[0] = v;
 }
 
-// Named accessors
-fn thr_tid(tid as i64) as i64           { return thr_get(tid, 0); }
 fn thr_state(tid as i64) as i64         { return thr_get(tid, 8); }
 fn thr_class(tid as i64) as i64         { return thr_get(tid, 16); }
 fn thr_band(tid as i64) as i64          { return thr_get(tid, 24); }
@@ -93,15 +99,14 @@ fn thr_slice(tid as i64) as i64         { return thr_get(tid, 40); }
 fn thr_vruntime(tid as i64) as i64      { return thr_get(tid, 48); }
 fn thr_vdeadline(tid as i64) as i64     { return thr_get(tid, 56); }
 fn thr_kstack_top(tid as i64) as i64    { return thr_get(tid, 64); }
-fn thr_kstack_base(tid as i64) as i64   { return thr_get(tid, 72); }
 fn thr_entry(tid as i64) as i64         { return thr_get(tid, 80); }
 fn thr_runtime(tid as i64) as i64       { return thr_get(tid, 88); }
 fn thr_next(tid as i64) as i64          { return thr_get(tid, 96); }
 fn thr_prev(tid as i64) as i64          { return thr_get(tid, 104); }
+fn thr_lag(tid as i64) as i64           { return thr_get(tid, 112); }
 
 // ============================================================
-// Per-band run lists (sorted linked list by virtual_deadline, via tid)
-// Head tid for each band (-1 = empty)
+// Per-band run lists (sorted by virtual_deadline)
 // ============================================================
 
 let is [48]u8 as band_heads_raw;   // 6 * i64
@@ -142,22 +147,19 @@ fn band_set_min_vruntime(band as i64, v as i64) as void {
 // Current thread and scheduling state
 // ============================================================
 
-let is i64 as current_tid with mut = 0 - 1;   // -1 = none
+let is i64 as current_tid with mut = 0 - 1;
 let is i64 as current_start_ns with mut = 0;
 let is i64 as nr_running with mut = 0;
 let is i64 as nr_switches with mut = 0;
 let is i64 as idle_tid with mut = 0 - 1;
-let is i64 as sched_active with mut = 0;       // 0 = not yet started
+let is i64 as sched_active with mut = 0;
 
-// Saved RSP for context switch (written by asm)
 let is i64 as switch_rsp with mut = 0;
-
-// Context switch globals (set by schedule, used by do_switch asm)
-let is i64 as ctx_old_rsp_ptr with mut = 0;  // address to save old RSP
-let is i64 as ctx_new_rsp with mut = 0;       // new RSP to load
+let is i64 as ctx_old_rsp_ptr with mut = 0;
+let is i64 as ctx_new_rsp with mut = 0;
 
 // ============================================================
-// Band weight table
+// Band weight table (§4.2.2)
 // ============================================================
 
 fn band_weight(band as i64) as i64 {
@@ -174,16 +176,14 @@ fn runlist_insert(band as i64, tid as i64) as void {
     let is i64 as vd = thr_vdeadline(tid);
     let is i64 as head = band_head(band);
 
-    // Empty list
     if (head < 0) {
-        thr_set(tid, 96, 0 - 1);   // next = -1
-        thr_set(tid, 104, 0 - 1);  // prev = -1
+        thr_set(tid, 96, 0 - 1);
+        thr_set(tid, 104, 0 - 1);
         band_set_head(band, tid);
         band_set_count(band, band_count(band) + 1);
         return;
     }
 
-    // Find insertion point (sorted ascending by virtual_deadline)
     let is i64 as cur with mut = head;
     let is i64 as prev_tid with mut = 0 - 1;
     let is i64 as found with mut = 0;
@@ -201,18 +201,17 @@ fn runlist_insert(band as i64, tid as i64) as void {
         }
     }
 
-    // Insert before 'cur', after 'prev_tid'
-    thr_set(tid, 96, cur);        // next = cur
-    thr_set(tid, 104, prev_tid);  // prev = prev_tid
+    thr_set(tid, 96, cur);
+    thr_set(tid, 104, prev_tid);
 
     if (prev_tid >= 0) {
-        thr_set(prev_tid, 96, tid);  // prev.next = tid
+        thr_set(prev_tid, 96, tid);
     } else {
-        band_set_head(band, tid);     // new head
+        band_set_head(band, tid);
     }
 
     if (cur >= 0) {
-        thr_set(cur, 104, tid);      // cur.prev = tid
+        thr_set(cur, 104, tid);
     }
 
     band_set_count(band, band_count(band) + 1);
@@ -238,24 +237,47 @@ fn runlist_remove(band as i64, tid as i64) as void {
 }
 
 // ============================================================
-// EEVDF vruntime + virtual deadline update
+// EEVDF: update min_vruntime for a band (§5.3)
+// ============================================================
+
+fn update_band_min_vruntime(band as i64) as void {
+    let is i64 as head = band_head(band);
+    if (head >= 0) {
+        let is i64 as hv = thr_vruntime(head);
+        let is i64 as cur = band_min_vruntime(band);
+        // min_vruntime only goes forward (monotonic)
+        if (hv > cur) {
+            band_set_min_vruntime(band, hv);
+        }
+    }
+}
+
+// ============================================================
+// EEVDF: vruntime + lag update (§5.3)
 // ============================================================
 
 fn update_vruntime(tid as i64, elapsed_ns as i64) as void {
     let is i64 as w = thr_weight(tid);
     let is i64 as delta = elapsed_ns * BASE_WEIGHT / w;
-    thr_set(tid, 48, thr_vruntime(tid) + delta);
+    let is i64 as new_vrt = thr_vruntime(tid) + delta;
+    thr_set(tid, 48, new_vrt);
 
-    // Update virtual deadline
-    let is i64 as vd = thr_vruntime(tid) + (thr_slice(tid) * BASE_WEIGHT / w);
+    // Update virtual deadline (§5.1)
+    let is i64 as vd = new_vrt + (thr_slice(tid) * BASE_WEIGHT / w);
     thr_set(tid, 56, vd);
 
     // Update total runtime
     thr_set(tid, 88, thr_runtime(tid) + elapsed_ns);
+
+    // Update lag (§5.3): lag = band_min_vruntime - vruntime
+    // Positive lag = thread is owed CPU. Negative = ran too much.
+    let is i64 as band = thr_band(tid);
+    let is i64 as lag = band_min_vruntime(band) - new_vrt;
+    thr_set(tid, 112, lag);
 }
 
 // ============================================================
-// Thread creation
+// Thread creation (§5.5)
 // ============================================================
 
 fn create_thread(entry as i64, band as i64) as i64 {
@@ -266,7 +288,6 @@ fn create_thread(entry as i64, band as i64) as i64 {
     let is i64 as tid = next_tid;
     next_tid = next_tid + 1;
 
-    // Zero the thread struct
     let is *u8 as tp = cast(*u8, thread_ptr(tid));
     let is i64 as z with mut = 0;
     while (z < THREAD_SIZE) {
@@ -274,11 +295,10 @@ fn create_thread(entry as i64, band as i64) as i64 {
         z = z + 1;
     }
 
-    // Allocate kernel stack (2 pages)
+    // Allocate kernel stack (8KB)
     let is i32 as stack_pfn = pmm.alloc_pages(
         pmm.ZONE_DMA32, pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
-        cast(i32, 1),  // order 1 = 2 pages = 8KB
-        pmm.USAGE_KERNEL, cast(i32, 0)
+        cast(i32, 1), pmm.USAGE_KERNEL, cast(i32, 0)
     );
     if (stack_pfn == pmm.PFN_NONE) {
         pmm.panic("sched: stack alloc failed", 25);
@@ -287,21 +307,8 @@ fn create_thread(entry as i64, band as i64) as i64 {
     let is i64 as stack_base = pmm.phys_to_virt(pmm.pfn_to_phys(stack_pfn));
     let is i64 as stack_top = stack_base + KSTACK_SIZE;
 
-    // Set up initial stack frame for inline context switch.
-    // The switch does: push r15..rbp, push .Lresume, save RSP, switch, ret.
-    // New thread's frame must have RIP at [saved_rsp] (popped by ret),
-    // then regs above (popped by .Lresume's pops, but new thread goes
-    // to trampoline instead — the regs are never popped, just consumed as stack space).
-    // Layout (7 entries, 56 bytes):
-    //   [top-56] = RIP = trampoline  ← saved_rsp points here, popped by ret
-    //   [top-48] = rbp = 0           (not popped for new thread — trampoline uses own frame)
-    //   [top-40] = rbx = 0
-    //   [top-32] = r12 = 0
-    //   [top-24] = r13 = 0
-    //   [top-16] = r14 = 0
-    //   [top-8]  = r15 = 0
+    // Fake stack frame: RIP + 6 callee-saved = 56 bytes
     let is *i64 as sf = cast(*i64, stack_top - 56);
-    // Get trampoline address first
     asm("lea rax, [rip+_kernel_sched_cst_thread_entry_trampoline]\n");
     asm("lea rbx, [rip+_kernel_sched_cst_switch_rsp]\n");
     asm("mov QWORD PTR [rbx], rax\n");
@@ -315,23 +322,26 @@ fn create_thread(entry as i64, band as i64) as i64 {
 
     let is i64 as saved_rsp = stack_top - 56;
 
-    // Fill thread fields
-    thr_set(tid, 0, tid);                       // tid
-    thr_set(tid, 8, THREAD_RUNNABLE);           // state
-    thr_set(tid, 16, SCHED_CLASS_QOS);          // class
-    thr_set(tid, 24, band);                     // band
-    thr_set(tid, 32, band_weight(band));        // weight
-    thr_set(tid, 40, DEFAULT_SLICE_NS);         // slice_ns
-    thr_set(tid, 48, band_min_vruntime(band));  // vruntime = band min
-    let is i64 as vd = band_min_vruntime(band) + (DEFAULT_SLICE_NS * BASE_WEIGHT / band_weight(band));
-    thr_set(tid, 56, vd);                       // virtual_deadline
-    thr_set(tid, 64, saved_rsp);                // kstack_top (saved RSP)
-    thr_set(tid, 72, stack_base);               // kstack_base
-    thr_set(tid, 80, entry);                    // entry_fn
-    thr_set(tid, 96, 0 - 1);                   // next = -1
-    thr_set(tid, 104, 0 - 1);                  // prev = -1
+    // EEVDF: start at band.min_vruntime with lag = 0 (§5.5)
+    let is i64 as w = band_weight(band);
+    let is i64 as mvrt = band_min_vruntime(band);
+    let is i64 as vd = mvrt + (DEFAULT_SLICE_NS * BASE_WEIGHT / w);
 
-    // Insert into run list
+    thr_set(tid, 0, tid);
+    thr_set(tid, 8, THREAD_RUNNABLE);
+    thr_set(tid, 16, SCHED_CLASS_QOS);
+    thr_set(tid, 24, band);
+    thr_set(tid, 32, w);
+    thr_set(tid, 40, DEFAULT_SLICE_NS);
+    thr_set(tid, 48, mvrt);           // vruntime = band.min_vruntime
+    thr_set(tid, 56, vd);             // virtual_deadline
+    thr_set(tid, 64, saved_rsp);
+    thr_set(tid, 72, stack_base);
+    thr_set(tid, 80, entry);
+    thr_set(tid, 96, 0 - 1);
+    thr_set(tid, 104, 0 - 1);
+    thr_set(tid, 112, 0);             // lag = 0
+
     runlist_insert(band, tid);
     nr_running = nr_running + 1;
     thread_count = thread_count + 1;
@@ -340,25 +350,85 @@ fn create_thread(entry as i64, band as i64) as i64 {
 }
 
 // ============================================================
-// Thread entry trampoline — called when a new thread is first scheduled
+// Sleep / Wakeup (§5.4, §15)
 // ============================================================
 
-// Global to pass entry function address to trampoline asm
+fn sleep_thread(tid as i64) as void {
+    // Thread must be RUNNING (current thread sleeping itself)
+    if (thr_state(tid) != THREAD_RUNNING) { return; }
+    thr_set(tid, 8, THREAD_SLEEPING);
+    // Don't re-insert into run list — schedule() will skip it
+    schedule();
+}
+
+fn wakeup_thread(tid as i64) as void {
+    if (thr_state(tid) != THREAD_SLEEPING) { return; }
+
+    let is i64 as band = thr_band(tid);
+    let is i64 as w = thr_weight(tid);
+    let is i64 as mvrt = band_min_vruntime(band);
+
+    // EEVDF sleeper handling (§5.4)
+    let is i64 as old_vrt = thr_vruntime(tid);
+    let is i64 as adjusted = mvrt - SLEEPER_BONUS_NS;
+    let is i64 as new_vrt with mut = old_vrt;
+    if (adjusted > old_vrt) {
+        new_vrt = adjusted;
+    }
+
+    thr_set(tid, 48, new_vrt);         // vruntime
+    thr_set(tid, 112, 0);              // lag = 0
+    let is i64 as vd = new_vrt + (thr_slice(tid) * BASE_WEIGHT / w);
+    thr_set(tid, 56, vd);              // virtual_deadline
+    thr_set(tid, 8, THREAD_RUNNABLE);
+
+    runlist_insert(band, tid);
+    nr_running = nr_running + 1;
+
+    // If woken thread is in higher band than current, force resched (§11.3)
+    if (current_tid >= 0) {
+        if (thr_class(current_tid) == SCHED_CLASS_IDLE) {
+            timer.need_resched = 1;
+        } else {
+            if (thr_class(current_tid) == SCHED_CLASS_QOS) {
+                if (band < thr_band(current_tid)) {
+                    timer.need_resched = 1;
+                }
+            }
+        }
+    }
+}
+
+fn suspend_thread(tid as i64) as void {
+    if (thr_state(tid) != THREAD_RUNNING) { return; }
+    thr_set(tid, 8, THREAD_SUSPENDED);
+    schedule();
+}
+
+fn resume_thread(tid as i64) as void {
+    if (thr_state(tid) != THREAD_SUSPENDED) { return; }
+    // Resume like wakeup but without sleeper bonus
+    let is i64 as band = thr_band(tid);
+    thr_set(tid, 8, THREAD_RUNNABLE);
+    runlist_insert(band, tid);
+    nr_running = nr_running + 1;
+}
+
+// ============================================================
+// Thread entry trampoline
+// ============================================================
+
 let is i64 as trampoline_entry with mut = 0;
 
 fn thread_entry_trampoline() as void {
-    // Enable interrupts (we arrive here with IRQs disabled)
     asm(".byte 0xFB\n");  // sti
 
-    // Get entry function via Caustic (correct offset calculation)
     trampoline_entry = thr_entry(current_tid);
 
-    // Call entry function via global (avoids imul immediate bug in caustic-as)
     asm("lea rax, [rip+_kernel_sched_cst_trampoline_entry]\n");
     asm("mov rax, QWORD PTR [rax]\n");
     asm("call rax\n");
 
-    // Thread returned — mark as dead and yield
     thr_set(current_tid, 8, THREAD_DEAD);
     nr_running = nr_running - 1;
     schedule();
@@ -369,68 +439,70 @@ fn thread_entry_trampoline() as void {
 }
 
 // ============================================================
-// Context switch — save/restore callee-saved registers + RSP
+// pick_next — EEVDF eligible selection (§5.2)
 // ============================================================
 
-// Context switch is done INLINE in schedule() via asm.
-// No separate function = no compiler prologue/epilogue issues.
-// The fake stack frame for new threads only needs our 6 callee-saved + RIP.
-
-// ============================================================
-// pick_next — find highest priority runnable thread
-// ============================================================
+fn pick_next_in_band(band as i64) as i64 {
+    // Walk sorted list, find first eligible thread (lag >= 0)
+    let is i64 as cur with mut = band_head(band);
+    while (cur >= 0) {
+        if (thr_lag(cur) >= 0) {
+            return cur;
+        }
+        cur = thr_next(cur);
+    }
+    // No eligible thread — all have negative lag.
+    // Fallback: pick the one with smallest virtual_deadline anyway.
+    // This prevents starvation when all threads have negative lag.
+    return band_head(band);
+}
 
 fn pick_next() as i64 {
-    // Check QoS bands in priority order
     let is i64 as b with mut = 0;
     while (b < NUM_QOS_BANDS) {
         if (band_count(b) > 0) {
-            let is i64 as head = band_head(b);
-            if (head >= 0) {
-                return head;
+            let is i64 as tid = pick_next_in_band(b);
+            if (tid >= 0) {
+                return tid;
             }
         }
         b = b + 1;
     }
-
-    // Fallback: idle thread
     return idle_tid;
 }
 
 // ============================================================
-// schedule — main scheduling decision
+// schedule — main scheduling decision (§10)
 // ============================================================
 
 fn schedule() as void {
     if (sched_active == 0) { return; }
 
-    // Disable interrupts for scheduling
     asm(".byte 0xFA\n");  // cli
 
     let is i64 as now = timer.current_time_ns();
     let is i64 as prev = current_tid;
 
-    // Account current thread's runtime and re-insert into run list
+    // Account current thread's runtime
     if (prev >= 0) {
         if (thr_state(prev) == THREAD_RUNNING) {
             let is i64 as elapsed = now - current_start_ns;
             if (elapsed > 0) {
                 if (thr_class(prev) == SCHED_CLASS_QOS) {
                     update_vruntime(prev, elapsed);
+                    // Update band min_vruntime after accounting
+                    update_band_min_vruntime(thr_band(prev));
                 }
             }
             thr_set(prev, 8, THREAD_RUNNABLE);
-            // Only re-insert QoS threads — idle is never in a run list
             if (thr_class(prev) == SCHED_CLASS_QOS) {
-                let is i64 as band = thr_band(prev);
-                runlist_insert(band, prev);
+                runlist_insert(thr_band(prev), prev);
             }
         }
+        // SLEEPING/SUSPENDED/DEAD threads: don't re-insert
     }
 
-    // Pick next
     let is i64 as next with mut = pick_next();
-
     if (next < 0) {
         next = idle_tid;
     }
@@ -444,23 +516,21 @@ fn schedule() as void {
     current_tid = next;
     current_start_ns = timer.current_time_ns();
     nr_switches = nr_switches + 1;
-
-    // Reset need_resched
     timer.need_resched = 0;
 
-    // Context switch if different thread
+    // Context switch
     if (prev != next) {
         if (prev >= 0) {
+            // Track switch type
+            if (thr_state(prev) == THREAD_RUNNABLE) {
+                thr_set(prev, 128, thr_get(prev, 128) + 1);  // forced_switches
+            } else {
+                thr_set(prev, 120, thr_get(prev, 120) + 1);  // voluntary_switches
+            }
+
             ctx_old_rsp_ptr = thread_ptr(prev) + 64;
             ctx_new_rsp = thr_kstack_top(next);
 
-            // Inline context switch:
-            // 1. Push callee-saved regs on old stack
-            // 2. Push .Lresume label as "return address"
-            // 3. Save RSP to old thread's kstack_top
-            // 4. Load new thread's RSP
-            // 5. ret → pops RIP: trampoline (new) or .Lresume (resumed old)
-            // Old thread resumes at .Lresume and pops its saved regs.
             asm("push r15\n");
             asm("push r14\n");
             asm("push r13\n");
@@ -469,15 +539,12 @@ fn schedule() as void {
             asm("push rbp\n");
             asm("lea rax, [rip+.Lresume]\n");
             asm("push rax\n");
-            // Save old RSP
             asm("lea rax, [rip+_kernel_sched_cst_ctx_old_rsp_ptr]\n");
             asm("mov rax, QWORD PTR [rax]\n");
             asm("mov QWORD PTR [rax], rsp\n");
-            // Load new RSP and ret (jumps to trampoline or .Lresume)
             asm("lea rax, [rip+_kernel_sched_cst_ctx_new_rsp]\n");
             asm("mov rsp, QWORD PTR [rax]\n");
             asm("ret\n");
-            // Old thread resumes here when switched back:
             asm(".Lresume:\n");
             asm("pop rbp\n");
             asm("pop rbx\n");
@@ -492,17 +559,27 @@ fn schedule() as void {
 }
 
 // ============================================================
-// Timer tick callback — called from timer to check preemption
+// Timer tick — check preemption (§11.3)
 // ============================================================
 
 fn on_timer_tick() as void {
     if (sched_active == 0) { return; }
 
-    // Check if quantum expired (5ms default)
     let is i64 as now = timer.current_time_ns();
     let is i64 as elapsed = now - current_start_ns;
 
-    if (elapsed >= DEFAULT_SLICE_NS) {
+    // Always resched if current is idle and there are runnable threads
+    if (current_tid >= 0) {
+        if (thr_class(current_tid) == SCHED_CLASS_IDLE) {
+            if (nr_running > 0) {
+                timer.need_resched = 1;
+            }
+            return;
+        }
+    }
+
+    // Quantum expired?
+    if (elapsed >= quantum_ns) {
         timer.need_resched = 1;
     }
 }
@@ -516,12 +593,11 @@ fn yield_cpu() as void {
 }
 
 // ============================================================
-// Idle thread function
+// Idle loop
 // ============================================================
 
 fn idle_fn() as void {
     while (1 == 1) {
-        // Check if scheduler wants to run
         if (timer.need_resched != 0) {
             schedule();
         }
@@ -536,7 +612,6 @@ fn idle_fn() as void {
 fn init() as void {
     serial.println("sched: init", 11);
 
-    // Zero band lists
     let is i64 as b with mut = 0;
     while (b < NUM_QOS_BANDS) {
         band_set_head(b, 0 - 1);
@@ -545,12 +620,11 @@ fn init() as void {
         b = b + 1;
     }
 
-    // Create idle thread (not in any run list)
+    // Create idle thread
     idle_tid = next_tid;
     let is i64 as itid = next_tid;
     next_tid = next_tid + 1;
 
-    // Zero idle thread struct
     let is *u8 as tp = cast(*u8, thread_ptr(itid));
     let is i64 as z with mut = 0;
     while (z < THREAD_SIZE) {
@@ -561,24 +635,19 @@ fn init() as void {
     thr_set(itid, 0, itid);
     thr_set(itid, 8, THREAD_RUNNING);
     thr_set(itid, 16, SCHED_CLASS_IDLE);
-    thr_set(itid, 24, 0);
     thr_set(itid, 32, BASE_WEIGHT);
     thr_set(itid, 40, DEFAULT_SLICE_NS);
     thr_set(itid, 96, 0 - 1);
     thr_set(itid, 104, 0 - 1);
 
-    // The idle thread uses the current (boot) stack — no allocation needed
-    // kstack_top will be saved when we first switch away from it
     current_tid = itid;
     current_start_ns = timer.current_time_ns();
 
     serial.println("sched: ready", 12);
 }
 
-// Start scheduling (call after creating initial threads)
 fn start() as void {
     sched_active = 1;
     serial.println("sched: active", 13);
-    // Enter idle loop — scheduler will pick threads on timer ticks
     idle_fn();
 }
