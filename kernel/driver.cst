@@ -9,6 +9,7 @@
 use "pmm.cst" as pmm;
 use "heap.cst" as heap;
 use "serial.cst" as serial;
+use "sched.cst" as sched;
 
 // ============================================================
 // DeviceState
@@ -160,4 +161,138 @@ fn init() as void {
 
 fn get_root() as *Device {
     return cast(*Device, root_device);
+}
+
+// ============================================================
+// Tree lock — single-CPU: block preemption, don't touch IRQ flag.
+// Composable: preempt_count is a counter, nested locks are safe.
+// Lock ordering (for future bus-type lock): always acquire tree_lock
+// BEFORE any bus-specific lock.
+// ============================================================
+
+fn tree_lock() as void {
+    sched.preempt_disable();
+    driver_tree_lock = 1;
+}
+
+fn tree_unlock() as void {
+    driver_tree_lock = 0;
+    sched.preempt_enable();
+}
+
+// ============================================================
+// Device allocation + lifecycle
+// ============================================================
+
+// kmalloc's second arg is flags, not alignment. The current kernel has no
+// alignment-aware allocator; kmalloc slabs are naturally pointer-aligned
+// (8 bytes), which satisfies every Device-sized allocation today. The
+// align parameter is kept in the signature per spec for forward-compat.
+fn device_alloc(size as i64, align as i64) as *Device {
+    let is i64 as addr = heap.kmalloc(size, 0);
+    if (addr == 0) { return cast(*Device, 0); }
+    let is *u8 as p = cast(*u8, addr);
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        p[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    return cast(*Device, addr);
+}
+
+// Links dev into parent's child list. Caller must have populated dev's
+// bus-specific fields (and dev.bus_type if dev is a BusInstance).
+// Returns OK, INVALID_ARGUMENT. Panics on double-registration.
+fn device_register(dev as *Device, parent as *Device) as i32 {
+    if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, dev.parent) != 0) {
+        pmm.panic("device_register: already registered", 35);
+    }
+
+    tree_lock();
+
+    dev.parent = parent;
+    dev.first_child = cast(*Device, 0);
+    dev.next_sibling = cast(*Device, 0);
+    dev.prev_sibling = cast(*Device, 0);
+
+    if (cast(i64, parent) != 0) {
+        // Inherit bus_type from parent unless caller already set it
+        // (BusInstance pre-sets its own bus_type per spec fix #15).
+        if (cast(i64, dev.bus_type) == 0) {
+            dev.bus_type = parent.bus_type;
+        }
+        let is *Device as old_head = parent.first_child;
+        dev.next_sibling = old_head;
+        if (cast(i64, old_head) != 0) {
+            old_head.prev_sibling = dev;
+        }
+        parent.first_child = dev;
+    }
+
+    tree_unlock();
+    return OK;
+}
+
+// Panics on invariant violation (state != DEAD, has children, or resources
+// still tracked). Unlinks dev from the tree and frees it.
+fn device_unregister(dev as *Device) as void {
+    if (cast(i64, dev) == 0) {
+        pmm.panic("device_unregister: null dev", 27);
+    }
+
+    tree_lock();
+
+    if (dev.state != STATE_DEAD) {
+        pmm.panic("device_unregister: not DEAD", 27);
+    }
+    if (cast(i64, dev.first_child) != 0) {
+        pmm.panic("device_unregister: has children", 31);
+    }
+    // Invariant #19: resources must be released before unregister.
+    if (cast(i64, dev.mmio_list) != 0) {
+        pmm.panic("device_unregister: mmio_list not empty", 38);
+    }
+    if (cast(i64, dev.irq_list) != 0) {
+        pmm.panic("device_unregister: irq_list not empty", 37);
+    }
+    if (cast(i64, dev.dma_list) != 0) {
+        pmm.panic("device_unregister: dma_list not empty", 37);
+    }
+
+    if (cast(i64, dev.parent) != 0) {
+        let is *Device as parent = dev.parent;
+        if (cast(i64, dev.prev_sibling) == 0) {
+            parent.first_child = dev.next_sibling;
+        } else {
+            dev.prev_sibling.next_sibling = dev.next_sibling;
+        }
+        if (cast(i64, dev.next_sibling) != 0) {
+            dev.next_sibling.prev_sibling = dev.prev_sibling;
+        }
+    }
+
+    tree_unlock();
+
+    heap.kfree(cast(i64, dev));
+}
+
+// Validates a state transition and applies it under the tree lock
+// (single-CPU: sufficient coverage; SMP will refine to per-device lock).
+// Returns OK or INVALID_STATE_TRANSITION.
+fn device_set_state(dev as *Device, new_state as i32) as i32 {
+    tree_lock();
+    let is i32 as cur = dev.state;
+    let is i32 as valid with mut = 0;
+    if (cur == STATE_UNINITIALIZED && new_state == STATE_PROBED)    { valid = 1; }
+    if (cur == STATE_UNINITIALIZED && new_state == STATE_DEAD)      { valid = 1; }
+    if (cur == STATE_PROBED        && new_state == STATE_DETACHING) { valid = 1; }
+    if (cur == STATE_DETACHING     && new_state == STATE_DEAD)      { valid = 1; }
+    if (valid == 0) {
+        tree_unlock();
+        return INVALID_STATE_TRANSITION;
+    }
+    dev.state = new_state;
+    tree_unlock();
+    return OK;
 }
