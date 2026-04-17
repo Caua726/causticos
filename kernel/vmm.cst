@@ -27,6 +27,7 @@ let is i64 as PTE_ADDR_MASK with mut = 0;
 let is i64 as PTE_TABLE with mut = 0;       // PRESENT | WRITE | NX
 let is i64 as PTE_TABLE_USER with mut = 0;  // PRESENT | WRITE | USER | NX
 let is i64 as KMAP_DATA with mut = 0;       // PRESENT | WRITE | NX
+let is i64 as KMAP_MMIO with mut = 0;       // PRESENT | WRITE | NX | PCD | PWT (UC)
 
 // Address space layout
 let is i64 as USER_SPACE_END with mut = 0;
@@ -36,6 +37,13 @@ let is i64 as PML4_KERNEL_END  = 511;
 // kvalloc range
 let is i64 as KVALLOC_BASE  = 0xFFFFC00000000000;
 let is i64 as KVALLOC_PAGES = 262144;       // 1 GiB / 4 KiB
+
+// MMIO virtual range — bump-allocated, uncached pages for device registers.
+// Not reclaimed on unmap today (small, boot-time use); a bitmap is easy to
+// add later if drivers churn MMIO ranges.
+let is i64 as MMIO_BASE      = 0xFFFFD00000000000;
+let is i64 as MMIO_SIZE_LIMIT = 0x40000000;  // 1 GiB of virtual MMIO space
+let is i64 as mmio_next_offset with mut = 0;
 
 // ============================================================
 // Paging index extraction
@@ -737,6 +745,61 @@ let is i64 as dma_result_vaddr with mut = 0;
 let is i64 as dma_result_phys with mut = 0;
 let is i64 as dma_result_order with mut = 0;
 
+// ============================================================
+// MMIO: uncached mapping of device-owned physical memory.
+// Bump allocator over [MMIO_BASE, MMIO_BASE + MMIO_SIZE_LIMIT).
+// Returns 0 on exhaustion. Unmap tears down PTEs but does not reclaim VA.
+// ============================================================
+
+fn mmio_map(phys as i64, size as i64) as i64 {
+    if (size <= 0) { return 0; }
+
+    let is i64 as phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
+    let is i64 as phys_offset  = phys - phys_aligned;
+    let is i64 as span         = pmm.align_up(size + phys_offset, pmm.PAGE_SIZE);
+    let is i64 as pages        = span / pmm.PAGE_SIZE;
+
+    sched_preempt_guard_enter();
+    if (mmio_next_offset + span > MMIO_SIZE_LIMIT) {
+        sched_preempt_guard_exit();
+        return 0;
+    }
+    let is i64 as vaddr = MMIO_BASE + mmio_next_offset;
+    mmio_next_offset = mmio_next_offset + span;
+    sched_preempt_guard_exit();
+
+    let is i64 as i with mut = 0;
+    while (i < pages) {
+        vmm_map_page(kas_pml4_phys,
+            vaddr + i * pmm.PAGE_SIZE,
+            phys_aligned + i * pmm.PAGE_SIZE,
+            KMAP_MMIO);
+        i = i + 1;
+    }
+    flush_tlb_range(vaddr, pages);
+    return vaddr + phys_offset;
+}
+
+fn mmio_unmap(vaddr as i64, size as i64) as void {
+    if (size <= 0) { return; }
+    let is i64 as va_aligned = vaddr & ~(pmm.PAGE_SIZE - 1);
+    let is i64 as va_offset  = vaddr - va_aligned;
+    let is i64 as pages      = pmm.align_up(size + va_offset, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
+
+    let is i64 as i with mut = 0;
+    while (i < pages) {
+        vmm_unmap_page(kas_pml4_phys, va_aligned + i * pmm.PAGE_SIZE);
+        i = i + 1;
+    }
+    flush_tlb_range(va_aligned, pages);
+    // VA slot remains leaked by the bump allocator (see MMIO_SIZE_LIMIT).
+}
+
+// Guards for the bump-cursor increment. Inlined helpers to avoid pulling
+// a circular dep on sched.cst (which already uses vmm).
+fn sched_preempt_guard_enter() as void { asm("cli\n"); }
+fn sched_preempt_guard_exit()  as void { asm("sti\n"); }
+
 fn ceil_log2(v as i64) as i32 {
     if (v <= 1) { return cast(i32, 0); }
     let is i32 as n with mut = 0;
@@ -790,6 +853,7 @@ fn init() as void {
     PTE_TABLE = PTE_PRESENT | PTE_WRITE | PTE_NX;
     PTE_TABLE_USER = PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX;
     KMAP_DATA = PTE_PRESENT | PTE_WRITE | PTE_NX;
+    KMAP_MMIO = PTE_PRESENT | PTE_WRITE | PTE_NX | PTE_PCD | PTE_PWT;
     USER_SPACE_END = 0x00007FFFFFFFFFFF;
 
     // Read Limine's PML4

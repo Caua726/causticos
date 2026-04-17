@@ -10,6 +10,7 @@ use "pmm.cst" as pmm;
 use "heap.cst" as heap;
 use "serial.cst" as serial;
 use "sched.cst" as sched;
+use "vmm.cst" as vmm;
 
 // ============================================================
 // DeviceState
@@ -325,9 +326,6 @@ fn bus_instance_register(bi as *BusInstance, parent as *Device) as i32 {
 // per spec §Cleanup Ordering.
 //
 // Limitations for V1:
-//   - mmio_map hands out HHDM aliases (limine's phys->virt direct map).
-//     Cacheability is whatever HHDM uses (write-back); real MMIO needing
-//     uncached access will require a dedicated vmm.mmio_map helper.
 //   - dma_alloc supports up to one page (PAGE_SIZE = 4096). Multi-page
 //     contiguous allocations need alloc_pages with order>0; added later.
 //   - irq_register tracks the binding but does not yet program the IDT or
@@ -337,14 +335,21 @@ fn bus_instance_register(bi as *BusInstance, parent as *Device) as i32 {
 fn mmio_map(dev as *Device, phys as u64, size as u64, flags as u32, out as **u8) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, out) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, size) == 0) { return INVALID_ARGUMENT; }
+
+    let is i64 as vaddr = vmm.mmio_map(cast(i64, phys), cast(i64, size));
+    if (vaddr == 0) { return OUT_OF_MEMORY; }
 
     let is i64 as node_addr = heap.kmalloc(sizeof(MmioRegion), 0);
-    if (node_addr == 0) { return OUT_OF_MEMORY; }
+    if (node_addr == 0) {
+        vmm.mmio_unmap(vaddr, cast(i64, size));
+        return OUT_OF_MEMORY;
+    }
     let is *MmioRegion as r = cast(*MmioRegion, node_addr);
     r.phys = phys;
     r.size = size;
     r.flags = flags;
-    r.mapped_at = cast(*u8, pmm.hhdm + cast(i64, phys));
+    r.mapped_at = cast(*u8, vaddr);
 
     sched.preempt_disable();
     r.next = dev.mmio_list;
@@ -367,6 +372,7 @@ fn mmio_unmap(dev as *Device, region as *MmioRegion) as void {
             if (cast(i64, prev) == 0) { dev.mmio_list = cur.next; }
             else                       { prev.next = cur.next; }
             sched.preempt_enable();
+            vmm.mmio_unmap(cast(i64, cur.mapped_at), cast(i64, cur.size));
             heap.kfree(cast(i64, cur));
             return;
         }
