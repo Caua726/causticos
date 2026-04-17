@@ -1,19 +1,18 @@
-// pci.cst — PCI config-space access (Mechanism #1, port I/O via 0xCF8/0xCFC).
+// pci.cst — PCI bus integration with the driver framework.
 //
-// Exposes pci_config_read8/16/32 and pci_config_write32, plus a
-// pci_probe_bus0 diagnostic that walks bus 0 and prints any devices found.
-// Later steps will add PciDevice struct, bus enumeration that feeds the
-// driver framework, and PciMatchSpec for drivers.
+// Mechanism #1 config-space access + per-function Device allocation.
+// A single BusInstance is registered for bus 0; PCI-to-PCI bridges
+// enumerate their secondary bus inline, attaching children to the
+// bridge PciDevice rather than spawning new BusInstances.
 
 use "port.cst" as port;
+use "driver.cst" as driver;
 use "serial.cst" as serial;
 use "util.cst" as util;
 
 let is i64 as CONFIG_ADDRESS = 0xCF8;
 let is i64 as CONFIG_DATA    = 0xCFC;
 
-// Compose a 32-bit CONFIG_ADDRESS value. Offset is truncated to its
-// dword-aligned bits (the mechanism reads/writes dwords at a time).
 fn pci_addr(bus as i32, dev as i32, func as i32, off as i32) as i64 {
     let is i64 as a with mut = 0x80000000;
     a = a | (cast(i64, bus)  << 16);
@@ -25,79 +24,170 @@ fn pci_addr(bus as i32, dev as i32, func as i32, off as i32) as i64 {
 
 fn pci_config_read32(bus as i32, dev as i32, func as i32, off as i32) as i64 {
     port.outl(CONFIG_ADDRESS, pci_addr(bus, dev, func, off));
-    return port.inl(CONFIG_DATA) & 0xFFFFFFFF;
+    return port.inl(CONFIG_DATA);
 }
 
 fn pci_config_read16(bus as i32, dev as i32, func as i32, off as i32) as i64 {
     let is i64 as dw = pci_config_read32(bus, dev, func, off);
-    let is i64 as shift = cast(i64, (off & 2)) * 8;
-    return (dw >> shift) & 0xFFFF;
+    return (dw >> (cast(i64, (off & 2)) * 8)) & 0xFFFF;
 }
 
 fn pci_config_read8(bus as i32, dev as i32, func as i32, off as i32) as i64 {
     let is i64 as dw = pci_config_read32(bus, dev, func, off);
-    let is i64 as shift = cast(i64, (off & 3)) * 8;
-    return (dw >> shift) & 0xFF;
+    return (dw >> (cast(i64, (off & 3)) * 8)) & 0xFF;
 }
 
 fn pci_config_write32(bus as i32, dev as i32, func as i32, off as i32, val as i64) as void {
     port.outl(CONFIG_ADDRESS, pci_addr(bus, dev, func, off));
-    port.outl(CONFIG_DATA, val & 0xFFFFFFFF);
+    port.outl(CONFIG_DATA, val);
 }
 
-// Convenience accessors.
-fn pci_vendor_id(bus as i32, dev as i32, func as i32) as i64 {
-    return pci_config_read16(bus, dev, func, cast(i32, 0));
+struct PciDevice {
+    base as driver.Device;
+    bus as u8;
+    dev as u8;
+    func as u8;
+    class_code as u8;
+    subclass as u8;
+    prog_if as u8;
+    revision as u8;
+    header_type as u8;
+    vendor as u16;
+    device_id as u16;
+    bar0 as u32;
+    bar1 as u32;
+    bar2 as u32;
+    bar3 as u32;
+    bar4 as u32;
+    bar5 as u32;
 }
 
-fn pci_device_id(bus as i32, dev as i32, func as i32) as i64 {
-    return pci_config_read16(bus, dev, func, cast(i32, 2));
+let is driver.BusType     as pci_bt;
+let is driver.BusInstance as pci_bi0;
+
+// Bus-level match callback. No PCI drivers are registered yet; step 4 wires
+// this up to each Driver's PciMatchSpec.
+fn pci_match(bt as *driver.BusType, dev as *driver.Device, drv as *driver.Driver) as i32 {
+    return 0;
 }
 
-// Returns header_type. Bit 7 set means multi-function device.
-fn pci_header_type(bus as i32, dev as i32, func as i32) as i64 {
-    return pci_config_read8(bus, dev, func, cast(i32, 0x0E));
-}
-
-// Diagnostic: walk bus 0, print vendor/device/class for each present
-// function. Does not touch the framework — just proves config reads work.
-fn pci_probe_bus0() as void {
-    serial.println("pci: probing bus 0", 18);
+// Walks one PCI bus, registering every present function as a child of `parent`.
+// Bridges (class=0x06, subclass=0x04) recurse into their secondary bus, placing
+// children under the bridge PciDevice so the framework's DFS probe visits them
+// in topological order.
+fn enumerate_bus(parent as *driver.Device, bus as i32) as void {
     let is i32 as d with mut = cast(i32, 0);
     while (d < 32) {
-        let is i64 as ven = pci_vendor_id(cast(i32, 0), d, cast(i32, 0));
+        let is i64 as ven = pci_config_read16(bus, d, cast(i32, 0), cast(i32, 0));
         if (ven != 0xFFFF) {
+            let is i64 as ht0 = pci_config_read8(bus, d, cast(i32, 0), cast(i32, 0x0E));
+            let is i32 as nfn with mut = cast(i32, 1);
+            if ((ht0 & 0x80) != 0) { nfn = cast(i32, 8); }
             let is i32 as f with mut = cast(i32, 0);
-            let is i64 as ht = pci_header_type(cast(i32, 0), d, cast(i32, 0));
-            let is i64 as nfn with mut = 1;
-            if ((ht & 0x80) != 0) { nfn = 8; }
-            while (cast(i64, f) < nfn) {
-                let is i64 as fven = pci_vendor_id(cast(i32, 0), d, f);
+            while (f < nfn) {
+                let is i64 as fven = pci_config_read16(bus, d, f, cast(i32, 0));
                 if (fven != 0xFFFF) {
-                    let is i64 as fdev = pci_device_id(cast(i32, 0), d, f);
-                    let is i64 as cls  = pci_config_read32(cast(i32, 0), d, f, cast(i32, 8));
-                    let is i64 as cc   = (cls >> 24) & 0xFF;
-                    let is i64 as sc   = (cls >> 16) & 0xFF;
-                    let is i64 as pif  = (cls >> 8)  & 0xFF;
-                    serial.print("  00:", 5);
-                    util.print_num(cast(i64, d));
-                    serial.putc(46);                // '.'
-                    util.print_num(cast(i64, f));
-                    serial.print("  ven=", 6);
-                    util.print_hex(fven);
-                    serial.print(" dev=", 5);
-                    util.print_hex(fdev);
-                    serial.print(" class=", 7);
-                    util.print_hex(cc);
-                    serial.putc(58);                // ':'
-                    util.print_hex(sc);
-                    serial.putc(58);
-                    util.print_hex(pif);
-                    serial.println("", 0);
+                    enumerate_function(parent, bus, d, f, fven);
                 }
                 f = f + cast(i32, 1);
             }
         }
         d = d + cast(i32, 1);
     }
+}
+
+fn enumerate_function(parent as *driver.Device, bus as i32, d as i32, f as i32, fven as i64) as void {
+    let is i64 as pd_addr = cast(i64, driver.device_alloc(sizeof(PciDevice), 8));
+    if (pd_addr == 0) {
+        serial.println("pci: device_alloc failed", 24);
+        return;
+    }
+    let is *PciDevice as pd = cast(*PciDevice, pd_addr);
+
+    let is i64 as fdev = pci_config_read16(bus, d, f, cast(i32, 2));
+    let is i64 as cls  = pci_config_read32(bus, d, f, cast(i32, 8));
+    let is i64 as ht   = pci_config_read8(bus, d, f, cast(i32, 0x0E));
+    let is i64 as cc   = (cls >> 24) & 0xFF;
+    let is i64 as sc   = (cls >> 16) & 0xFF;
+    let is i64 as pif  = (cls >> 8)  & 0xFF;
+    let is i64 as rev  = cls & 0xFF;
+
+    pd.bus         = cast(u8, bus);
+    pd.dev         = cast(u8, d);
+    pd.func        = cast(u8, f);
+    pd.vendor      = cast(u16, fven);
+    pd.device_id   = cast(u16, fdev);
+    pd.revision    = cast(u8, rev);
+    pd.prog_if     = cast(u8, pif);
+    pd.subclass    = cast(u8, sc);
+    pd.class_code  = cast(u8, cc);
+    pd.header_type = cast(u8, ht & 0x7F);
+
+    if ((ht & 0x7F) == 0) {
+        pd.bar0 = cast(u32, pci_config_read32(bus, d, f, cast(i32, 0x10)));
+        pd.bar1 = cast(u32, pci_config_read32(bus, d, f, cast(i32, 0x14)));
+        pd.bar2 = cast(u32, pci_config_read32(bus, d, f, cast(i32, 0x18)));
+        pd.bar3 = cast(u32, pci_config_read32(bus, d, f, cast(i32, 0x1C)));
+        pd.bar4 = cast(u32, pci_config_read32(bus, d, f, cast(i32, 0x20)));
+        pd.bar5 = cast(u32, pci_config_read32(bus, d, f, cast(i32, 0x24)));
+    }
+
+    pd.base.name[0] = cast(u8, 112); // 'p'
+    pd.base.name[1] = cast(u8, 99);  // 'c'
+    pd.base.name[2] = cast(u8, 105); // 'i'
+    pd.base.state = driver.STATE_UNINITIALIZED;
+    pd.base.bus_type = &pci_bt;
+
+    let is *driver.Device as as_dev = cast(*driver.Device, pd);
+    let is i32 as rc = driver.device_register(as_dev, parent);
+    if (rc != driver.OK) {
+        serial.println("pci: device_register failed", 27);
+        return;
+    }
+
+    serial.print("pci: ", 5);
+    util.print_num(cast(i64, bus));
+    serial.putc(58);
+    util.print_num(cast(i64, d));
+    serial.putc(46);
+    util.print_num(cast(i64, f));
+    serial.print(" ven=", 5);
+    util.print_hex(fven);
+    serial.print(" dev=", 5);
+    util.print_hex(fdev);
+    serial.print(" class=", 7);
+    util.print_hex(cc);
+    serial.putc(58);
+    util.print_hex(sc);
+    serial.println("", 0);
+
+    // PCI-to-PCI bridge: walk secondary bus under this device.
+    if (cc == 0x06 && sc == 0x04) {
+        let is i64 as sec = pci_config_read8(bus, d, f, cast(i32, 0x19));
+        enumerate_bus(as_dev, cast(i32, sec));
+    }
+}
+
+fn pci_enumerate(bi as *driver.BusInstance) as void {
+    serial.println("pci: enumerate bus 0", 20);
+    enumerate_bus(cast(*driver.Device, bi), cast(i32, 0));
+}
+
+fn register() as void {
+    pci_bt.name[0] = cast(u8, 112); // 'p'
+    pci_bt.name[1] = cast(u8, 99);  // 'c'
+    pci_bt.name[2] = cast(u8, 105); // 'i'
+    pci_bt.match_fn = fn_ptr(pci_match);
+    pci_bt.enumerate_instance = fn_ptr(pci_enumerate);
+    driver.bus_type_register(&pci_bt);
+
+    pci_bi0.base.bus_type = &pci_bt;
+    pci_bi0.base.state = driver.STATE_UNINITIALIZED;
+    pci_bi0.base.name[0] = cast(u8, 112);
+    pci_bi0.base.name[1] = cast(u8, 99);
+    pci_bi0.base.name[2] = cast(u8, 105);
+    pci_bi0.base.name[3] = cast(u8, 48); // '0'
+    driver.bus_instance_register(&pci_bi0, driver.get_root());
+
+    serial.println("pci: registered", 15);
 }
