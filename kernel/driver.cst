@@ -11,6 +11,7 @@ use "heap.cst" as heap;
 use "serial.cst" as serial;
 use "sched.cst" as sched;
 use "vmm.cst" as vmm;
+use "lapic.cst" as lapic;
 
 // ============================================================
 // DeviceState
@@ -63,7 +64,7 @@ struct MmioRegion {
 struct IrqBinding {
     vector as u32;
     kind as i32;
-    handler as *u8;   // fn(*Device, *u8) as i32
+    handler as fn(*Device, *u8) as i32;
     context as *u8;
     next as *IrqBinding;
 }
@@ -441,12 +442,49 @@ fn dma_free(dev as *Device, buffer as *DmaBuffer) as void {
     sched.preempt_enable();
 }
 
-// IRQ tracking only in V1 — the framework does not yet program the IDT or
-// LAPIC. Drivers that register a handler will not receive interrupts until
-// the IRQ subsystem is wired up in a later commit.
+// IRQ dispatch tables — one slot per 256 vectors. Lookup is O(1) from the
+// asm stub. Entry is (device, handler, context) triple. Null handler means
+// no driver registered for that vector.
+let is [2048]u8 as irq_handler_tbl_raw;   // 256 slots × 8 bytes
+let is [2048]u8 as irq_device_tbl_raw;
+let is [2048]u8 as irq_context_tbl_raw;
+
+fn irq_tbl_get(base as *u8, v as i64) as i64 {
+    let is *i64 as t = cast(*i64, base);
+    return t[v];
+}
+
+fn irq_tbl_set(base as *u8, v as i64, val as i64) as void {
+    let is *i64 as t = cast(*i64, base);
+    t[v] = val;
+}
+
+// Called from the asm stub with the vector number in rdi. Looks up the
+// registered handler and calls it. Emits LAPIC EOI after the handler
+// returns so that both software-triggered (int N) and LAPIC-delivered
+// interrupts are cleanly acked.
+fn driver_irq_dispatch(vector as i64) as void {
+    if (vector < 0) { return; }
+    if (vector > 255) { return; }
+    let is i64 as hptr = irq_tbl_get(cast(*u8, &irq_handler_tbl_raw), vector);
+    if (hptr == 0) {
+        // Spurious or unregistered — still EOI so the LAPIC doesn't wedge.
+        lapic.eoi();
+        return;
+    }
+    let is i64 as dptr = irq_tbl_get(cast(*u8, &irq_device_tbl_raw), vector);
+    let is i64 as cptr = irq_tbl_get(cast(*u8, &irq_context_tbl_raw), vector);
+    let is fn(*Device, *u8) as i32 as h = cast(fn(*Device, *u8) as i32, hptr);
+    call(h, cast(*Device, dptr), cast(*u8, cptr));
+    lapic.eoi();
+}
+
 fn irq_register(dev as *Device, vector as u32, kind as i32,
-                handler as *u8, context as *u8) as i32 {
+                handler as fn(*Device, *u8) as i32, context as *u8) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
+    let is i64 as v = cast(i64, vector);
+    if (v < 0) { return IRQ_INVALID_VECTOR; }
+    if (v > 255) { return IRQ_INVALID_VECTOR; }
 
     let is i64 as node_addr = heap.kmalloc(sizeof(IrqBinding), 0);
     if (node_addr == 0) { return OUT_OF_MEMORY; }
@@ -457,6 +495,14 @@ fn irq_register(dev as *Device, vector as u32, kind as i32,
     b.context = context;
 
     sched.preempt_disable();
+    if (irq_tbl_get(cast(*u8, &irq_handler_tbl_raw), v) != 0) {
+        sched.preempt_enable();
+        heap.kfree(node_addr);
+        return ALREADY_EXISTS;
+    }
+    irq_tbl_set(cast(*u8, &irq_handler_tbl_raw), v, cast(i64, handler));
+    irq_tbl_set(cast(*u8, &irq_device_tbl_raw),  v, cast(i64, dev));
+    irq_tbl_set(cast(*u8, &irq_context_tbl_raw), v, cast(i64, context));
     b.next = dev.irq_list;
     dev.irq_list = b;
     sched.preempt_enable();
@@ -465,6 +511,9 @@ fn irq_register(dev as *Device, vector as u32, kind as i32,
 
 fn irq_unregister(dev as *Device, vector as u32) as void {
     if (cast(i64, dev) == 0) { return; }
+    let is i64 as v = cast(i64, vector);
+    if (v < 0) { return; }
+    if (v > 255) { return; }
 
     sched.preempt_disable();
     let is *IrqBinding as cur with mut = dev.irq_list;
@@ -473,6 +522,9 @@ fn irq_unregister(dev as *Device, vector as u32) as void {
         if (cur.vector == vector) {
             if (cast(i64, prev) == 0) { dev.irq_list = cur.next; }
             else                       { prev.next = cur.next; }
+            irq_tbl_set(cast(*u8, &irq_handler_tbl_raw), v, 0);
+            irq_tbl_set(cast(*u8, &irq_device_tbl_raw),  v, 0);
+            irq_tbl_set(cast(*u8, &irq_context_tbl_raw), v, 0);
             sched.preempt_enable();
             heap.kfree(cast(i64, cur));
             return;
