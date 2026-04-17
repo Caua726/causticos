@@ -249,16 +249,6 @@ fn device_unregister(dev as *Device) as void {
     if (cast(i64, dev.first_child) != 0) {
         pmm.panic("device_unregister: has children", 31);
     }
-    // Invariant #19: resources must be released before unregister.
-    if (cast(i64, dev.mmio_list) != 0) {
-        pmm.panic("device_unregister: mmio_list not empty", 38);
-    }
-    if (cast(i64, dev.irq_list) != 0) {
-        pmm.panic("device_unregister: irq_list not empty", 37);
-    }
-    if (cast(i64, dev.dma_list) != 0) {
-        pmm.panic("device_unregister: dma_list not empty", 37);
-    }
 
     if (cast(i64, dev.parent) != 0) {
         let is *Device as parent = dev.parent;
@@ -274,6 +264,7 @@ fn device_unregister(dev as *Device) as void {
 
     tree_unlock();
 
+    release_all_resources(dev);
     heap.kfree(cast(i64, dev));
 }
 
@@ -323,6 +314,184 @@ fn bus_instance_register(bi as *BusInstance, parent as *Device) as i32 {
     sched.preempt_enable();
 
     return OK;
+}
+
+// ============================================================
+// Resource subsystems: MMIO / IRQ / DMA
+//
+// Resources are tracked per-device in three singly-linked lists. The lists
+// start empty (null). Allocations prepend; releases scan-and-unlink.
+// device_unregister drains all three in order IRQ -> DMA -> MMIO
+// per spec §Cleanup Ordering.
+//
+// Limitations for V1:
+//   - mmio_map hands out HHDM aliases (limine's phys->virt direct map).
+//     Cacheability is whatever HHDM uses (write-back); real MMIO needing
+//     uncached access will require a dedicated vmm.mmio_map helper.
+//   - dma_alloc supports up to one page (PAGE_SIZE = 4096). Multi-page
+//     contiguous allocations need alloc_pages with order>0; added later.
+//   - irq_register tracks the binding but does not yet program the IDT or
+//     LAPIC — that wiring lives in the IRQ subsystem commit.
+// ============================================================
+
+fn mmio_map(dev as *Device, phys as u64, size as u64, flags as u32, out as **u8) as i32 {
+    if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, out) == 0) { return INVALID_ARGUMENT; }
+
+    let is i64 as node_addr = heap.kmalloc(sizeof(MmioRegion), 0);
+    if (node_addr == 0) { return OUT_OF_MEMORY; }
+    let is *MmioRegion as r = cast(*MmioRegion, node_addr);
+    r.phys = phys;
+    r.size = size;
+    r.flags = flags;
+    r.mapped_at = cast(*u8, pmm.hhdm + cast(i64, phys));
+
+    sched.preempt_disable();
+    r.next = dev.mmio_list;
+    dev.mmio_list = r;
+    sched.preempt_enable();
+
+    *out = r.mapped_at;
+    return OK;
+}
+
+fn mmio_unmap(dev as *Device, region as *MmioRegion) as void {
+    if (cast(i64, dev) == 0) { return; }
+    if (cast(i64, region) == 0) { return; }
+
+    sched.preempt_disable();
+    let is *MmioRegion as cur with mut = dev.mmio_list;
+    let is *MmioRegion as prev with mut = cast(*MmioRegion, 0);
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur) == cast(i64, region)) {
+            if (cast(i64, prev) == 0) { dev.mmio_list = cur.next; }
+            else                       { prev.next = cur.next; }
+            sched.preempt_enable();
+            heap.kfree(cast(i64, cur));
+            return;
+        }
+        prev = cur;
+        cur = cur.next;
+    }
+    sched.preempt_enable();
+}
+
+fn dma_alloc(dev as *Device, size as u64, align as u64, flags as u32, out as **DmaBuffer) as i32 {
+    if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, out) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, size) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, size) > pmm.PAGE_SIZE) { return NOT_SUPPORTED; }
+
+    let is i32 as zone with mut = pmm.ZONE_NORMAL;
+    let is i32 as alloc_flags with mut = pmm.ALLOC_ZERO;
+    if ((flags & cast(u32, 1)) != cast(u32, 0)) {          // DMA_32BIT_ONLY
+        zone = pmm.ZONE_DMA32;
+        alloc_flags = alloc_flags | pmm.ALLOC_DMA32_ONLY;
+    }
+
+    let is i32 as pfn = pmm.alloc_pages(zone, alloc_flags, cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return DMA_OUT_OF_MEMORY; }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+
+    let is i64 as node_addr = heap.kmalloc(sizeof(DmaBuffer), 0);
+    if (node_addr == 0) {
+        pmm.free_pages(pfn);
+        return OUT_OF_MEMORY;
+    }
+    let is *DmaBuffer as b = cast(*DmaBuffer, node_addr);
+    b.virt = cast(*u8, pmm.hhdm + phys);
+    b.phys = cast(u64, phys);
+    b.size = size;
+
+    sched.preempt_disable();
+    b.next = dev.dma_list;
+    dev.dma_list = b;
+    sched.preempt_enable();
+
+    *out = b;
+    return OK;
+}
+
+fn dma_free(dev as *Device, buffer as *DmaBuffer) as void {
+    if (cast(i64, dev) == 0) { return; }
+    if (cast(i64, buffer) == 0) { return; }
+
+    sched.preempt_disable();
+    let is *DmaBuffer as cur with mut = dev.dma_list;
+    let is *DmaBuffer as prev with mut = cast(*DmaBuffer, 0);
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur) == cast(i64, buffer)) {
+            if (cast(i64, prev) == 0) { dev.dma_list = cur.next; }
+            else                       { prev.next = cur.next; }
+            sched.preempt_enable();
+            let is i32 as pfn = cast(i32, cast(i64, cur.phys) / pmm.PAGE_SIZE);
+            pmm.free_pages(pfn);
+            heap.kfree(cast(i64, cur));
+            return;
+        }
+        prev = cur;
+        cur = cur.next;
+    }
+    sched.preempt_enable();
+}
+
+// IRQ tracking only in V1 — the framework does not yet program the IDT or
+// LAPIC. Drivers that register a handler will not receive interrupts until
+// the IRQ subsystem is wired up in a later commit.
+fn irq_register(dev as *Device, vector as u32, kind as i32,
+                handler as *u8, context as *u8) as i32 {
+    if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
+
+    let is i64 as node_addr = heap.kmalloc(sizeof(IrqBinding), 0);
+    if (node_addr == 0) { return OUT_OF_MEMORY; }
+    let is *IrqBinding as b = cast(*IrqBinding, node_addr);
+    b.vector = vector;
+    b.kind = kind;
+    b.handler = handler;
+    b.context = context;
+
+    sched.preempt_disable();
+    b.next = dev.irq_list;
+    dev.irq_list = b;
+    sched.preempt_enable();
+    return OK;
+}
+
+fn irq_unregister(dev as *Device, vector as u32) as void {
+    if (cast(i64, dev) == 0) { return; }
+
+    sched.preempt_disable();
+    let is *IrqBinding as cur with mut = dev.irq_list;
+    let is *IrqBinding as prev with mut = cast(*IrqBinding, 0);
+    while (cast(i64, cur) != 0) {
+        if (cur.vector == vector) {
+            if (cast(i64, prev) == 0) { dev.irq_list = cur.next; }
+            else                       { prev.next = cur.next; }
+            sched.preempt_enable();
+            heap.kfree(cast(i64, cur));
+            return;
+        }
+        prev = cur;
+        cur = cur.next;
+    }
+    sched.preempt_enable();
+}
+
+// Drains all tracked resources in spec-mandated order IRQ -> DMA -> MMIO.
+// Idempotent: called from device_unregister; safe on empty lists.
+fn release_all_resources(dev as *Device) as void {
+    while (cast(i64, dev.irq_list) != 0) {
+        let is *IrqBinding as head = dev.irq_list;
+        irq_unregister(dev, head.vector);
+    }
+    while (cast(i64, dev.dma_list) != 0) {
+        let is *DmaBuffer as head = dev.dma_list;
+        dma_free(dev, head);
+    }
+    while (cast(i64, dev.mmio_list) != 0) {
+        let is *MmioRegion as head = dev.mmio_list;
+        mmio_unmap(dev, head);
+    }
 }
 
 // ============================================================
