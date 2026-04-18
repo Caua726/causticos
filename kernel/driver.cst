@@ -118,6 +118,7 @@ struct Device {
     mmio_list as *MmioRegion;
     irq_list as *IrqBinding;
     dma_list as *DmaBuffer;
+    waiter_tid as i64;           // single waiter for device_wait_state; -1 = none
 }
 
 struct BusInstance {
@@ -157,6 +158,7 @@ fn init() as void {
     root.name[2] = cast(u8, 111); // 'o'
     root.name[3] = cast(u8, 116); // 't'
     root.state = STATE_UNINITIALIZED;
+    root.waiter_tid = cast(i64, 0 - 1);
     root_device = addr;
     serial.println("ok", 2);
 }
@@ -199,7 +201,9 @@ fn device_alloc(size as i64, align as i64) as *Device {
         p[i] = cast(u8, 0);
         i = i + 1;
     }
-    return cast(*Device, addr);
+    let is *Device as d = cast(*Device, addr);
+    d.waiter_tid = cast(i64, 0 - 1);
+    return d;
 }
 
 // Links dev into parent's child list. Caller must have populated dev's
@@ -724,6 +728,91 @@ fn bus_register_driver(bt as *BusType, drv as *Driver) as i32 {
     return OK;
 }
 
+// Walks the device tree rooted at `dev` and returns 1 if any device has
+// `dev.driver == drv`. Used by bus_unregister_driver to refuse removing a
+// driver that is still bound to a probed device.
+fn _tree_has_bound(dev as *Device, drv as *Driver) as i32 {
+    if (cast(i64, dev) == 0) { return 0; }
+    if (cast(i64, dev.driver) == cast(i64, drv)) { return 1; }
+    let is *Device as c with mut = dev.first_child;
+    while (cast(i64, c) != 0) {
+        if (_tree_has_bound(c, drv) == 1) { return 1; }
+        c = c.next_sibling;
+    }
+    return 0;
+}
+
+// Unlinks `drv` from `bt.drivers`. Refuses if any device is still bound to
+// this driver — the caller must device_unregister those (or transition them
+// off this driver) first. Returns OK, INVALID_ARGUMENT, DEVICE_BUSY, or
+// NOT_FOUND if `drv` isn't in this bus type's list.
+fn bus_unregister_driver(bt as *BusType, drv as *Driver) as i32 {
+    if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
+    if (cast(i64, drv) == 0) { return INVALID_ARGUMENT; }
+
+    if (_tree_has_bound(cast(*Device, root_device), drv) == 1) {
+        return DEVICE_BUSY;
+    }
+
+    sched.preempt_disable();
+    let is *Driver as cur with mut = bt.drivers;
+    let is *Driver as prev with mut = cast(*Driver, 0);
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur) == cast(i64, drv)) {
+            if (cast(i64, prev) == 0) { bt.drivers = cur.next; }
+            else { prev.next = cur.next; }
+            cur.next = cast(*Driver, 0);
+            cur.bus_type = cast(*BusType, 0);
+            bt.driver_count = bt.driver_count - cast(u32, 1);
+            sched.preempt_enable();
+            return OK;
+        }
+        prev = cur;
+        cur = cur.next;
+    }
+    sched.preempt_enable();
+    return NOT_FOUND;
+}
+
+// Unlinks `bi` from its BusType's instance list and removes it from the
+// device tree. Caller is responsible for having unregistered every child
+// device first (the underlying device_unregister panics on non-empty
+// children per spec invariant #9). Transitions the instance through
+// DETACHING → DEAD so the tree invariants hold.
+fn bus_instance_unregister(bi as *BusInstance) as i32 {
+    if (cast(i64, bi) == 0) { return INVALID_ARGUMENT; }
+    let is *Device as d = cast(*Device, bi);
+    if (cast(i64, d.first_child) != 0) { return DEVICE_BUSY; }
+    let is *BusType as bt = d.bus_type;
+    if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
+
+    sched.preempt_disable();
+    let is *BusInstance as cur with mut = bt.instances;
+    let is *BusInstance as prev with mut = cast(*BusInstance, 0);
+    let is i32 as found with mut = 0;
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur) == cast(i64, bi)) {
+            if (cast(i64, prev) == 0) { bt.instances = cur.next; }
+            else { prev.next = cur.next; }
+            cur.next = cast(*BusInstance, 0);
+            bt.instance_count = bt.instance_count - cast(u32, 1);
+            found = 1;
+            cur = cast(*BusInstance, 0);
+        } else {
+            prev = cur;
+            cur = cur.next;
+        }
+    }
+    sched.preempt_enable();
+    if (found == 0) { return NOT_FOUND; }
+
+    // Transition through DETACHING→DEAD if probed; otherwise UNINITIALIZED→DEAD.
+    if (d.state == STATE_PROBED)    { device_set_state(d, STATE_DETACHING); }
+    if (d.state != STATE_DEAD)      { device_set_state(d, STATE_DEAD); }
+    device_unregister(d);
+    return OK;
+}
+
 // Iterate bt.drivers, invoke bt.match_fn on each, pick the winner by
 // drv.priority (unique within a bus, so no tie-breaking is needed).
 // Calls winner.probe on success, transitions dev.state accordingly.
@@ -787,6 +876,22 @@ fn device_set_state(dev as *Device, new_state as i32) as i32 {
         return INVALID_STATE_TRANSITION;
     }
     dev.state = new_state;
+    let is i64 as w = dev.waiter_tid;
+    dev.waiter_tid = cast(i64, 0 - 1);
     tree_unlock();
+    if (w >= 0) { sched.wakeup_thread(w); }
     return OK;
+}
+
+// Blocks the current thread until dev.state equals `desired`. Single-waiter
+// for V1 — the spec notes multi-waiter is a future extension. The caller
+// must be a real kernel thread (Phase 2 or later).
+fn device_wait_state(dev as *Device, desired as i32) as void {
+    if (cast(i64, dev) == 0) { return; }
+    while (dev.state != desired) {
+        let is i64 as tid = sched.current_tid();
+        if (tid < 0) { return; }
+        dev.waiter_tid = tid;
+        sched.sleep_thread(tid);
+    }
 }
