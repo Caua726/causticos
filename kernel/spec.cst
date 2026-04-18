@@ -1,0 +1,256 @@
+// spec.cst — Declarative driver specs (Phase 2).
+//
+// Replaces bus_register_driver-style runtime registration with
+// compile-time Specs that declare match predicates, capability
+// requirements, and lifecycle callbacks. Each (Spec, Hardware)
+// match produces a Binding whose lifecycle is framework-driven.
+//
+// Phase 2.1 (this commit): data model + transient in-memory spec
+//                          list (spec.register). No sections yet.
+// Phase 2.2 (cdvrspec-compile): text spec -> .cst emitter.
+// Phase 2.3 (section markers): kernel iterates .cdvrspec_table;
+//                              spec.register goes away.
+// Phase 3:                     framework fills Binding.caps;
+//                              drivers drop mmio_map / irq_register.
+
+use "heap.cst" as heap;
+use "serial.cst" as serial;
+use "sched.cst" as sched;
+use "util.cst" as util;
+use "driver.cst" as driver;
+
+// ============================================================
+// Match predicate kinds
+// ============================================================
+
+let is i64 as MATCH_BUS      = 1;
+let is i64 as MATCH_VENDOR   = 2;
+let is i64 as MATCH_DEVICE   = 3;
+let is i64 as MATCH_CLASS    = 4;
+let is i64 as MATCH_SUBCLASS = 5;
+let is i64 as MATCH_PROG_IF  = 6;
+let is i64 as MATCH_NAME     = 7;
+
+// ============================================================
+// Capability kinds (Phase 3 fills Binding.caps; Phase 2 leaves
+// caps zeroed and drivers use driver.mmio_map directly)
+// ============================================================
+
+let is i64 as CAP_MMIO   = 1;
+let is i64 as CAP_IRQ    = 2;
+let is i64 as CAP_DMA    = 3;
+let is i64 as CAP_PORTIO = 4;
+let is i64 as CAP_MEMORY = 5;
+
+// ============================================================
+// Data model
+// ============================================================
+
+struct MatchPredicate {
+    kind as i64;
+    value as i64;       // scalar match, or *u8 string ptr cast to i64
+    value_len as i64;   // length for string kinds; 0 otherwise
+}
+
+struct CapabilityRequest {
+    kind as i64;
+    p1 as i64;
+    p2 as i64;
+    p3 as i64;
+}
+
+struct Capabilities {
+    mmio as *u8;
+    mmio_size as i64;
+    irq_vector as i64;
+    dma_pool as *u8;
+    dma_phys as i64;
+    dma_size as i64;
+    portio_base as i64;
+    mem_pool as *u8;
+    mem_size as i64;
+}
+
+struct Spec {
+    name as [32]u8;
+    match_count as i64;
+    match_list as *MatchPredicate;
+    cap_count as i64;
+    cap_list as *CapabilityRequest;
+    on_bind as fn(*Binding) as i32;
+    on_unbind as fn(*Binding) as void;
+    on_irq as fn(*Binding) as i32;
+    next as *Spec;          // transient list head link; unused once sections land
+}
+
+struct Binding {
+    spec as *Spec;
+    hardware as *driver.Hardware;
+    caps as Capabilities;
+    private as *u8;
+    next as *Binding;
+}
+
+// ============================================================
+// Globals
+// ============================================================
+
+let is i64 as specs with mut = 0;
+let is i64 as bindings with mut = 0;
+let is i64 as spec_count with mut = 0;
+let is i64 as binding_count with mut = 0;
+
+// ============================================================
+// Spec registration (transient — Phase 2.3 replaces this with
+// linker-provided __start_cdvrspec_table iteration)
+// ============================================================
+
+fn register(s as *Spec) as i32 {
+    if (cast(i64, s) == 0) { return driver.INVALID_ARGUMENT; }
+
+    sched.preempt_disable();
+    s.next = cast(*Spec, specs);
+    specs = cast(i64, s);
+    spec_count = spec_count + 1;
+    sched.preempt_enable();
+    return driver.OK;
+}
+
+// ============================================================
+// Matching
+// ============================================================
+
+// Compare a [32]u8 name buffer against an arbitrary *u8 target with
+// explicit length. Match iff first `len` bytes equal AND the name
+// buffer terminates (null byte at offset `len`, or `len == 32`).
+fn name32_eq_bytes(name as *u8, target as *u8, len as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (i >= 32) { return 0; }
+        if (name[i] != target[i]) { return 0; }
+        i = i + 1;
+    }
+    if (len == 32) { return 1; }
+    if (cast(i64, name[len]) == 0) { return 1; }
+    return 0;
+}
+
+// Evaluate a single predicate against `hw`. Bus-specific scalar kinds
+// dispatch through hw.bus.get_match_field so spec.cst stays independent
+// of concrete bus types (pci, platform, ...).
+fn pred_matches(p as *MatchPredicate, hw as *driver.Hardware) as i32 {
+    if (p.kind == MATCH_BUS) {
+        if (cast(i64, hw.bus) == 0) { return 0; }
+        return name32_eq_bytes(&hw.bus.name[0], cast(*u8, p.value), p.value_len);
+    }
+    if (p.kind == MATCH_NAME) {
+        return name32_eq_bytes(&hw.name[0], cast(*u8, p.value), p.value_len);
+    }
+    if (cast(i64, hw.bus) == 0) { return 0; }
+    if (cast(i64, hw.bus.get_match_field) == 0) { return 0; }
+    let is i64 as actual = call(hw.bus.get_match_field, hw, p.kind);
+    if (actual == p.value) { return 1; }
+    return 0;
+}
+
+// AND semantics — every predicate must match. match_count == 0 means
+// "matches any hardware", which is legal but reserved for the synthetic
+// dummy bus.
+fn spec_matches(s as *Spec, hw as *driver.Hardware) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < s.match_count) {
+        let is i64 as pred_addr = cast(i64, s.match_list) + i * sizeof(MatchPredicate);
+        let is *MatchPredicate as p = cast(*MatchPredicate, pred_addr);
+        if (pred_matches(p, hw) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn zero_region(p as *u8, size as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < size) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+fn make_binding(s as *Spec, hw as *driver.Hardware) as *Binding {
+    let is i64 as addr = heap.kmalloc(sizeof(Binding), 0);
+    if (addr == 0) { return cast(*Binding, 0); }
+    zero_region(cast(*u8, addr), sizeof(Binding));
+    let is *Binding as b = cast(*Binding, addr);
+    b.spec = s;
+    b.hardware = hw;
+    return b;
+}
+
+// DFS walk of the Hardware tree. For each Hardware, take the first
+// matching Spec as winner and create a Binding. "First match" is a
+// placeholder — Phase 2.3 adds specificity-based resolution per D0.7.
+fn match_subtree(hw as *driver.Hardware) as void {
+    if (cast(i64, hw) == 0) { return; }
+
+    let is *Spec as winner with mut = cast(*Spec, 0);
+    let is *Spec as s with mut = cast(*Spec, specs);
+    while (cast(i64, s) != 0) {
+        if (spec_matches(s, hw) == 1) {
+            winner = s;
+            s = cast(*Spec, 0);
+        } else {
+            s = s.next;
+        }
+    }
+
+    if (cast(i64, winner) != 0) {
+        let is *Binding as b = make_binding(winner, hw);
+        if (cast(i64, b) != 0) {
+            sched.preempt_disable();
+            b.next = cast(*Binding, bindings);
+            bindings = cast(i64, b);
+            binding_count = binding_count + 1;
+            sched.preempt_enable();
+        }
+    }
+
+    let is *driver.Hardware as c with mut = hw.first_child;
+    while (cast(i64, c) != 0) {
+        match_subtree(c);
+        c = c.next_sibling;
+    }
+}
+
+fn match_all() as void {
+    serial.print("spec: matching ", 15);
+    util.print_num(spec_count);
+    serial.println(" specs", 6);
+    match_subtree(driver.get_root());
+    serial.print("spec: created ", 14);
+    util.print_num(binding_count);
+    serial.println(" bindings", 9);
+}
+
+fn bind_all() as void {
+    let is *Binding as b with mut = cast(*Binding, bindings);
+    while (cast(i64, b) != 0) {
+        if (cast(i64, b.spec.on_bind) != 0) {
+            let is i32 as rc = call(b.spec.on_bind, b);
+            if (rc != driver.OK) {
+                serial.println("spec: on_bind failed", 20);
+            }
+        }
+        b = b.next;
+    }
+}
+
+// ============================================================
+// Phase-2 kernel thread entry. Replaces driver.driver_init_thread;
+// runs old-style probing so existing bus_register_driver paths keep
+// working, then match_all/bind_all for specs registered in Phase 2.1.
+// ============================================================
+
+fn phase2_thread() as void {
+    serial.println("driver: phase 2 start", 21);
+    driver.driver_probe_all();
+    match_all();
+    bind_all();
+    driver.driver_late_init();
+    serial.println("driver: phase 2 done", 20);
+}
