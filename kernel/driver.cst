@@ -13,15 +13,6 @@ use "vmm.cst" as vmm;
 use "lapic.cst" as lapic;
 
 // ============================================================
-// HardwareState
-// ============================================================
-
-let is i32 as STATE_UNINITIALIZED = 0;
-let is i32 as STATE_PROBED        = 1;
-let is i32 as STATE_DETACHING     = 2;
-let is i32 as STATE_DEAD          = 3;
-
-// ============================================================
 // DriverResult — OK=0, errors positive
 // ============================================================
 
@@ -45,7 +36,6 @@ let is i32 as NO_IRQ_VECTORS           = 16;
 let is i32 as IRQ_INVALID_VECTOR       = 17;
 let is i32 as DMA_OUT_OF_MEMORY        = 18;
 let is i32 as DMA_ADDRESS_CONSTRAINT   = 19;
-let is i32 as INVALID_STATE_TRANSITION = 20;
 
 // ============================================================
 // Resource list nodes
@@ -98,6 +88,10 @@ struct Bus {
     next as *Bus;
 }
 
+// Phase 5: lifecycle is now structural (a Hardware is alive iff it's
+// linked into the parent's first_child chain; a Binding is alive iff
+// it's linked into spec.bindings). No explicit state field, no
+// state-machine transitions.
 struct Hardware {
     name as [32]u8;
     parent as *Hardware;
@@ -106,12 +100,11 @@ struct Hardware {
     prev_sibling as *Hardware;
     bus as *Bus;
     private as *u8;
-    state as i32;
     lock as i32;                 // spinlock stub; single-CPU for now
+    _pad as i32;
     mmio_list as *MmioRegion;
     irq_list as *IrqBinding;
     dma_list as *DmaBuffer;
-    waiter_tid as i64;           // retained for future async lifecycle signalling; -1 = none
 }
 
 struct BusNode {
@@ -150,8 +143,6 @@ fn init() as void {
     root.name[1] = cast(u8, 111); // 'o'
     root.name[2] = cast(u8, 111); // 'o'
     root.name[3] = cast(u8, 116); // 't'
-    root.state = STATE_UNINITIALIZED;
-    root.waiter_tid = cast(i64, 0 - 1);
     root_hardware = addr;
     serial.println("ok", 2);
 }
@@ -195,7 +186,6 @@ fn hardware_alloc(size as i64, align as i64) as *Hardware {
         i = i + 1;
     }
     let is *Hardware as d = cast(*Hardware, addr);
-    d.waiter_tid = cast(i64, 0 - 1);
     return d;
 }
 
@@ -233,8 +223,10 @@ fn hardware_register(dev as *Hardware, parent as *Hardware) as i32 {
     return OK;
 }
 
-// Panics on invariant violation (state != DEAD, has children, or resources
-// still tracked). Unlinks dev from the tree and frees it.
+// Unlinks dev from the parent's child chain and frees it. Panics if dev
+// still has children — caller is expected to have torn down the subtree
+// first. Resources tracked on the device (MMIO/IRQ/DMA lists) are
+// released before kfree.
 fn hardware_unregister(dev as *Hardware) as void {
     if (cast(i64, dev) == 0) {
         pmm.panic("hardware_unregister: null dev", 27);
@@ -242,9 +234,6 @@ fn hardware_unregister(dev as *Hardware) as void {
 
     tree_lock();
 
-    if (dev.state != STATE_DEAD) {
-        pmm.panic("hardware_unregister: not DEAD", 27);
-    }
     if (cast(i64, dev.first_child) != 0) {
         pmm.panic("hardware_unregister: has children", 31);
     }
@@ -634,7 +623,6 @@ fn bus_node_unregister(bi as *BusNode) as i32 {
     sched.preempt_enable();
     if (found == 0) { return NOT_FOUND; }
 
-    d.state = STATE_DEAD;
     hardware_unregister(d);
     return OK;
 }
