@@ -1,0 +1,19 @@
+// cdvrspec_data.s — embeds raw .cdvrspec text blobs into the kernel.
+//
+// Each driver contributes: a pair of labels delimiting its spec bytes
+// (.cdvrspec_data), plus two .quad entries in .cdvrspec_index holding
+// those labels' addresses. At boot the kernel iterates
+// __start_cdvrspec_index .. __stop_cdvrspec_index (emitted automatically
+// by caustic-ld for any custom section) reading pairs of (start, end)
+// pointers and handing each byte range to the parser in specparse.cst.
+
+.section .cdvrspec_data
+.global _cdvrspec_dummy_start
+.global _cdvrspec_dummy_end
+_cdvrspec_dummy_start:
+.incbin "kernel/dummy.cdvrspec"
+_cdvrspec_dummy_end:
+
+.section .cdvrspec_index
+.quad _cdvrspec_dummy_start
+.quad _cdvrspec_dummy_end

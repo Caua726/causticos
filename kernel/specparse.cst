@@ -1,0 +1,394 @@
+// specparse.cst — parser for .cdvrspec text blobs (Phase 2.4).
+//
+// Grammar (minimal — extensible):
+//   file      := 'driver' STRING '{' body '}'
+//   body      := section*
+//   section   := ident '{' entry* '}'
+//   entry     := ident ':' value
+//   value     := ident | STRING | NUMBER
+//   comment   := '#' ... newline       (skipped)
+//
+// Recognised sections: match, capabilities, lifecycle.
+// Values in `match`: bus (ident), vendor/device/class/subclass/prog_if (number).
+// Values in `lifecycle`: on_bind / on_unbind / on_irq (module.function
+//                        dotted ident, resolved via ksym.lookup).
+//
+// Boot flow: iterate_index() walks __start_cdvrspec_index ..
+// __stop_cdvrspec_index (pairs of (start_ptr, end_ptr) .quad entries
+// emitted by cdvrspec_data.s). For each pair call parse_and_register.
+
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "serial.cst" as serial;
+use "sched.cst" as sched;
+use "util.cst" as util;
+use "ksym.cst" as ksym;
+use "spec.cst" as spec;
+
+// Shuttle globals to read the linker-provided section bounds via asm.
+let is i64 as _idx_start with mut = 0;
+let is i64 as _idx_stop with mut = 0;
+
+fn _load_idx_start() as *i64 {
+    asm("lea rax, [rip+__start_cdvrspec_index]\n");
+    asm("lea rbx, [rip+_kernel_specparse_cst__idx_start]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return cast(*i64, _idx_start);
+}
+
+fn _load_idx_stop() as *i64 {
+    asm("lea rax, [rip+__stop_cdvrspec_index]\n");
+    asm("lea rbx, [rip+_kernel_specparse_cst__idx_stop]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return cast(*i64, _idx_stop);
+}
+
+// =======================================================================
+// Tokeniser
+// =======================================================================
+
+struct Parser {
+    src as *u8;
+    len as i64;
+    pos as i64;
+    ok as i64;           // 1 while no error has been raised
+}
+
+fn _is_ws(c as u8) as i32 {
+    let is i64 as v = cast(i64, c);
+    if (v == 32) { return 1; }     // space
+    if (v == 9)  { return 1; }     // tab
+    if (v == 10) { return 1; }     // \n
+    if (v == 13) { return 1; }     // \r
+    return 0;
+}
+
+fn _is_ident_start(c as u8) as i32 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 65 && v <= 90)  { return 1; }  // A-Z
+    if (v >= 97 && v <= 122) { return 1; }  // a-z
+    if (v == 95) { return 1; }              // _
+    return 0;
+}
+
+fn _is_ident_cont(c as u8) as i32 {
+    if (_is_ident_start(c) == 1) { return 1; }
+    let is i64 as v = cast(i64, c);
+    if (v >= 48 && v <= 57) { return 1; }   // 0-9
+    if (v == 46) { return 1; }              // .  (module.function)
+    return 0;
+}
+
+fn _is_hex_digit(c as u8) as i32 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 48 && v <= 57)  { return 1; }  // 0-9
+    if (v >= 65 && v <= 70)  { return 1; }  // A-F
+    if (v >= 97 && v <= 102) { return 1; }  // a-f
+    return 0;
+}
+
+fn _is_dec_digit(c as u8) as i32 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 48 && v <= 57) { return 1; }
+    return 0;
+}
+
+fn _hex_val(c as u8) as i64 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 48 && v <= 57)  { return v - 48; }
+    if (v >= 65 && v <= 70)  { return v - 65 + 10; }
+    if (v >= 97 && v <= 102) { return v - 97 + 10; }
+    return 0;
+}
+
+fn _skip_trivia(p as *Parser) as void {
+    while (p.pos < p.len) {
+        let is u8 as c = p.src[p.pos];
+        if (_is_ws(c) == 1) { p.pos = p.pos + 1; }
+        else if (cast(i64, c) == 35) {    // '#' — line comment
+            while (p.pos < p.len && cast(i64, p.src[p.pos]) != 10) { p.pos = p.pos + 1; }
+        } else {
+            return;
+        }
+    }
+}
+
+fn _peek(p as *Parser) as u8 {
+    if (p.pos >= p.len) { return cast(u8, 0); }
+    return p.src[p.pos];
+}
+
+fn _expect_char(p as *Parser, expected as u8) as i32 {
+    _skip_trivia(p);
+    if (p.pos >= p.len) { p.ok = 0; return 0; }
+    if (p.src[p.pos] != expected) { p.ok = 0; return 0; }
+    p.pos = p.pos + 1;
+    return 1;
+}
+
+// Reads an identifier into (out_ptr, out_len). ok=0 on failure.
+fn _read_ident(p as *Parser, out_ptr as **u8, out_len as *i64) as i32 {
+    _skip_trivia(p);
+    if (p.pos >= p.len) { p.ok = 0; return 0; }
+    if (_is_ident_start(p.src[p.pos]) == 0) { p.ok = 0; return 0; }
+    let is i64 as start = p.pos;
+    while (p.pos < p.len && _is_ident_cont(p.src[p.pos]) == 1) { p.pos = p.pos + 1; }
+    *out_ptr = cast(*u8, cast(i64, p.src) + start);
+    *out_len = p.pos - start;
+    return 1;
+}
+
+// Reads a quoted string into (out_ptr, out_len) — contents only, no quotes.
+// Does not decode escapes; kernel specs shouldn't need them yet.
+fn _read_string(p as *Parser, out_ptr as **u8, out_len as *i64) as i32 {
+    _skip_trivia(p);
+    if (p.pos >= p.len) { p.ok = 0; return 0; }
+    if (cast(i64, p.src[p.pos]) != 34) { p.ok = 0; return 0; }  // '"'
+    p.pos = p.pos + 1;
+    let is i64 as start = p.pos;
+    while (p.pos < p.len && cast(i64, p.src[p.pos]) != 34) { p.pos = p.pos + 1; }
+    if (p.pos >= p.len) { p.ok = 0; return 0; }
+    *out_ptr = cast(*u8, cast(i64, p.src) + start);
+    *out_len = p.pos - start;
+    p.pos = p.pos + 1;  // closing quote
+    return 1;
+}
+
+// Reads a hex (0x…) or decimal integer. ok=0 on failure.
+fn _read_number(p as *Parser, out as *i64) as i32 {
+    _skip_trivia(p);
+    if (p.pos >= p.len) { p.ok = 0; return 0; }
+    let is u8 as c = p.src[p.pos];
+    // hex prefix
+    if (cast(i64, c) == 48 && p.pos + 1 < p.len) {
+        let is u8 as c1 = p.src[p.pos + 1];
+        if (cast(i64, c1) == 120 || cast(i64, c1) == 88) {     // 0x / 0X
+            p.pos = p.pos + 2;
+            let is i64 as n with mut = 0;
+            let is i32 as any with mut = 0;
+            while (p.pos < p.len && _is_hex_digit(p.src[p.pos]) == 1) {
+                n = (n << 4) | _hex_val(p.src[p.pos]);
+                p.pos = p.pos + 1;
+                any = 1;
+            }
+            if (any == 0) { p.ok = 0; return 0; }
+            *out = n;
+            return 1;
+        }
+    }
+    if (_is_dec_digit(c) == 0) { p.ok = 0; return 0; }
+    let is i64 as n with mut = 0;
+    while (p.pos < p.len && _is_dec_digit(p.src[p.pos]) == 1) {
+        n = n * 10 + (cast(i64, p.src[p.pos]) - 48);
+        p.pos = p.pos + 1;
+    }
+    *out = n;
+    return 1;
+}
+
+// =======================================================================
+// Predicate / lifecycle handlers
+// =======================================================================
+
+// Returns the MATCH_* kind for a known match key, or -1 if unknown.
+fn _match_kind_of(key as *u8, len as i64) as i64 {
+    if (len == 3 && key[0] == cast(u8, 98)  && key[1] == cast(u8, 117) && key[2] == cast(u8, 115)) { return spec.MATCH_BUS; }       // "bus"
+    if (len == 6 && key[0] == cast(u8, 118) && key[5] == cast(u8, 114)) { return spec.MATCH_VENDOR; }                                // "vendor"
+    if (len == 6 && key[0] == cast(u8, 100) && key[5] == cast(u8, 101)) { return spec.MATCH_DEVICE; }                                // "device"
+    if (len == 5 && key[0] == cast(u8, 99)  && key[4] == cast(u8, 115)) { return spec.MATCH_CLASS; }                                 // "class"
+    if (len == 8 && key[0] == cast(u8, 115) && key[1] == cast(u8, 117)) { return spec.MATCH_SUBCLASS; }                              // "subclass"
+    if (len == 7 && key[0] == cast(u8, 112) && key[1] == cast(u8, 114)) { return spec.MATCH_PROG_IF; }                               // "prog_if"
+    if (len == 4 && key[0] == cast(u8, 110) && key[1] == cast(u8, 97)) { return spec.MATCH_NAME; }                                   // "name"
+    return cast(i64, 0 - 1);
+}
+
+fn _parse_match_block(p as *Parser, s as *spec.Spec) as void {
+    if (_expect_char(p, cast(u8, 123)) == 0) { return; }   // '{'
+    let is *spec.MatchPredicate as arr with mut = cast(*spec.MatchPredicate, 0);
+    let is i64 as count with mut = 0;
+    let is i64 as cap with mut = 8;
+    let is i64 as addr = heap.kmalloc(cap * sizeof(spec.MatchPredicate), 0);
+    if (addr == 0) { p.ok = 0; return; }
+    arr = cast(*spec.MatchPredicate, addr);
+
+    while (p.ok == 1) {
+        _skip_trivia(p);
+        if (_peek(p) == cast(u8, 125)) { p.pos = p.pos + 1; break; }  // '}'
+        let is *u8 as key_ptr with mut = cast(*u8, 0);
+        let is i64 as key_len with mut = 0;
+        if (_read_ident(p, &key_ptr, &key_len) == 0) { return; }
+        if (_expect_char(p, cast(u8, 58)) == 0) { return; }    // ':'
+        let is i64 as kind = _match_kind_of(key_ptr, key_len);
+        if (kind < 0) { p.ok = 0; return; }
+        let is *spec.MatchPredicate as pred =
+            cast(*spec.MatchPredicate, cast(i64, arr) + count * sizeof(spec.MatchPredicate));
+        pred.kind = kind;
+        if (kind == spec.MATCH_BUS || kind == spec.MATCH_NAME) {
+            let is *u8 as v_ptr with mut = cast(*u8, 0);
+            let is i64 as v_len with mut = 0;
+            if (_read_ident(p, &v_ptr, &v_len) == 0) { return; }
+            pred.value = cast(i64, v_ptr);
+            pred.value_len = v_len;
+        } else {
+            let is i64 as v with mut = 0;
+            if (_read_number(p, &v) == 0) { return; }
+            pred.value = v;
+            pred.value_len = 0;
+        }
+        count = count + 1;
+        // optional ';' or comma
+        _skip_trivia(p);
+        if (_peek(p) == cast(u8, 59)) { p.pos = p.pos + 1; }
+    }
+    s.match_count = count;
+    s.match_list = arr;
+}
+
+fn _parse_lifecycle_block(p as *Parser, s as *spec.Spec) as void {
+    if (_expect_char(p, cast(u8, 123)) == 0) { return; }   // '{'
+    while (p.ok == 1) {
+        _skip_trivia(p);
+        if (_peek(p) == cast(u8, 125)) { p.pos = p.pos + 1; break; }  // '}'
+        let is *u8 as key_ptr with mut = cast(*u8, 0);
+        let is i64 as key_len with mut = 0;
+        if (_read_ident(p, &key_ptr, &key_len) == 0) { return; }
+        if (_expect_char(p, cast(u8, 58)) == 0) { return; }
+        let is *u8 as v_ptr with mut = cast(*u8, 0);
+        let is i64 as v_len with mut = 0;
+        if (_read_ident(p, &v_ptr, &v_len) == 0) { return; }
+        let is i64 as addr = ksym.lookup(v_ptr, v_len);
+        if (addr == 0) { p.ok = 0; return; }
+        if (key_len == 7 && key_ptr[0] == cast(u8, 111) && key_ptr[1] == cast(u8, 110) &&
+            key_ptr[3] == cast(u8, 98)) {                               // on_bind
+            s.on_bind = cast(fn(*spec.Binding) as i32, addr);
+        } else if (key_len == 9 && key_ptr[3] == cast(u8, 117)) {       // on_unbind
+            s.on_unbind = cast(fn(*spec.Binding) as void, addr);
+        } else if (key_len == 6 && key_ptr[3] == cast(u8, 105)) {       // on_irq
+            s.on_irq = cast(fn(*spec.Binding) as i32, addr);
+        } else {
+            p.ok = 0; return;
+        }
+        _skip_trivia(p);
+        if (_peek(p) == cast(u8, 59)) { p.pos = p.pos + 1; }
+    }
+}
+
+// Skip a block whose semantics we don't implement yet (capabilities).
+fn _skip_block(p as *Parser) as void {
+    if (_expect_char(p, cast(u8, 123)) == 0) { return; }
+    let is i64 as depth with mut = 1;
+    while (p.ok == 1 && depth > 0 && p.pos < p.len) {
+        let is u8 as c = p.src[p.pos];
+        if (cast(i64, c) == 123) { depth = depth + 1; p.pos = p.pos + 1; }
+        else if (cast(i64, c) == 125) { depth = depth - 1; p.pos = p.pos + 1; }
+        else if (cast(i64, c) == 35) {
+            while (p.pos < p.len && cast(i64, p.src[p.pos]) != 10) { p.pos = p.pos + 1; }
+        } else {
+            p.pos = p.pos + 1;
+        }
+    }
+    if (depth != 0) { p.ok = 0; }
+}
+
+// =======================================================================
+// Top-level
+// =======================================================================
+
+// Parses the byte range [start, end) into a heap-allocated Spec and
+// registers it with spec.register. Returns 0 on success, negative on
+// parse error.
+fn parse_and_register(start as *u8, end as *u8) as i32 {
+    let is i64 as len = cast(i64, end) - cast(i64, start);
+    if (len <= 0) { return cast(i32, 0 - 1); }
+
+    let is i64 as spec_addr = heap.kmalloc(sizeof(spec.Spec), 0);
+    if (spec_addr == 0) { return cast(i32, 0 - 2); }
+    // zero
+    let is *u8 as zp = cast(*u8, spec_addr);
+    let is i64 as zi with mut = 0;
+    while (zi < sizeof(spec.Spec)) { zp[zi] = cast(u8, 0); zi = zi + 1; }
+    let is *spec.Spec as s = cast(*spec.Spec, spec_addr);
+
+    let is Parser as par;
+    par.src = start;
+    par.len = len;
+    par.pos = 0;
+    par.ok  = 1;
+
+    // driver "NAME" { body }
+    let is *u8 as kw_ptr with mut = cast(*u8, 0);
+    let is i64 as kw_len with mut = 0;
+    if (_read_ident(&par, &kw_ptr, &kw_len) == 0) { return cast(i32, 0 - 3); }
+    if (kw_len != 6) { return cast(i32, 0 - 4); }
+    // must spell "driver"
+    if (kw_ptr[0] != cast(u8, 100)) { return cast(i32, 0 - 5); }
+
+    let is *u8 as name_ptr with mut = cast(*u8, 0);
+    let is i64 as name_len with mut = 0;
+    if (_read_string(&par, &name_ptr, &name_len) == 0) { return cast(i32, 0 - 6); }
+
+    // Copy name into s.name[32]
+    let is i64 as ni with mut = 0;
+    while (ni < name_len && ni < 32) {
+        s.name[ni] = name_ptr[ni];
+        ni = ni + 1;
+    }
+
+    if (_expect_char(&par, cast(u8, 123)) == 0) { return cast(i32, 0 - 7); }
+
+    while (par.ok == 1) {
+        _skip_trivia(&par);
+        if (_peek(&par) == cast(u8, 125)) { par.pos = par.pos + 1; break; }
+        let is *u8 as sec_ptr with mut = cast(*u8, 0);
+        let is i64 as sec_len with mut = 0;
+        if (_read_ident(&par, &sec_ptr, &sec_len) == 0) { return cast(i32, 0 - 8); }
+        if (sec_len == 5 && sec_ptr[0] == cast(u8, 109)) {              // match
+            _parse_match_block(&par, s);
+        } else if (sec_len == 9 && sec_ptr[0] == cast(u8, 108)) {       // lifecycle
+            _parse_lifecycle_block(&par, s);
+        } else if (sec_len == 12 && sec_ptr[0] == cast(u8, 99)) {       // capabilities
+            _skip_block(&par);
+        } else {
+            return cast(i32, 0 - 9);
+        }
+    }
+    if (par.ok == 0) { return cast(i32, 0 - 10); }
+
+    spec.register(s);
+    return 0;
+}
+
+// Iterate the .cdvrspec_index section and register each spec.
+fn init() as void {
+    let is *i64 as start = _load_idx_start();
+    let is *i64 as stop = _load_idx_stop();
+    serial.print("specparse: index range ", 24);
+    util.print_hex(cast(i64, start));
+    serial.print(" .. ", 4);
+    util.print_hex(cast(i64, stop));
+    serial.println("", 0);
+
+    let is *i64 as p with mut = start;
+    let is i64 as n with mut = 0;
+    while (cast(i64, p) < cast(i64, stop)) {
+        let is *u8 as s_start = cast(*u8, p[0]);
+        let is *u8 as s_end = cast(*u8, p[1]);
+        serial.print("specparse: entry start=", 23);
+        util.print_hex(cast(i64, s_start));
+        serial.print(" end=", 5);
+        util.print_hex(cast(i64, s_end));
+        serial.println("", 0);
+        let is i32 as rc = parse_and_register(s_start, s_end);
+        if (rc != 0) {
+            serial.print("specparse: parse failed rc=", 27);
+            util.print_num(cast(i64, rc));
+            serial.println("", 0);
+        } else {
+            n = n + 1;
+        }
+        p = cast(*i64, cast(i64, p) + 16);
+    }
+    serial.print("specparse: registered ", 22);
+    util.print_num(n);
+    serial.println(" specs from index", 17);
+}
