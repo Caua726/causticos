@@ -1,10 +1,9 @@
-// driver.cst — Driver framework base (spec v2, step 1)
+// driver.cst — Driver framework base.
 //
-// Provides: Hardware/DriverImpl/Bus/BusNode structs, state constants,
-// DriverImplResult codes, the synthetic root device, and driver_framework_init.
-//
-// Operations (hardware_register, bus_register_driver, probing, resources) land
-// in later commits per the spec's Implementation Order.
+// Post-Phase-2: Hardware tree + Bus registry + resource tracking
+// (MMIO/IRQ/DMA). DriverImpl, bus_register_driver, and the old probe
+// path are gone — driver matching and lifecycle now live entirely in
+// spec.cst (declarative specs loaded from .cdvrspec text).
 
 use "pmm.cst" as pmm;
 use "heap.cst" as heap;
@@ -23,7 +22,7 @@ let is i32 as STATE_DETACHING     = 2;
 let is i32 as STATE_DEAD          = 3;
 
 // ============================================================
-// DriverImplResult — OK=0, errors positive
+// DriverResult — OK=0, errors positive
 // ============================================================
 
 let is i32 as OK                       = 0;
@@ -82,27 +81,13 @@ struct DmaBuffer {
 
 struct Bus {
     name as [32]u8;
-    match_fn as fn(*Bus, *Hardware, *DriverImpl) as i32;
     enumerate_node as fn(*BusNode) as void;
     get_match_field as fn(*Hardware, i64) as i64;
-    drivers as *DriverImpl;
-    driver_count as u32;
     node_count as u32;
     nodes as *BusNode;
     lock as i32;
     _pad as i32;
     next as *Bus;
-}
-
-struct DriverImpl {
-    name as [32]u8;
-    bus as *Bus;
-    match_spec as *u8;
-    probe as fn(*Hardware) as i32;
-    remove as fn(*Hardware) as void;
-    priority as i32;
-    _pad as i32;
-    next as *DriverImpl;
 }
 
 struct Hardware {
@@ -112,14 +97,13 @@ struct Hardware {
     next_sibling as *Hardware;
     prev_sibling as *Hardware;
     bus as *Bus;
-    driver as *DriverImpl;
     private as *u8;
     state as i32;
     lock as i32;                 // spinlock stub; single-CPU for now
     mmio_list as *MmioRegion;
     irq_list as *IrqBinding;
     dma_list as *DmaBuffer;
-    waiter_tid as i64;           // single waiter for device_wait_state; -1 = none
+    waiter_tid as i64;           // retained for future async lifecycle signalling; -1 = none
 }
 
 struct BusNode {
@@ -582,42 +566,17 @@ fn release_all_resources(dev as *Hardware) as void {
 }
 
 // ============================================================
-// Init-section iteration
+// Enumeration
 //
-// The spec describes four sections (.buses, .drivers_init.bus,
-// .drivers_init.driver, .drivers_init.late) iterated in ascending `order`
-// value. caustic-ld currently strips section names from the final ELF and
-// does not emit __start_SECNAME / __stop_SECNAME markers, so automatic
-// discovery of entries is not yet available.
-//
-// Until the linker gains that feature, buses and drivers register themselves
-// by calling `bus_register` / `bus_register_driver` from a bootstrap
-// hook. The four functions below are the wiring points the _kernel_start
-// path will call; each bus/driver module contributes by providing a function
-// that adds itself to the relevant list, and the kernel binds those hooks
-// statically.
-//
-// For now these are stubs. They are introduced so callers can be written
-// against the final API shape; the internals fill in once section iteration
-// becomes available or when a central registration table is wired.
+// For each registered Bus, invoke its enumerate_node hook on every
+// BusNode attached to it. The hook populates the Hardware tree with
+// children representing the actual hardware under that bus (PCI
+// functions, platform-fixed devices, etc). Called once at kernel
+// startup from _kernel_start; the spec framework (spec.cst) then
+// walks the tree to match declarative Specs against Hardware.
 // ============================================================
 
-fn driver_register_buses() as void {
-    // Filled by manual calls until section iteration is available.
-}
-
-fn driver_init_buses() as void {
-    // Creates BusNodes for each registered Bus. Buses provide their
-    // own enumerate-entry hook.
-}
-
-fn driver_init_drivers() as void {
-    // Calls bus_register_driver for each statically-linked driver.
-}
-
 fn driver_enumerate_all() as void {
-    // For each Bus with nodes, calls bt.enumerate_node(bi) to
-    // create UNINITIALIZED devices. No probing yet — Phase 1 only.
     let is *Bus as bt with mut = cast(*Bus, buses);
     while (cast(i64, bt) != 0) {
         if (cast(i64, bt.enumerate_node) != 0) {
@@ -631,155 +590,15 @@ fn driver_enumerate_all() as void {
     }
 }
 
-fn driver_late_init() as void {
-    // Deferred hooks that run after probing. No-op until callers wire in.
-}
-
-// Depth-first walk: probe the parent first so a bridge's probe can create
-// children which are then probed in turn. Hardwares with null bus (root)
-// are skipped. next_sibling is snapshotted before probing in case the list
-// is mutated during probe (e.g. child registration).
+// ============================================================
+// BusNode unregistration
 //
-// If a probe fails, bus_probe_hardware transitions the device to DEAD but
-// does NOT unregister it. probe_subtree is the owner of the unregister
-// step: it detects DEAD, unregisters, and does not descend into what is
-// now a freed device. Per spec fix #12, bridge drivers that registered
-// sub-devices during probe must unregister them before returning an
-// error, so by the time we see DEAD here the subtree is already empty.
-fn probe_subtree(dev as *Hardware) as void {
-    if (cast(i64, dev) == 0) { return; }
-    if (dev.state == STATE_UNINITIALIZED && cast(i64, dev.bus) != 0) {
-        bus_probe_hardware(dev.bus, dev);
-    }
-    if (dev.state == STATE_DEAD) {
-        hardware_unregister(dev);
-        return;
-    }
-    let is *Hardware as c with mut = dev.first_child;
-    while (cast(i64, c) != 0) {
-        let is *Hardware as next = c.next_sibling;
-        probe_subtree(c);
-        c = next;
-    }
-}
-
-fn driver_probe_all() as void {
-    probe_subtree(cast(*Hardware, root_hardware));
-}
-
-// Entry point dispatched by sched.start as the first kernel thread. Runs
-// Phase 2 (probing + late init) with the scheduler fully online so probes
-// may block, sleep, or spawn workers.
-fn driver_init_thread() as void {
-    serial.println("driver: phase 2 start", 21);
-    driver_probe_all();
-    driver_late_init();
-    serial.println("driver: phase 2 done", 20);
-    // Thread exits; scheduler reclaims it.
-}
-
-// ============================================================
-// DriverImpl registration, matching, probing
+// Unlinks `bi` from its Bus's node list and removes it from the
+// Hardware tree. Caller is responsible for having unregistered every
+// child hardware first — hardware_unregister panics on non-empty
+// children.
 // ============================================================
 
-// Byte-compare two [32]u8 name buffers. Equal if all 32 bytes match, or if
-// they match up to and including a shared null terminator.
-fn name32_eq(a as *u8, b as *u8) as i32 {
-    let is i64 as i with mut = 0;
-    while (i < 32) {
-        if (a[i] != b[i]) { return 0; }
-        if (cast(i64, a[i]) == 0) { return 1; }
-        i = i + 1;
-    }
-    return 1;
-}
-
-// Registers drv under bt. Enforces both name uniqueness and priority
-// uniqueness (spec fix #5). On success, drv.bus is set and drv is
-// linked into bt.drivers.
-fn bus_register_driver(bt as *Bus, drv as *DriverImpl) as i32 {
-    if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
-    if (cast(i64, drv) == 0) { return INVALID_ARGUMENT; }
-
-    sched.preempt_disable();
-
-    let is *DriverImpl as cur with mut = bt.drivers;
-    while (cast(i64, cur) != 0) {
-        if (cast(i64, cur) == cast(i64, drv)) {
-            sched.preempt_enable();
-            return ALREADY_EXISTS;
-        }
-        if (name32_eq(&cur.name[0], &drv.name[0]) == 1) {
-            sched.preempt_enable();
-            return DUPLICATE_DRIVER_NAME;
-        }
-        if (cur.priority == drv.priority) {
-            sched.preempt_enable();
-            return DUPLICATE_PRIORITY;
-        }
-        cur = cur.next;
-    }
-
-    drv.bus = bt;
-    drv.next = bt.drivers;
-    bt.drivers = drv;
-    bt.driver_count = bt.driver_count + cast(u32, 1);
-
-    sched.preempt_enable();
-    return OK;
-}
-
-// Walks the device tree rooted at `dev` and returns 1 if any device has
-// `dev.driver == drv`. Used by bus_unregister_driver to refuse removing a
-// driver that is still bound to a probed device.
-fn _tree_has_bound(dev as *Hardware, drv as *DriverImpl) as i32 {
-    if (cast(i64, dev) == 0) { return 0; }
-    if (cast(i64, dev.driver) == cast(i64, drv)) { return 1; }
-    let is *Hardware as c with mut = dev.first_child;
-    while (cast(i64, c) != 0) {
-        if (_tree_has_bound(c, drv) == 1) { return 1; }
-        c = c.next_sibling;
-    }
-    return 0;
-}
-
-// Unlinks `drv` from `bt.drivers`. Refuses if any device is still bound to
-// this driver — the caller must hardware_unregister those (or transition them
-// off this driver) first. Returns OK, INVALID_ARGUMENT, DEVICE_BUSY, or
-// NOT_FOUND if `drv` isn't in this bus type's list.
-fn bus_unregister_driver(bt as *Bus, drv as *DriverImpl) as i32 {
-    if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
-    if (cast(i64, drv) == 0) { return INVALID_ARGUMENT; }
-
-    if (_tree_has_bound(cast(*Hardware, root_hardware), drv) == 1) {
-        return DEVICE_BUSY;
-    }
-
-    sched.preempt_disable();
-    let is *DriverImpl as cur with mut = bt.drivers;
-    let is *DriverImpl as prev with mut = cast(*DriverImpl, 0);
-    while (cast(i64, cur) != 0) {
-        if (cast(i64, cur) == cast(i64, drv)) {
-            if (cast(i64, prev) == 0) { bt.drivers = cur.next; }
-            else { prev.next = cur.next; }
-            cur.next = cast(*DriverImpl, 0);
-            cur.bus = cast(*Bus, 0);
-            bt.driver_count = bt.driver_count - cast(u32, 1);
-            sched.preempt_enable();
-            return OK;
-        }
-        prev = cur;
-        cur = cur.next;
-    }
-    sched.preempt_enable();
-    return NOT_FOUND;
-}
-
-// Unlinks `bi` from its Bus's instance list and removes it from the
-// device tree. Caller is responsible for having unregistered every child
-// device first (the underlying hardware_unregister panics on non-empty
-// children per spec invariant #9). Transitions the instance through
-// DETACHING → DEAD so the tree invariants hold.
 fn bus_node_unregister(bi as *BusNode) as i32 {
     if (cast(i64, bi) == 0) { return INVALID_ARGUMENT; }
     let is *Hardware as d = cast(*Hardware, bi);
@@ -807,92 +626,7 @@ fn bus_node_unregister(bi as *BusNode) as i32 {
     sched.preempt_enable();
     if (found == 0) { return NOT_FOUND; }
 
-    // Transition through DETACHING→DEAD if probed; otherwise UNINITIALIZED→DEAD.
-    if (d.state == STATE_PROBED)    { device_set_state(d, STATE_DETACHING); }
-    if (d.state != STATE_DEAD)      { device_set_state(d, STATE_DEAD); }
+    d.state = STATE_DEAD;
     hardware_unregister(d);
     return OK;
-}
-
-// Iterate bt.drivers, invoke bt.match_fn on each, pick the winner by
-// drv.priority (unique within a bus, so no tie-breaking is needed).
-// Calls winner.probe on success, transitions dev.state accordingly.
-// Returns OK on PROBED, NO_DRIVER_MATCHED if no driver qualified (dev
-// stays UNINITIALIZED), or the probe's own DriverImplResult on probe failure
-// (dev transitions to DEAD and caller is expected to hardware_unregister).
-fn bus_probe_hardware(bt as *Bus, dev as *Hardware) as i32 {
-    if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
-    if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
-
-    let is *DriverImpl as best with mut = cast(*DriverImpl, 0);
-    let is i32 as best_pri with mut = 0;
-
-    sched.preempt_disable();
-    let is *DriverImpl as cur with mut = bt.drivers;
-    while (cast(i64, cur) != 0) {
-        let is i32 as matched = call(bt.match_fn, bt, dev, cur);
-        if (matched == 1) {
-            if (cast(i64, best) == 0) {
-                best = cur;
-                best_pri = cur.priority;
-            } else {
-                if (cur.priority > best_pri) {
-                    best = cur;
-                    best_pri = cur.priority;
-                }
-            }
-        }
-        cur = cur.next;
-    }
-    sched.preempt_enable();
-
-    if (cast(i64, best) == 0) {
-        return NO_DRIVER_MATCHED;
-    }
-
-    let is i32 as probe_rc = call(best.probe, dev);
-    if (probe_rc != OK) {
-        device_set_state(dev, STATE_DEAD);
-        return probe_rc;
-    }
-
-    dev.driver = best;
-    device_set_state(dev, STATE_PROBED);
-    return OK;
-}
-
-// Validates a state transition and applies it under the tree lock
-// (single-CPU: sufficient coverage; SMP will refine to per-device lock).
-// Returns OK or INVALID_STATE_TRANSITION.
-fn device_set_state(dev as *Hardware, new_state as i32) as i32 {
-    tree_lock();
-    let is i32 as cur = dev.state;
-    let is i32 as valid with mut = 0;
-    if (cur == STATE_UNINITIALIZED && new_state == STATE_PROBED)    { valid = 1; }
-    if (cur == STATE_UNINITIALIZED && new_state == STATE_DEAD)      { valid = 1; }
-    if (cur == STATE_PROBED        && new_state == STATE_DETACHING) { valid = 1; }
-    if (cur == STATE_DETACHING     && new_state == STATE_DEAD)      { valid = 1; }
-    if (valid == 0) {
-        tree_unlock();
-        return INVALID_STATE_TRANSITION;
-    }
-    dev.state = new_state;
-    let is i64 as w = dev.waiter_tid;
-    dev.waiter_tid = cast(i64, 0 - 1);
-    tree_unlock();
-    if (w >= 0) { sched.wakeup_thread(w); }
-    return OK;
-}
-
-// Blocks the current thread until dev.state equals `desired`. Single-waiter
-// for V1 — the spec notes multi-waiter is a future extension. The caller
-// must be a real kernel thread (Phase 2 or later).
-fn device_wait_state(dev as *Hardware, desired as i32) as void {
-    if (cast(i64, dev) == 0) { return; }
-    while (dev.state != desired) {
-        let is i64 as tid = sched.current_tid();
-        if (tid < 0) { return; }
-        dev.waiter_tid = tid;
-        sched.sleep_thread(tid);
-    }
 }
