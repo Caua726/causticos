@@ -1,0 +1,101 @@
+// ksym.cst — kernel symbol table (Phase 2.3).
+//
+// Maps human-readable names (e.g. "dummybus.dummy_bind") to runtime
+// addresses. Populated at boot by each module's register() function
+// and queried by the .cdvrspec parser when resolving lifecycle
+// callback names like `on_bind: dummybus.dummy_bind`.
+//
+// Storage model (Phase 2.3): singly-linked list rooted at `ksyms`,
+// each KSym statically allocated in the driver's module (BSS) and
+// linked in via ksym.register(&sym). A future optimisation can move
+// entries into `.ksym_table` with section() and iterate via the
+// linker-provided __start_/__stop_ markers — infrastructure intentionally
+// kept simple for now.
+//
+// Secondary use: panic backtrace / kdebug can consume the same table
+// to render return addresses as names (future work).
+
+use "sched.cst" as sched;
+use "serial.cst" as serial;
+
+// --- Symbol kinds ---
+let is i64 as KIND_FUNC = 1;
+let is i64 as KIND_DATA = 2;
+
+struct KSym {
+    name_ptr as *u8;    // points into rodata; owned by the declaring module
+    name_len as i64;
+    addr as i64;
+    kind as i64;
+    next as *KSym;
+}
+
+let is i64 as ksyms with mut = 0;       // head of registered symbols
+let is i64 as ksym_count with mut = 0;
+
+// Register a symbol. `s` must be a statically-allocated KSym (BSS or
+// with section) so the pointer stays valid for the lifetime of the kernel.
+// Returns 0 on success, negative on invalid input. Duplicate names are
+// allowed for now (caller responsibility); future lookup wins the
+// most-recently-registered entry (LIFO list order).
+fn register(s as *KSym) as i32 {
+    if (cast(i64, s) == 0) { return cast(i32, 0 - 1); }
+    if (cast(i64, s.name_ptr) == 0) { return cast(i32, 0 - 1); }
+
+    sched.preempt_disable();
+    s.next = cast(*KSym, ksyms);
+    ksyms = cast(i64, s);
+    ksym_count = ksym_count + 1;
+    sched.preempt_enable();
+    return 0;
+}
+
+// Byte-exact compare of two raw name slices.
+fn names_eq(a as *u8, a_len as i64, b as *u8, b_len as i64) as i32 {
+    if (a_len != b_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a_len) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Lookup returns the registered address, or 0 if no match. Callers treat
+// 0 as "not found" — registering a symbol with addr==0 is therefore a
+// programming error.
+fn lookup(name as *u8, name_len as i64) as i64 {
+    let is *KSym as s with mut = cast(*KSym, ksyms);
+    while (cast(i64, s) != 0) {
+        if (names_eq(s.name_ptr, s.name_len, name, name_len) == 1) {
+            return s.addr;
+        }
+        s = s.next;
+    }
+    return 0;
+}
+
+// Convenience: lookup by C-style null-terminated string.
+fn lookup_cstr(name as *u8) as i64 {
+    let is i64 as len with mut = 0;
+    while (name[len] != cast(u8, 0)) { len = len + 1; }
+    return lookup(name, len);
+}
+
+fn dump() as void {
+    serial.print("ksym: ", 6);
+    let is *KSym as s with mut = cast(*KSym, ksyms);
+    let is i64 as n with mut = 0;
+    while (cast(i64, s) != 0) { n = n + 1; s = s.next; }
+    // minimal count print to confirm population; full dump deferred.
+    if (n > 99) {
+        serial.print("(>99 syms)", 10);
+    } else {
+        let is [3]u8 as buf;
+        buf[0] = cast(u8, (n / 10) + 48);
+        buf[1] = cast(u8, (n % 10) + 48);
+        buf[2] = cast(u8, 32);
+        serial.print(&buf[0], 3);
+    }
+    serial.println("symbols", 7);
+}
