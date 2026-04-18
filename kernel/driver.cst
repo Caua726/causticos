@@ -1,9 +1,9 @@
 // driver.cst — Driver framework base (spec v2, step 1)
 //
-// Provides: Device/Driver/BusType/BusInstance structs, state constants,
-// DriverResult codes, the synthetic root device, and driver_framework_init.
+// Provides: Hardware/DriverImpl/Bus/BusNode structs, state constants,
+// DriverImplResult codes, the synthetic root device, and driver_framework_init.
 //
-// Operations (device_register, bus_register_driver, probing, resources) land
+// Operations (hardware_register, bus_register_driver, probing, resources) land
 // in later commits per the spec's Implementation Order.
 
 use "pmm.cst" as pmm;
@@ -14,7 +14,7 @@ use "vmm.cst" as vmm;
 use "lapic.cst" as lapic;
 
 // ============================================================
-// DeviceState
+// HardwareState
 // ============================================================
 
 let is i32 as STATE_UNINITIALIZED = 0;
@@ -23,7 +23,7 @@ let is i32 as STATE_DETACHING     = 2;
 let is i32 as STATE_DEAD          = 3;
 
 // ============================================================
-// DriverResult — OK=0, errors positive
+// DriverImplResult — OK=0, errors positive
 // ============================================================
 
 let is i32 as OK                       = 0;
@@ -64,7 +64,7 @@ struct MmioRegion {
 struct IrqBinding {
     vector as u32;
     kind as i32;
-    handler as fn(*Device, *u8) as i32;
+    handler as fn(*Hardware, *u8) as i32;
     context as *u8;
     next as *IrqBinding;
 }
@@ -80,38 +80,38 @@ struct DmaBuffer {
 // Core structs
 // ============================================================
 
-struct BusType {
+struct Bus {
     name as [32]u8;
-    match_fn as fn(*BusType, *Device, *Driver) as i32;
-    enumerate_instance as fn(*BusInstance) as void;
-    drivers as *Driver;
+    match_fn as fn(*Bus, *Hardware, *DriverImpl) as i32;
+    enumerate_node as fn(*BusNode) as void;
+    drivers as *DriverImpl;
     driver_count as u32;
-    instance_count as u32;
-    instances as *BusInstance;
+    node_count as u32;
+    nodes as *BusNode;
     lock as i32;
     _pad as i32;
-    next as *BusType;
+    next as *Bus;
 }
 
-struct Driver {
+struct DriverImpl {
     name as [32]u8;
-    bus_type as *BusType;
+    bus as *Bus;
     match_spec as *u8;
-    probe as fn(*Device) as i32;
-    remove as fn(*Device) as void;
+    probe as fn(*Hardware) as i32;
+    remove as fn(*Hardware) as void;
     priority as i32;
     _pad as i32;
-    next as *Driver;
+    next as *DriverImpl;
 }
 
-struct Device {
+struct Hardware {
     name as [32]u8;
-    parent as *Device;
-    first_child as *Device;
-    next_sibling as *Device;
-    prev_sibling as *Device;
-    bus_type as *BusType;
-    driver as *Driver;
+    parent as *Hardware;
+    first_child as *Hardware;
+    next_sibling as *Hardware;
+    prev_sibling as *Hardware;
+    bus as *Bus;
+    driver as *DriverImpl;
     private as *u8;
     state as i32;
     lock as i32;                 // spinlock stub; single-CPU for now
@@ -121,18 +121,18 @@ struct Device {
     waiter_tid as i64;           // single waiter for device_wait_state; -1 = none
 }
 
-struct BusInstance {
-    base as Device;
-    next as *BusInstance;
+struct BusNode {
+    base as Hardware;
+    next as *BusNode;
 }
 
 // ============================================================
 // Globals
 // ============================================================
 
-let is i64 as root_device with mut = 0;
-let is i64 as bus_types with mut = 0;
-let is i32 as bus_type_count with mut = 0;
+let is i64 as root_hardware with mut = 0;
+let is i64 as buses with mut = 0;
+let is i32 as bus_count with mut = 0;
 let is i32 as driver_tree_lock with mut = 0;
 
 // ============================================================
@@ -141,15 +141,15 @@ let is i32 as driver_tree_lock with mut = 0;
 
 fn init() as void {
     serial.print("driver: init ", 13);
-    let is i64 as addr = heap.kmalloc(sizeof(Device), 0);
+    let is i64 as addr = heap.kmalloc(sizeof(Hardware), 0);
     if (addr == 0) {
         pmm.panic("driver: root alloc failed", 25);
     }
-    let is *Device as root = cast(*Device, addr);
+    let is *Hardware as root = cast(*Hardware, addr);
     // Zero the struct
     let is *u8 as p = cast(*u8, addr);
     let is i64 as i with mut = 0;
-    while (i < sizeof(Device)) {
+    while (i < sizeof(Hardware)) {
         p[i] = cast(u8, 0);
         i = i + 1;
     }
@@ -159,12 +159,12 @@ fn init() as void {
     root.name[3] = cast(u8, 116); // 't'
     root.state = STATE_UNINITIALIZED;
     root.waiter_tid = cast(i64, 0 - 1);
-    root_device = addr;
+    root_hardware = addr;
     serial.println("ok", 2);
 }
 
-fn get_root() as *Device {
-    return cast(*Device, root_device);
+fn get_root() as *Hardware {
+    return cast(*Hardware, root_hardware);
 }
 
 // ============================================================
@@ -185,50 +185,50 @@ fn tree_unlock() as void {
 }
 
 // ============================================================
-// Device allocation + lifecycle
+// Hardware allocation + lifecycle
 // ============================================================
 
 // kmalloc's second arg is flags, not alignment. The current kernel has no
 // alignment-aware allocator; kmalloc slabs are naturally pointer-aligned
-// (8 bytes), which satisfies every Device-sized allocation today. The
+// (8 bytes), which satisfies every Hardware-sized allocation today. The
 // align parameter is kept in the signature per spec for forward-compat.
-fn device_alloc(size as i64, align as i64) as *Device {
+fn hardware_alloc(size as i64, align as i64) as *Hardware {
     let is i64 as addr = heap.kmalloc(size, 0);
-    if (addr == 0) { return cast(*Device, 0); }
+    if (addr == 0) { return cast(*Hardware, 0); }
     let is *u8 as p = cast(*u8, addr);
     let is i64 as i with mut = 0;
     while (i < size) {
         p[i] = cast(u8, 0);
         i = i + 1;
     }
-    let is *Device as d = cast(*Device, addr);
+    let is *Hardware as d = cast(*Hardware, addr);
     d.waiter_tid = cast(i64, 0 - 1);
     return d;
 }
 
 // Links dev into parent's child list. Caller must have populated dev's
-// bus-specific fields (and dev.bus_type if dev is a BusInstance).
+// bus-specific fields (and dev.bus if dev is a BusNode).
 // Returns OK, INVALID_ARGUMENT. Panics on double-registration.
-fn device_register(dev as *Device, parent as *Device) as i32 {
+fn hardware_register(dev as *Hardware, parent as *Hardware) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, dev.parent) != 0) {
-        pmm.panic("device_register: already registered", 35);
+        pmm.panic("hardware_register: already registered", 35);
     }
 
     tree_lock();
 
     dev.parent = parent;
-    dev.first_child = cast(*Device, 0);
-    dev.next_sibling = cast(*Device, 0);
-    dev.prev_sibling = cast(*Device, 0);
+    dev.first_child = cast(*Hardware, 0);
+    dev.next_sibling = cast(*Hardware, 0);
+    dev.prev_sibling = cast(*Hardware, 0);
 
     if (cast(i64, parent) != 0) {
-        // Inherit bus_type from parent unless caller already set it
-        // (BusInstance pre-sets its own bus_type per spec fix #15).
-        if (cast(i64, dev.bus_type) == 0) {
-            dev.bus_type = parent.bus_type;
+        // Inherit bus from parent unless caller already set it
+        // (BusNode pre-sets its own bus per spec fix #15).
+        if (cast(i64, dev.bus) == 0) {
+            dev.bus = parent.bus;
         }
-        let is *Device as old_head = parent.first_child;
+        let is *Hardware as old_head = parent.first_child;
         dev.next_sibling = old_head;
         if (cast(i64, old_head) != 0) {
             old_head.prev_sibling = dev;
@@ -242,22 +242,22 @@ fn device_register(dev as *Device, parent as *Device) as i32 {
 
 // Panics on invariant violation (state != DEAD, has children, or resources
 // still tracked). Unlinks dev from the tree and frees it.
-fn device_unregister(dev as *Device) as void {
+fn hardware_unregister(dev as *Hardware) as void {
     if (cast(i64, dev) == 0) {
-        pmm.panic("device_unregister: null dev", 27);
+        pmm.panic("hardware_unregister: null dev", 27);
     }
 
     tree_lock();
 
     if (dev.state != STATE_DEAD) {
-        pmm.panic("device_unregister: not DEAD", 27);
+        pmm.panic("hardware_unregister: not DEAD", 27);
     }
     if (cast(i64, dev.first_child) != 0) {
-        pmm.panic("device_unregister: has children", 31);
+        pmm.panic("hardware_unregister: has children", 31);
     }
 
     if (cast(i64, dev.parent) != 0) {
-        let is *Device as parent = dev.parent;
+        let is *Hardware as parent = dev.parent;
         if (cast(i64, dev.prev_sibling) == 0) {
             parent.first_child = dev.next_sibling;
         } else {
@@ -275,18 +275,18 @@ fn device_unregister(dev as *Device) as void {
 }
 
 // ============================================================
-// BusType + BusInstance registration
+// Bus + BusNode registration
 // ============================================================
 
-// Links bt into the global bus_types list. Rejects re-registration by
-// pointer identity. bt's drivers/instances/counters are expected to be
-// zero-initialized by the caller (static .bus_types entries satisfy this).
-// Lookup a registered BusType by name, byte-compared up to the caller's
+// Links bt into the global buses list. Rejects re-registration by
+// pointer identity. bt's drivers/nodes/counters are expected to be
+// zero-initialized by the caller (static .buses entries satisfy this).
+// Lookup a registered Bus by name, byte-compared up to the caller's
 // declared length or the stored null terminator. Returns null if no match.
 // Decouples bus-type registration from direct symbol references — a driver
 // can ask for "pci" without importing the PCI module's static.
-fn bus_type_by_name(name as *u8, name_len as i32) as *BusType {
-    let is *BusType as bt with mut = cast(*BusType, bus_types);
+fn bus_by_name(name as *u8, name_len as i32) as *Bus {
+    let is *Bus as bt with mut = cast(*Bus, buses);
     while (cast(i64, bt) != 0) {
         let is i32 as i with mut = 0;
         let is i32 as matched with mut = 1;
@@ -302,14 +302,14 @@ fn bus_type_by_name(name as *u8, name_len as i32) as *BusType {
         }
         bt = bt.next;
     }
-    return cast(*BusType, 0);
+    return cast(*Bus, 0);
 }
 
-fn bus_type_register(bt as *BusType) as i32 {
+fn bus_register(bt as *Bus) as i32 {
     if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
 
     tree_lock();
-    let is *BusType as cur with mut = cast(*BusType, bus_types);
+    let is *Bus as cur with mut = cast(*Bus, buses);
     while (cast(i64, cur) != 0) {
         if (cast(i64, cur) == cast(i64, bt)) {
             tree_unlock();
@@ -317,30 +317,30 @@ fn bus_type_register(bt as *BusType) as i32 {
         }
         cur = cur.next;
     }
-    bt.next = cast(*BusType, bus_types);
-    bus_types = cast(i64, bt);
-    bus_type_count = bus_type_count + 1;
+    bt.next = cast(*Bus, buses);
+    buses = cast(i64, bt);
+    bus_count = bus_count + 1;
     tree_unlock();
     return OK;
 }
 
-// Registers a BusInstance in the device tree and in its BusType's flat
-// instance list. Caller must set bi.base.bus_type before calling (spec
-// fix #15). Lock ordering: device_register acquires the tree lock; the
+// Registers a BusNode in the device tree and in its Bus's flat
+// instance list. Caller must set bi.base.bus before calling (spec
+// fix #15). Lock ordering: hardware_register acquires the tree lock; the
 // bus-type lock is acquired strictly after tree operations complete.
-fn bus_instance_register(bi as *BusInstance, parent as *Device) as i32 {
+fn bus_node_register(bi as *BusNode, parent as *Hardware) as i32 {
     if (cast(i64, bi) == 0) { return INVALID_ARGUMENT; }
-    if (cast(i64, bi.base.bus_type) == 0) { return INVALID_ARGUMENT; }
-    let is *BusType as bt = bi.base.bus_type;
+    if (cast(i64, bi.base.bus) == 0) { return INVALID_ARGUMENT; }
+    let is *Bus as bt = bi.base.bus;
 
-    let is i32 as rc = device_register(cast(*Device, bi), parent);
+    let is i32 as rc = hardware_register(cast(*Hardware, bi), parent);
     if (rc != OK) { return rc; }
 
     // Single-CPU: preempt_disable doubles as bt.lock.
     sched.preempt_disable();
-    bi.next = bt.instances;
-    bt.instances = bi;
-    bt.instance_count = bt.instance_count + cast(u32, 1);
+    bi.next = bt.nodes;
+    bt.nodes = bi;
+    bt.node_count = bt.node_count + cast(u32, 1);
     sched.preempt_enable();
 
     return OK;
@@ -351,7 +351,7 @@ fn bus_instance_register(bi as *BusInstance, parent as *Device) as i32 {
 //
 // Resources are tracked per-device in three singly-linked lists. The lists
 // start empty (null). Allocations prepend; releases scan-and-unlink.
-// device_unregister drains all three in order IRQ -> DMA -> MMIO
+// hardware_unregister drains all three in order IRQ -> DMA -> MMIO
 // per spec §Cleanup Ordering.
 //
 // Limitations for V1:
@@ -361,7 +361,7 @@ fn bus_instance_register(bi as *BusInstance, parent as *Device) as i32 {
 //     LAPIC — that wiring lives in the IRQ subsystem commit.
 // ============================================================
 
-fn mmio_map(dev as *Device, phys as u64, size as u64, flags as u32, out as **u8) as i32 {
+fn mmio_map(dev as *Hardware, phys as u64, size as u64, flags as u32, out as **u8) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, out) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, size) == 0) { return INVALID_ARGUMENT; }
@@ -389,7 +389,7 @@ fn mmio_map(dev as *Device, phys as u64, size as u64, flags as u32, out as **u8)
     return OK;
 }
 
-fn mmio_unmap(dev as *Device, region as *MmioRegion) as void {
+fn mmio_unmap(dev as *Hardware, region as *MmioRegion) as void {
     if (cast(i64, dev) == 0) { return; }
     if (cast(i64, region) == 0) { return; }
 
@@ -411,7 +411,7 @@ fn mmio_unmap(dev as *Device, region as *MmioRegion) as void {
     sched.preempt_enable();
 }
 
-fn dma_alloc(dev as *Device, size as u64, align as u64, flags as u32, out as **DmaBuffer) as i32 {
+fn dma_alloc(dev as *Hardware, size as u64, align as u64, flags as u32, out as **DmaBuffer) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, out) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, size) == 0) { return INVALID_ARGUMENT; }
@@ -447,7 +447,7 @@ fn dma_alloc(dev as *Device, size as u64, align as u64, flags as u32, out as **D
     return OK;
 }
 
-fn dma_free(dev as *Device, buffer as *DmaBuffer) as void {
+fn dma_free(dev as *Hardware, buffer as *DmaBuffer) as void {
     if (cast(i64, dev) == 0) { return; }
     if (cast(i64, buffer) == 0) { return; }
 
@@ -474,7 +474,7 @@ fn dma_free(dev as *Device, buffer as *DmaBuffer) as void {
 // asm stub. Entry is (device, handler, context) triple. Null handler means
 // no driver registered for that vector.
 let is [2048]u8 as irq_handler_tbl_raw;   // 256 slots × 8 bytes
-let is [2048]u8 as irq_device_tbl_raw;
+let is [2048]u8 as irq_hardware_tbl_raw;
 let is [2048]u8 as irq_context_tbl_raw;
 
 fn irq_tbl_get(base as *u8, v as i64) as i64 {
@@ -500,15 +500,15 @@ fn driver_irq_dispatch(vector as i64) as void {
         lapic.eoi();
         return;
     }
-    let is i64 as dptr = irq_tbl_get(cast(*u8, &irq_device_tbl_raw), vector);
+    let is i64 as dptr = irq_tbl_get(cast(*u8, &irq_hardware_tbl_raw), vector);
     let is i64 as cptr = irq_tbl_get(cast(*u8, &irq_context_tbl_raw), vector);
-    let is fn(*Device, *u8) as i32 as h = cast(fn(*Device, *u8) as i32, hptr);
-    call(h, cast(*Device, dptr), cast(*u8, cptr));
+    let is fn(*Hardware, *u8) as i32 as h = cast(fn(*Hardware, *u8) as i32, hptr);
+    call(h, cast(*Hardware, dptr), cast(*u8, cptr));
     lapic.eoi();
 }
 
-fn irq_register(dev as *Device, vector as u32, kind as i32,
-                handler as fn(*Device, *u8) as i32, context as *u8) as i32 {
+fn irq_register(dev as *Hardware, vector as u32, kind as i32,
+                handler as fn(*Hardware, *u8) as i32, context as *u8) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
     let is i64 as v = cast(i64, vector);
     if (v < 0) { return IRQ_INVALID_VECTOR; }
@@ -529,7 +529,7 @@ fn irq_register(dev as *Device, vector as u32, kind as i32,
         return ALREADY_EXISTS;
     }
     irq_tbl_set(cast(*u8, &irq_handler_tbl_raw), v, cast(i64, handler));
-    irq_tbl_set(cast(*u8, &irq_device_tbl_raw),  v, cast(i64, dev));
+    irq_tbl_set(cast(*u8, &irq_hardware_tbl_raw),  v, cast(i64, dev));
     irq_tbl_set(cast(*u8, &irq_context_tbl_raw), v, cast(i64, context));
     b.next = dev.irq_list;
     dev.irq_list = b;
@@ -537,7 +537,7 @@ fn irq_register(dev as *Device, vector as u32, kind as i32,
     return OK;
 }
 
-fn irq_unregister(dev as *Device, vector as u32) as void {
+fn irq_unregister(dev as *Hardware, vector as u32) as void {
     if (cast(i64, dev) == 0) { return; }
     let is i64 as v = cast(i64, vector);
     if (v < 0) { return; }
@@ -551,7 +551,7 @@ fn irq_unregister(dev as *Device, vector as u32) as void {
             if (cast(i64, prev) == 0) { dev.irq_list = cur.next; }
             else                       { prev.next = cur.next; }
             irq_tbl_set(cast(*u8, &irq_handler_tbl_raw), v, 0);
-            irq_tbl_set(cast(*u8, &irq_device_tbl_raw),  v, 0);
+            irq_tbl_set(cast(*u8, &irq_hardware_tbl_raw),  v, 0);
             irq_tbl_set(cast(*u8, &irq_context_tbl_raw), v, 0);
             sched.preempt_enable();
             heap.kfree(cast(i64, cur));
@@ -564,8 +564,8 @@ fn irq_unregister(dev as *Device, vector as u32) as void {
 }
 
 // Drains all tracked resources in spec-mandated order IRQ -> DMA -> MMIO.
-// Idempotent: called from device_unregister; safe on empty lists.
-fn release_all_resources(dev as *Device) as void {
+// Idempotent: called from hardware_unregister; safe on empty lists.
+fn release_all_resources(dev as *Hardware) as void {
     while (cast(i64, dev.irq_list) != 0) {
         let is *IrqBinding as head = dev.irq_list;
         irq_unregister(dev, head.vector);
@@ -583,14 +583,14 @@ fn release_all_resources(dev as *Device) as void {
 // ============================================================
 // Init-section iteration
 //
-// The spec describes four sections (.bus_types, .drivers_init.bus,
+// The spec describes four sections (.buses, .drivers_init.bus,
 // .drivers_init.driver, .drivers_init.late) iterated in ascending `order`
 // value. caustic-ld currently strips section names from the final ELF and
 // does not emit __start_SECNAME / __stop_SECNAME markers, so automatic
 // discovery of entries is not yet available.
 //
 // Until the linker gains that feature, buses and drivers register themselves
-// by calling `bus_type_register` / `bus_register_driver` from a bootstrap
+// by calling `bus_register` / `bus_register_driver` from a bootstrap
 // hook. The four functions below are the wiring points the _kernel_start
 // path will call; each bus/driver module contributes by providing a function
 // that adds itself to the relevant list, and the kernel binds those hooks
@@ -601,12 +601,12 @@ fn release_all_resources(dev as *Device) as void {
 // becomes available or when a central registration table is wired.
 // ============================================================
 
-fn driver_register_bus_types() as void {
+fn driver_register_buses() as void {
     // Filled by manual calls until section iteration is available.
 }
 
 fn driver_init_buses() as void {
-    // Creates BusInstances for each registered BusType. Buses provide their
+    // Creates BusNodes for each registered Bus. Buses provide their
     // own enumerate-entry hook.
 }
 
@@ -615,14 +615,14 @@ fn driver_init_drivers() as void {
 }
 
 fn driver_enumerate_all() as void {
-    // For each BusType with instances, calls bt.enumerate_instance(bi) to
+    // For each Bus with nodes, calls bt.enumerate_node(bi) to
     // create UNINITIALIZED devices. No probing yet — Phase 1 only.
-    let is *BusType as bt with mut = cast(*BusType, bus_types);
+    let is *Bus as bt with mut = cast(*Bus, buses);
     while (cast(i64, bt) != 0) {
-        if (cast(i64, bt.enumerate_instance) != 0) {
-            let is *BusInstance as bi with mut = bt.instances;
+        if (cast(i64, bt.enumerate_node) != 0) {
+            let is *BusNode as bi with mut = bt.nodes;
             while (cast(i64, bi) != 0) {
-                call(bt.enumerate_instance, bi);
+                call(bt.enumerate_node, bi);
                 bi = bi.next;
             }
         }
@@ -635,35 +635,35 @@ fn driver_late_init() as void {
 }
 
 // Depth-first walk: probe the parent first so a bridge's probe can create
-// children which are then probed in turn. Devices with null bus_type (root)
+// children which are then probed in turn. Hardwares with null bus (root)
 // are skipped. next_sibling is snapshotted before probing in case the list
 // is mutated during probe (e.g. child registration).
 //
-// If a probe fails, bus_probe_device transitions the device to DEAD but
+// If a probe fails, bus_probe_hardware transitions the device to DEAD but
 // does NOT unregister it. probe_subtree is the owner of the unregister
 // step: it detects DEAD, unregisters, and does not descend into what is
 // now a freed device. Per spec fix #12, bridge drivers that registered
 // sub-devices during probe must unregister them before returning an
 // error, so by the time we see DEAD here the subtree is already empty.
-fn probe_subtree(dev as *Device) as void {
+fn probe_subtree(dev as *Hardware) as void {
     if (cast(i64, dev) == 0) { return; }
-    if (dev.state == STATE_UNINITIALIZED && cast(i64, dev.bus_type) != 0) {
-        bus_probe_device(dev.bus_type, dev);
+    if (dev.state == STATE_UNINITIALIZED && cast(i64, dev.bus) != 0) {
+        bus_probe_hardware(dev.bus, dev);
     }
     if (dev.state == STATE_DEAD) {
-        device_unregister(dev);
+        hardware_unregister(dev);
         return;
     }
-    let is *Device as c with mut = dev.first_child;
+    let is *Hardware as c with mut = dev.first_child;
     while (cast(i64, c) != 0) {
-        let is *Device as next = c.next_sibling;
+        let is *Hardware as next = c.next_sibling;
         probe_subtree(c);
         c = next;
     }
 }
 
 fn driver_probe_all() as void {
-    probe_subtree(cast(*Device, root_device));
+    probe_subtree(cast(*Hardware, root_hardware));
 }
 
 // Entry point dispatched by sched.start as the first kernel thread. Runs
@@ -678,7 +678,7 @@ fn driver_init_thread() as void {
 }
 
 // ============================================================
-// Driver registration, matching, probing
+// DriverImpl registration, matching, probing
 // ============================================================
 
 // Byte-compare two [32]u8 name buffers. Equal if all 32 bytes match, or if
@@ -694,15 +694,15 @@ fn name32_eq(a as *u8, b as *u8) as i32 {
 }
 
 // Registers drv under bt. Enforces both name uniqueness and priority
-// uniqueness (spec fix #5). On success, drv.bus_type is set and drv is
+// uniqueness (spec fix #5). On success, drv.bus is set and drv is
 // linked into bt.drivers.
-fn bus_register_driver(bt as *BusType, drv as *Driver) as i32 {
+fn bus_register_driver(bt as *Bus, drv as *DriverImpl) as i32 {
     if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, drv) == 0) { return INVALID_ARGUMENT; }
 
     sched.preempt_disable();
 
-    let is *Driver as cur with mut = bt.drivers;
+    let is *DriverImpl as cur with mut = bt.drivers;
     while (cast(i64, cur) != 0) {
         if (cast(i64, cur) == cast(i64, drv)) {
             sched.preempt_enable();
@@ -719,7 +719,7 @@ fn bus_register_driver(bt as *BusType, drv as *Driver) as i32 {
         cur = cur.next;
     }
 
-    drv.bus_type = bt;
+    drv.bus = bt;
     drv.next = bt.drivers;
     bt.drivers = drv;
     bt.driver_count = bt.driver_count + cast(u32, 1);
@@ -731,10 +731,10 @@ fn bus_register_driver(bt as *BusType, drv as *Driver) as i32 {
 // Walks the device tree rooted at `dev` and returns 1 if any device has
 // `dev.driver == drv`. Used by bus_unregister_driver to refuse removing a
 // driver that is still bound to a probed device.
-fn _tree_has_bound(dev as *Device, drv as *Driver) as i32 {
+fn _tree_has_bound(dev as *Hardware, drv as *DriverImpl) as i32 {
     if (cast(i64, dev) == 0) { return 0; }
     if (cast(i64, dev.driver) == cast(i64, drv)) { return 1; }
-    let is *Device as c with mut = dev.first_child;
+    let is *Hardware as c with mut = dev.first_child;
     while (cast(i64, c) != 0) {
         if (_tree_has_bound(c, drv) == 1) { return 1; }
         c = c.next_sibling;
@@ -743,26 +743,26 @@ fn _tree_has_bound(dev as *Device, drv as *Driver) as i32 {
 }
 
 // Unlinks `drv` from `bt.drivers`. Refuses if any device is still bound to
-// this driver — the caller must device_unregister those (or transition them
+// this driver — the caller must hardware_unregister those (or transition them
 // off this driver) first. Returns OK, INVALID_ARGUMENT, DEVICE_BUSY, or
 // NOT_FOUND if `drv` isn't in this bus type's list.
-fn bus_unregister_driver(bt as *BusType, drv as *Driver) as i32 {
+fn bus_unregister_driver(bt as *Bus, drv as *DriverImpl) as i32 {
     if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, drv) == 0) { return INVALID_ARGUMENT; }
 
-    if (_tree_has_bound(cast(*Device, root_device), drv) == 1) {
+    if (_tree_has_bound(cast(*Hardware, root_hardware), drv) == 1) {
         return DEVICE_BUSY;
     }
 
     sched.preempt_disable();
-    let is *Driver as cur with mut = bt.drivers;
-    let is *Driver as prev with mut = cast(*Driver, 0);
+    let is *DriverImpl as cur with mut = bt.drivers;
+    let is *DriverImpl as prev with mut = cast(*DriverImpl, 0);
     while (cast(i64, cur) != 0) {
         if (cast(i64, cur) == cast(i64, drv)) {
             if (cast(i64, prev) == 0) { bt.drivers = cur.next; }
             else { prev.next = cur.next; }
-            cur.next = cast(*Driver, 0);
-            cur.bus_type = cast(*BusType, 0);
+            cur.next = cast(*DriverImpl, 0);
+            cur.bus = cast(*Bus, 0);
             bt.driver_count = bt.driver_count - cast(u32, 1);
             sched.preempt_enable();
             return OK;
@@ -774,30 +774,30 @@ fn bus_unregister_driver(bt as *BusType, drv as *Driver) as i32 {
     return NOT_FOUND;
 }
 
-// Unlinks `bi` from its BusType's instance list and removes it from the
+// Unlinks `bi` from its Bus's instance list and removes it from the
 // device tree. Caller is responsible for having unregistered every child
-// device first (the underlying device_unregister panics on non-empty
+// device first (the underlying hardware_unregister panics on non-empty
 // children per spec invariant #9). Transitions the instance through
 // DETACHING → DEAD so the tree invariants hold.
-fn bus_instance_unregister(bi as *BusInstance) as i32 {
+fn bus_node_unregister(bi as *BusNode) as i32 {
     if (cast(i64, bi) == 0) { return INVALID_ARGUMENT; }
-    let is *Device as d = cast(*Device, bi);
+    let is *Hardware as d = cast(*Hardware, bi);
     if (cast(i64, d.first_child) != 0) { return DEVICE_BUSY; }
-    let is *BusType as bt = d.bus_type;
+    let is *Bus as bt = d.bus;
     if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
 
     sched.preempt_disable();
-    let is *BusInstance as cur with mut = bt.instances;
-    let is *BusInstance as prev with mut = cast(*BusInstance, 0);
+    let is *BusNode as cur with mut = bt.nodes;
+    let is *BusNode as prev with mut = cast(*BusNode, 0);
     let is i32 as found with mut = 0;
     while (cast(i64, cur) != 0) {
         if (cast(i64, cur) == cast(i64, bi)) {
-            if (cast(i64, prev) == 0) { bt.instances = cur.next; }
+            if (cast(i64, prev) == 0) { bt.nodes = cur.next; }
             else { prev.next = cur.next; }
-            cur.next = cast(*BusInstance, 0);
-            bt.instance_count = bt.instance_count - cast(u32, 1);
+            cur.next = cast(*BusNode, 0);
+            bt.node_count = bt.node_count - cast(u32, 1);
             found = 1;
-            cur = cast(*BusInstance, 0);
+            cur = cast(*BusNode, 0);
         } else {
             prev = cur;
             cur = cur.next;
@@ -809,7 +809,7 @@ fn bus_instance_unregister(bi as *BusInstance) as i32 {
     // Transition through DETACHING→DEAD if probed; otherwise UNINITIALIZED→DEAD.
     if (d.state == STATE_PROBED)    { device_set_state(d, STATE_DETACHING); }
     if (d.state != STATE_DEAD)      { device_set_state(d, STATE_DEAD); }
-    device_unregister(d);
+    hardware_unregister(d);
     return OK;
 }
 
@@ -817,17 +817,17 @@ fn bus_instance_unregister(bi as *BusInstance) as i32 {
 // drv.priority (unique within a bus, so no tie-breaking is needed).
 // Calls winner.probe on success, transitions dev.state accordingly.
 // Returns OK on PROBED, NO_DRIVER_MATCHED if no driver qualified (dev
-// stays UNINITIALIZED), or the probe's own DriverResult on probe failure
-// (dev transitions to DEAD and caller is expected to device_unregister).
-fn bus_probe_device(bt as *BusType, dev as *Device) as i32 {
+// stays UNINITIALIZED), or the probe's own DriverImplResult on probe failure
+// (dev transitions to DEAD and caller is expected to hardware_unregister).
+fn bus_probe_hardware(bt as *Bus, dev as *Hardware) as i32 {
     if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
 
-    let is *Driver as best with mut = cast(*Driver, 0);
+    let is *DriverImpl as best with mut = cast(*DriverImpl, 0);
     let is i32 as best_pri with mut = 0;
 
     sched.preempt_disable();
-    let is *Driver as cur with mut = bt.drivers;
+    let is *DriverImpl as cur with mut = bt.drivers;
     while (cast(i64, cur) != 0) {
         let is i32 as matched = call(bt.match_fn, bt, dev, cur);
         if (matched == 1) {
@@ -863,7 +863,7 @@ fn bus_probe_device(bt as *BusType, dev as *Device) as i32 {
 // Validates a state transition and applies it under the tree lock
 // (single-CPU: sufficient coverage; SMP will refine to per-device lock).
 // Returns OK or INVALID_STATE_TRANSITION.
-fn device_set_state(dev as *Device, new_state as i32) as i32 {
+fn device_set_state(dev as *Hardware, new_state as i32) as i32 {
     tree_lock();
     let is i32 as cur = dev.state;
     let is i32 as valid with mut = 0;
@@ -886,7 +886,7 @@ fn device_set_state(dev as *Device, new_state as i32) as i32 {
 // Blocks the current thread until dev.state equals `desired`. Single-waiter
 // for V1 — the spec notes multi-waiter is a future extension. The caller
 // must be a real kernel thread (Phase 2 or later).
-fn device_wait_state(dev as *Device, desired as i32) as void {
+fn device_wait_state(dev as *Hardware, desired as i32) as void {
     if (cast(i64, dev) == 0) { return; }
     while (dev.state != desired) {
         let is i64 as tid = sched.current_tid();
