@@ -72,19 +72,32 @@ let is Fat32Volume as vol;
 // Scratch buffer for sector reads. AHCI requires DMA-safe memory in the
 // HHDM region (not kernel .bss), so we lazily allocate a page via pmm
 // on first use. One 4KB page fits a max-size sector (4096B).
-let is i64 as scratch_virt with mut = 0;
+// Two dedicated scratch pages: one for FAT sector reads, one for the
+// data cluster currently being consumed. Separating them means FAT
+// lookups during a file read don't clobber the payload buffer.
+let is i64 as scratch_virt     with mut = 0;
+let is i64 as clus_scratch_virt with mut = 0;
 
-fn ensure_scratch() as i32 {
-    if (scratch_virt != 0) { return 0; }
+fn alloc_dma_page() as i64 {
     let is i32 as pfn = pmm.alloc_pages(
         pmm.ZONE_DMA32,
         pmm.ALLOC_ZERO,
         cast(i32, 0),
         pmm.USAGE_KERNEL,
         cast(i32, 0));
-    if (pfn == pmm.PFN_NONE) { return cast(i32, 0 - 1); }
-    let is i64 as phys = pmm.pfn_to_phys(pfn);
-    scratch_virt = phys + pmm.hhdm;
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    return pmm.pfn_to_phys(pfn) + pmm.hhdm;
+}
+
+fn ensure_scratch() as i32 {
+    if (scratch_virt == 0) {
+        scratch_virt = alloc_dma_page();
+        if (scratch_virt == 0) { return cast(i32, 0 - 1); }
+    }
+    if (clus_scratch_virt == 0) {
+        clus_scratch_virt = alloc_dma_page();
+        if (clus_scratch_virt == 0) { return cast(i32, 0 - 1); }
+    }
     return 0;
 }
 
@@ -325,6 +338,233 @@ fn cluster_to_lba(v as *Fat32Volume, cluster as i64) as i64 {
 }
 
 // ============================================================
+// FAT entry walk — read next-cluster value for `cluster`.
+// Returns the raw 28-bit entry value. Callers interpret:
+//   0             -> free (unexpected during walk)
+//   2..0x0FFFFFEF -> next cluster
+//   0x0FFFFFF7    -> bad cluster
+//   0x0FFFFFF8..  -> EOF
+// Returns -1 on I/O failure.
+// ============================================================
+
+fn fat_read(v as *Fat32Volume, cluster as i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (cluster < 2) { return 0 - 1; }
+    if (cluster >= v.cluster_count + 2) { return 0 - 1; }
+    let is i64 as byte_off = cluster * 4;
+    let is i64 as sec  = v.fat_start_lba + byte_off / v.bytes_per_sector;
+    let is i64 as soff = byte_off % v.bytes_per_sector;
+    let is *u8 as buf = cast(*u8, scratch_virt);
+    let is i32 as rc = storage.read_lba(v.dev, sec, 1, buf);
+    if (rc != 0) { return 0 - 1; }
+    return read_u32(buf, soff) & 0x0FFFFFFF;
+}
+
+fn cluster_is_eof(entry as i64) as i32 {
+    if (entry >= 0x0FFFFFF8 && entry <= 0x0FFFFFFF) { return 1; }
+    return 0;
+}
+
+// Read one full cluster into the provided HHDM-resident buffer.
+// buf must hold at least cluster_size_bytes. Returns 0 on success.
+fn cluster_read(v as *Fat32Volume, cluster as i64, buf as *u8) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as lba = cluster_to_lba(v, cluster);
+    if (lba < 0) { return cast(i32, 0 - 2); }
+    return storage.read_lba(v.dev, lba, v.sectors_per_clus, buf);
+}
+
+// ============================================================
+// 8.3 short-name formatting — converts a caller-supplied name like
+// "hello.txt" to the 11-byte uppercase space-padded form "HELLO   TXT"
+// that the directory entry stores. Accepts only ASCII; any character
+// outside A-Z/0-9/a-z/._ is rejected (return != 0).
+// ============================================================
+
+fn upper_ascii(c as i64) as i64 {
+    if (c >= 97 && c <= 122) { return c - 32; }   // 'a'-'z'
+    return c;
+}
+
+fn format_8_3(name as *u8, name_len as i64, out as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < 11) { out[i] = cast(u8, 32); i = i + 1; }   // space-pad
+    if (name_len <= 0 || name_len > 12) { return cast(i32, 0 - 1); }
+
+    // Split at '.' (last one before the extension).
+    let is i64 as dot with mut = 0 - 1;
+    let is i64 as j with mut = 0;
+    while (j < name_len) {
+        if (name[j] == cast(u8, 46)) { dot = j; }   // '.'
+        j = j + 1;
+    }
+
+    let is i64 as base_end with mut = name_len;
+    if (dot >= 0) { base_end = dot; }
+    if (base_end == 0 || base_end > 8) { return cast(i32, 0 - 2); }
+
+    let is i64 as k with mut = 0;
+    while (k < base_end) {
+        let is i64 as ch = upper_ascii(cast(i64, name[k]));
+        if (ch < 32 || ch > 126) { return cast(i32, 0 - 3); }
+        out[k] = cast(u8, ch);
+        k = k + 1;
+    }
+    if (dot >= 0) {
+        let is i64 as ext_len = name_len - (dot + 1);
+        if (ext_len > 3) { return cast(i32, 0 - 4); }
+        let is i64 as e with mut = 0;
+        while (e < ext_len) {
+            let is i64 as ch = upper_ascii(cast(i64, name[dot + 1 + e]));
+            if (ch < 32 || ch > 126) { return cast(i32, 0 - 5); }
+            out[8 + e] = cast(u8, ch);
+            e = e + 1;
+        }
+    }
+    return 0;
+}
+
+// Compare 11 bytes starting at buf+base against target (11-byte array).
+// Returns 1 on match, 0 on mismatch. Kept inline-arithmetic instead of
+// taking two pointers so we avoid any Caustic quirk around & on array
+// indexing with *u8 bases.
+fn name_matches(buf as *u8, base as i64, target as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < 11) {
+        if (buf[base + i] != target[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// Directory entry lookup — walk the cluster chain of `start_cluster`
+// (typically root_cluster) scanning 32-byte records. On match, writes
+// the first-cluster and file-size to *out_cluster / *out_size and
+// returns 0. Returns -1 on not-found, -2 on I/O, -3 on chain loop.
+//
+// Handles standard 8.3 entries only; 0xE5 deleted entries are skipped,
+// 0x00 terminator ends scan, attribute 0x0F (LFN) entries are skipped
+// without interpretation (Phase 4 will parse LFN).
+// ============================================================
+
+let is i32 as ATTR_LFN       = 0x0F;
+let is i32 as ATTR_DIRECTORY = 0x10;
+let is i32 as ATTR_VOLUME_ID = 0x08;
+
+// Static scratch holding the formatted 8.3 target during dir_find.
+// Local [11]u8 declarations inside functions produced crashes via
+// &target[0], so the name buffer lives in .bss where addressing is
+// stable. dir_find is single-threaded today so no locking needed.
+let is [11]u8 as target_name with mut;
+
+fn dir_find(v as *Fat32Volume,
+            start_cluster as i64,
+            name as *u8,
+            name_len as i64,
+            out_cluster as *i64,
+            out_size as *i64,
+            out_attr as *i32) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 2); }
+    let is i32 as fr = format_8_3(name, name_len, cast(*u8, &target_name[0]));
+
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = start_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        guard = guard + 1;
+
+        let is i32 as rc = cluster_read(v, cluster, buf);
+        if (rc != 0) { return cast(i32, 0 - 2); }
+
+        let is i64 as i with mut = 0;
+        let is i64 as cbytes = v.cluster_size_bytes;
+        while (i < cbytes) {
+            let is u8 as marker = buf[i];
+            if (marker == cast(u8, 0)) {
+                return cast(i32, 0 - 1);   // end of directory
+            }
+            let is i32 as attr = cast(i32, buf[i + 11]) & 0xFF;
+            if (marker != cast(u8, 0xE5) && attr != ATTR_LFN) {
+                if (name_matches(buf, i, cast(*u8, &target_name[0])) == 1) {
+                    let is i64 as lo = read_u16(buf, i + 26);
+                    let is i64 as hi = read_u16(buf, i + 20);
+                    *out_cluster = lo | (hi << 16);
+                    *out_size    = read_u32(buf, i + 28);
+                    *out_attr    = attr;
+                    return 0;
+                }
+            }
+            i = i + 32;
+        }
+
+        // Advance to next cluster in the directory chain.
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 1); }
+        cluster = nxt;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// ============================================================
+// File read — walk the cluster chain of `first_cluster`, copying up
+// to min(size, max_bytes) bytes into `dst`. Returns bytes copied or
+// a negative errno on failure.
+// ============================================================
+
+fn file_read(v as *Fat32Volume,
+             first_cluster as i64,
+             size as i64,
+             dst as *u8,
+             max_bytes as i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (max_bytes <= 0) { return 0; }
+    if (size <= 0)      { return 0; }
+
+    let is i64 as to_copy with mut = size;
+    if (to_copy > max_bytes) { to_copy = max_bytes; }
+    let is i64 as copied with mut = 0;
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = first_cluster;
+    let is i64 as cbytes = v.cluster_size_bytes;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+
+    while (copied < to_copy) {
+        if (cluster < 2 || cluster >= v.cluster_count + 2) { return 0 - 2; }
+        if (guard > max_steps) { return 0 - 3; }
+        guard = guard + 1;
+
+        let is i32 as rc = cluster_read(v, cluster, buf);
+        if (rc != 0) { return 0 - 4; }
+
+        let is i64 as chunk with mut = cbytes;
+        if (chunk > to_copy - copied) { chunk = to_copy - copied; }
+        let is i64 as j with mut = 0;
+        while (j < chunk) {
+            dst[copied + j] = buf[j];
+            j = j + 1;
+        }
+        copied = copied + chunk;
+        if (copied >= to_copy) { return copied; }
+
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return 0 - 5; }
+        if (cluster_is_eof(nxt) == 1) {
+            // File size claimed more bytes than the chain provides —
+            // treat as truncated rather than surfacing EOF as an error.
+            return copied;
+        }
+        cluster = nxt;
+    }
+    return copied;
+}
+
+// ============================================================
 // Mount thread — yields until a storage device appears in the
 // registry, then tries to mount it as FAT32. Intended to be
 // started after driver phase 2 has kicked off probing.
@@ -346,5 +586,114 @@ fn mount_thread() as void {
         serial.println("fat32: no storage device after wait", 35);
         return;
     }
-    mount(d);
+    let is *Fat32Volume as v = mount(d);
+    if (cast(i64, v) == 0) { return; }
+    self_test_read(v);
+}
+
+// ============================================================
+// self_test_read — look up HELLO.TXT and BIGFILE.BIN (seeded by
+// scripts/fat32_add_file.py), read their contents, and validate the
+// payloads match expectations. Exercises dir_find, fat_read, and
+// file_read end-to-end.
+// ============================================================
+
+let is i64 as HELLO_EXPECTED_SIZE = 27;
+let is i64 as BIGFILE_EXPECTED_SIZE = 1200;
+
+fn self_test_read(v as *Fat32Volume) as void {
+    let is i64 as clus with mut = 0;
+    let is i64 as size with mut = 0;
+    let is i32 as attr with mut = 0;
+
+    let is i32 as r1 = dir_find(v, v.root_cluster,
+                                cast(*u8, "hello.txt"), 9,
+                                &clus, &size, &attr);
+    if (r1 != 0) {
+        serial.print("fat32.test: find hello.txt FAIL rc=", 35);
+        util.print_num(cast(i64, r1));
+        serial.println("", 0);
+        return;
+    }
+    serial.print("fat32.test: hello.txt cluster=", 30);
+    util.print_num(clus);
+    serial.print(" size=", 6);
+    util.print_num(size);
+    serial.println("", 0);
+
+    if (size != HELLO_EXPECTED_SIZE) {
+        serial.println("fat32.test: hello.txt size mismatch", 35);
+        return;
+    }
+
+    let is i64 as rbuf_virt = alloc_dma_page();
+    if (rbuf_virt == 0) {
+        serial.println("fat32.test: rbuf alloc fail", 27);
+        return;
+    }
+    let is *u8 as rbuf = cast(*u8, rbuf_virt);
+    let is i64 as n = file_read(v, clus, size, rbuf, 4096);
+    if (n != size) {
+        serial.print("fat32.test: file_read short n=", 30);
+        util.print_num(n);
+        serial.println("", 0);
+        return;
+    }
+    // Print the content (zero-term for safety since we know size < 4096).
+    rbuf[size] = cast(u8, 0);
+    serial.print("fat32.test: hello.txt='", 23);
+    let is i64 as k with mut = 0;
+    while (k < size) {
+        serial.putc(cast(i64, rbuf[k]));
+        k = k + 1;
+    }
+    serial.println("'", 1);
+
+    // Bigfile: 600 'A' + 600 'B'. Read and byte-verify.
+    let is i32 as r2 = dir_find(v, v.root_cluster,
+                                cast(*u8, "bigfile.bin"), 11,
+                                &clus, &size, &attr);
+    if (r2 != 0) {
+        serial.print("fat32.test: find bigfile.bin FAIL rc=", 37);
+        util.print_num(cast(i64, r2));
+        serial.println("", 0);
+        return;
+    }
+    if (size != BIGFILE_EXPECTED_SIZE) {
+        serial.print("fat32.test: bigfile size mismatch size=", 39);
+        util.print_num(size);
+        serial.println("", 0);
+        return;
+    }
+    // Need a bigger buffer for 1200 bytes; alloc 1 extra page.
+    let is i64 as big_virt = alloc_dma_page();
+    if (big_virt == 0) {
+        serial.println("fat32.test: big rbuf alloc fail", 31);
+        return;
+    }
+    let is *u8 as big = cast(*u8, big_virt);
+    let is i64 as nb = file_read(v, clus, size, big, 4096);
+    if (nb != size) {
+        serial.print("fat32.test: bigfile read short nb=", 34);
+        util.print_num(nb);
+        serial.println("", 0);
+        return;
+    }
+    let is i64 as mis with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 600) {
+        if (big[i] != cast(u8, 65)) { mis = mis + 1; }   // 'A'
+        i = i + 1;
+    }
+    while (i < 1200) {
+        if (big[i] != cast(u8, 66)) { mis = mis + 1; }   // 'B'
+        i = i + 1;
+    }
+    if (mis == 0) {
+        serial.println("fat32.test: bigfile verify OK (1200B across 3 clusters)", 55);
+    } else {
+        serial.print("fat32.test: bigfile mismatch=", 29);
+        util.print_num(mis);
+        serial.println("", 0);
+    }
 }
