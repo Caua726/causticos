@@ -1,0 +1,326 @@
+// ahci.cst — AHCI SATA controller driver.
+//
+// Phase E1 (this commit): HBA detection, port 0 init, IDENTIFY DEVICE
+// via polling, model string print. No I/O framework integration yet;
+// io.BlockIOProvider wiring and submit_io/harvest_io arrive in E2.
+//
+// Matches PCI class 0x01 / subclass 0x06 (SATA). BAR5 is ABAR (HBA
+// memory registers). IRQ line comes from PCI config 0x3C via the bus
+// vtable (irq: auto in the .cdvrspec).
+
+use "driver.cst" as driver;
+use "spec.cst" as spec;
+use "ksym.cst" as ksym;
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "heap.cst" as heap;
+
+// HBA register offsets (ABAR + N)
+let is i64 as HBA_CAP  = 0x00;
+let is i64 as HBA_GHC  = 0x04;
+let is i64 as HBA_IS   = 0x08;
+let is i64 as HBA_PI   = 0x0C;
+let is i64 as HBA_VS   = 0x10;
+let is i64 as HBA_PORTS = 0x100;
+
+// GHC bits
+let is i64 as GHC_HR = 1;            // HBA reset
+let is i64 as GHC_IE = 2;            // interrupt enable
+let is i64 as GHC_AE = 0x80000000;   // AHCI enable
+
+// Port register offsets (relative to port base = ABAR + 0x100 + port*0x80)
+let is i64 as PX_CLB  = 0x00;
+let is i64 as PX_CLBU = 0x04;
+let is i64 as PX_FB   = 0x08;
+let is i64 as PX_FBU  = 0x0C;
+let is i64 as PX_IS   = 0x10;
+let is i64 as PX_IE   = 0x14;
+let is i64 as PX_CMD  = 0x18;
+let is i64 as PX_TFD  = 0x20;
+let is i64 as PX_SIG  = 0x24;
+let is i64 as PX_SSTS = 0x28;
+let is i64 as PX_SCTL = 0x2C;
+let is i64 as PX_SERR = 0x30;
+let is i64 as PX_CI   = 0x38;
+
+// Port CMD bits
+let is i64 as CMD_ST  = 1;
+let is i64 as CMD_FRE = 0x10;
+let is i64 as CMD_FR  = 0x4000;
+let is i64 as CMD_CR  = 0x8000;
+
+// Port TFD bits
+let is i64 as TFD_ERR = 1;
+let is i64 as TFD_DRQ = 8;
+let is i64 as TFD_BSY = 0x80;
+
+// SATA commands
+let is i64 as ATA_CMD_IDENTIFY = 0xEC;
+
+// One static HBA context — only one AHCI controller expected in V1.
+// If the kernel ever binds to multiple HBAs this moves into a per-
+// binding heap allocation.
+struct AhciCtx {
+    abar as *u8;                       // ABAR virtual (from b.caps.mmio)
+    port as i64;                       // first active port (0 today)
+    cmd_list as *driver.DmaBuffer;     // 1KB command list (32 × 32-byte headers)
+    fis_base as *driver.DmaBuffer;     // 256-byte received FIS area
+    cmd_table as *driver.DmaBuffer;    // 128B header + PRDT
+    id_buf as *driver.DmaBuffer;       // 512B IDENTIFY result
+}
+
+let is AhciCtx as ctx;
+
+// ksym publishing for spec framework
+let is ksym.KSym as ksym_bind;
+
+// ============================================================
+// MMIO helpers
+// ============================================================
+
+fn mmio_read32(base as *u8, off as i64) as i64 {
+    let is *u32 as p = cast(*u32, cast(i64, base) + off);
+    return cast(i64, *p) & 0xFFFFFFFF;
+}
+
+fn mmio_write32(base as *u8, off as i64, val as i64) as void {
+    let is *u32 as p = cast(*u32, cast(i64, base) + off);
+    *p = cast(u32, val & 0xFFFFFFFF);
+}
+
+fn port_base(abar as *u8, port as i64) as *u8 {
+    return cast(*u8, cast(i64, abar) + HBA_PORTS + port * 0x80);
+}
+
+// ============================================================
+// Port init / IDENTIFY
+// ============================================================
+
+// Stop the port (CMD.ST=0, wait CMD.CR=0; CMD.FRE=0, wait CMD.FR=0).
+// Safe to call on a stopped port — bits already clear.
+fn port_stop(pb as *u8) as void {
+    let is i64 as cmd with mut = mmio_read32(pb, PX_CMD);
+    mmio_write32(pb, PX_CMD, cmd & (0 - 1 - CMD_ST));
+    let is i64 as spin with mut = 0;
+    while (spin < 1000000) {
+        if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { spin = 1000000; }
+        else { spin = spin + 1; }
+    }
+    cmd = mmio_read32(pb, PX_CMD);
+    mmio_write32(pb, PX_CMD, cmd & (0 - 1 - CMD_FRE));
+    spin = 0;
+    while (spin < 1000000) {
+        if ((mmio_read32(pb, PX_CMD) & CMD_FR) == 0) { spin = 1000000; }
+        else { spin = spin + 1; }
+    }
+}
+
+fn port_start(pb as *u8) as void {
+    let is i64 as spin with mut = 0;
+    while (spin < 1000000) {
+        if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { spin = 1000000; }
+        else { spin = spin + 1; }
+    }
+    let is i64 as cmd = mmio_read32(pb, PX_CMD);
+    mmio_write32(pb, PX_CMD, cmd | CMD_FRE | CMD_ST);
+}
+
+// Write command header 0 in the command list. CFL = FIS length in
+// dwords (5 for H2D register); W=0 read, W=1 write; PRDTL = number of
+// PRDT entries. CTBA points at the command table physical address.
+fn fill_cmd_header(c as *AhciCtx, write_flag as i64, prdtl as i64) as void {
+    let is *u8 as h = cast(*u8, c.cmd_list.virt);
+    let is *u32 as dw0 = cast(*u32, cast(i64, h) + 0);
+    let is i64 as flags with mut = 5;                   // CFL=5 dwords
+    if (write_flag == 1) { flags = flags | 0x40; }       // W bit
+    flags = flags | (prdtl << 16);
+    *dw0 = cast(u32, flags);
+    let is *u32 as prdbc = cast(*u32, cast(i64, h) + 4);
+    *prdbc = cast(u32, 0);
+    let is *u32 as ctba  = cast(*u32, cast(i64, h) + 8);
+    *ctba = cast(u32, c.cmd_table.phys & 0xFFFFFFFF);
+    let is *u32 as ctbau = cast(*u32, cast(i64, h) + 12);
+    *ctbau = cast(u32, (c.cmd_table.phys >> 32) & 0xFFFFFFFF);
+}
+
+// Build a single-PRDT command table for IDENTIFY. FIS type 0x27
+// (H2D register), command byte 0xEC, device 0xA0, no LBA, count 0.
+fn build_identify_ct(c as *AhciCtx) as void {
+    let is *u8 as ct = cast(*u8, c.cmd_table.virt);
+    // Zero the first 128 bytes + 16 bytes of PRDT
+    let is i64 as zi with mut = 0;
+    while (zi < 144) { ct[zi] = cast(u8, 0); zi = zi + 1; }
+    // Command FIS @ offset 0
+    ct[0] = cast(u8, 0x27);         // FIS_TYPE_REG_H2D
+    ct[1] = cast(u8, 0x80);         // C=1 (command)
+    ct[2] = cast(u8, 0xEC);         // IDENTIFY DEVICE
+    ct[7] = cast(u8, 0xA0);         // device (master, LBA mode irrelevant)
+    // PRDT entry 0 @ offset 0x80
+    let is *u32 as dba = cast(*u32, cast(i64, ct) + 0x80);
+    *dba = cast(u32, c.id_buf.phys & 0xFFFFFFFF);
+    let is *u32 as dbau = cast(*u32, cast(i64, ct) + 0x84);
+    *dbau = cast(u32, (c.id_buf.phys >> 32) & 0xFFFFFFFF);
+    // reserved 0x88..0x8B already zeroed
+    let is *u32 as dbc = cast(*u32, cast(i64, ct) + 0x8C);
+    *dbc = cast(u32, (512 - 1) | 0x80000000);    // byte count - 1, I bit
+}
+
+// Wait until BSY + DRQ clear. Polling; AHCI irq not yet wired here.
+fn wait_ready(pb as *u8) as i32 {
+    let is i64 as spin with mut = 0;
+    while (spin < 10000000) {
+        let is i64 as tfd = mmio_read32(pb, PX_TFD);
+        if ((tfd & (TFD_BSY | TFD_DRQ)) == 0) { return 0; }
+        spin = spin + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn wait_ci_clear(pb as *u8, slot as i64) as i32 {
+    let is i64 as mask = cast(i64, 1) << slot;
+    let is i64 as spin with mut = 0;
+    while (spin < 10000000) {
+        let is i64 as ci = mmio_read32(pb, PX_CI);
+        if ((ci & mask) == 0) { return 0; }
+        let is i64 as tfd = mmio_read32(pb, PX_TFD);
+        if ((tfd & TFD_ERR) != 0) { return cast(i32, 0 - 2); }
+        spin = spin + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// IDENTIFY stores model name at words 27..46 (bytes 54..93). Each 16-bit
+// word is big-endian in character order but little-endian in memory, so
+// bytes are swapped per-pair: print id[55],id[54],id[57],id[56],...
+fn print_identify_model(id as *u8) as void {
+    serial.print("ahci: model=", 12);
+    let is i64 as i with mut = 0;
+    while (i < 40) {
+        serial.putc(cast(i64, id[54 + i + 1]));
+        serial.putc(cast(i64, id[54 + i]));
+        i = i + 2;
+    }
+    serial.println("", 0);
+}
+
+// ============================================================
+// Lifecycle
+// ============================================================
+
+fn ahci_bind(b as *spec.Binding) as i32 {
+    let is *u8 as abar = b.caps.mmio;
+    if (cast(i64, abar) == 0) {
+        serial.println("ahci: no mmio", 13);
+        return cast(i32, 0 - 1);
+    }
+    ctx.abar = abar;
+
+    serial.print("ahci: abar=", 11);
+    util.print_hex(cast(i64, abar));
+    serial.println("", 0);
+
+    // Enable AHCI mode
+    let is i64 as ghc = mmio_read32(abar, HBA_GHC);
+    mmio_write32(abar, HBA_GHC, ghc | GHC_AE);
+
+    let is i64 as cap = mmio_read32(abar, HBA_CAP);
+    let is i64 as pi  = mmio_read32(abar, HBA_PI);
+    serial.print("ahci: cap=", 10);
+    util.print_hex(cap);
+    serial.print(" pi=", 4);
+    util.print_hex(pi);
+    serial.println("", 0);
+
+    // Find first port with a device present (SSTS.DET == 3)
+    let is i64 as port with mut = cast(i64, 0 - 1);
+    let is i64 as pp with mut = 0;
+    while (pp < 32) {
+        if ((pi & (cast(i64, 1) << pp)) != 0) {
+            let is *u8 as testpb = port_base(abar, pp);
+            let is i64 as ssts = mmio_read32(testpb, PX_SSTS);
+            if ((ssts & 0xF) == 3) {
+                port = pp;
+                pp = 32;
+            } else {
+                pp = pp + 1;
+            }
+        } else {
+            pp = pp + 1;
+        }
+    }
+    if (port < 0) {
+        serial.println("ahci: no device attached on any port", 36);
+        return 0;
+    }
+    ctx.port = port;
+    serial.print("ahci: device on port ", 21);
+    util.print_num(port);
+    serial.println("", 0);
+
+    let is *u8 as pb = port_base(abar, port);
+    port_stop(pb);
+
+    // Clear error register
+    mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
+
+    // Allocate command list (1KB), FIS base (256B), command table (1KB
+    // for safety — 128 header + 16 × 32 PRDT entries), and IDENTIFY
+    // buffer (512B).
+    let is i32 as rc1 = driver.dma_alloc(b.hardware, cast(u64, 1024), cast(u64, 1024),
+                                          cast(u32, 1), &ctx.cmd_list);
+    if (rc1 != driver.OK) { serial.println("ahci: cmd_list alloc fail", 25); return rc1; }
+    let is i32 as rc2 = driver.dma_alloc(b.hardware, cast(u64, 256), cast(u64, 256),
+                                          cast(u32, 1), &ctx.fis_base);
+    if (rc2 != driver.OK) { serial.println("ahci: fis alloc fail", 20); return rc2; }
+    let is i32 as rc3 = driver.dma_alloc(b.hardware, cast(u64, 1024), cast(u64, 128),
+                                          cast(u32, 1), &ctx.cmd_table);
+    if (rc3 != driver.OK) { serial.println("ahci: ct alloc fail", 19); return rc3; }
+    let is i32 as rc4 = driver.dma_alloc(b.hardware, cast(u64, 512), cast(u64, 2),
+                                          cast(u32, 1), &ctx.id_buf);
+    if (rc4 != driver.OK) { serial.println("ahci: id alloc fail", 19); return rc4; }
+
+    // Zero command list (32 × 32 bytes) and FIS area
+    let is i64 as zi with mut = 0;
+    let is *u8 as cl = cast(*u8, ctx.cmd_list.virt);
+    while (zi < 1024) { cl[zi] = cast(u8, 0); zi = zi + 1; }
+    zi = 0;
+    let is *u8 as fa = cast(*u8, ctx.fis_base.virt);
+    while (zi < 256) { fa[zi] = cast(u8, 0); zi = zi + 1; }
+
+    // Program CLB / FB
+    mmio_write32(pb, PX_CLB,  ctx.cmd_list.phys & 0xFFFFFFFF);
+    mmio_write32(pb, PX_CLBU, (ctx.cmd_list.phys >> 32) & 0xFFFFFFFF);
+    mmio_write32(pb, PX_FB,   ctx.fis_base.phys & 0xFFFFFFFF);
+    mmio_write32(pb, PX_FBU,  (ctx.fis_base.phys >> 32) & 0xFFFFFFFF);
+
+    port_start(pb);
+
+    // IDENTIFY
+    if (wait_ready(pb) != 0) { serial.println("ahci: port busy pre-identify", 28); return cast(i32, 0 - 2); }
+
+    build_identify_ct(&ctx);
+    fill_cmd_header(&ctx, 0, 1);        // read, 1 PRDT entry
+
+    // Issue command on slot 0
+    mmio_write32(pb, PX_CI, 1);
+
+    let is i32 as wrc = wait_ci_clear(pb, 0);
+    if (wrc != 0) {
+        serial.print("ahci: identify failed rc=", 25);
+        util.print_num(cast(i64, wrc));
+        serial.println("", 0);
+        return wrc;
+    }
+
+    print_identify_model(cast(*u8, ctx.id_buf.virt));
+    return driver.OK;
+}
+
+fn register() as void {
+    ksym_bind.name_ptr = cast(*u8, "ahci.ahci_bind");
+    ksym_bind.name_len = 14;
+    ksym_bind.addr     = cast(i64, fn_ptr(ahci_bind));
+    ksym_bind.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_bind);
+    serial.println("ahci: registered", 16);
+}

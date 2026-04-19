@@ -14,6 +14,8 @@
 .global _cdvrspec_e1000_end
 .global _cdvrspec_kbd_start
 .global _cdvrspec_kbd_end
+.global _cdvrspec_ahci_start
+.global _cdvrspec_ahci_end
 _cdvrspec_dummy_start:
 .incbin "kernel/dummy.cdvrspec"
 _cdvrspec_dummy_end:
@@ -23,6 +25,9 @@ _cdvrspec_e1000_end:
 _cdvrspec_kbd_start:
 .incbin "kernel/kbd.cdvrspec"
 _cdvrspec_kbd_end:
+_cdvrspec_ahci_start:
+.incbin "kernel/ahci.cdvrspec"
+_cdvrspec_ahci_end:
 
 .section .cdvrspec_index
 .quad _cdvrspec_dummy_start
@@ -31,3 +36,5 @@ _cdvrspec_kbd_end:
 .quad _cdvrspec_e1000_end
 .quad _cdvrspec_kbd_start
 .quad _cdvrspec_kbd_end
+.quad _cdvrspec_ahci_start
+.quad _cdvrspec_ahci_end
