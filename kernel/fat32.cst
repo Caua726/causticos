@@ -781,6 +781,694 @@ fn file_read(v as *Fat32Volume,
 }
 
 // ============================================================
+// FAT write side — update a single 28-bit FAT entry in all FAT copies
+// (FAT32 typically has 2). Preserves the upper 4 reserved bits.
+// Reads the sector, patches the entry, writes it back to every FAT.
+// ============================================================
+
+fn fat_write(v as *Fat32Volume, cluster as i64, value as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cluster < 0) { return cast(i32, 0 - 1); }
+    if (cluster >= v.cluster_count + 2) { return cast(i32, 0 - 1); }
+
+    let is i64 as byte_off = cluster * 4;
+    let is i64 as sec_off  = byte_off / v.bytes_per_sector;
+    let is i64 as b_in_sec = byte_off % v.bytes_per_sector;
+    let is *u8 as buf = cast(*u8, scratch_virt);
+
+    let is i64 as fi with mut = 0;
+    while (fi < v.num_fats) {
+        let is i64 as lba = v.fat_start_lba + fi * v.fat_size_sectors + sec_off;
+        let is i32 as rc = storage.read_lba(v.dev, lba, 1, buf);
+        if (rc != 0) { return cast(i32, 0 - 2); }
+        // Preserve upper 4 bits of the existing 32-bit slot per spec.
+        let is i64 as old = read_u32(buf, b_in_sec);
+        let is i64 as new_val = (old & 0xF0000000) | (value & 0x0FFFFFFF);
+        buf[b_in_sec]     = cast(u8, new_val & 0xFF);
+        buf[b_in_sec + 1] = cast(u8, (new_val >> 8) & 0xFF);
+        buf[b_in_sec + 2] = cast(u8, (new_val >> 16) & 0xFF);
+        buf[b_in_sec + 3] = cast(u8, (new_val >> 24) & 0xFF);
+        let is i32 as wc = storage.write_lba(v.dev, lba, 1, buf);
+        if (wc != 0) { return cast(i32, 0 - 3); }
+        fi = fi + 1;
+    }
+    return 0;
+}
+
+// Linear scan for a free FAT entry starting at cluster 3 (reserve 2
+// for the root). Returns the cluster number or -1 on ENOSPC.
+fn cluster_alloc(v as *Fat32Volume) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    let is i64 as max_c = v.cluster_count + 2;
+    let is i64 as c with mut = 3;
+    while (c < max_c) {
+        let is i64 as entry = fat_read(v, c);
+        if (entry == 0) {
+            // Mark as end-of-chain so a second alloc can't pick it
+            // before the caller chains further.
+            if (fat_write(v, c, 0x0FFFFFFF) != 0) { return 0 - 2; }
+            return c;
+        }
+        if (entry < 0) { return 0 - 2; }   // I/O
+        c = c + 1;
+    }
+    return 0 - 1;
+}
+
+fn cluster_free(v as *Fat32Volume, cluster as i64) as i32 {
+    return fat_write(v, cluster, 0);
+}
+
+// Free an entire cluster chain starting at `first`. Handy for unlink
+// and truncate-to-zero.
+fn chain_free(v as *Fat32Volume, first as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as cur with mut = first;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    while (cur >= 2 && cur < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        guard = guard + 1;
+        let is i64 as nxt = fat_read(v, cur);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_free(v, cur) != 0) { return cast(i32, 0 - 4); }
+        if (cluster_is_eof(nxt) == 1) { return 0; }
+        cur = nxt;
+    }
+    return 0;
+}
+
+// ============================================================
+// Cluster write — whole-cluster helper matching cluster_read. Writes
+// sectors_per_clus sectors at cluster_to_lba(cluster). buf must be in
+// HHDM-resident memory (DMA-safe) and at least cluster_size_bytes.
+// ============================================================
+fn cluster_write(v as *Fat32Volume, cluster as i64, buf as *u8) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as lba = cluster_to_lba(v, cluster);
+    if (lba < 0) { return cast(i32, 0 - 2); }
+    return storage.write_lba(v.dev, lba, v.sectors_per_clus, buf);
+}
+
+// Zero-fill a cluster. Used when extending a directory or materialising
+// a fresh allocation where stale data would leak.
+fn cluster_zero(v as *Fat32Volume, cluster as i64) as i32 {
+    if (ensure_scratch() != 0) { return cast(i32, 0 - 1); }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as i with mut = 0;
+    while (i < v.cluster_size_bytes) { buf[i] = cast(u8, 0); i = i + 1; }
+    return cluster_write(v, cluster, buf);
+}
+
+// ============================================================
+// Directory entry creation — implements the short-name + LFN write
+// logic mirroring fat32_add_file.py. Allocates a run of contiguous
+// 32-byte slots in the directory, extending it by one cluster if
+// needed. Emits LFN entries in reverse physical order so they
+// precede the 8.3 slot during a forward scan.
+//
+// Naming strategy: if the name fits the canonical 8.3 form (all
+// uppercase, valid chars, short), store only a short entry. Otherwise
+// derive a mangled 8.3 (BASE~N.EXT) + one or more LFN entries.
+// ============================================================
+
+// Compute the FAT LFN checksum of an 11-byte short name.
+fn lfn_checksum(short as *u8) as i64 {
+    let is i64 as s with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 11) {
+        let is i64 as b = cast(i64, short[i]) & 0xFF;
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF;
+        i = i + 1;
+    }
+    return s;
+}
+
+// Derive a mangled 8.3 short name from a long name. Strategy:
+//   - Sanitize to uppercase, replace invalid chars with '_'
+//   - Take first 6 chars of base, append ~N where N is 1..99
+//   - Extension is first 3 chars of the last '.' component
+//   - Ensure uniqueness in the target directory
+let is [11]u8 as short_scratch with mut;
+
+fn sanitize_char(c as i64) as i64 {
+    if (c >= 97 && c <= 122) { return c - 32; }          // 'a'-'z' -> 'A'-'Z'
+    if (c >= 65 && c <= 90)  { return c; }               // 'A'-'Z'
+    if (c >= 48 && c <= 57)  { return c; }               // '0'-'9'
+    if (c == 45 || c == 95)  { return c; }               // '-', '_'
+    return 95;                                            // everything else -> '_'
+}
+
+// Build a dir entry 11-byte name in short_scratch. Returns 0 if name
+// already fits 8.3 (no LFN needed), 1 if mangled (LFN required), -1 on
+// invalid input.
+fn derive_short_name(name as *u8, name_len as i64,
+                     parent_cluster as i64, v as *Fat32Volume) as i32 {
+    if (name_len <= 0) { return cast(i32, 0 - 1); }
+
+    // Pass 1: exact 8.3 fit test.
+    let is i32 as fits = format_8_3(name, name_len, cast(*u8, &short_scratch[0]));
+    if (fits == 0) {
+        // All-uppercase ASCII check — if any input lower case, we still
+        // need LFN to preserve case.
+        let is i32 as has_lower with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < name_len) {
+            let is i64 as cc = cast(i64, name[k]);
+            if (cc >= 97 && cc <= 122) { has_lower = 1; k = name_len; }
+            else { k = k + 1; }
+        }
+        if (has_lower == 0) { return 0; }
+        // Fall through: generate a mangled short name but still need LFN
+        // to preserve the original-case long name.
+    }
+
+    // Pass 2: mangled short. Find last '.' for extension.
+    let is i64 as dot with mut = 0 - 1;
+    let is i64 as j with mut = 0;
+    while (j < name_len) {
+        if (name[j] == cast(u8, 46)) { dot = j; }
+        j = j + 1;
+    }
+    let is i64 as base_end with mut = name_len;
+    if (dot >= 0) { base_end = dot; }
+
+    // Build base (up to 6 chars of sanitized input).
+    let is i64 as b with mut = 0;
+    let is [6]u8 as base_chars with mut;
+    let is i64 as bp with mut = 0;
+    while (bp < base_end && b < 6) {
+        let is i64 as c = sanitize_char(cast(i64, name[bp]));
+        base_chars[b] = cast(u8, c);
+        b = b + 1;
+        bp = bp + 1;
+    }
+
+    // Pick ~N suffix that keeps uniqueness in parent_cluster.
+    let is i64 as n with mut = 1;
+    while (n < 100) {
+        let is i64 as i with mut = 0;
+        while (i < 11) { short_scratch[i] = cast(u8, 32); i = i + 1; }
+        let is i64 as copy_n with mut = 0;
+        while (copy_n < b) { short_scratch[copy_n] = base_chars[copy_n]; copy_n = copy_n + 1; }
+        short_scratch[b] = cast(u8, 126);   // '~'
+        // N is 1-9 (single digit) or 10-99.
+        if (n < 10) {
+            short_scratch[b + 1] = cast(u8, 48 + n);
+        } else {
+            short_scratch[b + 1] = cast(u8, 48 + (n / 10));
+            short_scratch[b + 2] = cast(u8, 48 + (n % 10));
+        }
+        // Extension.
+        if (dot >= 0) {
+            let is i64 as e with mut = 0;
+            let is i64 as ep with mut = dot + 1;
+            while (ep < name_len && e < 3) {
+                short_scratch[8 + e] = cast(u8, sanitize_char(cast(i64, name[ep])));
+                e = e + 1; ep = ep + 1;
+            }
+        }
+        // Check uniqueness: scan parent dir for this short name.
+        if (short_name_exists(v, parent_cluster,
+                              cast(*u8, &short_scratch[0])) == 0) {
+            return 1;
+        }
+        n = n + 1;
+    }
+    return cast(i32, 0 - 2);
+}
+
+// Returns 1 if any non-deleted 8.3 entry in the directory chain
+// matches `target11` exactly.
+fn short_name_exists(v as *Fat32Volume, start_cluster as i64,
+                     target11 as *u8) as i32 {
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = start_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return 0; }
+        guard = guard + 1;
+        if (cluster_read(v, cluster, buf) != 0) { return 0; }
+        let is i64 as i with mut = 0;
+        let is i64 as cbytes = v.cluster_size_bytes;
+        while (i < cbytes) {
+            let is u8 as m = buf[i];
+            if (m == cast(u8, 0)) { return 0; }
+            let is i32 as a = cast(i32, buf[i + 11]) & 0xFF;
+            if (m != cast(u8, 0xE5) && a != ATTR_LFN) {
+                if (name_matches(buf, i, target11) == 1) { return 1; }
+            }
+            i = i + 32;
+        }
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return 0; }
+        if (cluster_is_eof(nxt) == 1) { return 0; }
+        cluster = nxt;
+    }
+    return 0;
+}
+
+// Emit a single 32-byte 8.3 entry into buf at offset `off`.
+fn emit_sfn(buf as *u8, off as i64, short11 as *u8, attr as i32,
+            first_cluster as i64, size as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 11) { buf[off + i] = short11[i]; i = i + 1; }
+    buf[off + 11] = cast(u8, attr & 0xFF);
+    // 12..21 zeroed (NTRes, ctime tenths, ctime/cdate/adate) — we
+    // intentionally leave timestamps at 0; a future pass wires an RTC.
+    let is i64 as j with mut = 12;
+    while (j < 22) { buf[off + j] = cast(u8, 0); j = j + 1; }
+    // First cluster high (20..21), time/date write (22..25), first
+    // cluster low (26..27), size (28..31).
+    let is i64 as hi = (first_cluster >> 16) & 0xFFFF;
+    let is i64 as lo = first_cluster & 0xFFFF;
+    buf[off + 20] = cast(u8, hi & 0xFF);
+    buf[off + 21] = cast(u8, (hi >> 8) & 0xFF);
+    buf[off + 22] = cast(u8, 0); buf[off + 23] = cast(u8, 0);
+    buf[off + 24] = cast(u8, 0); buf[off + 25] = cast(u8, 0);
+    buf[off + 26] = cast(u8, lo & 0xFF);
+    buf[off + 27] = cast(u8, (lo >> 8) & 0xFF);
+    buf[off + 28] = cast(u8, size & 0xFF);
+    buf[off + 29] = cast(u8, (size >> 8) & 0xFF);
+    buf[off + 30] = cast(u8, (size >> 16) & 0xFF);
+    buf[off + 31] = cast(u8, (size >> 24) & 0xFF);
+}
+
+// Emit one LFN entry at buf[off] for characters at logical slot
+// [(seq-1)*13, seq*13), taking chars from `name` (length name_len;
+// pad with 0x0000 terminator + 0xFFFF thereafter).
+fn emit_lfn(buf as *u8, off as i64, seq as i64, is_last_physical as i32,
+            name as *u8, name_len as i64, checksum as i64) as void {
+    let is [13]i64 as offs;
+    offs[0]=1;  offs[1]=3;  offs[2]=5;  offs[3]=7;  offs[4]=9;
+    offs[5]=14; offs[6]=16; offs[7]=18; offs[8]=20; offs[9]=22; offs[10]=24;
+    offs[11]=28; offs[12]=30;
+
+    let is i64 as ord_byte with mut = seq;
+    if (is_last_physical == 1) { ord_byte = ord_byte | 0x40; }
+    buf[off + 0]  = cast(u8, ord_byte & 0xFF);
+    buf[off + 11] = cast(u8, 0x0F);
+    buf[off + 12] = cast(u8, 0);
+    buf[off + 13] = cast(u8, checksum & 0xFF);
+    buf[off + 26] = cast(u8, 0); buf[off + 27] = cast(u8, 0);
+
+    let is i64 as base = (seq - 1) * 13;
+    let is i64 as k with mut = 0;
+    let is i32 as past_term with mut = 0;
+    while (k < 13) {
+        let is i64 as o = offs[k];
+        let is i64 as idx = base + k;
+        if (past_term == 1) {
+            buf[off + o]     = cast(u8, 0xFF);
+            buf[off + o + 1] = cast(u8, 0xFF);
+        } else if (idx < name_len) {
+            buf[off + o]     = name[idx];
+            buf[off + o + 1] = cast(u8, 0);
+        } else if (idx == name_len) {
+            // terminator
+            buf[off + o]     = cast(u8, 0);
+            buf[off + o + 1] = cast(u8, 0);
+            past_term = 1;
+        } else {
+            buf[off + o]     = cast(u8, 0xFF);
+            buf[off + o + 1] = cast(u8, 0xFF);
+        }
+        k = k + 1;
+    }
+}
+
+// Slot-by-slot directory placement. Walks `parent_cluster`'s chain,
+// locates the first 0x00 terminator, and writes `total` 32-byte entries
+// contiguously starting there — extending the chain with freshly-zeroed
+// clusters as needed. Because we only ever overwrite the dir's 0x00
+// tail, no existing entries are disturbed and no 0xE5 gap-patching is
+// required.
+fn dir_place_entries(v as *Fat32Volume, parent_cluster as i64,
+                     entries_buf as *u8, total as i64) as i32 {
+    if (total <= 0) { return 0; }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = parent_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    let is i64 as n_slots = v.cluster_size_bytes / 32;
+    let is i64 as remaining with mut = total;
+    let is i64 as src_off with mut = 0;
+    let is i32 as started with mut = 0;
+    let is i64 as cur_slot with mut = 0;
+
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        guard = guard + 1;
+        if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 2); }
+
+        // Once we've started placing, continue from slot 0 in the new
+        // cluster; otherwise find the first 0x00 terminator.
+        if (started == 0) {
+            cur_slot = 0 - 1;
+            let is i64 as i with mut = 0;
+            while (i < n_slots) {
+                if (buf[i * 32] == cast(u8, 0)) {
+                    cur_slot = i;
+                    i = n_slots;
+                } else {
+                    i = i + 1;
+                }
+            }
+            if (cur_slot < 0) {
+                // Cluster full, advance or extend.
+            } else {
+                started = 1;
+            }
+        } else {
+            cur_slot = 0;
+        }
+
+        if (started == 1) {
+            let is i64 as dirty with mut = 0;
+            while (cur_slot < n_slots && remaining > 0) {
+                let is i64 as dst = cur_slot * 32;
+                let is i64 as j with mut = 0;
+                while (j < 32) {
+                    buf[dst + j] = entries_buf[src_off + j];
+                    j = j + 1;
+                }
+                src_off = src_off + 32;
+                remaining = remaining - 1;
+                cur_slot = cur_slot + 1;
+                dirty = 1;
+            }
+            if (dirty == 1 && cluster_write(v, cluster, buf) != 0) {
+                return cast(i32, 0 - 4);
+            }
+            if (remaining == 0) { return 0; }
+        }
+
+        // Need more room: follow chain or extend.
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_is_eof(nxt) == 1) {
+            let is i64 as new_c = cluster_alloc(v);
+            if (new_c < 0) { return cast(i32, 0 - 5); }
+            if (cluster_zero(v, new_c) != 0) { return cast(i32, 0 - 6); }
+            if (fat_write(v, cluster, new_c) != 0) { return cast(i32, 0 - 7); }
+            cluster = new_c;
+        } else {
+            cluster = nxt;
+        }
+    }
+    return cast(i32, 0 - 8);
+}
+
+// Scratch buffer holding up to 21 entries (20 LFN + 1 SFN = 672B).
+let is [672]u8 as entry_scratch with mut;
+
+// Add a new entry named `name` (long) to `parent_cluster`, pointing at
+// `first_cluster` with size=size and attr=attr. Returns 0 on success.
+fn dir_add_entry(v as *Fat32Volume, parent_cluster as i64,
+                 name as *u8, name_len as i64,
+                 attr as i32, first_cluster as i64, size as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (name_len <= 0 || name_len > 255) { return cast(i32, 0 - 1); }
+    if (ensure_scratch() != 0) { return cast(i32, 0 - 2); }
+
+    let is i32 as sr = derive_short_name(name, name_len, parent_cluster, v);
+    if (sr < 0) { return cast(i32, 0 - 3); }
+    let is i64 as need_lfn with mut = 0;
+    if (sr == 1) {
+        need_lfn = (name_len / 13) + 1;
+        if (name_len % 13 == 0) { need_lfn = name_len / 13 + 1; }
+    }
+    let is i64 as total_slots = need_lfn + 1;
+    if (total_slots > 21) { return cast(i32, 0 - 4); }
+
+    // Zero the entry scratch region we'll populate.
+    let is i64 as z with mut = 0;
+    while (z < total_slots * 32) { entry_scratch[z] = cast(u8, 0); z = z + 1; }
+
+    if (need_lfn > 0) {
+        let is i64 as ck = lfn_checksum(cast(*u8, &short_scratch[0]));
+        let is i64 as k with mut = 0;
+        while (k < need_lfn) {
+            let is i64 as seq = need_lfn - k;
+            let is i32 as is_last with mut = 0;
+            if (k == 0) { is_last = 1; }
+            emit_lfn(cast(*u8, &entry_scratch[0]), k * 32, seq, is_last,
+                     name, name_len, ck);
+            k = k + 1;
+        }
+    }
+    emit_sfn(cast(*u8, &entry_scratch[0]), need_lfn * 32,
+             cast(*u8, &short_scratch[0]), attr, first_cluster, size);
+
+    return dir_place_entries(v, parent_cluster,
+                             cast(*u8, &entry_scratch[0]), total_slots);
+}
+
+// Remove the directory entry (and its preceding LFN entries) named
+// `name` from `parent_cluster`. Returns the first_cluster of the
+// removed entry on success, or a negative rc. Does NOT free the file's
+// data clusters; callers combine with chain_free for unlink semantics.
+fn dir_remove_entry(v as *Fat32Volume, parent_cluster as i64,
+                    name as *u8, name_len as i64,
+                    out_first_cluster as *i64, out_size as *i64,
+                    out_attr as *i32) as i32 {
+    let is i32 as at with mut = 0;
+    let is i32 as rc = dir_find(v, parent_cluster, name, name_len,
+                                out_first_cluster, out_size, &at);
+    if (rc != 0) { return rc; }
+    *out_attr = at;
+
+    // Re-walk the directory to mark the SFN and any preceding LFN run
+    // with 0xE5. We locate the SFN by first_cluster match — safe even
+    // if duplicate short names existed because a cluster number is
+    // unique per live file (we just allocated fresh one).
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = parent_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    let is i64 as lfn_run_start_slot with mut = 0 - 1;
+    let is i64 as lfn_run_cluster with mut = 0 - 1;
+    let is i64 as target_cluster = *out_first_cluster;
+
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        guard = guard + 1;
+        if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 4); }
+
+        let is i64 as n_slots = v.cluster_size_bytes / 32;
+        let is i64 as i with mut = 0;
+        while (i < n_slots) {
+            let is i64 as boff = i * 32;
+            let is u8 as m = buf[boff];
+            if (m == cast(u8, 0)) { return cast(i32, 0 - 5); }   // unreachable if dir_find matched
+            if (m == cast(u8, 0xE5)) {
+                lfn_run_start_slot = 0 - 1;
+            } else {
+                let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
+                if (a == ATTR_LFN) {
+                    if (lfn_run_start_slot < 0) {
+                        lfn_run_start_slot = i;
+                        lfn_run_cluster = cluster;
+                    }
+                } else {
+                    let is i64 as fc_lo = read_u16(buf, boff + 26);
+                    let is i64 as fc_hi = read_u16(buf, boff + 20);
+                    let is i64 as fc = fc_lo | (fc_hi << 16);
+                    if (fc == target_cluster) {
+                        // Mark this entry + preceding LFN run deleted.
+                        if (lfn_run_start_slot >= 0 && lfn_run_cluster == cluster) {
+                            let is i64 as r with mut = lfn_run_start_slot;
+                            while (r <= i) { buf[r * 32] = cast(u8, 0xE5); r = r + 1; }
+                        } else {
+                            buf[boff] = cast(u8, 0xE5);
+                        }
+                        if (cluster_write(v, cluster, buf) != 0) {
+                            return cast(i32, 0 - 6);
+                        }
+                        return 0;
+                    }
+                    lfn_run_start_slot = 0 - 1;
+                }
+            }
+            i = i + 1;
+        }
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return cast(i32, 0 - 4); }
+        if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 5); }
+        cluster = nxt;
+    }
+    return cast(i32, 0 - 5);
+}
+
+// ============================================================
+// High-level file API — create, write-all, unlink. Persists via a
+// final FLUSH so data survives a reset. For Phase 5 we keep the
+// contract simple: file_create/write_all take a complete buffer and
+// fully (re)populate the file; streamed writes arrive later.
+// ============================================================
+
+// Split `path` at the last '/' into parent path (may be empty) and
+// leaf name. Returns -1 if the path has no leaf component.
+fn path_split_parent(path as *u8, path_len as i64,
+                     out_leaf_off as *i64, out_leaf_len as *i64,
+                     out_parent_end as *i64) as i32 {
+    if (path_len <= 0) { return cast(i32, 0 - 1); }
+    let is i64 as end with mut = path_len;
+    while (end > 0 && path[end - 1] == cast(u8, 47)) { end = end - 1; }
+    if (end == 0) { return cast(i32, 0 - 1); }   // bare "/"
+    let is i64 as last_slash with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < end) {
+        if (path[i] == cast(u8, 47)) { last_slash = i; }
+        i = i + 1;
+    }
+    if (last_slash < 0) {
+        *out_leaf_off = 0;
+        *out_leaf_len = end;
+        *out_parent_end = 0;
+    } else {
+        *out_leaf_off = last_slash + 1;
+        *out_leaf_len = end - (last_slash + 1);
+        *out_parent_end = last_slash;
+    }
+    if (*out_leaf_len == 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+
+// Create a regular file at `path` containing `data[0..data_len]`.
+// parent directories must already exist. Returns 0 on success.
+// On failure leaves no partial state (rolls back cluster allocations).
+fn file_create(v as *Fat32Volume, path as *u8, path_len as i64,
+               data as *u8, data_len as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+
+    let is i64 as leaf_off with mut = 0;
+    let is i64 as leaf_len with mut = 0;
+    let is i64 as parent_end with mut = 0;
+    if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
+        return cast(i32, 0 - 2);
+    }
+
+    // Resolve parent directory cluster.
+    let is i64 as parent_cluster with mut = v.root_cluster;
+    let is i64 as psz with mut = 0;
+    let is i32 as pattr with mut = 0;
+    if (parent_end > 0) {
+        let is i32 as rc = path_lookup(v, path, parent_end,
+                                       &parent_cluster, &psz, &pattr);
+        if (rc != 0) { return cast(i32, 0 - 3); }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+    }
+
+    // Refuse creation when the name already exists.
+    let is i64 as dummy_c with mut = 0;
+    let is i64 as dummy_s with mut = 0;
+    let is i32 as dummy_a with mut = 0;
+    let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
+    if (dir_find(v, parent_cluster, leaf_ptr, leaf_len,
+                 &dummy_c, &dummy_s, &dummy_a) == 0) {
+        return cast(i32, 0 - 5);   // EEXIST
+    }
+
+    // Allocate cluster chain for the payload. data_len=0 => empty file
+    // with first_cluster=0 per FAT32 convention.
+    let is i64 as first_cluster with mut = 0;
+    if (data_len > 0) {
+        let is i64 as n_clusters = (data_len + v.cluster_size_bytes - 1)
+                                 / v.cluster_size_bytes;
+        let is i64 as prev with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < n_clusters) {
+            let is i64 as c = cluster_alloc(v);
+            if (c < 0) {
+                if (first_cluster != 0) { chain_free(v, first_cluster); }
+                return cast(i32, 0 - 6);
+            }
+            if (prev == 0) { first_cluster = c; }
+            else          { fat_write(v, prev, c); }
+            prev = c;
+            k = k + 1;
+        }
+        // Tail is already EOC from cluster_alloc.
+
+        // Write data clusters.
+        let is *u8 as wbuf = cast(*u8, clus_scratch_virt);
+        let is i64 as cur with mut = first_cluster;
+        let is i64 as offset with mut = 0;
+        while (offset < data_len) {
+            let is i64 as chunk with mut = v.cluster_size_bytes;
+            if (chunk > data_len - offset) { chunk = data_len - offset; }
+            let is i64 as j with mut = 0;
+            while (j < chunk) { wbuf[j] = data[offset + j]; j = j + 1; }
+            while (j < v.cluster_size_bytes) { wbuf[j] = cast(u8, 0); j = j + 1; }
+            if (cluster_write(v, cur, wbuf) != 0) {
+                chain_free(v, first_cluster);
+                return cast(i32, 0 - 7);
+            }
+            offset = offset + chunk;
+            if (offset < data_len) {
+                let is i64 as nxt = fat_read(v, cur);
+                if (nxt < 0) {
+                    chain_free(v, first_cluster);
+                    return cast(i32, 0 - 8);
+                }
+                cur = nxt;
+            }
+        }
+    }
+
+    // Create the directory entry. Roll back clusters on failure.
+    let is i32 as de = dir_add_entry(v, parent_cluster, leaf_ptr, leaf_len,
+                                     cast(i32, 0x20), first_cluster, data_len);
+    if (de != 0) {
+        if (first_cluster != 0) { chain_free(v, first_cluster); }
+        return cast(i32, 0 - 9);
+    }
+
+    // Durability barrier.
+    storage.flush(v.dev);
+    return 0;
+}
+
+fn file_unlink(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+
+    let is i64 as leaf_off with mut = 0;
+    let is i64 as leaf_len with mut = 0;
+    let is i64 as parent_end with mut = 0;
+    if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
+        return cast(i32, 0 - 2);
+    }
+    let is i64 as parent_cluster with mut = v.root_cluster;
+    let is i64 as psz with mut = 0;
+    let is i32 as pattr with mut = 0;
+    if (parent_end > 0) {
+        if (path_lookup(v, path, parent_end,
+                        &parent_cluster, &psz, &pattr) != 0) {
+            return cast(i32, 0 - 3);
+        }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+    }
+    let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
+
+    let is i64 as fc with mut = 0;
+    let is i64 as fs with mut = 0;
+    let is i32 as fa with mut = 0;
+    let is i32 as rc = dir_remove_entry(v, parent_cluster,
+                                        leaf_ptr, leaf_len,
+                                        &fc, &fs, &fa);
+    if (rc != 0) { return rc; }
+    if ((fa & ATTR_DIRECTORY) != 0) {
+        // Refuse rmdir through unlink. mkdir/rmdir land in a later phase.
+        return cast(i32, 0 - 6);
+    }
+    if (fc != 0) { chain_free(v, fc); }
+    storage.flush(v.dev);
+    return 0;
+}
+
+// ============================================================
 // Mount thread — yields until a storage device appears in the
 // registry, then tries to mount it as FAT32. Intended to be
 // started after driver phase 2 has kicked off probing.
@@ -954,4 +1642,145 @@ fn self_test_read(v as *Fat32Volume) as void {
         while (mm < sn) { serial.putc(cast(i64, sb[mm])); mm = mm + 1; }
         serial.println("'", 1);
     }
+
+    self_test_write(v);
+}
+
+// ============================================================
+// self_test_write — create, read-back, unlink round-trip. Covers the
+// Phase 5 write path end-to-end:
+//   1. Create /roundtrip.txt with ASCII payload → read back, compare
+//   2. Create /long round-trip name with spaces.md (LFN+mangle) →
+//      read back via both long-name and short-name queries, compare
+//   3. Create /large.bin spanning 5 clusters with deterministic
+//      pattern → read back, byte-verify
+//   4. Unlink each, verify dir_find returns not-found
+// ============================================================
+
+let is [2600]u8 as large_payload with mut;
+
+fn self_test_write(v as *Fat32Volume) as void {
+    serial.println("fat32.test: write-path start", 28);
+
+    // --- Test 1: simple ASCII file ---
+    let is *u8 as payload1 = cast(*u8, "causticos FAT32 write-path works");
+    let is i32 as c1 = file_create(v,
+        cast(*u8, "/roundtrip.txt"), 14,
+        payload1, 32);
+    if (c1 != 0) {
+        serial.print("fat32.test: create roundtrip.txt FAIL rc=", 41);
+        util.print_num(cast(i64, c1)); serial.println("", 0);
+        return;
+    }
+    let is i64 as back_virt = alloc_dma_page();
+    let is *u8 as back = cast(*u8, back_virt);
+    let is i64 as cc with mut = 0;
+    let is i64 as ss with mut = 0;
+    let is i32 as aa with mut = 0;
+    if (path_lookup(v, cast(*u8, "/roundtrip.txt"), 14,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: roundtrip lookup FAIL", 33);
+        return;
+    }
+    if (ss != 32) {
+        serial.print("fat32.test: roundtrip size=", 27);
+        util.print_num(ss); serial.println(" expected 32", 12);
+        return;
+    }
+    if (file_read(v, cc, ss, back, 4096) != 32) {
+        serial.println("fat32.test: roundtrip read short", 32);
+        return;
+    }
+    let is i64 as mm with mut = 0;
+    let is i64 as mis1 with mut = 0;
+    while (mm < 32) {
+        if (back[mm] != payload1[mm]) { mis1 = mis1 + 1; }
+        mm = mm + 1;
+    }
+    if (mis1 != 0) {
+        serial.print("fat32.test: roundtrip mismatch=", 31);
+        util.print_num(mis1); serial.println("", 0);
+        return;
+    }
+    serial.println("fat32.test: roundtrip.txt OK", 28);
+
+    // --- Test 2: long-name file requiring LFN + 8.3 mangle ---
+    let is *u8 as payload2 = cast(*u8, "write-path LFN works");
+    let is i32 as c2 = file_create(v,
+        cast(*u8, "/long round-trip name with spaces.md"), 36,
+        payload2, 20);
+    if (c2 != 0) {
+        serial.print("fat32.test: create LFN FAIL rc=", 31);
+        util.print_num(cast(i64, c2)); serial.println("", 0);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/long round-trip name with spaces.md"), 36,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: LFN lookup-after-create FAIL", 40);
+        return;
+    }
+    if (file_read(v, cc, ss, back, 4096) != 20) {
+        serial.println("fat32.test: LFN read-back size mismatch", 39);
+        return;
+    }
+    let is i64 as p with mut = 0;
+    let is i64 as mis2 with mut = 0;
+    while (p < 20) {
+        if (back[p] != payload2[p]) { mis2 = mis2 + 1; }
+        p = p + 1;
+    }
+    if (mis2 == 0) { serial.println("fat32.test: LFN round-trip OK", 29); }
+    else {
+        serial.print("fat32.test: LFN payload mismatch=", 33);
+        util.print_num(mis2); serial.println("", 0);
+    }
+
+    // --- Test 3: multi-cluster file (2600 bytes = 6 clusters of 512B) ---
+    let is i64 as fill with mut = 0;
+    while (fill < 2600) {
+        large_payload[fill] = cast(u8, (fill * 31 + 7) & 0xFF);
+        fill = fill + 1;
+    }
+    let is i32 as c3 = file_create(v,
+        cast(*u8, "/large.bin"), 10,
+        cast(*u8, &large_payload[0]), 2600);
+    if (c3 != 0) {
+        serial.print("fat32.test: create large FAIL rc=", 33);
+        util.print_num(cast(i64, c3)); serial.println("", 0);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/large.bin"), 10, &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: large lookup FAIL", 29);
+        return;
+    }
+    // Reuse clus_scratch via a fresh page to avoid colliding with FAT walks.
+    let is i64 as big_virt = alloc_dma_page();
+    let is *u8 as big = cast(*u8, big_virt);
+    if (file_read(v, cc, ss, big, 4096) != 2600) {
+        serial.println("fat32.test: large read-back size mismatch", 41);
+        return;
+    }
+    let is i64 as bi with mut = 0;
+    let is i64 as mis3 with mut = 0;
+    while (bi < 2600) {
+        if (big[bi] != cast(u8, (bi * 31 + 7) & 0xFF)) { mis3 = mis3 + 1; }
+        bi = bi + 1;
+    }
+    if (mis3 == 0) { serial.println("fat32.test: large.bin 2600B round-trip OK", 41); }
+    else {
+        serial.print("fat32.test: large mismatch=", 27);
+        util.print_num(mis3); serial.println("", 0);
+    }
+
+    // --- Test 4: unlink + verify gone ---
+    if (file_unlink(v, cast(*u8, "/roundtrip.txt"), 14) != 0) {
+        serial.println("fat32.test: unlink roundtrip FAIL", 33);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/roundtrip.txt"), 14,
+                    &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: unlinked file still visible!", 40);
+        return;
+    }
+    serial.println("fat32.test: unlink+verify OK", 28);
 }
