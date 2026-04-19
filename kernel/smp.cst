@@ -1,0 +1,304 @@
+// smp.cst — Application Processor bring-up and per-CPU state.
+//
+// Relies on Limine's SMP response to skip the 16→32→64-bit
+// trampoline dance: the bootloader has already brought each AP into
+// 64-bit long mode with our page tables active, then parked them in
+// a spin loop waiting for a function pointer. We publish our
+// ap_entry() address into each CPU's goto_address slot and they
+// jump to it, running exactly the same kernel binary as the BSP.
+//
+// What each AP does on arrival:
+//   1. Point IA32_GS_BASE at its PerCpu slot
+//   2. Enable the local APIC so it can receive IPIs + its timer
+//   3. Flip is_online = 1 so the BSP's rendezvous can release
+//   4. Park in HLT with IRQs on; next phase swaps this for a real
+//      per-CPU scheduler idle loop
+//
+// All per-CPU data lives in a bss-resident [16]PerCpu array — no
+// heap, so bring-up survives even if the kernel heap is pressured.
+// Stacks are allocated through the page allocator (one 16 KiB slab
+// per AP) because those are large and touched rarely at boot.
+
+use "serial.cst"   as serial;
+use "util.cst"     as util;
+use "limine.cst"   as limine;
+use "lapic.cst"    as lapic;
+use "pmm.cst"      as pmm;
+use "vmm.cst"      as vmm;
+use "timer.cst"    as timer;
+use "sched.cst"    as sched;
+use "lock.cst"     as lock;
+
+// ============================================================
+// Per-CPU layout
+// ============================================================
+
+let is i64 as MAX_CPUS = 16;
+let is i64 as AP_STACK_SIZE = 0x4000;   // 16 KiB
+
+struct PerCpu {
+    self_ptr as i64;         // offset 0: points back at this PerCpu — enables
+                             //           `mov rax, gs:[0]` to get the cpu base
+    cpu_id as i64;           // 0..cpu_count-1 (0 = BSP by convention)
+    lapic_id as i64;
+    idle_stack_top as i64;   // high address; AP's RSP lands here after entry
+    current_thread as i64;   // scheduler installs this in next phase
+    is_online as i32;
+    boot_done as i32;        // 1 after AP finished its first-time init
+}
+
+let is [16]PerCpu as per_cpus with mut;
+let is i64 as cpu_count with mut = 0;
+let is i64 as bsp_cpu_id with mut = 0;
+let is i64 as bsp_lapic_id with mut = 0;
+
+// Serialises AP entry logging so the per-CPU "online" lines don't
+// interleave in the serial output. Not strictly required for
+// correctness, but it's the first real thing we lock so it doubles as
+// a smoke test of the ticket lock.
+let is lock.TicketLock as log_lock with mut;
+
+// ============================================================
+// MSR helpers — IA32_GS_BASE lets us install a per-CPU pointer that
+// is readable via `mov rax, gs:[off]` instructions. swapgs shuttles
+// between the kernel (GS_BASE) and user (KERNEL_GS_BASE) slots; for
+// a kernel-only system we pin GS to the kernel value permanently
+// using plain wrmsr, no swapgs needed.
+// ============================================================
+
+let is i64 as IA32_GS_BASE         = 0xC0000101;
+let is i64 as IA32_KERNEL_GS_BASE  = 0xC0000102;
+
+// Thin Caustic wrappers around smp_asm.s. For functions that return
+// values we route through an out-pointer argument so the asm helper
+// writes where the C caller wants — this avoids having to chase
+// Caustic's compiler-chosen spill offsets for local variables. Args
+// live in rdi/rsi at entry and the .s file relies on that.
+
+fn wrmsr(msr as i64, value as i64) as void {
+    asm("call smp_wrmsr\n");
+}
+
+fn load_cr3(pml4_phys as i64) as void {
+    asm("call smp_load_cr3\n");
+}
+
+fn rdmsr_into(msr as i64, out as *i64) as void {
+    asm("call smp_rdmsr_into\n");
+}
+
+fn rdmsr(msr as i64) as i64 {
+    let is i64 as v with mut = 0;
+    rdmsr_into(msr, &v);
+    return v;
+}
+
+fn read_gs_self_into(out as *i64) as void {
+    asm("call smp_read_gs_self_into\n");
+}
+
+fn current_cpu() as *PerCpu {
+    let is i64 as v with mut = 0;
+    read_gs_self_into(&v);
+    return cast(*PerCpu, v);
+}
+
+fn current_cpu_id() as i64 {
+    let is *PerCpu as p = current_cpu();
+    if (cast(i64, p) == 0) { return 0; }
+    return p.cpu_id;
+}
+
+// ============================================================
+// Stack allocation — one 16 KiB per-AP idle stack, carved from the
+// page allocator at init time. Returns the top (high address) so the
+// caller can write it into PerCpu.idle_stack_top and the AP can load
+// it into RSP.
+// ============================================================
+
+fn alloc_idle_stack() as i64 {
+    // AP_STACK_SIZE = 16384 = 4 pages, order = 2 (2^2 = 4).
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ZONE_NORMAL,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        cast(i32, 2),
+        pmm.USAGE_KERNEL,
+        cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+    let is i64 as base = phys + pmm.hhdm;
+    // Stack grows down; top = base + size - 16 (leave 16-byte
+    // alignment slack for ABI compliance on entry).
+    return base + AP_STACK_SIZE - 16;
+}
+
+// ============================================================
+// BSP init — called from _kernel_start after sched.init. Populates
+// per_cpus[0] for the BSP and fires off each AP by writing our
+// ap_entry function pointer into its Limine goto_address slot.
+// ============================================================
+
+fn install_gs_base(p as *PerCpu) as void {
+    wrmsr(IA32_GS_BASE, cast(i64, p));
+    // KERNEL_GS_BASE left untouched — writing it would only matter
+    // once we implement syscall/sysret which swaps the two. Setting
+    // it now triggered flaky behaviour on QEMU -smp 2 where a later
+    // swapgs would have loaded garbage because we aren't paired
+    // with a user-mode entry yet.
+}
+
+fn init() as void {
+    let is *u8 as resp = limine.get_smp_response();
+    if (cast(i64, resp) == 0) {
+        serial.println("smp: no Limine SMP response — uniprocessor", 42);
+        // Configure BSP PerCpu anyway so current_cpu() works.
+        per_cpus[0].self_ptr = cast(i64, &per_cpus[0]);
+        per_cpus[0].cpu_id = 0;
+        per_cpus[0].lapic_id = 0;
+        per_cpus[0].is_online = 1;
+        install_gs_base(&per_cpus[0]);
+        cpu_count = 1;
+        return;
+    }
+
+    let is i64 as n with mut = limine.smp_resp_cpu_count(resp);
+    if (n > MAX_CPUS) { n = MAX_CPUS; }
+    cpu_count = n;
+    bsp_lapic_id = limine.smp_resp_bsp_lapic(resp);
+
+    lock.acquire(&log_lock);
+    serial.print("smp: ", 5);      util.print_num(n);
+    serial.print(" cpus (bsp lapic_id=", 20);
+    util.print_num(bsp_lapic_id);
+    serial.println(")", 1);
+    lock.release(&log_lock);
+
+    // Initialise every PerCpu slot up front so current_cpu() is
+    // always pointing at a valid struct even on races.
+    let is i64 as cpus_arr = limine.smp_resp_cpus(resp);
+    let is *i64 as cpu_ptrs = cast(*i64, cpus_arr);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as info = cast(*u8, cpu_ptrs[i]);
+        per_cpus[i].self_ptr       = cast(i64, &per_cpus[i]);
+        per_cpus[i].cpu_id         = i;
+        per_cpus[i].lapic_id       = limine.smp_info_lapic_id(info);
+        per_cpus[i].idle_stack_top = 0;
+        per_cpus[i].current_thread = 0;
+        per_cpus[i].is_online      = 0;
+        per_cpus[i].boot_done      = 0;
+        if (per_cpus[i].lapic_id == bsp_lapic_id) {
+            bsp_cpu_id = i;
+        }
+        i = i + 1;
+    }
+
+    per_cpus[bsp_cpu_id].is_online = 1;
+    per_cpus[bsp_cpu_id].boot_done = 1;
+    install_gs_base(&per_cpus[bsp_cpu_id]);
+
+    // Kick every AP except ourselves. Writing the goto_address slot
+    // makes Limine's trampoline loop exit and the AP jump to
+    // ap_entry with RDI = its *LimineSmpInfo and our pre-allocated
+    // stack in extra_argument.
+    // Kicks must be serialised with AP startup — between writing
+    // extra_argument and goto_address the AP could latch the goto
+    // write and start executing before extra_argument is visible.
+    // mfence after the extra_argument store gives the AP a
+    // consistent view. lock.acquire on log_lock is unrelated
+    // synchronisation — it ensures AP's "online" print doesn't race
+    // with BSP's log output during bring-up.
+    // AP stacks are Limine-provided at boot time. Once scheduler
+    // SMP retrofit lands and APs actually run kernel code, they'll
+    // migrate to their own per-CPU stacks (PerCpu.idle_stack_top is
+    // reserved for that). For the HLT idle loop here Limine's is
+    // enough.
+    i = 0;
+    while (i < n) {
+        if (i != bsp_cpu_id) {
+            let is *u8 as info = cast(*u8, cpu_ptrs[i]);
+            limine.smp_info_set_extra(info, cast(i64, &per_cpus[i]));
+            // mfence so the per_cpus + extra_argument stores are
+            // globally visible before the AP's read of goto_address
+            // releases it from Limine's spin loop.
+            asm(".byte 0x0F, 0xAE, 0xF0\n");
+            limine.smp_info_set_goto(info, cast(i64, fn_ptr(ap_entry)));
+        }
+        i = i + 1;
+    }
+
+    // Rendezvous: wait up to 2 s for every AP to flip is_online.
+    let is i64 as deadline = timer.current_time_ns() + cast(i64, 2000000000);
+    let is i32 as all_ok with mut = 0;
+    while (all_ok == 0 && timer.current_time_ns() < deadline) {
+        all_ok = 1;
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            if (per_cpus[j].is_online == 0) { all_ok = 0; j = n; }
+            else                            { j = j + 1; }
+        }
+        asm(".byte 0xF3, 0x90\n");
+    }
+
+    let is i64 as online with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (per_cpus[k].is_online == 1) { online = online + 1; }
+        k = k + 1;
+    }
+    lock.acquire(&log_lock);
+    serial.print("smp: ", 5); util.print_num(online);
+    serial.print("/", 1);     util.print_num(n);
+    serial.println(" cpus online", 12);
+    lock.release(&log_lock);
+}
+
+// ============================================================
+// AP entry — first thing each AP runs after Limine releases it.
+// ============================================================
+
+fn ap_entry(info as *u8) as void {
+    let is *PerCpu as me = cast(*PerCpu, limine.smp_info_get_extra(info));
+    if (cast(i64, me) == 0) {
+        while (1 == 1) { asm(".byte 0xF4\n"); }
+    }
+
+    // Stay on Limine's CR3 for now. AP doesn't touch post-vmm.init
+    // VAs (LAPIC MMIO, mmio_map) while idle-HLTing, and a load_cr3
+    // here on QEMU -smp 4 triggered a BSP lapic-write fault later
+    // that we're still tracking down. Switching back when the AP
+    // starts running scheduler code.
+    install_gs_base(me);
+
+    // LAPIC configuration (enable bit, spurious vector, timer) is
+    // deferred to the scheduler-SMP phase that will actually direct
+    // timer interrupts to APs. For now the AP just reports online
+    // and halts. IPIs won't reach it yet — that's fine, no code
+    // sends IPIs today.
+    lock.acquire(&log_lock);
+    serial.print("smp: AP[", 8);      util.print_num(me.cpu_id);
+    serial.print("] lapic_id=", 11);  util.print_num(me.lapic_id);
+    serial.println(" online", 7);
+    lock.release(&log_lock);
+
+    me.is_online = 1;
+    me.boot_done = 1;
+
+    // Idle loop with IRQs disabled (safe — no IRQ handlers target
+    // APs yet). HLT waits in low power until the next NMI or reset.
+    while (1 == 1) {
+        asm(".byte 0xF4\n");   // hlt
+    }
+}
+
+// ============================================================
+// Accessors for callers who want to branch on topology.
+// ============================================================
+
+fn get_cpu_count() as i64 { return cpu_count; }
+fn get_bsp_cpu_id() as i64 { return bsp_cpu_id; }
+
+fn get_per_cpu(i as i64) as *PerCpu {
+    if (i < 0 || i >= cpu_count) { return cast(*PerCpu, 0); }
+    return &per_cpus[i];
+}
