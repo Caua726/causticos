@@ -18,6 +18,7 @@ use "acpi.cst"   as acpi;
 use "vmm.cst"    as vmm;
 use "serial.cst" as serial;
 use "util.cst"   as util;
+use "port.cst"   as port;
 
 // ============================================================
 // Register offsets
@@ -101,19 +102,37 @@ fn read_counter() as i64 {
 // Unit conversions. period_fs is femtoseconds (10^-15 s) per tick.
 //   ns = ticks * period_fs / 1_000_000
 //   ticks = ns * 1_000_000 / period_fs
-// Integer math; for period_fs = 100_000_000 (100 ns) the ratios
-// reduce to ticks*100 and ns/100, never overflows inside i64 at
-// realistic durations.
+//
+// A naive `ticks * period_fs` overflows i64 when ticks * period_fs
+// exceeds 9.2e18. At a 100 MHz HPET (period_fs = 1e7) that's ~2.6 h
+// of uptime — fine for test runs, poison for a long-running server.
+// We split the multiplication to eliminate the overflow:
+//   ticks * period_fs = (ticks / 1e6) * period_fs + (ticks % 1e6) * period_fs
+// The first term's multiplicand is scaled down by 1e6, so even at
+// i64-max ticks it can't overflow; the second term's multiplier
+// (ticks % 1e6) is bounded at 999999, so even paired with the spec
+// max period_fs (1e8) it tops out at ~1e14 — well below i64 max.
+// Final result is accurate for the full 64-bit counter span.
 // ============================================================
+
+let is i64 as NS_DENOM = 1000000;   // fs per ns
 
 fn ticks_to_ns(ticks as i64) as i64 {
     if (period_fs == 0) { return 0; }
-    return ticks * period_fs / 1000000;
+    if (ticks <= 0)     { return 0; }
+    let is i64 as q = ticks / NS_DENOM;
+    let is i64 as r = ticks - q * NS_DENOM;
+    return q * period_fs + (r * period_fs) / NS_DENOM;
 }
 
 fn ns_to_ticks(ns as i64) as i64 {
     if (period_fs == 0) { return 0; }
-    return ns * 1000000 / period_fs;
+    if (ns <= 0)        { return 0; }
+    // Same split: ns * 1e6 / period_fs.
+    //   = (ns / period_fs) * 1e6 + ((ns % period_fs) * 1e6) / period_fs
+    let is i64 as q = ns / period_fs;
+    let is i64 as r = ns - q * period_fs;
+    return q * NS_DENOM + (r * NS_DENOM) / period_fs;
 }
 
 // Monotonic nanosecond clock built on the counter. Wraps never if
@@ -168,12 +187,23 @@ fn init() as i32 {
     if (((cap_lo >> 13) & 1) == 1) { counter_is_64 = 1; }
     period_fs     = cap_hi;
 
-    if (period_fs == 0 || period_fs > 0x05F5E100) {
-        // Spec: period must be non-zero and ≤ 100 ns (10^8 fs).
+    // Spec: period must be non-zero and ≤ 100 ns (1e8 fs). Also
+    // guard against unreasonably small periods (< 1 fs would imply
+    // > 10^15 Hz which is non-physical).
+    if (period_fs == 0 || period_fs > 100000000) {
         serial.print("hpet: invalid period ", 22); util.print_num(period_fs);
         serial.println("", 0);
         mmio_base = 0;
         return cast(i32, 0 - 3);
+    }
+    // 32-bit counter wraps every ~42 s at 100 MHz. We don't emulate
+    // a 64-bit shadow today, so refuse — any board reporting 32-bit
+    // HPET in ACPI is so rare in practice that a hard failure is
+    // less dangerous than silently returning stale timestamps.
+    if (counter_is_64 == 0) {
+        serial.println("hpet: 32-bit counter unsupported", 32);
+        mmio_base = 0;
+        return cast(i32, 0 - 4);
     }
 
     // Zero the main counter, disable legacy replacement (we want the
@@ -187,24 +217,55 @@ fn init() as i32 {
     serial.print("hpet: base=", 11); util.print_hex(phys);
     serial.print(" period=", 8);     util.print_num(period_fs);
     serial.print("fs timers=", 10);  util.print_num(num_timers);
-    if (counter_is_64 == 1) { serial.print(" 64-bit", 7); }
-    else                     { serial.print(" 32-bit", 7); }
-    serial.println("", 0);
+    serial.println(" 64-bit", 7);
 
-    // Verify the counter actually advances — some firmware ships
-    // HPET disabled in hardware despite claiming it in ACPI. A zero-
-    // delta over a small burst is our early warning.
+    // Verify the counter actually advances before we trust it. Some
+    // firmware (especially virtualised environments with buggy ACPI)
+    // ships HPET "enabled" in the capability register while the
+    // hardware is still frozen. We measure against the PIT — the one
+    // other clock source guaranteed to exist on x86 — by spinning a
+    // ~1 ms PIT one-shot and checking that HPET moved forward by at
+    // least a quarter of its expected increment.
     let is i64 as t0 = read_counter();
-    let is i64 as spin with mut = 0;
-    while (spin < 1000) { asm(".byte 0xF3, 0x90\n"); spin = spin + 1; }
+    pit_wait_1ms();
     let is i64 as t1 = read_counter();
-    if (t1 == t0) {
-        serial.println("hpet: counter not advancing — disabling", 40);
+    let is i64 as expected = ns_to_ticks(1000000);   // 1 ms in ticks
+    if ((t1 - t0) < expected / 4) {
+        serial.print("hpet: counter moved only ", 26);
+        util.print_num(t1 - t0);
+        serial.print(" ticks in 1ms (expected ~", 25);
+        util.print_num(expected);
+        serial.println(") — disabling", 13);
         ready = 0;
         reg_write64(HPET_GEN_CONF, 0);
         mmio_base = 0;
-        return cast(i32, 0 - 4);
+        return cast(i32, 0 - 5);
     }
 
     return 0;
+}
+
+// PIT one-shot busy-wait ~1 ms. Used only from init() to sanity-check
+// the HPET counter is actually ticking. PIT is on the platform's
+// legacy ISA line IRQ 0; we use channel 2 in mode 0 (interrupt on
+// terminal count) and poll the status register so no IRQ plumbing
+// is required.
+fn pit_wait_1ms() as void {
+    // PIT input is 1193182 Hz; 1193 counts ≈ 1.000 ms.
+    let is i64 as count = 1193;
+    // Enable gate for channel 2 (port 0x61 bit 0), disable speaker
+    // (bit 1). Preserve other bits.
+    let is i64 as cmd = cast(i64, port.inb(0x61));
+    port.outb(0x61, cast(i64, (cmd & 0xFC) | 0x01));
+    // Mode 0, channel 2, lobyte/hibyte, binary
+    port.outb(0x43, 0xB0);
+    port.outb(0x42, count & 0xFF);
+    port.outb(0x42, (count >> 8) & 0xFF);
+    // Poll OUT2 (bit 5 of port 0x61) until it goes high.
+    let is i64 as guard with mut = 0;
+    while (guard < 5000000) {
+        let is i64 as s = cast(i64, port.inb(0x61));
+        if ((s & 0x20) != 0) { guard = 5000000; }
+        else { guard = guard + 1; }
+    }
 }

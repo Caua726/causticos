@@ -76,6 +76,26 @@ struct IsaOverride {
 let is [32]IsaOverride as isos with mut;
 let is i64 as iso_count with mut = 0;
 
+// Direct-lookup table indexed by ISA IRQ 0-15. `gsi = isa_irq` and
+// `flags = 0` (conforms-to-bus) when no MADT override exists; ISO
+// entries overwrite the default in parse_madt. O(1) lookups during
+// IOAPIC redirection instead of a linear scan.
+struct IsaDirect {
+    gsi as i64;
+    flags as i64;
+}
+let is [16]IsaDirect as isa_direct with mut;
+
+// MADT NMI source entries. Each describes a platform NMI wired to a
+// GSI — used later for NMI watchdog routing. Few boards ship these
+// (firmware-dependent); we capture what's there.
+struct NmiSource {
+    flags as i64;
+    gsi as i64;
+}
+let is [8]NmiSource as nmi_sources with mut;
+let is i64 as nmi_source_count with mut = 0;
+
 // PCIe ECAM regions from MCFG. Each entry maps a [bus_start..bus_end]
 // range on a PCI segment to a physical base address. Config access is
 // base + (bus << 20) + (device << 15) + (function << 12) + offset.
@@ -97,6 +117,34 @@ let is i64 as hpet_period_fs with mut = 0;
 // Local APIC override address from MADT (usually 0xFEE00000 but can
 // be remapped by firmware). 0 = use default.
 let is i64 as lapic_override with mut = 0;
+
+// FADT ("FACP") selected fields. Captured even when not yet used so
+// power management + reset paths have the data when we grow into them.
+struct FadtInfo {
+    present as i32;            // 1 when FADT found + checksum OK
+    sci_int as i64;            // IRQ used for SCI (power events)
+    smi_cmd as i64;            // SMI command port
+    acpi_enable as i64;
+    acpi_disable as i64;
+    pm1a_evt as i64;           // PM1A event block I/O port
+    pm1a_cnt as i64;           // PM1A control block I/O port
+    pm_timer as i64;           // PM timer block I/O port (0 if none)
+    pm_timer_width as i64;     // 24 or 32 bits
+    reset_reg_addr as i64;     // address of reset register
+    reset_reg_space as i64;    // 0 = memory, 1 = I/O
+    reset_value as i64;        // value to write for reset
+    boot_flags as i64;         // IA-PC boot flags (i8042 presence etc)
+}
+let is FadtInfo as fadt with mut;
+
+// Top-level parse result so callers can distinguish "fully prod",
+// "partial", "critical table missing". Set by parse().
+let is i32 as STATUS_OK                = 0;
+let is i32 as STATUS_RSDP_MISSING      = 1;
+let is i32 as STATUS_RSDP_INVALID      = 2;
+let is i32 as STATUS_MADT_MISSING      = 3;
+let is i32 as STATUS_MADT_BAD_CHECKSUM = 4;
+let is i32 as parse_status with mut = 0;
 
 // ============================================================
 // LE byte readers. Work on HHDM-mapped virtual addresses.
@@ -264,19 +312,27 @@ fn find_table(xsdt_phys as i64, is_xsdt as i32,
 //   Type 9: x2APIC — reserved (u16), apic_id (u32), flags (u32), uid (u32)
 // ============================================================
 
-fn parse_madt(virt as i64) as void {
+fn parse_madt(virt as i64) as i32 {
     let is i64 as total_len = read_u32(virt, SDT_LENGTH_OFF);
     if (checksum_ok(virt, total_len) == 0) {
         serial.println("acpi: MADT checksum fail", 24);
-        return;
+        return STATUS_MADT_BAD_CHECKSUM;
     }
     lapic_override = read_u32(virt, SDT_HEADER_SIZE);  // default LAPIC addr
+
+    // Initialise ISA direct table to identity (gsi == isa_irq, no flags).
+    let is i64 as k with mut = 0;
+    while (k < 16) {
+        isa_direct[k].gsi = k;
+        isa_direct[k].flags = 0;
+        k = k + 1;
+    }
 
     let is i64 as off with mut = SDT_HEADER_SIZE + 8;
     while (off < total_len) {
         let is i64 as etype = read_u8(virt, off);
         let is i64 as elen  = read_u8(virt, off + 1);
-        if (elen < 2) { return; }   // malformed, bail
+        if (elen < 2) { return STATUS_MADT_BAD_CHECKSUM; }   // malformed, bail
 
         if (etype == 0) {
             // LAPIC: check enabled bit (flags bit 0) or online-capable (bit 1)
@@ -296,10 +352,24 @@ fn parse_madt(virt as i64) as void {
             }
         } else if (etype == 2) {
             if (iso_count < MAX_ISOS) {
-                isos[iso_count].isa_irq = read_u8(virt, off + 3);
-                isos[iso_count].gsi     = read_u32(virt, off + 4);
-                isos[iso_count].flags   = read_u16(virt, off + 8);
+                let is i64 as irq = read_u8(virt, off + 3);
+                let is i64 as gsi = read_u32(virt, off + 4);
+                let is i64 as flg = read_u16(virt, off + 8);
+                isos[iso_count].isa_irq = irq;
+                isos[iso_count].gsi     = gsi;
+                isos[iso_count].flags   = flg;
                 iso_count = iso_count + 1;
+                if (irq >= 0 && irq < 16) {
+                    isa_direct[irq].gsi = gsi;
+                    isa_direct[irq].flags = flg;
+                }
+            }
+        } else if (etype == 3) {
+            // NMI source — GSI, flags. No ISA IRQ; routed as NMI.
+            if (nmi_source_count < 8) {
+                nmi_sources[nmi_source_count].flags = read_u16(virt, off + 2);
+                nmi_sources[nmi_source_count].gsi   = read_u32(virt, off + 4);
+                nmi_source_count = nmi_source_count + 1;
             }
         } else if (etype == 5) {
             lapic_override = read_u64(virt, off + 4);
@@ -314,6 +384,53 @@ fn parse_madt(virt as i64) as void {
         }
         off = off + elen;
     }
+    return STATUS_OK;
+}
+
+// ============================================================
+// FADT — "FACP" signature. ACPI 1.0 laid out fields up to offset
+// 116; subsequent revisions added the Generic Address Structure
+// (GAS) blocks past that. We read the v1 fixed fields (always
+// present) plus the reset register GAS at offset 116 when revision
+// >= 2. Fields we capture have concrete consumers in planned work:
+//   - sci_int            → SCI IRQ number for ACPI events
+//   - smi_cmd/enable/disable → switching between ACPI and legacy mode
+//   - pm1a_*             → power state transitions
+//   - pm_timer           → secondary monotonic clock source
+//   - reset_reg_*        → software-initiated reboot
+//   - boot_flags         → LEGACY_DEVICES / 8042 / NO_VGA etc (ia-pc)
+// ============================================================
+
+fn parse_fadt(virt as i64) as void {
+    let is i64 as total_len = read_u32(virt, SDT_LENGTH_OFF);
+    if (checksum_ok(virt, total_len) == 0) {
+        serial.println("acpi: FADT checksum fail", 24);
+        return;
+    }
+    let is i64 as revision = read_u8(virt, SDT_REVISION_OFF);
+
+    // v1 fields (ACPI 1.0 guarantees these are present)
+    fadt.smi_cmd      = read_u32(virt, 48);
+    fadt.acpi_enable  = read_u8(virt, 52);
+    fadt.acpi_disable = read_u8(virt, 53);
+    fadt.pm1a_evt     = read_u32(virt, 56);
+    fadt.pm1a_cnt     = read_u32(virt, 64);
+    fadt.pm_timer     = read_u32(virt, 76);
+    fadt.sci_int      = read_u16(virt, 46);
+    // PM_TM_LEN @ offset 91: 0 means no PM timer, 4 means 32-bit
+    let is i64 as pm_tm_len = read_u8(virt, 91);
+    if (pm_tm_len == 4) { fadt.pm_timer_width = 32; }
+    else                { fadt.pm_timer_width = 24; }
+
+    fadt.boot_flags   = read_u16(virt, 109);
+
+    // Reset register: ACPI 2.0+ only (offset 116 into FADT).
+    if (revision >= 2 && total_len >= 129) {
+        fadt.reset_reg_space = read_u8(virt, 116);     // 0 = memory, 1 = I/O
+        fadt.reset_reg_addr  = read_u64(virt, 116 + 4); // addr field of GAS
+        fadt.reset_value     = read_u8(virt, 128);
+    }
+    fadt.present = 1;
 }
 
 // ============================================================
@@ -379,23 +496,36 @@ fn parse() as i32 {
     cpu_count = 0;
     ioapic_count = 0;
     iso_count = 0;
+    nmi_source_count = 0;
     mcfg_count = 0;
     hpet_phys = 0;
     hpet_period_fs = 0;
     lapic_override = 0;
+    fadt.present = 0;
+    // Default ISA direct table to identity so callers can rely on it
+    // even if MADT is missing entirely.
+    let is i64 as k with mut = 0;
+    while (k < 16) {
+        isa_direct[k].gsi = k;
+        isa_direct[k].flags = 0;
+        k = k + 1;
+    }
 
     let is i64 as rsdp_phys = limine.get_rsdp();
     if (rsdp_phys == 0) {
         serial.println("acpi: no RSDP from Limine", 25);
+        parse_status = STATUS_RSDP_MISSING;
         return cast(i32, 0 - 1);
     }
     let is i64 as rsdp_virt = phys_to_virt_read(rsdp_phys, 36);
     if (rsdp_virt == 0) {
         serial.println("acpi: rsdp map failed", 21);
+        parse_status = STATUS_RSDP_INVALID;
         return cast(i32, 0 - 2);
     }
     if (rsdp_valid(rsdp_virt) == 0) {
         serial.println("acpi: invalid RSDP", 18);
+        parse_status = STATUS_RSDP_INVALID;
         return cast(i32, 0 - 3);
     }
 
@@ -408,10 +538,20 @@ fn parse() as i32 {
     else              { serial.print(" (rsdt)", 7); }
     serial.println("", 0);
 
-    // MADT signature "APIC"
+    // MADT signature "APIC". Critical — without it we can't route
+    // any hardware interrupt through the IOAPIC.
     let is i64 as madt = find_table(xsdt_phys, is_xsdt, 0x41, 0x50, 0x49, 0x43);
-    if (madt != 0) { parse_madt(madt); }
-    else { serial.println("acpi: MADT not found", 20); }
+    if (madt != 0) {
+        let is i32 as mrc = parse_madt(madt);
+        if (mrc != STATUS_OK) { parse_status = mrc; }
+    } else {
+        serial.println("acpi: MADT not found", 20);
+        parse_status = STATUS_MADT_MISSING;
+    }
+
+    // FADT signature "FACP" — fixed hardware description.
+    let is i64 as fadt_virt = find_table(xsdt_phys, is_xsdt, 0x46, 0x41, 0x43, 0x50);
+    if (fadt_virt != 0) { parse_fadt(fadt_virt); }
 
     // MCFG signature "MCFG"
     let is i64 as mcfg = find_table(xsdt_phys, is_xsdt, 0x4D, 0x43, 0x46, 0x47);
@@ -422,7 +562,8 @@ fn parse() as i32 {
     if (hpet != 0) { parse_hpet(hpet); }
 
     log_summary();
-    return 0;
+    if (parse_status == STATUS_OK) { return 0; }
+    return cast(i32, 0 - 10);
 }
 
 fn log_summary() as void {
@@ -479,14 +620,20 @@ fn ioapic_addr_for_gsi(gsi as i64) as i64 {
     return 0;
 }
 
-// ISA IRQ → GSI remap (identity when no override present).
+// ISA IRQ → GSI remap via direct indexed table. O(1), zero branching
+// past the bounds check. Identity for IRQs not covered by any MADT
+// ISO entry (table initialised that way in parse()).
 fn remap_isa_irq(isa_irq as i64) as i64 {
-    let is i64 as i with mut = 0;
-    while (i < iso_count) {
-        if (isos[i].isa_irq == isa_irq) { return isos[i].gsi; }
-        i = i + 1;
-    }
-    return isa_irq;
+    if (isa_irq < 0 || isa_irq >= 16) { return isa_irq; }
+    return isa_direct[isa_irq].gsi;
+}
+
+// ISO polarity/trigger flags for an ISA IRQ, same O(1) lookup shape.
+// Returns 0 (= "conforms to bus", meaning edge + active-high for ISA)
+// when no override exists.
+fn isa_flags(isa_irq as i64) as i64 {
+    if (isa_irq < 0 || isa_irq >= 16) { return 0; }
+    return isa_direct[isa_irq].flags;
 }
 
 fn first_ioapic_addr() as i64 {
