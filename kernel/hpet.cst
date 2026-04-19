@@ -1,0 +1,210 @@
+// hpet.cst — High Precision Event Timer, memory-mapped.
+//
+// HPET gives us a free-running 64-bit monotonic counter at the
+// platform clock period (~10 MHz typical, 100 ns per tick; QEMU
+// defaults to the same). Better than RDTSC for early boot because it
+// doesn't need to worry about CPU frequency changes or power states,
+// and better than PIT because we get ns-level resolution + no IRQ
+// overhead on reads.
+//
+// We don't use the per-timer comparators today — the scheduler's
+// preemption tick runs off the LAPIC timer. HPET here is purely the
+// monotonic clock source + a busy-wait primitive that LAPIC
+// calibration leans on.
+//
+// Spec reference: IA-PC HPET Specification, Rev 1.0a (Intel, 2004).
+
+use "acpi.cst"   as acpi;
+use "vmm.cst"    as vmm;
+use "serial.cst" as serial;
+use "util.cst"   as util;
+
+// ============================================================
+// Register offsets
+// ============================================================
+
+let is i64 as HPET_GCAP_ID         = 0x00;  // General Capabilities + ID (64-bit)
+let is i64 as HPET_GEN_CONF        = 0x10;  // General Configuration (64-bit)
+let is i64 as HPET_GEN_ISR         = 0x20;  // General Interrupt Status
+let is i64 as HPET_MAIN_COUNTER    = 0xF0;  // 64-bit main counter
+
+// General Configuration bits
+let is i64 as GEN_CONF_ENABLE      = 1;
+let is i64 as GEN_CONF_LEG_REPL    = 2;
+
+// ============================================================
+// State — populated by init(). 0 in everything means HPET isn't
+// available; callers (timer.cst, lapic.cst) check hpet_available().
+// ============================================================
+
+let is i64 as mmio_base     with mut = 0;
+let is i64 as period_fs     with mut = 0;   // femtoseconds per tick
+let is i64 as num_timers    with mut = 0;
+let is i32 as counter_is_64 with mut = 0;
+let is i32 as ready         with mut = 0;
+
+// ============================================================
+// MMIO helpers — HPET registers are 64-bit; we split to two 32-bit
+// accesses because some chipsets don't honour 64-bit reads/writes
+// atomically. For the main counter we read high/low/high and retry
+// if high changed (standard double-read reconstruction).
+// ============================================================
+
+fn reg_read32(off as i64) as i64 {
+    let is *u32 as p = cast(*u32, mmio_base + off);
+    return cast(i64, *p) & 0xFFFFFFFF;
+}
+
+fn reg_write32(off as i64, val as i64) as void {
+    let is *u32 as p = cast(*u32, mmio_base + off);
+    *p = cast(u32, val & 0xFFFFFFFF);
+}
+
+fn reg_read64(off as i64) as i64 {
+    let is i64 as lo = reg_read32(off);
+    let is i64 as hi = reg_read32(off + 4);
+    return lo | (hi << 32);
+}
+
+fn reg_write64(off as i64, val as i64) as void {
+    reg_write32(off, val & 0xFFFFFFFF);
+    reg_write32(off + 4, (val >> 32) & 0xFFFFFFFF);
+}
+
+// ============================================================
+// Read the main counter safely. For 64-bit counters we just do the
+// usual split-read reconstruction. For 32-bit counters we return the
+// low half and the upper half stays zero (wraps every ~7 minutes at
+// 10 MHz — real hardware is always 64-bit; the 32-bit path exists
+// because the HPET spec allows it).
+// ============================================================
+
+fn read_counter() as i64 {
+    if (ready == 0) { return 0; }
+    if (counter_is_64 == 0) {
+        return reg_read32(HPET_MAIN_COUNTER);
+    }
+    // 64-bit safe read: low + high + low again; if low wrapped we
+    // retry.
+    let is i64 as hi1 with mut = reg_read32(HPET_MAIN_COUNTER + 4);
+    let is i64 as lo  with mut = reg_read32(HPET_MAIN_COUNTER);
+    let is i64 as hi2 with mut = reg_read32(HPET_MAIN_COUNTER + 4);
+    if (hi1 != hi2) {
+        // Wrap happened between reads; `lo` is now in the new hi
+        // epoch. Retry with the new hi.
+        lo = reg_read32(HPET_MAIN_COUNTER);
+    }
+    return lo | (hi2 << 32);
+}
+
+// ============================================================
+// Unit conversions. period_fs is femtoseconds (10^-15 s) per tick.
+//   ns = ticks * period_fs / 1_000_000
+//   ticks = ns * 1_000_000 / period_fs
+// Integer math; for period_fs = 100_000_000 (100 ns) the ratios
+// reduce to ticks*100 and ns/100, never overflows inside i64 at
+// realistic durations.
+// ============================================================
+
+fn ticks_to_ns(ticks as i64) as i64 {
+    if (period_fs == 0) { return 0; }
+    return ticks * period_fs / 1000000;
+}
+
+fn ns_to_ticks(ns as i64) as i64 {
+    if (period_fs == 0) { return 0; }
+    return ns * 1000000 / period_fs;
+}
+
+// Monotonic nanosecond clock built on the counter. Wraps never if
+// the counter is 64-bit, which is what every real board implements.
+fn current_ns() as i64 {
+    return ticks_to_ns(read_counter());
+}
+
+// Busy-wait `ns` nanoseconds. Used during LAPIC calibration where we
+// can't rely on any IRQ path yet.
+fn busy_wait_ns(ns as i64) as void {
+    if (ready == 0 || ns <= 0) { return; }
+    let is i64 as target_ticks = ns_to_ticks(ns);
+    let is i64 as start = read_counter();
+    while ((read_counter() - start) < target_ticks) {
+        asm(".byte 0xF3, 0x90\n");   // pause
+    }
+}
+
+fn available() as i32 {
+    if (ready == 1) { return 1; }
+    return 0;
+}
+
+fn get_period_fs() as i64 { return period_fs; }
+
+// ============================================================
+// init() — call after acpi.parse() populates acpi.hpet_phys.
+// Returns 0 on success, negative on failure. Side effect: mmio_base
+// + counter enable so current_ns() starts returning valid times.
+// ============================================================
+
+fn init() as i32 {
+    let is i64 as phys = acpi.get_hpet_phys();
+    if (phys == 0) {
+        serial.println("hpet: not advertised by ACPI", 28);
+        return cast(i32, 0 - 1);
+    }
+    let is i64 as base = vmm.mmio_map(phys, 4096);
+    if (base == 0) {
+        serial.println("hpet: mmio_map failed", 21);
+        return cast(i32, 0 - 2);
+    }
+    mmio_base = base;
+
+    // Pull capabilities. Low 32 bits of GCAP_ID hold rev/timers/flags,
+    // upper 32 bits hold the counter period in femtoseconds.
+    let is i64 as cap_lo = reg_read32(HPET_GCAP_ID);
+    let is i64 as cap_hi = reg_read32(HPET_GCAP_ID + 4);
+
+    num_timers    = ((cap_lo >> 8) & 0x1F) + 1;
+    if (((cap_lo >> 13) & 1) == 1) { counter_is_64 = 1; }
+    period_fs     = cap_hi;
+
+    if (period_fs == 0 || period_fs > 0x05F5E100) {
+        // Spec: period must be non-zero and ≤ 100 ns (10^8 fs).
+        serial.print("hpet: invalid period ", 22); util.print_num(period_fs);
+        serial.println("", 0);
+        mmio_base = 0;
+        return cast(i32, 0 - 3);
+    }
+
+    // Zero the main counter, disable legacy replacement (we want the
+    // IOAPIC paths we already own), then enable the counter.
+    reg_write64(HPET_GEN_CONF, 0);
+    reg_write64(HPET_MAIN_COUNTER, 0);
+    reg_write64(HPET_GEN_CONF, GEN_CONF_ENABLE);
+
+    ready = 1;
+
+    serial.print("hpet: base=", 11); util.print_hex(phys);
+    serial.print(" period=", 8);     util.print_num(period_fs);
+    serial.print("fs timers=", 10);  util.print_num(num_timers);
+    if (counter_is_64 == 1) { serial.print(" 64-bit", 7); }
+    else                     { serial.print(" 32-bit", 7); }
+    serial.println("", 0);
+
+    // Verify the counter actually advances — some firmware ships
+    // HPET disabled in hardware despite claiming it in ACPI. A zero-
+    // delta over a small burst is our early warning.
+    let is i64 as t0 = read_counter();
+    let is i64 as spin with mut = 0;
+    while (spin < 1000) { asm(".byte 0xF3, 0x90\n"); spin = spin + 1; }
+    let is i64 as t1 = read_counter();
+    if (t1 == t0) {
+        serial.println("hpet: counter not advancing — disabling", 40);
+        ready = 0;
+        reg_write64(HPET_GEN_CONF, 0);
+        mmio_base = 0;
+        return cast(i32, 0 - 4);
+    }
+
+    return 0;
+}
