@@ -212,13 +212,26 @@ fn thread_ptr(tid as i64) as i64 {
     return 0;  // not found
 }
 
+// thr_get/thr_set go through thread_ptr which returns 0 when the
+// tid isn't (yet) in the hash table. Without the null-guard the
+// dereference turns `0 + off` into a low-address read/write and page-
+// faults. The usual trigger was a LAPIC timer IRQ landing inside
+// create_thread / sched.init between `next_tid = next_tid + 1` and
+// the matching `tid_set_ptr`: scanners like dl_check_replenish and
+// program_next_tick iterate `tid < next_tid` and hit the half-
+// published slot. Returning 0 / no-op is the correct fallback — the
+// slot is transiently invalid, not corrupt.
 fn thr_get(tid as i64, off as i64) as i64 {
-    let is *i64 as p = cast(*i64, thread_ptr(tid) + off);
+    let is i64 as base = thread_ptr(tid);
+    if (base == 0) { return 0; }
+    let is *i64 as p = cast(*i64, base + off);
     return p[0];
 }
 
 fn thr_set(tid as i64, off as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, thread_ptr(tid) + off);
+    let is i64 as base = thread_ptr(tid);
+    if (base == 0) { return; }
+    let is *i64 as p = cast(*i64, base + off);
     p[0] = v;
 }
 
@@ -706,8 +719,12 @@ fn handle_nm_fault() as void {
 
 fn create_thread(entry as i64, band as i64) as i64 {
 
+    // Reserve the tid but do NOT publish it via next_tid yet — any
+    // IRQ that scans `tid < next_tid` (dl_check_replenish,
+    // program_next_tick) would otherwise see a half-built slot.
+    // Order: allocate thread struct → insert into hash → bump
+    // next_tid as the final release-store.
     let is i64 as tid = next_tid;
-    next_tid = next_tid + 1;
 
     // Allocate thread struct via kcache (dynamic)
     let is i64 as tptr with mut = 0;
@@ -718,6 +735,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     }
     if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
     tid_set_ptr(tid, tptr);
+    next_tid = tid + 1;   // publish last, after the hash is populated
 
     let is *u8 as tp = cast(*u8, tptr);
     let is i64 as z with mut = 0;
@@ -1137,12 +1155,14 @@ fn init() as void {
     bb_set(4, 0, 100); bb_set(4, 1, QOS_WINDOW_NS); bb_set(4, 2, 0); bb_set(4, 3, 0);
     bb_set(5, 0, 100); bb_set(5, 1, QOS_WINDOW_NS); bb_set(5, 2, 0); bb_set(5, 3, 0);
 
-    // Create idle thread (allocated dynamically)
+    // Create idle thread. Same ordering rule as create_thread:
+    // populate hash first, bump next_tid last so any scanner racing
+    // on `tid < next_tid` sees either no slot or a complete one.
     let is i64 as itid = next_tid;
-    next_tid = next_tid + 1;
     let is i64 as iptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
     if (iptr == 0) { pmm.panic("idle alloc fail", 15); }
     tid_set_ptr(itid, iptr);
+    next_tid = itid + 1;
 
     let is *u8 as tp = cast(*u8, iptr);
     let is i64 as izi with mut = 0;
