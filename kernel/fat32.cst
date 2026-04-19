@@ -437,6 +437,117 @@ fn name_matches(buf as *u8, base as i64, target as *u8) as i32 {
     return 1;
 }
 
+// Case-insensitive ASCII compare between lfn_buf[0..lfn_len] and
+// query name[0..name_len]. Returns 1 on match, 0 otherwise. Any char
+// above 0x7F on either side is a mismatch (Phase 4 ASCII-only).
+fn lfn_matches(name as *u8, name_len as i64) as i32 {
+    if (lfn_len != name_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < name_len) {
+        let is i64 as a = cast(i64, lfn_buf[i]);
+        let is i64 as b = cast(i64, name[i]);
+        if (a > 127 || b > 127) { return 0; }
+        if (upper_ascii(a) != upper_ascii(b)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Extract 13 UCS-2 code units from an LFN entry at buf[pos], writing
+// low bytes into lfn_buf[dest..dest+13]. High byte > 0 is stored as
+// that byte directly — lfn_matches rejects >127 as a compare-miss.
+// Returns the index (0..13) of the first 0x0000 terminator found in
+// this entry, or 13 if no terminator here.
+fn lfn_copy_chars(buf as *u8, pos as i64, dest as i64) as i64 {
+    // Byte layout of a 13-char LFN segment within the 32-byte entry:
+    //   bytes  1..10   (5 UCS-2 chars, little-endian) -> name[0..4]
+    //   bytes 14..25   (6 UCS-2 chars)                -> name[5..10]
+    //   bytes 28..31   (2 UCS-2 chars)                -> name[11..12]
+    let is [13]i64 as offs;
+    offs[0]  = 1;  offs[1]  = 3;  offs[2]  = 5;  offs[3]  = 7;  offs[4]  = 9;
+    offs[5]  = 14; offs[6]  = 16; offs[7]  = 18; offs[8]  = 20; offs[9]  = 22; offs[10] = 24;
+    offs[11] = 28; offs[12] = 30;
+
+    let is i64 as term with mut = 13;
+    let is i64 as i with mut = 0;
+    while (i < 13) {
+        let is i64 as lo = cast(i64, buf[pos + offs[i]]);
+        let is i64 as hi = cast(i64, buf[pos + offs[i] + 1]);
+        let is i64 as slot = dest + i;
+        if (slot < 0 || slot >= 256) { return term; }
+        if (lo == 0 && hi == 0) {
+            if (term == 13) { term = i; }
+            lfn_buf[slot] = cast(u8, 0);
+        } else if (hi == 0) {
+            lfn_buf[slot] = cast(u8, lo);
+        } else {
+            // Non-ASCII: store sentinel 0x7F+1 so lfn_matches rejects
+            // even if the target happens to have the same low byte.
+            lfn_buf[slot] = cast(u8, 0xFF);
+        }
+        i = i + 1;
+    }
+    return term;
+}
+
+// Process an LFN entry encountered at buf[pos] during directory scan.
+// Maintains the accumulator buffer and tracks sequence ordering. Sets
+// lfn_len on the final (seq=1) entry; resets expected_seq to 0 on any
+// out-of-order or stale entry.
+fn lfn_ingest(buf as *u8, pos as i64) as void {
+    let is i64 as order = cast(i64, buf[pos]) & 0xFF;
+    let is i64 as seq = order & 0x3F;
+    if (seq < 1 || seq > 20) {
+        lfn_expected_seq = 0;
+        lfn_len = 0;
+        return;
+    }
+    if ((order & 0x40) != 0) {
+        // First physical = last logical: starts a fresh assembly.
+        lfn_expected_seq = seq;
+        lfn_total_entries = seq;
+        lfn_len = 0;
+        // Zero out the buffer up to the max this LFN can reach so
+        // stale bytes from a prior entry can't leak into a shorter
+        // one that misses its terminator.
+        let is i64 as j with mut = 0;
+        while (j < seq * 13) {
+            lfn_buf[j] = cast(u8, 0);
+            j = j + 1;
+        }
+    } else {
+        if (seq + 1 != lfn_expected_seq) {
+            // Out of order; discard.
+            lfn_expected_seq = 0;
+            lfn_len = 0;
+            return;
+        }
+        lfn_expected_seq = seq;
+    }
+    let is i64 as dest = (seq - 1) * 13;
+    let is i64 as term_idx = lfn_copy_chars(buf, pos, dest);
+    if (seq == 1) {
+        // Last to arrive physically is the first logical segment;
+        // compute actual LFN length from the terminator or segment
+        // boundary. Use lfn_total_entries (captured from the 0x40
+        // marker) rather than the now-decremented expected_seq.
+        let is i64 as max_end = lfn_total_entries * 13;
+        let is i64 as scan with mut = 0;
+        let is i64 as found_term with mut = 0;
+        while (scan < max_end) {
+            if (lfn_buf[scan] == cast(u8, 0)) {
+                lfn_len = scan;
+                found_term = 1;
+                scan = max_end;
+            } else {
+                scan = scan + 1;
+            }
+        }
+        if (found_term == 0) { lfn_len = max_end; }
+        lfn_expected_seq = 0;
+    }
+}
+
 // ============================================================
 // Directory entry lookup — walk the cluster chain of `start_cluster`
 // (typically root_cluster) scanning 32-byte records. On match, writes
@@ -458,6 +569,16 @@ let is i32 as ATTR_VOLUME_ID = 0x08;
 // stable. dir_find is single-threaded today so no locking needed.
 let is [11]u8 as target_name with mut;
 
+// Long-file-name assembly scratch. FAT32 LFN encodes up to 20
+// 13-char UCS-2 segments per entry chain; we accept ASCII-compatible
+// names up to 255 bytes (chars above 0x7F are rejected as mismatch).
+// lfn_len is the last assembled length (0 when no LFN precedes the
+// 8.3 slot). Reset on dir_find entry and between entries.
+let is [260]u8 as lfn_buf with mut;
+let is i64 as lfn_len with mut = 0;
+let is i64 as lfn_expected_seq with mut = 0;   // 0 if no LFN in progress
+let is i64 as lfn_total_entries with mut = 0;  // N from the last-physical marker
+
 fn dir_find(v as *Fat32Volume,
             start_cluster as i64,
             name as *u8,
@@ -466,6 +587,13 @@ fn dir_find(v as *Fat32Volume,
             out_size as *i64,
             out_attr as *i32) as i32 {
     if (cast(i64, v) == 0) { return cast(i32, 0 - 2); }
+    // Reset LFN accumulator state. LFN is consumed per 8.3 entry, but
+    // any orphan stays in the buffer between dir_find calls otherwise.
+    lfn_len = 0;
+    lfn_expected_seq = 0;
+    // Pre-format the 8.3 target once: fast path for names that already
+    // fit 8.3 (no LFN preamble). Failure is not fatal — names like
+    // "long-name.txt" only match via LFN.
     let is i32 as fr = format_8_3(name, name_len, cast(*u8, &target_name[0]));
 
     let is *u8 as buf = cast(*u8, clus_scratch_virt);
@@ -488,8 +616,25 @@ fn dir_find(v as *Fat32Volume,
                 return cast(i32, 0 - 1);   // end of directory
             }
             let is i32 as attr = cast(i32, buf[i + 11]) & 0xFF;
-            if (marker != cast(u8, 0xE5) && attr != ATTR_LFN) {
-                if (name_matches(buf, i, cast(*u8, &target_name[0])) == 1) {
+            if (marker == cast(u8, 0xE5)) {
+                // Deleted slot — invalidate any LFN run in progress.
+                lfn_len = 0;
+                lfn_expected_seq = 0;
+            } else if (attr == ATTR_LFN) {
+                lfn_ingest(buf, i);
+            } else {
+                // Real 8.3 slot. Try LFN match first (case-insensitive),
+                // then fall back to canonical 8.3.
+                let is i32 as hit with mut = 0;
+                if (lfn_len > 0 && lfn_matches(name, name_len) == 1) {
+                    hit = 1;
+                }
+                if (hit == 0) {
+                    if (name_matches(buf, i, cast(*u8, &target_name[0])) == 1) {
+                        hit = 1;
+                    }
+                }
+                if (hit == 1) {
                     let is i64 as lo = read_u16(buf, i + 26);
                     let is i64 as hi = read_u16(buf, i + 20);
                     *out_cluster = lo | (hi << 16);
@@ -497,6 +642,9 @@ fn dir_find(v as *Fat32Volume,
                     *out_attr    = attr;
                     return 0;
                 }
+                // Consumed the preceding LFN run regardless of match.
+                lfn_len = 0;
+                lfn_expected_seq = 0;
             }
             i = i + 32;
         }
@@ -508,6 +656,74 @@ fn dir_find(v as *Fat32Volume,
         cluster = nxt;
     }
     return cast(i32, 0 - 1);
+}
+
+// ============================================================
+// Path resolution — walk a '/'-separated absolute path from the root
+// cluster, resolving each component via dir_find. Components other
+// than the last must resolve to directories (ATTR_DIRECTORY bit).
+// Returns 0 on success with out_cluster/out_size/out_attr populated;
+// negative rc on not-found / not-a-directory / I/O.
+// ============================================================
+
+fn path_lookup(v as *Fat32Volume,
+               path as *u8,
+               path_len as i64,
+               out_cluster as *i64,
+               out_size as *i64,
+               out_attr as *i32) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 2); }
+    if (path_len <= 0) { return cast(i32, 0 - 1); }
+
+    // Accept both "/foo/bar" and "foo/bar". Skip leading slashes.
+    let is i64 as p with mut = 0;
+    while (p < path_len && path[p] == cast(u8, 47)) { p = p + 1; }   // '/'
+
+    // Empty path after stripping = the root itself.
+    if (p == path_len) {
+        *out_cluster = v.root_cluster;
+        *out_size    = 0;
+        *out_attr    = ATTR_DIRECTORY;
+        return 0;
+    }
+
+    let is i64 as cur_cluster with mut = v.root_cluster;
+    let is i64 as cur_size    with mut = 0;
+    let is i32 as cur_attr    with mut = ATTR_DIRECTORY;
+
+    while (p < path_len) {
+        // Find next component end.
+        let is i64 as start = p;
+        while (p < path_len && path[p] != cast(u8, 47)) { p = p + 1; }
+        let is i64 as comp_len = p - start;
+        if (comp_len == 0) { return cast(i32, 0 - 1); }   // "//" illegal
+
+        // The component we're resolving must live in a directory.
+        if ((cast(i32, cur_attr) & ATTR_DIRECTORY) == 0) {
+            return cast(i32, 0 - 4);   // mid-path non-dir
+        }
+
+        let is i64 as found_c with mut = 0;
+        let is i64 as found_s with mut = 0;
+        let is i32 as found_a with mut = 0;
+        let is *u8 as comp_ptr = cast(*u8, cast(i64, path) + start);
+        let is i32 as rc = dir_find(v, cur_cluster, comp_ptr, comp_len,
+                                    &found_c, &found_s, &found_a);
+        if (rc != 0) { return rc; }
+
+        cur_cluster = found_c;
+        cur_size    = found_s;
+        cur_attr    = found_a;
+
+        // Skip trailing slashes so "/docs/" resolves the same as
+        // "/docs".
+        while (p < path_len && path[p] == cast(u8, 47)) { p = p + 1; }
+    }
+
+    *out_cluster = cur_cluster;
+    *out_size    = cur_size;
+    *out_attr    = cur_attr;
+    return 0;
 }
 
 // ============================================================
@@ -695,5 +911,47 @@ fn self_test_read(v as *Fat32Volume) as void {
         serial.print("fat32.test: bigfile mismatch=", 29);
         util.print_num(mis);
         serial.println("", 0);
+    }
+
+    // Long-file-name lookup: "long-name-with-spaces and mixed case.txt"
+    // stores 4 LFN entries + a mangled 8.3 short name. Query must
+    // match via LFN, case-insensitive.
+    let is i32 as r3 = path_lookup(v,
+        cast(*u8, "/long-name-with-spaces and mixed case.txt"), 41,
+        &clus, &size, &attr);
+    if (r3 != 0) {
+        serial.print("fat32.test: LFN lookup FAIL rc=", 31);
+        util.print_num(cast(i64, r3));
+        serial.println("", 0);
+    } else {
+        let is i64 as lfn_virt = alloc_dma_page();
+        let is *u8 as lb = cast(*u8, lfn_virt);
+        let is i64 as ln = file_read(v, clus, size, lb, 4096);
+        lb[size] = cast(u8, 0);
+        serial.print("fat32.test: LFN='", 17);
+        let is i64 as kk with mut = 0;
+        while (kk < ln) { serial.putc(cast(i64, lb[kk])); kk = kk + 1; }
+        serial.println("'", 1);
+    }
+
+    // Subdirectory traversal: /docs/readme.md was placed inside the
+    // docs/ subdir (created via mkdir). Tests both path parsing and
+    // walking into a non-root cluster.
+    let is i32 as r4 = path_lookup(v,
+        cast(*u8, "/docs/readme.md"), 15,
+        &clus, &size, &attr);
+    if (r4 != 0) {
+        serial.print("fat32.test: subdir lookup FAIL rc=", 34);
+        util.print_num(cast(i64, r4));
+        serial.println("", 0);
+    } else {
+        let is i64 as sub_virt = alloc_dma_page();
+        let is *u8 as sb = cast(*u8, sub_virt);
+        let is i64 as sn = file_read(v, clus, size, sb, 4096);
+        sb[size] = cast(u8, 0);
+        serial.print("fat32.test: /docs/readme.md='", 29);
+        let is i64 as mm with mut = 0;
+        while (mm < sn) { serial.putc(cast(i64, sb[mm])); mm = mm + 1; }
+        serial.println("'", 1);
     }
 }
