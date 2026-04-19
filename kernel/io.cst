@@ -214,6 +214,34 @@ fn harvest_all(p as *BlockIOProvider) as i64 {
 // Sync wrappers
 // ============================================================
 
+// Race-free wait for r.state == REQ_COMPLETE.
+//
+// Naive pattern:
+//     while (r.state != COMPLETE) { sched.sleep_thread(current) }
+// has a lost-wakeup window: between the state check (RUNNING) and
+// the sleep_thread call, an IRQ handler can set state=COMPLETE and
+// call wakeup_thread. wakeup_thread silently returns because the
+// thread isn't SLEEPING yet; the subsequent sleep_thread then
+// blocks permanently.
+//
+// Fix: mask IRQs with cli around the check. If state is already
+// COMPLETE, re-enable and break. Otherwise call sleep_thread while
+// IRQs are still masked — the thread transitions to SLEEPING and
+// schedule() swaps context. The incoming thread's iretq restores
+// EFLAGS with IF=1, so the completing IRQ runs after we're already
+// SLEEPING and its wakeup lands correctly.
+fn wait_complete(r as *BlockRequest) as void {
+    while (r.state != REQ_COMPLETE) {
+        asm("cli\n");
+        if (r.state == REQ_COMPLETE) {
+            asm("sti\n");
+            return;
+        }
+        sched.sleep_thread(sched.current_tid());
+        // Resumed with IRQs enabled; loop re-checks state.
+    }
+}
+
 // Blocking read. Creates a request, submits, and sleeps the caller
 // until the driver completes it. Returns the status from the driver
 // (0 = OK). buf must have room for count * sector_size bytes; sector
@@ -230,11 +258,7 @@ fn read_sync(dev as *driver.Hardware, port as i64, lba as i64,
     let is i32 as rc = submit(p, r);
     if (rc != 0) { free_request(r); return rc; }
 
-    // Block until harvest_one sets state=COMPLETE and wakes us.
-    while (r.state != REQ_COMPLETE) {
-        sched.sleep_thread(sched.current_tid());
-    }
-
+    wait_complete(r);
     let is i32 as status = r.status;
     free_request(r);
     return status;
@@ -252,10 +276,7 @@ fn write_sync(dev as *driver.Hardware, port as i64, lba as i64,
     let is i32 as rc = submit(p, r);
     if (rc != 0) { free_request(r); return rc; }
 
-    while (r.state != REQ_COMPLETE) {
-        sched.sleep_thread(sched.current_tid());
-    }
-
+    wait_complete(r);
     let is i32 as status = r.status;
     free_request(r);
     return status;
@@ -272,10 +293,7 @@ fn flush_sync(dev as *driver.Hardware, port as i64) as i32 {
     let is i32 as rc = submit(p, r);
     if (rc != 0) { free_request(r); return rc; }
 
-    while (r.state != REQ_COMPLETE) {
-        sched.sleep_thread(sched.current_tid());
-    }
-
+    wait_complete(r);
     let is i32 as status = r.status;
     free_request(r);
     return status;
