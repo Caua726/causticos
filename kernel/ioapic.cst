@@ -1,13 +1,19 @@
-// ioapic.cst — minimal IOAPIC support for routing hardware IRQs to
-// driver-framework vectors. Hardcodes the IOAPIC at 0xFEC00000 (legacy);
-// ACPI MADT-driven discovery lands when ACPI parsing arrives.
+// ioapic.cst — IOAPIC discovery + redirection management.
+//
+// Pulls the IOAPIC physical address from ACPI MADT (acpi.cst) instead
+// of the legacy 0xFEC00000 hardcode so boards that remap the IOAPIC
+// (multi-socket, QEMU -smp > some layouts, hardware with non-default
+// chipsets) are handled correctly. Falls back to the legacy address
+// if ACPI didn't find any IOAPIC entry — that's the 1-IOAPIC, 1-CPU
+// PC-AT defaults worst case, good enough for bring-up.
 
 use "vmm.cst" as vmm;
 use "serial.cst" as serial;
 use "sched.cst" as sched;
 use "util.cst" as util;
+use "acpi.cst" as acpi;
 
-let is i64 as IOAPIC_PHYS = 0xFEC00000;
+let is i64 as IOAPIC_FALLBACK_PHYS = 0xFEC00000;
 
 let is i64 as ioapic_base  with mut = 0;
 let is i64 as redir_count  with mut = 0;
@@ -33,18 +39,34 @@ fn write_reg(reg as i64, val as i64) as void {
 }
 
 fn init() as void {
-    ioapic_base = vmm.mmio_map(IOAPIC_PHYS, 4096);
+    // Discovery: prefer the MADT-derived address. acpi.parse() runs
+    // before ioapic.init() in main.cst's boot sequence.
+    let is i64 as phys with mut = acpi.first_ioapic_addr();
+    if (phys == 0) {
+        serial.println("ioapic: no MADT entry, using legacy 0xFEC00000", 46);
+        phys = IOAPIC_FALLBACK_PHYS;
+    }
+
+    ioapic_base = vmm.mmio_map(phys, 4096);
     if (ioapic_base == 0) {
         serial.println("ioapic: mmio_map failed", 23);
         return;
     }
     let is i64 as ver = read_reg(0x01);
     redir_count = ((ver >> 16) & 0xFF) + 1;
-    serial.print("ioapic: version=", 16);
+    serial.print("ioapic: phys=", 13);
+    util.print_hex(phys);
+    serial.print(" version=", 9);
     util.print_hex(ver & 0xFF);
     serial.print(" entries=", 9);
     util.print_num(redir_count);
     serial.println("", 0);
+    // Publish the GSI end for the first IOAPIC so acpi queries can
+    // route by range. Only IOAPIC 0 is active today; multi-IOAPIC
+    // systems are rare on x86 and we extend when we meet one.
+    if (acpi.ioapic_count > 0) {
+        acpi.ioapics[0].gsi_end = acpi.ioapics[0].gsi_base + redir_count;
+    }
 
     // Pre-reserve vectors that already have dedicated handlers. idt.cst
     // installs stubs for exceptions (0-31), PIC IRQs (32-47), driver IRQ
@@ -57,18 +79,62 @@ fn init() as void {
     bitmap_set(64);                                      // LAPIC timer
 }
 
-// Program redirection entry for hardware `irq` to deliver `vector` on the
-// CPU with LAPIC ID `dest`. Fixed delivery, physical dest, edge-triggered,
-// active-high, unmasked.
+// Program redirection entry for `irq` — interpreted as a legacy ISA
+// line number. We apply any ACPI Interrupt Source Override to translate
+// it to the real GSI, then combine the ISO polarity/trigger flags with
+// fixed delivery mode + physical destination.
+//
+// ISO flags (MADT spec §5.2.12):
+//   bits 0-1: polarity   — 00 = conforms-to-bus, 01 = active-high,
+//                           11 = active-low
+//   bits 2-3: trigger    — 00 = conforms-to-bus, 01 = edge,
+//                           11 = level
+// IOAPIC redirection entry:
+//   bit 13: polarity (0 = high, 1 = low)
+//   bit 15: trigger  (0 = edge, 1 = level)
+// "Conforms" for ISA defaults to edge + active-high, which is what we
+// emit when no ISO is present (the legacy PC-AT wiring).
 fn set_redirection(irq as i64, vector as i64, dest as i64) as void {
-    let is i64 as lo_reg = 0x10 + irq * 2;
+    let is i64 as gsi = acpi.remap_isa_irq(irq);
+    let is i64 as flags = iso_flags_for(irq);
+
+    let is i64 as entry_idx with mut = gsi;
+    if (acpi.ioapic_count > 0) {
+        // Subtract gsi_base so the IOAPIC register index is relative
+        // to that IOAPIC's range. Single-IOAPIC systems have base=0.
+        entry_idx = gsi - acpi.ioapics[0].gsi_base;
+    }
+    if (entry_idx < 0 || entry_idx >= redir_count) { return; }
+
+    let is i64 as polarity = (flags >> 0) & 0x3;
+    let is i64 as trigger  = (flags >> 2) & 0x3;
+    let is i64 as lo_extra with mut = 0;
+    if (polarity == 3) { lo_extra = lo_extra | (cast(i64, 1) << 13); }
+    if (trigger  == 3) { lo_extra = lo_extra | (cast(i64, 1) << 15); }
+
+    let is i64 as lo_reg = 0x10 + entry_idx * 2;
     let is i64 as hi_reg = lo_reg + 1;
     write_reg(hi_reg, (dest & 0xFF) << 24);
-    write_reg(lo_reg, vector & 0xFF);
+    write_reg(lo_reg, (vector & 0xFF) | lo_extra);
+}
+
+fn iso_flags_for(isa_irq as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < acpi.iso_count) {
+        if (acpi.isos[i].isa_irq == isa_irq) { return acpi.isos[i].flags; }
+        i = i + 1;
+    }
+    return 0;   // "conforms" = edge + active-high for ISA
 }
 
 fn mask(irq as i64) as void {
-    let is i64 as lo_reg = 0x10 + irq * 2;
+    let is i64 as gsi = acpi.remap_isa_irq(irq);
+    let is i64 as entry_idx with mut = gsi;
+    if (acpi.ioapic_count > 0) {
+        entry_idx = gsi - acpi.ioapics[0].gsi_base;
+    }
+    if (entry_idx < 0 || entry_idx >= redir_count) { return; }
+    let is i64 as lo_reg = 0x10 + entry_idx * 2;
     let is i64 as lo = read_reg(lo_reg);
     write_reg(lo_reg, lo | 0x10000);
 }

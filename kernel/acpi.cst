@@ -1,0 +1,503 @@
+// acpi.cst — ACPI table discovery and parsing.
+//
+// Walks the RSDP → XSDT chain and extracts the subset we actually use:
+//   - MADT  → CPU list, IOAPIC list, ISA IRQ source overrides
+//   - MCFG  → PCIe memory-mapped config space regions (ECAM)
+//   - HPET  → high-precision timer base address + tick period
+//
+// Everything lives in statically-sized tables so no heap is touched.
+// Deliberately skips FADT/DSDT/SSDT — parsing AML is a full interpreter
+// and we don't need power management yet. Fixed tables give us
+// discoverable hardware (IOAPIC address, PCIe bus ranges, CPU count,
+// precise timer), which unblocks SMP and modern driver work.
+//
+// Reference: ACPI Specification 6.5, Chapter 5 (Tables) and Chapter 5.2
+// (System Description Tables). Field offsets are hand-decoded against
+// the spec — no AML parsing path.
+
+use "limine.cst" as limine;
+use "serial.cst" as serial;
+use "util.cst"   as util;
+use "pmm.cst"    as pmm;
+use "vmm.cst"    as vmm;
+
+// ============================================================
+// SDT common header — every ACPI table other than the RSDP starts
+// with this 36-byte structure. Fields read via u32/u8 helpers
+// because the on-disk layout is explicit little-endian and we can't
+// trust struct-level alignment on heterogeneous tables.
+// ============================================================
+
+let is i64 as SDT_SIGNATURE_OFF       = 0;   // 4 bytes ASCII
+let is i64 as SDT_LENGTH_OFF          = 4;   // u32 total length
+let is i64 as SDT_REVISION_OFF        = 8;
+let is i64 as SDT_CHECKSUM_OFF        = 9;
+let is i64 as SDT_OEM_ID_OFF          = 10;  // 6 bytes
+let is i64 as SDT_OEM_TABLE_ID_OFF    = 16;  // 8 bytes
+let is i64 as SDT_OEM_REVISION_OFF    = 24;  // u32
+let is i64 as SDT_CREATOR_ID_OFF      = 28;  // u32
+let is i64 as SDT_CREATOR_REVISION    = 32;  // u32
+let is i64 as SDT_HEADER_SIZE         = 36;
+
+// ============================================================
+// Results — populated by parse(), read by rest of kernel.
+// ============================================================
+
+let is i64 as MAX_CPUS    = 64;
+let is i64 as MAX_IOAPICS = 8;
+let is i64 as MAX_ISOS    = 32;
+let is i64 as MAX_MCFGS   = 8;
+
+// CPU list: one entry per enabled LAPIC in MADT. apic_ids[i] is the
+// local APIC ID that identifies that processor.
+let is [64]i64 as apic_ids with mut;
+let is i64 as cpu_count with mut = 0;
+
+// IOAPIC list: each entry carries its physical address, the GSI base,
+// and (filled by ioapic.init) the redirection-entry count.
+struct IoApic {
+    id as i64;
+    phys_addr as i64;
+    gsi_base as i64;
+    gsi_end as i64;       // set by ioapic.init after MMIO probe
+}
+let is [8]IoApic as ioapics with mut;
+let is i64 as ioapic_count with mut = 0;
+
+// ISA IRQ → GSI source overrides. Legacy ISA IRQs routed through the
+// PIC come in as sources (e.g. kbd = IRQ 1). Firmware may remap them
+// to different GSIs; this table carries those remaps plus polarity/
+// trigger-mode bits for IOAPIC programming.
+struct IsaOverride {
+    isa_irq as i64;
+    gsi as i64;
+    flags as i64;         // bits 0-1 polarity, bits 2-3 trigger
+}
+let is [32]IsaOverride as isos with mut;
+let is i64 as iso_count with mut = 0;
+
+// PCIe ECAM regions from MCFG. Each entry maps a [bus_start..bus_end]
+// range on a PCI segment to a physical base address. Config access is
+// base + (bus << 20) + (device << 15) + (function << 12) + offset.
+struct McfgRegion {
+    phys_base as i64;
+    segment as i64;
+    bus_start as i64;
+    bus_end as i64;
+}
+let is [8]McfgRegion as mcfgs with mut;
+let is i64 as mcfg_count with mut = 0;
+
+// HPET base address (phys). 0 means not present.
+let is i64 as hpet_phys with mut = 0;
+// Counter tick period in femtoseconds (10^-15 s) — pulled from HPET
+// capability register in hpet.init().
+let is i64 as hpet_period_fs with mut = 0;
+
+// Local APIC override address from MADT (usually 0xFEE00000 but can
+// be remapped by firmware). 0 = use default.
+let is i64 as lapic_override with mut = 0;
+
+// ============================================================
+// LE byte readers. Work on HHDM-mapped virtual addresses.
+// ============================================================
+
+fn read_u8(virt as i64, off as i64) as i64 {
+    let is *u8 as p = cast(*u8, virt + off);
+    return cast(i64, *p) & 0xFF;
+}
+
+fn read_u16(virt as i64, off as i64) as i64 {
+    return read_u8(virt, off) | (read_u8(virt, off + 1) << 8);
+}
+
+fn read_u32(virt as i64, off as i64) as i64 {
+    return read_u8(virt, off)
+         | (read_u8(virt, off + 1) << 8)
+         | (read_u8(virt, off + 2) << 16)
+         | (read_u8(virt, off + 3) << 24);
+}
+
+fn read_u64(virt as i64, off as i64) as i64 {
+    return read_u32(virt, off)
+         | (read_u32(virt, off + 4) << 32);
+}
+
+fn sig_matches(virt as i64, a as i64, b as i64, c as i64, d as i64) as i32 {
+    if (read_u8(virt, 0) != a) { return 0; }
+    if (read_u8(virt, 1) != b) { return 0; }
+    if (read_u8(virt, 2) != c) { return 0; }
+    if (read_u8(virt, 3) != d) { return 0; }
+    return 1;
+}
+
+// Sum every byte of `len` bytes starting at `virt`. A valid ACPI
+// table has this checksum equal to zero (mod 256).
+fn checksum_ok(virt as i64, len as i64) as i32 {
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        sum = (sum + read_u8(virt, i)) & 0xFF;
+        i = i + 1;
+    }
+    if (sum == 0) { return 1; }
+    return 0;
+}
+
+// ============================================================
+// Physical → virtual translation. ACPI addresses are physical. We
+// remap them through pmm.hhdm when they fall in installed RAM; for
+// firmware-reserved regions outside RAM we defer to vmm.mmio_map so
+// page tables cover those pages. Short-lived reads during parse()
+// stay resident because we never free the kernel page tables.
+// ============================================================
+
+// Map a physical range into kernel VA space for reading. ACPI tables
+// can live either in:
+//   (a) ACPI-reclaimable RAM covered by HHDM (common on UEFI)
+//   (b) Legacy BIOS ROM region 0xE0000-0xFFFFF — below our installed
+//       RAM ceiling but NOT reliably covered by our kernel page tables
+//       after vmm.init rebuilt them. HHDM arithmetic gives a VA that
+//       page-faults on access.
+// Taking the mmio_map route always is slower (one 4KB page per table)
+// but provably correct. Table reads happen once at boot; the latency
+// cost is measured in microseconds total.
+fn phys_to_virt_read(phys as i64, len as i64) as i64 {
+    if (phys == 0) { return 0; }
+    let is i64 as page_off = phys % 4096;
+    let is i64 as page_base = phys - page_off;
+    let is i64 as map_len with mut = page_off + len;
+    if (map_len % 4096 != 0) { map_len = (map_len + 4095) & (0 - 4096); }
+    let is i64 as virt = vmm.mmio_map(page_base, map_len);
+    if (virt == 0) { return 0; }
+    return virt + page_off;
+}
+
+// ============================================================
+// RSDP — two forms. v1 uses rsdt (32-bit) at offset 16; v2 uses
+// xsdt (64-bit) at offset 24. Signature is "RSD PTR " (8 chars).
+// v2 carries a second extended checksum covering the full 36-byte
+// structure.
+// ============================================================
+
+fn rsdp_valid(virt as i64) as i32 {
+    // "RSD PTR " = 0x52 0x53 0x44 0x20 0x50 0x54 0x52 0x20
+    if (read_u8(virt, 0) != 0x52) { return 0; }
+    if (read_u8(virt, 1) != 0x53) { return 0; }
+    if (read_u8(virt, 2) != 0x44) { return 0; }
+    if (read_u8(virt, 3) != 0x20) { return 0; }
+    if (read_u8(virt, 4) != 0x50) { return 0; }
+    if (read_u8(virt, 5) != 0x54) { return 0; }
+    if (read_u8(virt, 6) != 0x52) { return 0; }
+    if (read_u8(virt, 7) != 0x20) { return 0; }
+    // v1 checksum covers first 20 bytes; v2 extends to 36.
+    if (checksum_ok(virt, 20) == 0) { return 0; }
+    let is i64 as revision = read_u8(virt, 15);
+    if (revision >= 2) {
+        let is i64 as len = read_u32(virt, 20);
+        if (len < 36) { return 0; }
+        if (checksum_ok(virt, len) == 0) { return 0; }
+    }
+    return 1;
+}
+
+fn rsdp_xsdt_addr(virt as i64) as i64 {
+    let is i64 as revision = read_u8(virt, 15);
+    if (revision >= 2) { return read_u64(virt, 24); }
+    // Fall back to 32-bit RSDT pointer on ACPI 1.0 firmware.
+    return read_u32(virt, 16);
+}
+
+fn rsdp_is_xsdt(virt as i64) as i32 {
+    if (read_u8(virt, 15) >= 2) { return 1; }
+    return 0;
+}
+
+// ============================================================
+// XSDT walk — the XSDT body is SDT_HEADER_SIZE + N * 8 bytes, where
+// each 8-byte slot is a physical pointer to another SDT. RSDT is the
+// same layout but with 4-byte slots.
+// ============================================================
+
+fn find_table(xsdt_phys as i64, is_xsdt as i32,
+              s0 as i64, s1 as i64, s2 as i64, s3 as i64) as i64 {
+    if (xsdt_phys == 0) { return 0; }
+    let is i64 as xsdt_virt with mut = phys_to_virt_read(xsdt_phys, SDT_HEADER_SIZE);
+    if (xsdt_virt == 0) { return 0; }
+    let is i64 as total_len = read_u32(xsdt_virt, SDT_LENGTH_OFF);
+    // Re-map with full length now that we know it.
+    xsdt_virt = phys_to_virt_read(xsdt_phys, total_len);
+    if (xsdt_virt == 0) { return 0; }
+    if (checksum_ok(xsdt_virt, total_len) == 0) { return 0; }
+
+    let is i64 as entry_size with mut = 8;
+    if (is_xsdt == 0) { entry_size = 4; }
+    let is i64 as n = (total_len - SDT_HEADER_SIZE) / entry_size;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as entry_off = SDT_HEADER_SIZE + i * entry_size;
+        let is i64 as table_phys with mut = 0;
+        if (is_xsdt == 1) { table_phys = read_u64(xsdt_virt, entry_off); }
+        else              { table_phys = read_u32(xsdt_virt, entry_off); }
+        if (table_phys != 0) {
+            let is i64 as tv = phys_to_virt_read(table_phys, SDT_HEADER_SIZE);
+            if (tv != 0 && sig_matches(tv, s0, s1, s2, s3) == 1) {
+                let is i64 as tlen = read_u32(tv, SDT_LENGTH_OFF);
+                return phys_to_virt_read(table_phys, tlen);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// MADT — "APIC" signature. Body layout:
+//   [36..40] Local Controller Address (u32)
+//   [40..44] Flags (u32)
+//   [44..len] Interrupt Controller Structure list
+// Each entry: [0] type, [1] entry length, [2..] body.
+//   Type 0: LAPIC — uid, apic_id, flags
+//   Type 1: IOAPIC — id, reserved, address, gsi_base
+//   Type 2: ISO — bus, source (ISA IRQ), gsi (u32), flags (u16)
+//   Type 5: LAPIC Address Override — reserved (u16), addr (u64)
+//   Type 9: x2APIC — reserved (u16), apic_id (u32), flags (u32), uid (u32)
+// ============================================================
+
+fn parse_madt(virt as i64) as void {
+    let is i64 as total_len = read_u32(virt, SDT_LENGTH_OFF);
+    if (checksum_ok(virt, total_len) == 0) {
+        serial.println("acpi: MADT checksum fail", 24);
+        return;
+    }
+    lapic_override = read_u32(virt, SDT_HEADER_SIZE);  // default LAPIC addr
+
+    let is i64 as off with mut = SDT_HEADER_SIZE + 8;
+    while (off < total_len) {
+        let is i64 as etype = read_u8(virt, off);
+        let is i64 as elen  = read_u8(virt, off + 1);
+        if (elen < 2) { return; }   // malformed, bail
+
+        if (etype == 0) {
+            // LAPIC: check enabled bit (flags bit 0) or online-capable (bit 1)
+            let is i64 as aid   = read_u8(virt, off + 3);
+            let is i64 as flags = read_u32(virt, off + 4);
+            if ((flags & 0x3) != 0 && cpu_count < MAX_CPUS) {
+                apic_ids[cpu_count] = aid;
+                cpu_count = cpu_count + 1;
+            }
+        } else if (etype == 1) {
+            if (ioapic_count < MAX_IOAPICS) {
+                ioapics[ioapic_count].id        = read_u8(virt, off + 2);
+                ioapics[ioapic_count].phys_addr = read_u32(virt, off + 4);
+                ioapics[ioapic_count].gsi_base  = read_u32(virt, off + 8);
+                ioapics[ioapic_count].gsi_end   = 0;
+                ioapic_count = ioapic_count + 1;
+            }
+        } else if (etype == 2) {
+            if (iso_count < MAX_ISOS) {
+                isos[iso_count].isa_irq = read_u8(virt, off + 3);
+                isos[iso_count].gsi     = read_u32(virt, off + 4);
+                isos[iso_count].flags   = read_u16(virt, off + 8);
+                iso_count = iso_count + 1;
+            }
+        } else if (etype == 5) {
+            lapic_override = read_u64(virt, off + 4);
+        } else if (etype == 9) {
+            // x2APIC: 32-bit APIC ID at offset +4, flags at +8.
+            let is i64 as aid   = read_u32(virt, off + 4);
+            let is i64 as flags = read_u32(virt, off + 8);
+            if ((flags & 0x3) != 0 && cpu_count < MAX_CPUS) {
+                apic_ids[cpu_count] = aid;
+                cpu_count = cpu_count + 1;
+            }
+        }
+        off = off + elen;
+    }
+}
+
+// ============================================================
+// MCFG — "MCFG" signature. Body after SDT header:
+//   [36..44] reserved (8 bytes)
+//   [44..]   region entries, 16 bytes each:
+//     [0..8]   base address
+//     [8..10]  pci segment
+//     [10]     start bus
+//     [11]     end bus
+//     [12..16] reserved
+// ============================================================
+
+fn parse_mcfg(virt as i64) as void {
+    let is i64 as total_len = read_u32(virt, SDT_LENGTH_OFF);
+    if (checksum_ok(virt, total_len) == 0) {
+        serial.println("acpi: MCFG checksum fail", 24);
+        return;
+    }
+    let is i64 as off with mut = SDT_HEADER_SIZE + 8;
+    while (off + 16 <= total_len && mcfg_count < MAX_MCFGS) {
+        mcfgs[mcfg_count].phys_base = read_u64(virt, off);
+        mcfgs[mcfg_count].segment   = read_u16(virt, off + 8);
+        mcfgs[mcfg_count].bus_start = read_u8(virt, off + 10);
+        mcfgs[mcfg_count].bus_end   = read_u8(virt, off + 11);
+        mcfg_count = mcfg_count + 1;
+        off = off + 16;
+    }
+}
+
+// ============================================================
+// HPET — "HPET" signature. Body:
+//   [36..40] Event Timer Block ID (u32)
+//   [40..52] Generic Address Structure:
+//     [0]   addr space (0 = system memory, 1 = system I/O)
+//     [1]   register bit width
+//     [2]   register bit offset
+//     [3]   reserved
+//     [4..12] address (u64)
+//   [52]    HPET Number
+//   [53..55] Minimum Tick (u16)
+//   [55]    Page Protection
+// ============================================================
+
+fn parse_hpet(virt as i64) as void {
+    let is i64 as total_len = read_u32(virt, SDT_LENGTH_OFF);
+    if (checksum_ok(virt, total_len) == 0) {
+        serial.println("acpi: HPET checksum fail", 24);
+        return;
+    }
+    // Only trust entries with addr_space = 0 (memory-mapped).
+    if (read_u8(virt, 40) != 0) { return; }
+    hpet_phys = read_u64(virt, 44);
+}
+
+// ============================================================
+// Top-level parse — callable once at boot. Idempotent: multiple calls
+// won't double-populate the result tables (they re-enter with counts
+// reset to zero so firmware changes between boots never leak state).
+// ============================================================
+
+fn parse() as i32 {
+    cpu_count = 0;
+    ioapic_count = 0;
+    iso_count = 0;
+    mcfg_count = 0;
+    hpet_phys = 0;
+    hpet_period_fs = 0;
+    lapic_override = 0;
+
+    let is i64 as rsdp_phys = limine.get_rsdp();
+    if (rsdp_phys == 0) {
+        serial.println("acpi: no RSDP from Limine", 25);
+        return cast(i32, 0 - 1);
+    }
+    let is i64 as rsdp_virt = phys_to_virt_read(rsdp_phys, 36);
+    if (rsdp_virt == 0) {
+        serial.println("acpi: rsdp map failed", 21);
+        return cast(i32, 0 - 2);
+    }
+    if (rsdp_valid(rsdp_virt) == 0) {
+        serial.println("acpi: invalid RSDP", 18);
+        return cast(i32, 0 - 3);
+    }
+
+    let is i64 as xsdt_phys = rsdp_xsdt_addr(rsdp_virt);
+    let is i32 as is_xsdt = rsdp_is_xsdt(rsdp_virt);
+
+    serial.print("acpi: rsdp=", 11); util.print_hex(rsdp_phys);
+    serial.print(" xsdt=", 6);        util.print_hex(xsdt_phys);
+    if (is_xsdt == 1) { serial.print(" (xsdt)", 7); }
+    else              { serial.print(" (rsdt)", 7); }
+    serial.println("", 0);
+
+    // MADT signature "APIC"
+    let is i64 as madt = find_table(xsdt_phys, is_xsdt, 0x41, 0x50, 0x49, 0x43);
+    if (madt != 0) { parse_madt(madt); }
+    else { serial.println("acpi: MADT not found", 20); }
+
+    // MCFG signature "MCFG"
+    let is i64 as mcfg = find_table(xsdt_phys, is_xsdt, 0x4D, 0x43, 0x46, 0x47);
+    if (mcfg != 0) { parse_mcfg(mcfg); }
+
+    // HPET signature "HPET"
+    let is i64 as hpet = find_table(xsdt_phys, is_xsdt, 0x48, 0x50, 0x45, 0x54);
+    if (hpet != 0) { parse_hpet(hpet); }
+
+    log_summary();
+    return 0;
+}
+
+fn log_summary() as void {
+    serial.print("acpi: cpus=", 11); util.print_num(cpu_count);
+    serial.print(" ioapics=", 9);    util.print_num(ioapic_count);
+    serial.print(" isos=", 6);       util.print_num(iso_count);
+    serial.print(" mcfgs=", 7);      util.print_num(mcfg_count);
+    serial.println("", 0);
+
+    let is i64 as i with mut = 0;
+    while (i < ioapic_count) {
+        serial.print("acpi: ioapic[", 13); util.print_num(i);
+        serial.print("] id=", 5);          util.print_num(ioapics[i].id);
+        serial.print(" addr=", 6);         util.print_hex(ioapics[i].phys_addr);
+        serial.print(" gsi_base=", 10);    util.print_num(ioapics[i].gsi_base);
+        serial.println("", 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < iso_count) {
+        serial.print("acpi: iso isa=", 14); util.print_num(isos[i].isa_irq);
+        serial.print(" -> gsi=", 8);        util.print_num(isos[i].gsi);
+        serial.print(" flags=", 7);         util.print_hex(isos[i].flags);
+        serial.println("", 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < mcfg_count) {
+        serial.print("acpi: mcfg seg=", 15); util.print_num(mcfgs[i].segment);
+        serial.print(" bus=[", 6);           util.print_num(mcfgs[i].bus_start);
+        serial.print(",", 1);                util.print_num(mcfgs[i].bus_end);
+        serial.print("] base=", 7);          util.print_hex(mcfgs[i].phys_base);
+        serial.println("", 0);
+        i = i + 1;
+    }
+    if (hpet_phys != 0) {
+        serial.print("acpi: hpet=", 11); util.print_hex(hpet_phys);
+        serial.println("", 0);
+    }
+}
+
+// ============================================================
+// Accessors for other modules.
+// ============================================================
+
+fn ioapic_addr_for_gsi(gsi as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < ioapic_count) {
+        if (gsi >= ioapics[i].gsi_base && gsi < ioapics[i].gsi_base + 24) {
+            return ioapics[i].phys_addr;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ISA IRQ → GSI remap (identity when no override present).
+fn remap_isa_irq(isa_irq as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < iso_count) {
+        if (isos[i].isa_irq == isa_irq) { return isos[i].gsi; }
+        i = i + 1;
+    }
+    return isa_irq;
+}
+
+fn first_ioapic_addr() as i64 {
+    if (ioapic_count == 0) { return 0; }
+    return ioapics[0].phys_addr;
+}
+
+fn first_mcfg() as *McfgRegion {
+    if (mcfg_count == 0) { return cast(*McfgRegion, 0); }
+    return &mcfgs[0];
+}
+
+fn get_hpet_phys() as i64 { return hpet_phys; }
+fn get_cpu_count() as i64 { return cpu_count; }
