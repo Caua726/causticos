@@ -1431,6 +1431,288 @@ fn file_create(v as *Fat32Volume, path as *u8, path_len as i64,
     return 0;
 }
 
+// ============================================================
+// Directory mutation — mkdir, rmdir, rename.
+// ============================================================
+
+// Create a new directory at `path`. Synthesises the canonical '.' and
+// '..' self-references inside the fresh cluster before registering
+// the entry in the parent. '..' reads as 0 when the parent is the
+// root (FAT32 convention).
+fn dir_create(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+
+    let is i64 as leaf_off with mut = 0;
+    let is i64 as leaf_len with mut = 0;
+    let is i64 as parent_end with mut = 0;
+    if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
+        return cast(i32, 0 - 2);
+    }
+    let is i64 as parent_cluster with mut = v.root_cluster;
+    let is i64 as psz with mut = 0;
+    let is i32 as pattr with mut = 0;
+    if (parent_end > 0) {
+        if (path_lookup(v, path, parent_end,
+                        &parent_cluster, &psz, &pattr) != 0) {
+            return cast(i32, 0 - 3);
+        }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+    }
+
+    let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
+    let is i64 as dc with mut = 0;
+    let is i64 as ds with mut = 0;
+    let is i32 as da with mut = 0;
+    if (dir_find(v, parent_cluster, leaf_ptr, leaf_len,
+                 &dc, &ds, &da) == 0) {
+        return cast(i32, 0 - 5);   // EEXIST
+    }
+
+    let is i64 as new_c = cluster_alloc(v);
+    if (new_c < 0) { return cast(i32, 0 - 6); }
+    if (cluster_zero(v, new_c) != 0) {
+        cluster_free(v, new_c);
+        return cast(i32, 0 - 7);
+    }
+
+    // Write '.' and '..' as two 8.3 entries at the start of the new
+    // cluster. '..' = 0 when the parent is the root per FAT spec.
+    if (ensure_scratch() != 0) { return cast(i32, 0 - 8); }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as k with mut = 0;
+    while (k < v.cluster_size_bytes) { buf[k] = cast(u8, 0); k = k + 1; }
+
+    let is [11]u8 as dot_name with mut;
+    let is i64 as d with mut = 0;
+    while (d < 11) { dot_name[d] = cast(u8, 32); d = d + 1; }
+    dot_name[0] = cast(u8, 46);   // '.'
+    emit_sfn(buf, 0, cast(*u8, &dot_name[0]),
+             cast(i32, ATTR_DIRECTORY), new_c, 0);
+
+    dot_name[1] = cast(u8, 46);   // '..'
+    let is i64 as dotdot_parent with mut = parent_cluster;
+    if (parent_cluster == v.root_cluster) { dotdot_parent = 0; }
+    emit_sfn(buf, 32, cast(*u8, &dot_name[0]),
+             cast(i32, ATTR_DIRECTORY), dotdot_parent, 0);
+
+    if (cluster_write(v, new_c, buf) != 0) {
+        chain_free(v, new_c);
+        return cast(i32, 0 - 9);
+    }
+
+    // Register the entry in the parent.
+    let is i32 as de = dir_add_entry(v, parent_cluster, leaf_ptr, leaf_len,
+                                     cast(i32, ATTR_DIRECTORY), new_c, 0);
+    if (de != 0) {
+        chain_free(v, new_c);
+        return cast(i32, 0 - 10);
+    }
+
+    storage.flush(v.dev);
+    return 0;
+}
+
+// True (returns 1) when a directory starting at `dir_cluster` contains
+// anything beyond '.' and '..' (i.e. is non-empty in user-visible
+// terms). Used to guard rmdir against stomping populated trees.
+fn dir_is_empty(v as *Fat32Volume, dir_cluster as i64) as i32 {
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = dir_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    let is i64 as n_slots = v.cluster_size_bytes / 32;
+
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return 0; }
+        guard = guard + 1;
+        if (cluster_read(v, cluster, buf) != 0) { return 0; }
+        let is i64 as i with mut = 0;
+        while (i < n_slots) {
+            let is i64 as boff = i * 32;
+            let is u8 as m = buf[boff];
+            if (m == cast(u8, 0)) { return 1; }   // end-of-dir reached
+            if (m == cast(u8, 0xE5)) { i = i + 1; }
+            else {
+                let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
+                if (a == ATTR_LFN) { i = i + 1; }
+                else {
+                    // Skip the two canonical '.' and '..' self-refs.
+                    if (buf[boff] == cast(u8, 46) &&
+                        buf[boff + 1] == cast(u8, 32)) {
+                        i = i + 1;
+                    } else if (buf[boff] == cast(u8, 46) &&
+                               buf[boff + 1] == cast(u8, 46) &&
+                               buf[boff + 2] == cast(u8, 32)) {
+                        i = i + 1;
+                    } else {
+                        return 0;
+                    }
+                }
+            }
+        }
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return 0; }
+        if (cluster_is_eof(nxt) == 1) { return 1; }
+        cluster = nxt;
+    }
+    return 1;
+}
+
+fn dir_remove(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+
+    let is i64 as leaf_off with mut = 0;
+    let is i64 as leaf_len with mut = 0;
+    let is i64 as parent_end with mut = 0;
+    if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
+        return cast(i32, 0 - 2);
+    }
+    let is i64 as parent_cluster with mut = v.root_cluster;
+    let is i64 as psz with mut = 0;
+    let is i32 as pattr with mut = 0;
+    if (parent_end > 0) {
+        if (path_lookup(v, path, parent_end,
+                        &parent_cluster, &psz, &pattr) != 0) {
+            return cast(i32, 0 - 3);
+        }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+    }
+    let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
+
+    let is i64 as fc with mut = 0;
+    let is i64 as fs with mut = 0;
+    let is i32 as fa with mut = 0;
+    let is i32 as rc = dir_find(v, parent_cluster, leaf_ptr, leaf_len,
+                                &fc, &fs, &fa);
+    if (rc != 0) { return rc; }
+    if ((fa & ATTR_DIRECTORY) == 0) {
+        return cast(i32, 0 - 5);   // not a directory
+    }
+    if (dir_is_empty(v, fc) == 0) {
+        return cast(i32, 0 - 6);   // ENOTEMPTY
+    }
+
+    let is i64 as junk_c with mut = 0;
+    let is i64 as junk_s with mut = 0;
+    let is i32 as junk_a with mut = 0;
+    let is i32 as r2 = dir_remove_entry(v, parent_cluster,
+                                        leaf_ptr, leaf_len,
+                                        &junk_c, &junk_s, &junk_a);
+    if (r2 != 0) { return r2; }
+    chain_free(v, fc);
+    storage.flush(v.dev);
+    return 0;
+}
+
+// Rename a file or directory. Implemented as an atomic-looking pair:
+// create new entry at dst, then delete old entry. On failure after
+// create we roll back the new entry. Cross-directory renames are
+// supported; the underlying data/cluster chain is NOT touched so the
+// operation is O(dir) in metadata, not O(file) in bytes.
+fn path_rename(v as *Fat32Volume,
+               src as *u8, src_len as i64,
+               dst as *u8, dst_len as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+
+    // Resolve source.
+    let is i64 as s_leaf_off with mut = 0;
+    let is i64 as s_leaf_len with mut = 0;
+    let is i64 as s_parent_end with mut = 0;
+    if (path_split_parent(src, src_len, &s_leaf_off, &s_leaf_len, &s_parent_end) != 0) {
+        return cast(i32, 0 - 2);
+    }
+    let is i64 as sp_cluster with mut = v.root_cluster;
+    let is i64 as psz with mut = 0;
+    let is i32 as pattr with mut = 0;
+    if (s_parent_end > 0) {
+        if (path_lookup(v, src, s_parent_end,
+                        &sp_cluster, &psz, &pattr) != 0) {
+            return cast(i32, 0 - 3);
+        }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+    }
+    let is *u8 as s_leaf = cast(*u8, cast(i64, src) + s_leaf_off);
+
+    let is i64 as src_cluster with mut = 0;
+    let is i64 as src_size    with mut = 0;
+    let is i32 as src_attr    with mut = 0;
+    let is i32 as sr = dir_find(v, sp_cluster, s_leaf, s_leaf_len,
+                                &src_cluster, &src_size, &src_attr);
+    if (sr != 0) { return sr; }
+
+    // Resolve destination.
+    let is i64 as d_leaf_off with mut = 0;
+    let is i64 as d_leaf_len with mut = 0;
+    let is i64 as d_parent_end with mut = 0;
+    if (path_split_parent(dst, dst_len, &d_leaf_off, &d_leaf_len, &d_parent_end) != 0) {
+        return cast(i32, 0 - 5);
+    }
+    let is i64 as dp_cluster with mut = v.root_cluster;
+    if (d_parent_end > 0) {
+        if (path_lookup(v, dst, d_parent_end,
+                        &dp_cluster, &psz, &pattr) != 0) {
+            return cast(i32, 0 - 6);
+        }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 7); }
+    }
+    let is *u8 as d_leaf = cast(*u8, cast(i64, dst) + d_leaf_off);
+
+    let is i64 as dummy_c with mut = 0;
+    let is i64 as dummy_s with mut = 0;
+    let is i32 as dummy_a with mut = 0;
+    if (dir_find(v, dp_cluster, d_leaf, d_leaf_len,
+                 &dummy_c, &dummy_s, &dummy_a) == 0) {
+        return cast(i32, 0 - 8);   // destination exists
+    }
+
+    // Add new entry first (keeps data reachable even if the crash
+    // window hits mid-operation; old entry still points to the same
+    // chain and we free it only on success).
+    let is i32 as de = dir_add_entry(v, dp_cluster, d_leaf, d_leaf_len,
+                                     src_attr, src_cluster, src_size);
+    if (de != 0) { return cast(i32, 0 - 9); }
+
+    // Drop the old entry. On failure we have two names pointing at
+    // the same chain; the next mount rebuild would flag it, but no
+    // data is lost.
+    let is i64 as junk_c with mut = 0;
+    let is i64 as junk_s with mut = 0;
+    let is i32 as junk_a with mut = 0;
+    let is i32 as r2 = dir_remove_entry(v, sp_cluster, s_leaf, s_leaf_len,
+                                        &junk_c, &junk_s, &junk_a);
+    if (r2 != 0) {
+        // Roll back: remove the new entry too. If the roll-back
+        // itself fails the dir has a dup; explicit error propagation
+        // matters more than paper-over.
+        dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len,
+                         &junk_c, &junk_s, &junk_a);
+        return cast(i32, 0 - 10);
+    }
+
+    // If this was a directory rename across parents, patch its '..'
+    // to point at the new parent. Same-parent renames leave '..'
+    // untouched (pointer equivalence).
+    if ((src_attr & ATTR_DIRECTORY) != 0 && sp_cluster != dp_cluster
+        && src_cluster != 0) {
+        let is *u8 as cbuf = cast(*u8, clus_scratch_virt);
+        if (cluster_read(v, src_cluster, cbuf) == 0) {
+            // Slot 1 is '..'. Patch first-cluster hi/lo.
+            let is i64 as new_parent with mut = dp_cluster;
+            if (dp_cluster == v.root_cluster) { new_parent = 0; }
+            let is i64 as hi = (new_parent >> 16) & 0xFFFF;
+            let is i64 as lo = new_parent & 0xFFFF;
+            cbuf[32 + 20] = cast(u8, hi & 0xFF);
+            cbuf[32 + 21] = cast(u8, (hi >> 8) & 0xFF);
+            cbuf[32 + 26] = cast(u8, lo & 0xFF);
+            cbuf[32 + 27] = cast(u8, (lo >> 8) & 0xFF);
+            cluster_write(v, src_cluster, cbuf);
+        }
+    }
+
+    storage.flush(v.dev);
+    return 0;
+}
+
 fn file_unlink(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
     if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
 
@@ -1783,4 +2065,116 @@ fn self_test_write(v as *Fat32Volume) as void {
         return;
     }
     serial.println("fat32.test: unlink+verify OK", 28);
+
+    self_test_dirs(v);
+}
+
+// ============================================================
+// Phase 6 self-tests: mkdir, rename, rmdir round-trips.
+// ============================================================
+
+fn self_test_dirs(v as *Fat32Volume) as void {
+    serial.println("fat32.test: dir-path start", 26);
+    let is i64 as cc with mut = 0;
+    let is i64 as ss with mut = 0;
+    let is i32 as aa with mut = 0;
+
+    // mkdir /data
+    if (dir_create(v, cast(*u8, "/data"), 5) != 0) {
+        serial.println("fat32.test: mkdir /data FAIL", 28);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/data"), 5, &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: /data lookup FAIL", 29);
+        return;
+    }
+    if ((aa & 0x10) == 0) {
+        serial.println("fat32.test: /data not DIR", 25);
+        return;
+    }
+    serial.println("fat32.test: mkdir /data OK", 26);
+
+    // Create file inside /data
+    if (file_create(v, cast(*u8, "/data/notes.txt"), 15,
+                    cast(*u8, "inside data"), 11) != 0) {
+        serial.println("fat32.test: create /data/notes FAIL", 35);
+        return;
+    }
+    let is i64 as rb_virt = alloc_dma_page();
+    let is *u8 as rb = cast(*u8, rb_virt);
+    if (path_lookup(v, cast(*u8, "/data/notes.txt"), 15,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: /data/notes lookup FAIL", 35);
+        return;
+    }
+    if (file_read(v, cc, ss, rb, 4096) != 11) {
+        serial.println("fat32.test: /data/notes read short", 34);
+        return;
+    }
+    rb[11] = cast(u8, 0);
+    serial.print("fat32.test: /data/notes.txt='", 29);
+    let is i64 as k0 with mut = 0;
+    while (k0 < 11) { serial.putc(cast(i64, rb[k0])); k0 = k0 + 1; }
+    serial.println("'", 1);
+
+    // rmdir on non-empty /data must be refused.
+    let is i32 as rm_busy = dir_remove(v, cast(*u8, "/data"), 5);
+    if (rm_busy == 0) {
+        serial.println("fat32.test: rmdir accepted non-empty!", 37);
+        return;
+    }
+    serial.println("fat32.test: rmdir refuses non-empty OK", 38);
+
+    // rename /data/notes.txt -> /data/notebook.md (same parent)
+    if (path_rename(v,
+                    cast(*u8, "/data/notes.txt"), 15,
+                    cast(*u8, "/data/notebook.md"), 17) != 0) {
+        serial.println("fat32.test: rename (same-parent) FAIL", 37);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/data/notes.txt"), 15,
+                    &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: old name still present after rename", 47);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/data/notebook.md"), 17,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: new name missing after rename", 41);
+        return;
+    }
+    if (file_read(v, cc, ss, rb, 4096) != 11) {
+        serial.println("fat32.test: renamed read short", 30);
+        return;
+    }
+    rb[11] = cast(u8, 0);
+    serial.print("fat32.test: rename same-parent OK '", 35);
+    let is i64 as k1 with mut = 0;
+    while (k1 < 11) { serial.putc(cast(i64, rb[k1])); k1 = k1 + 1; }
+    serial.println("'", 1);
+
+    // rename /data/notebook.md -> /docs/notebook.md (cross-parent)
+    if (path_rename(v,
+                    cast(*u8, "/data/notebook.md"), 17,
+                    cast(*u8, "/docs/notebook.md"), 17) != 0) {
+        serial.println("fat32.test: rename cross-parent FAIL", 36);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/docs/notebook.md"), 17,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: moved file not in /docs", 35);
+        return;
+    }
+    serial.println("fat32.test: rename cross-parent OK", 34);
+
+    // Now /data is empty — rmdir should succeed.
+    if (dir_remove(v, cast(*u8, "/data"), 5) != 0) {
+        serial.println("fat32.test: rmdir empty /data FAIL", 34);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/data"), 5, &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: /data still visible after rmdir", 43);
+        return;
+    }
+    serial.println("fat32.test: rmdir empty OK", 26);
+    serial.println("fat32.test: ALL PHASE-6 TESTS PASS", 34);
 }
