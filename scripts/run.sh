@@ -13,10 +13,13 @@ caustic-as kernel/main.cst.s
 
 echo "==> Linking (freestanding, higher-half)..."
 mkdir -p build
-# --strip is REQUIRED: caustic-ld's section table writer corrupts the
-# ELF once the kernel crosses ~300KB. Program headers stay correct so
-# Limine still loads it, but objdump/readelf break and we saw random
-# page faults until we linked stripped.
+# --strip: omits symbol/section tables. Limine inspects section
+# headers when they're present and the resulting load behaviour
+# diverges from program-header-only mode; kernels consistently page-
+# fault inside sched.init when linked non-stripped. The bug isn't in
+# caustic-ld (its section layout is correct post-2026-04-19 fix) so
+# much as in Limine's interaction with embedded symtab/strtab, so
+# kernels stay stripped by policy.
 caustic-ld --strip --freestanding --entry=_kernel_start \
     --base=0xFFFFFFFF80000000 \
     kernel/main.cst.s.o kernel/cdvrspec_data.s.o \
