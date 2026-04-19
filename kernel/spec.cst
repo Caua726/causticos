@@ -18,6 +18,8 @@ use "serial.cst" as serial;
 use "sched.cst" as sched;
 use "util.cst" as util;
 use "driver.cst" as driver;
+use "ioapic.cst" as ioapic;
+use "platform.cst" as platform;
 
 // ============================================================
 // Match predicate kinds
@@ -94,7 +96,10 @@ struct Spec {
     cap_list as *CapabilityRequest;
     on_bind as fn(*Binding) as i32;
     on_unbind as fn(*Binding) as void;
-    on_irq as fn(*Binding) as i32;
+    // on_irq signature matches driver.irq_register: the framework
+    // registers this as the IRQ handler when a CAP_IRQ is resolved,
+    // with the Binding pointer cast to *u8 as the handler context.
+    on_irq as fn(*driver.Hardware, *u8) as i32;
     impls as *Implementation;
     next as *Spec;          // transient list head link; unused once sections land
 }
@@ -304,9 +309,11 @@ fn match_all() as void {
 // Phase 3: resolve every CapabilityRequest on a binding into concrete
 // resources stored in binding.caps. MMIO uses the bus's get_bar_info
 // to translate a BAR index into a physical address, then drives
-// driver.mmio_map to produce a virtual pointer. Other kinds (IRQ,
-// DMA, PORTIO, MEMORY) are accepted by the parser but not yet
-// resolved here — added when a real driver needs them.
+// driver.mmio_map to produce a virtual pointer. IRQ allocates a
+// driver-framework vector, programs the IOAPIC redirection entry,
+// and registers the spec's on_irq callback. DMA / PORTIO / MEMORY
+// are accepted by the parser but not yet resolved here — added
+// when a real driver needs them.
 fn populate_caps(b as *Binding) as i32 {
     let is *Spec as s = b.spec;
     let is *driver.Hardware as hw = b.hardware;
@@ -326,6 +333,26 @@ fn populate_caps(b as *Binding) as i32 {
             if (mrc != driver.OK) { rollback_caps(b); return mrc; }
             b.caps.mmio = virt;
             b.caps.mmio_size = req.p2;
+        } else if (req.kind == CAP_IRQ) {
+            // req.p1 = hardware IRQ line. Allocate a driver-framework
+            // vector (48-49 today; extending requires more IDT stubs),
+            // program the IOAPIC routing, and register on_irq as the
+            // handler with the Binding pointer as context.
+            let is i64 as vector = ioapic.alloc_vector(48, 50);
+            if (vector < 0) { rollback_caps(b); return cast(i32, 0 - 3); }
+            platform.set_irq_route(req.p1, vector, 0);
+            if (cast(i64, s.on_irq) != 0) {
+                let is i32 as irc = driver.irq_register(hw, cast(u32, vector),
+                                                        cast(i32, 0),
+                                                        s.on_irq,
+                                                        cast(*u8, b));
+                if (irc != driver.OK) {
+                    ioapic.release_vector(vector);
+                    rollback_caps(b);
+                    return irc;
+                }
+            }
+            b.caps.irq_vector = vector;
         }
         i = i + 1;
     }
@@ -333,10 +360,9 @@ fn populate_caps(b as *Binding) as i32 {
 }
 
 // Undo any partial cap resolution. Called when populate_caps fails
-// mid-way, via release_all_resources on the underlying Hardware —
-// the MMIO list accumulates the mmio_map contribution and gets
-// released as a unit. Keeps caps.* fields cleared so the binding
-// doesn't point at torn-down memory.
+// mid-way. MMIO entries live on hw.mmio_list; IRQ handler lives in
+// driver's dispatch table. Keeps caps.* fields cleared so the binding
+// doesn't point at torn-down resources.
 fn rollback_caps(b as *Binding) as void {
     if (cast(i64, b.caps.mmio) != 0) {
         let is *driver.MmioRegion as r with mut = b.hardware.mmio_list;
@@ -350,6 +376,11 @@ fn rollback_caps(b as *Binding) as void {
         }
         b.caps.mmio = cast(*u8, 0);
         b.caps.mmio_size = 0;
+    }
+    if (b.caps.irq_vector != 0) {
+        driver.irq_unregister(b.hardware, cast(u32, b.caps.irq_vector));
+        ioapic.release_vector(b.caps.irq_vector);
+        b.caps.irq_vector = 0;
     }
 }
 
