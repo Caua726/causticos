@@ -71,9 +71,10 @@ let is i64 as TFD_DRQ = 8;
 let is i64 as TFD_BSY = 0x80;
 
 // SATA commands
-let is i64 as ATA_CMD_IDENTIFY    = 0xEC;
-let is i64 as ATA_CMD_READ_DMA_EX  = 0x25;    // READ DMA EXT, 48-bit LBA
-let is i64 as ATA_CMD_WRITE_DMA_EX = 0x35;    // WRITE DMA EXT, 48-bit LBA
+let is i64 as ATA_CMD_IDENTIFY        = 0xEC;
+let is i64 as ATA_CMD_READ_DMA_EX     = 0x25;    // READ DMA EXT, 48-bit LBA
+let is i64 as ATA_CMD_WRITE_DMA_EX    = 0x35;    // WRITE DMA EXT, 48-bit LBA
+let is i64 as ATA_CMD_FLUSH_CACHE_EX  = 0xEA;    // FLUSH CACHE EXT (48-bit)
 
 // Per-sector size. AHCI doesn't know this; we infer from IDENTIFY
 // word 106 when available, default to 512.
@@ -432,7 +433,7 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     }
 
     build_identify_ct(&ctx);
-    fill_slot_header(&ctx, 0, 0);       // slot 0, read
+    fill_slot_header(&ctx, 0, 0, 1);    // slot 0, read, 1 PRDT entry
 
     mmio_write32(pb, PX_CI, cast(i64, 1) << slot);
 
@@ -484,9 +485,11 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     let is i64 as ghc_final = mmio_read32(abar, HBA_GHC);
     mmio_write32(abar, HBA_GHC, ghc_final | GHC_IE);
 
-    // End-to-end self-test: read LBA 0. Validates submit/harvest
-    // round-trip and the race-free wait_complete path.
-    self_test_read_lba0(&ctx);
+    // End-to-end self-test: write pattern / flush / read / verify.
+    // Exercises all three op kinds (OP_WRITE/OP_FLUSH/OP_READ), the
+    // PRDT/no-PRDT command table variants, and the race-free
+    // wait_complete path.
+    self_test_io(&ctx);
     return driver.OK;
 }
 
@@ -530,6 +533,18 @@ fn build_rw_fis(ct as *u8, is_write as i64, lba as i64, count as i64) as void {
     ct[15] = cast(u8, 0);                        // control
 }
 
+// Build H2D FIS for FLUSH CACHE EXT. No LBA, no count, no PRDT —
+// durability barrier that tells the drive to evict its write cache
+// to persistent media. ATA/ATAPI-8 §7.8.
+fn build_flush_fis(ct as *u8) as void {
+    let is i64 as zi with mut = 0;
+    while (zi < 128) { ct[zi] = cast(u8, 0); zi = zi + 1; }
+    ct[0] = cast(u8, 0x27);                      // FIS_TYPE_REG_H2D
+    ct[1] = cast(u8, 0x80);                      // C=1
+    ct[2] = cast(u8, ATA_CMD_FLUSH_CACHE_EX);
+    ct[7] = cast(u8, 0x40);                      // device
+}
+
 // Single-PRDT entry at offset 0x80. AHCI spec §4.2.3: DBC is
 // (byte_count - 1) in bits 0-21, bit 31 is interrupt-on-complete.
 // byte_count must be even.
@@ -544,13 +559,14 @@ fn build_prdt_one(ct as *u8, phys as i64, byte_count as i64) as void {
     *dbc = cast(u32, (byte_count - 1) | 0x80000000);
 }
 
-// Command header at list[slot]. CFL=5 dwords (H2D register FIS),
-// PRDTL=1. W bit set for writes.
-fn fill_slot_header(c as *AhciCtx, slot as i64, is_write as i64) as void {
+// Command header at list[slot]. CFL=5 dwords (H2D register FIS).
+// PRDTL is the caller-supplied count — 1 for read/write, 0 for
+// FLUSH (no data transfer). W bit set for writes.
+fn fill_slot_header(c as *AhciCtx, slot as i64, is_write as i64, prdtl as i64) as void {
     let is *u8 as h = cast(*u8, cast(i64, c.cmd_list.virt) + slot * 32);
     let is i64 as flags with mut = 5;
     if (is_write == 1) { flags = flags | 0x40; }
-    flags = flags | (cast(i64, 1) << 16);          // PRDTL=1
+    flags = flags | (prdtl << 16);
     let is *u32 as dw0 = cast(*u32, h);
     *dw0 = cast(u32, flags);
     let is *u32 as prdbc = cast(*u32, cast(i64, h) + 4);
@@ -582,40 +598,45 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
     let is *AhciCtx as c = cast(*AhciCtx, p.private);
     let is *u8 as pb = port_base(c.abar, c.port);
 
-    if (r.op != io.OP_READ) {
-        if (r.op != io.OP_WRITE) {
-            // Only READ/WRITE today. OP_FLUSH arrives with Phase E3.
-            return cast(i32, driver.NOT_SUPPORTED);
+    let is i64 as is_write with mut = 0;
+    let is i64 as is_data with mut = 0;
+    if (r.op == io.OP_READ)       { is_data = 1; }
+    else if (r.op == io.OP_WRITE) { is_data = 1; is_write = 1; }
+    else if (r.op == io.OP_FLUSH) { is_data = 0; }
+    else                          { return cast(i32, driver.NOT_SUPPORTED); }
+
+    let is i64 as buf_phys with mut = 0;
+    let is i64 as byte_count with mut = 0;
+
+    if (is_data == 1) {
+        // Translate buf virtual → physical. Upper layer contract: buf
+        // is HHDM-mapped kernel virtual (typical for dma_alloc'd or
+        // direct pmm-backed buffers). kvalloc addresses don't satisfy
+        // this and are rejected here; scatter-gather path for non-
+        // contiguous allocations is a future extension.
+        //
+        // Both endpoints of the transfer must lie in installed RAM —
+        // is_hhdm_valid checks the start, is_phys_valid validates
+        // the tail. An out-of-range phys would make the HBA DMA to
+        // stale or unmapped memory.
+        let is i64 as buf_virt = cast(i64, r.buf);
+        byte_count = r.count * c.sector_size;
+        if (byte_count <= 0)             { return cast(i32, driver.INVALID_ARGUMENT); }
+        if ((byte_count & 1) != 0)       { return cast(i32, driver.INVALID_ARGUMENT); }
+        if (pmm.is_hhdm_valid(buf_virt) == 0) {
+            serial.println("ahci: buf not in HHDM", 21);
+            return cast(i32, driver.INVALID_ARGUMENT);
+        }
+        buf_phys = buf_virt - pmm.hhdm;
+        if (pmm.is_phys_valid(buf_phys + byte_count - 1) == 0) {
+            serial.println("ahci: buf tail beyond installed RAM", 35);
+            return cast(i32, driver.INVALID_ARGUMENT);
         }
     }
 
-    // Translate buf virtual → physical. Upper layer contract: buf is
-    // HHDM-mapped kernel virtual (typical for dma_alloc'd or direct
-    // pmm-backed buffers). kvalloc addresses don't satisfy this and
-    // are rejected here; scatter-gather path for non-contiguous
-    // allocations is a future extension.
-    //
-    // Both endpoints of the transfer [buf_phys, buf_phys + byte_count)
-    // must lie in installed RAM — pmm.is_hhdm_valid checks the start,
-    // phys_end check validates the end. An out-of-range phys would
-    // make the HBA DMA to stale or unmapped memory.
-    let is i64 as buf_virt = cast(i64, r.buf);
-    let is i64 as byte_count = r.count * c.sector_size;
-    if (byte_count <= 0) { return cast(i32, driver.INVALID_ARGUMENT); }
-    if ((byte_count & 1) != 0) { return cast(i32, driver.INVALID_ARGUMENT); }
-    if (pmm.is_hhdm_valid(buf_virt) == 0) {
-        serial.println("ahci: buf not in HHDM", 21);
-        return cast(i32, driver.INVALID_ARGUMENT);
-    }
-    let is i64 as buf_phys = buf_virt - pmm.hhdm;
-    if (pmm.is_phys_valid(buf_phys + byte_count - 1) == 0) {
-        serial.println("ahci: buf tail beyond installed RAM", 35);
-        return cast(i32, driver.INVALID_ARGUMENT);
-    }
-
-    // Reserve a slot. alloc_slot scans SACT|CI; we additionally check
-    // slot_requests_raw so a free HW slot that's still mid-book-keeping
-    // can't be double-assigned.
+    // Reserve a slot. Scans SACT|CI plus the driver's slot_requests
+    // table so a free HW slot that's still mid-book-keeping can't be
+    // double-assigned.
     sched.preempt_disable();
     let is i64 as slot with mut = cast(i64, 0 - 1);
     let is i64 as used_mask = mmio_read32(pb, PX_CI) | mmio_read32(pb, 0x34);
@@ -641,13 +662,18 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
     r.driver_slot = slot;
     sched.preempt_enable();
 
-    // Build command table + header
+    // Build command table + header. FLUSH has no PRDT (PRDTL=0); R/W
+    // always use a single PRDT entry (scatter-gather would bump this).
     let is *u8 as ct = slot_ct_virt(c, slot);
-    let is i64 as is_write with mut = 0;
-    if (r.op == io.OP_WRITE) { is_write = 1; }
-    build_rw_fis(ct, is_write, r.lba, r.count);
-    build_prdt_one(ct, buf_phys, byte_count);
-    fill_slot_header(c, slot, is_write);
+    let is i64 as prdtl with mut = 0;
+    if (is_data == 1) {
+        build_rw_fis(ct, is_write, r.lba, r.count);
+        build_prdt_one(ct, buf_phys, byte_count);
+        prdtl = 1;
+    } else {
+        build_flush_fis(ct);
+    }
+    fill_slot_header(c, slot, is_write, prdtl);
 
     // Kick: set the corresponding bit in PX_CI. Single-writer from
     // this context; safe without read-modify-write.
@@ -763,23 +789,88 @@ fn ahci_irq(hw as *driver.Hardware, context as *u8) as i32 {
 }
 
 // ============================================================
-// Post-IDENTIFY self-test: read LBA 0, verify submit/harvest round-trip
+// Post-IDENTIFY self-test: write known pattern, flush, read back,
+// verify. Exercises submit/harvest/wait_complete for all three op
+// kinds (OP_WRITE, OP_FLUSH, OP_READ) and the AHCI FIS builders.
+//
+// Uses LBA 100 so we don't stomp on anything a real disk image would
+// keep at LBA 0 (MBR / GPT header). For the 1MB build/disk.img this
+// is well inside bounds; callers pointing at a different image with
+// less than ~52KB should tune the LBA.
 // ============================================================
 
-fn self_test_read_lba0(c as *AhciCtx) as void {
-    let is *driver.DmaBuffer as test_buf;
-    let is i32 as rc = driver.dma_alloc(c.binding.hardware, cast(u64, 512),
-                                         cast(u64, 2), cast(u32, 1), &test_buf);
-    if (rc != driver.OK) {
-        serial.println("ahci.self_test: dma_alloc fail", 30);
+fn self_test_io(c as *AhciCtx) as void {
+    let is i64 as TEST_LBA = 100;
+    let is i64 as SECTOR   = c.sector_size;
+
+    let is *driver.DmaBuffer as wbuf;
+    let is *driver.DmaBuffer as rbuf;
+    let is i32 as rc1 = driver.dma_alloc(c.binding.hardware, cast(u64, SECTOR),
+                                          cast(u64, 2), cast(u32, 1), &wbuf);
+    if (rc1 != driver.OK) {
+        serial.println("ahci.self_test: dma_alloc wbuf fail", 35);
         return;
     }
-    let is i32 as status = io.read_sync(c.binding.hardware, c.port, 0, 1,
-                                         cast(*u8, test_buf.virt));
-    serial.print("ahci.self_test: read LBA 0 status=", 34);
-    util.print_num(cast(i64, status));
+    let is i32 as rc2 = driver.dma_alloc(c.binding.hardware, cast(u64, SECTOR),
+                                          cast(u64, 2), cast(u32, 1), &rbuf);
+    if (rc2 != driver.OK) {
+        serial.println("ahci.self_test: dma_alloc rbuf fail", 35);
+        driver.dma_free(c.binding.hardware, wbuf);
+        return;
+    }
+
+    // Fill wbuf with a rotating pattern and rbuf with an inverted
+    // sentinel so a failed read is trivially distinguishable.
+    let is *u8 as wp = cast(*u8, wbuf.virt);
+    let is *u8 as rp = cast(*u8, rbuf.virt);
+    let is i64 as i with mut = 0;
+    while (i < SECTOR) {
+        wp[i] = cast(u8, (i * 31 + 7) & 0xFF);
+        rp[i] = cast(u8, 0xA5);
+        i = i + 1;
+    }
+
+    let is i32 as wrc = io.write_sync(c.binding.hardware, c.port, TEST_LBA, 1, wp);
+    serial.print("ahci.self_test: write LBA 100 status=", 37);
+    util.print_num(cast(i64, wrc));
     serial.println("", 0);
-    driver.dma_free(c.binding.hardware, test_buf);
+    if (wrc != 0) { driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
+
+    let is i32 as frc = io.flush_sync(c.binding.hardware, c.port);
+    serial.print("ahci.self_test: flush status=", 29);
+    util.print_num(cast(i64, frc));
+    serial.println("", 0);
+    if (frc != 0) { driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
+
+    let is i32 as rrc = io.read_sync(c.binding.hardware, c.port, TEST_LBA, 1, rp);
+    serial.print("ahci.self_test: read LBA 100 status=", 36);
+    util.print_num(cast(i64, rrc));
+    serial.println("", 0);
+    if (rrc != 0) { driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
+
+    // Verify byte-for-byte.
+    let is i64 as mismatches with mut = 0;
+    let is i64 as first_bad with mut = cast(i64, 0 - 1);
+    i = 0;
+    while (i < SECTOR) {
+        if (wp[i] != rp[i]) {
+            mismatches = mismatches + 1;
+            if (first_bad < 0) { first_bad = i; }
+        }
+        i = i + 1;
+    }
+    if (mismatches == 0) {
+        serial.println("ahci.self_test: write/read/verify OK", 36);
+    } else {
+        serial.print("ahci.self_test: verify FAIL mismatches=", 39);
+        util.print_num(mismatches);
+        serial.print(" first_bad=", 11);
+        util.print_num(first_bad);
+        serial.println("", 0);
+    }
+
+    driver.dma_free(c.binding.hardware, wbuf);
+    driver.dma_free(c.binding.hardware, rbuf);
 }
 
 fn register() as void {
