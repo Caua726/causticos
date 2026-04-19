@@ -1,0 +1,350 @@
+// fat32.cst — FAT32 volume parse + mount.
+//
+// Phase 2 of the FAT32 stack: read sector 0 (BPB), validate the volume
+// is really FAT32, extract layout parameters, and publish the mounted
+// volume for later phases (FAT walk, directory traversal, file I/O).
+//
+// Reference: Microsoft FAT Specification (FATGEN103), section BPB/BS.
+// We support bytes_per_sector in {512, 1024, 2048, 4096}, sectors_per_
+// cluster that is a power of two in [1, 128], num_fats in {1, 2}, and
+// require the "FAT32   " fs_type string + 0x55AA signature.
+//
+// No heap dependency: a single static Fat32Volume slot is the V1 mount
+// table. Adding more mounts means promoting to a linked list.
+
+use "storage.cst" as storage;
+use "serial.cst"  as serial;
+use "util.cst"    as util;
+use "pmm.cst"     as pmm;
+use "sched.cst"   as sched;
+
+// ============================================================
+// BPB offsets (see FAT spec). Bytes unless suffixed _w (u16) or _d (u32).
+// ============================================================
+let is i64 as BPB_JMP           = 0x00;   // 3 bytes: short jump + nop
+let is i64 as BPB_OEM           = 0x03;   // 8 bytes
+let is i64 as BPB_BYTES_PER_SEC = 0x0B;   // u16
+let is i64 as BPB_SEC_PER_CLUS  = 0x0D;   // u8
+let is i64 as BPB_RSVD_SEC_CNT  = 0x0E;   // u16
+let is i64 as BPB_NUM_FATS      = 0x10;   // u8
+let is i64 as BPB_ROOT_ENT_CNT  = 0x11;   // u16 (must be 0 for FAT32)
+let is i64 as BPB_TOT_SEC_16    = 0x13;   // u16 (must be 0 for FAT32)
+let is i64 as BPB_MEDIA         = 0x15;   // u8
+let is i64 as BPB_FAT_SZ_16     = 0x16;   // u16 (must be 0 for FAT32)
+let is i64 as BPB_TOT_SEC_32    = 0x20;   // u32
+let is i64 as BPB_FAT_SZ_32     = 0x24;   // u32
+let is i64 as BPB_EXT_FLAGS     = 0x28;   // u16
+let is i64 as BPB_FS_VER        = 0x2A;   // u16 (must be 0)
+let is i64 as BPB_ROOT_CLUS     = 0x2C;   // u32
+let is i64 as BPB_FS_INFO       = 0x30;   // u16
+let is i64 as BPB_BK_BOOT       = 0x32;   // u16
+let is i64 as BPB_VOL_ID        = 0x43;   // u32
+let is i64 as BPB_VOL_LAB       = 0x47;   // 11 bytes
+let is i64 as BPB_FS_TYPE       = 0x52;   // 8 bytes, "FAT32   "
+let is i64 as BPB_SIG           = 0x1FE;  // u16, must be 0xAA55
+
+struct Fat32Volume {
+    dev as *storage.StorageDevice;
+
+    // Raw BPB values (as i64 for consistent arithmetic).
+    bytes_per_sector  as i64;
+    sectors_per_clus  as i64;
+    reserved_sectors  as i64;
+    num_fats          as i64;
+    fat_size_sectors  as i64;   // BPB_FAT_SZ_32
+    total_sectors     as i64;   // BPB_TOT_SEC_32
+    root_cluster      as i64;
+    fs_info_sector    as i64;
+    volume_id         as i64;
+    volume_label      as [12]u8;   // zero-terminated copy of BPB_VOL_LAB
+
+    // Derived.
+    cluster_size_bytes as i64;
+    fat_start_lba      as i64;   // reserved_sectors
+    data_start_lba     as i64;   // reserved + num_fats * fat_size
+    cluster_count      as i64;   // (total - data_start) / sectors_per_clus
+    is_mounted         as i32;   // 1 if valid, 0 otherwise
+}
+
+// Single static mount slot (V1).
+let is Fat32Volume as vol;
+
+// Scratch buffer for sector reads. AHCI requires DMA-safe memory in the
+// HHDM region (not kernel .bss), so we lazily allocate a page via pmm
+// on first use. One 4KB page fits a max-size sector (4096B).
+let is i64 as scratch_virt with mut = 0;
+
+fn ensure_scratch() as i32 {
+    if (scratch_virt != 0) { return 0; }
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ZONE_DMA32,
+        pmm.ALLOC_ZERO,
+        cast(i32, 0),
+        pmm.USAGE_KERNEL,
+        cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return cast(i32, 0 - 1); }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+    scratch_virt = phys + pmm.hhdm;
+    return 0;
+}
+
+// ============================================================
+// Little-endian readers from a byte buffer. FAT32 is defined LE.
+// ============================================================
+
+fn read_u16(buf as *u8, off as i64) as i64 {
+    return cast(i64, buf[off]) | (cast(i64, buf[off + 1]) << 8);
+}
+
+fn read_u32(buf as *u8, off as i64) as i64 {
+    return cast(i64, buf[off])
+         | (cast(i64, buf[off + 1]) << 8)
+         | (cast(i64, buf[off + 2]) << 16)
+         | (cast(i64, buf[off + 3]) << 24);
+}
+
+// Validate bytes_per_sector is one of {512, 1024, 2048, 4096} (spec).
+fn is_valid_sector_size(n as i64) as i32 {
+    if (n == 512)  { return 1; }
+    if (n == 1024) { return 1; }
+    if (n == 2048) { return 1; }
+    if (n == 4096) { return 1; }
+    return 0;
+}
+
+// Validate sectors_per_cluster is a power of two in [1, 128].
+fn is_valid_spc(n as i64) as i32 {
+    if (n < 1)   { return 0; }
+    if (n > 128) { return 0; }
+    if ((n & (n - 1)) != 0) { return 0; }
+    return 1;
+}
+
+// ============================================================
+// mount — read BPB, validate, derive layout, publish volume.
+// Returns null on any validation failure; logs the reason.
+// ============================================================
+
+fn mount(dev as *storage.StorageDevice) as *Fat32Volume {
+    if (cast(i64, dev) == 0) {
+        serial.println("fat32: mount null dev", 21);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Read sector 0. dev.sector_size may be >512, so we read one sector
+    // into the 4KB scratch (always big enough).
+    let is i64 as ss = storage.sector_size(dev);
+    if (ss < 512 || ss > 4096) {
+        serial.print("fat32: bad dev sector_size=", 27);
+        util.print_num(ss);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    if (ensure_scratch() != 0) {
+        serial.println("fat32: scratch alloc failed", 27);
+        return cast(*Fat32Volume, 0);
+    }
+    let is *u8 as buf = cast(*u8, scratch_virt);
+    let is i32 as rc = storage.read_lba(dev, 0, 1, buf);
+    if (rc != 0) {
+        serial.print("fat32: read sector 0 failed rc=", 31);
+        util.print_num(cast(i64, rc));
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Signature check first — cheapest rejection.
+    let is i64 as sig = read_u16(buf, BPB_SIG);
+    if (sig != 0xAA55) {
+        serial.print("fat32: bad signature 0x", 23);
+        util.print_hex(sig);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // fs_type string must match "FAT32   " (8 bytes).
+    let is i64 as fs0 = cast(i64, buf[BPB_FS_TYPE + 0]);
+    let is i64 as fs1 = cast(i64, buf[BPB_FS_TYPE + 1]);
+    let is i64 as fs2 = cast(i64, buf[BPB_FS_TYPE + 2]);
+    let is i64 as fs3 = cast(i64, buf[BPB_FS_TYPE + 3]);
+    let is i64 as fs4 = cast(i64, buf[BPB_FS_TYPE + 4]);
+    if (fs0 != 70 || fs1 != 65 || fs2 != 84 || fs3 != 51 || fs4 != 50) {
+        serial.println("fat32: fs_type not FAT32", 24);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Pull raw BPB fields.
+    let is i64 as bps   = read_u16(buf, BPB_BYTES_PER_SEC);
+    let is i64 as spc   = cast(i64, buf[BPB_SEC_PER_CLUS]);
+    let is i64 as rsvd  = read_u16(buf, BPB_RSVD_SEC_CNT);
+    let is i64 as nfats = cast(i64, buf[BPB_NUM_FATS]);
+    let is i64 as re16  = read_u16(buf, BPB_ROOT_ENT_CNT);
+    let is i64 as ts16  = read_u16(buf, BPB_TOT_SEC_16);
+    let is i64 as fs16  = read_u16(buf, BPB_FAT_SZ_16);
+    let is i64 as ts32  = read_u32(buf, BPB_TOT_SEC_32);
+    let is i64 as fs32  = read_u32(buf, BPB_FAT_SZ_32);
+    let is i64 as rclus = read_u32(buf, BPB_ROOT_CLUS);
+    let is i64 as fsver = read_u16(buf, BPB_FS_VER);
+    let is i64 as fsi   = read_u16(buf, BPB_FS_INFO);
+
+    // Validations per FAT32 spec.
+    if (is_valid_sector_size(bps) == 0) {
+        serial.print("fat32: bad bytes_per_sector=", 28);
+        util.print_num(bps); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    if (bps != ss) {
+        // BPB must agree with the physical device sector size.
+        serial.print("fat32: BPB bps=", 15);
+        util.print_num(bps);
+        serial.print(" != dev ss=", 11);
+        util.print_num(ss);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    if (is_valid_spc(spc) == 0) {
+        serial.print("fat32: bad sectors_per_clus=", 28);
+        util.print_num(spc); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    if (rsvd < 1) {
+        serial.println("fat32: reserved_sectors<1", 25);
+        return cast(*Fat32Volume, 0);
+    }
+    if (nfats < 1 || nfats > 2) {
+        serial.print("fat32: bad num_fats=", 20);
+        util.print_num(nfats); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    // FAT32 requires these to be zero.
+    if (re16 != 0) { serial.println("fat32: root_ent_cnt!=0", 22); return cast(*Fat32Volume, 0); }
+    if (ts16 != 0) { serial.println("fat32: tot_sec_16!=0",   20); return cast(*Fat32Volume, 0); }
+    if (fs16 != 0) { serial.println("fat32: fat_sz_16!=0",    19); return cast(*Fat32Volume, 0); }
+    if (fsver != 0) { serial.println("fat32: fs_ver!=0",      16); return cast(*Fat32Volume, 0); }
+    if (fs32 < 1) { serial.println("fat32: fat_sz_32<1",      18); return cast(*Fat32Volume, 0); }
+    if (ts32 < 1) { serial.println("fat32: tot_sec_32<1",     19); return cast(*Fat32Volume, 0); }
+    if (rclus < 2) {
+        serial.print("fat32: root_clus<2 =", 20);
+        util.print_num(rclus); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Derived layout.
+    let is i64 as fat_lba   = rsvd;
+    let is i64 as data_lba  = rsvd + nfats * fs32;
+    if (data_lba >= ts32) {
+        serial.println("fat32: data_lba past end", 24);
+        return cast(*Fat32Volume, 0);
+    }
+    let is i64 as data_secs = ts32 - data_lba;
+    let is i64 as ccount    = data_secs / spc;
+    // FAT32 spec: cluster_count must be >= 65525 to be a valid FAT32.
+    if (ccount < 65525) {
+        serial.print("fat32: cluster_count=", 21);
+        util.print_num(ccount);
+        serial.println(" < 65525 (not FAT32)", 20);
+        return cast(*Fat32Volume, 0);
+    }
+    if (rclus >= ccount + 2) {
+        serial.println("fat32: root_clus out of range", 29);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Cross-check device has enough sectors for the volume.
+    let is i64 as devsecs = storage.sector_count(dev);
+    if (devsecs > 0 && ts32 > devsecs) {
+        serial.print("fat32: BPB tot_sec=", 19);
+        util.print_num(ts32);
+        serial.print(" > dev=", 7);
+        util.print_num(devsecs);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Commit to volume struct.
+    vol.dev                = dev;
+    vol.bytes_per_sector   = bps;
+    vol.sectors_per_clus   = spc;
+    vol.reserved_sectors   = rsvd;
+    vol.num_fats           = nfats;
+    vol.fat_size_sectors   = fs32;
+    vol.total_sectors      = ts32;
+    vol.root_cluster       = rclus;
+    vol.fs_info_sector     = fsi;
+    vol.volume_id          = read_u32(buf, BPB_VOL_ID);
+    vol.cluster_size_bytes = bps * spc;
+    vol.fat_start_lba      = fat_lba;
+    vol.data_start_lba     = data_lba;
+    vol.cluster_count      = ccount;
+
+    // Copy volume label (11 bytes, space-padded in BPB).
+    let is i64 as i with mut = 0;
+    while (i < 11) {
+        vol.volume_label[i] = buf[BPB_VOL_LAB + i];
+        i = i + 1;
+    }
+    vol.volume_label[11] = cast(u8, 0);
+    vol.is_mounted = 1;
+
+    // Log concise summary.
+    serial.print("fat32: mounted ", 15);
+    let is i64 as j with mut = 0;
+    while (j < 11) {
+        let is u8 as c = vol.volume_label[j];
+        if (c == cast(u8, 0)) { j = 11; }
+        else { serial.putc(cast(i64, c)); j = j + 1; }
+    }
+    serial.print(" bps=", 5);   util.print_num(bps);
+    serial.print(" spc=", 5);   util.print_num(spc);
+    serial.print(" rsvd=", 6);  util.print_num(rsvd);
+    serial.print(" fatsz=", 7); util.print_num(fs32);
+    serial.print(" clusters=", 10); util.print_num(ccount);
+    serial.print(" root=", 6);  util.print_num(rclus);
+    serial.println("", 0);
+
+    return &vol;
+}
+
+// ============================================================
+// Accessors / helpers for later phases.
+// ============================================================
+
+fn head() as *Fat32Volume {
+    if (vol.is_mounted == 0) { return cast(*Fat32Volume, 0); }
+    return &vol;
+}
+
+// Convert a cluster number (>=2) to its absolute LBA on the device.
+// Returns -1 if cluster is out of range.
+fn cluster_to_lba(v as *Fat32Volume, cluster as i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (cluster < 2) { return 0 - 1; }
+    if (cluster >= v.cluster_count + 2) { return 0 - 1; }
+    return v.data_start_lba + (cluster - 2) * v.sectors_per_clus;
+}
+
+// ============================================================
+// Mount thread — yields until a storage device appears in the
+// registry, then tries to mount it as FAT32. Intended to be
+// started after driver phase 2 has kicked off probing.
+// ============================================================
+
+fn mount_thread() as void {
+    // Bounded wait for storage to show up (probing runs on its own
+    // thread after phase 2). Each yield lets the scheduler run other
+    // threads; ~1000 iterations is generous given AHCI bind completes
+    // within a few quanta.
+    let is i64 as tries with mut = 0;
+    let is *storage.StorageDevice as d with mut = storage.head();
+    while (cast(i64, d) == 0 && tries < 1000) {
+        sched.yield_cpu();
+        d = storage.head();
+        tries = tries + 1;
+    }
+    if (cast(i64, d) == 0) {
+        serial.println("fat32: no storage device after wait", 35);
+        return;
+    }
+    mount(d);
+}
