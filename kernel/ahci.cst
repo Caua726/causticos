@@ -15,6 +15,8 @@ use "serial.cst" as serial;
 use "util.cst" as util;
 use "heap.cst" as heap;
 use "timer.cst" as timer;
+use "io.cst" as io;
+use "pmm.cst" as pmm;
 
 // HBA register offsets (ABAR + N)
 let is i64 as HBA_CAP  = 0x00;
@@ -68,24 +70,46 @@ let is i64 as TFD_DRQ = 8;
 let is i64 as TFD_BSY = 0x80;
 
 // SATA commands
-let is i64 as ATA_CMD_IDENTIFY = 0xEC;
+let is i64 as ATA_CMD_IDENTIFY    = 0xEC;
+let is i64 as ATA_CMD_READ_DMA_EX  = 0x25;    // READ DMA EXT, 48-bit LBA
+let is i64 as ATA_CMD_WRITE_DMA_EX = 0x35;    // WRITE DMA EXT, 48-bit LBA
 
-// One static HBA context — only one AHCI controller expected in V1.
-// If the kernel ever binds to multiple HBAs this moves into a per-
-// binding heap allocation.
+// Per-sector size. AHCI doesn't know this; we infer from IDENTIFY
+// word 106 when available, default to 512.
+let is i64 as DEFAULT_SECTOR_SIZE = 512;
+
+// Max command slots the HBA can have (AHCI spec: up to 32).
+let is i64 as MAX_SLOTS = 32;
+
+// Port IE bits we enable. Ready-to-receive + DMA setup + SDB + task
+// file error + host bus fatal/data/cold presence.
+let is i64 as PX_IE_BITS = 0xFDC000FF;
+
+// Per-HBA state. One singleton today (V1 supports a single AHCI
+// controller). Extending to multiple HBAs means moving this into
+// Binding.private and allocating per-bind via heap.
 struct AhciCtx {
-    abar as *u8;                       // ABAR virtual (from b.caps.mmio)
-    port as i64;                       // first active port (0 today)
-    cmd_list as *driver.DmaBuffer;     // 1KB command list (32 × 32-byte headers)
-    fis_base as *driver.DmaBuffer;     // 256-byte received FIS area
-    cmd_table as *driver.DmaBuffer;    // 128B header + PRDT
-    id_buf as *driver.DmaBuffer;       // 512B IDENTIFY result
+    abar as *u8;                        // ABAR virtual (from b.caps.mmio)
+    port as i64;                        // first active port (0 today)
+    ncs as i64;                         // command slots available (CAP.NCS + 1)
+    sector_size as i64;                 // from IDENTIFY word 106 or default
+    cmd_list as *driver.DmaBuffer;      // 1KB command list (32 × 32B headers)
+    fis_base as *driver.DmaBuffer;      // 256-byte received FIS area
+    cmd_tables as *driver.DmaBuffer;    // 32 × 1024B command tables (per slot)
+    id_buf as *driver.DmaBuffer;        // 512B IDENTIFY result
+    // Per-slot BlockRequest pointers stored as i64. Caustic struct
+    // arrays of pointers trip the mixed-width layout convention; i64
+    // is the canonical carrier. slot_requests_raw is indexed directly.
+    slot_requests_raw as [32]i64;
+    provider as io.BlockIOProvider;     // embedded; registered with io
+    binding as *spec.Binding;           // kept so on_irq can find the provider
 }
 
 let is AhciCtx as ctx;
 
 // ksym publishing for spec framework
 let is ksym.KSym as ksym_bind;
+let is ksym.KSym as ksym_irq;
 
 // ============================================================
 // MMIO helpers
@@ -187,44 +211,23 @@ fn port_wait_link(abar as *u8, port as i64) as i32 {
     return cast(i32, 0 - 1);
 }
 
-// Write command header 0 in the command list. CFL = FIS length in
-// dwords (5 for H2D register); W=0 read, W=1 write; PRDTL = number of
-// PRDT entries. CTBA points at the command table physical address.
-fn fill_cmd_header(c as *AhciCtx, write_flag as i64, prdtl as i64) as void {
-    let is *u8 as h = cast(*u8, c.cmd_list.virt);
-    let is *u32 as dw0 = cast(*u32, cast(i64, h) + 0);
-    let is i64 as flags with mut = 5;                   // CFL=5 dwords
-    if (write_flag == 1) { flags = flags | 0x40; }       // W bit
-    flags = flags | (prdtl << 16);
-    *dw0 = cast(u32, flags);
-    let is *u32 as prdbc = cast(*u32, cast(i64, h) + 4);
-    *prdbc = cast(u32, 0);
-    let is *u32 as ctba  = cast(*u32, cast(i64, h) + 8);
-    *ctba = cast(u32, c.cmd_table.phys & 0xFFFFFFFF);
-    let is *u32 as ctbau = cast(*u32, cast(i64, h) + 12);
-    *ctbau = cast(u32, (c.cmd_table.phys >> 32) & 0xFFFFFFFF);
-}
-
-// Build a single-PRDT command table for IDENTIFY. FIS type 0x27
-// (H2D register), command byte 0xEC, device 0xA0, no LBA, count 0.
+// Build IDENTIFY command table in slot 0's command-table area.
+// FIS type 0x27 (H2D register), command byte 0xEC, device 0xA0,
+// single-PRDT pointing at id_buf.
 fn build_identify_ct(c as *AhciCtx) as void {
-    let is *u8 as ct = cast(*u8, c.cmd_table.virt);
-    // Zero the first 128 bytes + 16 bytes of PRDT
+    let is *u8 as ct = slot_ct_virt(c, 0);
     let is i64 as zi with mut = 0;
     while (zi < 144) { ct[zi] = cast(u8, 0); zi = zi + 1; }
-    // Command FIS @ offset 0
     ct[0] = cast(u8, 0x27);         // FIS_TYPE_REG_H2D
     ct[1] = cast(u8, 0x80);         // C=1 (command)
-    ct[2] = cast(u8, 0xEC);         // IDENTIFY DEVICE
-    ct[7] = cast(u8, 0xA0);         // device (master, LBA mode irrelevant)
-    // PRDT entry 0 @ offset 0x80
+    ct[2] = cast(u8, ATA_CMD_IDENTIFY);
+    ct[7] = cast(u8, 0xA0);
     let is *u32 as dba = cast(*u32, cast(i64, ct) + 0x80);
     *dba = cast(u32, c.id_buf.phys & 0xFFFFFFFF);
     let is *u32 as dbau = cast(*u32, cast(i64, ct) + 0x84);
     *dbau = cast(u32, (c.id_buf.phys >> 32) & 0xFFFFFFFF);
-    // reserved 0x88..0x8B already zeroed
     let is *u32 as dbc = cast(*u32, cast(i64, ct) + 0x8C);
-    *dbc = cast(u32, (512 - 1) | 0x80000000);    // byte count - 1, I bit
+    *dbc = cast(u32, (512 - 1) | 0x80000000);
 }
 
 // Wait until BSY + DRQ clear. Polling; AHCI irq not yet wired here.
@@ -358,18 +361,29 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
     mmio_write32(pb, PX_IS, cast(i64, 0 - 1));
 
-    // Allocate command list (1KB), FIS base (256B), command table
-    // (128B header + 16 PRDT entries = up to 256B; round to 1KB),
-    // and IDENTIFY buffer (512B). All in ZONE_DMA32 for HBAs that
-    // don't support S64A.
+    // NCS from CAP bits 8-12; cap at MAX_SLOTS.
+    ctx.ncs = ((cap >> 8) & 0x1F) + 1;
+    if (ctx.ncs > MAX_SLOTS) { ctx.ncs = MAX_SLOTS; }
+    ctx.sector_size = DEFAULT_SECTOR_SIZE;
+    ctx.binding = b;
+
+    // Zero the slot->request table so harvest never sees stale entries.
+    let is i64 as si with mut = 0;
+    while (si < MAX_SLOTS) { ctx.slot_requests_raw[si] = 0; si = si + 1; }
+
+    // Command list (1KB, 1KB-aligned per spec), FIS area (256B, 256-aligned),
+    // IDENTIFY buffer (512B), and one command table per slot (1KB each,
+    // 128-aligned per spec; we allocate ncs * 1024 contiguously). All in
+    // ZONE_DMA32 so HBAs without CAP.S64A can address them directly.
     let is i32 as rc1 = driver.dma_alloc(b.hardware, cast(u64, 1024), cast(u64, 1024),
                                           cast(u32, 1), &ctx.cmd_list);
     if (rc1 != driver.OK) { serial.println("ahci: cmd_list alloc fail", 25); return rc1; }
     let is i32 as rc2 = driver.dma_alloc(b.hardware, cast(u64, 256), cast(u64, 256),
                                           cast(u32, 1), &ctx.fis_base);
     if (rc2 != driver.OK) { serial.println("ahci: fis alloc fail", 20); return rc2; }
-    let is i32 as rc3 = driver.dma_alloc(b.hardware, cast(u64, 1024), cast(u64, 128),
-                                          cast(u32, 1), &ctx.cmd_table);
+    let is u64 as ct_total = cast(u64, ctx.ncs) * cast(u64, 1024);
+    let is i32 as rc3 = driver.dma_alloc(b.hardware, ct_total, cast(u64, 128),
+                                          cast(u32, 1), &ctx.cmd_tables);
     if (rc3 != driver.OK) { serial.println("ahci: ct alloc fail", 19); return rc3; }
     let is i32 as rc4 = driver.dma_alloc(b.hardware, cast(u64, 512), cast(u64, 2),
                                           cast(u32, 1), &ctx.id_buf);
@@ -412,7 +426,7 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     }
 
     build_identify_ct(&ctx);
-    fill_cmd_header(&ctx, 0, 1);        // read, 1 PRDT entry
+    fill_slot_header(&ctx, 0, 0);       // slot 0, read
 
     mmio_write32(pb, PX_CI, cast(i64, 1) << slot);
 
@@ -431,7 +445,265 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     }
 
     print_identify_model(cast(*u8, ctx.id_buf.virt));
+
+    // Infer sector size from IDENTIFY word 106: if bit 12 set, word
+    // 117-118 carries logical sector size in 16-bit words. Otherwise
+    // 512. Most QEMU and commodity drives report 512.
+    let is *u8 as id = cast(*u8, ctx.id_buf.virt);
+    let is *u16 as id16 = cast(*u16, id);
+    let is i64 as word106 = cast(i64, id16[106]) & 0xFFFF;
+    if ((word106 & 0x4000) == 0x4000 && (word106 & 0x1000) != 0) {
+        let is i64 as sw = cast(i64, id16[117]) | (cast(i64, id16[118]) << 16);
+        if (sw > 0) { ctx.sector_size = sw * 2; }
+    }
+    serial.print("ahci: sector_size=", 18);
+    util.print_num(ctx.sector_size);
+    serial.println("", 0);
+
+    // Register the block I/O provider and enable per-port + HBA interrupts.
+    ctx.provider.device      = b.hardware;
+    ctx.provider.submit_io   = fn_ptr(ahci_submit);
+    ctx.provider.harvest_io  = fn_ptr(ahci_harvest);
+    ctx.provider.private     = cast(*u8, &ctx);
+    ctx.provider.pending_head = cast(*io.BlockRequest, 0);
+    ctx.provider.pending_count = 0;
+    ctx.provider.next         = cast(*io.BlockIOProvider, 0);
+    let is i32 as prc = io.register(&ctx.provider);
+    if (prc != driver.OK) {
+        serial.println("ahci: io.register failed", 24);
+        return prc;
+    }
+
+    mmio_write32(pb, PX_IE, PX_IE_BITS);
+    let is i64 as ghc_final = mmio_read32(abar, HBA_GHC);
+    mmio_write32(abar, HBA_GHC, ghc_final | GHC_IE);
+
+    // End-to-end self-test: read LBA 0. Validates submit/harvest
+    // round-trip and the race-free wait_complete path.
+    self_test_read_lba0(&ctx);
     return driver.OK;
+}
+
+// ============================================================
+// READ / WRITE DMA EXT — build FIS H2D + single-PRDT command table
+// ============================================================
+
+fn slot_ct_virt(c as *AhciCtx, slot as i64) as *u8 {
+    return cast(*u8, cast(i64, c.cmd_tables.virt) + slot * 1024);
+}
+
+fn slot_ct_phys(c as *AhciCtx, slot as i64) as i64 {
+    return c.cmd_tables.phys + slot * 1024;
+}
+
+// Build H2D FIS for READ/WRITE DMA EXT (48-bit LBA, up to 65536
+// sectors per command). Overwrites the first 128 bytes of the
+// command table (FIS + ATAPI area + reserved).
+fn build_rw_fis(ct as *u8, is_write as i64, lba as i64, count as i64) as void {
+    let is i64 as zi with mut = 0;
+    while (zi < 128) { ct[zi] = cast(u8, 0); zi = zi + 1; }
+    ct[0] = cast(u8, 0x27);                      // FIS_TYPE_REG_H2D
+    ct[1] = cast(u8, 0x80);                      // C=1 (command)
+    if (is_write == 1) {
+        ct[2] = cast(u8, ATA_CMD_WRITE_DMA_EX);
+    } else {
+        ct[2] = cast(u8, ATA_CMD_READ_DMA_EX);
+    }
+    ct[3] = cast(u8, 0);                         // features (low)
+    ct[4] = cast(u8, lba & 0xFF);
+    ct[5] = cast(u8, (lba >> 8)  & 0xFF);
+    ct[6] = cast(u8, (lba >> 16) & 0xFF);
+    ct[7] = cast(u8, 0x40);                      // device = LBA mode
+    ct[8] = cast(u8, (lba >> 24) & 0xFF);
+    ct[9] = cast(u8, (lba >> 32) & 0xFF);
+    ct[10] = cast(u8, (lba >> 40) & 0xFF);
+    ct[11] = cast(u8, 0);                        // features (high)
+    ct[12] = cast(u8, count & 0xFF);
+    ct[13] = cast(u8, (count >> 8) & 0xFF);
+    ct[14] = cast(u8, 0);                        // ICC
+    ct[15] = cast(u8, 0);                        // control
+}
+
+// Single-PRDT entry at offset 0x80. AHCI spec §4.2.3: DBC is
+// (byte_count - 1) in bits 0-21, bit 31 is interrupt-on-complete.
+// byte_count must be even.
+fn build_prdt_one(ct as *u8, phys as i64, byte_count as i64) as void {
+    let is *u32 as dba = cast(*u32, cast(i64, ct) + 0x80);
+    *dba = cast(u32, phys & 0xFFFFFFFF);
+    let is *u32 as dbau = cast(*u32, cast(i64, ct) + 0x84);
+    *dbau = cast(u32, (phys >> 32) & 0xFFFFFFFF);
+    let is *u32 as rsvd = cast(*u32, cast(i64, ct) + 0x88);
+    *rsvd = cast(u32, 0);
+    let is *u32 as dbc = cast(*u32, cast(i64, ct) + 0x8C);
+    *dbc = cast(u32, (byte_count - 1) | 0x80000000);
+}
+
+// Command header at list[slot]. CFL=5 dwords (H2D register FIS),
+// PRDTL=1. W bit set for writes.
+fn fill_slot_header(c as *AhciCtx, slot as i64, is_write as i64) as void {
+    let is *u8 as h = cast(*u8, cast(i64, c.cmd_list.virt) + slot * 32);
+    let is i64 as flags with mut = 5;
+    if (is_write == 1) { flags = flags | 0x40; }
+    flags = flags | (cast(i64, 1) << 16);          // PRDTL=1
+    let is *u32 as dw0 = cast(*u32, h);
+    *dw0 = cast(u32, flags);
+    let is *u32 as prdbc = cast(*u32, cast(i64, h) + 4);
+    *prdbc = cast(u32, 0);
+    let is i64 as ct_phys = slot_ct_phys(c, slot);
+    let is *u32 as ctba = cast(*u32, cast(i64, h) + 8);
+    *ctba = cast(u32, ct_phys & 0xFFFFFFFF);
+    let is *u32 as ctbau = cast(*u32, cast(i64, h) + 12);
+    *ctbau = cast(u32, (ct_phys >> 32) & 0xFFFFFFFF);
+}
+
+// ============================================================
+// Slot request table (pointer ↔ slot mapping)
+// ============================================================
+
+fn slot_request_get(c as *AhciCtx, slot as i64) as *io.BlockRequest {
+    return cast(*io.BlockRequest, c.slot_requests_raw[slot]);
+}
+
+fn slot_request_set(c as *AhciCtx, slot as i64, r as *io.BlockRequest) as void {
+    c.slot_requests_raw[slot] = cast(i64, r);
+}
+
+// ============================================================
+// io.BlockIOProvider — submit / harvest
+// ============================================================
+
+fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
+    let is *AhciCtx as c = cast(*AhciCtx, p.private);
+    let is *u8 as pb = port_base(c.abar, c.port);
+
+    if (r.op != io.OP_READ) {
+        if (r.op != io.OP_WRITE) {
+            // Only READ/WRITE today. OP_FLUSH arrives with Phase E3.
+            return cast(i32, driver.NOT_SUPPORTED);
+        }
+    }
+
+    // Translate buf virtual → physical. Upper layer contract: buf is
+    // HHDM-mapped kernel virtual (typical for dma_alloc'd or direct
+    // pmm-backed buffers). kvalloc addresses don't satisfy this and
+    // are rejected here; scatter-gather path for non-contiguous
+    // allocations is a future extension.
+    let is i64 as buf_virt = cast(i64, r.buf);
+    if (buf_virt < pmm.hhdm) {
+        serial.println("ahci: buf not in HHDM", 21);
+        return cast(i32, driver.INVALID_ARGUMENT);
+    }
+    let is i64 as buf_phys = buf_virt - pmm.hhdm;
+    let is i64 as byte_count = r.count * c.sector_size;
+    if (byte_count <= 0) { return cast(i32, driver.INVALID_ARGUMENT); }
+    if ((byte_count & 1) != 0) { return cast(i32, driver.INVALID_ARGUMENT); }
+
+    // Reserve a slot. alloc_slot scans SACT|CI; we additionally check
+    // slot_requests_raw so a free HW slot that's still mid-book-keeping
+    // can't be double-assigned.
+    sched.preempt_disable();
+    let is i64 as slot with mut = cast(i64, 0 - 1);
+    let is i64 as used_mask = mmio_read32(pb, PX_CI) | mmio_read32(pb, 0x34);
+    let is i64 as s with mut = 0;
+    while (s < c.ncs) {
+        let is i64 as used_bit = (used_mask >> s) & 1;
+        if (used_bit == 0) {
+            if (slot_request_get(c, s) == cast(*io.BlockRequest, 0)) {
+                slot = s;
+                s = c.ncs;
+            } else {
+                s = s + 1;
+            }
+        } else {
+            s = s + 1;
+        }
+    }
+    if (slot < 0) {
+        sched.preempt_enable();
+        return cast(i32, driver.DEVICE_BUSY);
+    }
+    slot_request_set(c, slot, r);
+    r.driver_slot = slot;
+    sched.preempt_enable();
+
+    // Build command table + header
+    let is *u8 as ct = slot_ct_virt(c, slot);
+    let is i64 as is_write with mut = 0;
+    if (r.op == io.OP_WRITE) { is_write = 1; }
+    build_rw_fis(ct, is_write, r.lba, r.count);
+    build_prdt_one(ct, buf_phys, byte_count);
+    fill_slot_header(c, slot, is_write);
+
+    // Kick: set the corresponding bit in PX_CI. Single-writer from
+    // this context; safe without read-modify-write.
+    mmio_write32(pb, PX_CI, cast(i64, 1) << slot);
+    return 0;
+}
+
+fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
+    let is *AhciCtx as c = cast(*AhciCtx, p.private);
+    let is *u8 as pb = port_base(c.abar, c.port);
+    let is i64 as ci = mmio_read32(pb, PX_CI);
+    let is i64 as tfd = mmio_read32(pb, PX_TFD);
+    let is i64 as has_err with mut = 0;
+    if ((tfd & TFD_ERR) != 0) { has_err = 1; }
+
+    let is i64 as slot with mut = 0;
+    while (slot < c.ncs) {
+        let is *io.BlockRequest as r = slot_request_get(c, slot);
+        if (cast(i64, r) != 0) {
+            let is i64 as bit = (ci >> slot) & 1;
+            if (bit == 0) {
+                slot_request_set(c, slot, cast(*io.BlockRequest, 0));
+                if (has_err == 1) { r.status = cast(i32, 0 - 1); }
+                else              { r.status = 0; }
+                *out = r;
+                return 1;
+            }
+        }
+        slot = slot + 1;
+    }
+    *out = cast(*io.BlockRequest, 0);
+    return 0;
+}
+
+// ============================================================
+// IRQ entry — framework hands us *Hardware + Binding-as-ctx
+// ============================================================
+
+fn ahci_irq(hw as *driver.Hardware, context as *u8) as i32 {
+    // Our binding pointer is the handler context. Look up the
+    // BlockIOProvider attached to this binding's device and drain.
+    let is *spec.Binding as b = cast(*spec.Binding, context);
+    let is *io.BlockIOProvider as p = io.find_provider(b.hardware);
+    if (cast(i64, p) != 0) {
+        io.harvest_all(p);
+    }
+    // Clear port IS then HBA IS in that order per AHCI spec §10.1.2.
+    let is *u8 as pb = port_base(ctx.abar, ctx.port);
+    mmio_write32(pb, PX_IS, cast(i64, 0 - 1));
+    mmio_write32(ctx.abar, HBA_IS, cast(i64, 1) << ctx.port);
+    return 0;
+}
+
+// ============================================================
+// Post-IDENTIFY self-test: read LBA 0, verify submit/harvest round-trip
+// ============================================================
+
+fn self_test_read_lba0(c as *AhciCtx) as void {
+    let is *driver.DmaBuffer as test_buf;
+    let is i32 as rc = driver.dma_alloc(c.binding.hardware, cast(u64, 512),
+                                         cast(u64, 2), cast(u32, 1), &test_buf);
+    if (rc != driver.OK) {
+        serial.println("ahci.self_test: dma_alloc fail", 30);
+        return;
+    }
+    let is i32 as status = io.read_sync(c.binding.hardware, c.port, 0, 1,
+                                         cast(*u8, test_buf.virt));
+    serial.print("ahci.self_test: read LBA 0 status=", 34);
+    util.print_num(cast(i64, status));
+    serial.println("", 0);
+    driver.dma_free(c.binding.hardware, test_buf);
 }
 
 fn register() as void {
@@ -440,5 +712,12 @@ fn register() as void {
     ksym_bind.addr     = cast(i64, fn_ptr(ahci_bind));
     ksym_bind.kind     = ksym.KIND_FUNC;
     ksym.register(&ksym_bind);
+
+    ksym_irq.name_ptr = cast(*u8, "ahci.ahci_irq");
+    ksym_irq.name_len = 13;
+    ksym_irq.addr     = cast(i64, fn_ptr(ahci_irq));
+    ksym_irq.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_irq);
+
     serial.println("ahci: registered", 16);
 }
