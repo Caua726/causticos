@@ -18,6 +18,7 @@ use "timer.cst" as timer;
 use "io.cst" as io;
 use "pmm.cst" as pmm;
 use "pci.cst" as pci;
+use "storage.cst" as storage;
 
 // HBA register offsets (ABAR + N)
 let is i64 as HBA_CAP  = 0x00;
@@ -95,6 +96,7 @@ struct AhciCtx {
     port as i64;                        // first active port (0 today)
     ncs as i64;                         // command slots available (CAP.NCS + 1)
     sector_size as i64;                 // from IDENTIFY word 106 or default
+    sector_count as i64;                // from IDENTIFY words 100-103 (LBA48)
     cmd_list as *driver.DmaBuffer;      // 1KB command list (32 × 32B headers)
     fis_base as *driver.DmaBuffer;      // 256-byte received FIS area
     cmd_tables as *driver.DmaBuffer;    // 32 × 1024B command tables (per slot)
@@ -105,6 +107,7 @@ struct AhciCtx {
     slot_requests_raw as [32]i64;
     provider as io.BlockIOProvider;     // embedded; registered with io
     binding as *spec.Binding;           // kept so on_irq can find the provider
+    storage_dev as storage.StorageDevice; // embedded; registered with storage
 }
 
 let is AhciCtx as ctx;
@@ -453,9 +456,10 @@ fn ahci_bind(b as *spec.Binding) as i32 {
 
     print_identify_model(cast(*u8, ctx.id_buf.virt));
 
-    // Infer sector size from IDENTIFY word 106: if bit 12 set, word
-    // 117-118 carries logical sector size in 16-bit words. Otherwise
-    // 512. Most QEMU and commodity drives report 512.
+    // Infer sector size from IDENTIFY word 106: if bit 14 set and
+    // bit 12 set, words 117-118 carry logical sector size in 16-bit
+    // word units. Otherwise 512. Most QEMU and commodity drives
+    // report 512.
     let is *u8 as id = cast(*u8, ctx.id_buf.virt);
     let is *u16 as id16 = cast(*u16, id);
     let is i64 as word106 = cast(i64, id16[106]) & 0xFFFF;
@@ -463,8 +467,24 @@ fn ahci_bind(b as *spec.Binding) as i32 {
         let is i64 as sw = cast(i64, id16[117]) | (cast(i64, id16[118]) << 16);
         if (sw > 0) { ctx.sector_size = sw * 2; }
     }
+
+    // Total sectors: IDENTIFY words 100-103 = 48-bit LBA total count.
+    // For drives without LBA48 support, fall back to word 60-61
+    // (32-bit LBA28 count).
+    let is i64 as lba48 = cast(i64, id16[100])
+                        | (cast(i64, id16[101]) << 16)
+                        | (cast(i64, id16[102]) << 32)
+                        | (cast(i64, id16[103]) << 48);
+    if (lba48 > 0) {
+        ctx.sector_count = lba48;
+    } else {
+        ctx.sector_count = cast(i64, id16[60]) | (cast(i64, id16[61]) << 16);
+    }
+
     serial.print("ahci: sector_size=", 18);
     util.print_num(ctx.sector_size);
+    serial.print(" sectors=", 9);
+    util.print_num(ctx.sector_count);
     serial.println("", 0);
 
     // Register the block I/O provider and enable per-port + HBA interrupts.
@@ -484,6 +504,15 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     mmio_write32(pb, PX_IE, PX_IE_BITS);
     let is i64 as ghc_final = mmio_read32(abar, HBA_GHC);
     mmio_write32(abar, HBA_GHC, ghc_final | GHC_IE);
+
+    // Publish this port as an abstract StorageDevice for filesystems.
+    let is i32 as src = register_storage_device(&ctx);
+    if (src != 0) {
+        serial.print("ahci: storage.register failed rc=", 33);
+        util.print_num(cast(i64, src));
+        serial.println("", 0);
+        return cast(i32, 0 - 7);
+    }
 
     // End-to-end self-test: write pattern / flush / read / verify.
     // Exercises all three op kinds (OP_WRITE/OP_FLUSH/OP_READ), the
@@ -871,6 +900,69 @@ fn self_test_io(c as *AhciCtx) as void {
 
     driver.dma_free(c.binding.hardware, wbuf);
     driver.dma_free(c.binding.hardware, rbuf);
+}
+
+// ============================================================
+// storage.StorageDevice adapters — thin wrappers around io.read_sync /
+// write_sync / flush_sync that unpack the AhciCtx from the priv
+// pointer and forward to the queue. These are what filesystems like
+// FAT32 call through — they have no dependency on AHCI internals.
+// ============================================================
+
+fn stor_read(priv as *u8, lba as i64, count as i64, buf as *u8) as i32 {
+    let is *AhciCtx as c = cast(*AhciCtx, priv);
+    return io.read_sync(c.binding.hardware, c.port, lba, count, buf);
+}
+
+fn stor_write(priv as *u8, lba as i64, count as i64, buf as *u8) as i32 {
+    let is *AhciCtx as c = cast(*AhciCtx, priv);
+    return io.write_sync(c.binding.hardware, c.port, lba, count, buf);
+}
+
+fn stor_flush(priv as *u8) as i32 {
+    let is *AhciCtx as c = cast(*AhciCtx, priv);
+    return io.flush_sync(c.binding.hardware, c.port);
+}
+
+fn stor_sector_size(priv as *u8) as i64 {
+    let is *AhciCtx as c = cast(*AhciCtx, priv);
+    return c.sector_size;
+}
+
+fn stor_sector_count(priv as *u8) as i64 {
+    let is *AhciCtx as c = cast(*AhciCtx, priv);
+    return c.sector_count;
+}
+
+// Populate AhciCtx.storage_dev and register it with the storage
+// registry. Called after IDENTIFY has set sector_size + sector_count
+// and after the BlockIOProvider is registered.
+fn register_storage_device(c as *AhciCtx) as i32 {
+    // Name: "ahci-pN" where N is the port index (0-31, so 1 or 2 digits)
+    c.storage_dev.name[0] = cast(u8, 97);   // 'a'
+    c.storage_dev.name[1] = cast(u8, 104);  // 'h'
+    c.storage_dev.name[2] = cast(u8, 99);   // 'c'
+    c.storage_dev.name[3] = cast(u8, 105);  // 'i'
+    c.storage_dev.name[4] = cast(u8, 45);   // '-'
+    c.storage_dev.name[5] = cast(u8, 112);  // 'p'
+    let is i64 as pos with mut = 6;
+    if (c.port >= 10) {
+        c.storage_dev.name[pos] = cast(u8, 48 + (c.port / 10));
+        pos = pos + 1;
+    }
+    c.storage_dev.name[pos] = cast(u8, 48 + (c.port % 10));
+    pos = pos + 1;
+    c.storage_dev.name[pos] = cast(u8, 0);
+
+    c.storage_dev.read_lba     = fn_ptr(stor_read);
+    c.storage_dev.write_lba    = fn_ptr(stor_write);
+    c.storage_dev.flush        = fn_ptr(stor_flush);
+    c.storage_dev.sector_size  = fn_ptr(stor_sector_size);
+    c.storage_dev.sector_count = fn_ptr(stor_sector_count);
+    c.storage_dev.priv         = cast(*u8, c);
+    c.storage_dev.next         = cast(*storage.StorageDevice, 0);
+
+    return storage.register(&c.storage_dev);
 }
 
 fn register() as void {

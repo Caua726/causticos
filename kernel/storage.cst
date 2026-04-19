@@ -1,0 +1,121 @@
+// storage.cst — block-storage device registry + abstract I/O contract.
+//
+// Sits between driver-specific block I/O (AHCI today, NVMe/USB later)
+// and filesystem code (FAT32). Drivers register one StorageDevice per
+// addressable disk; consumers enumerate the registry and issue reads,
+// writes, and flushes through the vtable without knowing which
+// hardware backs the disk.
+//
+// Each method takes an opaque `priv` pointer as its first argument so
+// the registry supports multi-instance drivers (two AHCI HBAs, AHCI
+// port 0 + NVMe namespace 1, etc.) without a global singleton. The
+// driver populates priv at registration time and the vtable methods
+// cast it back to their own state struct.
+
+use "sched.cst" as sched;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+struct StorageDevice {
+    name as [32]u8;
+    // All methods take (priv, ...) so each device carries its own
+    // state pointer; read_lba/write_lba take (priv, lba, count, buf).
+    read_lba     as fn(*u8, i64, i64, *u8) as i32;
+    write_lba    as fn(*u8, i64, i64, *u8) as i32;
+    flush        as fn(*u8) as i32;
+    // Opaque metadata accessors — return bytes, not sectors, to avoid
+    // ambiguity on non-512B drives.
+    sector_size  as fn(*u8) as i64;
+    sector_count as fn(*u8) as i64;
+    priv         as *u8;
+    next         as *StorageDevice;
+}
+
+// ============================================================
+// Registry
+// ============================================================
+
+let is i64 as devices with mut = 0;
+let is i64 as device_count with mut = 0;
+
+fn register(dev as *StorageDevice) as i32 {
+    if (cast(i64, dev) == 0)           { return cast(i32, 0 - 1); }
+    if (cast(i64, dev.read_lba) == 0)  { return cast(i32, 0 - 2); }
+    if (cast(i64, dev.write_lba) == 0) { return cast(i32, 0 - 2); }
+    if (cast(i64, dev.flush) == 0)     { return cast(i32, 0 - 2); }
+
+    sched.preempt_disable();
+    dev.next = cast(*StorageDevice, devices);
+    devices = cast(i64, dev);
+    device_count = device_count + 1;
+    sched.preempt_enable();
+
+    serial.print("storage: registered ", 20);
+    let is i64 as i with mut = 0;
+    while (i < 32) {
+        if (dev.name[i] == cast(u8, 0)) { i = 32; }
+        else { serial.putc(cast(i64, dev.name[i])); i = i + 1; }
+    }
+    serial.print(" (", 2);
+    util.print_num(call(dev.sector_count, dev.priv));
+    serial.print(" sectors x ", 11);
+    util.print_num(call(dev.sector_size, dev.priv));
+    serial.println("B)", 2);
+    return 0;
+}
+
+fn head() as *StorageDevice {
+    return cast(*StorageDevice, devices);
+}
+
+fn count() as i64 {
+    return device_count;
+}
+
+// Lookup by name (zero-terminated or full 32 bytes). Returns first
+// match or null. Case-sensitive.
+fn find(name as *u8, name_len as i64) as *StorageDevice {
+    let is *StorageDevice as d with mut = cast(*StorageDevice, devices);
+    while (cast(i64, d) != 0) {
+        let is i64 as j with mut = 0;
+        let is i32 as eq with mut = 1;
+        while (j < name_len) {
+            if (j >= 32)                 { eq = 0; j = name_len; }
+            else if (d.name[j] != name[j]) { eq = 0; j = name_len; }
+            else                         { j = j + 1; }
+        }
+        if (eq == 1) {
+            // Also require terminator at name_len (or full 32)
+            if (name_len == 32 || d.name[name_len] == cast(u8, 0)) {
+                return d;
+            }
+        }
+        d = d.next;
+    }
+    return cast(*StorageDevice, 0);
+}
+
+// ============================================================
+// Convenience wrappers — callers usually invoke these instead of
+// dereferencing the vtable manually.
+// ============================================================
+
+fn read_lba(d as *StorageDevice, lba as i64, count as i64, buf as *u8) as i32 {
+    return call(d.read_lba, d.priv, lba, count, buf);
+}
+
+fn write_lba(d as *StorageDevice, lba as i64, count as i64, buf as *u8) as i32 {
+    return call(d.write_lba, d.priv, lba, count, buf);
+}
+
+fn flush(d as *StorageDevice) as i32 {
+    return call(d.flush, d.priv);
+}
+
+fn sector_size(d as *StorageDevice) as i64 {
+    return call(d.sector_size, d.priv);
+}
+
+fn sector_count(d as *StorageDevice) as i64 {
+    return call(d.sector_count, d.priv);
+}
