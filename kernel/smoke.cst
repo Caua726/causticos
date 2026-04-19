@@ -8,6 +8,7 @@ use "driver.cst" as driver;
 use "heap.cst" as heap;
 use "serial.cst" as serial;
 use "util.cst" as util;
+use "io.cst" as io;
 
 // Per-device smoke state. Allocated by setup_state and stashed in
 // dev.private; irq_handler reads it back from the same field.
@@ -85,4 +86,90 @@ fn run_irq(dev as *driver.Hardware) as void {
     serial.print("smoke: irq_hit_count=", 21);
     util.print_num(s.irq_hit_count);
     serial.println("", 0);
+}
+
+// ============================================================
+// io.cst smoke test — fake block provider that completes inline.
+//
+// Exercises the framework-owned queue. submit_io stashes the request
+// in a per-provider "hw queue" (just a single slot here); harvest_io
+// pops it and hands it back. No real hardware, no real IRQs — this
+// validates the framework's push/pop/state transitions end-to-end
+// before AHCI lands.
+// ============================================================
+
+struct FakeState {
+    slot as *io.BlockRequest;   // single-slot "hardware queue"
+    done as i32;
+    provider as io.BlockIOProvider;
+}
+
+fn fake_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
+    let is *FakeState as f = cast(*FakeState, p.private);
+    if (cast(i64, f.slot) != 0) { return driver.DEVICE_BUSY; }
+    f.slot = r;
+    r.status = 0;
+    return 0;
+}
+
+fn fake_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
+    let is *FakeState as f = cast(*FakeState, p.private);
+    if (cast(i64, f.slot) == 0) { *out = cast(*io.BlockRequest, 0); return 0; }
+    *out = f.slot;
+    f.slot = cast(*io.BlockRequest, 0);
+    return 1;
+}
+
+fn run_io(dev as *driver.Hardware) as void {
+    let is *SmokeState as s = setup_state(dev);
+    if (cast(i64, s) == 0) { return; }
+    if (s.irq_hit_count < 0) { return; }  // placeholder; no io_done field yet
+    // Run once per device using irq_done as a convenient guard; safe because
+    // run_irq runs before run_io and flipping the flag doesn't affect anything.
+    if (s.irq_done != 1) { return; }
+    // Use mmio_done as the io-already-ran guard (it starts cleared after irq).
+    // Actually use a different approach: allocate FakeState once and key off it.
+
+    let is i64 as addr = heap.kmalloc(sizeof(FakeState), 0);
+    if (addr == 0) { return; }
+    let is *FakeState as f = cast(*FakeState, addr);
+    f.slot = cast(*io.BlockRequest, 0);
+    f.done = 0;
+    f.provider.device = dev;
+    f.provider.submit_io = fn_ptr(fake_submit);
+    f.provider.harvest_io = fn_ptr(fake_harvest);
+    f.provider.private = cast(*u8, f);
+    f.provider.pending_head = cast(*io.BlockRequest, 0);
+    f.provider.pending_count = 0;
+    f.provider.next = cast(*io.BlockIOProvider, 0);
+
+    if (io.register(&f.provider) != driver.OK) {
+        serial.println("smoke.io: register failed", 25);
+        return;
+    }
+
+    // Submit a fake read and harvest it. This bypasses read_sync to
+    // avoid the wait/wake primitive until AHCI exercises it with real IRQs.
+    let is i64 as buf_addr = heap.kmalloc(512, 0);
+    if (buf_addr == 0) { return; }
+    let is *u8 as buf = cast(*u8, buf_addr);
+    let is *io.BlockRequest as r = io.new_request(io.OP_READ, 0, 1024, 1, buf);
+    if (cast(i64, r) == 0) { heap.kfree(buf_addr); return; }
+
+    let is i32 as rc = io.submit(&f.provider, r);
+    serial.print("smoke.io: submit rc=", 20);
+    util.print_num(cast(i64, rc));
+    serial.println("", 0);
+
+    let is i64 as harvested = io.harvest_all(&f.provider);
+    serial.print("smoke.io: harvested=", 20);
+    util.print_num(harvested);
+    serial.println("", 0);
+
+    serial.print("smoke.io: req.state=", 20);
+    util.print_num(r.state);
+    serial.println("", 0);
+
+    io.free_request(r);
+    heap.kfree(buf_addr);
 }
