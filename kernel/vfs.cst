@@ -1,0 +1,833 @@
+// vfs.cst — Virtual File System layer.
+//
+// Sits between callers ("give me /docs/readme.md") and filesystem
+// drivers (FAT32 today, tmpfs/nvme later). The VFS owns:
+//   - Mount table: paths like "/" or "/boot" → FileSystemOps vtable + priv
+//   - Open-file pool: stateful handles carrying offset, flags, refcount
+//   - Path resolution: split mount prefix, forward the rest to the FS
+//
+// Design choices tuned to causticos philosophy:
+//   - No heap: static arrays for mount table (8 slots) + file pool (64
+//     slots). Fits every realistic single-user kernel, heap can come
+//     later if we grow past it.
+//   - Filesystems expose a narrow vtable. Every write/metadata op is
+//     path-based at the interface so the VFS doesn't need to translate
+//     FS-specific inode layouts.
+//   - Open() caches (parent_cluster, first_cluster, size) on the
+//     handle so subsequent read/write/seek skip re-traversal of the
+//     directory tree. Persist-back on write_at happens through
+//     update_entry in the same request.
+//   - Sync writes: every mutation flushes the device. No write-back
+//     cache yet — when we add one it'll live under the FS, invisible
+//     to the VFS.
+
+use "serial.cst" as serial;
+use "util.cst"   as util;
+use "sched.cst"  as sched;
+
+// ============================================================
+// Error codes. Negative to play nice with syscalls that return -errno.
+// ============================================================
+
+// Error codes declared as functions returning i32 — Caustic's global
+// initializer evaluator rejects `cast(i32, 0-N)` as non-constant, so
+// we route through trivial thunks. Effectively free after inlining.
+fn VFS_OK()        as i32 { return cast(i32, 0); }
+fn VFS_ENOENT()    as i32 { return cast(i32, 0 - 2); }
+fn VFS_EIO()       as i32 { return cast(i32, 0 - 5); }
+fn VFS_EBADF()     as i32 { return cast(i32, 0 - 9); }
+fn VFS_ENOTDIR()   as i32 { return cast(i32, 0 - 20); }
+fn VFS_EISDIR()    as i32 { return cast(i32, 0 - 21); }
+fn VFS_EINVAL()    as i32 { return cast(i32, 0 - 22); }
+fn VFS_EMFILE()    as i32 { return cast(i32, 0 - 24); }
+fn VFS_ENOSPC()    as i32 { return cast(i32, 0 - 28); }
+fn VFS_ENOSYS()    as i32 { return cast(i32, 0 - 38); }
+fn VFS_ENOTEMPTY() as i32 { return cast(i32, 0 - 39); }
+fn VFS_EEXIST()    as i32 { return cast(i32, 0 - 17); }
+fn VFS_EXDEV()     as i32 { return cast(i32, 0 - 18); }
+
+// ============================================================
+// open() flags (POSIX-ish). Bitmask.
+// ============================================================
+
+let is i32 as O_RDONLY = 0x0000;
+let is i32 as O_WRONLY = 0x0001;
+let is i32 as O_RDWR   = 0x0002;
+let is i32 as O_ACCMODE = 0x0003;
+let is i32 as O_CREAT  = 0x0040;
+let is i32 as O_EXCL   = 0x0080;
+let is i32 as O_TRUNC  = 0x0200;
+let is i32 as O_APPEND = 0x0400;
+
+// seek whence values
+let is i32 as SEEK_SET = 0;
+let is i32 as SEEK_CUR = 1;
+let is i32 as SEEK_END = 2;
+
+// File-type bit inside VfsStat.attr / FileSystemOps attrs.
+let is i32 as ATTR_FILE      = 0x01;
+let is i32 as ATTR_DIR       = 0x10;
+
+// ============================================================
+// Public types
+// ============================================================
+
+struct VfsStat {
+    size as i64;
+    first_cluster as i64;   // FS-specific identifier; FAT32 stores the chain head here
+    attr as i32;            // bitmask: ATTR_DIR etc.
+    is_dir as i32;
+}
+
+// Populated by readdir(). Name is zero-terminated up to name_len.
+struct VfsDirEntry {
+    name as [256]u8;
+    name_len as i64;
+    first_cluster as i64;
+    size as i64;
+    attr as i32;
+    is_dir as i32;
+}
+
+// Thin per-entry result the FS layer writes into. Kept separate from
+// VfsDirEntry so the filesystem adapter doesn't need to know about the
+// VFS's own 256-byte name buffer — we pass the buffer as a *u8 + cap.
+struct ReaddirOut {
+    name_len as i64;
+    attr as i32;
+    first_cluster as i64;
+    size as i64;
+}
+
+// Filesystem vtable. Every op takes `priv` (the FS-private state) as
+// its first argument so a single vtable instance can serve multiple
+// mounted volumes of the same type.
+//
+// Paths handed to the FS are *already stripped* of the mount prefix:
+// for mount "/boot" a caller's "/boot/kernel.elf" becomes the FS-
+// relative "/kernel.elf". Mount root is always a leading '/'.
+struct FileSystemOps {
+    // resolve path → parent_cluster + first_cluster + size + attr.
+    // Used by open() to cache handle state.
+    resolve as fn(*u8, *u8, i64,
+                  *i64, *i64, *i64, *i32) as i32;
+    // Stat: lighter resolve variant, doesn't need parent. Path based.
+    stat as fn(*u8, *u8, i64, *VfsStat) as i32;
+    // read/write by first_cluster + size — O(1) from already-open file.
+    read as fn(*u8, i64, i64, i64, *u8, i64) as i64;
+    // write_at may relocate the head (empty file → allocated chain)
+    // and always returns the new file size. *out_first_cluster is set
+    // even on success so callers can detect relocation.
+    write_at as fn(*u8, i64, i64, i64, *u8, i64, *i64) as i64;
+    // truncate to exactly new_size. May shrink by freeing clusters or
+    // grow by allocating zeroed clusters. *out_first_cluster reflects
+    // the (possibly new) head.
+    truncate as fn(*u8, i64, i64, i64, *i64) as i32;
+    // Persist a new (first_cluster, size) for the entry pointing at
+    // old_first_cluster in `parent_cluster`. Called after write_at or
+    // truncate changes the chain so the directory entry matches.
+    update_entry as fn(*u8, i64, i64, i64, i64) as i32;
+    // Metadata operations, all path-based. create makes an empty
+    // regular file, unlink removes a regular file, mkdir/rmdir for
+    // directories, rename is cross-parent aware.
+    create as fn(*u8, *u8, i64) as i32;
+    unlink as fn(*u8, *u8, i64) as i32;
+    mkdir  as fn(*u8, *u8, i64) as i32;
+    rmdir  as fn(*u8, *u8, i64) as i32;
+    rename as fn(*u8, *u8, i64, *u8, i64) as i32;
+    // readdir by parent first_cluster (caller passes first_cluster
+    // from stat/resolve). idx is 0-based; -1 on end, -2 on I/O.
+    readdir as fn(*u8, i64, i64,
+                  *u8, i64, *ReaddirOut) as i32;
+    // Fsync: barrier on the underlying device.
+    sync as fn(*u8) as i32;
+}
+
+// Caustic miscompiles structs that mix inline arrays (like [32]u8)
+// with other scalar fields — the array body can alias subsequent
+// slots. Store the mount path as a caller-owned pointer instead so
+// every VfsMount field is a uniform 8-byte word.
+struct VfsMount {
+    path as *u8;
+    path_len as i64;
+    ops as *FileSystemOps;
+    priv as *u8;
+    next as *VfsMount;
+}
+
+// Open file handle. VFS owns the state machine; FS ops are stateless
+// w.r.t. offset and flags.
+struct VfsFile {
+    in_use as i32;
+    ref_count as i32;
+    flags as i32;
+    // Filesystem pointers.
+    mount as *VfsMount;
+    parent_cluster as i64;   // used for update_entry after writes
+    first_cluster as i64;
+    size as i64;
+    offset as i64;
+    attr as i32;
+    is_dir as i32;
+    // readdir cursor — only meaningful for directories.
+    readdir_idx as i64;
+}
+
+// ============================================================
+// Static pools
+// ============================================================
+
+let is i32 as MAX_MOUNTS = 8;
+let is i32 as MAX_OPEN_FILES = 64;
+
+// Array-of-struct in .bss mis-aligns its first element on Caustic
+// when the struct has pointer+i64 fields; accesses aliased with other
+// globals. Declaring each slot as its own top-level VfsMount keeps
+// them independently-addressed and 8-aligned.
+let is VfsMount as mount_slot0 with mut;
+let is VfsMount as mount_slot1 with mut;
+let is VfsMount as mount_slot2 with mut;
+let is VfsMount as mount_slot3 with mut;
+let is VfsMount as mount_slot4 with mut;
+let is VfsMount as mount_slot5 with mut;
+let is VfsMount as mount_slot6 with mut;
+let is VfsMount as mount_slot7 with mut;
+
+fn mount_slot_ptr(i as i64) as *VfsMount {
+    if (i == 0) { return &mount_slot0; }
+    if (i == 1) { return &mount_slot1; }
+    if (i == 2) { return &mount_slot2; }
+    if (i == 3) { return &mount_slot3; }
+    if (i == 4) { return &mount_slot4; }
+    if (i == 5) { return &mount_slot5; }
+    if (i == 6) { return &mount_slot6; }
+    if (i == 7) { return &mount_slot7; }
+    return cast(*VfsMount, 0);
+}
+
+let is i64 as mount_pool_used with mut = 0;
+let is i64 as mount_head_raw with mut = 0;
+
+fn mount_head() as *VfsMount { return cast(*VfsMount, mount_head_raw); }
+fn set_mount_head(p as *VfsMount) as void { mount_head_raw = cast(i64, p); }
+
+let is [64]VfsFile as file_pool with mut;
+
+// ============================================================
+// Init
+// ============================================================
+
+fn init() as void {
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, MAX_OPEN_FILES)) {
+        file_pool[i].in_use = 0;
+        file_pool[i].ref_count = 0;
+        i = i + 1;
+    }
+    mount_pool_used = 0;
+    set_mount_head(cast(*VfsMount, 0));
+    serial.println("vfs: ready", 10);
+}
+
+// ============================================================
+// Mount / unmount
+// ============================================================
+
+fn mount(path as *u8, path_len as i64,
+         ops as *FileSystemOps, priv as *u8) as i32 {
+    if (path_len <= 0 || path_len >= 32) { return VFS_EINVAL(); }
+    if (path[0] != cast(u8, 47))          { return VFS_EINVAL(); }   // must start with '/'
+    if (cast(i64, ops) == 0)              { return VFS_EINVAL(); }
+    if (mount_pool_used >= cast(i64, MAX_MOUNTS)) { return VFS_ENOSPC(); }
+
+    // Reject duplicate mount at same path.
+    let is *VfsMount as m with mut = mount_head();
+    while (cast(i64, m) != 0) {
+        if (m.path_len == path_len) {
+            let is i64 as k with mut = 0;
+            let is i32 as eq with mut = 1;
+            while (k < path_len) {
+                if (m.path[k] != path[k]) { eq = 0; k = path_len; }
+                else { k = k + 1; }
+            }
+            if (eq == 1) { return VFS_EEXIST(); }
+        }
+        m = m.next;
+    }
+
+    let is *VfsMount as slot = mount_slot_ptr(mount_pool_used);
+    mount_pool_used = mount_pool_used + 1;
+    slot.path = path;
+    slot.path_len = path_len;
+    slot.ops = ops;
+    slot.priv = priv;
+    slot.next = mount_head();
+    set_mount_head(slot);
+
+    serial.print("vfs: mounted ", 13);
+    let is i64 as j with mut = 0;
+    while (j < path_len) { serial.putc(cast(i64, path[j])); j = j + 1; }
+    serial.println("", 0);
+    return VFS_OK();
+}
+
+// Resolve which mount serves `path`. Longest-prefix-match. Returns the
+// VfsMount plus the offset where the FS-relative path starts. "/" is
+// always that offset-0 in the returned string. On no match returns
+// null.
+//
+// Matching rules:
+//   - Mount "/" matches every absolute path.
+//   - Mount "/boot" matches "/boot" and "/boot/..." but not "/boots".
+fn resolve_mount(path as *u8, path_len as i64,
+                 out_rel_off as *i64) as *VfsMount {
+    if (path_len <= 0) { return cast(*VfsMount, 0); }
+    let is *VfsMount as best with mut = cast(*VfsMount, 0);
+    let is i64 as best_len with mut = 0 - 1;
+
+    let is *VfsMount as m with mut = mount_head();
+    while (cast(i64, m) != 0) {
+        if (m.path_len <= path_len) {
+            let is i32 as prefix_ok with mut = 1;
+            let is i64 as k with mut = 0;
+            while (k < m.path_len) {
+                if (m.path[k] != path[k]) { prefix_ok = 0; k = m.path_len; }
+                else { k = k + 1; }
+            }
+            if (prefix_ok == 1) {
+                // Additional boundary check: the char right after must
+                // be '/' or end-of-string, otherwise "/boot" would
+                // match "/booted".
+                let is i32 as boundary with mut = 0;
+                if (m.path_len == 1 && m.path[0] == cast(u8, 47)) {
+                    boundary = 1;   // '/' is a universal prefix
+                } else if (m.path_len == path_len) {
+                    boundary = 1;
+                } else if (path[m.path_len] == cast(u8, 47)) {
+                    boundary = 1;
+                }
+                if (boundary == 1 && m.path_len > best_len) {
+                    best = m;
+                    best_len = m.path_len;
+                }
+            }
+        }
+        m = m.next;
+    }
+    if (cast(i64, best) == 0) { return cast(*VfsMount, 0); }
+    if (best.path_len == 1) { *out_rel_off = 0; }   // mount "/" sees full path
+    else                    { *out_rel_off = best.path_len; }
+    return best;
+}
+
+// ============================================================
+// File pool helpers
+// ============================================================
+
+fn pool_alloc() as *VfsFile {
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, MAX_OPEN_FILES)) {
+        if (file_pool[i].in_use == 0) {
+            file_pool[i].in_use = 1;
+            file_pool[i].ref_count = 1;
+            file_pool[i].flags = 0;
+            file_pool[i].mount = cast(*VfsMount, 0);
+            file_pool[i].parent_cluster = 0;
+            file_pool[i].first_cluster = 0;
+            file_pool[i].size = 0;
+            file_pool[i].offset = 0;
+            file_pool[i].attr = 0;
+            file_pool[i].is_dir = 0;
+            file_pool[i].readdir_idx = 0;
+            return &file_pool[i];
+        }
+        i = i + 1;
+    }
+    return cast(*VfsFile, 0);
+}
+
+fn pool_release(f as *VfsFile) as void {
+    if (cast(i64, f) == 0) { return; }
+    f.ref_count = f.ref_count - 1;
+    if (f.ref_count <= 0) {
+        f.in_use = 0;
+        f.mount = cast(*VfsMount, 0);
+    }
+}
+
+// ============================================================
+// open/close/read/write/seek/stat
+// ============================================================
+
+fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
+    if (path_len <= 0) { return cast(*VfsFile, 0); }
+    let is i64 as rel_off with mut = 0;
+    let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
+    if (cast(i64, mnt) == 0) { return cast(*VfsFile, 0); }
+
+    let is *u8 as rel = cast(*u8, cast(i64, path) + rel_off);
+    let is i64 as rel_len = path_len - rel_off;
+    // Mount root lookup always needs at least "/".
+    let is i64 as effective_len with mut = rel_len;
+    let is *u8 as effective_path with mut = rel;
+    if (rel_len == 0) {
+        effective_path = cast(*u8, "/");
+        effective_len = 1;
+    }
+
+    let is i64 as parent_cluster with mut = 0;
+    let is i64 as first_cluster with mut = 0;
+    let is i64 as size with mut = 0;
+    let is i32 as attr with mut = 0;
+    let is i32 as rc with mut = call(mnt.ops.resolve,
+                                     mnt.priv, effective_path, effective_len,
+                                     &parent_cluster, &first_cluster, &size, &attr);
+
+    if (rc != 0) {
+        if ((flags & O_CREAT) == 0) { return cast(*VfsFile, 0); }
+        // Create path requested — attempt file creation (empty), then
+        // resolve again.
+        let is i32 as cc = call(mnt.ops.create,
+                                mnt.priv, effective_path, effective_len);
+        if (cc != 0) { return cast(*VfsFile, 0); }
+        rc = call(mnt.ops.resolve,
+                  mnt.priv, effective_path, effective_len,
+                  &parent_cluster, &first_cluster, &size, &attr);
+        if (rc != 0) { return cast(*VfsFile, 0); }
+    } else {
+        // Exists; honour O_EXCL.
+        if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+            return cast(*VfsFile, 0);
+        }
+    }
+
+    let is *VfsFile as f = pool_alloc();
+    if (cast(i64, f) == 0) { return cast(*VfsFile, 0); }
+
+    f.flags = flags;
+    f.mount = mnt;
+    f.parent_cluster = parent_cluster;
+    f.first_cluster = first_cluster;
+    f.size = size;
+    f.attr = attr;
+    if ((attr & ATTR_DIR) != 0) { f.is_dir = 1; } else { f.is_dir = 0; }
+    f.offset = 0;
+
+    // O_TRUNC: reset file to zero length (only makes sense on regular
+    // files opened for writing).
+    if ((flags & O_TRUNC) != 0 && f.is_dir == 0 &&
+        (flags & O_ACCMODE) != O_RDONLY) {
+        let is i64 as new_first with mut = 0;
+        let is i32 as tc = call(mnt.ops.truncate,
+                                mnt.priv,
+                                f.first_cluster, f.size, cast(i64, 0),
+                                &new_first);
+        if (tc == 0) {
+            if (new_first != f.first_cluster || f.size != 0) {
+                call(mnt.ops.update_entry,
+                     mnt.priv, f.parent_cluster,
+                     f.first_cluster, new_first, cast(i64, 0));
+            }
+            f.first_cluster = new_first;
+            f.size = 0;
+        } else {
+            pool_release(f);
+            return cast(*VfsFile, 0);
+        }
+    }
+
+    // O_APPEND starts offset at the end.
+    if ((flags & O_APPEND) != 0) { f.offset = f.size; }
+
+    return f;
+}
+
+fn close(f as *VfsFile) as i32 {
+    if (cast(i64, f) == 0) { return VFS_EBADF(); }
+    if (f.in_use == 0)     { return VFS_EBADF(); }
+    // Reader/writer synchronisation barrier — let the FS flush any
+    // per-mount caches before the handle dissolves.
+    if (cast(i64, f.mount) != 0 && cast(i64, f.mount.ops.sync) != 0) {
+        call(f.mount.ops.sync, f.mount.priv);
+    }
+    pool_release(f);
+    return VFS_OK();
+}
+
+fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
+    if (cast(i64, f) == 0 || f.in_use == 0) { return cast(i64, VFS_EBADF()); }
+    if (f.is_dir == 1)                       { return cast(i64, VFS_EISDIR()); }
+    if ((f.flags & O_ACCMODE) == O_WRONLY)   { return cast(i64, VFS_EBADF()); }
+    if (n <= 0)                              { return 0; }
+    if (f.offset >= f.size)                  { return 0; }
+    let is i64 as to_read with mut = n;
+    if (f.offset + to_read > f.size) { to_read = f.size - f.offset; }
+    let is i64 as got = call(f.mount.ops.read,
+                             f.mount.priv,
+                             f.first_cluster, f.size, f.offset,
+                             buf, to_read);
+    if (got < 0) { return got; }
+    f.offset = f.offset + got;
+    return got;
+}
+
+fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
+    if (cast(i64, f) == 0 || f.in_use == 0)    { return cast(i64, VFS_EBADF()); }
+    if (f.is_dir == 1)                          { return cast(i64, VFS_EISDIR()); }
+    if ((f.flags & O_ACCMODE) == O_RDONLY)      { return cast(i64, VFS_EBADF()); }
+    if (n <= 0)                                 { return 0; }
+
+    let is i64 as write_off with mut = f.offset;
+    if ((f.flags & O_APPEND) != 0) { write_off = f.size; }
+
+    let is i64 as new_first with mut = f.first_cluster;
+    let is i64 as new_size = call(f.mount.ops.write_at,
+                                  f.mount.priv,
+                                  f.first_cluster, f.size,
+                                  write_off, buf, n, &new_first);
+    if (new_size < 0) { return new_size; }
+
+    // Persist the new (first_cluster, size) in the dir entry.
+    let is i32 as ue = call(f.mount.ops.update_entry,
+                            f.mount.priv, f.parent_cluster,
+                            f.first_cluster, new_first, new_size);
+    if (ue != 0) { return cast(i64, ue); }
+
+    f.first_cluster = new_first;
+    f.size = new_size;
+    f.offset = write_off + n;
+    return n;
+}
+
+fn lseek(f as *VfsFile, off as i64, whence as i32) as i64 {
+    if (cast(i64, f) == 0 || f.in_use == 0) { return cast(i64, VFS_EBADF()); }
+    let is i64 as new_off with mut = 0;
+    if (whence == SEEK_SET) { new_off = off; }
+    else if (whence == SEEK_CUR) { new_off = f.offset + off; }
+    else if (whence == SEEK_END) { new_off = f.size + off; }
+    else { return cast(i64, VFS_EINVAL()); }
+    if (new_off < 0) { return cast(i64, VFS_EINVAL()); }
+    f.offset = new_off;
+    return new_off;
+}
+
+fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
+    if (path_len <= 0)        { return VFS_EINVAL(); }
+    let is i64 as rel_off with mut = 0;
+    let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
+    if (cast(i64, mnt) == 0)  { return VFS_ENOENT(); }
+    let is *u8 as rel = cast(*u8, cast(i64, path) + rel_off);
+    let is i64 as rel_len = path_len - rel_off;
+    let is i64 as ef_len with mut = rel_len;
+    let is *u8 as ef_path with mut = rel;
+    if (rel_len == 0) { ef_path = cast(*u8, "/"); ef_len = 1; }
+    return call(mnt.ops.stat, mnt.priv, ef_path, ef_len, out);
+}
+
+// ============================================================
+// Metadata dispatch
+// ============================================================
+
+fn unlink(path as *u8, path_len as i64) as i32 {
+    let is i64 as rel_off with mut = 0;
+    let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
+    if (cast(i64, mnt) == 0) { return VFS_ENOENT(); }
+    let is *u8 as rel = cast(*u8, cast(i64, path) + rel_off);
+    let is i64 as rel_len = path_len - rel_off;
+    let is i64 as ef_len with mut = rel_len;
+    let is *u8 as ef_path with mut = rel;
+    if (rel_len == 0) { ef_path = cast(*u8, "/"); ef_len = 1; }
+    return call(mnt.ops.unlink, mnt.priv, ef_path, ef_len);
+}
+
+fn mkdir(path as *u8, path_len as i64) as i32 {
+    let is i64 as rel_off with mut = 0;
+    let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
+    if (cast(i64, mnt) == 0) { return VFS_ENOENT(); }
+    let is *u8 as rel = cast(*u8, cast(i64, path) + rel_off);
+    let is i64 as rel_len = path_len - rel_off;
+    let is i64 as ef_len with mut = rel_len;
+    let is *u8 as ef_path with mut = rel;
+    if (rel_len == 0) { ef_path = cast(*u8, "/"); ef_len = 1; }
+    return call(mnt.ops.mkdir, mnt.priv, ef_path, ef_len);
+}
+
+fn rmdir(path as *u8, path_len as i64) as i32 {
+    let is i64 as rel_off with mut = 0;
+    let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
+    if (cast(i64, mnt) == 0) { return VFS_ENOENT(); }
+    let is *u8 as rel = cast(*u8, cast(i64, path) + rel_off);
+    let is i64 as rel_len = path_len - rel_off;
+    let is i64 as ef_len with mut = rel_len;
+    let is *u8 as ef_path with mut = rel;
+    if (rel_len == 0) { ef_path = cast(*u8, "/"); ef_len = 1; }
+    return call(mnt.ops.rmdir, mnt.priv, ef_path, ef_len);
+}
+
+fn rename(src as *u8, src_len as i64,
+          dst as *u8, dst_len as i64) as i32 {
+    let is i64 as src_off with mut = 0;
+    let is *VfsMount as m1 = resolve_mount(src, src_len, &src_off);
+    let is i64 as dst_off with mut = 0;
+    let is *VfsMount as m2 = resolve_mount(dst, dst_len, &dst_off);
+    if (cast(i64, m1) == 0 || cast(i64, m2) == 0) { return VFS_ENOENT(); }
+    if (cast(i64, m1) != cast(i64, m2))           { return VFS_EXDEV(); }
+    let is *u8 as rs = cast(*u8, cast(i64, src) + src_off);
+    let is *u8 as rd = cast(*u8, cast(i64, dst) + dst_off);
+    return call(m1.ops.rename, m1.priv,
+                rs, src_len - src_off,
+                rd, dst_len - dst_off);
+}
+
+fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
+    if (cast(i64, f) == 0 || f.in_use == 0) { return VFS_EBADF(); }
+    if (f.is_dir == 0) { return VFS_ENOTDIR(); }
+    let is ReaddirOut as ro;
+    let is i32 as rc = call(f.mount.ops.readdir,
+                            f.mount.priv, f.first_cluster, f.readdir_idx,
+                            cast(*u8, &out.name[0]), cast(i64, 256), &ro);
+    if (rc != 0) { return rc; }
+    out.name_len = ro.name_len;
+    out.first_cluster = ro.first_cluster;
+    out.size = ro.size;
+    out.attr = ro.attr;
+    if ((ro.attr & ATTR_DIR) != 0) { out.is_dir = 1; } else { out.is_dir = 0; }
+    f.readdir_idx = f.readdir_idx + 1;
+    return VFS_OK();
+}
+
+// ============================================================
+// Self-test — exercises every hot path of the VFS surface through a
+// real filesystem underneath. Assumes someone has already mounted "/",
+// typically by the FAT32 worker thread after disk binding completes.
+//
+// Coverage:
+//   - stat_path on file + directory
+//   - open read-only, read, seek, stat (via handle), close
+//   - open O_CREAT|O_RDWR on a fresh path, write, seek, read-back
+//   - append semantics (O_APPEND forces offset = size)
+//   - truncate via O_TRUNC
+//   - mkdir, readdir enumeration, rmdir
+//   - unlink + verify ENOENT
+//   - rename across parents
+// ============================================================
+
+let is [4096]u8 as test_buf with mut;
+let is [64]u8 as test_payload with mut;
+
+fn bytes_equal(a as *u8, b as *u8, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn print_name(e as *VfsDirEntry) as void {
+    let is i64 as i with mut = 0;
+    while (i < e.name_len) {
+        serial.putc(cast(i64, e.name[i]));
+        i = i + 1;
+    }
+}
+
+fn self_test() as void {
+    serial.println("vfs.test: start", 15);
+
+    // --- stat_path on a known file ---
+    let is VfsStat as st;
+    if (stat_path(cast(*u8, "/hello.txt"), 10, &st) != 0) {
+        serial.println("vfs.test: stat /hello.txt FAIL", 30);
+        return;
+    }
+    if (st.is_dir != 0 || st.size != 27) {
+        serial.print("vfs.test: stat size unexpected=", 31);
+        util.print_num(st.size); serial.println("", 0);
+        return;
+    }
+    serial.println("vfs.test: stat /hello.txt OK", 28);
+
+    // --- open/read/seek/close ---
+    let is *VfsFile as f = open(cast(*u8, "/hello.txt"), 10, O_RDONLY);
+    if (cast(i64, f) == 0) {
+        serial.println("vfs.test: open /hello.txt FAIL", 30);
+        return;
+    }
+    let is i64 as n with mut = read(f, cast(*u8, &test_buf[0]), 11);
+    if (n != 11) {
+        serial.print("vfs.test: read n=", 17);
+        util.print_num(n); serial.println(" expected 11", 12);
+        return;
+    }
+    test_buf[11] = cast(u8, 0);
+    serial.print("vfs.test: read first 11 = '", 27);
+    let is i64 as p with mut = 0;
+    while (p < 11) { serial.putc(cast(i64, test_buf[p])); p = p + 1; }
+    serial.println("'", 1);
+
+    // Seek to middle, read 5
+    if (lseek(f, cast(i64, 6), SEEK_SET) != 6) {
+        serial.println("vfs.test: lseek FAIL", 20);
+        return;
+    }
+    n = read(f, cast(*u8, &test_buf[0]), 5);
+    if (n != 5 || test_buf[0] != cast(u8, 102)) {   // 'f'
+        serial.println("vfs.test: post-seek read FAIL", 29);
+        return;
+    }
+    serial.println("vfs.test: seek+read OK", 22);
+
+    // Seek to end, read returns 0
+    if (lseek(f, cast(i64, 0), SEEK_END) != 27) {
+        serial.println("vfs.test: seek_end FAIL", 23);
+        return;
+    }
+    if (read(f, cast(*u8, &test_buf[0]), 5) != 0) {
+        serial.println("vfs.test: read past end != 0", 28);
+        return;
+    }
+    close(f);
+
+    // --- O_CREAT + write + read back ---
+    let is *VfsFile as w = open(cast(*u8, "/vfs-created.bin"), 16,
+                                O_RDWR | O_CREAT | O_TRUNC);
+    if (cast(i64, w) == 0) {
+        serial.println("vfs.test: open O_CREAT FAIL", 27);
+        return;
+    }
+    let is i64 as i with mut = 0;
+    while (i < 64) { test_payload[i] = cast(u8, (i * 5 + 1) & 0xFF); i = i + 1; }
+    let is i64 as wn = write(w, cast(*u8, &test_payload[0]), 64);
+    if (wn != 64) {
+        serial.print("vfs.test: write n=", 18);
+        util.print_num(wn); serial.println(" expected 64", 12);
+        return;
+    }
+    // Seek back, re-read, byte-check.
+    lseek(w, cast(i64, 0), SEEK_SET);
+    if (read(w, cast(*u8, &test_buf[0]), 64) != 64) {
+        serial.println("vfs.test: read-back size mismatch", 33);
+        return;
+    }
+    if (bytes_equal(cast(*u8, &test_payload[0]),
+                    cast(*u8, &test_buf[0]), 64) == 0) {
+        serial.println("vfs.test: read-back pattern mismatch", 36);
+        return;
+    }
+    // Write at offset 32 to exercise partial overwrite.
+    lseek(w, cast(i64, 32), SEEK_SET);
+    let is i64 as j with mut = 0;
+    while (j < 16) { test_payload[j] = cast(u8, 0xAA); j = j + 1; }
+    write(w, cast(*u8, &test_payload[0]), 16);
+    // Verify
+    lseek(w, cast(i64, 32), SEEK_SET);
+    read(w, cast(*u8, &test_buf[0]), 16);
+    let is i32 as ok with mut = 1;
+    j = 0;
+    while (j < 16) {
+        if (test_buf[j] != cast(u8, 0xAA)) { ok = 0; j = 16; }
+        else { j = j + 1; }
+    }
+    if (ok == 0) {
+        serial.println("vfs.test: offset write verify FAIL", 34);
+        return;
+    }
+    serial.println("vfs.test: O_CREAT+write+seek+read+offset-write OK", 49);
+    close(w);
+
+    // --- O_APPEND ---
+    let is *VfsFile as a = open(cast(*u8, "/vfs-created.bin"), 16,
+                                O_RDWR | O_APPEND);
+    if (cast(i64, a) == 0) {
+        serial.println("vfs.test: open O_APPEND FAIL", 28);
+        return;
+    }
+    let is i64 as ss = a.size;
+    let is *u8 as tail = cast(*u8, "APPENDED");
+    write(a, tail, 8);
+    if (a.size != ss + 8) {
+        serial.print("vfs.test: append size=", 22);
+        util.print_num(a.size); serial.print(" expected=", 10);
+        util.print_num(ss + 8); serial.println("", 0);
+        return;
+    }
+    close(a);
+    serial.println("vfs.test: O_APPEND OK", 21);
+
+    // --- mkdir + readdir + rmdir ---
+    if (mkdir(cast(*u8, "/vfs-dir"), 8) != 0) {
+        serial.println("vfs.test: mkdir /vfs-dir FAIL", 29);
+        return;
+    }
+    let is *VfsFile as d = open(cast(*u8, "/vfs-dir"), 8, O_RDONLY);
+    if (cast(i64, d) == 0 || d.is_dir == 0) {
+        serial.println("vfs.test: open /vfs-dir FAIL", 28);
+        return;
+    }
+    let is VfsDirEntry as de;
+    let is i64 as saw with mut = 0;
+    while (readdir(d, &de) == 0) {
+        serial.print("vfs.test: /vfs-dir entry: ", 26);
+        print_name(&de); serial.println("", 0);
+        saw = saw + 1;
+    }
+    // Freshly made dir has exactly '.' and '..'.
+    if (saw != 2) {
+        serial.print("vfs.test: readdir saw ", 22);
+        util.print_num(saw); serial.println(" entries (expected 2)", 21);
+        return;
+    }
+    close(d);
+    if (rmdir(cast(*u8, "/vfs-dir"), 8) != 0) {
+        serial.println("vfs.test: rmdir FAIL", 20);
+        return;
+    }
+    serial.println("vfs.test: mkdir/readdir/rmdir OK", 32);
+
+    // --- rename across parents ---
+    if (mkdir(cast(*u8, "/vfs-box"), 8) != 0) {
+        serial.println("vfs.test: mkdir /vfs-box FAIL", 29);
+        return;
+    }
+    if (rename(cast(*u8, "/vfs-created.bin"), 16,
+               cast(*u8, "/vfs-box/moved.bin"), 18) != 0) {
+        serial.println("vfs.test: rename FAIL", 21);
+        return;
+    }
+    if (stat_path(cast(*u8, "/vfs-box/moved.bin"), 18, &st) != 0) {
+        serial.println("vfs.test: moved file missing", 28);
+        return;
+    }
+    serial.println("vfs.test: cross-parent rename OK", 32);
+
+    // --- unlink + ENOENT ---
+    if (unlink(cast(*u8, "/vfs-box/moved.bin"), 18) != 0) {
+        serial.println("vfs.test: unlink FAIL", 21);
+        return;
+    }
+    if (stat_path(cast(*u8, "/vfs-box/moved.bin"), 18, &st) == 0) {
+        serial.println("vfs.test: unlinked file still visible!", 38);
+        return;
+    }
+    rmdir(cast(*u8, "/vfs-box"), 8);
+    serial.println("vfs.test: unlink+ENOENT OK", 26);
+
+    serial.println("vfs.test: ALL PASS", 18);
+}
+
+// Thread entry — yields until mount_head is populated, then runs the
+// self-test. Scheduler starts it after phase 2 fires fat32.mount_thread
+// which in turn publishes the mount.
+fn self_test_thread() as void {
+    let is i64 as tries with mut = 0;
+    while (cast(i64, mount_head()) == 0 && tries < 2000) {
+        sched.yield_cpu();
+        tries = tries + 1;
+    }
+    if (cast(i64, mount_head()) == 0) {
+        serial.println("vfs.test: no mount — skipping", 29);
+        return;
+    }
+    self_test();
+}

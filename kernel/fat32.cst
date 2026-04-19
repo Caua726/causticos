@@ -17,6 +17,7 @@ use "serial.cst"  as serial;
 use "util.cst"    as util;
 use "pmm.cst"     as pmm;
 use "sched.cst"   as sched;
+use "vfs.cst"     as vfs;
 
 // ============================================================
 // BPB offsets (see FAT spec). Bytes unless suffixed _w (u16) or _d (u32).
@@ -1751,6 +1752,683 @@ fn file_unlink(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
 }
 
 // ============================================================
+// Additional primitives exposed for the VFS layer:
+//   file_write_at     — arbitrary-offset writes with chain extension
+//   file_truncate     — shrink/grow, updates dir entry
+//   dir_update_entry  — patch first_cluster/size on an existing SFN
+//   dir_readdir       — index-based enumeration for readdir(2)
+// ============================================================
+
+// Find the SFN that points to `file_first_cluster` inside
+// `parent_cluster`'s chain and patch its first-cluster hi/lo and size
+// fields in-place. Used when a write extends a file that previously
+// had first_cluster == 0 (empty), or when truncate reshapes the chain.
+// Returns 0 on success, negative on I/O or not-found.
+fn dir_update_entry(v as *Fat32Volume, parent_cluster as i64,
+                    file_first_cluster as i64,
+                    new_first_cluster as i64, new_size as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = parent_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    let is i64 as n_slots = v.cluster_size_bytes / 32;
+
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        guard = guard + 1;
+        if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 2); }
+        let is i64 as i with mut = 0;
+        while (i < n_slots) {
+            let is i64 as boff = i * 32;
+            let is u8 as m = buf[boff];
+            if (m == cast(u8, 0)) { return cast(i32, 0 - 4); }
+            if (m != cast(u8, 0xE5)) {
+                let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
+                if (a != ATTR_LFN) {
+                    let is i64 as fc_lo = read_u16(buf, boff + 26);
+                    let is i64 as fc_hi = read_u16(buf, boff + 20);
+                    let is i64 as fc = fc_lo | (fc_hi << 16);
+                    if (fc == file_first_cluster) {
+                        let is i64 as hi = (new_first_cluster >> 16) & 0xFFFF;
+                        let is i64 as lo = new_first_cluster & 0xFFFF;
+                        buf[boff + 20] = cast(u8, hi & 0xFF);
+                        buf[boff + 21] = cast(u8, (hi >> 8) & 0xFF);
+                        buf[boff + 26] = cast(u8, lo & 0xFF);
+                        buf[boff + 27] = cast(u8, (lo >> 8) & 0xFF);
+                        buf[boff + 28] = cast(u8, new_size & 0xFF);
+                        buf[boff + 29] = cast(u8, (new_size >> 8) & 0xFF);
+                        buf[boff + 30] = cast(u8, (new_size >> 16) & 0xFF);
+                        buf[boff + 31] = cast(u8, (new_size >> 24) & 0xFF);
+                        if (cluster_write(v, cluster, buf) != 0) {
+                            return cast(i32, 0 - 5);
+                        }
+                        return 0;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 4); }
+        cluster = nxt;
+    }
+    return cast(i32, 0 - 4);
+}
+
+// Walk `first_cluster` chain forward by `skip` clusters, returning the
+// landed cluster or negative on error. skip=0 returns first_cluster.
+fn chain_advance(v as *Fat32Volume, first_cluster as i64,
+                 skip as i64) as i64 {
+    if (first_cluster < 2) { return 0 - 1; }
+    let is i64 as c with mut = first_cluster;
+    let is i64 as left with mut = skip;
+    while (left > 0) {
+        let is i64 as nxt = fat_read(v, c);
+        if (nxt < 0) { return 0 - 2; }
+        if (cluster_is_eof(nxt) == 1) { return 0 - 3; }
+        c = nxt;
+        left = left - 1;
+    }
+    return c;
+}
+
+// Ensure the chain starting at `first_cluster` has at least `want`
+// clusters; allocate and link new clusters as needed. If first_cluster
+// is 0 (empty file), allocates fresh chain and returns the new head
+// via *out_first_cluster. Returns 0 on success.
+fn chain_ensure_length(v as *Fat32Volume, first_cluster as i64,
+                       want as i64, out_first_cluster as *i64) as i32 {
+    if (want <= 0) { *out_first_cluster = first_cluster; return 0; }
+
+    let is i64 as head_c with mut = first_cluster;
+    if (head_c == 0) {
+        let is i64 as c = cluster_alloc(v);
+        if (c < 0) { return cast(i32, 0 - 1); }
+        head_c = c;
+    }
+
+    let is i64 as c with mut = head_c;
+    let is i64 as have with mut = 1;
+    while (have < want) {
+        let is i64 as nxt = fat_read(v, c);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_is_eof(nxt) == 1) {
+            let is i64 as new_c = cluster_alloc(v);
+            if (new_c < 0) { return cast(i32, 0 - 3); }
+            if (fat_write(v, c, new_c) != 0) { return cast(i32, 0 - 4); }
+            c = new_c;
+        } else {
+            c = nxt;
+        }
+        have = have + 1;
+    }
+    *out_first_cluster = head_c;
+    return 0;
+}
+
+// ============================================================
+// file_write_at — read-modify-write over the cluster chain. Writes
+// `data[0..data_len]` starting at byte `offset` in the file; extends
+// the chain when offset+data_len exceeds current size. Returns the
+// new file size (>= offset+data_len, never shrinks) or a negative
+// errno on failure. Callers must persist the new (first_cluster, size)
+// via dir_update_entry.
+// ============================================================
+fn file_write_at(v as *Fat32Volume,
+                 first_cluster as i64, old_size as i64,
+                 offset as i64, data as *u8, data_len as i64,
+                 out_first_cluster as *i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (offset < 0 || data_len < 0) { return 0 - 1; }
+    if (data_len == 0) {
+        *out_first_cluster = first_cluster;
+        if (offset > old_size) { return offset; }
+        return old_size;
+    }
+    if (ensure_scratch() != 0) { return 0 - 2; }
+
+    let is i64 as end = offset + data_len;
+    let is i64 as cbytes = v.cluster_size_bytes;
+    let is i64 as clusters_needed = (end + cbytes - 1) / cbytes;
+
+    let is i64 as new_first with mut = first_cluster;
+    if (chain_ensure_length(v, first_cluster, clusters_needed, &new_first) != 0) {
+        return 0 - 3;
+    }
+    *out_first_cluster = new_first;
+
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as written with mut = 0;
+    let is i64 as cur_off with mut = offset;
+    let is i64 as start_idx = offset / cbytes;
+    let is i64 as cur_cluster with mut = chain_advance(v, new_first, start_idx);
+    if (cur_cluster < 2) { return 0 - 4; }
+
+    while (written < data_len) {
+        let is i64 as in_clus_off = cur_off % cbytes;
+        let is i64 as chunk with mut = cbytes - in_clus_off;
+        if (chunk > data_len - written) { chunk = data_len - written; }
+
+        // Read-modify-write. For a full-cluster overwrite we could skip
+        // the read; keeping it uniform avoids a bug surface and the
+        // extra latency is one IRQ round-trip.
+        if (cluster_read(v, cur_cluster, buf) != 0) { return 0 - 5; }
+        let is i64 as k with mut = 0;
+        while (k < chunk) {
+            buf[in_clus_off + k] = data[written + k];
+            k = k + 1;
+        }
+        if (cluster_write(v, cur_cluster, buf) != 0) { return 0 - 6; }
+
+        written = written + chunk;
+        cur_off = cur_off + chunk;
+        if (written >= data_len) { break; }
+
+        // Advance.
+        let is i64 as nxt = fat_read(v, cur_cluster);
+        if (nxt < 0) { return 0 - 7; }
+        if (cluster_is_eof(nxt) == 1) { return 0 - 8; }
+        cur_cluster = nxt;
+    }
+
+    if (end > old_size) { return end; }
+    return old_size;
+}
+
+// file_truncate — adjust a file to exactly `new_size` bytes. Shrinks
+// by freeing trailing clusters + cutting the chain; grows by
+// allocating zeroed clusters and padding the last partial cluster
+// with zero bytes. Returns new_first_cluster via out (may be 0 when
+// truncating to 0 bytes). Callers update the dir entry.
+fn file_truncate(v as *Fat32Volume,
+                 first_cluster as i64, old_size as i64,
+                 new_size as i64, out_first_cluster as *i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (new_size < 0) { return cast(i32, 0 - 1); }
+    if (ensure_scratch() != 0) { return cast(i32, 0 - 2); }
+
+    let is i64 as cbytes = v.cluster_size_bytes;
+
+    if (new_size == 0) {
+        if (first_cluster != 0) { chain_free(v, first_cluster); }
+        *out_first_cluster = 0;
+        return 0;
+    }
+    if (new_size == old_size) {
+        *out_first_cluster = first_cluster;
+        return 0;
+    }
+
+    let is i64 as want = (new_size + cbytes - 1) / cbytes;
+
+    if (new_size < old_size) {
+        // Shrink: keep first `want` clusters, free the rest, cut chain.
+        let is i64 as keep_last = chain_advance(v, first_cluster, want - 1);
+        if (keep_last < 2) { return cast(i32, 0 - 3); }
+        let is i64 as tail = fat_read(v, keep_last);
+        if (tail < 0) { return cast(i32, 0 - 4); }
+        // Mark keep_last as EOC.
+        if (fat_write(v, keep_last, 0x0FFFFFFF) != 0) { return cast(i32, 0 - 5); }
+        if (cluster_is_eof(tail) == 0) {
+            chain_free(v, tail);
+        }
+        // Zero the trailing bytes inside keep_last so a later read
+        // doesn't surface stale content.
+        let is i64 as in_last = new_size % cbytes;
+        if (in_last > 0) {
+            if (cluster_read(v, keep_last, cast(*u8, clus_scratch_virt)) != 0) {
+                return cast(i32, 0 - 6);
+            }
+            let is *u8 as buf = cast(*u8, clus_scratch_virt);
+            let is i64 as z with mut = in_last;
+            while (z < cbytes) { buf[z] = cast(u8, 0); z = z + 1; }
+            if (cluster_write(v, keep_last, buf) != 0) { return cast(i32, 0 - 7); }
+        }
+        *out_first_cluster = first_cluster;
+        return 0;
+    }
+
+    // Grow: ensure chain has `want` clusters. Pad the final partial
+    // cluster's tail with zeros so reads past old_size return zero.
+    let is i64 as new_first with mut = first_cluster;
+    if (chain_ensure_length(v, first_cluster, want, &new_first) != 0) {
+        return cast(i32, 0 - 8);
+    }
+
+    // Zero the region between old_size and new_size in the cluster(s)
+    // that straddle that boundary. For the cluster containing old_size
+    // we do a read-modify-write; later clusters are entirely within the
+    // grown region and cluster_alloc already returned zeroed memory
+    // (heap zone) — but alloc_pages doesn't zero the storage block,
+    // so we explicitly cluster_zero them.
+    if (old_size > 0) {
+        let is i64 as last_old_idx = (old_size - 1) / cbytes;
+        let is i64 as tail_cluster = chain_advance(v, new_first, last_old_idx);
+        if (tail_cluster >= 2) {
+            let is i64 as tail_off = old_size % cbytes;
+            if (tail_off > 0) {
+                let is *u8 as buf = cast(*u8, clus_scratch_virt);
+                if (cluster_read(v, tail_cluster, buf) != 0) {
+                    return cast(i32, 0 - 9);
+                }
+                let is i64 as z with mut = tail_off;
+                while (z < cbytes) { buf[z] = cast(u8, 0); z = z + 1; }
+                if (cluster_write(v, tail_cluster, buf) != 0) {
+                    return cast(i32, 0 - 10);
+                }
+            }
+        }
+    }
+    let is i64 as zfrom with mut = (old_size + cbytes - 1) / cbytes;
+    if (old_size == 0) { zfrom = 0; }
+    let is i64 as zc with mut = chain_advance(v, new_first, zfrom);
+    let is i64 as zidx with mut = zfrom;
+    while (zidx < want && zc >= 2) {
+        if (cluster_zero(v, zc) != 0) { return cast(i32, 0 - 11); }
+        zidx = zidx + 1;
+        if (zidx < want) {
+            let is i64 as nxt = fat_read(v, zc);
+            if (nxt < 0) { return cast(i32, 0 - 12); }
+            if (cluster_is_eof(nxt) == 1) { zidx = want; }
+            else { zc = nxt; }
+        }
+    }
+
+    *out_first_cluster = new_first;
+    return 0;
+}
+
+// ============================================================
+// dir_readdir — enumerate directory entries by logical index so
+// readdir(3) style iteration works without exposing cluster-level
+// details. Skips LFN, volume-id, and deleted entries. Writes the long
+// name (or the 8.3 string when no LFN precedes) into `out_name` up to
+// out_name_cap bytes (always null-terminated); on truncation the
+// suffix is cut but null-term still written. Returns 0 on success,
+// -1 on end-of-directory, -2 on I/O, -3 on invalid args.
+// ============================================================
+
+fn dir_readdir(v as *Fat32Volume, dir_cluster as i64, target_index as i64,
+               out_name as *u8, out_name_cap as i64,
+               out as *vfs.ReaddirOut) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 3); }
+    if (out_name_cap < 1) { return cast(i32, 0 - 3); }
+    if (target_index < 0) { return cast(i32, 0 - 3); }
+
+    lfn_len = 0;
+    lfn_expected_seq = 0;
+
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as cluster with mut = dir_cluster;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    let is i64 as n_slots = v.cluster_size_bytes / 32;
+    let is i64 as seen_idx with mut = 0 - 1;
+
+    while (cluster >= 2 && cluster < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 2); }
+        guard = guard + 1;
+        if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 2); }
+
+        let is i64 as i with mut = 0;
+        while (i < n_slots) {
+            let is i64 as boff = i * 32;
+            let is u8 as m = buf[boff];
+            if (m == cast(u8, 0)) { return cast(i32, 0 - 1); }
+            if (m == cast(u8, 0xE5)) {
+                lfn_len = 0; lfn_expected_seq = 0;
+                i = i + 1;
+                continue;
+            }
+            let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
+            if (a == ATTR_LFN) {
+                lfn_ingest(buf, boff);
+                i = i + 1;
+                continue;
+            }
+            if ((a & ATTR_VOLUME_ID) != 0) {
+                // Volume label — not a regular entry.
+                lfn_len = 0; lfn_expected_seq = 0;
+                i = i + 1;
+                continue;
+            }
+
+            seen_idx = seen_idx + 1;
+            if (seen_idx == target_index) {
+                // Populate out fields.
+                let is i64 as fc_lo = read_u16(buf, boff + 26);
+                let is i64 as fc_hi = read_u16(buf, boff + 20);
+                out.first_cluster = fc_lo | (fc_hi << 16);
+                out.size = read_u32(buf, boff + 28);
+                out.attr = a;
+
+                // Name: prefer LFN if present.
+                let is i64 as write_len with mut = 0;
+                if (lfn_len > 0) {
+                    let is i64 as lim with mut = lfn_len;
+                    if (lim > out_name_cap - 1) { lim = out_name_cap - 1; }
+                    let is i64 as k with mut = 0;
+                    while (k < lim) {
+                        out_name[k] = lfn_buf[k];
+                        k = k + 1;
+                    }
+                    write_len = lim;
+                } else {
+                    // 8.3: strip trailing spaces in base + ext, join with '.'.
+                    let is i64 as b with mut = 8;
+                    while (b > 0 && buf[boff + b - 1] == cast(u8, 32)) {
+                        b = b - 1;
+                    }
+                    let is i64 as e with mut = 3;
+                    while (e > 0 && buf[boff + 8 + e - 1] == cast(u8, 32)) {
+                        e = e - 1;
+                    }
+                    let is i64 as k with mut = 0;
+                    while (k < b && write_len < out_name_cap - 1) {
+                        out_name[write_len] = buf[boff + k];
+                        write_len = write_len + 1;
+                        k = k + 1;
+                    }
+                    if (e > 0 && write_len < out_name_cap - 1) {
+                        out_name[write_len] = cast(u8, 46);   // '.'
+                        write_len = write_len + 1;
+                        let is i64 as x with mut = 0;
+                        while (x < e && write_len < out_name_cap - 1) {
+                            out_name[write_len] = buf[boff + 8 + x];
+                            write_len = write_len + 1;
+                            x = x + 1;
+                        }
+                    }
+                }
+                out_name[write_len] = cast(u8, 0);
+                out.name_len = write_len;
+                return 0;
+            }
+            lfn_len = 0; lfn_expected_seq = 0;
+            i = i + 1;
+        }
+
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 1); }
+        cluster = nxt;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// ============================================================
+// VFS adapter functions — exposed to vfs.cst through a populated
+// FileSystemOps-shaped vtable. priv is always a *Fat32Volume.
+//
+// The adapters translate VFS contracts into fat32.cst primitives:
+//   - resolve/stat use path_lookup + path_split_parent so the parent
+//     cluster is available for later write-path update_entry calls.
+//   - read/write_at/truncate operate directly on (first_cluster, size)
+//     so open() → read()/write() skips directory re-traversal.
+//   - create uses file_create with an empty payload; update_entry
+//     patches the dir slot written by create once the new data lands.
+// ============================================================
+
+fn vfs_resolve(priv as *u8, path as *u8, path_len as i64,
+               out_parent_cluster as *i64,
+               out_first_cluster as *i64,
+               out_size as *i64,
+               out_attr as *i32) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    if (cast(i64, v) == 0 || v.is_mounted == 0) { return cast(i32, 0 - 1); }
+
+    // Special-case the root directory: parent is itself, first cluster
+    // is root_cluster, no size, attr=DIRECTORY.
+    if (path_len == 1 && path[0] == cast(u8, 47)) {
+        *out_parent_cluster = v.root_cluster;
+        *out_first_cluster  = v.root_cluster;
+        *out_size           = 0;
+        *out_attr           = ATTR_DIRECTORY;
+        return 0;
+    }
+
+    // Parent resolution: split off the leaf, look the parent up.
+    let is i64 as leaf_off with mut = 0;
+    let is i64 as leaf_len with mut = 0;
+    let is i64 as parent_end with mut = 0;
+    if (path_split_parent(path, path_len,
+                          &leaf_off, &leaf_len, &parent_end) != 0) {
+        return cast(i32, 0 - 2);
+    }
+
+    let is i64 as parent_c with mut = v.root_cluster;
+    let is i64 as psz with mut = 0;
+    let is i32 as pattr with mut = 0;
+    if (parent_end > 0) {
+        let is i32 as rp = path_lookup(v, path, parent_end,
+                                       &parent_c, &psz, &pattr);
+        if (rp != 0) { return cast(i32, 0 - 3); }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+    }
+
+    let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
+    let is i64 as fc with mut = 0;
+    let is i64 as fs with mut = 0;
+    let is i32 as fa with mut = 0;
+    let is i32 as rf = dir_find(v, parent_c, leaf_ptr, leaf_len,
+                                &fc, &fs, &fa);
+    if (rf != 0) { return rf; }
+    *out_parent_cluster = parent_c;
+    *out_first_cluster  = fc;
+    *out_size           = fs;
+    *out_attr           = fa;
+    return 0;
+}
+
+fn vfs_stat(priv as *u8, path as *u8, path_len as i64,
+            out as *vfs.VfsStat) as i32 {
+    let is i64 as pc with mut = 0;
+    let is i64 as fc with mut = 0;
+    let is i64 as sz with mut = 0;
+    let is i32 as at with mut = 0;
+    let is i32 as rc = vfs_resolve(priv, path, path_len,
+                                   &pc, &fc, &sz, &at);
+    if (rc != 0) { return rc; }
+    out.size = sz;
+    out.first_cluster = fc;
+    out.attr = at;
+    if ((at & ATTR_DIRECTORY) != 0) { out.is_dir = 1; } else { out.is_dir = 0; }
+    return 0;
+}
+
+// Offset-based read that pulls only the requested window — avoids
+// file_read's copy-from-start model so seek + read stays O(n) in
+// bytes requested, not file size.
+fn vfs_read(priv as *u8, first_cluster as i64, size as i64,
+            offset as i64, dst as *u8, n as i64) as i64 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (offset >= size || n <= 0 || first_cluster < 2) { return 0; }
+
+    if (ensure_scratch() != 0) { return 0 - 2; }
+    let is i64 as cbytes = v.cluster_size_bytes;
+    let is i64 as cluster_idx = offset / cbytes;
+    let is i64 as in_off with mut = offset % cbytes;
+    let is i64 as cluster with mut = chain_advance(v, first_cluster, cluster_idx);
+    if (cluster < 2) { return 0 - 3; }
+
+    let is i64 as want with mut = n;
+    if (offset + want > size) { want = size - offset; }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as copied with mut = 0;
+
+    while (copied < want) {
+        if (cluster_read(v, cluster, buf) != 0) { return 0 - 4; }
+        let is i64 as chunk with mut = cbytes - in_off;
+        if (chunk > want - copied) { chunk = want - copied; }
+        let is i64 as j with mut = 0;
+        while (j < chunk) {
+            dst[copied + j] = buf[in_off + j];
+            j = j + 1;
+        }
+        copied = copied + chunk;
+        in_off = 0;   // subsequent clusters start fresh
+        if (copied >= want) { break; }
+        let is i64 as nxt = fat_read(v, cluster);
+        if (nxt < 0) { return 0 - 5; }
+        if (cluster_is_eof(nxt) == 1) { return copied; }
+        cluster = nxt;
+    }
+    return copied;
+}
+
+fn vfs_write_at(priv as *u8, first_cluster as i64, size as i64,
+                offset as i64, data as *u8, data_len as i64,
+                out_first_cluster as *i64) as i64 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return file_write_at(v, first_cluster, size, offset,
+                         data, data_len, out_first_cluster);
+}
+
+fn vfs_truncate(priv as *u8, first_cluster as i64, old_size as i64,
+                new_size as i64, out_first_cluster as *i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return file_truncate(v, first_cluster, old_size, new_size,
+                         out_first_cluster);
+}
+
+fn vfs_update_entry(priv as *u8, parent_cluster as i64,
+                    old_first as i64, new_first as i64,
+                    new_size as i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    if (parent_cluster == v.root_cluster && old_first == v.root_cluster) {
+        // The root has no entry in any parent directory; nothing to
+        // persist (and no valid parent to scan).
+        return 0;
+    }
+    // If the file was previously empty (old_first == 0) we must locate
+    // the entry by name, not by cluster. Callers in the write path
+    // stash parent+first; if first is 0 we need a different hook. For
+    // now ensure callers only invoke update_entry after first_cluster
+    // has been allocated.
+    if (old_first == 0) {
+        // Locate the one-and-only entry in the parent whose first
+        // cluster is 0 — that's us. This is a linear scan over the
+        // parent but it only happens once per file (second write
+        // brings old_first != 0).
+        if (ensure_scratch() != 0) { return cast(i32, 0 - 1); }
+        let is *u8 as buf = cast(*u8, clus_scratch_virt);
+        let is i64 as cluster with mut = parent_cluster;
+        let is i64 as guard with mut = 0;
+        let is i64 as max_steps = v.cluster_count + 2;
+        let is i64 as n_slots = v.cluster_size_bytes / 32;
+        while (cluster >= 2 && cluster < v.cluster_count + 2) {
+            if (guard > max_steps) { return cast(i32, 0 - 2); }
+            guard = guard + 1;
+            if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 3); }
+            let is i64 as i with mut = 0;
+            while (i < n_slots) {
+                let is i64 as boff = i * 32;
+                let is u8 as m = buf[boff];
+                if (m == cast(u8, 0)) { return cast(i32, 0 - 4); }
+                if (m != cast(u8, 0xE5)) {
+                    let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
+                    if (a != ATTR_LFN) {
+                        let is i64 as lo = read_u16(buf, boff + 26);
+                        let is i64 as hi = read_u16(buf, boff + 20);
+                        let is i64 as fc = lo | (hi << 16);
+                        let is i64 as sz = read_u32(buf, boff + 28);
+                        if (fc == 0 && sz == 0) {
+                            let is i64 as nh = (new_first >> 16) & 0xFFFF;
+                            let is i64 as nl = new_first & 0xFFFF;
+                            buf[boff + 20] = cast(u8, nh & 0xFF);
+                            buf[boff + 21] = cast(u8, (nh >> 8) & 0xFF);
+                            buf[boff + 26] = cast(u8, nl & 0xFF);
+                            buf[boff + 27] = cast(u8, (nl >> 8) & 0xFF);
+                            buf[boff + 28] = cast(u8, new_size & 0xFF);
+                            buf[boff + 29] = cast(u8, (new_size >> 8) & 0xFF);
+                            buf[boff + 30] = cast(u8, (new_size >> 16) & 0xFF);
+                            buf[boff + 31] = cast(u8, (new_size >> 24) & 0xFF);
+                            if (cluster_write(v, cluster, buf) != 0) {
+                                return cast(i32, 0 - 5);
+                            }
+                            return 0;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            let is i64 as nxt = fat_read(v, cluster);
+            if (nxt < 0) { return cast(i32, 0 - 3); }
+            if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 4); }
+            cluster = nxt;
+        }
+        return cast(i32, 0 - 4);
+    }
+    return dir_update_entry(v, parent_cluster, old_first,
+                            new_first, new_size);
+}
+
+fn vfs_create(priv as *u8, path as *u8, path_len as i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return file_create(v, path, path_len, cast(*u8, 0), cast(i64, 0));
+}
+
+fn vfs_unlink(priv as *u8, path as *u8, path_len as i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return file_unlink(v, path, path_len);
+}
+
+fn vfs_mkdir(priv as *u8, path as *u8, path_len as i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return dir_create(v, path, path_len);
+}
+
+fn vfs_rmdir(priv as *u8, path as *u8, path_len as i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return dir_remove(v, path, path_len);
+}
+
+fn vfs_rename(priv as *u8,
+              src as *u8, src_len as i64,
+              dst as *u8, dst_len as i64) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return path_rename(v, src, src_len, dst, dst_len);
+}
+
+fn vfs_readdir(priv as *u8, dir_cluster as i64, idx as i64,
+               name_buf as *u8, name_cap as i64,
+               out as *vfs.ReaddirOut) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    return dir_readdir(v, dir_cluster, idx, name_buf, name_cap, out);
+}
+
+fn vfs_sync(priv as *u8) as i32 {
+    let is *Fat32Volume as v = cast(*Fat32Volume, priv);
+    if (cast(i64, v) == 0 || v.is_mounted == 0) { return cast(i32, 0 - 1); }
+    return storage.flush(v.dev);
+}
+
+// Populated once at startup; vfs.mount stores a pointer to this so
+// every op dispatches through a predictable vtable.
+let is vfs.FileSystemOps as ops_vtable;
+
+fn vfs_ops_init() as void {
+    ops_vtable.resolve      = fn_ptr(vfs_resolve);
+    ops_vtable.stat         = fn_ptr(vfs_stat);
+    ops_vtable.read         = fn_ptr(vfs_read);
+    ops_vtable.write_at     = fn_ptr(vfs_write_at);
+    ops_vtable.truncate     = fn_ptr(vfs_truncate);
+    ops_vtable.update_entry = fn_ptr(vfs_update_entry);
+    ops_vtable.create       = fn_ptr(vfs_create);
+    ops_vtable.unlink       = fn_ptr(vfs_unlink);
+    ops_vtable.mkdir        = fn_ptr(vfs_mkdir);
+    ops_vtable.rmdir        = fn_ptr(vfs_rmdir);
+    ops_vtable.rename       = fn_ptr(vfs_rename);
+    ops_vtable.readdir      = fn_ptr(vfs_readdir);
+    ops_vtable.sync         = fn_ptr(vfs_sync);
+}
+
+fn ops() as *vfs.FileSystemOps { return &ops_vtable; }
+
+// ============================================================
 // Mount thread — yields until a storage device appears in the
 // registry, then tries to mount it as FAT32. Intended to be
 // started after driver phase 2 has kicked off probing.
@@ -1775,6 +2453,17 @@ fn mount_thread() as void {
     let is *Fat32Volume as v = mount(d);
     if (cast(i64, v) == 0) { return; }
     self_test_read(v);
+
+    // Publish the FAT32 volume through the VFS at "/". Done after the
+    // FS self-tests so any failures there don't point the VFS at a
+    // half-initialised volume.
+    let is i32 as mr = vfs.mount(cast(*u8, "/"), cast(i64, 1),
+                                  ops(), cast(*u8, v));
+    if (mr != 0) {
+        serial.print("fat32: vfs.mount failed rc=", 27);
+        util.print_num(cast(i64, mr));
+        serial.println("", 0);
+    }
 }
 
 // ============================================================
