@@ -14,6 +14,7 @@ use "ksym.cst" as ksym;
 use "serial.cst" as serial;
 use "util.cst" as util;
 use "heap.cst" as heap;
+use "timer.cst" as timer;
 
 // HBA register offsets (ABAR + N)
 let is i64 as HBA_CAP  = 0x00;
@@ -23,10 +24,22 @@ let is i64 as HBA_PI   = 0x0C;
 let is i64 as HBA_VS   = 0x10;
 let is i64 as HBA_PORTS = 0x100;
 
+// CAP bits
+let is i64 as CAP_S64A = 0x80000000;   // 64-bit addressing supported
+let is i64 as CAP_SSS  = 0x08000000;   // staggered spin-up supported
+
 // GHC bits
 let is i64 as GHC_HR = 1;            // HBA reset
 let is i64 as GHC_IE = 2;            // interrupt enable
 let is i64 as GHC_AE = 0x80000000;   // AHCI enable
+
+// Timeouts (ns). tick_count increments at 1ms; the clock resolution
+// is 1ms, so a 1ms deadline can fire as soon as the next tick lands
+// — budgets below are conservative.
+let is i64 as TIMEOUT_HBA_RESET_NS = 1000000000;      //  1 s
+let is i64 as TIMEOUT_LINK_NS      = 1000000000;      //  1 s
+let is i64 as TIMEOUT_PORT_IDLE_NS =  500000000;      // 500 ms
+let is i64 as TIMEOUT_COMMAND_NS   = 30000000000;     // 30 s (ATA IDENTIFY can be slow)
 
 // Port register offsets (relative to port base = ABAR + 0x100 + port*0x80)
 let is i64 as PX_CLB  = 0x00;
@@ -93,36 +106,85 @@ fn port_base(abar as *u8, port as i64) as *u8 {
 }
 
 // ============================================================
+// Real-time timeouts via timer.current_time_ns. Prefer these over
+// spin-count loops — a 10M iteration spin completes in microseconds
+// on a fast CPU but a real HBA may take hundreds of ms for link
+// negotiation or drive spin-up.
+// ============================================================
+
+fn deadline_ns(budget as i64) as i64 {
+    return timer.current_time_ns() + budget;
+}
+
+fn deadline_expired(deadline as i64) as i32 {
+    if (timer.current_time_ns() >= deadline) { return 1; }
+    return 0;
+}
+
+// ============================================================
+// HBA reset — scrub any state left by firmware. GHC.HR self-clears
+// when the HBA is ready again; spec allows up to 1s.
+// ============================================================
+
+fn hba_reset(abar as *u8) as i32 {
+    let is i64 as ghc = mmio_read32(abar, HBA_GHC);
+    mmio_write32(abar, HBA_GHC, ghc | GHC_AE | GHC_HR);
+    let is i64 as dl = deadline_ns(TIMEOUT_HBA_RESET_NS);
+    while (deadline_expired(dl) == 0) {
+        if ((mmio_read32(abar, HBA_GHC) & GHC_HR) == 0) { return 0; }
+    }
+    return cast(i32, 0 - 1);
+}
+
+// ============================================================
 // Port init / IDENTIFY
 // ============================================================
 
-// Stop the port (CMD.ST=0, wait CMD.CR=0; CMD.FRE=0, wait CMD.FR=0).
-// Safe to call on a stopped port — bits already clear.
-fn port_stop(pb as *u8) as void {
+// Stop the port: clear CMD.ST, wait CR=0; clear CMD.FRE, wait FR=0.
+// Returns 0 on success, -1 on timeout. Safe to call on an already
+// stopped port — bits already clear, loop exits immediately.
+fn port_stop(pb as *u8) as i32 {
     let is i64 as cmd with mut = mmio_read32(pb, PX_CMD);
     mmio_write32(pb, PX_CMD, cmd & (0 - 1 - CMD_ST));
-    let is i64 as spin with mut = 0;
-    while (spin < 1000000) {
-        if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { spin = 1000000; }
-        else { spin = spin + 1; }
+    let is i64 as dl1 with mut = deadline_ns(TIMEOUT_PORT_IDLE_NS);
+    while (deadline_expired(dl1) == 0) {
+        if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { dl1 = 0 - 1; }
     }
+    if ((mmio_read32(pb, PX_CMD) & CMD_CR) != 0) { return cast(i32, 0 - 1); }
     cmd = mmio_read32(pb, PX_CMD);
     mmio_write32(pb, PX_CMD, cmd & (0 - 1 - CMD_FRE));
-    spin = 0;
-    while (spin < 1000000) {
-        if ((mmio_read32(pb, PX_CMD) & CMD_FR) == 0) { spin = 1000000; }
-        else { spin = spin + 1; }
+    let is i64 as dl2 with mut = deadline_ns(TIMEOUT_PORT_IDLE_NS);
+    while (deadline_expired(dl2) == 0) {
+        if ((mmio_read32(pb, PX_CMD) & CMD_FR) == 0) { dl2 = 0 - 1; }
     }
+    if ((mmio_read32(pb, PX_CMD) & CMD_FR) != 0) { return cast(i32, 0 - 1); }
+    return 0;
 }
 
-fn port_start(pb as *u8) as void {
-    let is i64 as spin with mut = 0;
-    while (spin < 1000000) {
-        if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { spin = 1000000; }
-        else { spin = spin + 1; }
+fn port_start(pb as *u8) as i32 {
+    // Must have CR=0 (port not running) before setting FRE/ST.
+    let is i64 as dl with mut = deadline_ns(TIMEOUT_PORT_IDLE_NS);
+    while (deadline_expired(dl) == 0) {
+        if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { dl = 0 - 1; }
     }
+    if ((mmio_read32(pb, PX_CMD) & CMD_CR) != 0) { return cast(i32, 0 - 1); }
     let is i64 as cmd = mmio_read32(pb, PX_CMD);
     mmio_write32(pb, PX_CMD, cmd | CMD_FRE | CMD_ST);
+    return 0;
+}
+
+// Wait for SSTS.DET == 3 (device present and phy communication
+// established). Returns 0 if link came up within TIMEOUT_LINK_NS,
+// -1 on timeout, -2 if port isn't implemented in PI.
+fn port_wait_link(abar as *u8, port as i64) as i32 {
+    let is i64 as pi = mmio_read32(abar, HBA_PI);
+    if ((pi & (cast(i64, 1) << port)) == 0) { return cast(i32, 0 - 2); }
+    let is *u8 as pb = port_base(abar, port);
+    let is i64 as dl = deadline_ns(TIMEOUT_LINK_NS);
+    while (deadline_expired(dl) == 0) {
+        if ((mmio_read32(pb, PX_SSTS) & 0xF) == 3) { return 0; }
+    }
+    return cast(i32, 0 - 1);
 }
 
 // Write command header 0 in the command list. CFL = FIS length in
@@ -167,26 +229,39 @@ fn build_identify_ct(c as *AhciCtx) as void {
 
 // Wait until BSY + DRQ clear. Polling; AHCI irq not yet wired here.
 fn wait_ready(pb as *u8) as i32 {
-    let is i64 as spin with mut = 0;
-    while (spin < 10000000) {
+    let is i64 as dl = deadline_ns(TIMEOUT_PORT_IDLE_NS);
+    while (deadline_expired(dl) == 0) {
         let is i64 as tfd = mmio_read32(pb, PX_TFD);
         if ((tfd & (TFD_BSY | TFD_DRQ)) == 0) { return 0; }
-        spin = spin + 1;
     }
     return cast(i32, 0 - 1);
 }
 
 fn wait_ci_clear(pb as *u8, slot as i64) as i32 {
     let is i64 as mask = cast(i64, 1) << slot;
-    let is i64 as spin with mut = 0;
-    while (spin < 10000000) {
+    let is i64 as dl = deadline_ns(TIMEOUT_COMMAND_NS);
+    while (deadline_expired(dl) == 0) {
         let is i64 as ci = mmio_read32(pb, PX_CI);
         if ((ci & mask) == 0) { return 0; }
         let is i64 as tfd = mmio_read32(pb, PX_TFD);
         if ((tfd & TFD_ERR) != 0) { return cast(i32, 0 - 2); }
-        spin = spin + 1;
     }
     return cast(i32, 0 - 1);
+}
+
+// Allocate any free command slot by scanning (SACT | CI). AHCI spec
+// requires finding the first slot where both are clear. CAP.NCS tells
+// us how many slots the HBA supports (N+1 in bits 8-12).
+fn alloc_slot(abar as *u8, pb as *u8) as i64 {
+    let is i64 as cap = mmio_read32(abar, HBA_CAP);
+    let is i64 as ncs = ((cap >> 8) & 0x1F) + 1;
+    let is i64 as used = mmio_read32(pb, PX_CI) | mmio_read32(pb, 0x34);  // 0x34 = SACT
+    let is i64 as s with mut = 0;
+    while (s < ncs) {
+        if ((used & (cast(i64, 1) << s)) == 0) { return s; }
+        s = s + 1;
+    }
+    return cast(i64, 0 - 1);
 }
 
 // IDENTIFY stores model name at words 27..46 (bytes 54..93). Each 16-bit
@@ -219,9 +294,18 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     util.print_hex(cast(i64, abar));
     serial.println("", 0);
 
-    // Enable AHCI mode
-    let is i64 as ghc = mmio_read32(abar, HBA_GHC);
-    mmio_write32(abar, HBA_GHC, ghc | GHC_AE);
+    // Take ownership of AE before reset so the HBA processes the HR
+    // bit in AHCI-aware mode (spec §10.4.3).
+    let is i64 as ghc0 = mmio_read32(abar, HBA_GHC);
+    mmio_write32(abar, HBA_GHC, ghc0 | GHC_AE);
+    if (hba_reset(abar) != 0) {
+        serial.println("ahci: HBA reset timeout", 23);
+        return cast(i32, 0 - 2);
+    }
+    // GHC.HR self-cleared but AE may have reset too; re-assert.
+    mmio_write32(abar, HBA_GHC, mmio_read32(abar, HBA_GHC) | GHC_AE);
+    // Clear any HBA-level pending interrupt status.
+    mmio_write32(abar, HBA_IS, cast(i64, 0 - 1));
 
     let is i64 as cap = mmio_read32(abar, HBA_CAP);
     let is i64 as pi  = mmio_read32(abar, HBA_PI);
@@ -231,14 +315,21 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     util.print_hex(pi);
     serial.println("", 0);
 
-    // Find first port with a device present (SSTS.DET == 3)
+    // S64A capability: if the HBA doesn't support 64-bit addressing
+    // we must keep all DMA structures below 4GB. Our dma_alloc already
+    // passes the DMA32 flag unconditionally, but log for visibility
+    // and future conditional behaviour.
+    if ((cap & CAP_S64A) == 0) {
+        serial.println("ahci: 32-bit-only HBA (S64A=0)", 30);
+    }
+
+    // Find first port with an implemented slot that has a live link.
+    // port_wait_link gives the phy up to TIMEOUT_LINK_NS to come up.
     let is i64 as port with mut = cast(i64, 0 - 1);
     let is i64 as pp with mut = 0;
     while (pp < 32) {
         if ((pi & (cast(i64, 1) << pp)) != 0) {
-            let is *u8 as testpb = port_base(abar, pp);
-            let is i64 as ssts = mmio_read32(testpb, PX_SSTS);
-            if ((ssts & 0xF) == 3) {
+            if (port_wait_link(abar, pp) == 0) {
                 port = pp;
                 pp = 32;
             } else {
@@ -249,7 +340,7 @@ fn ahci_bind(b as *spec.Binding) as i32 {
         }
     }
     if (port < 0) {
-        serial.println("ahci: no device attached on any port", 36);
+        serial.println("ahci: no device linked on any port", 34);
         return 0;
     }
     ctx.port = port;
@@ -258,14 +349,19 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     serial.println("", 0);
 
     let is *u8 as pb = port_base(abar, port);
-    port_stop(pb);
+    if (port_stop(pb) != 0) {
+        serial.println("ahci: port_stop timeout", 23);
+        return cast(i32, 0 - 3);
+    }
 
-    // Clear error register
+    // Clear PxSERR (W1C) and PxIS so we start fresh.
     mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
+    mmio_write32(pb, PX_IS, cast(i64, 0 - 1));
 
-    // Allocate command list (1KB), FIS base (256B), command table (1KB
-    // for safety — 128 header + 16 × 32 PRDT entries), and IDENTIFY
-    // buffer (512B).
+    // Allocate command list (1KB), FIS base (256B), command table
+    // (128B header + 16 PRDT entries = up to 256B; round to 1KB),
+    // and IDENTIFY buffer (512B). All in ZONE_DMA32 for HBAs that
+    // don't support S64A.
     let is i32 as rc1 = driver.dma_alloc(b.hardware, cast(u64, 1024), cast(u64, 1024),
                                           cast(u32, 1), &ctx.cmd_list);
     if (rc1 != driver.OK) { serial.println("ahci: cmd_list alloc fail", 25); return rc1; }
@@ -287,27 +383,49 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     let is *u8 as fa = cast(*u8, ctx.fis_base.virt);
     while (zi < 256) { fa[zi] = cast(u8, 0); zi = zi + 1; }
 
-    // Program CLB / FB
+    // Program CLB / FB. On S64A=0 HBAs the upper-32 registers still
+    // exist but must be zero — our DMA32 allocation keeps that true.
     mmio_write32(pb, PX_CLB,  ctx.cmd_list.phys & 0xFFFFFFFF);
     mmio_write32(pb, PX_CLBU, (ctx.cmd_list.phys >> 32) & 0xFFFFFFFF);
     mmio_write32(pb, PX_FB,   ctx.fis_base.phys & 0xFFFFFFFF);
     mmio_write32(pb, PX_FBU,  (ctx.fis_base.phys >> 32) & 0xFFFFFFFF);
 
-    port_start(pb);
+    if (port_start(pb) != 0) {
+        serial.println("ahci: port_start failed (CR stayed set)", 39);
+        return cast(i32, 0 - 4);
+    }
 
-    // IDENTIFY
-    if (wait_ready(pb) != 0) { serial.println("ahci: port busy pre-identify", 28); return cast(i32, 0 - 2); }
+    // IDENTIFY: must catch the port idle after start (firmware FIS
+    // traffic can keep BSY set briefly).
+    if (wait_ready(pb) != 0) {
+        let is i64 as tfd = mmio_read32(pb, PX_TFD);
+        serial.print("ahci: port busy pre-identify tfd=", 33);
+        util.print_hex(tfd);
+        serial.println("", 0);
+        return cast(i32, 0 - 5);
+    }
+
+    let is i64 as slot = alloc_slot(abar, pb);
+    if (slot < 0) {
+        serial.println("ahci: no free command slot", 26);
+        return cast(i32, 0 - 6);
+    }
 
     build_identify_ct(&ctx);
     fill_cmd_header(&ctx, 0, 1);        // read, 1 PRDT entry
 
-    // Issue command on slot 0
-    mmio_write32(pb, PX_CI, 1);
+    mmio_write32(pb, PX_CI, cast(i64, 1) << slot);
 
-    let is i32 as wrc = wait_ci_clear(pb, 0);
+    let is i32 as wrc = wait_ci_clear(pb, slot);
     if (wrc != 0) {
+        let is i64 as tfd = mmio_read32(pb, PX_TFD);
+        let is i64 as serr = mmio_read32(pb, PX_SERR);
         serial.print("ahci: identify failed rc=", 25);
         util.print_num(cast(i64, wrc));
+        serial.print(" tfd=", 5);
+        util.print_hex(tfd);
+        serial.print(" serr=", 6);
+        util.print_hex(serr);
         serial.println("", 0);
         return wrc;
     }
