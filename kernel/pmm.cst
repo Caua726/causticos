@@ -4,6 +4,7 @@
 use "serial.cst" as serial;
 use "limine.cst" as limine;
 use "util.cst" as util;
+use "lock.cst" as lock;
 
 // ============================================================
 // Constants
@@ -67,8 +68,28 @@ let is [2]i32 as zone_atomic_reserve;
 // IRQ lock state
 let is i64 as saved_flags with mut = 0;
 
-// Interrupt context tracking (set by IRQ handler, cleared on return)
-let is i32 as in_irq_context with mut = 0;
+// Per-cpu IRQ-context flag lives in smp.PerCpu. Reading it here
+// goes through a raw asm stub (smp_in_irq_context → gs:[0x70]) with
+// a shuttle scalar because `use "smp.cst"` would close a module
+// cycle — smp.cst already depends on pmm.
+let is i64 as irq_ctx_shuttle with mut = 0;
+
+// Global PMM lock. The buddy allocator touches per-zone freelists,
+// per-pfn bitmaps, the per-zone free counters, and emergency
+// reserves — all shared state. With multiple cpus calling
+// alloc_pages/free_pages concurrently (via heap.kmalloc, vmm
+// table-page allocation, per-thread kstack alloc), concurrent
+// updates corrupt the freelist and we take #PF inside
+// alloc_pages. acquire_irq pairs with the IRQ paths (AHCI
+// harvest allocates nothing today but kept IRQ-safe for future).
+let is lock.TicketLock as pmm_lock with mut;
+
+fn irq_context() as i64 {
+    asm("call smp_in_irq_context\n");
+    asm("lea rbx, [rip+_kernel_pmm_cst_irq_ctx_shuttle]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return irq_ctx_shuttle;
+}
 
 // HHDM offset — physical-to-virtual: virt = phys + hhdm
 let is i64 as hhdm with mut = 0;
@@ -836,7 +857,7 @@ fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as 
 
     // ALLOC_EMERGENCY enforcement: panic if used outside permitted context
     if ((flags & ALLOC_EMERGENCY) != cast(i32, 0)) {
-        if (in_irq_context == cast(i32, 0)) {
+        if (irq_context() == 0) {
             panic("ALLOC_EMERGENCY outside IRQ/panic context", 41);
         }
     }
@@ -851,7 +872,13 @@ fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as 
     while (att < NUM_ZONES) {
         let is i32 as need = cast(i32, 1) << order;
 
-        irq_save();
+        // Serialise the buddy allocator under pmm_lock. The legacy
+        // irq_save/irq_restore primitives stored their flags in a
+        // module global — fine on uniprocessor, SMP-fatal because
+        // two cpus doing irq_save concurrently stomp the same
+        // saved_flags slot. acquire_irq grabs the lock AND saves
+        // flags on this stack frame, so neither concern survives.
+        let is i64 as pflags = lock.acquire_irq(&pmm_lock);
 
         if (zone_has_budget(zone, flags, need) != cast(i32, 0)) {
             // Find smallest sufficient order
@@ -882,7 +909,7 @@ fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as 
                 mark_alloc(pfn, order, usage, owner);
                 totals[cast(i64, zone)] = totals[cast(i64, zone)] - need;
 
-                irq_restore();
+                lock.release_irq(&pmm_lock, pflags);
 
                 // Zero OUTSIDE lock (spec section 16.1)
                 if ((flags & ALLOC_ZERO) != cast(i32, 0)) {
@@ -900,7 +927,7 @@ fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as 
             }
         }
 
-        irq_restore();
+        lock.release_irq(&pmm_lock, pflags);
 
         // Bug #4 fix: DMA32 never falls back to NORMAL
         if (zone == ZONE_DMA32) { return PFN_NONE; }
@@ -961,14 +988,14 @@ fn free_pages(pfn as i32) as void {
     let is i32 as order = meta_get_order(pg.meta);
     let is i32 as zone = pfn_to_zone(pfn);
 
-    irq_save();
+    let is i64 as pflags = lock.acquire_irq(&pmm_lock);
 
     let is *i32 as totals = cast(*i32, &zone_free_totals);
     mark_free(pfn, order);
     totals[cast(i64, zone)] = totals[cast(i64, zone)] + (cast(i32, 1) << order);
     merge_insert(zone, pfn, order);
 
-    irq_restore();
+    lock.release_irq(&pmm_lock, pflags);
 }
 
 // ============================================================

@@ -3,6 +3,7 @@
 
 use "serial.cst" as serial;
 use "pmm.cst" as pmm;
+use "lock.cst" as lock;
 
 // ============================================================
 // Constants
@@ -22,6 +23,16 @@ let is i32 as SLAB_LIST_EMPTY   = 4;
 
 // Number of kmalloc size classes (14 per spec)
 let is i32 as NUM_CLASSES       = 14;
+
+// Global heap lock. Protects slab tables, kmalloc cache table,
+// per-cache partial/full/empty lists, and freelists inside each
+// slab. Two cpus concurrently kmalloc'ing from the same class
+// race on slab.freelist pops and corrupt the chain — observed as
+// #PF inside alloc_pages / slab internals on smp>=2. Acquired
+// IRQ-safe so allocations can happen from IRQ context (e.g.
+// io.new_request from a completion path). Nests INSIDE sched_lock
+// (schedule ctor on heap for thread struct) and OUTSIDE pmm_lock.
+let is lock.TicketLock as heap_lock with mut;
 
 // Cache flags
 let is i32 as CACHE_POISON      = 1;
@@ -290,19 +301,43 @@ fn kmalloc_cache_set(cls as i32, addr as i64) as void {
 // IRQ save/restore
 // ============================================================
 
+// Take the global heap_lock and stash the caller's RFLAGS in a
+// per-cpu slot (smp.PerCpu.heap_saved_flags at offset 0x80).
+// Replaces a pre-SMP pair that cli'd and wrote flags into a
+// module global — two cpus racing there would trash each other's
+// saved state and mis-restore IF on exit. The per-cpu slot plus
+// the ticket lock gives us cross-cpu mutual exclusion AND a
+// correct IF restore for each cpu independently. The gs:[0x80]
+// access is emitted as raw bytes because we can't `use "smp.cst"`
+// from here (would close a module cycle via smp's graph) and
+// caustic-as drops the gs: segment prefix.
 fn hirq_save() as void {
-    asm(".byte 0x9C\n");       // pushfq
-    asm("pop rax\n");
-    asm("lea rbx, [rip+_kernel_heap_cst_heap_saved_flags]\n");
-    asm("mov QWORD PTR [rbx], rax\n");
-    asm(".byte 0xFA\n");       // cli
+    let is i64 as flags = lock.acquire_irq(&heap_lock);
+    // mov QWORD PTR gs:[0x80], rdi  — Caustic places arg in rdi at
+    // this call position but `flags` is a local, not an arg — need
+    // to shuttle it via a Caustic-friendly helper.
+    heap_stash_flags(flags);
 }
 
+fn heap_stash_flags(f as i64) as void {
+    // Caustic places f in rdi. Move to gs:[0x80].
+    asm("mov rax, rdi\n");
+    asm(".byte 0x65, 0x48, 0x89, 0x04, 0x25, 0x80, 0x00, 0x00, 0x00\n");  // mov QWORD PTR gs:[0x80], rax
+}
+
+fn heap_load_flags() as i64 {
+    // Read gs:[0x80] via raw-bytes mov, stash in shuttle, return.
+    asm(".byte 0x65, 0x48, 0x8B, 0x04, 0x25, 0x80, 0x00, 0x00, 0x00\n");  // mov rax, QWORD PTR gs:[0x80]
+    asm("lea rbx, [rip+_kernel_heap_cst_heap_load_shuttle]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return heap_load_shuttle;
+}
+
+let is i64 as heap_load_shuttle with mut = 0;
+
 fn hirq_restore() as void {
-    asm("lea rbx, [rip+_kernel_heap_cst_heap_saved_flags]\n");
-    asm("mov rax, QWORD PTR [rbx]\n");
-    asm("push rax\n");
-    asm(".byte 0x9D\n");       // popfq
+    let is i64 as flags = heap_load_flags();
+    lock.release_irq(&heap_lock, flags);
 }
 
 // ============================================================
@@ -1111,7 +1146,8 @@ fn kmalloc(size as i64, flags as i32) as i64 {
     if (size == 0) { return 0; }
 
     if (size > KMALLOC_MAX_SIZE) {
-        // Large kmalloc: direct buddy allocation
+        // Large kmalloc: direct buddy allocation — pmm.alloc_pages
+        // has its own lock, so no heap_lock needed here.
         let is i64 as pages_needed = pmm.align_up(size, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
         let is i32 as order = ceil_log2(pages_needed);
         let is i32 as pfn = pmm.alloc_pages(pmm.ZONE_DMA32, flags, order, pmm.USAGE_KERNEL, cast(i32, 0));
@@ -1126,6 +1162,8 @@ fn kmalloc(size as i64, flags as i32) as i64 {
         // size <= 4096 always yields a valid class
         pmm.panic("kmalloc: invalid size class", 28);
     }
+    // kmalloc_cache_get is a plain table read; kcache_alloc takes
+    // heap_lock internally, so callers don't have to.
     let is i64 as c = kmalloc_cache_get(cls);
     if (c == 0) { return 0; }
     return kcache_alloc(c, flags);
@@ -1143,7 +1181,7 @@ fn kfree(ptr as i64) as void {
     let is i32 as usage = pmm.meta_get_usage(pi.meta);
 
     if (usage == cast(i32, pmm.USAGE_KERNEL)) {
-        // Large kmalloc — return to buddy
+        // Large kmalloc — return to buddy (pmm has its own lock).
         pmm.free_pages(pfn);
         return;
     }
@@ -1153,6 +1191,8 @@ fn kfree(ptr as i64) as void {
         if (sid == SLAB_NONE) {
             pmm.panic("kfree: no slab_id", 17);
         }
+        // slab_table_get is a plain table read; kcache_free takes
+        // heap_lock internally.
         let is i64 as s = slab_table_get(sid);
         if (s == 0) {
             pmm.panic("kfree: null slab", 16);

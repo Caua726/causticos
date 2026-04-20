@@ -26,8 +26,13 @@ use "lapic.cst"    as lapic;
 use "pmm.cst"      as pmm;
 use "vmm.cst"      as vmm;
 use "timer.cst"    as timer;
-use "sched.cst"    as sched;
 use "lock.cst"     as lock;
+// GDT / IDT helpers are reached by symbol rather than `use` because
+// idt.cst imports sched.cst which imports smp.cst — a `use` here
+// would close a cycle that caustic's module layer doesn't support.
+// The ap_load helpers are stable external symbols, so a direct
+// `call _kernel_gdt_cst_ap_load` / `call _kernel_idt_cst_ap_load`
+// is fine.
 
 // ============================================================
 // Per-CPU layout
@@ -37,14 +42,57 @@ let is i64 as MAX_CPUS = 16;
 let is i64 as AP_STACK_SIZE = 0x4000;   // 16 KiB
 
 struct PerCpu {
-    self_ptr as i64;         // offset 0: points back at this PerCpu — enables
-                             //           `mov rax, gs:[0]` to get the cpu base
-    cpu_id as i64;           // 0..cpu_count-1 (0 = BSP by convention)
+    self_ptr as i64;          // offset 0: points back at this PerCpu — enables
+                              //           `mov rax, gs:[0]` to get the cpu base
+    cpu_id as i64;            // 0..cpu_count-1 (0 = BSP by convention)
     lapic_id as i64;
-    idle_stack_top as i64;   // high address; AP's RSP lands here after entry
-    current_thread as i64;   // scheduler installs this in next phase
-    is_online as i64;        // all-i64 fields — caustic miscompiles mixed widths
-    boot_done as i64;        // 1 after AP finished its first-time init
+    idle_stack_top as i64;    // high address; AP's RSP lands here after entry
+    is_online as i64;         // all-i64 fields — caustic miscompiles mixed widths
+    boot_done as i64;         // 1 after AP finished its first-time init
+
+    // Per-CPU scheduler state. The shared runqueue (dl tree, band trees)
+    // is covered by sched.sched_lock; these fields are the bits of
+    // "what's running right now on THIS cpu" that must be per-CPU.
+    current_tid as i64;       // tid executing on this cpu, -1 before first schedule()
+    current_start_ns as i64;  // monotonic ns this cpu started running current_tid
+    idle_tid as i64;          // this cpu's own idle thread (every cpu has one)
+    fpu_owner_tid as i64;     // last thread to touch FPU on this cpu (FPU regs are per-cpu)
+    need_resched as i64;      // set by this cpu's timer IRQ, observed by idle / schedule
+
+    // Context-switch scratch. schedule() writes these before the asm
+    // mov-rsp pair; they live in PerCpu so two cpus running schedule()
+    // concurrently can't stomp each other's switch mid-flight.
+    ctx_old_rsp_ptr as i64;   // where to stash outgoing rsp
+    ctx_new_rsp as i64;       // incoming thread's saved rsp
+
+    // Trampoline scratch. A brand-new thread's first call goes
+    // through sched.thread_entry_trampoline which has to load the
+    // thread's entry point into a register before `call rax`. A
+    // module-level global here would race between cpus both
+    // launching new threads concurrently (each overwrites the
+    // other's read) — keep it per-cpu.
+    trampoline_entry as i64;
+
+    // `in_irq_context` has to be per-cpu: cpu A entering an IRQ
+    // shouldn't have its flag cleared by cpu B exiting one. The
+    // IDT stubs poke this slot via gs:[0x70] (raw bytes below —
+    // caustic-as drops the gs prefix so the instruction goes in
+    // as .byte). sched.cond_resched / preempt_enable read it via
+    // smp.this_cpu_in_irq_context().
+    in_irq_context as i64;
+
+    // Same for preempt_count — disable/enable is a read-modify-
+    // write, and a global would race between cpus even though
+    // the intent is strictly per-cpu.
+    preempt_count as i64;
+
+    // Per-cpu heap-lock flag stash. heap.hirq_save pairs (take
+    // heap_lock, save flags) with hirq_restore (release lock,
+    // restore flags); pre-SMP the flags lived in a module global
+    // that two cpus would stomp. A single i64 slot per cpu is
+    // enough because heap's own control flow never nests two
+    // hirq_save pairs at once on the same cpu.
+    heap_saved_flags as i64;
 }
 
 let is [16]PerCpu as per_cpus with mut;
@@ -109,6 +157,130 @@ fn current_cpu_id() as i64 {
     return p.cpu_id;
 }
 
+// Per-CPU scheduler-state accessors. These are thin enough that the
+// scheduler calls them by name — keeps the hot paths readable and
+// isolates the PerCpu struct layout from sched.cst. All reads/writes
+// happen on whichever cpu is currently executing, so there is no
+// cross-cpu cache coherence concern here (each cpu owns its own slot).
+
+fn this_cpu_current_tid() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.current_tid;
+}
+
+fn this_cpu_set_current_tid(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.current_tid = v;
+}
+
+fn this_cpu_current_start_ns() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.current_start_ns;
+}
+
+fn this_cpu_set_current_start_ns(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.current_start_ns = v;
+}
+
+fn this_cpu_idle_tid() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.idle_tid;
+}
+
+fn this_cpu_set_idle_tid(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.idle_tid = v;
+}
+
+fn this_cpu_fpu_owner_tid() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.fpu_owner_tid;
+}
+
+fn this_cpu_set_fpu_owner_tid(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.fpu_owner_tid = v;
+}
+
+fn this_cpu_need_resched() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.need_resched;
+}
+
+fn this_cpu_set_need_resched(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.need_resched = v;
+}
+
+// ctx_* are the scratch used during a context switch. `schedule()`
+// stores the outgoing-rsp pointer and incoming-rsp value here and the
+// asm sequence reads them by RIP-relative through a fixed symbol —
+// keeping them in PerCpu means concurrent schedule() calls on two cpus
+// don't trample each other's mid-switch state.
+
+fn this_cpu_set_ctx_old_rsp_ptr(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.ctx_old_rsp_ptr = v;
+}
+
+fn this_cpu_set_ctx_new_rsp(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.ctx_new_rsp = v;
+}
+
+fn this_cpu_trampoline_entry() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.trampoline_entry;
+}
+
+fn this_cpu_set_trampoline_entry(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.trampoline_entry = v;
+}
+
+// Jump to `target` via a register-only indirection. Implemented in
+// smp_asm.s because the sched trampoline can't use a module-level
+// shuttle or a PerCpu slot as a function-pointer hand-off — both
+// break when a thread is preempted after the set and resumed on a
+// different cpu's PerCpu slot or after another thread overwrote the
+// global. Caustic places the arg in rdi as per SysV; smp_call_ptr
+// copies it to rax and calls. Rdi/rax are caller-saved but the IRQ
+// stub push/pops them so preempt-through-this is safe.
+fn call_ptr(target as i64) as void {
+    asm("call smp_call_ptr\n");
+}
+
+fn this_cpu_in_irq_context() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.in_irq_context;
+}
+
+fn this_cpu_set_in_irq_context(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.in_irq_context = v;
+}
+
+fn this_cpu_preempt_count() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.preempt_count;
+}
+
+fn this_cpu_set_preempt_count(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.preempt_count = v;
+}
+
+fn this_cpu_heap_saved_flags() as i64 {
+    let is *PerCpu as p = current_cpu();
+    return p.heap_saved_flags;
+}
+
+fn this_cpu_set_heap_saved_flags(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.heap_saved_flags = v;
+}
+
 // ============================================================
 // Stack allocation — one 16 KiB per-AP idle stack, carved from the
 // page allocator at init time. Returns the top (high address) so the
@@ -147,16 +319,39 @@ fn install_gs_base(p as *PerCpu) as void {
     // with a user-mode entry yet.
 }
 
+// Minimal BSP-side GS base install. Called very early, right after
+// gdt.init, so IDT stubs can safely read per-cpu state through
+// gs:[..] the moment sti fires. With GS.BASE left at 0, the first
+// unrelated IRQ would have `mov rax, gs:[0x50]` load from physical
+// address 0x50 — a guaranteed #PF. Populating per_cpus[0] with
+// sentinel defaults keeps this_cpu_need_resched (and the idle_tid /
+// fpu_owner_tid probes schedule() does later) well-defined until
+// init() runs for real.
+fn init_bsp_early() as void {
+    per_cpus[0].self_ptr         = cast(i64, &per_cpus[0]);
+    per_cpus[0].cpu_id           = 0;
+    per_cpus[0].lapic_id         = 0;
+    per_cpus[0].is_online        = 1;
+    per_cpus[0].current_tid      = 0 - 1;
+    per_cpus[0].current_start_ns = 0;
+    per_cpus[0].idle_tid         = 0 - 1;
+    per_cpus[0].fpu_owner_tid    = 0 - 1;
+    per_cpus[0].need_resched     = 0;
+    per_cpus[0].ctx_old_rsp_ptr  = 0;
+    per_cpus[0].ctx_new_rsp      = 0;
+    per_cpus[0].trampoline_entry = 0;
+    per_cpus[0].in_irq_context   = 0;
+    per_cpus[0].preempt_count    = 0;
+    per_cpus[0].heap_saved_flags = 0;
+    install_gs_base(&per_cpus[0]);
+}
+
 fn init() as void {
     let is *u8 as resp = limine.get_smp_response();
     if (cast(i64, resp) == 0) {
         serial.println("smp: no Limine SMP response — uniprocessor", 42);
-        // Configure BSP PerCpu anyway so current_cpu() works.
-        per_cpus[0].self_ptr = cast(i64, &per_cpus[0]);
-        per_cpus[0].cpu_id = 0;
-        per_cpus[0].lapic_id = 0;
-        per_cpus[0].is_online = 1;
-        install_gs_base(&per_cpus[0]);
+        // BSP slot was already populated by init_bsp_early. Just
+        // confirm we're the one-and-only.
         cpu_count = 1;
         return;
     }
@@ -180,13 +375,23 @@ fn init() as void {
     let is i64 as i with mut = 0;
     while (i < n) {
         let is *u8 as info = cast(*u8, cpu_ptrs[i]);
-        per_cpus[i].self_ptr       = cast(i64, &per_cpus[i]);
-        per_cpus[i].cpu_id         = i;
-        per_cpus[i].lapic_id       = limine.smp_info_lapic_id(info);
-        per_cpus[i].idle_stack_top = 0;
-        per_cpus[i].current_thread = 0;
-        per_cpus[i].is_online      = 0;
-        per_cpus[i].boot_done      = 0;
+        per_cpus[i].self_ptr         = cast(i64, &per_cpus[i]);
+        per_cpus[i].cpu_id           = i;
+        per_cpus[i].lapic_id         = limine.smp_info_lapic_id(info);
+        per_cpus[i].idle_stack_top   = 0;
+        per_cpus[i].is_online        = 0;
+        per_cpus[i].boot_done        = 0;
+        per_cpus[i].current_tid      = 0 - 1;
+        per_cpus[i].current_start_ns = 0;
+        per_cpus[i].idle_tid         = 0 - 1;
+        per_cpus[i].fpu_owner_tid    = 0 - 1;
+        per_cpus[i].need_resched     = 0;
+        per_cpus[i].ctx_old_rsp_ptr  = 0;
+        per_cpus[i].ctx_new_rsp      = 0;
+        per_cpus[i].trampoline_entry = 0;
+        per_cpus[i].in_irq_context   = 0;
+        per_cpus[i].preempt_count    = 0;
+        per_cpus[i].heap_saved_flags = 0;
         if (per_cpus[i].lapic_id == bsp_lapic_id) {
             bsp_cpu_id = i;
         }
@@ -263,13 +468,34 @@ fn ap_entry(info as *u8) as void {
         while (1 == 1) { asm(".byte 0xF4\n"); }
     }
 
-    // Stay on Limine's CR3. APs only touch code + their own PerCpu
-    // slot here (both reside in kernel .text/.bss which Limine mapped
-    // identically). LAPIC MMIO is a kas-only mapping, but APs don't
-    // access it in this phase — LAPIC configuration is deferred to
-    // the scheduler-SMP phase that will actually route timer IRQs to
-    // APs. At that point APs will also switch to kas_pml4_phys.
+    // Step 1: move onto the kernel address space. Limine gave us a
+    // pml4 that covers its trampoline + the kernel ELF, but not our
+    // LAPIC MMIO mapping or any vmm_map_page allocations that happen
+    // after vmm.init — the BSP does those against kas_pml4_phys, and
+    // an AP running on Limine's pml4 would miss them.
+    load_cr3(vmm.kas_pml4_phys);
+
+    // Step 2: load our GDT. Intel's segment-selector caches are
+    // per-cpu, so even though the descriptor table is shared, each
+    // cpu has to lgdt it once to populate its own hidden state.
+    // `mov gs, ax` inside ap_load clobbers GS.BASE to 0 — GS base is
+    // re-armed immediately below.
+    asm("call _kernel_gdt_cst_ap_load\n");
+
+    // Step 3: install per-cpu GS base AFTER gdt.ap_load so the mov
+    // gs, ax in the segment reload doesn't overwrite what we just
+    // wrote. Every this_cpu_* accessor and the gs:[0x50] need_resched
+    // probe in IDT stubs rely on this being correct.
     install_gs_base(me);
+
+    // Step 4: IDT. Same story as the GDT — gates are shared, IDTR
+    // is per-cpu.
+    asm("call _kernel_idt_cst_ap_load\n");
+
+    // Step 5: local APIC — enable, pick the scheduler's timer
+    // vector, program the first tick. From here on, this cpu gets
+    // its own preemption IRQs on LAPIC vector 0x40.
+    lapic.ap_init();
 
     lock.acquire(&log_lock);
     serial.print("smp: AP[", 8);      util.print_num(me.cpu_id);
@@ -280,12 +506,33 @@ fn ap_entry(info as *u8) as void {
     me.is_online = 1;
     me.boot_done = 1;
 
-    // Idle loop. IRQs stay masked — no handler targets APs yet and
-    // leaving them enabled would deliver the BSP's LAPIC timer vector
-    // to an AP without a configured local APIC.
-    while (1 == 1) {
-        asm(".byte 0xF4\n");   // hlt
+    // Wait for BSP to finish sched.init before we dispatch —
+    // smp.init kicks APs before sched.init runs, so an eager AP
+    // would sail into per_cpu_init with thread_cache=0 and panic.
+    while (ap_wait_sched_active() == 0) {
+        asm(".byte 0xF3, 0x90\n");   // pause
     }
+
+    // Enter the scheduler. sti so the LAPIC timer IRQ can fire
+    // and drive preemption; sched.ap_start creates this cpu's
+    // idle thread, installs it as current, and jumps into
+    // idle_fn. Never returns.
+    asm(".byte 0xFB\n");  // sti
+    asm("call _kernel_sched_cst_ap_start\n");
+    while (1 == 1) { asm(".byte 0xF4\n"); }
+}
+
+// Thin shim around sched.is_active — called from the busy-wait above
+// because we can't `use "sched.cst"` from here (sched already uses
+// us). Shuttle pattern: call the external symbol, stash rax into a
+// module-level scalar, read it back through a normal Caustic return.
+let is i64 as ap_wait_shuttle with mut = 0;
+
+fn ap_wait_sched_active() as i64 {
+    asm("call _kernel_sched_cst_is_active\n");
+    asm("lea rbx, [rip+_kernel_smp_cst_ap_wait_shuttle]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return ap_wait_shuttle;
 }
 
 // ============================================================

@@ -216,28 +216,29 @@ fn harvest_all(p as *BlockIOProvider) as i64 {
 
 // Race-free wait for r.state == REQ_COMPLETE.
 //
-// Naive pattern:
-//     while (r.state != COMPLETE) { sched.sleep_thread(current) }
-// has a lost-wakeup window: between the state check (RUNNING) and
-// the sleep_thread call, an IRQ handler can set state=COMPLETE and
-// call wakeup_thread. wakeup_thread silently returns because the
-// thread isn't SLEEPING yet; the subsequent sleep_thread then
-// blocks permanently.
+// The pre-SMP version leaned on `cli` to mask the completing IRQ,
+// but under SMP an IRQ on another cpu is not masked by our local
+// `cli`. The lost-wakeup window is:
 //
-// Fix: enter the check with IRQs already masked. If state is already
-// COMPLETE, re-enable and break. Otherwise sleep_thread transitions
-// the thread to SLEEPING while IRQs are still masked and schedule()
-// hands off. The completing IRQ fires in another context with IF=1
-// restored, finds us SLEEPING, and the wakeup lands correctly.
-// After resume we re-mask before re-checking — never touch state
-// with IRQs enabled.
+//   CPU A:  r.state != COMPLETE  → call sleep_thread
+//   CPU B:  IRQ fires, state=COMPLETE, wakeup_thread(A)
+//              (A is still RUNNING; wakeup is a no-op)
+//   CPU A:  sleep_thread → state=SLEEPING, never woken
+//
+// Fix: hold sched_lock across the predicate check + SLEEPING
+// transition. wakeup_thread acquires the same lock, so if the
+// completer fires while we're in the check it blocks until we
+// either see COMPLETE (and bail out of the loop) or transition
+// to SLEEPING — in which case wakeup now observes SLEEPING and
+// re-queues us correctly. sched.sleep_locked_and_yield drops the
+// lock atomically with the hand-off to schedule().
 fn wait_complete(r as *BlockRequest) as void {
-    asm("cli\n");
+    let is i64 as flags with mut = sched.take_lock();
     while (r.state != REQ_COMPLETE) {
-        sched.sleep_thread(sched.current_tid());
-        asm("cli\n");
+        sched.sleep_locked_and_yield(flags);
+        flags = sched.take_lock();
     }
-    asm("sti\n");
+    sched.drop_lock(flags);
 }
 
 // Blocking read. Creates a request, submits, and sleeps the caller

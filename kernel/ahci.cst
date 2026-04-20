@@ -19,6 +19,7 @@ use "io.cst" as io;
 use "pmm.cst" as pmm;
 use "pci.cst" as pci;
 use "storage.cst" as storage;
+use "lock.cst" as lock;
 
 // HBA register offsets (ABAR + N)
 let is i64 as HBA_CAP  = 0x00;
@@ -105,6 +106,16 @@ struct AhciCtx {
     // arrays of pointers trip the mixed-width layout convention; i64
     // is the canonical carrier. slot_requests_raw is indexed directly.
     slot_requests_raw as [32]i64;
+    // Per-port ticket lock. Protects the critical sections that
+    // combine an MMIO read of PX_CI with a write to
+    // slot_requests_raw + PX_CI: without it two cpus submitting
+    // concurrently can pick the same free slot and stomp each
+    // other's request slot (observed on -smp 2 as
+    // "ahci.self_test: verify FAIL" — one self-test step's DMA
+    // buffer/slot got overwritten by a concurrent submit). Also
+    // held by the harvest path so it can read slot_requests_raw
+    // + zero the entry without tearing against a fresh submit.
+    port_lock as lock.TicketLock;
     provider as io.BlockIOProvider;     // embedded; registered with io
     binding as *spec.Binding;           // kept so on_irq can find the provider
     storage_dev as storage.StorageDevice; // embedded; registered with storage
@@ -672,10 +683,16 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
         }
     }
 
-    // Reserve a slot. Scans SACT|CI plus the driver's slot_requests
-    // table so a free HW slot that's still mid-book-keeping can't be
-    // double-assigned.
-    sched.preempt_disable();
+    // Reserve a slot + build the command + kick PX_CI under the
+    // port lock. Under SMP two cpus could otherwise read the same
+    // free PX_CI/SACT bits, both pick slot N, both write
+    // slot_requests_raw[N] (one wins), both overwrite the same
+    // command table (data corruption), and both OR bit N into
+    // PX_CI (which is idempotent but too late — the table has
+    // already been stomped). lock.acquire_irq masks IRQs so the
+    // IRQ-side harvest path, which also takes this lock, can't
+    // deadlock against us on this cpu either.
+    let is i64 as pflags = lock.acquire_irq(&c.port_lock);
     let is i64 as slot with mut = cast(i64, 0 - 1);
     let is i64 as used_mask = mmio_read32(pb, PX_CI) | mmio_read32(pb, 0x34);
     let is i64 as s with mut = 0;
@@ -693,12 +710,11 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
         }
     }
     if (slot < 0) {
-        sched.preempt_enable();
+        lock.release_irq(&c.port_lock, pflags);
         return cast(i32, driver.DEVICE_BUSY);
     }
     slot_request_set(c, slot, r);
     r.driver_slot = slot;
-    sched.preempt_enable();
 
     // Build command table + header. FLUSH has no PRDT (PRDTL=0); R/W
     // always use a single PRDT entry (scatter-gather would bump this).
@@ -713,9 +729,12 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
     }
     fill_slot_header(c, slot, is_write, prdtl);
 
-    // Kick: set the corresponding bit in PX_CI. Single-writer from
-    // this context; safe without read-modify-write.
+    // Kick: set the corresponding bit in PX_CI. Still under port
+    // lock so a harvest IRQ on another cpu observes the completed
+    // state (entry in slot_requests_raw, PX_CI bit set) atomically
+    // with the command-table contents being valid.
     mmio_write32(pb, PX_CI, cast(i64, 1) << slot);
+    lock.release_irq(&c.port_lock, pflags);
     return 0;
 }
 
@@ -747,6 +766,13 @@ fn recover_tfes(c as *AhciCtx, pb as *u8) as void {
 fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
     let is *AhciCtx as c = cast(*AhciCtx, p.private);
     let is *u8 as pb = port_base(c.abar, c.port);
+    // Serialise against concurrent submits on other cpus. Without
+    // this lock an in-flight submit (between slot_request_set and
+    // mmio_write32(PX_CI, ...)) could be observed here as "PX_CI
+    // bit clear + slot_requests entry set", which harvest would
+    // mistake for a completion and return a freshly-submitted
+    // request as though its DMA had finished.
+    let is i64 as pflags = lock.acquire_irq(&c.port_lock);
     let is i64 as ci = mmio_read32(pb, PX_CI);
     let is i64 as tfd = mmio_read32(pb, PX_TFD);
     let is i64 as pxis = mmio_read32(pb, PX_IS);
@@ -792,12 +818,14 @@ fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
                     }
                     if (any_left == 0) { recover_tfes(c, pb); }
                 }
+                lock.release_irq(&c.port_lock, pflags);
                 return 1;
             }
         }
         slot = slot + 1;
     }
     *out = cast(*io.BlockRequest, 0);
+    lock.release_irq(&c.port_lock, pflags);
     return 0;
 }
 

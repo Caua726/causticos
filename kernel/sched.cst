@@ -16,6 +16,8 @@ use "timer.cst" as timer;
 use "util.cst" as util;
 use "rbtree.cst" as rb;
 use "lapic.cst" as lapic;
+use "smp.cst" as smp;
+use "lock.cst" as lock;
 
 // ============================================================
 // Constants
@@ -298,18 +300,26 @@ fn dl_root_ptr() as i64      { return rq_ptr() + 8; }
 fn dl_count() as i64         { return rq_get(16); }
 fn dl_set_count(v as i64) as void { rq_set(16, v); }
 
-fn current_tid() as i64      { return rq_get(24); }
-fn set_current_tid(v as i64) as void { rq_set(24, v); }
-fn current_start_ns() as i64 { return rq_get(32); }
-fn set_current_start_ns(v as i64) as void { rq_set(32, v); }
-fn idle_tid() as i64         { return rq_get(40); }
-fn set_idle_tid(v as i64) as void { rq_set(40, v); }
+// current_tid / current_start_ns / idle_tid / fpu_owner_tid are
+// per-CPU — each cpu tracks what it is running, when it started, and
+// which thread last touched the FPU *on that cpu*. They live in
+// smp.PerCpu; the accessors here forward to smp.this_cpu_* so call
+// sites don't have to know about the indirection.
+fn current_tid() as i64               { return smp.this_cpu_current_tid(); }
+fn set_current_tid(v as i64) as void  { smp.this_cpu_set_current_tid(v); }
+fn current_start_ns() as i64          { return smp.this_cpu_current_start_ns(); }
+fn set_current_start_ns(v as i64) as void { smp.this_cpu_set_current_start_ns(v); }
+fn idle_tid() as i64                  { return smp.this_cpu_idle_tid(); }
+fn set_idle_tid(v as i64) as void     { smp.this_cpu_set_idle_tid(v); }
+fn fpu_owner_tid() as i64             { return smp.this_cpu_fpu_owner_tid(); }
+fn set_fpu_owner_tid(v as i64) as void { smp.this_cpu_set_fpu_owner_tid(v); }
+
+// nr_running / nr_switches remain in the shared runqueue — they
+// describe cross-cpu totals and are updated under sched_lock.
 fn nr_running() as i64       { return rq_get(48); }
 fn set_nr_running(v as i64) as void { rq_set(48, v); }
 fn nr_switches() as i64      { return rq_get(56); }
 fn set_nr_switches(v as i64) as void { rq_set(56, v); }
-fn fpu_owner_tid() as i64    { return rq_get(64); }
-fn set_fpu_owner_tid(v as i64) as void { rq_set(64, v); }
 
 // Per-band accessors (within runqueue)
 fn band_root_ptr(b as i64) as i64 { return rq_ptr() + 72 + b * 8; }
@@ -351,11 +361,26 @@ fn bb_set(band as i64, field as i64, v as i64) as void {
 let is i64 as sched_active with mut = 0;
 
 let is i64 as switch_rsp with mut = 0;
-let is i64 as ctx_old_rsp_ptr with mut = 0;
-let is i64 as ctx_new_rsp with mut = 0;
+// ctx_old_rsp_ptr / ctx_new_rsp live in smp.PerCpu now (offsets
+// 0x58 / 0x60). schedule()'s switch asm reads them via gs:[..]
+// so a concurrent switch on another cpu can't stomp our scratch
+// between the store and the mov-rsp pair.
 
-// Preemption control (§11.5)
-let is i64 as preempt_count with mut = 0;
+// Preempt count lives in smp.PerCpu now — accessed via
+// smp.this_cpu_{,set_}preempt_count. Keeping it global would race
+// across cpus even though the intent is per-cpu.
+
+// Global scheduler lock. Held for the duration of schedule() —
+// including the context-switch asm — so only one cpu at a time
+// picks the next thread and updates the runqueue. The lock is
+// released on the *resuming* side of the switch (either at .Lresume
+// for a previously-suspended thread, or at the top of
+// thread_entry_trampoline for a brand-new thread). Every thread that
+// can be switched into therefore returns from schedule() owning the
+// obligation to drop this lock. create_thread / sleep_thread /
+// wakeup_thread also take it since they mutate the same runqueue
+// structures.
+let is lock.TicketLock as sched_lock with mut;
 
 fn band_weight(b as i64) as i64 {
     if (b == QOS_BATCH) { return 512; }
@@ -368,14 +393,14 @@ fn band_weight(b as i64) as i64 {
 // ============================================================
 
 fn preempt_disable() as void {
-    preempt_count = preempt_count + 1;
+    smp.this_cpu_set_preempt_count(smp.this_cpu_preempt_count() + 1);
 }
 
 fn preempt_enable() as void {
-    preempt_count = preempt_count - 1;
-    if (preempt_count == 0) {
-        if (pmm.in_irq_context == 0) {
-            if (timer.need_resched != 0) {
+    smp.this_cpu_set_preempt_count(smp.this_cpu_preempt_count() - 1);
+    if (smp.this_cpu_preempt_count() == 0) {
+        if (smp.this_cpu_in_irq_context() == 0) {
+            if (smp.this_cpu_need_resched() != 0) {
                 schedule();
             }
         }
@@ -383,9 +408,9 @@ fn preempt_enable() as void {
 }
 
 fn cond_resched() as void {
-    if (preempt_count > 0) { return; }
-    if (pmm.in_irq_context != 0) { return; }  // never schedule from IRQ context
-    if (timer.need_resched != 0) {
+    if (smp.this_cpu_preempt_count() > 0) { return; }
+    if (smp.this_cpu_in_irq_context() != 0) { return; }
+    if (smp.this_cpu_need_resched() != 0) {
         schedule();
     }
 }
@@ -474,17 +499,26 @@ fn dl_total_utilization() as i64 {
 }
 
 fn sched_set_deadline(tid as i64, runtime_ns as i64, period_ns as i64, deadline_ns as i64) as i64 {
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
     // Check capability
     if ((thr_caps(tid) & CAP_SCHED_REALTIME) == 0) {
+        lock.release_irq(&sched_lock, saved_flags);
         return 0 - 1;  // EPERM
     }
-    if (runtime_ns > deadline_ns) { return 0 - 2; }  // EINVAL
-    if (deadline_ns > period_ns)  { return 0 - 2; }
+    if (runtime_ns > deadline_ns) {
+        lock.release_irq(&sched_lock, saved_flags);
+        return 0 - 2;  // EINVAL
+    }
+    if (deadline_ns > period_ns) {
+        lock.release_irq(&sched_lock, saved_flags);
+        return 0 - 2;
+    }
 
     // Admission test
     let is i64 as new_util = runtime_ns * 100 / period_ns;
     let is i64 as total = dl_total_utilization() + new_util;
     if (total > MAX_DL_UTIL_PCT) {
+        lock.release_irq(&sched_lock, saved_flags);
         return 0 - 3;  // EBUSY
     }
 
@@ -508,6 +542,7 @@ fn sched_set_deadline(tid as i64, runtime_ns as i64, period_ns as i64, deadline_
         dl_insert(tid);
     }
 
+    lock.release_irq(&sched_lock, saved_flags);
     return 0;
 }
 
@@ -542,7 +577,7 @@ fn dl_check_replenish() as void {
                     thr_set(tid, 8, THREAD_RUNNABLE);
                     dl_insert(tid);
                     set_nr_running(nr_running() + 1);
-                    timer.need_resched = 1;
+                    smp.this_cpu_set_need_resched(1);
                 }
             }
         }
@@ -616,9 +651,13 @@ fn demote_thread(tid as i64) as void {
     if (thr_state(tid) == THREAD_RUNNABLE) {
         runlist_insert(new_band, tid);
     }
-    serial.print("demote tid=", 11);
-    util.print_num(tid);
-    serial.println("", 0);
+    // No serial output here: demote_thread is called from
+    // qos_budget_check inside schedule() while sched_lock is
+    // held. serial.print takes its own ticket lock and busy-waits
+    // on the UART; under SMP that creates an ordering
+    // sched_lock → serial_lock with a bounded-but-long spin,
+    // which interacts badly with any other cpu parked spinning
+    // on sched_lock.
 }
 
 fn promote_thread(tid as i64) as void {
@@ -643,15 +682,23 @@ fn promote_thread(tid as i64) as void {
 // ============================================================
 
 fn sched_set_qos(tid as i64, requested_band as i64) as i64 {
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
     if (requested_band == QOS_INPUT) {
-        if ((thr_caps(tid) & CAP_SCHED_INPUT) == 0) { return 0 - 1; }
+        if ((thr_caps(tid) & CAP_SCHED_INPUT) == 0) {
+            lock.release_irq(&sched_lock, saved_flags);
+            return 0 - 1;
+        }
     }
     if (requested_band == QOS_RENDER) {
-        if ((thr_caps(tid) & CAP_SCHED_RENDER) == 0) { return 0 - 1; }
+        if ((thr_caps(tid) & CAP_SCHED_RENDER) == 0) {
+            lock.release_irq(&sched_lock, saved_flags);
+            return 0 - 1;
+        }
     }
     thr_set(tid, 24, requested_band);
     thr_set(tid, 216, requested_band);  // original_qos_band
     thr_set(tid, 32, band_weight(requested_band));
+    lock.release_irq(&sched_lock, saved_flags);
     return 0;
 }
 
@@ -718,6 +765,7 @@ fn handle_nm_fault() as void {
 // ============================================================
 
 fn create_thread(entry as i64, band as i64) as i64 {
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
 
     // Reserve the tid but do NOT publish it via next_tid yet — any
     // IRQ that scans `tid < next_tid` (dl_check_replenish,
@@ -790,6 +838,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     set_nr_running(nr_running() + 1);
     thread_count = thread_count + 1;
 
+    lock.release_irq(&sched_lock, saved_flags);
     return tid;
 }
 
@@ -798,13 +847,41 @@ fn create_thread(entry as i64, band as i64) as i64 {
 // ============================================================
 
 fn sleep_thread(tid as i64) as void {
-    if (thr_state(tid) != THREAD_RUNNING) { return; }
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
+    if (thr_state(tid) != THREAD_RUNNING) {
+        lock.release_irq(&sched_lock, saved_flags);
+        return;
+    }
     thr_set(tid, 8, THREAD_SLEEPING);
+    lock.release_irq(&sched_lock, saved_flags);
+    // schedule() re-acquires the lock itself. We are the current
+    // thread on this cpu; nobody else can try to dispatch us between
+    // the release and the schedule call, and if a cross-cpu IRQ
+    // fires, the worst it can do is observe us as SLEEPING and
+    // accelerate the deschedule we were about to do.
+    schedule();
+}
+
+// Condition-variable-style sleep. Caller holds sched_lock with
+// IRQs disabled and a copy of the saved flags; this helper marks
+// the current thread SLEEPING, drops the lock, yields, and
+// re-acquires on resume. Used by io.wait_complete and anywhere
+// else that needs atomic "check predicate → sleep". Closes the
+// lost-wakeup window where a cross-cpu IRQ between an
+// unlocked predicate check and sleep_thread would observe the
+// thread as RUNNING and no-op the wakeup.
+fn sleep_locked_and_yield(saved_flags as i64) as void {
+    thr_set(current_tid(), 8, THREAD_SLEEPING);
+    lock.release_irq(&sched_lock, saved_flags);
     schedule();
 }
 
 fn wakeup_thread(tid as i64) as void {
-    if (thr_state(tid) != THREAD_SLEEPING) { return; }
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
+    if (thr_state(tid) != THREAD_SLEEPING) {
+        lock.release_irq(&sched_lock, saved_flags);
+        return;
+    }
 
     let is i64 as band = thr_band(tid);
     let is i64 as w = thr_weight(tid);
@@ -827,47 +904,86 @@ fn wakeup_thread(tid as i64) as void {
     set_nr_running(nr_running() + 1);
 
     if (current_tid() >= 0) {
-        if (thr_class(current_tid()) == SCHED_CLASS_IDLE) { timer.need_resched = 1; }
+        if (thr_class(current_tid()) == SCHED_CLASS_IDLE) { smp.this_cpu_set_need_resched(1); }
         else {
-            if (thr_class(tid) == SCHED_CLASS_DEADLINE) { timer.need_resched = 1; }
+            if (thr_class(tid) == SCHED_CLASS_DEADLINE) { smp.this_cpu_set_need_resched(1); }
             else {
                 if (thr_class(current_tid()) == SCHED_CLASS_QOS) {
-                    if (band < thr_band(current_tid())) { timer.need_resched = 1; }
+                    if (band < thr_band(current_tid())) { smp.this_cpu_set_need_resched(1); }
                 }
             }
         }
     }
+
+    lock.release_irq(&sched_lock, saved_flags);
 }
 
 fn suspend_thread(tid as i64) as void {
-    if (thr_state(tid) != THREAD_RUNNING) { return; }
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
+    if (thr_state(tid) != THREAD_RUNNING) {
+        lock.release_irq(&sched_lock, saved_flags);
+        return;
+    }
     thr_set(tid, 8, THREAD_SUSPENDED);
+    lock.release_irq(&sched_lock, saved_flags);
     schedule();
 }
 
 fn resume_thread(tid as i64) as void {
-    if (thr_state(tid) != THREAD_SUSPENDED) { return; }
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
+    if (thr_state(tid) != THREAD_SUSPENDED) {
+        lock.release_irq(&sched_lock, saved_flags);
+        return;
+    }
     thr_set(tid, 8, THREAD_RUNNABLE);
     let is i64 as band = thr_band(tid);
     if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dl_insert(tid); }
     else { runlist_insert(band, tid); }
     set_nr_running(nr_running() + 1);
+    lock.release_irq(&sched_lock, saved_flags);
 }
 
 // ============================================================
 // Thread entry trampoline
 // ============================================================
 
-let is i64 as trampoline_entry with mut = 0;
 
 fn thread_entry_trampoline() as void {
+    // First code to run on a brand-new thread. schedule() handed
+    // control over to us via a ret off the fake frame that
+    // create_thread built — sched_lock is still held from that
+    // context switch, drop it before enabling IRQs so the new
+    // thread starts on equal footing with any resuming thread.
+    //
+    // If the switch that launched us came from an IRQ stub, that
+    // stub set gs:[0x70]=1 (in_irq_context) and now never regains
+    // control to clear it — the stub's frame is left pinned on
+    // the outgoing thread's kstack, to be drained whenever that
+    // thread is eventually resumed via .Lresume. Meanwhile this
+    // cpu would otherwise sit with in_irq_context=1 forever,
+    // which disables cond_resched/preempt_enable here. Clear it
+    // explicitly so thread-context code in this trampoline-born
+    // thread runs with the right semantics.
+    smp.this_cpu_set_in_irq_context(0);
+    lock.release(&sched_lock);
     asm(".byte 0xFB\n");  // sti
-    trampoline_entry = thr_entry(current_tid());
-    asm("lea rax, [rip+_kernel_sched_cst_trampoline_entry]\n");
-    asm("mov rax, QWORD PTR [rax]\n");
-    asm("call rax\n");
+    // Jump to the thread's entry via a register indirection in
+    // smp_asm.s. A PerCpu-slot shuttle here was racy: if the thread
+    // got preempted after the store and resumed on a different cpu,
+    // the reload would fetch some other cpu's slot. `call_ptr`
+    // passes the entry through rdi/rax which the IRQ stub
+    // consistently push/pops around preemption, so preempt-through
+    // the sequence is safe.
+    smp.call_ptr(thr_entry(current_tid()));
+
+    // Thread exited. Mark DEAD + drop from nr_running under the
+    // scheduler lock, then schedule(); we never come back.
+    asm(".byte 0xFA\n");  // cli
+    lock.acquire(&sched_lock);
     thr_set(current_tid(), 8, THREAD_DEAD);
     set_nr_running(nr_running() - 1);
+    lock.release(&sched_lock);
+    asm(".byte 0xFB\n");  // sti
     schedule();
     while (1 == 1) { asm(".byte 0xF4\n"); }
 }
@@ -951,7 +1067,15 @@ fn account_runtime(tid as i64, elapsed_ns as i64) as void {
 fn schedule() as void {
     if (sched_active == 0) { return; }
 
+    // Remember whether we came from IRQ context so the tail knows
+    // whether it's safe to sti. On the IRQ-stub path the iretq will
+    // restore IF from the saved frame; on the thread-call path the
+    // caller ran with IF=1 and expects IF=1 on return. Capture
+    // BEFORE the cli masks our window.
+    let is i64 as from_irq = smp.this_cpu_in_irq_context();
+
     asm(".byte 0xFA\n");  // cli
+    lock.acquire(&sched_lock);
 
     let is i64 as now = timer.current_time_ns();
     let is i64 as prev = current_tid();
@@ -990,9 +1114,14 @@ fn schedule() as void {
     set_current_tid(next);
     set_current_start_ns(timer.current_time_ns());
     set_nr_switches(nr_switches() + 1);
-    timer.need_resched = 0;
+    smp.this_cpu_set_need_resched(0);
 
-    // Context switch
+    // Context switch. The asm keeps sched_lock held across the
+    // rsp swap so the outgoing ctx_old/new_rsp globals can't be
+    // stomped by another cpu between the store and load — the
+    // resuming side (either .Lresume below for a previously-
+    // suspended thread or the top of thread_entry_trampoline for
+    // a brand-new one) is responsible for dropping the lock.
     if (prev != next) {
         if (prev >= 0) {
             if (thr_state(prev) == THREAD_RUNNABLE) {
@@ -1004,8 +1133,17 @@ fn schedule() as void {
             // FPU: set TS so next thread triggers #NM on first FPU use
             cr0_set_ts();
 
-            ctx_old_rsp_ptr = thread_ptr(prev) + 64;
-            ctx_new_rsp = thr_kstack_top(next);
+            // Stash the switch scratch in this cpu's PerCpu slot
+            // instead of module globals. sched_lock serialises
+            // concurrent switches so globals would "work", but
+            // once a cpu releases the lock (in .Lresume below)
+            // another cpu can immediately start its own switch —
+            // if it races into writing the globals while the first
+            // cpu is still about to read them in the asm, ctx_*
+            // globals stomp. Per-cpu slots close that window
+            // without depending on lock coverage of the asm.
+            smp.this_cpu_set_ctx_old_rsp_ptr(thread_ptr(prev) + 64);
+            smp.this_cpu_set_ctx_new_rsp(thr_kstack_top(next));
 
             asm("push r15\n");
             asm("push r14\n");
@@ -1015,11 +1153,11 @@ fn schedule() as void {
             asm("push rbp\n");
             asm("lea rax, [rip+.Lresume]\n");
             asm("push rax\n");
-            asm("lea rax, [rip+_kernel_sched_cst_ctx_old_rsp_ptr]\n");
-            asm("mov rax, QWORD PTR [rax]\n");
+            // mov rax, QWORD PTR gs:[0x58] → ctx_old_rsp_ptr
+            asm(".byte 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00\n");
             asm("mov QWORD PTR [rax], rsp\n");
-            asm("lea rax, [rip+_kernel_sched_cst_ctx_new_rsp]\n");
-            asm("mov rsp, QWORD PTR [rax]\n");
+            // mov rsp, QWORD PTR gs:[0x60] → ctx_new_rsp
+            asm(".byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x60, 0x00, 0x00, 0x00\n");
             asm("ret\n");
             asm(".Lresume:\n");
             asm("pop rbp\n");
@@ -1029,12 +1167,29 @@ fn schedule() as void {
             asm("pop r14\n");
             asm("pop r15\n");
         }
-    } else {
-        asm(".byte 0xFB\n");  // sti
     }
 
-    // Program LAPIC for next event (§12.2)
+    // Program LAPIC for next event (§12.2) while still holding
+    // the lock — the deadline tree + suspended-deadline scan read
+    // shared state, so doing it under the lock keeps those reads
+    // consistent with whatever picks came before. The LAPIC MSR
+    // write itself is per-cpu, so contending cpus don't collide.
     program_next_tick();
+
+    lock.release(&sched_lock);
+
+    // sti only on the thread-call path. If schedule() was called
+    // from an IRQ stub, the stub's iretq will restore IF from the
+    // saved frame; an sti here would enable IRQs while the stub is
+    // still mid-pop of 15 GPRs, and a recursive IRQ entry would
+    // stomp the in-flight register restore (observed as crashes at
+    // RIP=0x10/0xe/0x1 — the tail end of return-address pop
+    // sequences). Thread-call path (idle_fn, yield_cpu, trampoline
+    // tail) came in with IF=1 and expects IF=1 on return; they have
+    // no iretq to fix IF for them.
+    if (from_irq == 0) {
+        asm(".byte 0xFB\n");  // sti
+    }
 }
 
 // ============================================================
@@ -1044,23 +1199,32 @@ fn schedule() as void {
 fn on_timer_tick() as void {
     if (sched_active == 0) { return; }
 
+    // Runs from the LAPIC timer IRQ stub without sched_lock.
+    // Everything this function reads — current_tid() / thr_class /
+    // nr_running() / elapsed — is either per-cpu state owned by
+    // this cpu or a word-sized shared counter that's fine to read
+    // racily (worst case: one tick of drift before schedule()
+    // picks the correct next thread under the lock anyway). What
+    // we deliberately do NOT do here: touch the deadline RB tree.
+    // dl_check_replenish mutates the tree and MUST run under
+    // sched_lock; schedule() calls it at the top once we commit
+    // to rescheduling, so scheduling the reschedule here is
+    // enough.
+
     let is i64 as now = timer.current_time_ns();
     let is i64 as elapsed = now - current_start_ns();
 
     // Always resched if idle and threads available
     if (current_tid() >= 0) {
         if (thr_class(current_tid()) == SCHED_CLASS_IDLE) {
-            if (nr_running() > 0) { timer.need_resched = 1; }
+            if (nr_running() > 0) { smp.this_cpu_set_need_resched(1); }
             return;
         }
     }
 
-    // Deadline: check if higher-prio deadline thread became runnable (replenishment)
-    dl_check_replenish();
-
     // Quantum expired?
     if (elapsed >= quantum_ns) {
-        timer.need_resched = 1;
+        smp.this_cpu_set_need_resched(1);
     }
 }
 
@@ -1112,7 +1276,7 @@ fn yield_cpu() as void { schedule(); }
 
 fn idle_fn() as void {
     while (1 == 1) {
-        if (timer.need_resched != 0) { schedule(); }
+        if (smp.this_cpu_need_resched() != 0) { schedule(); }
         asm(".byte 0xF4\n");
     }
 }
@@ -1143,9 +1307,6 @@ fn init() as void {
         band_set_min_vruntime(b, 0);
         b = b + 1;
     }
-    rq_set(24, 0 - 1);  // current_tid = -1
-    rq_set(40, 0 - 1);  // idle_tid = -1
-    rq_set(64, 0 - 1);  // fpu_owner_tid = -1
 
     // Band budgets (§7.2)
     bb_set(0, 0, 20);  bb_set(0, 1, QOS_WINDOW_NS); bb_set(0, 2, 5); bb_set(0, 3, 3);
@@ -1155,9 +1316,23 @@ fn init() as void {
     bb_set(4, 0, 100); bb_set(4, 1, QOS_WINDOW_NS); bb_set(4, 2, 0); bb_set(4, 3, 0);
     bb_set(5, 0, 100); bb_set(5, 1, QOS_WINDOW_NS); bb_set(5, 2, 0); bb_set(5, 3, 0);
 
-    // Create idle thread. Same ordering rule as create_thread:
-    // populate hash first, bump next_tid last so any scanner racing
-    // on `tid < next_tid` sees either no slot or a complete one.
+    // Per-cpu idle is created by per_cpu_init below (BSP calls it
+    // inline here; APs call it from their entry path). Keeping idle
+    // creation out of init() means the shared structures are fully
+    // valid before any cpu installs itself as "currently running".
+
+    per_cpu_init();
+
+    serial.println("sched: ready", 12);
+}
+
+// Per-cpu scheduler bring-up. Creates this cpu's idle thread, marks
+// it RUNNING on this cpu, and publishes it as current + idle. Must
+// be called by every cpu before it touches schedule() / yield_cpu.
+// Safe to call from either BSP (inside sched.init) or AP entry.
+fn per_cpu_init() as void {
+    let is i64 as saved_flags = lock.acquire_irq(&sched_lock);
+
     let is i64 as itid = next_tid;
     let is i64 as iptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
     if (iptr == 0) { pmm.panic("idle alloc fail", 15); }
@@ -1174,15 +1349,57 @@ fn init() as void {
     thr_set(itid, 32, BASE_WEIGHT);
     thr_set(itid, 40, DEFAULT_SLICE_NS);
 
+    // current_tid / idle_tid / current_start_ns live in smp.PerCpu
+    // and the accessors write to whichever cpu is running right now
+    // — which is exactly the one we want to initialise.
     set_idle_tid(itid);
     set_current_tid(itid);
     set_current_start_ns(timer.current_time_ns());
 
-    serial.println("sched: ready", 12);
+    lock.release_irq(&sched_lock, saved_flags);
 }
 
 fn start() as void {
     sched_active = 1;
     serial.println("sched: active", 13);
+    idle_fn();
+}
+
+// Read sched_active from outside this module. APs poll this before
+// entering ap_start so they don't start dispatching on a runqueue
+// whose data structures (tid_ht, thread_cache, band trees) aren't
+// fully set up yet. A plain load is fine — the BSP sets the flag
+// long after all init writes are globally visible.
+fn is_active() as i64 {
+    return sched_active;
+}
+
+// External handles on sched_lock for subsystems that need
+// atomic check-then-sleep against an IRQ-driven wakeup (io,
+// futures, etc). Use pattern:
+//
+//   flags = sched.take_lock();
+//   while (predicate != true) {
+//     sched.sleep_locked_and_yield(flags);
+//     flags = sched.take_lock();
+//   }
+//   sched.drop_lock(flags);
+//
+// `sleep_locked_and_yield` hands the lock off through
+// schedule(); on resume the caller re-acquires with
+// take_lock() to re-check the predicate without a race.
+fn take_lock() as i64 {
+    return lock.acquire_irq(&sched_lock);
+}
+
+fn drop_lock(saved_flags as i64) as void {
+    lock.release_irq(&sched_lock, saved_flags);
+}
+
+// AP entry point into the scheduler. APs call this after they've
+// loaded GDT/IDT, switched to kas_pml4_phys, enabled their LAPIC and
+// programmed their local timer. Never returns.
+fn ap_start() as void {
+    per_cpu_init();
     idle_fn();
 }
