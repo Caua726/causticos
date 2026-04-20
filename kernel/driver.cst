@@ -11,6 +11,7 @@ use "serial.cst" as serial;
 use "sched.cst" as sched;
 use "vmm.cst" as vmm;
 use "lapic.cst" as lapic;
+use "lock.cst" as lock;
 
 // ============================================================
 // DriverResult — OK=0, errors positive
@@ -485,6 +486,18 @@ let is [256]i64 as irq_handler_tbl_raw;
 let is [256]i64 as irq_hardware_tbl_raw;
 let is [256]i64 as irq_context_tbl_raw;
 
+// IRQ table lock. driver_irq_dispatch reads the table from IRQ
+// context; irq_register / irq_unregister mutate it from thread
+// context. Without a lock a thread-context write could tear across
+// a concurrent IRQ-context read and hand the dispatcher a handler
+// pointer mismatched with its hardware/context (observed in
+// practice as #GP at garbage RIP — the handler fn_ptr slot is read
+// while the writer is still in-flight). acquire_irq disables IRQs
+// on the local cpu so the dispatch can't reentrantly take the
+// lock; cross-cpu dispatch still serialises through the ticket
+// lock.
+let is lock.TicketLock as irq_tbl_lock with mut;
+
 fn irq_tbl_get(base as *i64, v as i64) as i64 {
     return base[v];
 }
@@ -500,14 +513,26 @@ fn irq_tbl_set(base as *i64, v as i64, val as i64) as void {
 fn driver_irq_dispatch(vector as i64) as void {
     if (vector < 0) { return; }
     if (vector > 255) { return; }
+
+    // Snapshot handler + hardware + context atomically under the
+    // ticket lock. IRQ handlers run with IF=0 at the CPU level (IDT
+    // gate is an interrupt gate), but on SMP another cpu can be
+    // mutating the table from thread context. acquire_irq re-cli's
+    // (no-op on IRQ entry), takes the ticket, copies the triple,
+    // releases, then we call the handler with the lock dropped so
+    // the handler itself is free to do whatever (including take
+    // other locks) without carrying ours.
+    let is i64 as flags = lock.acquire_irq(&irq_tbl_lock);
     let is i64 as hptr = irq_tbl_get(&irq_handler_tbl_raw[0], vector);
+    let is i64 as dptr = irq_tbl_get(&irq_hardware_tbl_raw[0], vector);
+    let is i64 as cptr = irq_tbl_get(&irq_context_tbl_raw[0], vector);
+    lock.release_irq(&irq_tbl_lock, flags);
+
     if (hptr == 0) {
         // Spurious or unregistered — still EOI so the LAPIC doesn't wedge.
         lapic.eoi();
         return;
     }
-    let is i64 as dptr = irq_tbl_get(&irq_hardware_tbl_raw[0], vector);
-    let is i64 as cptr = irq_tbl_get(&irq_context_tbl_raw[0], vector);
     let is fn(*Hardware, *u8) as i32 as h = cast(fn(*Hardware, *u8) as i32, hptr);
     call(h, cast(*Hardware, dptr), cast(*u8, cptr));
     lapic.eoi();
@@ -528,18 +553,24 @@ fn irq_register(dev as *Hardware, vector as u32, kind as i32,
     b.handler = handler;
     b.context = context;
 
-    sched.preempt_disable();
+    let is i64 as flags = lock.acquire_irq(&irq_tbl_lock);
     if (irq_tbl_get(&irq_handler_tbl_raw[0], v) != 0) {
-        sched.preempt_enable();
+        lock.release_irq(&irq_tbl_lock, flags);
         heap.kfree(node_addr);
         return ALREADY_EXISTS;
     }
-    irq_tbl_set(&irq_handler_tbl_raw[0], v, cast(i64, handler));
-    irq_tbl_set(&irq_hardware_tbl_raw[0],  v, cast(i64, dev));
-    irq_tbl_set(&irq_context_tbl_raw[0], v, cast(i64, context));
+    // Write hardware + context BEFORE handler: the dispatcher reads
+    // all three under the lock so ordering is moot for SMP
+    // correctness, but keeping handler last means a stale snapshot
+    // taken mid-update is simply "no handler yet" — the dispatcher's
+    // hptr==0 fast-path makes that benign even if the dispatch lock
+    // were somehow bypassed.
+    irq_tbl_set(&irq_hardware_tbl_raw[0], v, cast(i64, dev));
+    irq_tbl_set(&irq_context_tbl_raw[0],  v, cast(i64, context));
+    irq_tbl_set(&irq_handler_tbl_raw[0],  v, cast(i64, handler));
     b.next = dev.irq_list;
     dev.irq_list = b;
-    sched.preempt_enable();
+    lock.release_irq(&irq_tbl_lock, flags);
     return OK;
 }
 
@@ -549,24 +580,27 @@ fn irq_unregister(dev as *Hardware, vector as u32) as void {
     if (v < 0) { return; }
     if (v > 255) { return; }
 
-    sched.preempt_disable();
+    let is i64 as flags = lock.acquire_irq(&irq_tbl_lock);
     let is *IrqBinding as cur with mut = dev.irq_list;
     let is *IrqBinding as prev with mut = cast(*IrqBinding, 0);
     while (cast(i64, cur) != 0) {
         if (cur.vector == v) {
             if (cast(i64, prev) == 0) { dev.irq_list = cur.next; }
             else                       { prev.next = cur.next; }
-            irq_tbl_set(&irq_handler_tbl_raw[0], v, 0);
-            irq_tbl_set(&irq_hardware_tbl_raw[0],  v, 0);
-            irq_tbl_set(&irq_context_tbl_raw[0], v, 0);
-            sched.preempt_enable();
+            // Zero handler first — after this any dispatch sees
+            // hptr==0 and falls through to the EOI-only path, so the
+            // dev/context slots can be cleared without racing.
+            irq_tbl_set(&irq_handler_tbl_raw[0],  v, 0);
+            irq_tbl_set(&irq_hardware_tbl_raw[0], v, 0);
+            irq_tbl_set(&irq_context_tbl_raw[0],  v, 0);
+            lock.release_irq(&irq_tbl_lock, flags);
             heap.kfree(cast(i64, cur));
             return;
         }
         prev = cur;
         cur = cur.next;
     }
-    sched.preempt_enable();
+    lock.release_irq(&irq_tbl_lock, flags);
 }
 
 // Drains all tracked resources in spec-mandated order IRQ -> DMA -> MMIO.

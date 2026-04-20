@@ -886,15 +886,19 @@ fn wakeup_thread(tid as i64) as void {
     let is i64 as band = thr_band(tid);
     let is i64 as w = thr_weight(tid);
     let is i64 as mvrt = band_min_vruntime(band);
-    let is i64 as old_vrt = thr_vruntime(tid);
-    let is i64 as adjusted = mvrt - SLEEPER_BONUS_NS;
-    let is i64 as new_vrt with mut = old_vrt;
-    if (adjusted > old_vrt) { new_vrt = adjusted; }
-
-    thr_set(tid, 48, new_vrt);
-    thr_set(tid, 112, 0);
-    thr_set(tid, 56, new_vrt + (thr_slice(tid) * BASE_WEIGHT / w));
-    thr_set(tid, 8, THREAD_RUNNABLE);
+    // I/O-style wakers (fat32, vfs, ahci completers) would otherwise
+    // come back with vd > CPU-bound siblings that accrued 50+ms of
+    // runtime while we slept; EEVDF then picks the CPU-bound threads
+    // forever. The fix: reset the waker to the band's current
+    // min_vruntime — the thread gave up the CPU voluntarily and
+    // earned priority over anything that didn't. The old sleeper-
+    // bonus-cap dance (mvrt - 2.5ms, clamped against old_vrt) left
+    // the thread arbitrarily behind depending on how long it slept
+    // relative to its siblings' runtime; overwriting vruntime is the
+    // canonical EEVDF sleeper-wakeup recipe and what Linux CFS does
+    // in wake_up_new_task / place_entity. lag is cleared so
+    // pick_next_in_band's eligibility test doesn't reject us.
+    let is i64 as new_vrt = mvrt;
 
     if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
         dl_insert(tid);
@@ -936,12 +940,16 @@ fn wakeup_thread(tid as i64) as void {
 
     lock.release_irq(&sched_lock, saved_flags);
 
-    // IPI temporarily disabled — under the current AHCI IRQ
-    // handler something about the broadcast is wedging
-    // subsequent completions. Fall back to timer-driven
-    // reschedule (5 ms quantum on every cpu). Slower wakeup
-    // latency but known-good.
-    // if (cpus > 1) { lapic.send_resched_ipi_all_except_self(); }
+    // Flip every online cpu to reschedule now that we've put a
+    // runnable thread on the queue. Without the IPI APs finish out
+    // their current 5ms quantum before seeing need_resched and the
+    // wakeup latency chains across sequential I/O. The previous
+    // version of this kernel had the IPI commented out because
+    // concurrent driver_irq_register rewrites and an unlocked io
+    // pending list made AHCI completions wedge whenever a broadcast
+    // hit mid-update; those races are now locked and the IPI is
+    // safe to fire.
+    if (cpus > 1) { lapic.send_resched_ipi_all_except_self(); }
 }
 
 fn suspend_thread(tid as i64) as void {
@@ -1301,9 +1309,15 @@ fn yield_cpu() as void { schedule(); }
 // ============================================================
 
 fn idle_fn() as void {
+    // APs enter with IF=0 (ap_entry deliberately does not sti before
+    // calling ap_start so per_cpu_init publishes current_tid without
+    // a racing timer tick). Arm IRQs here now that the cpu is fully
+    // initialised, then loop sti-hlt. The BSP enters with IF=1
+    // already; the sti here is a harmless no-op for it.
+    asm(".byte 0xFB\n");   // sti
     while (1 == 1) {
         if (smp.this_cpu_need_resched() != 0) { schedule(); }
-        asm(".byte 0xF4\n");
+        asm(".byte 0xF4\n");   // hlt
     }
 }
 

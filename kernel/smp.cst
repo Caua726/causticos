@@ -506,15 +506,30 @@ fn ap_entry(info as *u8) as void {
     me.is_online = 1;
     me.boot_done = 1;
 
-    // AP scheduler dispatch is wired below but gated behind
-    // masked LAPIC + hlt while the residual AHCI / scheduler
-    // issues diagnosed in memory/project_smp_ap_dispatch_diagnosis
-    // are resolved. All the plumbing (per-cpu state, sched_lock,
-    // PMM/heap locks, AHCI port lock, io pending lock, reschedule
-    // IPI vector, GDT/IDT/LAPIC per-cpu install) is in place —
-    // flipping the gate to `ap_wait_sched_active + sched.ap_start`
-    // completes the migration once the residual issues land.
-    lapic.mask_timer();
+    // Wait for the BSP to finish sched.init + create the initial
+    // workload and flip sched_active=1 before we attempt to pick
+    // the next thread on this AP — otherwise we'd race against a
+    // half-built tid_ht / thread_cache / band trees.
+    while (ap_wait_sched_active() == 0) {
+        asm(".byte 0xF3, 0x90\n");   // pause
+    }
+
+    // Enter ap_start with IRQs still masked. sched.ap_start calls
+    // per_cpu_init which creates this cpu's idle thread, publishes
+    // it as current_tid, AND THEN drops into idle_fn which arms
+    // sti+hlt itself. If we sti'd here before per_cpu_init ran,
+    // a LAPIC timer tick landing in that window would call
+    // schedule() on a cpu whose current_tid is still the -1
+    // sentinel — schedule would "set_current_tid(next)" without
+    // context-switching (because prev<0), orphaning `next` as
+    // nominally-running on this cpu while the cpu actually
+    // continues executing on Limine's stack. Observed as
+    // intermittent #PF rip=0x282 / #GP rip=<garbage> a few ms
+    // later when something else tries to use the corrupted state.
+    asm("call _kernel_sched_cst_ap_start\n");
+
+    // Unreachable; ap_start loops inside idle_fn. Keep a hlt so a
+    // theoretical fallthrough doesn't spin the cpu 100%.
     while (1 == 1) {
         asm(".byte 0xF4\n");   // hlt
     }
