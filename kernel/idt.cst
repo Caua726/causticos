@@ -133,6 +133,16 @@ fn irq_handler(irq as i64) as void {
     pic_eoi(irq);
 }
 
+// Reschedule IPI handler — called from vector 0x41 (65). The sender
+// set our PerCpu.need_resched = 1 before sending the IPI, so all we
+// need to do here is ack the LAPIC; the IDT stub's shared tail
+// checks gs:[0x50] and calls schedule(). Reusing the LAPIC-timer
+// stub trampoline means we don't have to duplicate the 15-GPR
+// save/restore — just point the IDT gate at the same stub.
+fn resched_ipi_handler() as void {
+    lapic.eoi();
+}
+
 // LAPIC timer handler — called from vector 0x40 (64)
 fn lapic_timer_handler() as void {
     timer.on_lapic_tick();
@@ -330,6 +340,38 @@ fn install_stubs() as void {
     asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
     asm(".byte 0x48, 0xCF\n");    // iretq
 
+    // --- Reschedule IPI stub (vector 0x41 = 65). Wakes the target
+    //     cpu out of an idle HLT or a lower-priority thread so it
+    //     picks up a newly-RUNNABLE thread queued by the sender.
+    //     Same structural pattern as the LAPIC timer stub: save all
+    //     GPRs, flag IRQ context, ack the LAPIC, check need_resched
+    //     (which the sender already wrote on this cpu's PerCpu),
+    //     call schedule() if set, clear IRQ context, pop, iretq.
+    asm(".Lresched_ipi:\n");
+    asm("push r15\n"); asm("push r14\n"); asm("push r13\n"); asm("push r12\n");
+    asm("push r11\n"); asm("push r10\n"); asm("push r9\n");  asm("push r8\n");
+    asm("push rbp\n"); asm("push rdi\n"); asm("push rsi\n"); asm("push rdx\n");
+    asm("push rcx\n"); asm("push rbx\n"); asm("push rax\n");
+    asm(".byte 0x65, 0x48, 0xC7, 0x04, 0x25, 0x70, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00\n");    // mov QWORD PTR gs:[0x70], 1
+    asm("mov rbp, rsp\n");
+    asm("and rsp, -16\n");
+    asm("call _kernel_idt_cst_resched_ipi_handler\n");
+    asm("mov rsp, rbp\n");
+    asm(".byte 0x65, 0x48, 0x8B, 0x04, 0x25, 0x50, 0x00, 0x00, 0x00\n");    // mov rax, QWORD PTR gs:[0x50]
+    asm("test rax, rax\n");
+    asm("jz .Lresched_no_sched\n");
+    asm("mov rbp, rsp\n");
+    asm("and rsp, -16\n");
+    asm("call _kernel_sched_cst_schedule\n");
+    asm("mov rsp, rbp\n");
+    asm(".Lresched_no_sched:\n");
+    asm(".byte 0x65, 0x48, 0xC7, 0x04, 0x25, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00\n");    // mov QWORD PTR gs:[0x70], 0
+    asm("pop rax\n"); asm("pop rbx\n"); asm("pop rcx\n"); asm("pop rdx\n");
+    asm("pop rsi\n"); asm("pop rdi\n"); asm("pop rbp\n");
+    asm("pop r8\n");  asm("pop r9\n");  asm("pop r10\n"); asm("pop r11\n");
+    asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
+    asm(".byte 0x48, 0xCF\n");    // iretq
+
     // --- Driver IRQ stubs (vectors 48..63). Each stub is a tiny
     //     per-vector prologue: save the caller's rdi, load the vector
     //     number into rdi, and jump to the shared dispatch body.
@@ -448,6 +490,8 @@ fn install_stubs() as void {
     asm("lea rax, [rip+.Ldrvirq61]\n"); asm("mov QWORD PTR [rbx+392], rax\n");
     asm("lea rax, [rip+.Ldrvirq62]\n"); asm("mov QWORD PTR [rbx+400], rax\n");
     asm("lea rax, [rip+.Ldrvirq63]\n"); asm("mov QWORD PTR [rbx+408], rax\n");
+    // Reschedule IPI stub at index 52 (offset 416) — vector 0x41.
+    asm("lea rax, [rip+.Lresched_ipi]\n"); asm("mov QWORD PTR [rbx+416], rax\n");
 }
 
 // ============================================================
@@ -476,6 +520,9 @@ fn init() as void {
 
     // LAPIC timer -> vector 64 (0x40)
     set_gate(64, addrs[35], 0x08, 0, 0x8E);
+
+    // Reschedule IPI -> vector 65 (0x41)
+    set_gate(65, addrs[52], 0x08, 0, 0x8E);
 
     // Driver IRQ vectors 48..63 — 16 slots for IOAPIC-routed device
     // interrupts (PS/2 kbd, AHCI, future NVMe/USB/etc). ioapic.cst

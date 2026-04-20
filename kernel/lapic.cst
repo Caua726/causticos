@@ -34,6 +34,19 @@ let is i64 as LVT_MASKED         = 0x10000;    // bit 16 = masked
 // Timer vector (must not conflict with PIC IRQs 32-47)
 let is i64 as TIMER_VECTOR       = 0x40;       // vector 64
 
+// Reschedule IPI vector. Sent by wakeup_thread after queueing a
+// newly-RUNNABLE thread, so other cpus drop whatever low-priority
+// thread they're running and pick the wakee on their next
+// schedule(). Without this a wakeup landing on a cpu different
+// from the target's runnable cpu waits up to one full quantum
+// (5 ms) for the target's next timer tick — under chained I/O
+// this serialises every round-trip and slows SMP by 10-20×.
+let is i64 as RESCHED_VECTOR     = 0x41;       // vector 65
+
+// LAPIC ICR (Interrupt Command Register) offsets
+let is i64 as LAPIC_ICR_LO       = 0x300;
+let is i64 as LAPIC_ICR_HI       = 0x310;
+
 // Max initial count for free-running calibration
 let is i64 as TIMER_MAX_COUNT    = 0xFFFFFFFF;
 
@@ -266,4 +279,34 @@ fn ap_init() as void {
     set_divisor(1);
     set_oneshot(TIMER_VECTOR);
     program_tick_ms(5);
+}
+
+// Broadcast a reschedule IPI to every cpu except the sender. Target
+// cpus take vector RESCHED_VECTOR on their IDT; the handler for that
+// vector does nothing but the IDT stub's shared tail checks
+// need_resched — so the meaningful work is done by the need_resched
+// store the sender performs on each target's PerCpu.need_resched
+// before the IPI. Shorthand 0b11 (0xC0000) = "all excluding self";
+// fixed delivery (bits 8:10 = 000), physical dest, edge, assert.
+// Spins on ICR_LO bit 12 (delivery status) until the LAPIC has
+// latched the command so a follow-up IPI doesn't collide with an
+// in-flight one.
+fn send_resched_ipi_all_except_self() as void {
+    if (lapic_base == 0) { return; }
+    // Wait for any prior IPI to finish delivery.
+    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
+    // Dest field unused with all-except-self shorthand but the
+    // write-order matters on Intel: ICR_HI first (even when
+    // ignored), then ICR_LO which commits the send.
+    lapic_write(LAPIC_ICR_HI, 0);
+    // ICR_LO bit layout for a fixed-vector IPI (Intel SDM §10.6.1):
+    //   [0:7]   vector
+    //   [8:10]  delivery mode (000 = fixed)
+    //   [11]    dest mode (0 = physical)
+    //   [14]    level (1 = assert; must be 1 for non-INIT IPIs
+    //           on newer Intel parts — SDM recommends always 1)
+    //   [15]    trigger (0 = edge)
+    //   [18:19] dest shorthand (11 = all excluding self)
+    lapic_write(LAPIC_ICR_LO, RESCHED_VECTOR | 0x4000 | 0xC0000);
+    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
 }

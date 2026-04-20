@@ -19,6 +19,7 @@ use "sched.cst" as sched;
 use "serial.cst" as serial;
 use "util.cst" as util;
 use "driver.cst" as driver;
+use "lock.cst" as lock;
 
 // ============================================================
 // Request model
@@ -65,6 +66,12 @@ struct BlockIOProvider {
     pending_head as *BlockRequest;  // submitted, awaiting completion
     pending_count as i64;
     next as *BlockIOProvider;       // global provider list
+    // Per-provider lock protecting the pending_head linked list
+    // and pending_count. Under SMP the old `preempt_disable` guard
+    // prevented re-entry on the same cpu but not cross-cpu races:
+    // two cpus concurrently doing pending_push/pending_remove could
+    // lose entries or corrupt the chain. Ticket lock serialises.
+    pending_lock as lock.TicketLock;
 }
 
 let is i64 as providers with mut = 0;
@@ -167,16 +174,16 @@ fn submit(p as *BlockIOProvider, r as *BlockRequest) as i32 {
     if (cast(i64, r) == 0) { return driver.INVALID_ARGUMENT; }
 
     r.state = REQ_PENDING;
-    sched.preempt_disable();
+    let is i64 as pflags = lock.acquire_irq(&p.pending_lock);
     pending_push(p, r);
-    sched.preempt_enable();
+    lock.release_irq(&p.pending_lock, pflags);
 
     r.state = REQ_SUBMITTED;
     let is i32 as rc = call(p.submit_io, p, r);
     if (rc != 0) {
-        sched.preempt_disable();
+        let is i64 as pf2 = lock.acquire_irq(&p.pending_lock);
         pending_remove(p, r);
-        sched.preempt_enable();
+        lock.release_irq(&p.pending_lock, pf2);
         r.state = REQ_INIT;
         return rc;
     }
@@ -192,9 +199,9 @@ fn harvest_one(p as *BlockIOProvider) as i32 {
     if (rc != 1) { return 0; }
     if (cast(i64, r) == 0) { return 0; }
 
-    sched.preempt_disable();
+    let is i64 as pflags = lock.acquire_irq(&p.pending_lock);
     pending_remove(p, r);
-    sched.preempt_enable();
+    lock.release_irq(&p.pending_lock, pflags);
 
     r.state = REQ_COMPLETE;
     if (r.waiter_tid >= 0) {

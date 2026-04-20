@@ -915,7 +915,34 @@ fn wakeup_thread(tid as i64) as void {
         }
     }
 
+    // Flag every other online cpu to reschedule too. Without this
+    // a cross-cpu IRQ completer (AHCI on BSP waking a thread that
+    // wants to run on an AP) leaves the AP running whatever
+    // lower-priority work it was on until its next timer tick —
+    // up to 5 ms per I/O completion, which chains into 10-20×
+    // slowdown on sequential I/O under SMP. We set need_resched
+    // directly on each PerCpu slot, then fire a broadcast IPI
+    // below; the handler for vector 0x41 EOIs and the stub tail
+    // sees need_resched set and calls schedule(). If a cpu has no
+    // higher-priority runnable thread, schedule() re-picks its
+    // current thread — cheap no-op.
+    let is i64 as cpus = smp.get_cpu_count();
+    let is i64 as ci with mut = 0;
+    while (ci < cpus) {
+        let is *smp.PerCpu as pc = smp.get_per_cpu(ci);
+        if (cast(i64, pc) != 0) { pc.need_resched = 1; }
+        ci = ci + 1;
+    }
+
     lock.release_irq(&sched_lock, saved_flags);
+
+    // IPI must go out *after* we release sched_lock: the receiving
+    // cpu's stub tail calls schedule(), which will try to acquire
+    // the same sched_lock — if we still held it we'd force a
+    // round-trip spin before the target cpu makes progress. The
+    // IPI itself doesn't touch sched_lock, just a LAPIC MMIO
+    // write.
+    if (cpus > 1) { lapic.send_resched_ipi_all_except_self(); }
 }
 
 fn suspend_thread(tid as i64) as void {
