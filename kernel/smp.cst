@@ -27,12 +27,12 @@ use "pmm.cst"      as pmm;
 use "vmm.cst"      as vmm;
 use "timer.cst"    as timer;
 use "lock.cst"     as lock;
-// GDT / IDT helpers are reached by symbol rather than `use` because
+use "gdt.cst"      as gdt;
+// IDT helpers are reached by symbol rather than `use` because
 // idt.cst imports sched.cst which imports smp.cst — a `use` here
-// would close a cycle that caustic's module layer doesn't support.
-// The ap_load helpers are stable external symbols, so a direct
-// `call _kernel_gdt_cst_ap_load` / `call _kernel_idt_cst_ap_load`
-// is fine.
+// would close that cycle. gdt.cst itself depends only on serial so
+// we can import it normally and call install_tss_descriptor /
+// load_tss directly.
 
 // ============================================================
 // Per-CPU layout
@@ -304,6 +304,43 @@ fn alloc_idle_stack() as i64 {
     return base + AP_STACK_SIZE - 16;
 }
 
+// IST1 stack — same size + alignment policy as the idle stack.
+// Allocated once per cpu at boot, never freed. Used by IDT gates
+// programmed with IST=1 (every exception vector after this lands).
+// On entry, the cpu hardware switches RSP to the value stored in
+// TSS.IST1 of the currently-loaded TSS. That gives exception
+// handlers a clean stack so a primary fault can't cascade into a
+// secondary fault that overwrites the original iretq frame —
+// previously the cascade was masking the actual primary RIP under
+// -smp 4.
+fn alloc_ist_stack() as i64 {
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ZONE_NORMAL,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        cast(i32, 2),                 // 4 pages = 16 KiB
+        pmm.USAGE_KERNEL,
+        cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    let is i64 as base = pmm.pfn_to_phys(pfn) + pmm.hhdm;
+    return base + AP_STACK_SIZE - 16;
+}
+
+// Set up this cpu's TSS + IST1 stack and install the matching GDT
+// descriptor. Caller does ltr afterwards.
+fn setup_tss_for(cpu as i64) as void {
+    let is i64 as ist1 = alloc_ist_stack();
+    if (ist1 == 0) {
+        // No memory for the IST stack — kernel can't start safely.
+        // panic via pmm so we get a clear message instead of a
+        // mysterious #DF later.
+        pmm.panic("smp: ist1 alloc failed", 22);
+    }
+    gdt.ist1_top_set(cpu, ist1);
+    gdt.tss_set_ist1(cpu, ist1);
+    gdt.tss_set_iomap_base(cpu, gdt.TSS_SIZE);   // no I/O map
+    gdt.install_tss_descriptor(cpu);
+}
+
 // ============================================================
 // BSP init — called from _kernel_start after sched.init. Populates
 // per_cpus[0] for the BSP and fires off each AP by writing our
@@ -402,6 +439,14 @@ fn init() as void {
     per_cpus[bsp_cpu_id].boot_done = 1;
     install_gs_base(&per_cpus[bsp_cpu_id]);
 
+    // Allocate this cpu's IST1 stack and install its TSS descriptor
+    // before any IDT gate with IST=1 can fire. The BSP runs without
+    // a TSS up to this point because the early IDT (idt.init) used
+    // IST=0 — exceptions before now would land on the boot stack.
+    // From here on every cpu has a dedicated exception stack.
+    setup_tss_for(bsp_cpu_id);
+    gdt.load_tss(bsp_cpu_id);
+
     // Kick every AP except ourselves. Writing the goto_address slot
     // makes Limine's trampoline loop exit and the AP jump to
     // ap_entry with RDI = its *LimineSmpInfo and our pre-allocated
@@ -456,6 +501,14 @@ fn init() as void {
     serial.print("/", 1);     util.print_num(n);
     serial.println(" cpus online", 12);
     lock.release(&log_lock);
+
+    // Every cpu has now ltr'd its own TSS with a valid IST1
+    // pointer. Re-tag the exception IDT gates to IST=1 so any
+    // future #PF / #GP / #UD lands on a clean exception stack
+    // instead of cascading on a corrupt thread kstack. Done last
+    // so an early-boot fault still works against IST=0 / current
+    // rsp before this commits.
+    asm("call _kernel_idt_cst_enable_ist_for_exceptions\n");
 }
 
 // ============================================================
@@ -491,6 +544,15 @@ fn ap_entry(info as *u8) as void {
     // Step 4: IDT. Same story as the GDT — gates are shared, IDTR
     // is per-cpu.
     asm("call _kernel_idt_cst_ap_load\n");
+
+    // Step 4b: TSS + IST1. The BSP set up its slot in init();
+    // every AP allocates its own IST stack and installs its own
+    // descriptor before ltr. Must happen BEFORE lapic.ap_init() so
+    // any LAPIC error / spurious interrupt that fires during APIC
+    // setup lands on the IST1 stack rather than overflowing the
+    // tiny Limine bring-up stack we're still standing on.
+    setup_tss_for(me.cpu_id);
+    gdt.load_tss(me.cpu_id);
 
     // Step 5: local APIC — enable, pick the scheduler's timer
     // vector, program the first tick. From here on, this cpu gets
