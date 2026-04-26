@@ -18,6 +18,8 @@ use "rbtree.cst" as rb;
 use "lapic.cst" as lapic;
 use "smp.cst" as smp;
 use "lock.cst" as lock;
+use "vmm.cst" as vmm;
+use "gdt.cst" as gdt;
 
 // ============================================================
 // Constants
@@ -267,6 +269,11 @@ fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
 fn thr_home_cpu(tid as i64) as i64      { return thr_get(tid, 256); }
 fn thr_last_run_ns(tid as i64) as i64   { return thr_get(tid, 264); }
 fn thr_sleep_until_ns(tid as i64) as i64 { return thr_get(tid, 272); }
+// Address space the thread runs against. Kernel threads share
+// vmm.kas_pml4_phys (set by create_thread); user threads carry the
+// pml4_phys handed back by vmm.as_create. Read on every context
+// switch — if it differs from the cpu's current CR3, we reload.
+fn thr_aspace_pml4(tid as i64) as i64   { return thr_get(tid, 280); }
 
 // ============================================================
 // Per-band data
@@ -903,6 +910,8 @@ fn create_thread(entry as i64, band as i64) as i64 {
     thr_set(tid, 256, home_cpu);      // home_cpu — every wakeup_thread / sched
                                       //  cross-cpu touch reads this slot to
                                       //  pick the correct lock + runqueue
+    thr_set(tid, 280, vmm.kas_pml4_phys);  // aspace_pml4 — kernel AS until a
+                                      //  process loader replaces it
 
     runlist_insert(home_cpu, band, tid);
     set_nr_running(home_cpu, nr_running(home_cpu) + 1);
@@ -1283,6 +1292,27 @@ fn schedule() as void {
 
             // FPU: set TS so next thread triggers #NM on first FPU use
             cr0_set_ts();
+
+            // Update TSS.RSP0 = kstack top of the incoming thread.
+            // The CPU loads RSP from TSS.RSP0 on a ring-3 → ring-0
+            // transition (legacy IDT path) and on SYSCALL when MSR
+            // KernelGsBase isn't doing the swap. Kernel-only
+            // workloads don't need this, but the wiring has to be
+            // correct from the first ring-3 thread onwards.
+            gdt.tss_set_rsp0(cpu, thr_kstack_top(next));
+
+            // CR3 swap if the incoming thread runs against a
+            // different aspace. as_create copies the kernel half
+            // of the PML4 from kas_pml4, so the kernel's mapping
+            // (including this code, kstacks, MMIO) is identical
+            // across aspaces — the swap only changes what the user
+            // half resolves to. Do it inside the lock-held section,
+            // before the asm rsp swap, so the new stack is already
+            // on a CR3 that maps it.
+            let is i64 as next_pml4 = thr_aspace_pml4(next);
+            if (next_pml4 != 0) {
+                vmm.cr3_load_if_different(next_pml4);
+            }
 
             // Stash the switch scratch in this cpu's PerCpu slot
             // instead of module globals. sched_lock serialises
@@ -1721,6 +1751,7 @@ fn per_cpu_init() as void {
     thr_set(itid, 32, BASE_WEIGHT);
     thr_set(itid, 40, DEFAULT_SLICE_NS);
     thr_set(itid, 256, cpu);   // home_cpu = this cpu
+    thr_set(itid, 280, vmm.kas_pml4_phys);  // idle runs in kernel AS
 
     set_idle_tid(itid);
     set_current_tid(itid);
