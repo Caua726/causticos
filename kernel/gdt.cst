@@ -1,20 +1,37 @@
 // gdt.cst — Global Descriptor Table setup
+//
+// Layout (long mode, with userspace support):
+//   slot 0    (sel 0x00): null
+//   slot 1    (sel 0x08): kernel code        (DPL=0, L=1)
+//   slot 2    (sel 0x10): kernel data / SS   (DPL=0)
+//   slot 3    (sel 0x18): user code 32-bit   (DPL=3, L=0, D=1) — compat mode placeholder
+//   slot 4    (sel 0x20): user data / SS     (DPL=3)
+//   slot 5    (sel 0x28): user code 64-bit   (DPL=3, L=1)
+//   slot 6+2i (sel 0x30 + 0x10*i): per-cpu TSS descriptor low half
+//   slot 7+2i:                       per-cpu TSS descriptor high half
+//
+// The kernel CS / kernel SS / user CS-32 / user SS / user CS-64 ordering
+// is mandated by SYSCALL/SYSRET: STAR[47:32] = kernel-base CS, kernel SS
+// is taken from kernel-base+8; STAR[63:48] = user-base, user SS comes
+// from user-base+8, user CS from user-base+16 on SYSRETQ. See
+// IA-32 SDM Vol 2A SYSRET.
+//
+// TSS descriptors in long mode are 16 bytes (two 8-byte slots) so we
+// reserve 2 slots per cpu. With MAX_CPUS_GDT=16 the GDT is now
+// 6 fixed + 32 TSS = 38 slots = 304 bytes.
 
 use "serial.cst" as serial;
 
-// GDT layout (long mode):
-//   slot 0:    null
-//   slot 1:    kernel code (selector 0x08)
-//   slot 2:    kernel data (selector 0x10)
-//   slot 3+2i: per-cpu TSS descriptor low half
-//   slot 4+2i: per-cpu TSS descriptor high half
-//
-// TSS descriptors in long mode are 16 bytes (two 8-byte slots) so we
-// reserve 2 slots per cpu. With MAX_CPUS=16 the GDT needs 3 + 32 = 35
-// slots = 280 bytes. Stored as a packed i64 array in BSS so APs and
-// BSP all share the same descriptor table.
 let is i64 as MAX_CPUS_GDT = 16;
-let is [280]u8 as gdt_raw;          // 35 i64 slots, zero-init
+let is [304]u8 as gdt_raw;          // 38 i64 slots, zero-init
+
+// Selectors. RPL bits stripped on the kernel ones, RPL=3 baked in on
+// the user ones since SYSRETQ forces RPL=3 anyway.
+let is i64 as KERNEL_CS_SEL  = 0x08;
+let is i64 as KERNEL_DS_SEL  = 0x10;
+let is i64 as USER_CS32_SEL  = 0x18 | 3;     // 0x1B
+let is i64 as USER_DS_SEL    = 0x20 | 3;     // 0x23
+let is i64 as USER_CS64_SEL  = 0x28 | 3;     // 0x2B
 
 // GDTR: 2 bytes limit + 8 bytes base (10 bytes, packed)
 let is i64 as gdtr_limit_base with mut = 0;
@@ -23,18 +40,14 @@ let is i64 as gdtr_base_hi with mut = 0;
 // Per-cpu TSS structs. x86_64 TSS is 104 bytes — fields are NOT
 // 8-byte aligned (RSP0 starts at offset 4) so we keep a raw byte
 // array and poke the offsets manually. One per cpu, indexed by
-// cpu_id. Each cpu loads ltr 0x18+(cpu_id*16) at boot to point its
-// task register at its own slot.
+// cpu_id. Each cpu loads ltr (0x30 + cpu*0x10) at boot.
 let is i64 as TSS_SIZE = 104;
 let is [1664]u8 as tss_raw;         // 16 cpus * 104 bytes
 
 // IST1 stacks — separate kstack used by exception handlers (IDT
 // gates with IST=1 force-switch RSP to this stack on entry, even
-// for same-priv interrupts). Means a nested fault inside an
-// exception handler runs on a known-good stack instead of stomping
-// over the faulting thread's kstack. 16 KiB per cpu, allocated at
-// init via pmm. Top-of-stack pointer is what TSS.IST1 holds.
-let is [128]u8 as ist1_tops;        // 16 cpus * 8 bytes (i64 top-of-stack)
+// for same-priv interrupts). 16 KiB per cpu.
+let is [128]u8 as ist1_tops;        // 16 cpus * 8 bytes
 
 fn ist1_top_get(cpu as i64) as i64 {
     let is *i64 as p = cast(*i64, &ist1_tops);
@@ -47,14 +60,27 @@ fn ist1_top_set(cpu as i64, v as i64) as void {
 }
 
 // TSS field accessors (raw-byte writes at fixed offsets per AMD64
-// SDM Vol 2 §7.7). IST1 lives at byte offset 36 of the TSS struct.
+// SDM Vol 2 §7.7).
+//   offset 4   : RSP0  (i64) — kernel stack used on a ring-3 → ring-0
+//                              transition (IRQ / exception without
+//                              IST / SYSCALL via TSS)
+//   offset 36  : IST1  (i64) — exception stack
+//   offset 102 : iomap (u16)
 fn tss_base_for(cpu as i64) as i64 {
     return cast(i64, &tss_raw) + cpu * TSS_SIZE;
 }
 
+fn tss_set_rsp0(cpu as i64, rsp as i64) as void {
+    let is *i64 as p = cast(*i64, tss_base_for(cpu) + 4);
+    p[0] = rsp;
+}
+
+fn tss_get_rsp0(cpu as i64) as i64 {
+    let is *i64 as p = cast(*i64, tss_base_for(cpu) + 4);
+    return p[0];
+}
+
 fn tss_set_ist1(cpu as i64, rsp as i64) as void {
-    // i64 store at byte offset 36 — not 8-aligned, but x86 allows
-    // unaligned 64-bit stores so a `*i64 = ...` works.
     let is *i64 as p = cast(*i64, tss_base_for(cpu) + 36);
     p[0] = rsp;
 }
@@ -78,7 +104,7 @@ fn tss_set_iomap_base(cpu as i64, base as i64) as void {
 fn install_tss_descriptor(cpu as i64) as void {
     let is i64 as base = tss_base_for(cpu);
     let is i64 as limit = TSS_SIZE - 1;
-    let is i64 as slot_offset = (3 + cpu * 2) * 8;
+    let is i64 as slot_offset = (6 + cpu * 2) * 8;
 
     let is i64 as lo with mut = 0;
     lo = limit & 0xFFFF;
@@ -96,23 +122,30 @@ fn install_tss_descriptor(cpu as i64) as void {
 
 // Slot indices used by IDT gates / ltr.
 fn tss_selector(cpu as i64) as i64 {
-    return (3 + cpu * 2) * 8;       // GDT byte offset = selector value
+    return (6 + cpu * 2) * 8;       // GDT byte offset = selector value
 }
 
 fn init() as void {
-    // Slot 0 = null (already zero-init via BSS).
-    // Slot 1 = kernel code: present, DPL=0, type=0xA (exec/read), L=1
-    //   raw = 0x00AF9A000000FFFF
     let is *i64 as g = cast(*i64, &gdt_raw);
     g[0] = 0;
+    // slot 1: kernel CS — present, DPL=0, type=0xA (exec/read), L=1
     g[1] = 0x00AF9A000000FFFF;
-    g[2] = 0x00CF92000000FFFF;       // kernel data: present, DPL=0, type=2
+    // slot 2: kernel SS / data — present, DPL=0, type=2 (read/write)
+    g[2] = 0x00CF92000000FFFF;
+    // slot 3: user CS 32-bit (compat) — present, DPL=3, type=0xA, L=0, D=1
+    //   Required by SYSRETL even when we never actually run 32-bit code:
+    //   the slot has to exist at STAR_user_base + 0 with DPL=3.
+    g[3] = 0x00CFFA000000FFFF;
+    // slot 4: user SS / data — present, DPL=3, type=2 (read/write)
+    g[4] = 0x00CFF2000000FFFF;
+    // slot 5: user CS 64-bit — present, DPL=3, type=0xA, L=1
+    g[5] = 0x00AFFA000000FFFF;
 
     // TSS slots are filled per-cpu later. install_tss_descriptor
-    // pokes (3 + 2*cpu) and (4 + 2*cpu).
+    // pokes (6 + 2*cpu) and (7 + 2*cpu).
 
     let is i64 as gdt_base = cast(i64, &gdt_raw);
-    let is i64 as limit = 280 - 1;   // 35 slots * 8 - 1
+    let is i64 as limit = 304 - 1;   // 38 slots * 8 - 1
 
     gdtr_limit_base = limit + ((gdt_base & 0xFFFFFFFFFFFF) << 16);
     gdtr_base_hi = (gdt_base >> 48) & 0xFFFF;
