@@ -800,6 +800,24 @@ fn handle_nm_fault() as void {
 // still get different home cpus.
 let is i64 as next_placement_cpu with mut = 0;
 
+// Per-cpu watchdog heartbeat. schedule() stamps this with the current
+// time on every entry. The watchdog thread (run from BSP) polls these
+// once per second and panics with a dump if any cpu hasn't ticked in
+// WATCHDOG_THRESHOLD_NS — that's strong evidence the cpu is wedged
+// (deadlock, infinite loop without yield, missed IRQ). Indexed by
+// cpu_id; only the first MAX_CPUS_RQ slots are meaningful.
+let is [128]u8 as cpu_heartbeat_ns;     // 16 cpus * i64
+
+fn heartbeat_get(cpu as i64) as i64 {
+    let is *i64 as p = cast(*i64, &cpu_heartbeat_ns);
+    return p[cpu];
+}
+
+fn heartbeat_set(cpu as i64, ns as i64) as void {
+    let is *i64 as p = cast(*i64, &cpu_heartbeat_ns);
+    p[cpu] = ns;
+}
+
 fn create_thread(entry as i64, band as i64) as i64 {
     // Pick this thread's home cpu via round-robin BEFORE taking
     // any lock — the placement choice is itself the input that
@@ -1118,6 +1136,7 @@ fn schedule() as void {
     lock.acquire(sched_lock_ptr(cpu));
 
     let is i64 as now = timer.current_time_ns();
+    heartbeat_set(cpu, now);
     let is i64 as prev = current_tid();
 
     // Account and re-insert prev on its home cpu (= cpu, since the
@@ -1251,6 +1270,14 @@ fn on_timer_tick() as void {
     let is i64 as elapsed = now - current_start_ns();
     let is i64 as cpu = this_cpu();
 
+    // Heartbeat for the watchdog — every cpu's timer tick stamps
+    // its own slot. BSP additionally polls for stalled cpus below.
+    heartbeat_set(cpu, now);
+
+    if (cpu == smp.get_bsp_cpu_id()) {
+        watchdog_check();
+    }
+
     if (current_tid() >= 0) {
         if (thr_class(current_tid()) == SCHED_CLASS_IDLE) {
             if (nr_running(cpu) > 0) { smp.this_cpu_set_need_resched(1); }
@@ -1305,6 +1332,123 @@ fn yield_cpu() as void { schedule(); }
 // ============================================================
 // Idle
 // ============================================================
+
+// Watchdog: each cpu's timer tick stamps its heartbeat. The BSP's
+// timer additionally polls every cpu's heartbeat — if one hasn't
+// ticked in WATCHDOG_THRESHOLD_NS, dump diagnostic state and halt.
+// Polling from inside the timer IRQ is safe because we're already
+// in IRQ context and the only I/O we do is serial.print which has
+// its own ticket lock.
+let is i64 as WATCHDOG_THRESHOLD_NS = 5000000000;   // 5 s
+let is i64 as WATCHDOG_WARM_NS      = 3000000000;   // 3 s grace at boot
+let is i64 as watchdog_armed_at_ns with mut = 0;
+let is i64 as watchdog_fired with mut = 0;
+
+fn watchdog_check() as void {
+    if (watchdog_fired != 0) { return; }
+    let is i64 as now = timer.current_time_ns();
+    if (watchdog_armed_at_ns == 0) {
+        watchdog_armed_at_ns = now + WATCHDOG_WARM_NS;
+        return;
+    }
+    if (now < watchdog_armed_at_ns) { return; }
+
+    let is i64 as cpus = smp.get_cpu_count();
+    let is i64 as ci with mut = 0;
+    while (ci < cpus) {
+        let is i64 as last = heartbeat_get(ci);
+        if (last > 0) {
+            if (now - last > WATCHDOG_THRESHOLD_NS) {
+                watchdog_fired = 1;
+                watchdog_dump_and_halt(ci, now - last);
+                return;
+            }
+        }
+        ci = ci + 1;
+    }
+}
+
+fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
+    serial.println("", 0);
+    serial.println("=== WATCHDOG: cpu stalled ===", 29);
+
+    serial.print("stalled cpu=", 12);
+    util.print_num(stalled_cpu);
+    serial.print(" age_ms=", 8);
+    util.print_num(age_ns / 1000000);
+    serial.println("", 0);
+
+    let is i64 as cpus = smp.get_cpu_count();
+    let is i64 as ci with mut = 0;
+    while (ci < cpus) {
+        let is *smp.PerCpu as pc = smp.get_per_cpu(ci);
+        if (cast(i64, pc) != 0) {
+            serial.print("cpu", 3);
+            util.print_num(ci);
+            serial.print(": current_tid=", 14);
+            util.print_num(pc.current_tid);
+            serial.print(" need_resched=", 14);
+            util.print_num(pc.need_resched);
+            serial.print(" in_irq=", 8);
+            util.print_num(pc.in_irq_context);
+            serial.print(" nr_running=", 12);
+            util.print_num(nr_running(ci));
+            serial.print(" heartbeat_age_ms=", 18);
+            let is i64 as hb = heartbeat_get(ci);
+            if (hb > 0) {
+                util.print_num((timer.current_time_ns() - hb) / 1000000);
+            } else {
+                serial.print("never", 5);
+            }
+            serial.println("", 0);
+
+            // Per-cpu band populations
+            let is i64 as bi with mut = 0;
+            while (bi < NUM_QOS_BANDS) {
+                let is i64 as bc = band_count(ci, bi);
+                if (bc > 0) {
+                    serial.print("  band[", 7);
+                    util.print_num(bi);
+                    serial.print("]=", 2);
+                    util.print_num(bc);
+                    serial.println("", 0);
+                }
+                bi = bi + 1;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    // Walk threads and print state of each. Use a snapshot of next_tid
+    // taken under tid_lock so the table read is consistent.
+    let is i64 as tflags = lock.acquire_irq(&tid_lock);
+    let is i64 as ntid = next_tid;
+    lock.release_irq(&tid_lock, tflags);
+    serial.print("threads (next_tid=", 18);
+    util.print_num(ntid);
+    serial.println("):", 2);
+    let is i64 as tid with mut = 0;
+    while (tid < ntid) {
+        if (thread_ptr(tid) != 0) {
+            serial.print("  tid=", 6);
+            util.print_num(tid);
+            serial.print(" state=", 7);
+            util.print_num(thr_state(tid));
+            serial.print(" class=", 7);
+            util.print_num(thr_class(tid));
+            serial.print(" band=", 6);
+            util.print_num(thr_band(tid));
+            serial.print(" home=", 6);
+            util.print_num(thr_home_cpu(tid));
+            serial.println("", 0);
+        }
+        tid = tid + 1;
+    }
+
+    serial.println("=== WATCHDOG halt ===", 21);
+    asm("cli\n");
+    while (1 == 1) { asm(".byte 0xF4\n"); }
+}
 
 fn idle_fn() as void {
     // APs enter with IF=0 (ap_entry deliberately does not sti before
