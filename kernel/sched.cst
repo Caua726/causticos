@@ -113,7 +113,8 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // --- Process link ---
 // 248  process_ptr      i64   (ptr to owning Process)
 // 256  home_cpu         i64   (cpu owning this thread's runqueue)
-// 264  reserved         120 bytes
+// 264  last_run_ns      i64   (monotonic when this thread last started running)
+// 272  reserved         112 bytes
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
@@ -263,6 +264,7 @@ fn thr_dl_budget(tid as i64) as i64     { return thr_get(tid, 160); }
 fn thr_dl_abs_dl(tid as i64) as i64     { return thr_get(tid, 176); }
 fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
 fn thr_home_cpu(tid as i64) as i64      { return thr_get(tid, 256); }
+fn thr_last_run_ns(tid as i64) as i64   { return thr_get(tid, 264); }
 
 // ============================================================
 // Per-band data
@@ -588,10 +590,12 @@ fn dl_account(cpu as i64, tid as i64, elapsed_ns as i64) as void {
     thr_set(tid, 88, thr_runtime(tid) + elapsed_ns);
 
     if (budget <= 0) {
-        // Budget exhausted — suspend until next period
+        // Budget exhausted — suspend until next period.
+        // Drop nr_running so the counter stays in step with replenish
+        // (which adds +1 again).
         thr_set(tid, 8, THREAD_SUSPENDED);
         dl_remove(cpu, tid);
-        // Period replenishment will be checked on timer tick
+        set_nr_running(cpu, nr_running(cpu) - 1);
     }
 }
 
@@ -924,6 +928,7 @@ fn sleep_thread(tid as i64) as void {
         return;
     }
     thr_set(tid, 8, THREAD_SLEEPING);
+    set_nr_running(cpu, nr_running(cpu) - 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
@@ -937,6 +942,7 @@ fn sleep_locked_and_yield(saved_flags as i64) as void {
     let is i64 as tid = current_tid();
     let is i64 as cpu = thr_home_cpu(tid);
     thr_set(tid, 8, THREAD_SLEEPING);
+    set_nr_running(cpu, nr_running(cpu) - 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
@@ -1010,6 +1016,7 @@ fn suspend_thread(tid as i64) as void {
         return;
     }
     thr_set(tid, 8, THREAD_SUSPENDED);
+    set_nr_running(cpu, nr_running(cpu) - 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
@@ -1169,7 +1176,9 @@ fn schedule() as void {
 
     thr_set(next, 8, THREAD_RUNNING);
     set_current_tid(next);
-    set_current_start_ns(timer.current_time_ns());
+    let is i64 as t_now = timer.current_time_ns();
+    set_current_start_ns(t_now);
+    thr_set(next, 264, t_now);   // last_run_ns
     set_nr_switches(cpu, nr_switches(cpu) + 1);
     smp.this_cpu_set_need_resched(0);
 
@@ -1339,8 +1348,9 @@ fn yield_cpu() as void { schedule(); }
 // Polling from inside the timer IRQ is safe because we're already
 // in IRQ context and the only I/O we do is serial.print which has
 // its own ticket lock.
-let is i64 as WATCHDOG_THRESHOLD_NS = 5000000000;   // 5 s
-let is i64 as WATCHDOG_WARM_NS      = 3000000000;   // 3 s grace at boot
+let is i64 as WATCHDOG_THRESHOLD_NS  = 5000000000;   // 5 s — cpu stalled
+let is i64 as STARVATION_THRESHOLD_NS = 800000000;   // 800 ms — RUNNABLE not picked
+let is i64 as WATCHDOG_WARM_NS       = 3000000000;   // 3 s grace at boot
 let is i64 as watchdog_armed_at_ns with mut = 0;
 let is i64 as watchdog_fired with mut = 0;
 
@@ -1353,6 +1363,7 @@ fn watchdog_check() as void {
     }
     if (now < watchdog_armed_at_ns) { return; }
 
+    // Stage 1: cpu-level — heartbeat too old.
     let is i64 as cpus = smp.get_cpu_count();
     let is i64 as ci with mut = 0;
     while (ci < cpus) {
@@ -1366,6 +1377,126 @@ fn watchdog_check() as void {
         }
         ci = ci + 1;
     }
+
+    // Stage 2: thread-level — a RUNNABLE thread that hasn't been
+    // picked for STARVATION_THRESHOLD_NS. The classic smp=2 hang
+    // signature: fat32 in band 2 is RUNNABLE on cpu 1, but cpu 1
+    // somehow keeps picking A in band 3 (or idle). thr_last_run_ns
+    // is stamped each time a thread becomes RUNNING; a stale stamp
+    // on a RUNNABLE thread is starvation.
+    //
+    // We only check threads with home_cpu set (>=0). Idle threads
+    // (SCHED_CLASS_IDLE) and dead/sleeping/suspended states are
+    // skipped — they're not expected to run on demand.
+    let is i64 as ntid with mut = next_tid;
+    let is i64 as tid with mut = 0;
+    while (tid < ntid) {
+        if (thread_ptr(tid) != 0) {
+            if (thr_state(tid) == THREAD_RUNNABLE) {
+                if (thr_class(tid) != SCHED_CLASS_IDLE) {
+                    let is i64 as lr = thr_last_run_ns(tid);
+                    if (lr > 0) {
+                        if (now - lr > STARVATION_THRESHOLD_NS) {
+                            watchdog_fired = 1;
+                            starvation_dump_and_halt(tid, now - lr);
+                            return;
+                        }
+                    } else {
+                        // Never run, but armed period ended — should
+                        // have run by now if it's reachable.
+                        if (now - watchdog_armed_at_ns > STARVATION_THRESHOLD_NS) {
+                            watchdog_fired = 1;
+                            starvation_dump_and_halt(tid, now - watchdog_armed_at_ns);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        tid = tid + 1;
+    }
+}
+
+fn starvation_dump_and_halt(starved_tid as i64, age_ns as i64) as void {
+    serial.println("", 0);
+    serial.println("=== STARVATION: thread RUNNABLE but not picked ===", 49);
+
+    serial.print("starved tid=", 12);
+    util.print_num(starved_tid);
+    serial.print(" age_ms=", 8);
+    util.print_num(age_ns / 1000000);
+    serial.print(" home_cpu=", 10);
+    util.print_num(thr_home_cpu(starved_tid));
+    serial.print(" band=", 6);
+    util.print_num(thr_band(starved_tid));
+    serial.print(" class=", 7);
+    util.print_num(thr_class(starved_tid));
+    serial.println("", 0);
+
+    let is i64 as cpus = smp.get_cpu_count();
+    let is i64 as ci with mut = 0;
+    while (ci < cpus) {
+        let is *smp.PerCpu as pc = smp.get_per_cpu(ci);
+        if (cast(i64, pc) != 0) {
+            serial.print("cpu", 3);
+            util.print_num(ci);
+            serial.print(": current_tid=", 14);
+            util.print_num(pc.current_tid);
+            serial.print(" need_resched=", 14);
+            util.print_num(pc.need_resched);
+            serial.print(" nr_running=", 12);
+            util.print_num(nr_running(ci));
+            serial.println("", 0);
+
+            let is i64 as bi with mut = 0;
+            while (bi < NUM_QOS_BANDS) {
+                let is i64 as bc = band_count(ci, bi);
+                if (bc > 0) {
+                    serial.print("  band[", 7);
+                    util.print_num(bi);
+                    serial.print("]=", 2);
+                    util.print_num(bc);
+                    serial.println("", 0);
+                }
+                bi = bi + 1;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    let is i64 as now = timer.current_time_ns();
+    let is i64 as ntid with mut = next_tid;
+    serial.print("threads (next_tid=", 18);
+    util.print_num(ntid);
+    serial.println("):", 2);
+    let is i64 as tid with mut = 0;
+    while (tid < ntid) {
+        if (thread_ptr(tid) != 0) {
+            serial.print("  tid=", 6);
+            util.print_num(tid);
+            serial.print(" state=", 7);
+            util.print_num(thr_state(tid));
+            serial.print(" class=", 7);
+            util.print_num(thr_class(tid));
+            serial.print(" band=", 6);
+            util.print_num(thr_band(tid));
+            serial.print(" home=", 6);
+            util.print_num(thr_home_cpu(tid));
+            let is i64 as lr = thr_last_run_ns(tid);
+            if (lr > 0) {
+                serial.print(" age_ms=", 8);
+                util.print_num((now - lr) / 1000000);
+            } else {
+                serial.print(" age_ms=never", 13);
+            }
+            serial.println("", 0);
+        }
+        tid = tid + 1;
+    }
+
+    serial.println("=== STARVATION halt ===", 23);
+    asm("cli\n");
+    while (1 == 1) { asm(".byte 0xF4\n"); }
 }
 
 fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
