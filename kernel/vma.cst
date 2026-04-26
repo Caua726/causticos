@@ -1,0 +1,379 @@
+// vma.cst — virtual memory area tracker for user address spaces.
+//
+// Keeps the per-aspace bookkeeping that vmm.cst's raw page-table API
+// can't hold on its own: which VA ranges have been claimed, what
+// protection they carry, which file (eventually) backs them, etc.
+// vmm.cst owns the page tables; vma.cst owns the higher-level
+// "is this address mapped?" answer.
+//
+// Aspace = pml4_phys (the kernel page-table handle from vmm) + a
+// sorted list of Vma nodes. mmap_anon and munmap go through the
+// aspace, which maintains both the VMA list and the page-table
+// mappings together. Existing low-level callers (`vmm.vmm_map_page`)
+// still work — they just bypass VMA tracking.
+//
+// VMA list is a simple doubly-linked sorted-by-start list. Number
+// of VMAs per process is small (text, data, bss, stack, a few
+// mmap'd regions), so O(N) insert/find is fine for now. Future
+// large workloads can swap in an rb-tree without changing the
+// public API.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "vmm.cst" as vmm;
+use "lock.cst" as lock;
+
+// ============================================================
+// Constants — flags + helpers
+// ============================================================
+
+// Prot is the leaf-PTE bit set the VMA carries. Stored as the same
+// PTE_* values vmm.cst uses so consumers can pass it straight into
+// vmm_map_page without translation.
+let is i64 as PROT_NONE   = 0;                          // not mapped
+let is i64 as PROT_READ   = 1;                          // PTE_PRESENT
+let is i64 as PROT_WRITE  = 2;                          // PTE_WRITE
+let is i64 as PROT_USER   = 4;                          // PTE_USER
+let is i64 as PROT_NX     = 0x8000000000000000;         // PTE_NX (bit 63)
+
+// vma.flags semantic bits — independent of the PTE leaf bits.
+let is i64 as VMA_ANON    = 1;                          // backed by zero pages
+let is i64 as VMA_FILE    = 2;                          // file-backed (future)
+let is i64 as VMA_FIXED   = 4;                          // hint must be honoured
+let is i64 as VMA_GROWSDOWN = 8;                        // user stack
+
+let is i64 as USER_VA_MAX = 0x00007FFFFFFFFFFF;
+
+// ============================================================
+// Data model
+// ============================================================
+
+struct Vma {
+    start as i64;            // inclusive, page-aligned
+    end as i64;              // exclusive, page-aligned
+    prot as i64;             // PTE leaf flags
+    flags as i64;            // VMA_* bitmask
+    file_offset as i64;      // 0 for VMA_ANON
+    file_handle as i64;      // 0 for VMA_ANON (later: *VfsFile)
+    next as *Vma;
+    prev as *Vma;
+}
+
+struct Aspace {
+    pml4_phys as i64;
+    vma_head as *Vma;
+    vma_count as i64;
+    lk as lock.TicketLock;
+}
+
+fn lk_ptr(a as *Aspace) as *lock.TicketLock {
+    return &a.lk;
+}
+
+// ============================================================
+// Aspace alloc / free
+// ============================================================
+
+fn aspace_create() as *Aspace {
+    let is i64 as addr = heap.kmalloc(sizeof(Aspace), pmm.ALLOC_ZERO);
+    if (addr == 0) { return cast(*Aspace, 0); }
+    let is *Aspace as a = cast(*Aspace, addr);
+    a.pml4_phys = vmm.as_create();
+    if (a.pml4_phys == 0) {
+        heap.kfree(addr);
+        return cast(*Aspace, 0);
+    }
+    a.vma_head = cast(*Vma, 0);
+    a.vma_count = 0;
+    return a;
+}
+
+fn aspace_pml4(a as *Aspace) as i64 {
+    if (cast(i64, a) == 0) { return 0; }
+    return a.pml4_phys;
+}
+
+// Tear down every VMA + every backing page + the user page tables
+// + the Aspace struct itself. Caller is responsible for guaranteeing
+// no thread is currently running against this aspace (i.e. it isn't
+// the active CR3 on any cpu) — that's the job of the future
+// process-exit path; this function just does the bookkeeping.
+fn aspace_destroy(a as *Aspace) as void {
+    if (cast(i64, a) == 0) { return; }
+    let is i64 as flags = lock.acquire_irq(lk_ptr(a));
+    let is *Vma as v with mut = a.vma_head;
+    while (cast(i64, v) != 0) {
+        let is *Vma as next = v.next;
+        unmap_vma_pages(a.pml4_phys, v);
+        heap.kfree(cast(i64, v));
+        v = next;
+    }
+    a.vma_head = cast(*Vma, 0);
+    a.vma_count = 0;
+    lock.release_irq(lk_ptr(a), flags);
+    vmm.as_destroy(a.pml4_phys);
+    heap.kfree(cast(i64, a));
+}
+
+// ============================================================
+// VMA list ops (caller holds aspace lock)
+// ============================================================
+
+fn vma_alloc(start as i64, end as i64, prot as i64, flags as i64) as *Vma {
+    let is i64 as addr = heap.kmalloc(sizeof(Vma), pmm.ALLOC_ZERO);
+    if (addr == 0) { return cast(*Vma, 0); }
+    let is *Vma as v = cast(*Vma, addr);
+    v.start = start;
+    v.end = end;
+    v.prot = prot;
+    v.flags = flags;
+    v.file_offset = 0;
+    v.file_handle = 0;
+    v.next = cast(*Vma, 0);
+    v.prev = cast(*Vma, 0);
+    return v;
+}
+
+// Insert v into a's list, keeping it sorted by start ascending.
+// Caller has already guaranteed v doesn't overlap any existing VMA.
+fn vma_insert_sorted(a as *Aspace, v as *Vma) as void {
+    let is *Vma as cur with mut = a.vma_head;
+    let is *Vma as prev with mut = cast(*Vma, 0);
+    while (cast(i64, cur) != 0) {
+        if (cur.start >= v.end) { cur = cast(*Vma, 0); }
+        else {
+            prev = cur;
+            cur = cur.next;
+        }
+    }
+    // Insert v after prev (or at head if prev is null).
+    if (cast(i64, prev) == 0) {
+        v.next = a.vma_head;
+        v.prev = cast(*Vma, 0);
+        if (cast(i64, a.vma_head) != 0) { a.vma_head.prev = v; }
+        a.vma_head = v;
+    } else {
+        v.next = prev.next;
+        v.prev = prev;
+        if (cast(i64, prev.next) != 0) { prev.next.prev = v; }
+        prev.next = v;
+    }
+    a.vma_count = a.vma_count + 1;
+}
+
+fn vma_unlink(a as *Aspace, v as *Vma) as void {
+    if (cast(i64, v.prev) == 0) { a.vma_head = v.next; }
+    else                         { v.prev.next = v.next; }
+    if (cast(i64, v.next) != 0) { v.next.prev = v.prev; }
+    a.vma_count = a.vma_count - 1;
+}
+
+// Returns the Vma covering `va`, or null if no Vma covers it.
+fn vma_find(a as *Aspace, va as i64) as *Vma {
+    let is *Vma as cur with mut = a.vma_head;
+    while (cast(i64, cur) != 0) {
+        if (va >= cur.start && va < cur.end) { return cur; }
+        if (cur.start > va) { return cast(*Vma, 0); }
+        cur = cur.next;
+    }
+    return cast(*Vma, 0);
+}
+
+// True iff the half-open range [start, end) overlaps any existing VMA.
+fn vma_range_overlaps(a as *Aspace, start as i64, end as i64) as i32 {
+    let is *Vma as cur with mut = a.vma_head;
+    while (cast(i64, cur) != 0) {
+        if (start < cur.end && cur.start < end) { return 1; }
+        if (cur.start >= end) { return 0; }
+        cur = cur.next;
+    }
+    return 0;
+}
+
+// Pick the lowest user VA ≥ hint where a `len`-byte window fits
+// without overlapping any existing VMA. Returns -1 if no fit found.
+fn vma_find_free_va(a as *Aspace, hint as i64, len as i64) as i64 {
+    let is i64 as start with mut = hint;
+    if (start < pmm.PAGE_SIZE) { start = pmm.PAGE_SIZE; }   // never give va 0
+    let is *Vma as cur with mut = a.vma_head;
+    while (cast(i64, cur) != 0) {
+        if (start + len <= cur.start) { return start; }
+        if (cur.end > start) { start = cur.end; }
+        cur = cur.next;
+    }
+    if (start + len <= USER_VA_MAX) { return start; }
+    return cast(i64, 0 - 1);
+}
+
+// ============================================================
+// Page-table backing
+// ============================================================
+
+fn page_align_down(v as i64) as i64 {
+    return v & cast(i64, 0 - 1) - 0xFFF;
+}
+
+fn page_align_up(v as i64) as i64 {
+    return (v + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
+}
+
+// Allocate one zero-filled page and map it into pml4 at va with the
+// VMA's prot bits + the always-required PRESENT/USER flags. Returns
+// 0 on success, -1 on allocator / mapper failure.
+fn back_anon_page(pml4 as i64, va as i64, prot as i64) as i32 {
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ZONE_NORMAL,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0)
+    );
+    if (pfn == pmm.PFN_NONE) { return cast(i32, 0 - 1); }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+    let is i64 as full = vmm.PTE_PRESENT | vmm.PTE_USER | prot;
+    let is i64 as rc = vmm.vmm_map_range(pml4, va, phys, 1, full);
+    if (rc != 0) {
+        pmm.free_pages(pfn);
+        return cast(i32, 0 - 1);
+    }
+    return 0;
+}
+
+// Walk every page in [v.start, v.end), unmap from pml4, free the
+// backing physical page.
+fn unmap_vma_pages(pml4 as i64, v as *Vma) as void {
+    let is i64 as p with mut = v.start;
+    while (p < v.end) {
+        let is i64 as old_phys = vmm.vmm_unmap_page(pml4, p);
+        if (old_phys != 0) {
+            let is i32 as pfn = pmm.phys_to_pfn(old_phys);
+            pmm.free_pages(pfn);
+        }
+        p = p + pmm.PAGE_SIZE;
+    }
+}
+
+// ============================================================
+// Public mmap / munmap
+// ============================================================
+
+// mmap_anon: reserve a `len`-byte region (rounded up to pages) at
+// `va_hint` (rounded down) and back it with zero pages.
+//
+// `prot` is a leaf-PTE bit set already containing PTE_USER /
+// PTE_WRITE / PTE_NX as appropriate (no PTE_PRESENT — we add that).
+// `flags` is the VMA_* bitmask. If VMA_FIXED is set the VMA must
+// land at the exact hint or fail; otherwise we walk forward until
+// we find a free spot.
+//
+// Returns the start VA on success, -1 on overlap / OOM.
+fn mmap_anon(a as *Aspace, va_hint as i64, len as i64,
+             prot as i64, flags as i64) as i64 {
+    if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
+    if (len <= 0) { return cast(i64, 0 - 1); }
+
+    let is i64 as start with mut = page_align_down(va_hint);
+    let is i64 as size = page_align_up(len);
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+
+    if ((flags & VMA_FIXED) != 0) {
+        if (vma_range_overlaps(a, start, start + size) != 0) {
+            lock.release_irq(lk_ptr(a), f_internal);
+            return cast(i64, 0 - 1);
+        }
+    } else {
+        let is i64 as picked = vma_find_free_va(a, start, size);
+        if (picked < 0) {
+            lock.release_irq(lk_ptr(a), f_internal);
+            return cast(i64, 0 - 1);
+        }
+        start = picked;
+    }
+
+    let is *Vma as v = vma_alloc(start, start + size, prot, flags | VMA_ANON);
+    if (cast(i64, v) == 0) {
+        lock.release_irq(lk_ptr(a), f_internal);
+        return cast(i64, 0 - 1);
+    }
+
+    // Eager backing: allocate + map every page now. Demand paging
+    // (via #PF on first touch) lands in a later step once the
+    // page-fault dispatcher learns to consult VMAs.
+    let is i64 as p with mut = start;
+    while (p < start + size) {
+        if (back_anon_page(a.pml4_phys, p, prot) != 0) {
+            // Roll back: unmap everything we already mapped, free
+            // the partially-built VMA.
+            let is i64 as q with mut = start;
+            while (q < p) {
+                let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, q);
+                if (old != 0) { pmm.free_pages(pmm.phys_to_pfn(old)); }
+                q = q + pmm.PAGE_SIZE;
+            }
+            heap.kfree(cast(i64, v));
+            lock.release_irq(lk_ptr(a), f_internal);
+            return cast(i64, 0 - 1);
+        }
+        p = p + pmm.PAGE_SIZE;
+    }
+
+    vma_insert_sorted(a, v);
+    lock.release_irq(lk_ptr(a), f_internal);
+    return start;
+}
+
+// munmap: drop every VMA whose range falls fully inside [va, va+len).
+// Partial-overlap split is left for a later commit; today's user
+// code only unmaps regions it mapped whole.
+fn munmap(a as *Aspace, va as i64, len as i64) as i32 {
+    if (cast(i64, a) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as start = page_align_down(va);
+    let is i64 as end = page_align_up(va + len);
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+
+    let is *Vma as cur with mut = a.vma_head;
+    let is i32 as removed_any with mut = 0;
+    while (cast(i64, cur) != 0) {
+        let is *Vma as next with mut = cur.next;
+        if (cur.start >= start && cur.end <= end) {
+            unmap_vma_pages(a.pml4_phys, cur);
+            vma_unlink(a, cur);
+            heap.kfree(cast(i64, cur));
+            removed_any = 1;
+        } else if (cur.start >= end) {
+            next = cast(*Vma, 0);
+        }
+        cur = next;
+    }
+    lock.release_irq(lk_ptr(a), f_internal);
+    if (removed_any == 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+
+// ============================================================
+// Debug
+// ============================================================
+
+fn dump(a as *Aspace) as void {
+    if (cast(i64, a) == 0) { serial.println("aspace: <null>", 14); return; }
+    let is i64 as flags = lock.acquire_irq(lk_ptr(a));
+    serial.print("aspace pml4=", 12);
+    util.print_hex(a.pml4_phys);
+    serial.print(" vmas=", 6);
+    util.print_num(a.vma_count);
+    serial.println("", 0);
+    let is *Vma as cur with mut = a.vma_head;
+    while (cast(i64, cur) != 0) {
+        serial.print("  vma [", 7);
+        util.print_hex(cur.start);
+        serial.print(", ", 2);
+        util.print_hex(cur.end);
+        serial.print(") prot=", 7);
+        util.print_hex(cur.prot);
+        serial.print(" flags=", 7);
+        util.print_hex(cur.flags);
+        serial.println("", 0);
+        cur = cur.next;
+    }
+    lock.release_irq(lk_ptr(a), flags);
+}

@@ -21,6 +21,7 @@ use "serial.cst" as serial;
 use "util.cst" as util;
 use "pmm.cst" as pmm;
 use "vmm.cst" as vmm;
+use "vma.cst" as vma;
 use "sched.cst" as sched;
 use "timer.cst" as timer;
 
@@ -164,41 +165,34 @@ fn write_syscall_shellcode(dst as *u8) as i64 {
     return 38;
 }
 
-// Allocate `n` zero-filled physical pages and map them into `pml4`
-// at [vaddr, vaddr+n*PAGE). flags is OR'd onto PTE_PRESENT / PTE_RW.
-// Returns the kernel-virtual base (HHDM mapping of the physical
-// page) so the caller can populate the page from kernel space —
-// every alloc here is small enough to fit in a single buddy block.
-fn map_user_pages(pml4 as i64, vaddr as i64, n as i64,
-                  flags as i64, label as *u8, label_len as i32) as i64 {
-    let is i32 as pfn = pmm.alloc_pages(
-        pmm.ZONE_NORMAL,
-        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
-        cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0)
-    );
-    if (pfn == pmm.PFN_NONE) {
-        serial.print("userspace: alloc fail ", 22);
+// mmap a fixed-VA, anonymous, eager-backed region in the aspace and
+// hand back the kernel-virtual address of the first backing page so
+// the caller can populate the region from kernel space. Returns 0
+// on any failure (invalid prot, OOM, range overlap).
+fn mmap_user_fixed(a as *vma.Aspace, va as i64, n as i64,
+                   prot as i64, label as *u8, label_len as i32) as i64 {
+    let is i64 as got = vma.mmap_anon(a, va, n * pmm.PAGE_SIZE,
+                                       prot, vma.VMA_FIXED);
+    if (got != va) {
+        serial.print("userspace: mmap_anon fail ", 26);
         serial.println(label, label_len);
         return 0;
     }
-    let is i64 as phys = pmm.pfn_to_phys(pfn);
-    let is i64 as kvirt = pmm.phys_to_virt(phys);
-    let is i64 as full = vmm.PTE_PRESENT | vmm.PTE_WRITE | flags;
-    let is i64 as rc = vmm.vmm_map_range(pml4, vaddr, phys, n, full);
-    if (rc != 0) {
-        serial.print("userspace: map fail ", 20);
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, va);
+    if (phys == 0) {
+        serial.print("userspace: phys lookup fail ", 28);
         serial.println(label, label_len);
         return 0;
     }
-    return kvirt;
+    return pmm.phys_to_virt(phys);
 }
 
 // Walk the user pml4 by hand to read the current counter value. We
 // can't dereference USER_DATA_VA directly because the kernel runs
 // against kas_pml4 here, not the smoke aspace. Instead, ask vmm for
 // the physical address backing USER_DATA_VA and read it via HHDM.
-fn read_user_counter(pml4 as i64) as i64 {
-    let is i64 as phys = vmm.virt_to_phys_walk(pml4, USER_DATA_VA);
+fn read_user_counter(a as *vma.Aspace) as i64 {
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, USER_DATA_VA);
     if (phys == 0) { return cast(i64, 0 - 1); }
     let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
     return p[0];
@@ -279,56 +273,50 @@ fn copy_to_user(pml4 as i64, user_va as i64, src as *u8, n as i64) as i32 {
 fn spawn_user_smoke() as void {
     serial.println("userspace.smoke: start", 22);
 
-    let is i64 as pml4 = vmm.as_create();
-    if (pml4 == 0) {
-        serial.println("userspace.smoke: as_create FAIL", 31);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.smoke: aspace_create FAIL", 35);
         return;
     }
 
     // Text page: present, ring 3, executable (NX cleared).
-    let is i64 as text_kv = map_user_pages(pml4, USER_TEXT_VA, 1,
-                                            vmm.PTE_USER,
-                                            cast(*u8, "text"), 4);
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE,
+                                             cast(*u8, "text"), 4);
     if (text_kv == 0) { return; }
     write_smoke_shellcode(cast(*u8, text_kv));
 
-    // Data page: present, ring 3, writable, NX (no exec needed).
-    let is i64 as data_kv = map_user_pages(pml4, USER_DATA_VA, 1,
-                                            vmm.PTE_USER | vmm.PTE_NX,
-                                            cast(*u8, "data"), 4);
+    // Data page: writable, NX.
+    let is i64 as data_kv = mmap_user_fixed(a, USER_DATA_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "data"), 4);
     if (data_kv == 0) { return; }
     let is *i64 as cnt = cast(*i64, data_kv);
     cnt[0] = 0;
 
-    // Stack page: present, ring 3, writable, NX. RSP starts at top
-    // of the page (stacks grow down).
-    let is i64 as stack_kv = map_user_pages(pml4, USER_STACK_VA, 1,
-                                             vmm.PTE_USER | vmm.PTE_NX,
-                                             cast(*u8, "stack"), 5);
+    // Stack page: writable, NX.
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                              vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                              cast(*u8, "stack"), 5);
     if (stack_kv == 0) { return; }
     let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
 
-    // Spawn the thread. QOS_NORMAL so it doesn't preempt the I/O
-    // workers that bring the rest of the system up.
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        pml4, USER_TEXT_VA, user_rsp
+        a.pml4_phys, USER_TEXT_VA, user_rsp
     );
 
     serial.print("userspace.smoke: spawned tid=", 29);
     util.print_num(tid);
     serial.print(" pml4=", 6);
-    util.print_hex(pml4);
+    util.print_hex(a.pml4_phys);
     serial.println("", 0);
 
-    // Poll the counter every 50 ms for up to 1 s. Real hardware will
-    // tick the counter millions of times per quantum — we just want
-    // proof the user thread is running, not a benchmark.
     let is i64 as deadline = timer.current_time_ns() + 1000000000;
     let is i64 as last with mut = 0;
     while (timer.current_time_ns() < deadline) {
-        let is i64 as cur = read_user_counter(pml4);
+        let is i64 as cur = read_user_counter(a);
         if (cur > 0) {
             serial.print("userspace.smoke: counter=", 25);
             util.print_num(cur);
@@ -350,29 +338,29 @@ fn spawn_user_smoke() as void {
 // halt the system instead.
 fn spawn_user_fault_smoke() as void {
     serial.println("userspace.fault_smoke: start", 28);
-    let is i64 as pml4 = vmm.as_create();
-    if (pml4 == 0) {
-        serial.println("userspace.fault_smoke: as_create FAIL", 37);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.fault_smoke: aspace_create FAIL", 41);
         return;
     }
-    let is i64 as text_kv = map_user_pages(pml4, USER_TEXT_VA, 1,
-                                            vmm.PTE_USER,
-                                            cast(*u8, "btext"), 5);
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE,
+                                             cast(*u8, "btext"), 5);
     if (text_kv == 0) { return; }
     let is *u8 as code = cast(*u8, text_kv);
     code[0] = cast(u8, 0x0F);                  // ud2 — invalid opcode
     code[1] = cast(u8, 0x0B);
 
-    let is i64 as stack_kv = map_user_pages(pml4, USER_STACK_VA, 1,
-                                             vmm.PTE_USER | vmm.PTE_NX,
-                                             cast(*u8, "bstack"), 6);
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                              vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                              cast(*u8, "bstack"), 6);
     if (stack_kv == 0) { return; }
     let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
 
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        pml4, USER_TEXT_VA, user_rsp
+        a.pml4_phys, USER_TEXT_VA, user_rsp
     );
     serial.print("userspace.fault_smoke: spawned tid=", 35);
     util.print_num(tid);
@@ -391,40 +379,39 @@ fn spawn_user_fault_smoke() as void {
 // reads it via the aspace walk.
 fn spawn_user_syscall_smoke() as void {
     serial.println("userspace.syscall_smoke: start", 30);
-    let is i64 as pml4 = vmm.as_create();
-    if (pml4 == 0) {
-        serial.println("userspace.syscall_smoke: as_create FAIL", 39);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.syscall_smoke: aspace_create FAIL", 43);
         return;
     }
-    let is i64 as text_kv = map_user_pages(pml4, USER_TEXT_VA, 1,
-                                            vmm.PTE_USER,
-                                            cast(*u8, "stext"), 5);
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE,
+                                             cast(*u8, "stext"), 5);
     if (text_kv == 0) { return; }
     write_syscall_shellcode(cast(*u8, text_kv));
 
-    let is i64 as data_kv = map_user_pages(pml4, USER_DATA_VA, 1,
-                                            vmm.PTE_USER | vmm.PTE_NX,
-                                            cast(*u8, "sdata"), 5);
+    let is i64 as data_kv = mmap_user_fixed(a, USER_DATA_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "sdata"), 5);
     if (data_kv == 0) { return; }
     let is *i64 as result = cast(*i64, data_kv);
     result[0] = cast(i64, 0 - 1);              // sentinel — sys_test returns 33
 
-    let is i64 as stack_kv = map_user_pages(pml4, USER_STACK_VA, 1,
-                                             vmm.PTE_USER | vmm.PTE_NX,
-                                             cast(*u8, "sstack"), 6);
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                              vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                              cast(*u8, "sstack"), 6);
     if (stack_kv == 0) { return; }
     let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
 
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        pml4, USER_TEXT_VA, user_rsp
+        a.pml4_phys, USER_TEXT_VA, user_rsp
     );
     serial.print("userspace.syscall_smoke: spawned tid=", 37);
     util.print_num(tid);
     serial.println("", 0);
 
-    // Poll the result for up to 1 s. sys_test does a + b = 33.
     let is i64 as deadline = timer.current_time_ns() + 1000000000;
     while (timer.current_time_ns() < deadline) {
         let is i64 as cur = result[0];
