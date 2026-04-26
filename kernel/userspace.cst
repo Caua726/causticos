@@ -25,6 +25,7 @@ use "vma.cst" as vma;
 use "sched.cst" as sched;
 use "timer.cst" as timer;
 use "vfs.cst" as vfs;
+use "elf.cst" as elf;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
 // pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
@@ -427,6 +428,179 @@ fn spawn_user_syscall_smoke() as void {
     serial.println(" FAIL", 5);
 }
 
+// ============================================================
+// Embedded test ELF — fully static x86_64 ET_EXEC.
+//
+// Layout:
+//   00..3F : ELF64 header (64 B)
+//   40..77 : PT_LOAD program header (56 B), loads file at vaddr
+//            0x400000 with p_filesz = TEST_ELF_LEN, p_memsz = 0x2000
+//            (one page of code + one page of BSS for the result word)
+//   78..   : code:
+//            mov rax, 0       ; syscall #0 (sys_test)
+//            mov rdi, 11
+//            mov rsi, 22
+//            syscall          ; rax = 33
+//            movabs r10, 0x401000
+//            mov [r10], rax   ; store result in BSS
+//            jmp .            ; halt
+//
+// Entry point sits at 0x400000 + 0x78 (file offset of code) =
+// 0x400078 since PT_LOAD maps the file 1:1 from offset 0 onward.
+// ============================================================
+
+let is i64 as TEST_ELF_BSS_VA = 0x401000;
+let is i64 as TEST_ELF_LEN = 0xAE;
+
+let is [174]u8 as test_elf;
+
+fn build_test_elf() as void {
+    let is *u8 as e = cast(*u8, &test_elf[0]);
+    let is i64 as i with mut = 0;
+    while (i < TEST_ELF_LEN) { e[i] = cast(u8, 0); i = i + 1; }
+
+    // ELF magic
+    e[0] = cast(u8, 0x7F);
+    e[1] = cast(u8, 0x45);                          // 'E'
+    e[2] = cast(u8, 0x4C);                          // 'L'
+    e[3] = cast(u8, 0x46);                          // 'F'
+    e[4] = cast(u8, 2);                             // ELFCLASS64
+    e[5] = cast(u8, 1);                             // ELFDATA2LSB
+    e[6] = cast(u8, 1);                             // EV_CURRENT
+    // 7..15: zeros (OSABI, padding)
+
+    // e_type = ET_EXEC (16-17)
+    e[16] = cast(u8, 2);
+    // e_machine = EM_X86_64 = 0x3E (18-19)
+    e[18] = cast(u8, 0x3E);
+    // e_version = 1 (20-23)
+    e[20] = cast(u8, 1);
+    // e_entry = 0x400078 (24-31)
+    e[24] = cast(u8, 0x78);
+    e[26] = cast(u8, 0x40);
+    // e_phoff = 64 (32-39)
+    e[32] = cast(u8, 0x40);
+    // e_ehsize = 64 (52-53)
+    e[52] = cast(u8, 0x40);
+    // e_phentsize = 56 (54-55)
+    e[54] = cast(u8, 0x38);
+    // e_phnum = 1 (56-57)
+    e[56] = cast(u8, 1);
+
+    // PT_LOAD at offset 64
+    let is i64 as ph with mut = 64;
+    e[ph + 0] = cast(u8, 1);                        // p_type = PT_LOAD
+    e[ph + 4] = cast(u8, 7);                        // p_flags = PF_R | PF_W | PF_X
+                                                    // (test image — real
+                                                    //  binaries split text
+                                                    //  and data into separate
+                                                    //  PT_LOAD entries)
+    // p_offset = 0
+    // p_vaddr = 0x400000 (offset 16-23 of phdr)
+    e[ph + 18] = cast(u8, 0x40);
+    // p_paddr = 0x400000
+    e[ph + 26] = cast(u8, 0x40);
+    // p_filesz = TEST_ELF_LEN
+    let is i64 as fsz with mut = TEST_ELF_LEN;
+    let is i64 as k with mut = 0;
+    while (k < 8) {
+        e[ph + 32 + k] = cast(u8, fsz & 0xFF);
+        fsz = fsz >> 8;
+        k = k + 1;
+    }
+    // p_memsz = 0x2000 (offset 40-47)
+    e[ph + 41] = cast(u8, 0x20);
+    // p_align = 0x1000 (offset 48-55)
+    e[ph + 49] = cast(u8, 0x10);
+
+    // Code at offset 0x78 (120)
+    let is i64 as c with mut = 0x78;
+    // mov rax, 0
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    // (4 zero bytes)
+    c = c + 7;
+    // mov rdi, 11
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC7);
+    e[c+3]=cast(u8,11);
+    c = c + 7;
+    // mov rsi, 22
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,22);
+    c = c + 7;
+    // syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05);
+    c = c + 2;
+    // movabs r10, 0x401000
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBA);
+    let is i64 as v with mut = TEST_ELF_BSS_VA;
+    let is i64 as kk with mut = 0;
+    while (kk < 8) {
+        e[c + 2 + kk] = cast(u8, v & 0xFF);
+        v = v >> 8;
+        kk = kk + 1;
+    }
+    c = c + 10;
+    // mov [r10], rax
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x02);
+    c = c + 3;
+    // jmp .  (rel8 = -2)
+    e[c+0]=cast(u8,0xEB); e[c+1]=cast(u8,0xFE);
+}
+
+fn spawn_user_elf_smoke() as void {
+    serial.println("userspace.elf_smoke: start", 26);
+
+    build_test_elf();
+
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.elf_smoke: aspace FAIL", 32);
+        return;
+    }
+
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = elf.load_elf(a, cast(*u8, &test_elf[0]), TEST_ELF_LEN,
+                                     cast(*u8, "test"), 4,
+                                     &entry, &user_rsp);
+    if (rc != 0) {
+        serial.print("userspace.elf_smoke: load_elf rc=", 33);
+        util.print_num(cast(i64, rc));
+        serial.println(" FAIL", 5);
+        return;
+    }
+
+    serial.print("userspace.elf_smoke: entry=", 27);
+    util.print_hex(entry);
+    serial.print(" rsp=", 5);
+    util.print_hex(user_rsp);
+    serial.println("", 0);
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        a.pml4_phys, entry, user_rsp
+    );
+    serial.print("userspace.elf_smoke: spawned tid=", 33);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Poll the BSS word for the syscall result.
+    let is i64 as deadline = timer.current_time_ns() + 1500000000;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, TEST_ELF_BSS_VA);
+        if (phys != 0) {
+            let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+            if (p[0] == 33) {
+                serial.println("userspace.elf_smoke: result=33 PASS", 35);
+                return;
+            }
+        }
+        sched.sleep_for_ns(20000000);
+    }
+    serial.println("userspace.elf_smoke: timeout FAIL", 33);
+}
+
 // FD table smoke — kernel-side test of the per-aspace fd table.
 // Opens /hello.txt twice, validates fd allocation / lookup / close /
 // install semantics. Doesn't go through the (yet-unwritten) syscall
@@ -495,5 +669,6 @@ fn smoke_thread() as void {
     spawn_user_fault_smoke();
     spawn_user_syscall_smoke();
     fd_table_smoke();
+    spawn_user_elf_smoke();
 }
 

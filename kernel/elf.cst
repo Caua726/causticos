@@ -1,0 +1,352 @@
+// elf.cst — ELF64 loader for ring-3 binaries.
+//
+// Parses an ELF image (currently a kernel-side byte buffer; once the
+// VFS open path is wired into the syscall layer we'll switch to
+// reading off the file descriptor directly), walks every PT_LOAD
+// segment, mmap_anon's the requested user VA range with the right
+// PTE protection, copies p_filesz bytes from the file, and zeroes
+// the [p_filesz, p_memsz) tail (BSS). On success it builds the
+// System V AMD64 initial user stack — argc / argv[] / envp[] / auxv
+// per the ABI doc — and returns the entry RIP plus user RSP via
+// out parameters.
+//
+// What this loader does NOT do (deferred):
+//   * Dynamic linking (PT_INTERP / PT_DYNAMIC).
+//   * Relocations (R_X86_64_*) — only static, fully-linked images.
+//   * PIE rebasing — e_entry must be the true VA. (PT_LOAD vaddrs
+//     are honoured verbatim; the spec reserves PIE rebasing for a
+//     future commit that decides on a load offset.)
+//   * Permission downgrade pass — every PT_LOAD page lands W+X if
+//     either bit is set in p_flags, then we'd ideally remap to drop
+//     W. mprotect lands separately.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "pmm.cst" as pmm;
+use "vmm.cst" as vmm;
+use "vma.cst" as vma;
+
+// ============================================================
+// ELF constants (subset relevant to a static x86_64 binary)
+// ============================================================
+
+let is i64 as ELF_MAG0 = 0x7F;
+let is i64 as ELF_MAG1 = 0x45;     // 'E'
+let is i64 as ELF_MAG2 = 0x4C;     // 'L'
+let is i64 as ELF_MAG3 = 0x46;     // 'F'
+
+let is i64 as ELFCLASS64 = 2;
+let is i64 as ELFDATA2LSB = 1;
+
+let is i64 as ET_EXEC = 2;
+let is i64 as ET_DYN  = 3;
+
+let is i64 as EM_X86_64 = 62;
+
+let is i64 as PT_NULL    = 0;
+let is i64 as PT_LOAD    = 1;
+let is i64 as PT_DYNAMIC = 2;
+let is i64 as PT_INTERP  = 3;
+let is i64 as PT_NOTE    = 4;
+let is i64 as PT_PHDR    = 6;
+let is i64 as PT_TLS     = 7;
+
+let is i64 as PF_X = 1;
+let is i64 as PF_W = 2;
+let is i64 as PF_R = 4;
+
+// Auxv entry types (subset).
+let is i64 as AT_NULL       = 0;
+let is i64 as AT_PHDR       = 3;
+let is i64 as AT_PHENT      = 4;
+let is i64 as AT_PHNUM      = 5;
+let is i64 as AT_PAGESZ     = 6;
+let is i64 as AT_BASE       = 7;
+let is i64 as AT_FLAGS      = 8;
+let is i64 as AT_ENTRY      = 9;
+let is i64 as AT_UID        = 11;
+let is i64 as AT_EUID       = 12;
+let is i64 as AT_GID        = 13;
+let is i64 as AT_EGID       = 14;
+let is i64 as AT_RANDOM     = 25;
+let is i64 as AT_EXECFN     = 31;
+
+// Default user stack size (System V AMD64 RLIMIT_STACK on Linux is
+// 8 MiB; we use 16 KiB while we don't have growing-stack support).
+let is i64 as USER_STACK_SIZE = 0x4000;
+
+// Where the stack sits in the user aspace: just below the upper
+// canonical-half boundary so it doesn't collide with anything the
+// linker chose to put low.
+let is i64 as USER_STACK_TOP_VA = 0x00007FFFFFFFE000;
+
+// ============================================================
+// Little-endian byte reads — every ELF integer is LE.
+// ============================================================
+
+fn read_u16_le(p as *u8, off as i64) as i64 {
+    let is i64 as a = cast(i64, p[off])     & 0xFF;
+    let is i64 as b = cast(i64, p[off + 1]) & 0xFF;
+    return a | (b << 8);
+}
+
+fn read_u32_le(p as *u8, off as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        v = v | ((cast(i64, p[off + i]) & 0xFF) << (i * 8));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn read_u64_le(p as *u8, off as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        v = v | ((cast(i64, p[off + i]) & 0xFF) << (i * 8));
+        i = i + 1;
+    }
+    return v;
+}
+
+// ============================================================
+// Validation
+// ============================================================
+
+fn validate_header(buf as *u8, size as i64) as i32 {
+    if (size < 64) { return cast(i32, 0 - 1); }
+    if (cast(i64, buf[0]) != ELF_MAG0) { return cast(i32, 0 - 1); }
+    if (cast(i64, buf[1]) != ELF_MAG1) { return cast(i32, 0 - 1); }
+    if (cast(i64, buf[2]) != ELF_MAG2) { return cast(i32, 0 - 1); }
+    if (cast(i64, buf[3]) != ELF_MAG3) { return cast(i32, 0 - 1); }
+    if (cast(i64, buf[4]) != ELFCLASS64) { return cast(i32, 0 - 2); }
+    if (cast(i64, buf[5]) != ELFDATA2LSB) { return cast(i32, 0 - 3); }
+    let is i64 as e_type = read_u16_le(buf, 16);
+    if (e_type != ET_EXEC && e_type != ET_DYN) { return cast(i32, 0 - 4); }
+    if (read_u16_le(buf, 18) != EM_X86_64) { return cast(i32, 0 - 5); }
+    return 0;
+}
+
+// ============================================================
+// PT_LOAD → mmap_anon + copy
+// ============================================================
+
+fn flags_to_prot(p_flags as i64) as i64 {
+    let is i64 as prot with mut = vma.PROT_USER;
+    // Read is implied by anything else; PROT_READ == PTE_PRESENT,
+    // which mmap_anon ORs in unconditionally.
+    if ((p_flags & PF_W) != 0) { prot = prot | vma.PROT_WRITE; }
+    if ((p_flags & PF_X) == 0) { prot = prot | vma.PROT_NX; }
+    return prot;
+}
+
+fn copy_segment_into_aspace(a as *vma.Aspace, va as i64,
+                             src as *u8, src_off as i64,
+                             filesz as i64, memsz as i64) as i32 {
+    // mmap_anon already zero-filled every backing page, so the
+    // BSS portion (memsz - filesz) needs no extra work — we just
+    // copy filesz bytes from the source buffer.
+    let is i64 as i with mut = 0;
+    while (i < filesz) {
+        let is i64 as page_va = (va + i) & cast(i64, 0 - 1) - 0xFFF;
+        let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
+        if (phys == 0) { return cast(i32, 0 - 1); }
+        let is *u8 as page_kv = cast(*u8, pmm.phys_to_virt(phys));
+        let is i64 as in_page = (va + i) & 0xFFF;
+        let is i64 as room = pmm.PAGE_SIZE - in_page;
+        let is i64 as left = filesz - i;
+        let is i64 as n with mut = room;
+        if (n > left) { n = left; }
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            page_kv[in_page + j] = src[src_off + i + j];
+            j = j + 1;
+        }
+        i = i + n;
+    }
+    return 0;
+}
+
+// Walk all PT_LOAD program headers, mmap each, copy bytes.
+fn load_segments(a as *vma.Aspace, buf as *u8, size as i64) as i32 {
+    let is i64 as e_phoff = read_u64_le(buf, 32);
+    let is i64 as e_phentsize = read_u16_le(buf, 54);
+    let is i64 as e_phnum = read_u16_le(buf, 56);
+    if (e_phentsize < 56) { return cast(i32, 0 - 1); }
+
+    let is i64 as i with mut = 0;
+    while (i < e_phnum) {
+        let is i64 as ph_off = e_phoff + i * e_phentsize;
+        if (ph_off + e_phentsize > size) { return cast(i32, 0 - 2); }
+        let is i64 as p_type = read_u32_le(buf, ph_off);
+        if (p_type == PT_LOAD) {
+            let is i64 as p_flags  = read_u32_le(buf, ph_off + 4);
+            let is i64 as p_offset = read_u64_le(buf, ph_off + 8);
+            let is i64 as p_vaddr  = read_u64_le(buf, ph_off + 16);
+            let is i64 as p_filesz = read_u64_le(buf, ph_off + 32);
+            let is i64 as p_memsz  = read_u64_le(buf, ph_off + 40);
+
+            if (p_offset + p_filesz > size) { return cast(i32, 0 - 3); }
+            if (p_memsz < p_filesz) { return cast(i32, 0 - 4); }
+
+            let is i64 as prot = flags_to_prot(p_flags);
+            let is i64 as got = vma.mmap_anon(a, p_vaddr, p_memsz,
+                                               prot, vma.VMA_FIXED);
+            if (got != (p_vaddr & cast(i64, 0 - 1) - 0xFFF)) {
+                serial.println("elf: PT_LOAD overlap / OOM", 26);
+                return cast(i32, 0 - 5);
+            }
+            if (p_filesz > 0) {
+                let is i32 as crc = copy_segment_into_aspace(a, p_vaddr,
+                                                              buf, p_offset,
+                                                              p_filesz, p_memsz);
+                if (crc != 0) { return cast(i32, 0 - 6); }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Initial-stack builder.
+//
+// System V AMD64 layout at ring-3 entry:
+//   rsp →  argc                (i64)
+//          argv[0]              (*u8)
+//          argv[1]
+//          ...
+//          argv[argc] = NULL
+//          envp[0]              (*u8)
+//          ...
+//          envp[N] = NULL
+//          auxv[0].type         (i64)
+//          auxv[0].val          (i64)
+//          ...
+//          auxv[K] = AT_NULL, 0
+//          /* string area follows, pointed at by argv[]/envp[] */
+//
+// rsp must be 16-byte aligned at entry. SysV says (rsp+8) %% 16 == 0
+// at the call site of `_start`, but kernel-launched processes get
+// rsp 16-aligned exactly (no return address from a `call` is on the
+// stack). We honour that.
+// ============================================================
+
+fn build_initial_stack(a as *vma.Aspace, entry as i64,
+                        argv0 as *u8, argv0_len as i64,
+                        out_rsp as *i64) as i32 {
+    let is i64 as stack_top = USER_STACK_TOP_VA;
+    let is i64 as got = vma.mmap_anon(a, stack_top - USER_STACK_SIZE,
+                                       USER_STACK_SIZE,
+                                       vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                       vma.VMA_FIXED | vma.VMA_GROWSDOWN);
+    if (got != stack_top - USER_STACK_SIZE) {
+        serial.println("elf: stack mmap fail", 20);
+        return cast(i32, 0 - 1);
+    }
+
+    // Layout the stack inside our kernel-mapped view of the page.
+    // We work backwards from stack_top: first the strings (argv[0]
+    // text + a 16-byte AT_RANDOM blob), then the argv/envp/auxv
+    // arrays.
+    let is i64 as page_va = stack_top - pmm.PAGE_SIZE;
+    let is i64 as page_phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
+    if (page_phys == 0) {
+        serial.println("elf: stack page lookup fail", 27);
+        return cast(i32, 0 - 2);
+    }
+    let is *u8 as page_kv = cast(*u8, pmm.phys_to_virt(page_phys));
+
+    // Cursor inside the page (offset from page base, growing down
+    // from PAGE_SIZE).
+    let is i64 as off with mut = pmm.PAGE_SIZE;
+
+    // Write argv[0] string (NUL-terminated).
+    off = off - (argv0_len + 1);
+    page_kv[off + argv0_len] = cast(u8, 0);
+    let is i64 as i with mut = 0;
+    while (i < argv0_len) {
+        page_kv[off + i] = argv0[i];
+        i = i + 1;
+    }
+    let is i64 as argv0_va = page_va + off;
+
+    // 16 bytes for AT_RANDOM (just zeros for now — real entropy
+    // arrives with the RNG syscall).
+    off = off - 16;
+    let is i64 as random_va = page_va + off;
+    let is i64 as zr with mut = 0;
+    while (zr < 16) { page_kv[off + zr] = cast(u8, 0); zr = zr + 1; }
+
+    // Align cursor to 16 bytes before laying out the i64-array
+    // section so the SP at entry lands aligned.
+    off = off & cast(i64, 0 - 1) - 15;
+
+    // Compute total bytes for argv (1 + 1 NULL = 2 entries),
+    // envp (1 NULL = 1 entry), auxv (4 entries × 2 = 8 i64s),
+    // argc (1 i64). Total = 1 + 2 + 1 + 8 = 12 i64s = 96 bytes.
+    let is i64 as scalars_bytes = 12 * 8;
+    if (off < scalars_bytes) {
+        serial.println("elf: initial stack overflow", 27);
+        return cast(i32, 0 - 3);
+    }
+    off = off - scalars_bytes;
+
+    // Realign down to 16.
+    off = off & cast(i64, 0 - 1) - 15;
+
+    let is *i64 as words = cast(*i64, &page_kv[off]);
+    let is i64 as user_rsp = page_va + off;
+
+    // Slot 0  : argc
+    // Slot 1  : argv[0] = argv0_va
+    // Slot 2  : argv[1] = NULL
+    // Slot 3  : envp[0] = NULL
+    // Slots 4..11 : 4 auxv entries (type, val) pairs
+    words[0] = 1;
+    words[1] = argv0_va;
+    words[2] = 0;
+    words[3] = 0;
+    words[4] = AT_PAGESZ;   words[5]  = pmm.PAGE_SIZE;
+    words[6] = AT_ENTRY;    words[7]  = entry;
+    words[8] = AT_RANDOM;   words[9]  = random_va;
+    words[10] = AT_NULL;    words[11] = 0;
+
+    *out_rsp = user_rsp;
+    return 0;
+}
+
+// ============================================================
+// Top-level entry. buf/size = ELF image bytes.
+// On success: *out_entry = e_entry, *out_user_rsp = stack pointer.
+// ============================================================
+
+fn load_elf(a as *vma.Aspace, buf as *u8, size as i64,
+            argv0 as *u8, argv0_len as i64,
+            out_entry as *i64, out_user_rsp as *i64) as i32 {
+    let is i32 as vrc = validate_header(buf, size);
+    if (vrc != 0) {
+        serial.print("elf: header invalid rc=", 23);
+        util.print_num(cast(i64, vrc));
+        serial.println("", 0);
+        return vrc;
+    }
+
+    let is i64 as e_entry = read_u64_le(buf, 24);
+    if (e_entry == 0) { return cast(i32, 0 - 7); }
+
+    let is i32 as src = load_segments(a, buf, size);
+    if (src != 0) {
+        serial.print("elf: load_segments rc=", 22);
+        util.print_num(cast(i64, src));
+        serial.println("", 0);
+        return src;
+    }
+
+    let is i32 as ssrc = build_initial_stack(a, e_entry, argv0, argv0_len, out_user_rsp);
+    if (ssrc != 0) { return ssrc; }
+
+    *out_entry = e_entry;
+    return 0;
+}
