@@ -133,6 +133,37 @@ fn write_smoke_shellcode(dst as *u8) as i64 {
     return 15;
 }
 
+// Syscall round-trip shellcode:
+//   mov rax, 0          ; sys_test
+//   mov rdi, 11
+//   mov rsi, 22
+//   syscall             ; rax = a + b = 33
+//   movabs r10, USER_DATA_VA
+//   mov [r10], rax      ; store result for kernel to inspect
+//   jmp .               ; halt
+//
+// Total: 38 bytes.
+fn write_syscall_shellcode(dst as *u8) as i64 {
+    dst[0]  = cast(u8, 0x48); dst[1]  = cast(u8, 0xC7); dst[2]  = cast(u8, 0xC0);
+    dst[3]  = cast(u8, 0); dst[4]  = cast(u8, 0); dst[5]  = cast(u8, 0); dst[6] = cast(u8, 0);
+    dst[7]  = cast(u8, 0x48); dst[8]  = cast(u8, 0xC7); dst[9]  = cast(u8, 0xC7);
+    dst[10] = cast(u8, 11); dst[11] = cast(u8, 0); dst[12] = cast(u8, 0); dst[13] = cast(u8, 0);
+    dst[14] = cast(u8, 0x48); dst[15] = cast(u8, 0xC7); dst[16] = cast(u8, 0xC6);
+    dst[17] = cast(u8, 22); dst[18] = cast(u8, 0); dst[19] = cast(u8, 0); dst[20] = cast(u8, 0);
+    dst[21] = cast(u8, 0x0F); dst[22] = cast(u8, 0x05);                      // syscall
+    dst[23] = cast(u8, 0x49); dst[24] = cast(u8, 0xBA);                      // movabs r10, imm64
+    let is i64 as v with mut = USER_DATA_VA;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        dst[25 + i] = cast(u8, v & 0xFF);
+        v = v >> 8;
+        i = i + 1;
+    }
+    dst[33] = cast(u8, 0x49); dst[34] = cast(u8, 0x89); dst[35] = cast(u8, 0x02);  // mov [r10], rax
+    dst[36] = cast(u8, 0xEB); dst[37] = cast(u8, 0xFE);                            // jmp .
+    return 38;
+}
+
 // Allocate `n` zero-filled physical pages and map them into `pml4`
 // at [vaddr, vaddr+n*PAGE). flags is OR'd onto PTE_PRESENT / PTE_RW.
 // Returns the kernel-virtual base (HHDM mapping of the physical
@@ -353,12 +384,68 @@ fn spawn_user_fault_smoke() as void {
     serial.println("userspace.fault_smoke: kernel still alive PASS", 46);
 }
 
+// Third smoke: user thread runs `mov rax, 0; mov rdi, 11; mov rsi, 22;
+// syscall; mov [USER_DATA_VA], rax; jmp .` — proves SYSCALL gets us
+// back into the kernel, sys_test runs, sysretq returns rax=33 to
+// user land, and the user can write the result back so the kernel
+// reads it via the aspace walk.
+fn spawn_user_syscall_smoke() as void {
+    serial.println("userspace.syscall_smoke: start", 30);
+    let is i64 as pml4 = vmm.as_create();
+    if (pml4 == 0) {
+        serial.println("userspace.syscall_smoke: as_create FAIL", 39);
+        return;
+    }
+    let is i64 as text_kv = map_user_pages(pml4, USER_TEXT_VA, 1,
+                                            vmm.PTE_USER,
+                                            cast(*u8, "stext"), 5);
+    if (text_kv == 0) { return; }
+    write_syscall_shellcode(cast(*u8, text_kv));
+
+    let is i64 as data_kv = map_user_pages(pml4, USER_DATA_VA, 1,
+                                            vmm.PTE_USER | vmm.PTE_NX,
+                                            cast(*u8, "sdata"), 5);
+    if (data_kv == 0) { return; }
+    let is *i64 as result = cast(*i64, data_kv);
+    result[0] = cast(i64, 0 - 1);              // sentinel — sys_test returns 33
+
+    let is i64 as stack_kv = map_user_pages(pml4, USER_STACK_VA, 1,
+                                             vmm.PTE_USER | vmm.PTE_NX,
+                                             cast(*u8, "sstack"), 6);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        pml4, USER_TEXT_VA, user_rsp
+    );
+    serial.print("userspace.syscall_smoke: spawned tid=", 37);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Poll the result for up to 1 s. sys_test does a + b = 33.
+    let is i64 as deadline = timer.current_time_ns() + 1000000000;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as cur = result[0];
+        if (cur == 33) {
+            serial.println("userspace.syscall_smoke: result=33 PASS", 39);
+            return;
+        }
+        sched.sleep_for_ns(20000000);
+    }
+    serial.print("userspace.syscall_smoke: result=", 32);
+    util.print_num(result[0]);
+    serial.println(" FAIL", 5);
+}
+
 // Thread entry called from main.cst. Sleeps a moment so the rest
 // of phase-2 bind / mount finishes printing before our log lands,
-// then runs the smoke once.
+// then runs the smokes once each.
 fn smoke_thread() as void {
     sched.sleep_for_ns(200000000);     // 200 ms
     spawn_user_smoke();
     spawn_user_fault_smoke();
+    spawn_user_syscall_smoke();
 }
 

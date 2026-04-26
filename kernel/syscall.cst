@@ -1,0 +1,245 @@
+// syscall.cst — SYSCALL/SYSRET MSR setup + dispatch skeleton.
+//
+// Wires up the fast path for ring-3 → ring-0 transitions:
+//   * IA32_EFER.SCE = 1                    enables SYSCALL/SYSRET
+//   * IA32_STAR  = (user_base << 48) | (kernel_cs << 32)
+//   * IA32_LSTAR = address of syscall_entry
+//   * IA32_FMASK = bits to clear in RFLAGS on entry (we mask IF so
+//                  the entry stub runs with interrupts disabled
+//                  until it has switched stacks)
+//
+// Convention chosen for now (subject to the open syscall-shape
+// design decision):
+//   * rax = syscall number on entry, return value on exit
+//   * rdi rsi rdx r10 r8 r9 = args (Linux-style; r10 substitutes
+//                                   for rcx because rcx holds saved
+//                                   user RIP after SYSCALL)
+//   * rcx = saved user RIP (CPU does this; SYSRETQ pops from it)
+//   * r11 = saved user RFLAGS (same)
+//
+// User code: `mov rax, N; syscall` — kernel runs the dispatch and
+// `sysretq` returns with rax = result.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "smp.cst" as smp;
+
+// ============================================================
+// MSR identifiers (see Intel SDM Vol 4 §2.20-2.22)
+// ============================================================
+
+let is i64 as IA32_EFER  = 0xC0000080;
+let is i64 as IA32_STAR  = 0xC0000081;
+let is i64 as IA32_LSTAR = 0xC0000082;
+let is i64 as IA32_FMASK = 0xC0000084;
+
+// EFER bit 0 = SCE (System Call Enable). Limine usually leaves it
+// clear since long-mode entry doesn't need SYSCALL; we set it here.
+let is i64 as EFER_SCE = 1;
+
+// STAR encoding:
+//   [31:0]  reserved (used for legacy mode segments)
+//   [47:32] kernel CS (also kernel SS = +8)
+//   [63:48] user base — SYSRETQ does CS = base+16, SS = base+8
+//
+// Our GDT puts kernel CS at 0x08 (so kernel SS = 0x10 ✓) and the
+// user 64-bit CS at 0x28 (= base 0x18 + 16) with user data at 0x20
+// (= base 0x18 + 8).
+let is i64 as STAR_VALUE = (cast(i64, 0x18) << 48) | (cast(i64, 0x08) << 32);
+
+// FMASK: bits that get CLEARED in RFLAGS on SYSCALL entry. Clearing
+// IF (bit 9 = 0x200) means the entry stub runs with interrupts
+// disabled until it has switched stacks; clearing DF + TF + AC is
+// hygiene so the kernel doesn't inherit weird user state.
+let is i64 as FMASK_VALUE = 0x47700;     // IF | TF | DF | AC | NT | IOPL bits
+
+// Globals the entry stub reads via RIP-relative LEAs. Same shuttle
+// pattern enter_user uses — caustic prologues clobber rdi/rsi but
+// these are static.
+let is i64 as syscall_entry_addr with mut = 0;
+
+// ============================================================
+// MSR helpers (rdmsr / wrmsr go through asm).
+//
+// Args go through shuttle globals because Caustic prologues spill
+// rdi/rsi to stack slots before any inline asm runs, so reading
+// them from registers is unreliable. The globals are also handy
+// for wrmsr: edx:eax has to hold the value split, and we'd rather
+// load the i64 once and shr in asm than bounce through Caustic.
+// ============================================================
+
+let is i64 as msr_id with mut = 0;
+let is i64 as msr_value with mut = 0;
+
+fn wrmsr(msr as i64, val as i64) as void {
+    msr_id = msr;
+    msr_value = val;
+    asm("lea rax, [rip+_kernel_syscall_cst_msr_value]\n");
+    asm("mov rax, QWORD PTR [rax]\n");
+    asm("mov rdx, rax\n");
+    asm("shr rdx, 32\n");
+    asm("lea rbx, [rip+_kernel_syscall_cst_msr_id]\n");
+    asm("mov ecx, DWORD PTR [rbx]\n");
+    asm(".byte 0x0F, 0x30\n");       // wrmsr
+}
+
+fn rdmsr(msr as i64) as i64 {
+    msr_id = msr;
+    asm("lea rbx, [rip+_kernel_syscall_cst_msr_id]\n");
+    asm("mov ecx, DWORD PTR [rbx]\n");
+    asm(".byte 0x0F, 0x32\n");       // rdmsr — eax = low, edx = high
+    asm("shl rdx, 32\n");
+    asm("or rax, rdx\n");
+    asm("lea rbx, [rip+_kernel_syscall_cst_msr_value]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    return msr_value;
+}
+
+// ============================================================
+// Dispatch table — placeholder until the syscall shape is locked
+// in. Each entry: a function that takes 6 i64 args (rdi..r9 in
+// dispatch order) and returns an i64. Out-of-range numbers return
+// -ENOSYS (=-38 in Linux). The skeleton hosts a single test
+// syscall (#0) so we can prove user → kernel → user round-trip.
+// ============================================================
+
+let is i64 as MAX_SYSCALL = 256;
+let is [256]i64 as syscall_table;
+
+fn sys_test(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    serial.print("syscall.test: a=", 16);
+    util.print_num(a);
+    serial.print(" b=", 3);
+    util.print_num(b);
+    serial.println("", 0);
+    return a + b;
+}
+
+// Called from the asm entry stub. nr is the syscall number (rax on
+// entry); a..f are the user arg registers in System V order.
+fn dispatch(nr as i64, a as i64, b as i64, c as i64,
+            d as i64, e as i64, f as i64) as i64 {
+    if (nr < 0) { return cast(i64, 0 - 38); }
+    if (nr >= MAX_SYSCALL) { return cast(i64, 0 - 38); }
+    let is *i64 as tbl = cast(*i64, &syscall_table);
+    let is i64 as h = tbl[nr];
+    if (h == 0) { return cast(i64, 0 - 38); }
+    let is fn(i64,i64,i64,i64,i64,i64) as i64 as fp =
+        cast(fn(i64,i64,i64,i64,i64,i64) as i64, h);
+    return call(fp, a, b, c, d, e, f);
+}
+
+// ============================================================
+// Entry stub. Reached via SYSCALL from ring 3.
+//
+// State at entry (per Intel SDM §6.5):
+//   rcx        ← saved user RIP
+//   r11        ← saved user RFLAGS
+//   CS         ← STAR[47:32]    (kernel CS = 0x08)
+//   SS         ← STAR[47:32]+8  (kernel SS = 0x10)
+//   IF         ← 0 (FMASK cleared it)
+//   rsp        ← STILL the user rsp — we have to switch
+//   GS_BASE    ← unchanged (we don't swapgs; user code is
+//                 contractually forbidden from touching gs until
+//                 a future TLS pass adds the swapgs convention)
+//
+// Save user rsp into per-cpu slot, swap to kernel kstack from the
+// per-cpu mirror sched maintains, push the registers Linux dispatch
+// preserves, marshal args (r10 → rcx for the System V dispatch),
+// call dispatch, then unwind.
+// ============================================================
+
+fn syscall_entry() as void {
+    // Stash user rsp + load kernel kstack via gs.
+    // syscall_user_rsp is at PerCpu offset 0x88, syscall_kstack at 0x90.
+    asm(".byte 0x65, 0x48, 0x89, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00\n");  // mov gs:[0x88], rsp
+    asm(".byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x90, 0x00, 0x00, 0x00\n");  // mov rsp, gs:[0x90]
+
+    // Save user-visible regs the kernel needs preserved across
+    // sysretq. rcx and r11 are the SYSCALL/SYSRET register pair —
+    // sysretq pops them back, so push them first. The remaining
+    // pushes are caller-saved per System V; Caustic-emitted code
+    // from `dispatch` saves callee-saved on its own.
+    asm("push rcx\n");                   // user RIP
+    asm("push r11\n");                   // user RFLAGS
+    asm("push rbx\n");
+    asm("push rbp\n");
+    asm("push r12\n");
+    asm("push r13\n");
+    asm("push r14\n");
+    asm("push r15\n");
+
+    // Reenable interrupts now that we're on the kernel stack with
+    // a coherent saved-regs frame.
+    asm(".byte 0xFB\n");                 // sti
+
+    // Marshal args. SYSCALL ABI (Linux-style):
+    //     rax=nr  rdi=a  rsi=b  rdx=c  r10=d  r8=e  r9=f
+    // Dispatch is fn(nr, a, b, c, d, e, f) which System V passes as:
+    //     rdi=nr  rsi=a  rdx=b  rcx=c  r8=d  r9=e  [rsp]=f
+    // Shuffle so we never read a register after we've overwritten it.
+    asm("push r9\n");                    // f → stack arg
+    asm("mov r9,  r8\n");                // r9 ← e
+    asm("mov r8,  r10\n");               // r8 ← d
+    asm("mov rcx, rdx\n");               // rcx ← c
+    asm("mov rdx, rsi\n");               // rdx ← b
+    asm("mov rsi, rdi\n");               // rsi ← a
+    asm("mov rdi, rax\n");               // rdi ← nr
+    asm("call _kernel_syscall_cst_dispatch\n");
+    asm("add rsp, 8\n");                 // drop the pushed f
+
+    // dispatch returned in rax. That's the user's rax on sysretq.
+    asm(".byte 0xFA\n");                 // cli (disable IRQs across the unwind)
+
+    asm("pop r15\n");
+    asm("pop r14\n");
+    asm("pop r13\n");
+    asm("pop r12\n");
+    asm("pop rbp\n");
+    asm("pop rbx\n");
+    asm("pop r11\n");                    // user RFLAGS
+    asm("pop rcx\n");                    // user RIP
+
+    // Restore user rsp from the per-cpu shuttle and sysretq.
+    asm(".byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00\n");  // mov rsp, gs:[0x88]
+    asm(".byte 0x48, 0x0F, 0x07\n");     // sysretq (caustic-as drops the mnemonic)
+}
+
+// ============================================================
+// init() — run on each cpu. wrmsr is per-cpu state.
+// ============================================================
+
+fn init() as void {
+    // Caustic miscompiles `arr[i] = fn_ptr(...)` for module-level
+    // i64 arrays; the address computation lands on the wrong slot
+    // and the fn_ptr write smashes whatever heap-tagged page sits
+    // nearby, producing a delayed "kfree: bad usage" panic. Going
+    // through an explicit *i64 cast generates a clean lea + mov
+    // sequence and avoids the bug.
+    let is *i64 as tbl = cast(*i64, &syscall_table);
+    tbl[0] = cast(i64, fn_ptr(sys_test));
+    let is i64 as i with mut = 1;
+    while (i < MAX_SYSCALL) { tbl[i] = 0; i = i + 1; }
+
+    init_per_cpu();
+    serial.println("syscall: ready", 14);
+}
+
+// Per-cpu MSR setup. Called by BSP from init() and by every AP from
+// ap_start before they go into the scheduler.
+fn init_per_cpu() as void {
+    syscall_entry_addr = cast(i64, fn_ptr(syscall_entry));
+
+    // EFER |= SCE
+    let is i64 as efer = rdmsr(IA32_EFER);
+    wrmsr(IA32_EFER, efer | EFER_SCE);
+
+    // STAR — selectors
+    wrmsr(IA32_STAR, STAR_VALUE);
+
+    // LSTAR — entry RIP
+    wrmsr(IA32_LSTAR, syscall_entry_addr);
+
+    // FMASK — RFLAGS bits to clear on entry
+    wrmsr(IA32_FMASK, FMASK_VALUE);
+}
