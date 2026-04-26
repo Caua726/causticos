@@ -58,7 +58,9 @@ struct IrqBinding {
     kind as i64;
     handler as fn(*Hardware, *u8) as i32;
     context as *u8;
-    next as *IrqBinding;
+    dev as *Hardware;
+    next as *IrqBinding;             // per-device list (dev.irq_list)
+    chain_next as *IrqBinding;       // per-vector dispatch chain
 }
 
 struct DmaBuffer {
@@ -477,25 +479,23 @@ fn dma_free(dev as *Hardware, buffer as *DmaBuffer) as void {
     sched.preempt_enable();
 }
 
-// IRQ dispatch tables — one slot per 256 vectors. Lookup is O(1) from the
-// asm stub. Entry is (device, handler, context) triple. Null handler means
-// no driver registered for that vector. Declared as [256]i64 (not
-// [2048]u8) so access is naturally 8-byte aligned without relying on
-// Caustic's global-array alignment guarantees.
-let is [256]i64 as irq_handler_tbl_raw;
-let is [256]i64 as irq_hardware_tbl_raw;
-let is [256]i64 as irq_context_tbl_raw;
+// Per-vector dispatch chain. Each vector slot holds the head of a
+// chain of IrqBinding nodes (one per registered handler). Multiple
+// devices on a shared PCI line all map to the same IOAPIC vector —
+// the chain walk gives every handler a chance to ack its device.
+//
+// Declared as [256]i64 of pointer-shaped slots so accesses are
+// 8-byte aligned without relying on Caustic's global-array
+// alignment guarantees.
+let is [256]i64 as irq_chain_head;
 
-// IRQ table lock. driver_irq_dispatch reads the table from IRQ
-// context; irq_register / irq_unregister mutate it from thread
-// context. Without a lock a thread-context write could tear across
-// a concurrent IRQ-context read and hand the dispatcher a handler
-// pointer mismatched with its hardware/context (observed in
-// practice as #GP at garbage RIP — the handler fn_ptr slot is read
-// while the writer is still in-flight). acquire_irq disables IRQs
-// on the local cpu so the dispatch can't reentrantly take the
-// lock; cross-cpu dispatch still serialises through the ticket
-// lock.
+// IRQ table lock. driver_irq_dispatch reads the chain head from IRQ
+// context; irq_register / irq_unregister mutate the chain from
+// thread context. Without a lock a thread-context write could tear
+// across a concurrent IRQ-context read and hand the dispatcher a
+// half-linked node. acquire_irq disables IRQs on the local cpu so
+// the dispatch can't reentrantly take the lock; cross-cpu dispatch
+// still serialises through the ticket lock.
 let is lock.TicketLock as irq_tbl_lock with mut;
 
 fn irq_tbl_get(base as *i64, v as i64) as i64 {
@@ -506,31 +506,39 @@ fn irq_tbl_set(base as *i64, v as i64, val as i64) as void {
     base[v] = val;
 }
 
-// Called from the asm stub with the vector number in rdi. Looks up the
-// registered handler and calls it. Emits LAPIC EOI after the handler
-// returns so that both software-triggered (int N) and LAPIC-delivered
-// interrupts are cleanly acked.
+// Called from the asm stub with the vector number in rdi. Walks the
+// chain head for `vector` and invokes every registered handler.
+// Each handler is expected to be self-aware (read its own status
+// register; bail out cheaply if the IRQ wasn't from it). EOI is
+// emitted exactly once at the end, after every chained handler has
+// run.
 fn driver_irq_dispatch(vector as i64) as void {
     if (vector < 0) { return; }
     if (vector > 255) { return; }
 
-    // Plain snapshot — handlers are registered once at boot and
-    // never re-registered while the IRQ source is live, so a lock-
-    // free read is sufficient. The earlier irq_tbl_lock guard was
-    // suspected of interacting with cross-cpu schedule traffic on
-    // -smp 4 and is removed pending a precise repro.
-    let is i64 as hptr = irq_tbl_get(&irq_handler_tbl_raw[0], vector);
-
-    if (hptr == 0) {
-        // Spurious or unregistered — still EOI so the LAPIC doesn't wedge.
-        lapic.eoi();
-        return;
+    let is *IrqBinding as cur with mut =
+        cast(*IrqBinding, irq_tbl_get(&irq_chain_head[0], vector));
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur.handler) != 0) {
+            call(cur.handler, cur.dev, cur.context);
+        }
+        cur = cur.chain_next;
     }
-    let is i64 as dptr = irq_tbl_get(&irq_hardware_tbl_raw[0], vector);
-    let is i64 as cptr = irq_tbl_get(&irq_context_tbl_raw[0], vector);
-    let is fn(*Hardware, *u8) as i32 as h = cast(fn(*Hardware, *u8) as i32, hptr);
-    call(h, cast(*Hardware, dptr), cast(*u8, cptr));
     lapic.eoi();
+}
+
+// True if `vector` already has at least one chained handler. The
+// spec framework uses this so two devices wired to the same hardware
+// IRQ line can share a single allocated vector — second registration
+// joins the chain instead of overwriting the IOAPIC routing.
+fn irq_vector_in_use(vector as i64) as i32 {
+    if (vector < 0) { return 0; }
+    if (vector > 255) { return 0; }
+    let is i64 as flags = lock.acquire_irq(&irq_tbl_lock);
+    let is i64 as head = irq_tbl_get(&irq_chain_head[0], vector);
+    lock.release_irq(&irq_tbl_lock, flags);
+    if (head != 0) { return 1; }
+    return 0;
 }
 
 fn irq_register(dev as *Hardware, vector as u32, kind as i32,
@@ -547,22 +555,27 @@ fn irq_register(dev as *Hardware, vector as u32, kind as i32,
     b.kind = cast(i64, kind);
     b.handler = handler;
     b.context = context;
+    b.dev = dev;
+    b.next = cast(*IrqBinding, 0);
+    b.chain_next = cast(*IrqBinding, 0);
 
     let is i64 as flags = lock.acquire_irq(&irq_tbl_lock);
-    if (irq_tbl_get(&irq_handler_tbl_raw[0], v) != 0) {
-        lock.release_irq(&irq_tbl_lock, flags);
-        heap.kfree(node_addr);
-        return ALREADY_EXISTS;
+    // Reject a *duplicate* registration from the same device on the
+    // same vector; everything else is permitted (sharing).
+    let is *IrqBinding as scan with mut =
+        cast(*IrqBinding, irq_tbl_get(&irq_chain_head[0], v));
+    while (cast(i64, scan) != 0) {
+        if (cast(i64, scan.dev) == cast(i64, dev)) {
+            lock.release_irq(&irq_tbl_lock, flags);
+            heap.kfree(node_addr);
+            return ALREADY_EXISTS;
+        }
+        scan = scan.chain_next;
     }
-    // Write hardware + context BEFORE handler: the dispatcher reads
-    // all three under the lock so ordering is moot for SMP
-    // correctness, but keeping handler last means a stale snapshot
-    // taken mid-update is simply "no handler yet" — the dispatcher's
-    // hptr==0 fast-path makes that benign even if the dispatch lock
-    // were somehow bypassed.
-    irq_tbl_set(&irq_hardware_tbl_raw[0], v, cast(i64, dev));
-    irq_tbl_set(&irq_context_tbl_raw[0],  v, cast(i64, context));
-    irq_tbl_set(&irq_handler_tbl_raw[0],  v, cast(i64, handler));
+    // Push to chain head + per-device list.
+    b.chain_next = cast(*IrqBinding,
+                        irq_tbl_get(&irq_chain_head[0], v));
+    irq_tbl_set(&irq_chain_head[0], v, cast(i64, b));
     b.next = dev.irq_list;
     dev.irq_list = b;
     lock.release_irq(&irq_tbl_lock, flags);
@@ -580,14 +593,27 @@ fn irq_unregister(dev as *Hardware, vector as u32) as void {
     let is *IrqBinding as prev with mut = cast(*IrqBinding, 0);
     while (cast(i64, cur) != 0) {
         if (cur.vector == v) {
+            // Remove from per-device list.
             if (cast(i64, prev) == 0) { dev.irq_list = cur.next; }
             else                       { prev.next = cur.next; }
-            // Zero handler first — after this any dispatch sees
-            // hptr==0 and falls through to the EOI-only path, so the
-            // dev/context slots can be cleared without racing.
-            irq_tbl_set(&irq_handler_tbl_raw[0],  v, 0);
-            irq_tbl_set(&irq_hardware_tbl_raw[0], v, 0);
-            irq_tbl_set(&irq_context_tbl_raw[0],  v, 0);
+            // Remove from per-vector chain.
+            let is *IrqBinding as ch with mut =
+                cast(*IrqBinding, irq_tbl_get(&irq_chain_head[0], v));
+            let is *IrqBinding as chp with mut = cast(*IrqBinding, 0);
+            while (cast(i64, ch) != 0) {
+                if (cast(i64, ch) == cast(i64, cur)) {
+                    if (cast(i64, chp) == 0) {
+                        irq_tbl_set(&irq_chain_head[0], v,
+                                    cast(i64, ch.chain_next));
+                    } else {
+                        chp.chain_next = ch.chain_next;
+                    }
+                    ch = cast(*IrqBinding, 0);
+                } else {
+                    chp = ch;
+                    ch = ch.chain_next;
+                }
+            }
             lock.release_irq(&irq_tbl_lock, flags);
             heap.kfree(cast(i64, cur));
             return;

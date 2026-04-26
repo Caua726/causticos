@@ -141,6 +141,40 @@ let is i64 as bindings with mut = 0;
 let is i64 as spec_count with mut = 0;
 let is i64 as binding_count with mut = 0;
 
+// Hardware-IRQ-line → CPU-vector cache. ISA / legacy PCI INTx tops
+// out at line 23 on a single-IOAPIC system; sizing the table to 256
+// covers any reasonable IOAPIC GSI window without dynamic alloc.
+// Slot value -1 == "no vector allocated for this line yet".
+let is [256]i64 as line_vector_table;
+let is i32 as line_vector_init_done with mut = 0;
+
+fn line_vector_init_lazy() as void {
+    if (line_vector_init_done == 1) { return; }
+    let is i64 as i with mut = 0;
+    while (i < 256) { line_vector_table[i] = cast(i64, 0 - 1); i = i + 1; }
+    line_vector_init_done = 1;
+}
+
+fn line_vector_lookup(line as i64) as i64 {
+    if (line < 0) { return cast(i64, 0 - 1); }
+    if (line >= 256) { return cast(i64, 0 - 1); }
+    line_vector_init_lazy();
+    return line_vector_table[line];
+}
+
+fn line_vector_store(line as i64, vector as i64) as void {
+    if (line < 0) { return; }
+    if (line >= 256) { return; }
+    line_vector_init_lazy();
+    line_vector_table[line] = vector;
+}
+
+fn line_vector_clear(line as i64) as void {
+    if (line < 0) { return; }
+    if (line >= 256) { return; }
+    line_vector_table[line] = cast(i64, 0 - 1);
+}
+
 // ============================================================
 // Spec registration (transient — Phase 2.3 replaces this with
 // linker-provided __start_cdvrspec_table iteration)
@@ -347,19 +381,47 @@ fn populate_caps(b as *Binding) as i32 {
                 line = call(hw.bus.get_irq_line, hw);
                 if (line < 0) { rollback_caps(b); return cast(i32, 0 - 6); }
             }
-            let is i64 as vector = ioapic.alloc_vector(48, 64);
+            // Two devices on the same hardware IRQ line (shared PCI
+            // INTx is the textbook case) must share a single CPU
+            // vector — the IOAPIC routes a line to exactly one
+            // vector, so allocating a fresh vector for the second
+            // device would silently overwrite the first device's
+            // routing. line_to_vector caches the mapping; the chain
+            // semantics in driver.irq_register let multiple
+            // handlers coexist on the same vector.
+            let is i64 as vector with mut = line_vector_lookup(line);
+            let is i32 as fresh_vector with mut = 0;
             if (vector < 0) {
-                serial.println("spec: CAP_IRQ alloc_vector exhausted", 35);
-                rollback_caps(b); return cast(i32, 0 - 3);
+                vector = ioapic.alloc_vector(48, 64);
+                if (vector < 0) {
+                    serial.println("spec: CAP_IRQ alloc_vector exhausted", 35);
+                    rollback_caps(b); return cast(i32, 0 - 3);
+                }
+                line_vector_store(line, vector);
+                fresh_vector = 1;
+                platform.set_irq_route(line, vector, 0);
+                serial.print("spec: irq line=", 15);
+                util.print_num(line);
+                serial.print(" -> vector=", 11);
+                util.print_num(vector);
+                serial.println("", 0);
+            } else {
+                serial.print("spec: irq line=", 15);
+                util.print_num(line);
+                serial.print(" sharing vector=", 16);
+                util.print_num(vector);
+                serial.println("", 0);
             }
-            platform.set_irq_route(line, vector, 0);
             if (cast(i64, s.on_irq) != 0) {
                 let is i32 as irc = driver.irq_register(hw, cast(u32, vector),
                                                         cast(i32, 0),
                                                         s.on_irq,
                                                         cast(*u8, b));
                 if (irc != driver.OK) {
-                    ioapic.release_vector(vector);
+                    if (fresh_vector == 1) {
+                        line_vector_clear(line);
+                        ioapic.release_vector(vector);
+                    }
                     rollback_caps(b);
                     return irc;
                 }
