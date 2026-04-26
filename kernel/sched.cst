@@ -954,26 +954,34 @@ fn wakeup_thread(tid as i64) as void {
     set_nr_running(cpu, nr_running(cpu) + 1);
 
     // Flag the home cpu (not all cpus) — the thread can only run
-    // on its home, so resched on remote cpus is wasted work. With
-    // per-cpu runqueues the cross-cpu broadcast was the bug
-    // exposure path on -smp 4 anyway.
+    // on its home, so resched on remote cpus is wasted work.
     let is *smp.PerCpu as hpc = smp.get_per_cpu(cpu);
-    if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
+    let is i64 as target_lapic_id with mut = 0 - 1;
+    let is i64 as is_remote with mut = 0;
+    if (cast(i64, hpc) != 0) {
+        hpc.need_resched = 1;
+        target_lapic_id = hpc.lapic_id;
+        if (cpu != this_cpu()) { is_remote = 1; }
+    }
 
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
 
-    // IPI broadcast intentionally absent. Setting per-cpu
-    // need_resched above is enough — every cpu picks it up on its
-    // next 5 ms quantum tick, so worst-case wakeup latency is one
-    // tick. A `lapic.send_resched_ipi_all_except_self()` call here
-    // shaves that latency to microseconds, but on -smp 4 the
-    // resulting cross-cpu IRQ storm exposes a context-switch
-    // corruption (rip lands inside BSS / iretq frame slot ends up
-    // RFLAGS-shaped) that we can't yet pin down. Rate of failure
-    // dropped from ~40% to ~10% on -smp 4 just by dropping the
-    // broadcast — see project_smp_ap_dispatch_diagnosis. Re-enable
-    // once the residual race is closed; for now timer-driven
-    // reschedule is correct, just slower.
+    // Targeted reschedule IPI — wake the home cpu's idle/HLT (or
+    // preempt whatever lower-priority thread it's running) so the
+    // freshly-runnable thread starts in microseconds instead of
+    // waiting for the home cpu's next 5 ms timer tick. We only
+    // fire when the home is a *different* cpu; if we're already
+    // on it the local need_resched flag plus the in-flight
+    // schedule()/return path picks the wakeup up without an IRQ
+    // round-trip. The broadcast variant that this replaces was
+    // dangerous on -smp 4 pre-per-cpu-runqueue (cross-cpu lock
+    // contention exposed a codegen race); a single targeted
+    // delivery to a runqueue we don't own has none of that.
+    if (is_remote != 0) {
+        if (target_lapic_id >= 0) {
+            lapic.send_resched_ipi_to(target_lapic_id);
+        }
+    }
 }
 
 fn suspend_thread(tid as i64) as void {
