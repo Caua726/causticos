@@ -26,6 +26,7 @@ for i in $(seq 1 "$RUNS"); do
     -cdrom build/causticos.iso -m 128M -machine q35 \
     -drive id=disk,file=build/disk.img,if=none,format=raw \
     -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
+    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
     -boot d -serial stdio -display none -no-reboot -smp "$SMP" \
     > "$TMPLOG" 2>&1 &
   QPID=$!

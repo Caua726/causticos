@@ -70,6 +70,8 @@ qemu-system-x86_64 \
     -drive id=disk,file=build/disk.img,if=none,format=raw \
     -device ahci,id=ahci \
     -device ide-hd,drive=disk,bus=ahci.0 \
+    -netdev user,id=net0 \
+    -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
     -boot d \
     -serial stdio \
     -display none \
