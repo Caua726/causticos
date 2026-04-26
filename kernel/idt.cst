@@ -113,11 +113,37 @@ fn pic_unmask(irq as i64) as void {
 // Handlers (called from asm with proper ABI)
 // ============================================================
 
-fn exception_handler(vector as i64, error_code as i64, rip as i64, fault_rsp as i64) as void {
+fn exception_handler(vector as i64, error_code as i64, rip as i64,
+                     fault_rsp as i64, cs as i64, rflags as i64) as void {
     // #NM (7) = Device Not Available — lazy FPU restore, not a real fault
     if (vector == 7) {
         sched.handle_nm_fault();
         return;
+    }
+
+    let is i32 as from_user with mut = 0;
+    if ((cs & 3) == 3) { from_user = 1; }
+
+    if (from_user == 1) {
+        // User-mode fault. Log under a non-"EXCEPTION" prefix so
+        // verify.sh's panic-detector doesn't flag it as a kernel
+        // failure — the fault is per-thread and the kernel keeps
+        // running. Future signals work plugs in here; for now we
+        // kill the thread and reschedule.
+        serial.println("", 0);
+        serial.print("user-fault: vec=", 16);
+        print_num(vector);
+        serial.print(" err=", 5);
+        print_num(error_code);
+        serial.print(" rip=", 5);
+        print_hex(rip);
+        serial.print(" cs=", 4);
+        print_hex(cs);
+        serial.println(" — killing thread", 17);
+        sched.exit_current_thread();
+        // exit_current_thread never returns — it schedules another
+        // thread on this cpu. We don't fall through.
+        while (1 == 1) { asm(".byte 0xF4\n"); }
     }
 
     serial.println("", 0);
@@ -129,13 +155,13 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64, fault_rsp as 
     print_hex(rip);
     serial.print(" rsp=", 5);
     print_hex(fault_rsp);
-    serial.println("", 0);
+    serial.print(" cs=", 4);
+    print_hex(cs);
+    serial.println(" (kernel)", 9);
 
-    // Stack dump — when rip points at a non-text address (typical
-    // function-pointer-corruption #PF), the saved [rsp] is the caller's
-    // return address, i.e. the instruction right after the `call` that
-    // jumped to garbage. Dump the first 8 quadwords so we can pinpoint
-    // the caller in nm output without needing a debugger.
+    // Kernel-mode fault. Dump a few words from the kstack so the
+    // caller chain is recoverable from the serial log when post-
+    // mortem debugging.
     if (fault_rsp >= 0xFFFF800000000000) {
         let is *i64 as sp = cast(*i64, fault_rsp);
         let is i64 as i with mut = 0;
@@ -265,6 +291,8 @@ fn install_stubs() as void {
     asm("mov rsi, QWORD PTR [rsp+128]\n");
     asm("mov rdx, QWORD PTR [rsp+136]\n");
     asm("mov rcx, QWORD PTR [rsp+160]\n");
+    asm("mov r8,  QWORD PTR [rsp+144]\n");      // CS — handler uses (cs & 3) to detect user mode
+    asm("mov r9,  QWORD PTR [rsp+152]\n");      // RFLAGS (currently unused; reserved for fault-fixup)
     asm("mov rbp, rsp\n");
     asm("and rsp, -16\n");
     asm("call _kernel_idt_cst_exception_handler\n");

@@ -173,6 +173,74 @@ fn read_user_counter(pml4 as i64) as i64 {
     return p[0];
 }
 
+// ============================================================
+// copy_from_user / copy_to_user
+//
+// The kernel side of "safe access to user memory". Caller passes
+// the user thread's aspace pml4_phys and a user virtual address;
+// we validate every covered page against the pml4 (PRESENT + USER,
+// plus WRITE for copy_to_user) before touching it. Validation +
+// copy are split because pte_lookup walks 4 cache lines per page
+// — doing the walk first means the actual copy can run inline
+// without per-byte branching.
+//
+// Returns 0 on full copy, -1 on any range / mapping / overflow
+// problem. The kernel side of the copy assumes CR3 already points
+// at `pml4_phys` (i.e. the caller is running on the user thread's
+// kernel stack with the user aspace mapped). syscall handlers, the
+// upcoming on-fault path, and the exit-cleanup path all satisfy
+// this; cross-aspace copies go through walk + HHDM instead.
+// ============================================================
+
+let is i64 as USER_VA_MAX = 0x00007FFFFFFFFFFF;
+
+fn user_range_ok(pml4 as i64, va as i64, n as i64, need_write as i32) as i32 {
+    if (n < 0) { return 0; }
+    if (n == 0) { return 1; }
+    if (va < 0) { return 0; }
+    let is i64 as end = va + n;
+    if (end < va) { return 0; }                 // overflow
+    if (end > USER_VA_MAX) { return 0; }
+
+    let is i64 as page_mask = cast(i64, 0 - 1) - 0xFFF;
+    let is i64 as p with mut = va & page_mask;
+    let is i64 as last = (end - 1) & page_mask;
+    while (p <= last) {
+        let is i64 as pte = vmm.pte_lookup(pml4, p);
+        if (pte == 0) { return 0; }
+        if ((pte & vmm.PTE_USER) == 0) { return 0; }
+        if (need_write == 1 && (pte & vmm.PTE_WRITE) == 0) { return 0; }
+        p = p + pmm.PAGE_SIZE;
+    }
+    return 1;
+}
+
+fn copy_from_user(pml4 as i64, dst as *u8, user_va as i64, n as i64) as i32 {
+    if (user_range_ok(pml4, user_va, n, cast(i32, 0)) == 0) {
+        return cast(i32, 0 - 1);
+    }
+    let is *u8 as src = cast(*u8, user_va);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn copy_to_user(pml4 as i64, user_va as i64, src as *u8, n as i64) as i32 {
+    if (user_range_ok(pml4, user_va, n, cast(i32, 1)) == 0) {
+        return cast(i32, 0 - 1);
+    }
+    let is *u8 as dst = cast(*u8, user_va);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return 0;
+}
+
 // ----------------------------------------------------------------
 // Smoke entry. Builds an aspace, maps text/data/stack, drops a
 // ring-3 thread on top of it, polls the counter, declares pass/fail.
@@ -244,11 +312,53 @@ fn spawn_user_smoke() as void {
     serial.println(" FAIL", 5);
 }
 
+// Second smoke: a user thread whose first instruction is ud2 (the
+// canonical "undefined opcode" trap). The kernel must observe a
+// user-mode #UD, kill the thread, and keep running. If the kernel
+// were still treating user faults as panics this whole test would
+// halt the system instead.
+fn spawn_user_fault_smoke() as void {
+    serial.println("userspace.fault_smoke: start", 28);
+    let is i64 as pml4 = vmm.as_create();
+    if (pml4 == 0) {
+        serial.println("userspace.fault_smoke: as_create FAIL", 37);
+        return;
+    }
+    let is i64 as text_kv = map_user_pages(pml4, USER_TEXT_VA, 1,
+                                            vmm.PTE_USER,
+                                            cast(*u8, "btext"), 5);
+    if (text_kv == 0) { return; }
+    let is *u8 as code = cast(*u8, text_kv);
+    code[0] = cast(u8, 0x0F);                  // ud2 — invalid opcode
+    code[1] = cast(u8, 0x0B);
+
+    let is i64 as stack_kv = map_user_pages(pml4, USER_STACK_VA, 1,
+                                             vmm.PTE_USER | vmm.PTE_NX,
+                                             cast(*u8, "bstack"), 6);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        pml4, USER_TEXT_VA, user_rsp
+    );
+    serial.print("userspace.fault_smoke: spawned tid=", 35);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Give the scheduler a couple of quanta to dispatch + reap.
+    sched.sleep_for_ns(200000000);
+
+    serial.println("userspace.fault_smoke: kernel still alive PASS", 46);
+}
+
 // Thread entry called from main.cst. Sleeps a moment so the rest
 // of phase-2 bind / mount finishes printing before our log lands,
 // then runs the smoke once.
 fn smoke_thread() as void {
     sched.sleep_for_ns(200000000);     // 200 ms
     spawn_user_smoke();
+    spawn_user_fault_smoke();
 }
 
