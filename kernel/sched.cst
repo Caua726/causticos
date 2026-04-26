@@ -114,7 +114,8 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 248  process_ptr      i64   (ptr to owning Process)
 // 256  home_cpu         i64   (cpu owning this thread's runqueue)
 // 264  last_run_ns      i64   (monotonic when this thread last started running)
-// 272  reserved         112 bytes
+// 272  sleep_until_ns   i64   (timer-driven wakeup deadline; 0 = no auto-wake)
+// 280  reserved         104 bytes
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
@@ -265,6 +266,7 @@ fn thr_dl_abs_dl(tid as i64) as i64     { return thr_get(tid, 176); }
 fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
 fn thr_home_cpu(tid as i64) as i64      { return thr_get(tid, 256); }
 fn thr_last_run_ns(tid as i64) as i64   { return thr_get(tid, 264); }
+fn thr_sleep_until_ns(tid as i64) as i64 { return thr_get(tid, 272); }
 
 // ============================================================
 // Per-band data
@@ -920,6 +922,81 @@ fn create_thread(entry as i64, band as i64) as i64 {
 // Sleep / Wakeup (§5.4)
 // ============================================================
 
+// Per-cpu count of threads currently sleeping with a wake deadline.
+// Lets on_timer_tick skip the per-thread scan entirely on cpus that
+// have no time-driven sleepers — most ticks. Bumped under the home
+// cpu's sched_lock by sleep_for_ns; decremented by tick_wake when a
+// timed sleep fires (and by wakeup_thread if a manual wakeup arrives
+// while sleep_until_ns > 0).
+let is [128]u8 as cpu_timed_sleepers;   // 16 cpus * i64
+
+fn timed_sleepers_get(cpu as i64) as i64 {
+    let is *i64 as p = cast(*i64, &cpu_timed_sleepers);
+    return p[cpu];
+}
+
+fn timed_sleepers_set(cpu as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, &cpu_timed_sleepers);
+    p[cpu] = v;
+}
+
+// sleep_for_ns: park the current thread until at least `ns` from
+// now. Replaces the yield-loop pattern that vfs.self_test_thread
+// and fat32.mount_thread used to use — yielding within QOS_ACTIVE
+// keeps re-picking the same thread (because pick_next walks bands
+// in order and the yielder is the only ACTIVE thread on its cpu),
+// which starves the QOS_NORMAL test threads sharing the same cpu.
+// A real sleep transitions the thread to SLEEPING, drops it from
+// the runqueue, and lets pick_next fall through to lower bands.
+// The timer tick on the thread's home cpu wakes it once its
+// deadline passes.
+fn sleep_for_ns(ns as i64) as void {
+    if (ns <= 0) { yield_cpu(); return; }
+    let is i64 as tid = current_tid();
+    if (tid < 0) { return; }
+    let is i64 as cpu = thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    if (thr_state(tid) != THREAD_RUNNING) {
+        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        return;
+    }
+    let is i64 as wake_at = timer.current_time_ns() + ns;
+    thr_set(tid, 272, wake_at);                              // sleep_until_ns
+    thr_set(tid, 8, THREAD_SLEEPING);
+    set_nr_running(cpu, nr_running(cpu) - 1);
+    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
+    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    schedule();
+}
+
+// Called from on_timer_tick on each cpu. Walks threads homed on
+// this cpu that are SLEEPING with a non-zero sleep_until_ns; wakes
+// any whose deadline has passed. Cheap fast path: the
+// timed_sleepers counter lets us skip the walk entirely when no
+// thread on this cpu is in a timed sleep (the common case).
+fn tick_wake(cpu as i64, now as i64) as void {
+    if (timed_sleepers_get(cpu) <= 0) { return; }
+    let is i64 as ntid with mut = next_tid;
+    let is i64 as tid with mut = 0;
+    while (tid < ntid) {
+        if (thread_ptr(tid) != 0) {
+            if (thr_home_cpu(tid) == cpu) {
+                if (thr_state(tid) == THREAD_SLEEPING) {
+                    let is i64 as wake_at = thr_sleep_until_ns(tid);
+                    if (wake_at > 0) {
+                        if (now >= wake_at) {
+                            thr_set(tid, 272, 0);   // clear deadline
+                            timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
+                            wakeup_thread(tid);
+                        }
+                    }
+                }
+            }
+        }
+        tid = tid + 1;
+    }
+}
+
 fn sleep_thread(tid as i64) as void {
     let is i64 as cpu = thr_home_cpu(tid);
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
@@ -953,6 +1030,14 @@ fn wakeup_thread(tid as i64) as void {
     if (thr_state(tid) != THREAD_SLEEPING) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
+    }
+
+    // If this thread had a timed sleep pending, clear it and
+    // decrement the cpu's timed-sleeper count so on_timer_tick's
+    // fast path can skip the per-thread scan again.
+    if (thr_sleep_until_ns(tid) > 0) {
+        thr_set(tid, 272, 0);
+        timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
     }
 
     let is i64 as band = thr_band(tid);
@@ -1282,6 +1367,10 @@ fn on_timer_tick() as void {
     // Heartbeat for the watchdog — every cpu's timer tick stamps
     // its own slot. BSP additionally polls for stalled cpus below.
     heartbeat_set(cpu, now);
+
+    // Wake any timed-sleep threads on this cpu whose deadline
+    // has passed (no-op when no timed sleeper is registered).
+    tick_wake(cpu, now);
 
     if (cpu == smp.get_bsp_cpu_id()) {
         watchdog_check();
