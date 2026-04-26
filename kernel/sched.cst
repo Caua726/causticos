@@ -274,6 +274,10 @@ fn thr_sleep_until_ns(tid as i64) as i64 { return thr_get(tid, 272); }
 // pml4_phys handed back by vmm.as_create. Read on every context
 // switch — if it differs from the cpu's current CR3, we reload.
 fn thr_aspace_pml4(tid as i64) as i64   { return thr_get(tid, 280); }
+// User entry / stack — meaningful only for user threads. The kernel
+// trampoline reads these on first dispatch and IRETQs to ring 3.
+fn thr_user_entry(tid as i64) as i64    { return thr_get(tid, 288); }
+fn thr_user_rsp(tid as i64) as i64      { return thr_get(tid, 296); }
 
 // ============================================================
 // Per-band data
@@ -920,6 +924,98 @@ fn create_thread(entry as i64, band as i64) as i64 {
     // Tell the home cpu it has new work so it preempts on next
     // tick — no IPI needed, the per-cpu need_resched flag is
     // visible the next time that cpu enters its scheduler.
+    let is *smp.PerCpu as hpc = smp.get_per_cpu(home_cpu);
+    if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
+
+    lock.release_irq(sched_lock_ptr(home_cpu), saved_flags);
+    return tid;
+}
+
+// Create a thread that will iretq into ring 3 once dispatched. Same
+// shape as create_thread but populates aspace_pml4 / user_entry /
+// user_rsp under the same sched_lock so the home cpu's pick_next
+// can't observe the thread before its user context is in place.
+//
+// `kentry` is the kernel-side trampoline (typically
+// userspace.user_thread_trampoline) that reads thr_user_entry /
+// thr_user_rsp and runs the iretq.
+fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
+                      user_entry as i64, user_rsp as i64) as i64 {
+    let is i64 as cpus = smp.get_cpu_count();
+    let is i64 as home_cpu with mut = next_placement_cpu;
+    if (home_cpu >= cpus) { home_cpu = 0; }
+    next_placement_cpu = home_cpu + 1;
+    if (next_placement_cpu >= cpus) { next_placement_cpu = 0; }
+
+    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(home_cpu));
+
+    let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
+    let is i64 as tid = next_tid;
+
+    let is i64 as tptr with mut = 0;
+    if (thread_cache != 0) {
+        tptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
+    } else {
+        tptr = heap.kmalloc(THREAD_SIZE, pmm.ALLOC_ZERO);
+    }
+    if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
+    tid_set_ptr(tid, tptr);
+    next_tid = tid + 1;
+    lock.release_irq(&tid_lock, tid_flags);
+
+    let is *u8 as tp = cast(*u8, tptr);
+    let is i64 as z with mut = 0;
+    while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
+
+    let is i32 as stack_pfn = pmm.alloc_pages(
+        pmm.ZONE_DMA32, pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        cast(i32, 1), pmm.USAGE_KERNEL, cast(i32, 0)
+    );
+    if (stack_pfn == pmm.PFN_NONE) { pmm.panic("ustack alloc fail", 17); }
+
+    let is i64 as stack_base = pmm.phys_to_virt(pmm.pfn_to_phys(stack_pfn));
+    let is i64 as stack_top = stack_base + KSTACK_SIZE;
+
+    let is *i64 as sf = cast(*i64, stack_top - 56);
+    asm("lea rax, [rip+_kernel_sched_cst_thread_entry_trampoline]\n");
+    asm("lea rbx, [rip+_kernel_sched_cst_switch_rsp]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+    sf[0] = switch_rsp;
+    sf[1] = 0; sf[2] = 0; sf[3] = 0; sf[4] = 0; sf[5] = 0; sf[6] = 0;
+
+    let is i64 as fpu_addr = heap.kmalloc(FPU_STATE_SIZE, pmm.ALLOC_ZERO);
+
+    let is i64 as w = band_weight(band);
+    let is i64 as mvrt = band_min_vruntime(home_cpu, band);
+    let is i64 as vd = mvrt + (DEFAULT_SLICE_NS * BASE_WEIGHT / w);
+    let is i64 as now = timer.current_time_ns();
+
+    thr_set(tid, 0, tid);
+    thr_set(tid, 8, THREAD_RUNNABLE);
+    thr_set(tid, 16, SCHED_CLASS_QOS);
+    thr_set(tid, 24, band);
+    thr_set(tid, 32, w);
+    thr_set(tid, 40, DEFAULT_SLICE_NS);
+    thr_set(tid, 48, mvrt);
+    thr_set(tid, 56, vd);
+    thr_set(tid, 64, stack_top - 56);
+    thr_set(tid, 72, stack_base);
+    thr_set(tid, 80, kentry);
+    thr_set(tid, 96, 0 - 1);
+    thr_set(tid, 104, 0 - 1);
+    thr_set(tid, 112, 0);
+    thr_set(tid, 192, now);
+    thr_set(tid, 216, band);
+    thr_set(tid, 240, fpu_addr);
+    thr_set(tid, 256, home_cpu);
+    thr_set(tid, 280, aspace_pml4);   // user aspace
+    thr_set(tid, 288, user_entry);    // ring-3 RIP
+    thr_set(tid, 296, user_rsp);      // ring-3 RSP
+
+    runlist_insert(home_cpu, band, tid);
+    set_nr_running(home_cpu, nr_running(home_cpu) + 1);
+    thread_count = thread_count + 1;
+
     let is *smp.PerCpu as hpc = smp.get_per_cpu(home_cpu);
     if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
 

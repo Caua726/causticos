@@ -1,0 +1,254 @@
+// userspace.cst — ring-3 entry primitives + first-user-thread smoke.
+//
+// What this gives us, building on the gdt + per-thread aspace work:
+//
+//   - enter_user(rip, rsp): the asm sequence that flips the CPU into
+//     ring 3 via IRETQ. Pushes the (SS, RSP, RFLAGS, CS, RIP) frame
+//     in the order IRETQ pops them, then iretq.
+//   - user_thread_trampoline(): kernel-side stub installed as a
+//     thread's entry. On first dispatch it reads the thread's
+//     user_entry / user_rsp slots and calls enter_user.
+//   - spawn_user_smoke(): builds a fresh aspace, maps a couple of
+//     user pages with a tiny shellcode that increments a counter,
+//     creates a user thread pointing at it, then polls the counter
+//     to confirm the thread is making forward progress in ring 3.
+//
+// Future syscall + page-fault work will plug into the same path
+// (the trampoline / iretq frame). Nothing here depends on the
+// design-decision-loaded layers (syscall shape, IPC, etc.).
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "pmm.cst" as pmm;
+use "vmm.cst" as vmm;
+use "sched.cst" as sched;
+use "timer.cst" as timer;
+
+// User VAs the smoke uses. Anywhere in the lower half is fine; we
+// pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
+// land on the same page as something else.
+let is i64 as USER_TEXT_VA    = 0x0000000000400000;
+let is i64 as USER_DATA_VA    = 0x0000000000401000;
+let is i64 as USER_STACK_VA   = 0x0000000000600000;
+
+// Page-table flag aliases. PTE_PRESENT / PTE_WRITE / PTE_USER / PTE_NX
+// all live in vmm; we just keep this file readable by giving the
+// most-used combinations short names.
+
+// ----------------------------------------------------------------
+// Ring-3 entry asm.
+//
+// Caustic prologue clobbers rdi/rsi before any inline asm runs (it
+// stashes args to spill slots), so the iretq frame can't be built
+// directly from registers — we shuttle through module globals.
+// Concurrent enter_user calls would race on these slots, but ring-3
+// entry is rare (once per user-thread spawn) and serialised by the
+// thread doing it. If a future workload spawns user threads on
+// multiple cpus simultaneously this needs to move to per-cpu
+// storage.
+//
+// IRETQ pops in order (low → high on stack):
+//   RIP, CS, RFLAGS, RSP, SS
+//
+// We push them in the reverse order. RFLAGS = 0x202 sets IF=1 (so
+// the LAPIC timer can preempt the user thread) and the always-set
+// reserved bit 1.
+//
+// DS/ES/FS get reloaded to USER_DS_SEL (0x23) so any user code that
+// reads a segment register sees a ring-3 selector. GS is left alone:
+// loading it in 64-bit mode would clobber GSBASE (per-cpu pointer)
+// and anyway iretq doesn't pop GS.
+// ----------------------------------------------------------------
+let is i64 as enter_user_rip with mut = 0;
+let is i64 as enter_user_rsp with mut = 0;
+
+fn enter_user(rip as i64, rsp as i64) as void {
+    enter_user_rip = rip;
+    enter_user_rsp = rsp;
+
+    // Build the iretq frame. Pull rip/rsp from the shuttle globals
+    // since rdi/rsi are unreliable here. iretq with a CS DPL change
+    // also reloads SS for us, so we don't need to mov ss/ds/es/fs
+    // ourselves; the SS reload by iretq tags DS/ES/FS as null
+    // implicitly in 64-bit mode (segment regs are mostly ignored).
+    asm("mov rax, 0x23\n");      // SS  = USER_DS_SEL
+    asm("push rax\n");
+    asm("lea rax, [rip+_kernel_userspace_cst_enter_user_rsp]\n");
+    asm("mov rax, QWORD PTR [rax]\n");
+    asm("push rax\n");           // RSP (user)
+    asm("mov rax, 0x202\n");     // RFLAGS = IF | reserved
+    asm("push rax\n");
+    asm("mov rax, 0x2B\n");      // CS  = USER_CS64_SEL
+    asm("push rax\n");
+    asm("lea rax, [rip+_kernel_userspace_cst_enter_user_rip]\n");
+    asm("mov rax, QWORD PTR [rax]\n");
+    asm("push rax\n");           // RIP (user)
+    asm(".byte 0x48, 0xCF\n");   // iretq (caustic-as drops the mnemonic)
+}
+
+// First instructions of every ring-3 thread. Runs in ring 0 with
+// the thread's aspace_pml4 already loaded by the context switch,
+// then iretq's into ring 3 with the entry/rsp the spawner stashed.
+fn user_thread_trampoline() as void {
+    let is i64 as tid = sched.current_tid();
+    let is i64 as rip = sched.thr_user_entry(tid);
+    let is i64 as rsp = sched.thr_user_rsp(tid);
+    if (rip == 0) {
+        serial.println("userspace: trampoline tid has no user_entry", 44);
+        return;
+    }
+    enter_user(rip, rsp);
+}
+
+// ----------------------------------------------------------------
+// Smoke shellcode.
+//
+//   movabs rax, USER_DATA_VA   ; 48 B8 <imm64>
+//   inc qword ptr [rax]        ; 48 FF 00
+//   jmp -5                     ; EB FB
+//
+// 15 bytes total. Increments a counter at USER_DATA_VA forever.
+// Runs in ring 3 — the timer IRQ preempts it on every quantum, so
+// the counter advances in chunks of "however many `inc` opcodes
+// fit between two timer ticks" (millions on QEMU).
+// ----------------------------------------------------------------
+fn write_smoke_shellcode(dst as *u8) as i64 {
+    // movabs rax, imm64
+    dst[0]  = cast(u8, 0x48);
+    dst[1]  = cast(u8, 0xB8);
+    let is i64 as v with mut = USER_DATA_VA;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        dst[2 + i] = cast(u8, v & 0xFF);
+        v = v >> 8;
+        i = i + 1;
+    }
+    // inc qword ptr [rax]
+    dst[10] = cast(u8, 0x48);
+    dst[11] = cast(u8, 0xFF);
+    dst[12] = cast(u8, 0x00);
+    // jmp short -5 (back to the start of `inc`)
+    dst[13] = cast(u8, 0xEB);
+    dst[14] = cast(u8, 0xFB);
+    return 15;
+}
+
+// Allocate `n` zero-filled physical pages and map them into `pml4`
+// at [vaddr, vaddr+n*PAGE). flags is OR'd onto PTE_PRESENT / PTE_RW.
+// Returns the kernel-virtual base (HHDM mapping of the physical
+// page) so the caller can populate the page from kernel space —
+// every alloc here is small enough to fit in a single buddy block.
+fn map_user_pages(pml4 as i64, vaddr as i64, n as i64,
+                  flags as i64, label as *u8, label_len as i32) as i64 {
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ZONE_NORMAL,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0)
+    );
+    if (pfn == pmm.PFN_NONE) {
+        serial.print("userspace: alloc fail ", 22);
+        serial.println(label, label_len);
+        return 0;
+    }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+    let is i64 as kvirt = pmm.phys_to_virt(phys);
+    let is i64 as full = vmm.PTE_PRESENT | vmm.PTE_WRITE | flags;
+    let is i64 as rc = vmm.vmm_map_range(pml4, vaddr, phys, n, full);
+    if (rc != 0) {
+        serial.print("userspace: map fail ", 20);
+        serial.println(label, label_len);
+        return 0;
+    }
+    return kvirt;
+}
+
+// Walk the user pml4 by hand to read the current counter value. We
+// can't dereference USER_DATA_VA directly because the kernel runs
+// against kas_pml4 here, not the smoke aspace. Instead, ask vmm for
+// the physical address backing USER_DATA_VA and read it via HHDM.
+fn read_user_counter(pml4 as i64) as i64 {
+    let is i64 as phys = vmm.virt_to_phys_walk(pml4, USER_DATA_VA);
+    if (phys == 0) { return cast(i64, 0 - 1); }
+    let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+    return p[0];
+}
+
+// ----------------------------------------------------------------
+// Smoke entry. Builds an aspace, maps text/data/stack, drops a
+// ring-3 thread on top of it, polls the counter, declares pass/fail.
+// ----------------------------------------------------------------
+fn spawn_user_smoke() as void {
+    serial.println("userspace.smoke: start", 22);
+
+    let is i64 as pml4 = vmm.as_create();
+    if (pml4 == 0) {
+        serial.println("userspace.smoke: as_create FAIL", 31);
+        return;
+    }
+
+    // Text page: present, ring 3, executable (NX cleared).
+    let is i64 as text_kv = map_user_pages(pml4, USER_TEXT_VA, 1,
+                                            vmm.PTE_USER,
+                                            cast(*u8, "text"), 4);
+    if (text_kv == 0) { return; }
+    write_smoke_shellcode(cast(*u8, text_kv));
+
+    // Data page: present, ring 3, writable, NX (no exec needed).
+    let is i64 as data_kv = map_user_pages(pml4, USER_DATA_VA, 1,
+                                            vmm.PTE_USER | vmm.PTE_NX,
+                                            cast(*u8, "data"), 4);
+    if (data_kv == 0) { return; }
+    let is *i64 as cnt = cast(*i64, data_kv);
+    cnt[0] = 0;
+
+    // Stack page: present, ring 3, writable, NX. RSP starts at top
+    // of the page (stacks grow down).
+    let is i64 as stack_kv = map_user_pages(pml4, USER_STACK_VA, 1,
+                                             vmm.PTE_USER | vmm.PTE_NX,
+                                             cast(*u8, "stack"), 5);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    // Spawn the thread. QOS_NORMAL so it doesn't preempt the I/O
+    // workers that bring the rest of the system up.
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        pml4, USER_TEXT_VA, user_rsp
+    );
+
+    serial.print("userspace.smoke: spawned tid=", 29);
+    util.print_num(tid);
+    serial.print(" pml4=", 6);
+    util.print_hex(pml4);
+    serial.println("", 0);
+
+    // Poll the counter every 50 ms for up to 1 s. Real hardware will
+    // tick the counter millions of times per quantum — we just want
+    // proof the user thread is running, not a benchmark.
+    let is i64 as deadline = timer.current_time_ns() + 1000000000;
+    let is i64 as last with mut = 0;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as cur = read_user_counter(pml4);
+        if (cur > 0) {
+            serial.print("userspace.smoke: counter=", 25);
+            util.print_num(cur);
+            serial.println(" PASS", 5);
+            return;
+        }
+        last = cur;
+        sched.sleep_for_ns(50000000);
+    }
+    serial.print("userspace.smoke: counter stalled at ", 36);
+    util.print_num(last);
+    serial.println(" FAIL", 5);
+}
+
+// Thread entry called from main.cst. Sleeps a moment so the rest
+// of phase-2 bind / mount finishes printing before our log lands,
+// then runs the smoke once.
+fn smoke_thread() as void {
+    sched.sleep_for_ns(200000000);     // 200 ms
+    spawn_user_smoke();
+}
+
