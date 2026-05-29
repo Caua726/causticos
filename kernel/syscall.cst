@@ -152,78 +152,16 @@ fn dispatch(nr as i64, a as i64, b as i64, c as i64,
 // ============================================================
 // Entry stub. Reached via SYSCALL from ring 3.
 //
-// State at entry (per Intel SDM §6.5):
-//   rcx        ← saved user RIP
-//   r11        ← saved user RFLAGS
-//   CS         ← STAR[47:32]    (kernel CS = 0x08)
-//   SS         ← STAR[47:32]+8  (kernel SS = 0x10)
-//   IF         ← 0 (FMASK cleared it)
-//   rsp        ← STILL the user rsp — we have to switch
-//   GS_BASE    ← unchanged (we don't swapgs; user code is
-//                 contractually forbidden from touching gs until
-//                 a future TLS pass adds the swapgs convention)
-//
-// Save user rsp into per-cpu slot, swap to kernel kstack from the
-// per-cpu mirror sched maintains, push the registers Linux dispatch
-// preserves, marshal args (r10 → rcx for the System V dispatch),
-// call dispatch, then unwind.
+// It lives in kernel/syscall_entry.s (symbol `syscall_entry_asm`), NOT
+// here, and for a load-bearing reason: a Caustic `fn` gets a compiler
+// prologue (`push rbp; mov rbp,rsp; push rbx; sub rsp,N`) that would run
+// while rsp is STILL the user stack — shifting it before we can save it,
+// so SYSRET would hand the user a corrupted rsp. A raw-asm entry has no
+// prologue, exactly like the IDT stubs. The dispatch LOGIC stays here in
+// Caustic (`dispatch` above); the asm stub only does the naked register/
+// stack juggling and `call`s it. syscall_entry_addr_get (also in the .s)
+// returns the trampoline's address for IA32_LSTAR.
 // ============================================================
-
-fn syscall_entry() as void {
-    // Stash user rsp + load kernel kstack via gs.
-    // syscall_user_rsp is at PerCpu offset 0x88, syscall_kstack at 0x90.
-    asm(".byte 0x65, 0x48, 0x89, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00\n");  // mov gs:[0x88], rsp
-    asm(".byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x90, 0x00, 0x00, 0x00\n");  // mov rsp, gs:[0x90]
-
-    // Save user-visible regs the kernel needs preserved across
-    // sysretq. rcx and r11 are the SYSCALL/SYSRET register pair —
-    // sysretq pops them back, so push them first. The remaining
-    // pushes are caller-saved per System V; Caustic-emitted code
-    // from `dispatch` saves callee-saved on its own.
-    asm("push rcx\n");                   // user RIP
-    asm("push r11\n");                   // user RFLAGS
-    asm("push rbx\n");
-    asm("push rbp\n");
-    asm("push r12\n");
-    asm("push r13\n");
-    asm("push r14\n");
-    asm("push r15\n");
-
-    // Reenable interrupts now that we're on the kernel stack with
-    // a coherent saved-regs frame.
-    asm(".byte 0xFB\n");                 // sti
-
-    // Marshal args. SYSCALL ABI (Linux-style):
-    //     rax=nr  rdi=a  rsi=b  rdx=c  r10=d  r8=e  r9=f
-    // Dispatch is fn(nr, a, b, c, d, e, f) which System V passes as:
-    //     rdi=nr  rsi=a  rdx=b  rcx=c  r8=d  r9=e  [rsp]=f
-    // Shuffle so we never read a register after we've overwritten it.
-    asm("push r9\n");                    // f → stack arg
-    asm("mov r9,  r8\n");                // r9 ← e
-    asm("mov r8,  r10\n");               // r8 ← d
-    asm("mov rcx, rdx\n");               // rcx ← c
-    asm("mov rdx, rsi\n");               // rdx ← b
-    asm("mov rsi, rdi\n");               // rsi ← a
-    asm("mov rdi, rax\n");               // rdi ← nr
-    asm("call _kernel_syscall_cst_dispatch\n");
-    asm("add rsp, 8\n");                 // drop the pushed f
-
-    // dispatch returned in rax. That's the user's rax on sysretq.
-    asm(".byte 0xFA\n");                 // cli (disable IRQs across the unwind)
-
-    asm("pop r15\n");
-    asm("pop r14\n");
-    asm("pop r13\n");
-    asm("pop r12\n");
-    asm("pop rbp\n");
-    asm("pop rbx\n");
-    asm("pop r11\n");                    // user RFLAGS
-    asm("pop rcx\n");                    // user RIP
-
-    // Restore user rsp from the per-cpu shuttle and sysretq.
-    asm(".byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00\n");  // mov rsp, gs:[0x88]
-    asm(".byte 0x48, 0x0F, 0x07\n");     // sysretq (caustic-as drops the mnemonic)
-}
 
 // ============================================================
 // init() — run on each cpu. wrmsr is per-cpu state.
@@ -242,10 +180,19 @@ fn init() as void {
     serial.println("syscall: ready", 14);
 }
 
+// Fetch &syscall_entry_asm (the raw-asm trampoline in syscall_entry.s)
+// into syscall_entry_addr via the shuttle pattern — the symbol lives in
+// another object, so we go through inline asm rather than fn_ptr.
+fn load_entry_addr() as void {
+    asm("call syscall_entry_addr_get\n");
+    asm("lea rbx, [rip+_kernel_syscall_cst_syscall_entry_addr]\n");
+    asm("mov QWORD PTR [rbx], rax\n");
+}
+
 // Per-cpu MSR setup. Called by BSP from init() and by every AP from
 // ap_start before they go into the scheduler.
 fn init_per_cpu() as void {
-    syscall_entry_addr = cast(i64, fn_ptr(syscall_entry));
+    load_entry_addr();
 
     // EFER |= SCE
     let is i64 as efer = rdmsr(IA32_EFER);
