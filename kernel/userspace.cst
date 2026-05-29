@@ -698,60 +698,92 @@ fn spawn_user_elf_smoke() as void {
 }
 
 // ============================================================
-// Embedded test CSE — the causticos-native executable format (see
-// cse.cst / CSE_FORMAT.md). Same 7-syscall program as the test ELF, but
-// in CST_ format: 32-byte header, .text at file/vaddr offset 0x1000,
-// fixed base 0x400000, page-aligned so bss lands in the R-W region.
-//
-// Proves the CSE loader end-to-end against the real causticos ABI
-// WITHOUT needing the toolchain to emit CSE yet — when caustic-ld grows
-// a causticos-x86_64 target, its binaries load through the same path.
+// Embedded test CSE v2 — causticos-native executable format (see
+// cse.cst / CSE_FORMAT.md). Same 7-syscall program as the test ELF, in
+// the v2 CST_ container: 32B header + segment table + segment bytes.
+// Two segments: .text (R-X) @0x401000 and a R-W bss page @0x402000 for
+// the syscall results. Proves the v2 loader end-to-end against the real
+// causticos ABI, deterministically (the synthetic image never changes).
 //
 // The BSS base is held in r15 (callee-saved; arg regs are clobbered by
-// syscalls). Memory refs are r15-relative so only the movabs immediate
-// depends on the computed bss vaddr.
+// syscalls). Memory refs are r15-relative.
 //   bss+0x000  TIME_NOW_NS result    bss+0x008  GETPID result
 //   bss+0x100  KERN_INFO struct (48B)
 // ============================================================
 
-let is i64 as CSE_TEST_BASE   = 0x400000;
-let is i64 as CSE_TEST_ENTRY  = 0x401000;     // base + text_off(0x1000)
-let is i64 as CSE_TEST_BSS_VA = 0x402000;     // base + stored_size(0x2000)
-let is i64 as TEST_CSE_LEN    = 0x2000;       // stored image (page-padded)
+let is i64 as CSE_TEST_ENTRY  = 0x401000;     // seg0 (.text) vaddr
+let is i64 as CSE_TEST_BSS_VA = 0x402000;     // seg1 (R-W) vaddr
+let is i64 as CSE_TEXT_FOFF   = 0x50;         // header(0x20) + 2 segs(2*0x18)
+let is i64 as test_cse_len with mut = 0;      // total image size, set by build
 
-let is [8192]u8 as test_cse;
+let is [512]u8 as test_cse;
+
+fn write_le_u32(p as *u8, off as i64, v as i64) as void {
+    p[off + 0] = cast(u8, v & 0xFF);
+    p[off + 1] = cast(u8, (v >> 8)  & 0xFF);
+    p[off + 2] = cast(u8, (v >> 16) & 0xFF);
+    p[off + 3] = cast(u8, (v >> 24) & 0xFF);
+}
 
 fn build_test_cse() as void {
     let is *u8 as e = cast(*u8, &test_cse[0]);
     let is i64 as z with mut = 0;
-    while (z < TEST_CSE_LEN) { e[z] = cast(u8, 0); z = z + 1; }
+    while (z < 512) { e[z] = cast(u8, 0); z = z + 1; }
 
-    // ---- CST_ header (32 bytes) ----
+    // ---- header (32 bytes) ----
     e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
-    e[4]=cast(u8,1); e[5]=cast(u8,0);                       // version u16 = 1
-    e[6]=cast(u8,1);                                        // arch = 1 (x86_64)
-    e[7]=cast(u8,0);                                        // flags
-    write_le_u64(e, 0x08, CSE_TEST_ENTRY);                 // entry_point
-    e[0x10]=cast(u8,0x00); e[0x11]=cast(u8,0x10);          // text_off u32 = 0x1000
-    e[0x12]=cast(u8,0x00); e[0x13]=cast(u8,0x00);
-    // text_size @0x14 patched at the end
-    write_le_u64(e, 0x18, 0x1000);                         // bss_size = one page
+    e[4]=cast(u8,2); e[5]=cast(u8,0);                  // version u16 = 2
+    e[6]=cast(u8,1);                                   // arch = 1 (x86_64)
+    e[7]=cast(u8,0);                                   // flags
+    write_le_u64(e, 0x08, CSE_TEST_ENTRY);             // entry_point
+    write_le_u64(e, 0x10, 0x400000);                   // base_addr (informative)
+    write_le_u32(e, 0x18, 2);                          // seg_count
+    write_le_u32(e, 0x1C, 0);                          // app_version_off (none)
 
-    // ---- .text at file offset 0x1000 ----
-    let is i64 as c with mut = 0x1000;
+    // ---- seg0 @0x20: .text, R-X (perms=5) ----
+    write_le_u64(e, 0x20, CSE_TEST_ENTRY);             // vaddr
+    write_le_u32(e, 0x28, CSE_TEXT_FOFF);              // file_off
+    // file_size/mem_size @0x2C/0x30 patched once .text length is known
+    write_le_u32(e, 0x34, 5);                          // perms = R|X
 
-    // movabs r15, <bss_va>   (imm patched after we know the layout)
-    let is i64 as movabs_at = c;
+    // ---- seg1 @0x38: R-W bss page (perms=3) ----
+    write_le_u64(e, 0x38, CSE_TEST_BSS_VA);            // vaddr
+    write_le_u32(e, 0x40, 0);                          // file_off (pure bss)
+    write_le_u32(e, 0x44, 0);                          // file_size
+    write_le_u32(e, 0x48, 0x1000);                     // mem_size (one page)
+    write_le_u32(e, 0x4C, 3);                          // perms = R|W
+
+    // ---- .text at file offset CSE_TEXT_FOFF ----
+    let is i64 as c with mut = CSE_TEXT_FOFF;
+
+    // movabs r15, CSE_TEST_BSS_VA   (seg1 vaddr; fixed, no patch needed)
     e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF);
-    write_le_u64(e, c + 2, 0);
+    write_le_u64(e, c + 2, CSE_TEST_BSS_VA);
     c = c + 10;
 
-    // SYS_TIME_NOW_NS (1): mov rax,1; syscall; mov [r15], rax
-    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
-    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
-    c = c + 7;
-    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
-    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x07); c = c + 3;
+    // SYS_TIME_NOW_NS (1) — REGRESSION GUARD: driven through a call/ret
+    // so the test exercises the user stack surviving a syscall. This is
+    // the exact path the naked syscall-entry fix protects (a register-
+    // only test would not catch a regression). If the entry ever shifts
+    // the user rsp again, the `ret` in the subroutine faults and
+    // cse_smoke reports time_ok=0 / FAIL.
+    //   jmp .past   (skip the 13-byte subroutine)
+    e[c+0]=cast(u8,0xEB); e[c+1]=cast(u8,13); c = c + 2;
+    let is i64 as time_sub = c;            // .time_sub:
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,1
+    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x07); c = c + 3;  // mov [r15],rax
+    e[c+0]=cast(u8,0xC3); c = c + 1;                                    // ret
+    // .past:  call .time_sub
+    let is i64 as call_at = c;
+    let is i64 as crel = time_sub - (call_at + 5);
+    e[c+0]=cast(u8,0xE8);
+    e[c+1]=cast(u8, crel & 0xFF);
+    e[c+2]=cast(u8, (crel >> 8)  & 0xFF);
+    e[c+3]=cast(u8, (crel >> 16) & 0xFF);
+    e[c+4]=cast(u8, (crel >> 24) & 0xFF);
+    c = c + 5;
 
     // SYS_PROC_GETPID (4): mov rax,4; syscall; mov [r15+8], rax
     e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
@@ -823,27 +855,12 @@ fn build_test_cse() as void {
     e[lea_at + 5] = cast(u8, (disp >> 16) & 0xFF);
     e[lea_at + 6] = cast(u8, (disp >> 24) & 0xFF);
 
-    // Finalize the layout. text_size, page-aligned stored size, and the
-    // bss vaddr all derive from where .text ended.
-    let is i64 as text_size = c - 0x1000;
-    e[0x14] = cast(u8, text_size & 0xFF);
-    e[0x15] = cast(u8, (text_size >> 8)  & 0xFF);
-    e[0x16] = cast(u8, (text_size >> 16) & 0xFF);
-    e[0x17] = cast(u8, (text_size >> 24) & 0xFF);
-
-    let is i64 as stored = (0x1000 + text_size + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
-    let is i64 as bss_va = CSE_TEST_BASE + stored;
-    write_le_u64(e, movabs_at + 2, bss_va);
-
-    // The hardcoded smoke constants assume this exact layout. If the
-    // shellcode grows past a page the constants drift — log it.
-    if (stored != TEST_CSE_LEN || bss_va != CSE_TEST_BSS_VA) {
-        serial.print("userspace.cse_smoke: WARN layout drift stored=", 46);
-        util.print_num(stored);
-        serial.print(" bss_va=", 8);
-        util.print_hex(bss_va);
-        serial.println("", 0);
-    }
+    // Finalize: .text length goes into seg0's file_size + mem_size, and
+    // the total image size is where the bytes ended.
+    let is i64 as text_size = c - CSE_TEXT_FOFF;
+    write_le_u32(e, 0x2C, text_size);     // seg0 file_size
+    write_le_u32(e, 0x30, text_size);     // seg0 mem_size
+    test_cse_len = c;
 }
 
 fn spawn_user_cse_smoke() as void {
@@ -859,7 +876,7 @@ fn spawn_user_cse_smoke() as void {
 
     let is i64 as entry with mut = 0;
     let is i64 as user_rsp with mut = 0;
-    let is i32 as rc = cse.load_cse(a, cast(*u8, &test_cse[0]), TEST_CSE_LEN,
+    let is i32 as rc = cse.load_cse(a, cast(*u8, &test_cse[0]), test_cse_len,
                                      cast(*u8, "test"), 4,
                                      &entry, &user_rsp);
     if (rc != 0) {
