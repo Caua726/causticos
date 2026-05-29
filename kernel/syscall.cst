@@ -23,6 +23,15 @@
 use "serial.cst" as serial;
 use "util.cst" as util;
 use "smp.cst" as smp;
+use "abi.cst" as abi;
+use "timer.cst" as timer;
+// NOTE: syscall.cst does NOT `use syshandlers.cst`. Doing so closes an
+// import cycle (syscall -> syshandlers -> sched -> syscall, since
+// sched.cst uses syscall for per-cpu MSR init) that the 0.0.14 compiler
+// can't resolve and segfaults on. Composition is owned by main.cst: it
+// imports both this module and syshandlers and wires the handler table
+// after init() via dispatch_set_ptr() below. Mechanism (here) stays
+// decoupled from policy (the handlers).
 
 // ============================================================
 // MSR identifiers (see Intel SDM Vol 4 §2.20-2.22)
@@ -96,34 +105,45 @@ fn rdmsr(msr as i64) as i64 {
 }
 
 // ============================================================
-// Dispatch table — placeholder until the syscall shape is locked
-// in. Each entry: a function that takes 6 i64 args (rdi..r9 in
-// dispatch order) and returns an i64. Out-of-range numbers return
-// -ENOSYS (=-38 in Linux). The skeleton hosts a single test
-// syscall (#0) so we can prove user → kernel → user round-trip.
+// Dispatch — flat-numbered (see abi.cst). rax = i64 syscall id.
+//
+// Linux-shape on purpose: array indexed by id, no namespace bits,
+// no per-call type tags. Each handler unpacks its own args
+// statically — the dispatcher only looks up the function pointer
+// and tail-calls. A type-checked / typed-args dispatcher is what
+// every "framework-y" syscall design tries; it costs an interpreter
+// loop on the hot path and forces uniform copy_from_user policy
+// that handlers always end up overriding. Skipping it.
 // ============================================================
 
-let is i64 as MAX_SYSCALL = 256;
-let is [256]i64 as syscall_table;
+let is [64]i64 as syscall_dispatch_table;       // SYS_MAX entries
 
-fn sys_test(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
-    serial.print("syscall.test: a=", 16);
-    util.print_num(a);
-    serial.print(" b=", 3);
-    util.print_num(b);
-    serial.println("", 0);
-    return a + b;
+fn dispatch_set(nr as i64, fp as i64) as void {
+    if (nr < 0) { return; }
+    if (nr >= abi.SYS_MAX) { return; }
+    let is *i64 as t = cast(*i64, &syscall_dispatch_table);
+    t[nr] = fp;
 }
 
-// Called from the asm entry stub. nr is the syscall number (rax on
-// entry); a..f are the user arg registers in System V order.
+// Hand main.cst the address of dispatch_set so it can wire syshandlers
+// into the table without this module importing syshandlers (see the
+// import-cycle note at the top). Returned as a raw i64; the callee
+// stores it in syshandlers.install_fn_addr.
+fn dispatch_set_ptr() as i64 {
+    return cast(i64, fn_ptr(dispatch_set));
+}
+
+// Called from the asm entry stub with the user's rax in `nr` and
+// the 6 user arg registers in a..f. Out-of-range or unimplemented
+// numbers return E_NOSYS — no namespace decoding, no reserved-bit
+// check, just an array lookup.
 fn dispatch(nr as i64, a as i64, b as i64, c as i64,
             d as i64, e as i64, f as i64) as i64 {
-    if (nr < 0) { return cast(i64, 0 - 38); }
-    if (nr >= MAX_SYSCALL) { return cast(i64, 0 - 38); }
-    let is *i64 as tbl = cast(*i64, &syscall_table);
-    let is i64 as h = tbl[nr];
-    if (h == 0) { return cast(i64, 0 - 38); }
+    if (nr < 0) { return abi.E_NOSYS; }
+    if (nr >= abi.SYS_MAX) { return abi.E_NOSYS; }
+    let is *i64 as t = cast(*i64, &syscall_dispatch_table);
+    let is i64 as h = t[nr];
+    if (h == 0) { return abi.E_NOSYS; }
     let is fn(i64,i64,i64,i64,i64,i64) as i64 as fp =
         cast(fn(i64,i64,i64,i64,i64,i64) as i64, h);
     return call(fp, a, b, c, d, e, f);
@@ -210,10 +230,14 @@ fn syscall_entry() as void {
 // ============================================================
 
 fn init() as void {
-    syscall_table[0] = cast(i64, fn_ptr(sys_test));
-    let is i64 as i with mut = 1;
-    while (i < MAX_SYSCALL) { syscall_table[i] = 0; i = i + 1; }
+    let is *i64 as t = cast(*i64, &syscall_dispatch_table);
+    let is i64 as i with mut = 0;
+    while (i < abi.SYS_MAX) { t[i] = 0; i = i + 1; }
 
+    // Handler registration is done by main.cst after this returns (it
+    // owns composition and avoids the import cycle). The table is empty
+    // until then; that's fine because nothing issues a syscall between
+    // here and the userspace smoke thread, which runs much later.
     init_per_cpu();
     serial.println("syscall: ready", 14);
 }

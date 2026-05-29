@@ -1,0 +1,173 @@
+// syshandlers.cst — concrete handlers for every causticos syscall
+// number defined in abi.cst. Each handler unpacks its own args
+// statically (no generic arg-tag interpreter), does whatever
+// copy_from_user / copy_to_user it actually needs (no automatic
+// policy in the dispatcher), and returns an i64 result.
+//
+// install_all() at the bottom wires them into syscall.dispatch_table
+// via a fn-pointer indirection so the syscall ↔ syshandlers module
+// pair stays acyclic.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "abi.cst" as abi;
+use "timer.cst" as timer;
+use "sched.cst" as sched;
+use "userspace.cst" as userspace;
+
+// ============================================================
+// SYS_KERN_INFO(buf, buf_size) — fill `buf` with the static KernInfo
+// probe (see abi.cst). Userspace calls this once at startup, never per
+// call. Returns the number of bytes written (non-negative), or an errno.
+//
+//   buf_size == 0  → size probe: returns KERN_INFO_SIZE without writing,
+//                    so a caller can allocate exactly the right buffer.
+//   buf_size  > 0  → writes min(KERN_INFO_SIZE, buf_size) bytes. Copying
+//                    only what fits is the append-only contract: an old
+//                    binary with a smaller struct still gets a valid
+//                    prefix. Returns the byte count written.
+//
+// No dynamic fields here — the clock lives in SYS_TIME_NOW_NS so a cached
+// probe never goes stale.
+// ============================================================
+
+fn sys_kern_info(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as user_buf = a;
+    let is i64 as buf_size = b;
+    if (buf_size < 0) { return abi.E_INVAL; }
+    if (buf_size == 0) { return abi.KERN_INFO_SIZE; }
+
+    let is i64 as n with mut = abi.KERN_INFO_SIZE;
+    if (buf_size < n) { n = buf_size; }
+
+    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
+    let is [64]u8 as kbuf;
+    let is *u8 as p = cast(*u8, &kbuf[0]);
+    let is *i64 as q = cast(*i64, p);
+    q[0] = abi.KERN_INFO_SIZE;       // info_size
+    q[1] = abi.ABI_MAJOR;            // abi_major
+    q[2] = abi.ABI_MINOR;            // abi_minor
+    q[3] = abi.SYS_COUNT;            // syscalls_max (probe ceiling)
+    q[4] = 4096;                     // page_size
+    q[5] = 0;                        // flags (reserved)
+
+    let is i32 as rc = userspace.copy_to_user(pml4, user_buf, p, n);
+    if (rc != 0) { return abi.E_FAULT; }
+    return n;
+}
+
+// ============================================================
+// SYS_TIME_NOW_NS — monotonic ns since boot.
+// ============================================================
+
+fn sys_time_now_ns(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    return timer.current_time_ns();
+}
+
+// ============================================================
+// SYS_TIME_SLEEP_NS — block until at least `ns` from now.
+// ============================================================
+
+fn sys_time_sleep_ns(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (a < 0) { return abi.E_INVAL; }
+    sched.sleep_for_ns(a);
+    return abi.E_OK;
+}
+
+// ============================================================
+// SYS_PROC_EXIT — terminate the current thread. Never returns.
+// Future: stash exit code on the thread / process so a wait()
+// equivalent can collect it.
+// ============================================================
+
+fn sys_proc_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    serial.print("sys.proc_exit: code=", 20);
+    util.print_num(a);
+    serial.println("", 0);
+    sched.exit_current_thread();
+    return 0;
+}
+
+// ============================================================
+// SYS_PROC_GETPID — current "pid". No Process struct linkage yet,
+// so we return tid as a stand-in.
+// ============================================================
+
+fn sys_proc_getpid(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    return sched.current_tid();
+}
+
+// ============================================================
+// SYS_PROC_YIELD — voluntary preempt.
+// ============================================================
+
+fn sys_proc_yield(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    sched.yield_cpu();
+    return abi.E_OK;
+}
+
+// ============================================================
+// SYS_IO_WRITE_SERIAL — write `len` bytes from `buf` to the kernel
+// serial console. fd-less; the only "channel" we have for stdout
+// today. When we add a real fd table on top of VFS, this stays for
+// kernel-level diagnostics; userspace stdout migrates to fd 1.
+//
+// Iterates one page at a time so a 1 MiB buffer doesn't force the
+// kernel to allocate a 1 MiB staging area. No arbitrary limit at
+// the ABI level — the user can chunk if they want.
+// ============================================================
+
+let is i64 as IO_PAGE_BYTES = 4096;
+
+fn sys_io_write_serial(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as user_buf = a;
+    let is i64 as len = b;
+    if (len < 0) { return abi.E_INVAL; }
+    if (len == 0) { return 0; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
+    let is [4096]u8 as kbuf;
+    let is *u8 as kp = cast(*u8, &kbuf[0]);
+    let is i64 as written with mut = 0;
+    while (written < len) {
+        let is i64 as remaining = len - written;
+        let is i64 as chunk with mut = remaining;
+        if (chunk > IO_PAGE_BYTES) { chunk = IO_PAGE_BYTES; }
+        let is i32 as rc = userspace.copy_from_user(pml4, kp,
+                                                     user_buf + written, chunk);
+        if (rc != 0) {
+            if (written > 0) { return written; }
+            return abi.E_FAULT;
+        }
+        let is i64 as i with mut = 0;
+        while (i < chunk) {
+            serial.putc(cast(i64, kp[i]));
+            i = i + 1;
+        }
+        written = written + chunk;
+    }
+    return written;
+}
+
+// ============================================================
+// Registry — wire the implemented numbers into syscall.dispatch.
+// Adding a new syscall = append one install() line + one fn above.
+// ============================================================
+
+let is i64 as install_fn_addr with mut = 0;
+
+fn install(nr as i64, fp as i64) as void {
+    let is fn(i64,i64) as void as f =
+        cast(fn(i64,i64) as void, install_fn_addr);
+    if (cast(i64, f) == 0) { return; }
+    call(f, nr, fp);
+}
+
+fn install_all() as void {
+    install(abi.SYS_KERN_INFO,       cast(i64, fn_ptr(sys_kern_info)));
+    install(abi.SYS_TIME_NOW_NS,     cast(i64, fn_ptr(sys_time_now_ns)));
+    install(abi.SYS_TIME_SLEEP_NS,   cast(i64, fn_ptr(sys_time_sleep_ns)));
+    install(abi.SYS_PROC_EXIT,       cast(i64, fn_ptr(sys_proc_exit)));
+    install(abi.SYS_PROC_GETPID,     cast(i64, fn_ptr(sys_proc_getpid)));
+    install(abi.SYS_PROC_YIELD,      cast(i64, fn_ptr(sys_proc_yield)));
+    install(abi.SYS_IO_WRITE_SERIAL, cast(i64, fn_ptr(sys_io_write_serial)));
+}
