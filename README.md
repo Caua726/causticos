@@ -1,88 +1,95 @@
-# Causticos
+# causticos
 
-An operating system written entirely in the [Caustic](https://github.com/Caua726/Caustic) programming language. Boots via Limine into 64-bit long mode on x86_64.
+A hobby x86_64 operating system written in [Caustic](https://github.com/Caua726/Caustic), a from-scratch systems language with its own compiler, assembler, and linker. It boots under Limine and runs its own ring-3 programs.
 
-## Building
+causticos is not a Linux clone. It has its own syscall ABI — not binary-compatible with anything — and its own executable format, CSE, the *Caustic Standard Executable* (see [CSE_FORMAT.md](CSE_FORMAT.md)). The Caustic toolchain has a `causticos-x86_64` target that emits both, so a program written in Caustic, compiled to CSE, calling causticos syscalls, loads and runs:
 
-Requires the Caustic toolchain (`caustic`, `caustic-as`, `caustic-ld`, `caustic-mk`), Limine bootloader, `xorriso`, and QEMU.
-
-```sh
-caustic-mk build kernel
-caustic-mk run iso
-GDK_BACKEND=x11 qemu-system-x86_64 -cdrom build/causticos.iso -m 128M -serial file:build/serial.log
+```
+userspace.cse_smoke: PASS
+Hello from Caustic!
+sys.proc_exit: code=0
 ```
 
-## Architecture
+About 21k lines of Caustic across ~40 modules. One developer, x86_64 only.
+
+## What works
+
+- **Boot** — Limine, long mode, higher-half kernel at `0xFFFFFFFF80000000`.
+- **SMP** — AP bring-up, per-CPU state, ticket locks. Validated at `-smp 1/2/4`.
+- **Memory** — buddy physical allocator, slab/`kmalloc` heap, 4-level paging, per-address-space VMA and file-descriptor tables.
+- **Scheduler** — EEVDF across QoS bands plus a deadline class (EDF + CBS), preemptive, backed by red-black trees.
+- **Time** — PIT, LAPIC timer (calibrated against the HPET), HPET nanosecond clock. ACPI table discovery (RSDP/XSDT/MADT/MCFG/HPET) and IOAPIC routing.
+- **Drivers** — a declarative framework where devices are described in `.cdvrspec` files, over PCI, with shared-IRQ chaining.
+- **Storage** — AHCI (SATA), a FAT32 implementation (read, write, create, unlink, rename, mkdir), and a POSIX-shaped VFS on top.
+- **Network** — an e1000 NIC driver: TX/RX rings, interrupts, ARP.
+- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, a small v0 syscall ABI, and loaders for both ELF64 and CSE. It loads a real toolchain-built `.cse` and runs it to completion.
+
+## What's not there yet
+
+- The syscall ABI is 7 calls: kernel info, monotonic time, sleep, exit, getpid, yield, write-to-console. There's no file I/O, `mmap`, or process spawning from userspace — fd-based read/write, user `mmap`, and `spawn` arrive with the capability layer.
+- No IPC, no signals.
+- The NIC driver exists, but there is no TCP/IP stack.
+- No ASLR, no KPTI (single-trust for now). x86_64 only.
+
+## Requirements
+
+The Caustic toolchain (`caustic`, `caustic-as`, `caustic-ld`) on your `PATH`, plus:
+
+- [Limine](https://github.com/limine-bootloader/limine), installed under `/usr/share/limine`
+- `xorriso` and `qemu-system-x86_64`
+- `mkfs.fat`, `qemu-img`, `python3` — only to seed the test FAT32 disk
+
+## Build and run
+
+```sh
+bash scripts/run.sh            # compile, assemble, link, build the ISO, seed a disk, boot QEMU
+bash scripts/run.sh -smp 4     # trailing arguments pass straight through to QEMU
+```
+
+The serial console is wired to stdout. To run many boots without watching each one — `verify.sh` reuses the ISO, reseeds the disk per run, and kills QEMU on the success marker:
+
+```sh
+bash scripts/verify.sh 4 20    # -smp 4, 20 runs
+```
+
+> The kernel must be linked with `--strip`, or Limine page-faults it in early boot (it reads embedded section headers when they're present). `scripts/run.sh` does this; the `caustic-mk` / `Causticfile` path does not, so use the script.
+
+## Layout
 
 ```
 kernel/
-  main.cst        Entry point (_kernel_start)
-  limine.cst       Limine boot protocol (framebuffer, HHDM, memory map)
-  gdt.cst          Global Descriptor Table
-  idt.cst          IDT, PIC, exception/IRQ handlers
-  port.cst         x86 port I/O (in/out via raw opcodes)
-  serial.cst       COM1 serial debug output
-  pmm.cst          Physical Memory Manager (buddy allocator)
-  heap.cst         Slab allocator + kmalloc
-  vmm.cst          Virtual Memory Manager (paging, kvalloc, DMA)
-  timer.cst        PIT timer (early boot) + monotonic clock
-  lapic.cst        Local APIC timer (one-shot, PIT-calibrated)
-  sched.cst        Scheduler (EEVDF, deadline EDF+CBS, anti-abuse)
-  rbtree.cst       Red-black tree (used by scheduler)
-  util.cst         Shared utilities (print_num, print_hex)
-  fb.cst           Framebuffer rendering (32bpp)
-font/
-  font8x8.cst      8x8 bitmap font
+  main, limine, gdt, idt, port, serial, util, ksym, fb   boot, traps, I/O, console
+  pmm, heap, vmm, vma                                     physical / heap / virtual memory
+  sched, rbtree, smp, lock, lapic, timer, hpet           scheduling, SMP, clocks
+  acpi, ioapic                                           ACPI tables, interrupt routing
+  driver, spec, specparse, pci, io, platform_bus         declarative driver framework
+  ahci, storage, fat32, vfs                              SATA, block layer, FAT32, VFS
+  pcitest                                                e1000 NIC driver
+  syscall, syscall_entry.s, syshandlers, abi             syscall entry, dispatch, ABI
+  userspace, elf, cse, process, kbd                      ring-3 entry, ELF/CSE loaders
+font/font8x8.cst                                         8x8 bitmap font
+scripts/                                                 run.sh, verify.sh, FAT32 fixtures
+CSE_FORMAT.md                                            the CSE executable format spec
 ```
 
-## Subsystems
+The hand-written assembly (`kernel/smp_asm.s`, `kernel/syscall_entry.s`) holds the raw entry points. Anything that runs before a stack frame exists — the syscall trampoline, the SMP primitives — can't be a Caustic function, because the compiler's prologue would run on the wrong stack.
 
-### Memory Management
+## Caustic quirks
 
-- **PMM**: Buddy allocator (orders 0-10, 4KB-4MB), section-based sparse model (128 MiB sections, 12 bytes/page metadata), DMA32/NORMAL zones with reserves, IRQ-safe
-- **Heap**: Slab allocator with 14 kmalloc size classes (16-4096), kcache API for typed objects, poison + redzone debug, shrinker, slab ID recycling
-- **VMM**: 4-level x86_64 paging, deep-cloned kernel page tables, address space create/destroy/switch, kvalloc (bitmap range manager with guard pages), DMA allocator
+The assembler ignores instructions it doesn't recognize instead of erroring, so the kernel drops to raw bytes more than usual:
 
-### Scheduler
-
-- **EEVDF** within 6 QoS bands (input, render, active, normal, batch, lazy) with strict inter-band priority
-- **Deadline class** (EDF + CBS): admission test, budget enforcement, period replenishment
-- **Anti-abuse**: capability-gated bands (CAP_SCHED_INPUT, CAP_SCHED_RENDER, CAP_SCHED_REALTIME), per-thread budget measurement, demotion/promotion
-- **LAPIC timer**: one-shot mode, PIT-calibrated, program_next_tick for precise event scheduling
-- **Red-black trees** for both deadline list and per-band runqueues (O(log n))
-- **Per-CPU runqueue struct** (single CPU in V1, SMP-ready layout)
-- **Dynamic threads** via kcache + hash table TID lookup (unbounded thread count)
-- **Lazy FPU**: CR0 TS bit + #NM handler, fxsave/fxrstor
-- **Preemption**: preempt_count, cond_resched, IRQ-return preemption check
-
-### Hardware
-
-- Limine boot protocol (framebuffer, HHDM, memory map)
-- GDT with kernel code/data segments (raw opcode segment register loads)
-- IDT with 19 exception + 16 IRQ + LAPIC timer handlers
-- PIC 8259 remapping (vectors 32-47)
-- Local APIC (MMIO-mapped, timer calibration)
-- COM1 serial output (115200 8N1)
-- PS/2 keyboard (scancode via IRQ1)
-- Framebuffer text rendering (8x8 bitmap font)
-
-## Caustic Language Workarounds
-
-The Caustic assembler (`caustic-as`) silently drops several x86_64 instructions. Workarounds used throughout:
-
-| Instruction | Workaround |
+| Instruction | Encoded as |
 |---|---|
-| `mov ss/ds/es/fs/gs, ax` | `.byte 0x8E, 0xD0/D8/C0/E0/E8` |
-| `push imm8` | `.byte 0x6A, N` |
-| `lgdt/lidt/iretq/retfq` | `.byte` raw opcodes |
-| `pushfq/popfq` | `.byte 0x9C/0x9D` |
-| `cli/sti/hlt` | `.byte 0xFA/0xFB/0xF4` |
-| `in/out` | `.byte 0xEC/0xEE` |
-| `mov cr0/cr3` | `.byte 0x0F, 0x20/0x22, ...` |
-| `invlpg/clts/fxsave/fxrstor` | `.byte` sequences |
-| `imul rax, rax, imm` | Use Caustic code + global (immediate dropped) |
-| Function pointers (`&fn`) | `lea rax, [rip+symbol]` via asm |
-| `inb` return value | Global shuttle (compiler overwrites rax) |
+| `cli` / `sti` / `hlt` | `.byte 0xFA` / `0xFB` / `0xF4` |
+| `in` / `out` | `.byte 0xEC` / `0xEE` |
+| `iretq` / `sysretq` | `.byte 0x48,0xCF` / `0x48,0x0F,0x07` |
+| `mov ds/es/fs/gs, ax` | `.byte 0x8E, ...` |
+| `mov cr0/cr3, r` | `.byte 0x0F,0x22, ...` |
+| `lgdt` / `lidt` / `invlpg` / `fxsave` | `.byte` sequences |
+| `wrmsr` / `rdmsr` / `lock xadd` | `.byte` (see `kernel/smp_asm.s`) |
+| `gs:[off]` segment override | `.byte 0x65, ...` |
+
+Two structural ones worth knowing: a function used as a raw CPU entry point (LSTAR, IDT vectors) has to be hand-assembly, not a Caustic `fn`, or its prologue corrupts the incoming stack; and the compiler crashes on cyclic module imports, so module composition is pushed up to `main`.
 
 ## License
 
