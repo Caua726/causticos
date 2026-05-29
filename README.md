@@ -1,8 +1,8 @@
 # causticos
 
-A hobby x86_64 operating system written in [Caustic](https://github.com/Caua726/Caustic), a from-scratch systems language with its own compiler, assembler, and linker. It boots under Limine and runs its own ring-3 programs.
+An x86_64 operating system written in [Caustic](https://github.com/Caua726/Caustic), a from-scratch systems language with its own compiler, assembler, and linker. It boots under Limine and runs its own ring-3 programs.
 
-causticos is not a Linux clone. It has its own syscall ABI — not binary-compatible with anything — and its own executable format, CSE, the *Caustic Standard Executable* (see [CSE_FORMAT.md](CSE_FORMAT.md)). The Caustic toolchain has a `causticos-x86_64` target that emits both, so a program written in Caustic, compiled to CSE, calling causticos syscalls, loads and runs:
+causticos isn't trying to run Linux software. It has its own way for programs to reach the kernel (its own syscall ABI) and its own executable format, CSE — the *Caustic Standard Executable*. You write a program in Caustic, build it for the `causticos-x86_64` target, and the toolchain hands you a `.cse` that the kernel loads and runs directly:
 
 ```
 userspace.cse_smoke: PASS
@@ -10,7 +10,9 @@ Hello from Caustic!
 sys.proc_exit: code=0
 ```
 
-About 21k lines of Caustic across ~40 modules. One developer, x86_64 only.
+If you want the friendly version of how that works, see [docs/executables.md](docs/executables.md); the exact byte layout and syscall contract live in [CSE_FORMAT.md](CSE_FORMAT.md).
+
+Around 21k lines of Caustic across ~40 modules. x86_64 only.
 
 ## What works
 
