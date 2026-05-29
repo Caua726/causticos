@@ -26,6 +26,7 @@ use "sched.cst" as sched;
 use "timer.cst" as timer;
 use "vfs.cst" as vfs;
 use "elf.cst" as elf;
+use "cse.cst" as cse;
 use "abi.cst" as abi;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
@@ -696,6 +697,246 @@ fn spawn_user_elf_smoke() as void {
     serial.println(" FAIL", 5);
 }
 
+// ============================================================
+// Embedded test CSE — the causticos-native executable format (see
+// cse.cst / CSE_FORMAT.md). Same 7-syscall program as the test ELF, but
+// in CST_ format: 32-byte header, .text at file/vaddr offset 0x1000,
+// fixed base 0x400000, page-aligned so bss lands in the R-W region.
+//
+// Proves the CSE loader end-to-end against the real causticos ABI
+// WITHOUT needing the toolchain to emit CSE yet — when caustic-ld grows
+// a causticos-x86_64 target, its binaries load through the same path.
+//
+// The BSS base is held in r15 (callee-saved; arg regs are clobbered by
+// syscalls). Memory refs are r15-relative so only the movabs immediate
+// depends on the computed bss vaddr.
+//   bss+0x000  TIME_NOW_NS result    bss+0x008  GETPID result
+//   bss+0x100  KERN_INFO struct (48B)
+// ============================================================
+
+let is i64 as CSE_TEST_BASE   = 0x400000;
+let is i64 as CSE_TEST_ENTRY  = 0x401000;     // base + text_off(0x1000)
+let is i64 as CSE_TEST_BSS_VA = 0x402000;     // base + stored_size(0x2000)
+let is i64 as TEST_CSE_LEN    = 0x2000;       // stored image (page-padded)
+
+let is [8192]u8 as test_cse;
+
+fn build_test_cse() as void {
+    let is *u8 as e = cast(*u8, &test_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < TEST_CSE_LEN) { e[z] = cast(u8, 0); z = z + 1; }
+
+    // ---- CST_ header (32 bytes) ----
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,1); e[5]=cast(u8,0);                       // version u16 = 1
+    e[6]=cast(u8,1);                                        // arch = 1 (x86_64)
+    e[7]=cast(u8,0);                                        // flags
+    write_le_u64(e, 0x08, CSE_TEST_ENTRY);                 // entry_point
+    e[0x10]=cast(u8,0x00); e[0x11]=cast(u8,0x10);          // text_off u32 = 0x1000
+    e[0x12]=cast(u8,0x00); e[0x13]=cast(u8,0x00);
+    // text_size @0x14 patched at the end
+    write_le_u64(e, 0x18, 0x1000);                         // bss_size = one page
+
+    // ---- .text at file offset 0x1000 ----
+    let is i64 as c with mut = 0x1000;
+
+    // movabs r15, <bss_va>   (imm patched after we know the layout)
+    let is i64 as movabs_at = c;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF);
+    write_le_u64(e, c + 2, 0);
+    c = c + 10;
+
+    // SYS_TIME_NOW_NS (1): mov rax,1; syscall; mov [r15], rax
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x07); c = c + 3;
+
+    // SYS_PROC_GETPID (4): mov rax,4; syscall; mov [r15+8], rax
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,4); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x08); c = c + 4;
+
+    // SYS_KERN_INFO (0): mov rax,0; lea rdi,[r15+0x100]; mov rsi,48; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    // lea rdi, [r15 + 0x100]   = 49 8D BF 00 01 00 00
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0xBF);
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x01); e[c+5]=cast(u8,0x00); e[c+6]=cast(u8,0x00);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8, abi.KERN_INFO_SIZE & 0xFF); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    // SYS_PROC_YIELD (5): mov rax,5; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,5); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    // SYS_TIME_SLEEP_NS (2): mov rax,2; mov rdi,1000000; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,2); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC7);
+    e[c+3]=cast(u8,0x40); e[c+4]=cast(u8,0x42); e[c+5]=cast(u8,0x0F); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    // SYS_IO_WRITE_SERIAL (6): mov rax,6; lea rdi,[rip+.str]; mov rsi,6; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,6); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    let is i64 as lea_at = c;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x3D);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,6); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    // SYS_PROC_EXIT (3): mov rax,3; mov rdi,7; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC7);
+    e[c+3]=cast(u8,7); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    // .str
+    let is i64 as str_at = c;
+    e[c+0]=cast(u8,104); e[c+1]=cast(u8,101); e[c+2]=cast(u8,108);
+    e[c+3]=cast(u8,108); e[c+4]=cast(u8,111); e[c+5]=cast(u8,10);
+    c = c + 6;
+
+    // Patch the lea disp32 (rip-relative; same math as the ELF builder —
+    // disp is in vaddr space but reduces to a file-offset difference).
+    let is i64 as disp = str_at - (lea_at + 7);
+    e[lea_at + 3] = cast(u8, disp & 0xFF);
+    e[lea_at + 4] = cast(u8, (disp >> 8)  & 0xFF);
+    e[lea_at + 5] = cast(u8, (disp >> 16) & 0xFF);
+    e[lea_at + 6] = cast(u8, (disp >> 24) & 0xFF);
+
+    // Finalize the layout. text_size, page-aligned stored size, and the
+    // bss vaddr all derive from where .text ended.
+    let is i64 as text_size = c - 0x1000;
+    e[0x14] = cast(u8, text_size & 0xFF);
+    e[0x15] = cast(u8, (text_size >> 8)  & 0xFF);
+    e[0x16] = cast(u8, (text_size >> 16) & 0xFF);
+    e[0x17] = cast(u8, (text_size >> 24) & 0xFF);
+
+    let is i64 as stored = (0x1000 + text_size + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
+    let is i64 as bss_va = CSE_TEST_BASE + stored;
+    write_le_u64(e, movabs_at + 2, bss_va);
+
+    // The hardcoded smoke constants assume this exact layout. If the
+    // shellcode grows past a page the constants drift — log it.
+    if (stored != TEST_CSE_LEN || bss_va != CSE_TEST_BSS_VA) {
+        serial.print("userspace.cse_smoke: WARN layout drift stored=", 46);
+        util.print_num(stored);
+        serial.print(" bss_va=", 8);
+        util.print_hex(bss_va);
+        serial.println("", 0);
+    }
+}
+
+fn spawn_user_cse_smoke() as void {
+    serial.println("userspace.cse_smoke: start", 26);
+
+    build_test_cse();
+
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.cse_smoke: aspace FAIL", 32);
+        return;
+    }
+
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse(a, cast(*u8, &test_cse[0]), TEST_CSE_LEN,
+                                     cast(*u8, "test"), 4,
+                                     &entry, &user_rsp);
+    if (rc != 0) {
+        serial.print("userspace.cse_smoke: load_cse rc=", 33);
+        util.print_num(cast(i64, rc));
+        serial.println(" FAIL", 5);
+        return;
+    }
+
+    serial.print("userspace.cse_smoke: entry=", 27);
+    util.print_hex(entry);
+    serial.print(" rsp=", 5);
+    util.print_hex(user_rsp);
+    serial.println("", 0);
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        a.pml4_phys, entry, user_rsp
+    );
+    serial.print("userspace.cse_smoke: spawned tid=", 33);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Same validation as the ELF smoke, reading the CSE bss page.
+    let is i64 as deadline = timer.current_time_ns() + 1500000000;
+    let is i32 as time_ok with mut = 0;
+    let is i32 as exit_ok with mut = 0;
+    let is i32 as getpid_ok with mut = 0;
+    let is i32 as kinfo_ok with mut = 0;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, CSE_TEST_BSS_VA);
+        if (phys != 0) {
+            let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+            if (time_ok == 0 && p[0] != 0) {
+                serial.print("userspace.cse_smoke: time_now=", 30);
+                util.print_num(p[0]);
+                serial.println("", 0);
+                time_ok = 1;
+            }
+            if (exit_ok == 0 && sched.thr_state(tid) == sched.THREAD_DEAD) {
+                exit_ok = 1;
+                if (p[1] == tid) { getpid_ok = 1; }
+                serial.print("userspace.cse_smoke: getpid=", 28);
+                util.print_num(p[1]);
+                serial.print(" (tid=", 6);
+                util.print_num(tid);
+                serial.println(")", 1);
+                if (p[32] == abi.KERN_INFO_SIZE && p[33] == abi.ABI_MAJOR
+                    && p[34] == abi.ABI_MINOR && p[35] == abi.SYS_COUNT
+                    && p[36] == 4096 && p[37] == 0) {
+                    kinfo_ok = 1;
+                }
+                serial.print("userspace.cse_smoke: kinfo size=", 32);
+                util.print_num(p[32]);
+                serial.print(" syscalls_max=", 14);
+                util.print_num(p[35]);
+                serial.println("", 0);
+            }
+        }
+        if (time_ok == 1 && exit_ok == 1 && getpid_ok == 1 && kinfo_ok == 1) {
+            serial.println("userspace.cse_smoke: PASS", 25);
+            return;
+        }
+        sched.sleep_for_ns(20000000);
+    }
+    serial.print("userspace.cse_smoke: time_ok=", 29);
+    util.print_num(cast(i64, time_ok));
+    serial.print(" exit_ok=", 9);
+    util.print_num(cast(i64, exit_ok));
+    serial.print(" getpid_ok=", 11);
+    util.print_num(cast(i64, getpid_ok));
+    serial.print(" kinfo_ok=", 10);
+    util.print_num(cast(i64, kinfo_ok));
+    serial.println(" FAIL", 5);
+}
+
 // FD table smoke — kernel-side test of the per-aspace fd table.
 // Opens /hello.txt twice, validates fd allocation / lookup / close /
 // install semantics. Doesn't go through the (yet-unwritten) syscall
@@ -764,5 +1005,6 @@ fn smoke_thread() as void {
     spawn_user_fault_smoke();
     fd_table_smoke();
     spawn_user_elf_smoke();
+    spawn_user_cse_smoke();
 }
 

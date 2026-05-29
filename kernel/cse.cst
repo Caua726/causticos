@@ -1,0 +1,188 @@
+// cse.cst — loader for the Caustic Standard Executable (CSE / "CST").
+//
+// CSE is causticos' own executable format (the toolchain emits it for
+// the causticos-x86_64 target; see CSE_FORMAT.md). It is deliberately
+// simpler than ELF: static-only, fixed load base, no section table, no
+// relocations, no dynamic linking. The kernel only ever loads the
+// "CST image":
+//
+//   CST_ header (32 bytes, little-endian):
+//     0x00  magic         "CST_"  (43 53 54 5F)
+//     0x04  version u16    = 1
+//     0x06  arch    u8     = 1 (x86_64)
+//     0x07  flags   u8     = 0
+//     0x08  entry_point u64 absolute vaddr to jump to
+//     0x10  text_off  u32  file offset of .text (= 0x1000)
+//     0x14  text_size u32  bytes of .text
+//     0x18  bss_size  u64  zero-filled tail, not present in the file
+//
+// Load model: FIXED base 0x400000 (implicit — not in the header). The
+// image is flat: vaddr == base + file_offset for every stored byte. It
+// is NOT position-independent; relocations are already baked against the
+// base, so it MUST load at 0x400000. The producer page-aligns the end of
+// .text so the R-X / R-W split lands on a page boundary:
+//   [base, page_align(base + text_off + text_size))  = R-X (header+text)
+//   [that boundary, base + stored_size + bss_size)    = R-W (data + bss)
+// bss starts at base + stored_size and is zero-filled by the loader
+// (mmap_anon already zeroes), so there is no separate bss vaddr field.
+//
+// Two on-disk containers carry a CST image:
+//   * pure .cse        — the file IS the CST image (magic "CST_" @ 0).
+//   * polyglot .cse.exe — a PE32+ that also runs on Win/Linux; a small
+//     "CST*" mini-header at offset 0x40 points at the embedded CST body.
+// causticos-target binaries are pure .cse; the polyglot exists only for
+// cross-OS portability, which causticos binaries don't need. We handle
+// both: the pure path is canonical, the MZ path reads the @0x40 header.
+//
+// Reuses elf.cst for the byte readers, the page-copy, and the System V
+// initial-stack builder — the entry ABI is identical (argc/argv/envp/
+// auxv on the stack), only the container differs.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "vma.cst" as vma;
+use "elf.cst" as elf;
+
+// Fixed load base — baked into the image's relocations, not negotiable.
+let is i64 as CSE_BASE = 0x400000;
+
+// CST_ header field offsets.
+let is i64 as CST_OFF_MAGIC   = 0x00;
+let is i64 as CST_OFF_VERSION = 0x04;
+let is i64 as CST_OFF_ARCH    = 0x06;
+let is i64 as CST_OFF_ENTRY   = 0x08;
+let is i64 as CST_OFF_TEXTOFF = 0x10;
+let is i64 as CST_OFF_TEXTSZ  = 0x14;
+let is i64 as CST_OFF_BSSSZ   = 0x18;
+let is i64 as CST_HEADER_SIZE = 0x20;
+
+// Polyglot mini-header ("CST*") offset and its fields.
+let is i64 as MINI_OFF        = 0x40;
+let is i64 as MINI_OFF_BODY   = 0x48;     // u64: file offset of CST image
+let is i64 as MINI_OFF_BODYSZ = 0x50;     // u64: size of CST image
+
+// Synthetic ELF-style protection flags fed to elf.flags_to_prot:
+//   R|X = 5 (executable, read-only)   R|W = 6 (writable, no-execute)
+let is i64 as PROT_RX_FLAGS = 5;
+let is i64 as PROT_RW_FLAGS = 6;
+
+fn page_align_up(x as i64) as i64 {
+    return (x + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
+}
+
+// ============================================================
+// Locate the CST image inside the container. Sets *out_off / *out_size
+// to the byte range of the CST_ image within buf. Returns 0 on success.
+// ============================================================
+
+fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32 {
+    if (size < CST_HEADER_SIZE) { return cast(i32, 0 - 1); }
+
+    // Pure: magic "CST_" at offset 0 → the whole file is the image.
+    if (cast(i64, buf[0]) == 0x43 && cast(i64, buf[1]) == 0x53
+        && cast(i64, buf[2]) == 0x54 && cast(i64, buf[3]) == 0x5F) {
+        *out_off = 0;
+        *out_size = size;
+        return 0;
+    }
+
+    // Polyglot: "MZ" → read the "CST*" mini-header at 0x40.
+    if (cast(i64, buf[0]) == 0x4D && cast(i64, buf[1]) == 0x5A) {
+        if (size < MINI_OFF + 0x20) { return cast(i32, 0 - 2); }
+        if (cast(i64, buf[MINI_OFF + 0]) != 0x43 || cast(i64, buf[MINI_OFF + 1]) != 0x53
+            || cast(i64, buf[MINI_OFF + 2]) != 0x54 || cast(i64, buf[MINI_OFF + 3]) != 0x2A) {
+            // No CST* mini-header; the older self-extract layout would
+            // need a magic scan, which we don't support — fail loudly.
+            return cast(i32, 0 - 3);
+        }
+        let is i64 as body_off = elf.read_u64_le(buf, MINI_OFF_BODY);
+        let is i64 as body_sz  = elf.read_u64_le(buf, MINI_OFF_BODYSZ);
+        if (body_off < 0 || body_sz < CST_HEADER_SIZE) { return cast(i32, 0 - 4); }
+        if (body_off + body_sz > size) { return cast(i32, 0 - 5); }
+        *out_off = body_off;
+        *out_size = body_sz;
+        return 0;
+    }
+
+    return cast(i32, 0 - 6);
+}
+
+// ============================================================
+// Top-level entry. buf/size = container bytes (pure .cse or polyglot).
+// On success: *out_entry = entry_point, *out_user_rsp = stack pointer.
+// Signature mirrors elf.load_elf for drop-in use.
+// ============================================================
+
+fn load_cse(a as *vma.Aspace, buf as *u8, size as i64,
+            argv0 as *u8, argv0_len as i64,
+            out_entry as *i64, out_user_rsp as *i64) as i32 {
+    let is i64 as cst_off with mut = 0;
+    let is i64 as cst_size with mut = 0;
+    let is i32 as lrc = locate_cst(buf, size, &cst_off, &cst_size);
+    if (lrc != 0) {
+        serial.print("cse: locate rc=", 15);
+        util.print_num(cast(i64, lrc));
+        serial.println("", 0);
+        return lrc;
+    }
+
+    // Validate the CST_ header.
+    let is *u8 as img = cast(*u8, &buf[cst_off]);
+    if (cast(i64, img[0]) != 0x43 || cast(i64, img[1]) != 0x53
+        || cast(i64, img[2]) != 0x54 || cast(i64, img[3]) != 0x5F) {
+        return cast(i32, 0 - 7);
+    }
+    if (elf.read_u16_le(img, CST_OFF_VERSION) != 1) { return cast(i32, 0 - 8); }
+    if (cast(i64, img[CST_OFF_ARCH]) != 1) { return cast(i32, 0 - 9); }
+
+    let is i64 as entry     = elf.read_u64_le(img, CST_OFF_ENTRY);
+    let is i64 as text_off  = elf.read_u32_le(img, CST_OFF_TEXTOFF);
+    let is i64 as text_size = elf.read_u32_le(img, CST_OFF_TEXTSZ);
+    let is i64 as bss_size  = elf.read_u64_le(img, CST_OFF_BSSSZ);
+    if (entry < CSE_BASE) { return cast(i32, 0 - 10); }
+    if (text_off + text_size > cst_size) { return cast(i32, 0 - 11); }
+
+    let is i64 as stored_size = cst_size;
+
+    // R-X region: header + .text, up to the page-aligned text boundary.
+    let is i64 as rx_size = page_align_up(text_off + text_size);
+    let is i64 as rx_prot = elf.flags_to_prot(PROT_RX_FLAGS);
+    let is i64 as gotx = vma.mmap_anon(a, CSE_BASE, rx_size, rx_prot, vma.VMA_FIXED);
+    if (gotx != CSE_BASE) {
+        serial.println("cse: R-X map fail", 17);
+        return cast(i32, 0 - 12);
+    }
+
+    // R-W region: everything past the text boundary (data + bss). The
+    // producer page-aligns stored_size so bss never lands in the R-X
+    // region. Skip if the image is text-only with no bss.
+    let is i64 as rw_start = CSE_BASE + rx_size;
+    let is i64 as rw_end   = CSE_BASE + stored_size + bss_size;
+    if (rw_end > rw_start) {
+        let is i64 as rw_prot = elf.flags_to_prot(PROT_RW_FLAGS);
+        let is i64 as gotw = vma.mmap_anon(a, rw_start, rw_end - rw_start,
+                                            rw_prot, vma.VMA_FIXED);
+        if (gotw != rw_start) {
+            serial.println("cse: R-W map fail", 17);
+            return cast(i32, 0 - 13);
+        }
+    }
+
+    // Copy the stored image flat to the base. mmap_anon already zeroed
+    // the bss tail, so we only copy the stored_size bytes. The copy goes
+    // through the physical pages, so the R-X protection on the text
+    // region doesn't block this kernel-side write.
+    let is i32 as crc = elf.copy_segment_into_aspace(a, CSE_BASE, buf, cst_off,
+                                                      stored_size, stored_size);
+    if (crc != 0) {
+        serial.println("cse: image copy fail", 20);
+        return cast(i32, 0 - 14);
+    }
+
+    // Identical entry ABI to ELF — reuse the System V stack builder.
+    let is i32 as ssrc = elf.build_initial_stack(a, entry, argv0, argv0_len, out_user_rsp);
+    if (ssrc != 0) { return ssrc; }
+
+    *out_entry = entry;
+    return 0;
+}
