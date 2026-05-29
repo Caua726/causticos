@@ -60,9 +60,11 @@ from two formats: ELF64 and CSE (causticos' own). See
 
 A few choices that explain why things look the way they do:
 
-- **Own ABI, own format.** causticos doesn't aim to run Linux binaries. It
-  has its own syscall numbers and its own executable format, so a program
-  is built *for* causticos, not ported to it.
+- **Own ABI, own format.** causticos has its own syscall numbers and its
+  own executable format (CSE), so software is built *for* it, not ported.
+  A CSE is polyglot — one file can hold a causticos, a Linux, and a Windows
+  image (macOS planned) — so the same binary runs natively on each, but on
+  causticos it uses causticos' own syscalls.
 - **Small kernel, declarative drivers.** Device knowledge lives in spec
   files, not scattered through C-style probe code.
 - **Honest about ring 0.** No KPTI, no ASLR, single-trust for now — the

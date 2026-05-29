@@ -2,7 +2,7 @@
 
 An x86_64 operating system written in [Caustic](https://github.com/Caua726/Caustic), a from-scratch systems language with its own compiler, assembler, and linker. It boots under Limine and runs its own ring-3 programs.
 
-causticos isn't trying to run Linux software. It has its own way for programs to reach the kernel (its own syscall ABI) and its own executable format, CSE — the *Caustic Standard Executable*. You write a program in Caustic, build it for the `causticos-x86_64` target, and the toolchain hands you a `.cse` that the kernel loads and runs directly:
+causticos has its own syscall ABI and its own executable format, CSE — the *Caustic Standard Executable*. You build a program for the `caustic` target and get a `.cse` the kernel loads and runs in ring 3:
 
 ```
 userspace.cse_smoke: PASS
@@ -10,7 +10,9 @@ Hello from Caustic!
 sys.proc_exit: code=0
 ```
 
-If you want the friendly version of how that works, see [docs/executables.md](docs/executables.md); the exact byte layout and syscall contract live in [CSE_FORMAT.md](CSE_FORMAT.md).
+A `.cse` is polyglot. The toolchain welds a causticos, a Linux, and a Windows image into one file (macOS planned), so the same binary runs natively on each — every image calls its own OS's syscalls, APE/Cosmopolitan-style. On causticos, the kernel pulls out the causticos image and runs it.
+
+For the friendly version of how that works, see [docs/executables.md](docs/executables.md); the exact byte layout and syscall contract live in [docs/CSE_FORMAT.md](docs/CSE_FORMAT.md).
 
 Around 21k lines of Caustic across ~40 modules. x86_64 only.
 
@@ -71,7 +73,7 @@ kernel/
   userspace, elf, cse, process, kbd                      ring-3 entry, ELF/CSE loaders
 font/font8x8.cst                                         8x8 bitmap font
 scripts/                                                 run.sh, verify.sh, FAT32 fixtures
-CSE_FORMAT.md                                            the CSE executable format spec
+docs/                                                    overview, executables, CSE_FORMAT spec
 ```
 
 The hand-written assembly (`kernel/smp_asm.s`, `kernel/syscall_entry.s`) holds the raw entry points. Anything that runs before a stack frame exists — the syscall trampoline, the SMP primitives — can't be a Caustic function, because the compiler's prologue would run on the wrong stack.

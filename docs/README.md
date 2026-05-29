@@ -8,4 +8,4 @@ the source — the code is the real reference.
 
 For building and running, see the [README](../README.md). For the exact
 byte layout of the executable format and the syscall contract, see
-[CSE_FORMAT.md](../CSE_FORMAT.md).
+[CSE_FORMAT.md](CSE_FORMAT.md).

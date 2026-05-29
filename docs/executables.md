@@ -2,26 +2,34 @@
 
 The friendly version of what happens between "I wrote some Caustic" and
 "it printed on screen." For the byte-exact format and the full syscall
-contract, jump to [CSE_FORMAT.md](../CSE_FORMAT.md).
+contract, jump to [CSE_FORMAT.md](CSE_FORMAT.md).
 
 ## The short story
 
-You write a program in Caustic, build it for causticos, and you get a
-`.cse` file. The kernel reads that file, drops the program into ring 3
-(unprivileged mode), and lets it run. When the program needs the kernel —
-to print something, to know the time, to exit — it makes a *syscall*.
+You write a program in Caustic, build it for the `caustic` target, and you
+get a `.cse` file. The kernel reads that file, drops the program into ring
+3 (unprivileged mode), and lets it run. When the program needs the kernel
+— to print something, to know the time, to exit — it makes a *syscall*.
 
 ```
-hello.cst  ──caustic (target causticos-x86_64)──▶  .s
+hello.cst  ──caustic (target caustic-x86_64)──▶  .s
            ──caustic-as──▶  .o
            ──caustic-ld──▶  hello.cse
 hello.cse  ──kernel (cse.cst)──▶  loaded at 0x400000, jumped to in ring 3
 ```
 
-That last `.cse` is the *Caustic Standard Executable* — causticos' own
-format. It's much simpler than ELF: a small header, a list of segments
-(code, data), and that's it. No dynamic linking, no relocations; the
-kernel maps the segments and jumps to the entry point.
+That `.cse` is the *Caustic Standard Executable* — causticos' own format.
+It's much simpler than ELF: a small header, a list of segments (code,
+data), and that's it. No dynamic linking, no relocations; the kernel maps
+the segments and jumps to the entry point.
+
+It's also **polyglot**. The `caustic` target can weld three images into
+one file — a causticos one (CST), a Linux one (ELF), and a Windows one
+(PE), with macOS planned — so the *same* `.cse` runs natively on each, the
+APE / Cosmopolitan trick. On causticos the kernel just pulls out the CST
+image; on Linux the file is a valid ELF, on Windows a valid PE. Each image
+calls its own OS's syscalls, so "runs everywhere" doesn't mean a slow
+shared layer — every OS gets native code.
 
 ## What a program can do today
 
@@ -64,7 +72,7 @@ entered in ring 3 with a System V stack (argc, argv, envp, auxv).
 
 ## Where to go deeper
 
-- [CSE_FORMAT.md](../CSE_FORMAT.md) — the header, the segment table, the
+- [CSE_FORMAT.md](CSE_FORMAT.md) — the header, the segment table, the
   permission rules, and the syscall numbers, byte for byte. This is the
   contract the toolchain and the kernel both follow.
 - `kernel/cse.cst` / `kernel/elf.cst` — the loaders.

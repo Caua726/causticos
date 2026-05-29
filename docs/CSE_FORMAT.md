@@ -3,10 +3,10 @@
 This is the contract between **two sides**:
 
 - **kernel** (`kernel/cse.cst`) — loads CSE images. **Implemented (v2).**
-- **toolchain** (`caustic-ld` + `std/os/causticos.cst`, branch `cse-ultraplan`)
-  — emits CSE images for the `causticos-x86_64` target and calls the
-  causticos syscall numbers. **Working** — a real `hello.cse` loads,
-  prints, and exits cleanly through this loader.
+- **toolchain** (`caustic-ld` + the `caustic-x86_64` target backend, branch
+  `cse-ultraplan`) — emits CSE images that call the causticos syscall
+  numbers. **Working** — a real `hello.cse` loads, prints, and exits
+  cleanly through this loader.
 
 CSE is causticos' own executable format: deliberately simpler than ELF —
 **static only, fixed load base, no relocations, no dynamic linking.** It
@@ -24,10 +24,13 @@ A CSE file is one of:
 | pure `.cse` | `"CST_"` (43 53 54 5F) | the whole file IS the image, offset 0 |
 | polyglot `.cse.exe` | `"MZ"` (4D 5A) | read the `"CST*"` mini-header at **0x40** → `cst_body_offset` (@0x48, u64), `cst_body_size` (@0x50, u64) |
 
-**causticos-target binaries are pure `.cse`.** The polyglot exists only so
-a binary can *also* run on Windows/Linux (APE-style); causticos binaries
-don't need that, so the toolchain should emit **pure CST_** for
-`causticos-x86_64`. The kernel handles both; pure is canonical.
+The `.cse` is **polyglot**: the `caustic-x86_64` target welds a causticos
+(CST), a Linux (ELF), and a Windows (PE) image into one file, APE /
+Cosmopolitan-style — macOS planned — so the same binary runs natively on
+each, every image calling its own OS's syscalls. On causticos the kernel
+pulls out the CST image: the whole file for a pure `.cse`, or the embedded
+body behind the `"CST*"` mini-header for a polyglot `.cse.exe`. It handles
+both.
 
 (The older self-extract polyglot — `#!/bin/sh` + ELF@512 + CST, no
 `CST*`@0x40 — is **not** supported by the loader. Standardize on the
@@ -107,7 +110,7 @@ At `entry_point`, the stack holds the System V AMD64 frame:
 
 ---
 
-## 6. Syscall ABI contract — what `OS_CAUSTICOS` must emit
+## 6. Syscall ABI contract — what the `caustic-x86_64` target must emit
 
 The register convention is **identical to Linux x86_64**, so only the
 numbers and the operation set change:
@@ -131,7 +134,7 @@ numbers and the operation set change:
 | 5 | PROC_YIELD | `()` | |
 | 6 | IO_WRITE_SERIAL | `(buf, len)` | kernel console; **no fd** |
 
-### Mapping the stdlib facade → causticos (for `std/os/causticos.cst`)
+### Mapping the stdlib facade → causticos (the `caustic-x86_64` backend)
 
 These are **semantic adapters**, not renumbered Linux wrappers — the
 operations differ in shape:
