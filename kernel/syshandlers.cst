@@ -14,6 +14,8 @@ use "abi.cst" as abi;
 use "timer.cst" as timer;
 use "sched.cst" as sched;
 use "userspace.cst" as userspace;
+use "vma.cst" as vma;
+use "vfs.cst" as vfs;
 
 // ============================================================
 // SYS_KERN_INFO(buf, buf_size) — fill `buf` with the static KernInfo
@@ -149,6 +151,202 @@ fn sys_io_write_serial(a as i64, b as i64, c as i64, d as i64, e as i64, f as i6
 }
 
 // ============================================================
+// SYS_MMAP(hint, len, prot) — anonymous mapping in the caller's address
+// space. hint == 0: the kernel picks a free range. hint != 0: the range
+// is honoured exactly (VMA_FIXED), failing if it overlaps. Returns the
+// base virtual address (always positive — user VAs are below
+// 0x00007FFFFFFFFFFF), or an errno. v0 is anonymous + eager only: no fd,
+// no offset, no demand paging (mmap_anon maps all pages up front).
+// ============================================================
+
+fn sys_mmap(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as hint = a;
+    let is i64 as len = b;
+    let is i64 as uprot = c;
+    if (len <= 0) { return abi.E_INVAL; }
+
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return abi.E_INVAL; }
+
+    // ABI prot bits → PTE leaf bits. mmap_anon adds PTE_PRESENT|PTE_USER;
+    // read is implied by present. WRITE → PTE_WRITE; no EXEC → PTE_NX.
+    let is i64 as vprot with mut = vma.PROT_USER;
+    if ((uprot & abi.MMAP_PROT_WRITE) != 0) { vprot = vprot | vma.PROT_WRITE; }
+    if ((uprot & abi.MMAP_PROT_EXEC) == 0)  { vprot = vprot | vma.PROT_NX; }
+
+    let is i64 as flags with mut = vma.VMA_ANON;
+    let is i64 as use_hint with mut = 0;
+    if (hint != 0) { flags = flags | vma.VMA_FIXED; use_hint = hint; }
+
+    let is i64 as va = vma.mmap_anon(cast(*vma.Aspace, asp),
+                                     use_hint, len, vprot, flags);
+    if (va < 0) { return abi.E_NOMEM; }   // mmap_anon returns -1 on failure
+    return va;
+}
+
+// ============================================================
+// SYS_MUNMAP(addr, len) — unmap a region. v0 only removes VMAs that fall
+// entirely within [addr, addr+len); partial-range splitting isn't
+// implemented (vma.munmap returns -1 if nothing matched). Returns 0 or errno.
+// ============================================================
+
+fn sys_munmap(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (b <= 0) { return abi.E_INVAL; }
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i32 as rc = vma.munmap(cast(*vma.Aspace, asp), a, b);
+    if (rc != 0) { return abi.E_INVAL; }
+    return abi.E_OK;
+}
+
+// ============================================================
+// int-fd file I/O. open() resolves a path through the VFS and parks the
+// resulting *VfsFile in the per-aspace fd table; read/write/close/lseek
+// look the fd back up. fd is just an index into that table — no caps, no
+// generation, no rights. See docs: the capability layers come only when a
+// cross-aspace workload (spawn/IPC) needs them.
+//
+// The VFS returns its own negative error codes; map them to the causticos
+// errno set so userspace sees one consistent scheme.
+// ============================================================
+
+fn vfs_err_to_abi(rc as i64) as i64 {
+    if (rc == vfs.VFS_ENOENT)   { return abi.E_NOENT; }
+    if (rc == vfs.VFS_EBADF)    { return abi.E_BADF; }
+    if (rc == vfs.VFS_EINVAL)   { return abi.E_INVAL; }
+    if (rc == vfs.VFS_EISDIR)   { return abi.E_ISDIR; }
+    if (rc == vfs.VFS_ENOTDIR)  { return abi.E_NOTDIR; }
+    if (rc == vfs.VFS_EEXIST)   { return abi.E_EXIST; }
+    if (rc == vfs.VFS_EMFILE)   { return abi.E_MFILE; }
+    if (rc == vfs.VFS_ENOSPC)   { return abi.E_NOSPC; }
+    if (rc == vfs.VFS_EIO)      { return abi.E_IO; }
+    return abi.E_INVAL;
+}
+
+let is i64 as PATH_MAX = 255;
+
+// SYS_OPEN(path, path_len, flags) — open/create a file, return its fd.
+// NOTE: vfs.open only signals success/failure (a null handle), not which
+// error, so a failed open reports E_NOENT generically. Surfacing the
+// precise errno is a VFS-side improvement for later.
+fn sys_open(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as path_len = b;
+    if (path_len <= 0) { return abi.E_INVAL; }
+    if (path_len > PATH_MAX) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    let is [256]u8 as kpath;
+    let is *u8 as kp = cast(*u8, &kpath[0]);
+    let is i32 as crc = userspace.copy_from_user(pml4, kp, a, path_len);
+    if (crc != 0) { return abi.E_FAULT; }
+
+    let is *vfs.VfsFile as fp = vfs.open(kp, path_len, cast(i32, c));
+    if (cast(i64, fp) == 0) { return abi.E_NOENT; }
+
+    let is i64 as fd = vma.fd_alloc(cast(*vma.Aspace, asp), cast(i64, fp));
+    if (fd < 0) { vfs.close(fp); return abi.E_MFILE; }
+    return fd;
+}
+
+// SYS_READ(fd, buf, n) — read up to n bytes into the user buffer. Loops a
+// page at a time so a large n needs no large kernel staging area; stops at
+// EOF (a short VFS read).
+fn sys_read(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as n = c;
+    if (n < 0) { return abi.E_INVAL; }
+    if (n == 0) { return 0; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (fv == 0) { return abi.E_BADF; }
+    let is *vfs.VfsFile as fp = cast(*vfs.VfsFile, fv);
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    let is [4096]u8 as kbuf;
+    let is *u8 as kp = cast(*u8, &kbuf[0]);
+    let is i64 as total with mut = 0;
+    while (total < n) {
+        let is i64 as chunk with mut = n - total;
+        if (chunk > IO_PAGE_BYTES) { chunk = IO_PAGE_BYTES; }
+        let is i64 as got = vfs.read(fp, kp, chunk);
+        if (got < 0) {
+            if (total > 0) { return total; }
+            return vfs_err_to_abi(got);
+        }
+        if (got == 0) { return total; }                 // EOF
+        let is i32 as wrc = userspace.copy_to_user(pml4, b + total, kp, got);
+        if (wrc != 0) {
+            if (total > 0) { return total; }
+            return abi.E_FAULT;
+        }
+        total = total + got;
+        if (got < chunk) { return total; }               // short read = EOF
+    }
+    return total;
+}
+
+// SYS_WRITE(fd, buf, n) — write n bytes from the user buffer, page at a time.
+fn sys_write(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as n = c;
+    if (n < 0) { return abi.E_INVAL; }
+    if (n == 0) { return 0; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (fv == 0) { return abi.E_BADF; }
+    let is *vfs.VfsFile as fp = cast(*vfs.VfsFile, fv);
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    let is [4096]u8 as kbuf;
+    let is *u8 as kp = cast(*u8, &kbuf[0]);
+    let is i64 as total with mut = 0;
+    while (total < n) {
+        let is i64 as chunk with mut = n - total;
+        if (chunk > IO_PAGE_BYTES) { chunk = IO_PAGE_BYTES; }
+        let is i32 as rrc = userspace.copy_from_user(pml4, kp, b + total, chunk);
+        if (rrc != 0) {
+            if (total > 0) { return total; }
+            return abi.E_FAULT;
+        }
+        let is i64 as wrote = vfs.write(fp, kp, chunk);
+        if (wrote < 0) {
+            if (total > 0) { return total; }
+            return vfs_err_to_abi(wrote);
+        }
+        total = total + wrote;
+        if (wrote < chunk) { return total; }              // short write
+    }
+    return total;
+}
+
+// SYS_CLOSE(fd) — drop the file and free the fd slot.
+fn sys_close(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (fv == 0) { return abi.E_BADF; }
+    vfs.close(cast(*vfs.VfsFile, fv));
+    vma.fd_close(cast(*vma.Aspace, asp), a);
+    return abi.E_OK;
+}
+
+// SYS_LSEEK(fd, off, whence) — reposition; returns the new absolute offset.
+fn sys_lseek(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (fv == 0) { return abi.E_BADF; }
+    let is i64 as r = vfs.lseek(cast(*vfs.VfsFile, fv), b, cast(i32, c));
+    if (r < 0) { return vfs_err_to_abi(r); }
+    return r;
+}
+
+// ============================================================
 // Registry — wire the implemented numbers into syscall.dispatch.
 // Adding a new syscall = append one install() line + one fn above.
 // ============================================================
@@ -170,4 +368,11 @@ fn install_all() as void {
     install(abi.SYS_PROC_GETPID,     cast(i64, fn_ptr(sys_proc_getpid)));
     install(abi.SYS_PROC_YIELD,      cast(i64, fn_ptr(sys_proc_yield)));
     install(abi.SYS_IO_WRITE_SERIAL, cast(i64, fn_ptr(sys_io_write_serial)));
+    install(abi.SYS_MMAP,            cast(i64, fn_ptr(sys_mmap)));
+    install(abi.SYS_MUNMAP,          cast(i64, fn_ptr(sys_munmap)));
+    install(abi.SYS_OPEN,            cast(i64, fn_ptr(sys_open)));
+    install(abi.SYS_READ,            cast(i64, fn_ptr(sys_read)));
+    install(abi.SYS_WRITE,           cast(i64, fn_ptr(sys_write)));
+    install(abi.SYS_CLOSE,           cast(i64, fn_ptr(sys_close)));
+    install(abi.SYS_LSEEK,           cast(i64, fn_ptr(sys_lseek)));
 }

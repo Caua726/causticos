@@ -116,6 +116,15 @@ fn user_thread_trampoline() as void {
 // Runs in ring 3 — the timer IRQ preempts it on every quantum, so
 // the counter advances in chunks of "however many `inc` opcodes
 // fit between two timer ticks" (millions on QEMU).
+//
+// NOTE: this thread runs FOREVER on purpose. The clean version (a
+// bounded loop + SYS_PROC_EXIT) was tried and reverted: an early
+// thread exit followed by heavy thread churn trips a flaky scheduler
+// context-switch race — random kernel #GP/#PF at varying addresses in
+// the sched.cst region (observed: #14 @0x20f27, #13 @0x207bb), not a
+// deterministic logic bug. Until that race is fixed, the counter stays
+// immortal; the harmless cosmetic user-mode #PF it eventually takes
+// (when its leaked aspace pages are reused) beats a kernel crash.
 // ----------------------------------------------------------------
 fn write_smoke_shellcode(dst as *u8) as i64 {
     // movabs rax, imm64
@@ -281,7 +290,7 @@ fn spawn_user_smoke() as void {
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        a.pml4_phys, USER_TEXT_VA, user_rsp
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
     );
 
     serial.print("userspace.smoke: spawned tid=", 29);
@@ -337,7 +346,7 @@ fn spawn_user_fault_smoke() as void {
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        a.pml4_phys, USER_TEXT_VA, user_rsp
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
     );
     serial.print("userspace.fault_smoke: spawned tid=", 35);
     util.print_num(tid);
@@ -621,7 +630,7 @@ fn spawn_user_elf_smoke() as void {
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        a.pml4_phys, entry, user_rsp
+        a.pml4_phys, entry, user_rsp, cast(i64, a)
     );
     serial.print("userspace.elf_smoke: spawned tid=", 33);
     util.print_num(tid);
@@ -708,7 +717,14 @@ fn spawn_user_elf_smoke() as void {
 // The BSS base is held in r15 (callee-saved; arg regs are clobbered by
 // syscalls). Memory refs are r15-relative.
 //   bss+0x000  TIME_NOW_NS result    bss+0x008  GETPID result
-//   bss+0x100  KERN_INFO struct (48B)
+//   bss+0x010  SYS_MMAP returned VA  bss+0x018  sentinel read back
+//   bss+0x020  SYS_MUNMAP result     bss+0x028  SYS_OPEN fd
+//   bss+0x030  SYS_READ bytes        bss+0x038  SYS_CLOSE result
+//   bss+0x040  wtest fd              bss+0x048  SYS_WRITE bytes
+//   bss+0x050  SYS_LSEEK offset      bss+0x058  wtest re-read bytes
+//   bss+0x060  wtest close result
+//   bss+0x100  KERN_INFO struct (48B) bss+0x200  /hello.txt read buffer
+//   bss+0x240  wtest re-read buffer (7B)
 // ============================================================
 
 let is i64 as CSE_TEST_ENTRY  = 0x401000;     // seg0 (.text) vaddr
@@ -716,7 +732,7 @@ let is i64 as CSE_TEST_BSS_VA = 0x402000;     // seg1 (R-W) vaddr
 let is i64 as CSE_TEXT_FOFF   = 0x50;         // header(0x20) + 2 segs(2*0x18)
 let is i64 as test_cse_len with mut = 0;      // total image size, set by build
 
-let is [512]u8 as test_cse;
+let is [768]u8 as test_cse;
 
 fn write_le_u32(p as *u8, off as i64, v as i64) as void {
     p[off + 0] = cast(u8, v & 0xFF);
@@ -728,7 +744,7 @@ fn write_le_u32(p as *u8, off as i64, v as i64) as void {
 fn build_test_cse() as void {
     let is *u8 as e = cast(*u8, &test_cse[0]);
     let is i64 as z with mut = 0;
-    while (z < 512) { e[z] = cast(u8, 0); z = z + 1; }
+    while (z < 768) { e[z] = cast(u8, 0); z = z + 1; }
 
     // ---- header (32 bytes) ----
     e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
@@ -760,6 +776,208 @@ fn build_test_cse() as void {
     e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF);
     write_le_u64(e, c + 2, CSE_TEST_BSS_VA);
     c = c + 10;
+
+    // --- SYS_MMAP(0, 0x1000, R|W) → write+read a sentinel → SYS_MUNMAP.
+    //     Exercises the camada-0 memory syscalls end-to-end in ring 3. ---
+    //   mov rax,7  (SYS_MMAP)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,7); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   xor edi,edi   (hint = 0 → kernel picks the VA)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;
+    //   mov rsi,0x1000   (len = one page)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x10); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   mov rdx,3   (prot = R|W)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x10],rax   (save returned VA)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x10);
+    c = c + 4;
+    //   mov dword [rax],0xCAFEBABE   (write sentinel into the new page)
+    e[c+0]=cast(u8,0xC7); e[c+1]=cast(u8,0x00);
+    e[c+2]=cast(u8,0xBE); e[c+3]=cast(u8,0xBA); e[c+4]=cast(u8,0xFE); e[c+5]=cast(u8,0xCA);
+    c = c + 6;
+    //   mov ecx,[rax]   (read it back, zero-extended into rcx)
+    e[c+0]=cast(u8,0x8B); e[c+1]=cast(u8,0x08); c = c + 2;
+    //   mov [r15+0x18],rcx
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x4F); e[c+3]=cast(u8,0x18);
+    c = c + 4;
+    //   mov rax,8  (SYS_MUNMAP)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,8); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   mov rdi,[r15+0x10]   (the saved VA)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x10);
+    c = c + 4;
+    //   mov rsi,0x1000
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x10); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x20],rax   (munmap result; 0 = ok)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x20);
+    c = c + 4;
+
+    // --- SYS_OPEN("/hello.txt", O_RDONLY) → SYS_READ → SYS_CLOSE.
+    //     Reads the FAT32 fixture through the int-fd file syscalls. The
+    //     path is embedded inline (jmp over it) so its user VA is known. ---
+    //   jmp +10  (skip the path bytes)
+    e[c+0]=cast(u8,0xEB); e[c+1]=cast(u8,10); c = c + 2;
+    let is i64 as path_foff = c;
+    //   "/hello.txt"
+    e[c+0]=cast(u8,47);  e[c+1]=cast(u8,104); e[c+2]=cast(u8,101); e[c+3]=cast(u8,108);
+    e[c+4]=cast(u8,108); e[c+5]=cast(u8,111); e[c+6]=cast(u8,46);  e[c+7]=cast(u8,116);
+    e[c+8]=cast(u8,120); e[c+9]=cast(u8,116);
+    c = c + 10;
+    let is i64 as path_va = CSE_TEST_ENTRY + (path_foff - CSE_TEXT_FOFF);
+
+    //   mov rax,9  (SYS_OPEN)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,9); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   movabs rdi, path_va
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBF); write_le_u64(e, c + 2, path_va); c = c + 10;
+    //   mov rsi,10  (path_len)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   xor edx,edx  (O_RDONLY)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x28],rax  (fd)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x28);
+    c = c + 4;
+
+    //   mov rax,10  (SYS_READ)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   mov rdi,[r15+0x28]  (fd)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x28);
+    c = c + 4;
+    //   movabs rsi, bss+0x200  (read buffer)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBE);
+    write_le_u64(e, c + 2, CSE_TEST_BSS_VA + 0x200); c = c + 10;
+    //   mov rdx,64  (count)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,64); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x30],rax  (bytes read)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x30);
+    c = c + 4;
+
+    //   mov rax,12  (SYS_CLOSE)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,12); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   mov rdi,[r15+0x28]  (fd)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x28);
+    c = c + 4;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x38],rax  (close result)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x38);
+    c = c + 4;
+
+    // --- write/lseek round-trip: open(O_CREAT|O_RDWR|O_TRUNC) a new file,
+    //     write "CAUSTIC", lseek back to 0, read it, close. Exercises
+    //     SYS_WRITE + SYS_LSEEK (and O_CREAT) through the ring-3 path. ---
+    //   jmp +17  (skip the two inline strings)
+    e[c+0]=cast(u8,0xEB); e[c+1]=cast(u8,17); c = c + 2;
+    let is i64 as wpath_foff = c;
+    //   "/wtest.txt"  (10)
+    e[c+0]=cast(u8,47);  e[c+1]=cast(u8,119); e[c+2]=cast(u8,116); e[c+3]=cast(u8,101);
+    e[c+4]=cast(u8,115); e[c+5]=cast(u8,116); e[c+6]=cast(u8,46);  e[c+7]=cast(u8,116);
+    e[c+8]=cast(u8,120); e[c+9]=cast(u8,116);
+    c = c + 10;
+    let is i64 as wdata_foff = c;
+    //   "CAUSTIC"  (7)
+    e[c+0]=cast(u8,67); e[c+1]=cast(u8,65); e[c+2]=cast(u8,85); e[c+3]=cast(u8,83);
+    e[c+4]=cast(u8,84); e[c+5]=cast(u8,73); e[c+6]=cast(u8,67);
+    c = c + 7;
+    let is i64 as wpath_va = CSE_TEST_ENTRY + (wpath_foff - CSE_TEXT_FOFF);
+    let is i64 as wdata_va = CSE_TEST_ENTRY + (wdata_foff - CSE_TEXT_FOFF);
+
+    //   mov rax,9  (SYS_OPEN), movabs rdi,wpath_va, mov rsi,10, mov rdx,0x242
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,9); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBF); write_le_u64(e, c + 2, wpath_va); c = c + 10;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   O_CREAT|O_RDWR|O_TRUNC = 0x242
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,0x42); e[c+4]=cast(u8,0x02); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x40],rax  (wfd)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x40);
+    c = c + 4;
+
+    //   mov rax,11  (SYS_WRITE), rdi=wfd, movabs rsi,wdata_va, rdx=7
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,11); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x40);
+    c = c + 4;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBE); write_le_u64(e, c + 2, wdata_va); c = c + 10;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,7); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x48],rax  (bytes written)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x48);
+    c = c + 4;
+
+    //   mov rax,13  (SYS_LSEEK), rdi=wfd, xor esi,esi (off 0), xor edx,edx (SEEK_SET)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,13); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x40);
+    c = c + 4;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x50],rax  (new offset; 0)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x50);
+    c = c + 4;
+
+    //   mov rax,10  (SYS_READ), rdi=wfd, movabs rsi,bss+0x240, rdx=7
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x40);
+    c = c + 4;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBE);
+    write_le_u64(e, c + 2, CSE_TEST_BSS_VA + 0x240); c = c + 10;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,7); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x58],rax  (bytes read back)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x58);
+    c = c + 4;
+
+    //   mov rax,12  (SYS_CLOSE), rdi=wfd
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,12); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x40);
+    c = c + 4;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov [r15+0x60],rax  (close result)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x60);
+    c = c + 4;
 
     // SYS_TIME_NOW_NS (1) — REGRESSION GUARD: driven through a call/ret
     // so the test exercises the user stack surviving a syscall. This is
@@ -895,18 +1113,23 @@ fn spawn_user_cse_smoke() as void {
     let is i64 as tid = sched.create_user_thread(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
-        a.pml4_phys, entry, user_rsp
+        a.pml4_phys, entry, user_rsp, cast(i64, a)
     );
     serial.print("userspace.cse_smoke: spawned tid=", 33);
     util.print_num(tid);
     serial.println("", 0);
 
-    // Same validation as the ELF smoke, reading the CSE bss page.
+    // Same validation as the ELF smoke, reading the CSE bss page, plus
+    // the mmap/munmap round-trip (VA at p[2], sentinel at p[3], munmap rc
+    // at p[4]).
     let is i64 as deadline = timer.current_time_ns() + 1500000000;
     let is i32 as time_ok with mut = 0;
     let is i32 as exit_ok with mut = 0;
     let is i32 as getpid_ok with mut = 0;
     let is i32 as kinfo_ok with mut = 0;
+    let is i32 as mmap_ok with mut = 0;
+    let is i32 as file_ok with mut = 0;
+    let is i32 as wfile_ok with mut = 0;
     while (timer.current_time_ns() < deadline) {
         let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, CSE_TEST_BSS_VA);
         if (phys != 0) {
@@ -920,6 +1143,60 @@ fn spawn_user_cse_smoke() as void {
             if (exit_ok == 0 && sched.thr_state(tid) == sched.THREAD_DEAD) {
                 exit_ok = 1;
                 if (p[1] == tid) { getpid_ok = 1; }
+                if (p[2] >= 4096 && p[3] == cast(i64, 0xCAFEBABE) && p[4] == 0) {
+                    mmap_ok = 1;
+                }
+                serial.print("userspace.cse_smoke: mmap_va=", 29);
+                util.print_hex(p[2]);
+                serial.print(" readback=", 10);
+                util.print_hex(p[3]);
+                serial.print(" munmap=", 8);
+                util.print_num(p[4]);
+                serial.println("", 0);
+                // file I/O: fd>=0, read returned the fixture, close ok, and
+                // the bytes read back match "Hello from causticos FAT32!".
+                let is *u8 as pb = cast(*u8, p);
+                let is *u8 as want = cast(*u8, "Hello from causticos FAT32!");
+                let is i32 as fmatch with mut = 1;
+                let is i64 as fi with mut = 0;
+                while (fi < 27) {
+                    if (pb[0x200 + fi] != want[fi]) { fmatch = 0; }
+                    fi = fi + 1;
+                }
+                if (p[6] >= 27 && p[5] >= 0 && p[7] == 0 && fmatch == 1) {
+                    file_ok = 1;
+                }
+                serial.print("userspace.cse_smoke: open fd=", 29);
+                util.print_num(p[5]);
+                serial.print(" read=", 6);
+                util.print_num(p[6]);
+                serial.print(" close=", 7);
+                util.print_num(p[7]);
+                serial.print(" match=", 7);
+                util.print_num(cast(i64, fmatch));
+                serial.println("", 0);
+                // write/lseek: created file, wrote 7B, seeked to 0, re-read
+                // them back as "CAUSTIC".
+                let is *u8 as want2 = cast(*u8, "CAUSTIC");
+                let is i32 as wmatch with mut = 1;
+                let is i64 as wi with mut = 0;
+                while (wi < 7) {
+                    if (pb[0x240 + wi] != want2[wi]) { wmatch = 0; }
+                    wi = wi + 1;
+                }
+                if (p[8] >= 0 && p[9] == 7 && p[10] == 0 && p[11] == 7
+                    && p[12] == 0 && wmatch == 1) {
+                    wfile_ok = 1;
+                }
+                serial.print("userspace.cse_smoke: write=", 27);
+                util.print_num(p[9]);
+                serial.print(" lseek=", 7);
+                util.print_num(p[10]);
+                serial.print(" reread=", 8);
+                util.print_num(p[11]);
+                serial.print(" wmatch=", 8);
+                util.print_num(cast(i64, wmatch));
+                serial.println("", 0);
                 serial.print("userspace.cse_smoke: getpid=", 28);
                 util.print_num(p[1]);
                 serial.print(" (tid=", 6);
@@ -937,7 +1214,8 @@ fn spawn_user_cse_smoke() as void {
                 serial.println("", 0);
             }
         }
-        if (time_ok == 1 && exit_ok == 1 && getpid_ok == 1 && kinfo_ok == 1) {
+        if (time_ok == 1 && exit_ok == 1 && getpid_ok == 1 && kinfo_ok == 1
+            && mmap_ok == 1 && file_ok == 1 && wfile_ok == 1) {
             serial.println("userspace.cse_smoke: PASS", 25);
             return;
         }
@@ -951,6 +1229,12 @@ fn spawn_user_cse_smoke() as void {
     util.print_num(cast(i64, getpid_ok));
     serial.print(" kinfo_ok=", 10);
     util.print_num(cast(i64, kinfo_ok));
+    serial.print(" mmap_ok=", 9);
+    util.print_num(cast(i64, mmap_ok));
+    serial.print(" file_ok=", 9);
+    util.print_num(cast(i64, file_ok));
+    serial.print(" wfile_ok=", 10);
+    util.print_num(cast(i64, wfile_ok));
     serial.println(" FAIL", 5);
 }
 
