@@ -112,39 +112,44 @@ fn user_thread_trampoline() as void {
 //   inc qword ptr [rax]        ; 48 FF 00
 //   jmp -5                     ; EB FB
 //
-// 15 bytes total. Increments a counter at USER_DATA_VA forever.
-// Runs in ring 3 — the timer IRQ preempts it on every quantum, so
-// the counter advances in chunks of "however many `inc` opcodes
-// fit between two timer ticks" (millions on QEMU).
-//
-// NOTE: this thread runs FOREVER on purpose. The clean version (a
-// bounded loop + SYS_PROC_EXIT) was tried and reverted: an early
-// thread exit followed by heavy thread churn trips a flaky scheduler
-// context-switch race — random kernel #GP/#PF at varying addresses in
-// the sched.cst region (observed: #14 @0x20f27, #13 @0x207bb), not a
-// deterministic logic bug. Until that race is fixed, the counter stays
-// immortal; the harmless cosmetic user-mode #PF it eventually takes
-// (when its leaked aspace pages are reused) beats a kernel crash.
+// Bounded loop (5M increments) then SYS_PROC_EXIT(0): the thread runs
+// in ring 3, is preempted by the timer across the loop (the smoke sees
+// the counter advancing), then exits cleanly — no immortal/leaked
+// thread. This is also the workload that first exposed the kstack-top
+// scheduler bug (TSS.RSP0 / syscall-kstack must be the fixed stack top,
+// not the saved rsp); see schedule() in sched.cst.
 // ----------------------------------------------------------------
 fn write_smoke_shellcode(dst as *u8) as i64 {
-    // movabs rax, imm64
-    dst[0]  = cast(u8, 0x48);
-    dst[1]  = cast(u8, 0xB8);
+    let is i64 as c with mut = 0;
+    // movabs rax, USER_DATA_VA
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xB8); c = c + 2;
     let is i64 as v with mut = USER_DATA_VA;
     let is i64 as i with mut = 0;
-    while (i < 8) {
-        dst[2 + i] = cast(u8, v & 0xFF);
-        v = v >> 8;
-        i = i + 1;
-    }
-    // inc qword ptr [rax]
-    dst[10] = cast(u8, 0x48);
-    dst[11] = cast(u8, 0xFF);
-    dst[12] = cast(u8, 0x00);
-    // jmp short -5 (back to the start of `inc`)
-    dst[13] = cast(u8, 0xEB);
-    dst[14] = cast(u8, 0xFB);
-    return 15;
+    while (i < 8) { dst[c + i] = cast(u8, v & 0xFF); v = v >> 8; i = i + 1; }
+    c = c + 8;
+    // mov rcx, 5000000
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xC7); dst[c + 2] = cast(u8, 0xC1);
+    dst[c + 3] = cast(u8, 0x40); dst[c + 4] = cast(u8, 0x4B);
+    dst[c + 5] = cast(u8, 0x4C); dst[c + 6] = cast(u8, 0x00);
+    c = c + 7;
+    // .loop: inc qword [rax]
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xFF); dst[c + 2] = cast(u8, 0x00);
+    c = c + 3;
+    // dec rcx
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xFF); dst[c + 2] = cast(u8, 0xC9);
+    c = c + 3;
+    // jnz .loop  (rel8 = -8)
+    dst[c + 0] = cast(u8, 0x75); dst[c + 1] = cast(u8, 0xF8); c = c + 2;
+    // mov rax, 3  (SYS_PROC_EXIT)
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xC7); dst[c + 2] = cast(u8, 0xC0);
+    dst[c + 3] = cast(u8, 3); dst[c + 4] = cast(u8, 0);
+    dst[c + 5] = cast(u8, 0); dst[c + 6] = cast(u8, 0);
+    c = c + 7;
+    // xor edi, edi  (exit code 0)
+    dst[c + 0] = cast(u8, 0x31); dst[c + 1] = cast(u8, 0xFF); c = c + 2;
+    // syscall
+    dst[c + 0] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    return c;
 }
 
 // (Old syscall_smoke shellcode lived here, hard-coding rax=0 for
