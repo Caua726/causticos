@@ -28,7 +28,18 @@ let is i64 as PTE_ADDR_MASK with mut = 0;
 let is i64 as PTE_TABLE with mut = 0;       // PRESENT | WRITE | NX
 let is i64 as PTE_TABLE_USER with mut = 0;  // PRESENT | WRITE | USER | NX
 let is i64 as KMAP_DATA with mut = 0;       // PRESENT | WRITE | NX
-let is i64 as KMAP_MMIO with mut = 0;       // PRESENT | WRITE | NX | PCD | PWT (UC)
+let is i64 as KMAP_MMIO with mut = 0;       // PRESENT | WRITE | NX | PCD | PWT (UC, = PAT entry PA3)
+let is i64 as KMAP_WC with mut = 0;         // PRESENT | WRITE | NX | PWT (write-combining, = PA1)
+
+// IA32_PAT (MSR 0x277). Default is 0x0007040600070406 (PA0..PA7 =
+// WB,WT,UC-,UC,WB,WT,UC-,UC). We reprogram PA1 (selected by PWT=1,PCD=0,
+// PAT=0) from WT (0x04) to WC (0x01) — a 4 KiB PTE with only PWT set then
+// maps write-combining. PA1 avoids touching the PTE PAT bit (bit 7), which
+// aliases the page-size bit on huge entries. Per-CPU MSR: set on the BSP
+// and every AP.
+let is i64 as IA32_PAT_MSR = 0x277;
+let is i64 as PAT_VALUE     = 0x0007040600070106;
+let is i64 as pat_shuttle with mut = 0;
 
 // Address space layout
 let is i64 as USER_SPACE_END with mut = 0;
@@ -845,6 +856,55 @@ fn mmio_unmap(vaddr as i64, size as i64) as void {
     // VA slot remains leaked by the bump allocator (see MMIO_SIZE_LIMIT).
 }
 
+// Program IA32_PAT so PA1 = write-combining. Per-CPU MSR: called on the
+// BSP at the end of vmm.init and on every AP from smp.ap_entry. Done early,
+// before any WC mapping exists, so a TLB flush is enough (no cache line
+// holds the old memory type yet). Shuttles the value through a global to
+// avoid relying on the arg register surviving the prologue (same pattern
+// as read_cr3); clobbers rax/rbx/rcx/rdx (caller-saved here).
+fn pat_init() as void {
+    pat_shuttle = PAT_VALUE;
+    asm("lea rbx, [rip+_kernel_vmm_cst_pat_shuttle]\n");
+    asm("mov rax, QWORD PTR [rbx]\n");   // full value
+    asm("mov rdx, rax\n");
+    asm("shr rdx, 32\n");                // edx = high 32, eax = low 32
+    asm("mov ecx, 0x277\n");             // IA32_PAT
+    asm(".byte 0x0F, 0x30\n");           // wrmsr
+    flush_tlb_full();
+}
+
+// Like mmio_map, but write-combining (KMAP_WC) instead of uncached. Used
+// for the framebuffer scanout: WC coalesces the per-pixel writes into
+// burst transfers — the right memory type for a linear framebuffer, where
+// UC would be slow and WB (no automatic flush to the device) is wrong.
+fn iomap_wc(phys as i64, size as i64) as i64 {
+    if (size <= 0) { return 0; }
+    let is i64 as phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
+    let is i64 as phys_offset  = phys - phys_aligned;
+    let is i64 as span         = pmm.align_up(size + phys_offset, pmm.PAGE_SIZE);
+    let is i64 as pages        = span / pmm.PAGE_SIZE;
+
+    let is i64 as vflags = lock.acquire_irq(&vmm_lock);
+    if (mmio_next_offset + span > MMIO_SIZE_LIMIT) {
+        lock.release_irq(&vmm_lock, vflags);
+        return 0;
+    }
+    let is i64 as vaddr = MMIO_BASE + mmio_next_offset;
+    mmio_next_offset = mmio_next_offset + span;
+    lock.release_irq(&vmm_lock, vflags);
+
+    let is i64 as i with mut = 0;
+    while (i < pages) {
+        vmm_map_page(kas_pml4_phys,
+            vaddr + i * pmm.PAGE_SIZE,
+            phys_aligned + i * pmm.PAGE_SIZE,
+            KMAP_WC);
+        i = i + 1;
+    }
+    flush_tlb_range(vaddr, pages);
+    return vaddr + phys_offset;
+}
+
 fn ceil_log2(v as i64) as i32 {
     if (v <= 1) { return cast(i32, 0); }
     let is i32 as n with mut = 0;
@@ -906,6 +966,7 @@ fn init() as void {
     PTE_TABLE_USER = PTE_PRESENT | PTE_WRITE | PTE_USER;
     KMAP_DATA = PTE_PRESENT | PTE_WRITE | PTE_NX;
     KMAP_MMIO = PTE_PRESENT | PTE_WRITE | PTE_NX | PTE_PCD | PTE_PWT;
+    KMAP_WC   = PTE_PRESENT | PTE_WRITE | PTE_NX | PTE_PWT;   // PA1 reprogrammed to WC
     USER_SPACE_END = 0x00007FFFFFFFFFFF;
 
     // Read Limine's PML4
@@ -1029,6 +1090,10 @@ fn init() as void {
         serial.println(" ok", 3);
         dma_free(dma_result_vaddr);
     }
+
+    // Write-combining PAT entry for the BSP. APs run pat_init() themselves
+    // from ap_entry, after they load this PML4.
+    pat_init();
 
     serial.println("vmm: ready", 10);
 }
