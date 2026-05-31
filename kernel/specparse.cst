@@ -25,6 +25,7 @@ use "util.cst" as util;
 use "ksym.cst" as ksym;
 use "spec.cst" as spec;
 use "driver.cst" as driver;
+use "abi.cst" as abi;
 
 // Shuttle globals to read the linker-provided section bounds via asm.
 let is i64 as _idx_start with mut = 0;
@@ -289,6 +290,61 @@ fn _parse_lifecycle_block(p as *Parser, s as *spec.Spec) as void {
     }
 }
 
+// Maps a device-class name to its abi.DEV_* enum, or -1 if unknown. The class
+// taxonomy lives in abi.cst (it is ABI); this is just the text spelling of an
+// existing enum, not a new concept — extend both together when a class lands.
+fn _dev_class_of(name as *u8, len as i64) as i64 {
+    // "keyboard"
+    if (len == 8 && name[0] == cast(u8, 107) && name[7] == cast(u8, 100)) { return abi.DEV_KEYBOARD; }
+    // "framebuffer"
+    if (len == 11 && name[0] == cast(u8, 102) && name[10] == cast(u8, 114)) { return abi.DEV_FB; }
+    return cast(i64, 0 - 1);
+}
+
+// Parses the `device { class: <name>; acquire: module.fn }` block. `class` is
+// the userspace device class the driver provides (mapped to abi.DEV_* by
+// name); `acquire` is the symbol that mints an instance's *KObject, resolved
+// via ksym. The framework device_register's the pair after a successful bind —
+// the driver writes no registration code. Both keys are required for the
+// block to take effect (a half-declared block is a parse error).
+fn _parse_device_block(p as *Parser, s as *spec.Spec) as void {
+    if (_expect_char(p, cast(u8, 123)) == 0) { return; }   // '{'
+    while (p.ok == 1) {
+        _skip_trivia(p);
+        if (_peek(p) == cast(u8, 125)) { p.pos = p.pos + 1; break; }  // '}'
+        let is *u8 as key_ptr with mut = cast(*u8, 0);
+        let is i64 as key_len with mut = 0;
+        if (_read_ident(p, &key_ptr, &key_len) == 0) { return; }
+        if (_expect_char(p, cast(u8, 58)) == 0) { return; }            // ':'
+        let is *u8 as v_ptr with mut = cast(*u8, 0);
+        let is i64 as v_len with mut = 0;
+        if (_read_ident(p, &v_ptr, &v_len) == 0) { return; }
+        if (key_len == 5 && key_ptr[0] == cast(u8, 99)) {              // "class"
+            let is i64 as cls = _dev_class_of(v_ptr, v_len);
+            if (cls < 0) {
+                serial.print("specparse: unknown device class: ", 32);
+                serial.print(v_ptr, cast(i32, v_len));
+                serial.println("", 0);
+                p.ok = 0; return;
+            }
+            s.provides = cls;
+        } else if (key_len == 7 && key_ptr[0] == cast(u8, 97)) {       // "acquire"
+            let is i64 as addr = ksym.lookup(v_ptr, v_len);
+            if (addr == 0) {
+                serial.print("specparse: unresolved ksym: ", 28);
+                serial.print(v_ptr, cast(i32, v_len));
+                serial.println("", 0);
+                p.ok = 0; return;
+            }
+            s.on_acquire = cast(fn(i64) as i64, addr);
+        } else {
+            p.ok = 0; return;
+        }
+        _skip_trivia(p);
+        if (_peek(p) == cast(u8, 59)) { p.pos = p.pos + 1; }
+    }
+}
+
 // Phase 4 slice 2: parses the `implements` block.
 //   implements {
 //       IfaceName {
@@ -462,6 +518,10 @@ fn parse_and_register(start as *u8, end as *u8) as i32 {
     let is i64 as zi with mut = 0;
     while (zi < sizeof(spec.Spec)) { zp[zi] = cast(u8, 0); zi = zi + 1; }
     let is *spec.Spec as s = cast(*spec.Spec, spec_addr);
+    // provides defaults to -1 (none), NOT the zero from the memset — DEV_FB is
+    // 0, so a zeroed provides would falsely claim every driver serves the
+    // framebuffer. Only a `device { class: ... }` block overrides this.
+    s.provides = cast(i64, 0 - 1);
 
     let is Parser as par;
     par.src = start;
@@ -504,6 +564,8 @@ fn parse_and_register(start as *u8, end as *u8) as i32 {
             _parse_capabilities_block(&par, s);
         } else if (sec_len == 10 && sec_ptr[0] == cast(u8, 105)) {      // implements
             _parse_implements_block(&par, s);
+        } else if (sec_len == 6 && sec_ptr[0] == cast(u8, 100)) {       // device
+            _parse_device_block(&par, s);
         } else {
             heap.kfree(spec_addr); return cast(i32, 0 - 9);
         }

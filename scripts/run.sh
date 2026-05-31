@@ -10,6 +10,11 @@ caustic -c kernel/main.cst
 
 echo "==> Assembling..."
 caustic-as kernel/main.cst.s
+# cdvrspec_data.s .incbin's the .cdvrspec text blobs — re-assemble it every
+# build so editing a driver's .cdvrspec (e.g. its `device { class }` block)
+# actually reaches the kernel. Skipping this leaves a stale .s.o and the build
+# silently runs the old specs (or none).
+caustic-as kernel/cdvrspec_data.s
 caustic-as kernel/smp_asm.s
 caustic-as kernel/syscall_entry.s
 
