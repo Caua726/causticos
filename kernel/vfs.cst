@@ -25,6 +25,8 @@ use "serial.cst" as serial;
 use "util.cst"   as util;
 use "sched.cst"  as sched;
 use "timer.cst"  as timer;
+use "abi.cst"    as abi;
+use "kobject.cst" as kobject;
 
 // ============================================================
 // Error codes. Negative to play nice with syscalls that return -errno.
@@ -200,6 +202,7 @@ fn init() as void {
     }
     mount_pool_used = 0;
     set_mount_head(cast(*VfsMount, 0));
+    file_ops_init();
     serial.println("vfs: ready", 10);
 }
 
@@ -570,6 +573,80 @@ fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
     if ((ro.attr & ATTR_DIR) != 0) { out.is_dir = 1; } else { out.is_dir = 0; }
     f.readdir_idx = f.readdir_idx + 1;
     return VFS_OK;
+}
+
+// ============================================================
+// KObject (file kind) — a VfsFile is the `priv` of a KOBJ_FILE. These
+// wrappers give the typed vfs ops the uniform i64 signature the KObject
+// vtable expects, and map the VFS errno dialect to the abi.E_* set so
+// every fd-backed object speaks one error language. The fd table itself
+// already stores an opaque i64; sys_open mints one of these and parks it.
+// ============================================================
+
+// VFS_* → abi.E_* . Single source of truth (the metadata syscalls call
+// this too, via vfs.err_to_abi).
+fn err_to_abi(rc as i64) as i64 {
+    if (rc == cast(i64, VFS_ENOENT))    { return abi.E_NOENT; }
+    if (rc == cast(i64, VFS_EBADF))     { return abi.E_BADF; }
+    if (rc == cast(i64, VFS_EINVAL))    { return abi.E_INVAL; }
+    if (rc == cast(i64, VFS_EISDIR))    { return abi.E_ISDIR; }
+    if (rc == cast(i64, VFS_ENOTDIR))   { return abi.E_NOTDIR; }
+    if (rc == cast(i64, VFS_EEXIST))    { return abi.E_EXIST; }
+    if (rc == cast(i64, VFS_EMFILE))    { return abi.E_MFILE; }
+    if (rc == cast(i64, VFS_ENOSPC))    { return abi.E_NOSPC; }
+    if (rc == cast(i64, VFS_EIO))       { return abi.E_IO; }
+    return abi.E_INVAL;
+}
+
+fn file_op_read(priv as i64, buf as i64, n as i64) as i64 {
+    let is i64 as r = read(cast(*VfsFile, priv), cast(*u8, buf), n);
+    if (r < 0) { return err_to_abi(r); }
+    return r;
+}
+
+fn file_op_write(priv as i64, buf as i64, n as i64) as i64 {
+    let is i64 as r = write(cast(*VfsFile, priv), cast(*u8, buf), n);
+    if (r < 0) { return err_to_abi(r); }
+    return r;
+}
+
+fn file_op_close(priv as i64) as i64 {
+    let is i32 as r = close(cast(*VfsFile, priv));
+    if (r != 0) { return err_to_abi(cast(i64, r)); }
+    return abi.E_OK;
+}
+
+fn file_op_lseek(priv as i64, off as i64, whence as i64) as i64 {
+    let is i64 as r = lseek(cast(*VfsFile, priv), off, cast(i32, whence));
+    if (r < 0) { return err_to_abi(r); }
+    return r;
+}
+
+fn file_op_readdir(priv as i64, out as i64) as i64 {
+    let is i32 as r = readdir(cast(*VfsFile, priv), cast(*VfsDirEntry, out));
+    if (r != 0) { return err_to_abi(cast(i64, r)); }
+    return abi.E_OK;
+}
+
+// The single FILE vtable; filled in init() (fn pointers don't const-init
+// cleanly). mmap/present stay null (a file is a byte stream, not a
+// surface), so ko_mmap/ko_present on a file fd return E_INVAL — honest.
+let is kobject.KObjectOps as FILE_OPS with mut;
+
+fn file_ops_init() as void {
+    FILE_OPS.read    = fn_ptr(file_op_read);
+    FILE_OPS.write   = fn_ptr(file_op_write);
+    FILE_OPS.close   = fn_ptr(file_op_close);
+    FILE_OPS.lseek   = fn_ptr(file_op_lseek);
+    FILE_OPS.readdir = fn_ptr(file_op_readdir);
+}
+
+// Wrap an open *VfsFile in a fresh KOBJ_FILE. Returns the *KObject as i64
+// (0 on OOM). The caller installs it in the fd table; ko_unref closes the
+// file when the last fd drops.
+fn make_file_kobject(f as *VfsFile) as i64 {
+    if (cast(i64, f) == 0) { return 0; }
+    return kobject.ko_alloc(kobject.KOBJ_FILE, &FILE_OPS, cast(i64, f));
 }
 
 // ============================================================

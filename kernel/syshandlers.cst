@@ -16,6 +16,7 @@ use "sched.cst" as sched;
 use "userspace.cst" as userspace;
 use "vma.cst" as vma;
 use "vfs.cst" as vfs;
+use "kobject.cst" as kobject;
 use "process.cst" as proc;
 use "heap.cst" as heap;
 
@@ -220,17 +221,11 @@ fn sys_munmap(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64
 // errno set so userspace sees one consistent scheme.
 // ============================================================
 
+// VFS_* → abi.E_* . The mapping table lives in vfs.cst (the FILE KObject
+// wrappers need it too); this is a thin forward so the path-based metadata
+// handlers below keep their call sites.
 fn vfs_err_to_abi(rc as i64) as i64 {
-    if (rc == vfs.VFS_ENOENT)   { return abi.E_NOENT; }
-    if (rc == vfs.VFS_EBADF)    { return abi.E_BADF; }
-    if (rc == vfs.VFS_EINVAL)   { return abi.E_INVAL; }
-    if (rc == vfs.VFS_EISDIR)   { return abi.E_ISDIR; }
-    if (rc == vfs.VFS_ENOTDIR)  { return abi.E_NOTDIR; }
-    if (rc == vfs.VFS_EEXIST)   { return abi.E_EXIST; }
-    if (rc == vfs.VFS_EMFILE)   { return abi.E_MFILE; }
-    if (rc == vfs.VFS_ENOSPC)   { return abi.E_NOSPC; }
-    if (rc == vfs.VFS_EIO)      { return abi.E_IO; }
-    return abi.E_INVAL;
+    return vfs.err_to_abi(rc);
 }
 
 let is i64 as PATH_MAX = 255;
@@ -256,8 +251,13 @@ fn sys_open(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is *vfs.VfsFile as fp = vfs.open(kp, path_len, cast(i32, c));
     if (cast(i64, fp) == 0) { return abi.E_NOENT; }
 
-    let is i64 as fd = vma.fd_alloc(cast(*vma.Aspace, asp), cast(i64, fp));
-    if (fd < 0) { vfs.close(fp); return abi.E_MFILE; }
+    // Wrap the open file in a KObject (the fd-table entry is a *KObject,
+    // not a *VfsFile — an fd can back a file, surface, channel, or device).
+    let is i64 as ko = vfs.make_file_kobject(fp);
+    if (ko == 0) { vfs.close(fp); return abi.E_NOMEM; }
+
+    let is i64 as fd = vma.fd_alloc(cast(*vma.Aspace, asp), ko);
+    if (fd < 0) { kobject.ko_unref(ko); return abi.E_MFILE; }
     return fd;
 }
 
@@ -271,9 +271,8 @@ fn sys_read(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is i64 as tid = sched.current_tid();
     let is i64 as asp = sched.thr_aspace_ptr(tid);
     if (asp == 0) { return abi.E_INVAL; }
-    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
-    if (fv == 0) { return abi.E_BADF; }
-    let is *vfs.VfsFile as fp = cast(*vfs.VfsFile, fv);
+    let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (ko == 0) { return abi.E_BADF; }
     let is i64 as pml4 = sched.thr_aspace_pml4(tid);
 
     let is [4096]u8 as kbuf;
@@ -282,10 +281,10 @@ fn sys_read(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     while (total < n) {
         let is i64 as chunk with mut = n - total;
         if (chunk > IO_PAGE_BYTES) { chunk = IO_PAGE_BYTES; }
-        let is i64 as got = vfs.read(fp, kp, chunk);
+        let is i64 as got = kobject.ko_read(ko, cast(i64, kp), chunk);
         if (got < 0) {
             if (total > 0) { return total; }
-            return vfs_err_to_abi(got);
+            return got;                                  // already an abi errno
         }
         if (got == 0) { return total; }                 // EOF
         let is i32 as wrc = userspace.copy_to_user(pml4, b + total, kp, got);
@@ -307,9 +306,8 @@ fn sys_write(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     let is i64 as tid = sched.current_tid();
     let is i64 as asp = sched.thr_aspace_ptr(tid);
     if (asp == 0) { return abi.E_INVAL; }
-    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
-    if (fv == 0) { return abi.E_BADF; }
-    let is *vfs.VfsFile as fp = cast(*vfs.VfsFile, fv);
+    let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (ko == 0) { return abi.E_BADF; }
     let is i64 as pml4 = sched.thr_aspace_pml4(tid);
 
     let is [4096]u8 as kbuf;
@@ -323,10 +321,10 @@ fn sys_write(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
             if (total > 0) { return total; }
             return abi.E_FAULT;
         }
-        let is i64 as wrote = vfs.write(fp, kp, chunk);
+        let is i64 as wrote = kobject.ko_write(ko, cast(i64, kp), chunk);
         if (wrote < 0) {
             if (total > 0) { return total; }
-            return vfs_err_to_abi(wrote);
+            return wrote;                                // already an abi errno
         }
         total = total + wrote;
         if (wrote < chunk) { return total; }              // short write
@@ -334,14 +332,15 @@ fn sys_write(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     return total;
 }
 
-// SYS_CLOSE(fd) — drop the file and free the fd slot.
+// SYS_CLOSE(fd) — drop the object's fd reference and free the slot. The
+// last reference runs the object's close op (the file flushes, etc.).
 fn sys_close(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
     if (asp == 0) { return abi.E_INVAL; }
-    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
-    if (fv == 0) { return abi.E_BADF; }
-    vfs.close(cast(*vfs.VfsFile, fv));
-    vma.fd_close(cast(*vma.Aspace, asp), a);
+    let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (ko == 0) { return abi.E_BADF; }
+    vma.fd_close(cast(*vma.Aspace, asp), a);             // clear the slot first
+    kobject.ko_unref(ko);                                // then drop the reference
     return abi.E_OK;
 }
 
@@ -349,11 +348,105 @@ fn sys_close(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
 fn sys_lseek(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
     if (asp == 0) { return abi.E_INVAL; }
-    let is i64 as fv = vma.fd_get(cast(*vma.Aspace, asp), a);
-    if (fv == 0) { return abi.E_BADF; }
-    let is i64 as r = vfs.lseek(cast(*vfs.VfsFile, fv), b, cast(i32, c));
-    if (r < 0) { return vfs_err_to_abi(r); }
-    return r;
+    let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (ko == 0) { return abi.E_BADF; }
+    return kobject.ko_lseek(ko, b, c);                   // already an abi errno on failure
+}
+
+// SYS_UNLINK(path, len) — remove a file. Thin forward to vfs.unlink.
+fn sys_unlink(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (b <= 0 || b > PATH_MAX) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is [256]u8 as kpath;
+    let is *u8 as kp = cast(*u8, &kpath[0]);
+    if (userspace.copy_from_user(pml4, kp, a, b) != 0) { return abi.E_FAULT; }
+    let is i32 as r = vfs.unlink(kp, b);
+    if (r < 0) { return vfs_err_to_abi(cast(i64, r)); }
+    return abi.E_OK;
+}
+
+// SYS_MKDIR(path, len) — create a directory. Thin forward to vfs.mkdir.
+fn sys_mkdir(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (b <= 0 || b > PATH_MAX) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is [256]u8 as kpath;
+    let is *u8 as kp = cast(*u8, &kpath[0]);
+    if (userspace.copy_from_user(pml4, kp, a, b) != 0) { return abi.E_FAULT; }
+    let is i32 as r = vfs.mkdir(kp, b);
+    if (r < 0) { return vfs_err_to_abi(cast(i64, r)); }
+    return abi.E_OK;
+}
+
+// SYS_RMDIR(path, len) — remove an empty directory. Thin forward to vfs.rmdir.
+fn sys_rmdir(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (b <= 0 || b > PATH_MAX) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is [256]u8 as kpath;
+    let is *u8 as kp = cast(*u8, &kpath[0]);
+    if (userspace.copy_from_user(pml4, kp, a, b) != 0) { return abi.E_FAULT; }
+    let is i32 as r = vfs.rmdir(kp, b);
+    if (r < 0) { return vfs_err_to_abi(cast(i64, r)); }
+    return abi.E_OK;
+}
+
+// SYS_RENAME(src, src_len, dst, dst_len) — rename/move. Forward to vfs.rename.
+fn sys_rename(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (b <= 0 || b > PATH_MAX || d <= 0 || d > PATH_MAX) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is [256]u8 as ksrc;
+    let is [256]u8 as kdst;
+    let is *u8 as ksp = cast(*u8, &ksrc[0]);
+    let is *u8 as kdp = cast(*u8, &kdst[0]);
+    if (userspace.copy_from_user(pml4, ksp, a, b) != 0) { return abi.E_FAULT; }
+    if (userspace.copy_from_user(pml4, kdp, c, d) != 0) { return abi.E_FAULT; }
+    let is i32 as r = vfs.rename(ksp, b, kdp, d);
+    if (r < 0) { return vfs_err_to_abi(cast(i64, r)); }
+    return abi.E_OK;
+}
+
+// SYS_STAT(path, len, out) — fill the user's VfsStat. Forward to vfs.stat_path.
+fn sys_stat(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    if (b <= 0 || b > PATH_MAX) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is [256]u8 as kpath;
+    let is *u8 as kp = cast(*u8, &kpath[0]);
+    if (userspace.copy_from_user(pml4, kp, a, b) != 0) { return abi.E_FAULT; }
+    let is vfs.VfsStat as st;
+    let is i32 as r = vfs.stat_path(kp, b, &st);
+    if (r < 0) { return vfs_err_to_abi(cast(i64, r)); }
+    if (userspace.copy_to_user(pml4, c, cast(*u8, &st), sizeof(vfs.VfsStat)) != 0) { return abi.E_FAULT; }
+    return abi.E_OK;
+}
+
+// SYS_READDIR(fd, out) — next dir entry into the user's VfsDirEntry. Returns
+// 0 when an entry is filled; a negative errno (E_NOENT) marks end-of-directory.
+fn sys_readdir(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (ko == 0) { return abi.E_BADF; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is vfs.VfsDirEntry as de;
+    let is i64 as r = kobject.ko_readdir(ko, cast(i64, &de));
+    if (r != 0) { return r; }                            // already an abi errno
+    if (userspace.copy_to_user(pml4, b, cast(*u8, &de), sizeof(vfs.VfsDirEntry)) != 0) { return abi.E_FAULT; }
+    return abi.E_OK;
 }
 
 // ============================================================
@@ -450,4 +543,10 @@ fn install_all() as void {
     install(abi.SYS_LSEEK,           cast(i64, fn_ptr(sys_lseek)));
     install(abi.SYS_SPAWN,           cast(i64, fn_ptr(sys_spawn)));
     install(abi.SYS_WAIT,            cast(i64, fn_ptr(sys_wait)));
+    install(abi.SYS_UNLINK,          cast(i64, fn_ptr(sys_unlink)));
+    install(abi.SYS_MKDIR,           cast(i64, fn_ptr(sys_mkdir)));
+    install(abi.SYS_RMDIR,           cast(i64, fn_ptr(sys_rmdir)));
+    install(abi.SYS_RENAME,          cast(i64, fn_ptr(sys_rename)));
+    install(abi.SYS_STAT,            cast(i64, fn_ptr(sys_stat)));
+    install(abi.SYS_READDIR,         cast(i64, fn_ptr(sys_readdir)));
 }

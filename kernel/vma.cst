@@ -24,6 +24,7 @@ use "heap.cst" as heap;
 use "pmm.cst" as pmm;
 use "vmm.cst" as vmm;
 use "lock.cst" as lock;
+use "kobject.cst" as kobject;
 
 // ============================================================
 // Constants — flags + helpers
@@ -113,6 +114,13 @@ fn aspace_pml4(a as *Aspace) as i64 {
 // process-exit path; this function just does the bookkeeping.
 fn aspace_destroy(a as *Aspace) as void {
     if (cast(i64, a) == 0) { return; }
+    // Close every fd still open before tearing down memory: a process
+    // that exits with open fds must not leak its KObjects. The drain runs
+    // first so a surface's close op (which frees its backbuffer pages) and
+    // a file's (which returns the VfsFile to the pool) happen while the
+    // aspace is still coherent. No concurrency: the contract is that no
+    // thread runs against this aspace anymore.
+    fd_table_drain(a);
     let is i64 as flags = lock.acquire_irq(lk_ptr(a));
     let is *Vma as v with mut = a.vma_head;
     while (cast(i64, v) != 0) {
@@ -442,6 +450,27 @@ fn fd_close(a as *Aspace, fd as i64) as i32 {
     a.fd_count = a.fd_count - 1;
     lock.release_irq(lk_ptr(a), flags);
     return 0;
+}
+
+// Close every fd still open in this aspace: drop each KObject's fd
+// reference. The last reference runs the object's close op — a file
+// returns its VfsFile to the pool, a surface frees its backbuffer pages.
+// Without this, a process that exits with open fds leaks the KObject (and,
+// for a surface, framebuffer pages — worse than a VfsFile). Called by
+// aspace_destroy on process teardown; no lock, since by then no thread
+// runs against this aspace.
+fn fd_table_drain(a as *Aspace) as void {
+    if (cast(i64, a) == 0) { return; }
+    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    let is i64 as i with mut = 0;
+    while (i < FD_TABLE_CAP) {
+        if (t[i] != 0) {
+            kobject.ko_unref(t[i]);
+            t[i] = 0;
+        }
+        i = i + 1;
+    }
+    a.fd_count = 0;
 }
 
 // ============================================================
