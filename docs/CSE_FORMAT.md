@@ -122,39 +122,20 @@ numbers and the operation set change:
   **preserved:** `rbx, rbp, r12–r15, rsp` — exactly like a C call. Hold any
   value that must survive a syscall in a callee-saved register.
 
-### v0 syscall numbers (causticos, see `kernel/abi.cst`)
+### Syscall numbers + the full operation set
 
-| # | name | args | notes |
-|---|---|---|---|
-| 0 | KERN_INFO | `(buf, buf_size)` | fills KernInfo; `size==0` returns required size |
-| 1 | TIME_NOW_NS | `()` | returns monotonic ns in `rax` |
-| 2 | TIME_SLEEP_NS | `(ns)` | |
-| 3 | PROC_EXIT | `(code)` | never returns |
-| 4 | PROC_GETPID | `()` | returns tid |
-| 5 | PROC_YIELD | `()` | |
-| 6 | IO_WRITE_SERIAL | `(buf, len)` | kernel console; **no fd** |
+The register convention above is the stable part. The **syscall numbers,
+arguments, errnos, struct layouts, and usage patterns** now live in their own
+reference — **[syscall-abi.md](syscall-abi.md)** — because the set has grown
+well past the original five. As of `SYS_COUNT = 25` it includes fd-based file
+I/O (`open/read/write/close/lseek` + metadata), user `mmap`/`munmap`,
+processes (`spawn`/`wait` with fd handoff), the display (`dev_open`/`present`),
+IPC (`channel_create`), and the keyboard device. The `caustic-x86_64` syscall
+lib emits one thin wrapper per entry there.
 
-### Mapping the stdlib facade → causticos (the `caustic-x86_64` backend)
-
-These are **semantic adapters**, not renumbered Linux wrappers — the
-operations differ in shape:
-
-| stdlib op | causticos call | note |
-|---|---|---|
-| `write(fd, buf, n)` | `syscall(6, buf, n)` | fd∈{1,2}→serial; **drops fd** in v0 |
-| `exit(code)` | `syscall(3, code)` | |
-| `getpid()` | `syscall(4)` | |
-| sleep / nanosleep | `syscall(2, ns)` | |
-| clock / time-now | `syscall(1)` → ns | |
-
-### v0 limit (honest)
-
-Only programs using **write / exit / getpid / sleep / time** run. There is
-**no `read`, `open`, `close`, `mmap`, `brk`** yet — causticos has no
-fd-based file I/O or user mmap syscall. Those arrive with the **capability
-chain** (a `FILE` object type, fd-based read/write/open, a user `mmap`),
-which is the next ABI-growth step, gated on the self-host need. A `hello +
-exit` program is the realistic first CSE target; reading a file is not yet.
+> Historical note: this section once listed only 7 calls (write/exit/getpid/
+> sleep/time) and said "no read/open/mmap yet" — true at CSE bring-up
+> (2026-05-17), long obsolete now. See syscall-abi.md for the live contract.
 
 ---
 
