@@ -32,6 +32,7 @@ use "process.cst" as proc;
 use "fb.cst" as fb;
 use "channel.cst" as channel;
 use "kobject.cst" as kobject;
+use "kbd.cst" as kbd;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
 // pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
@@ -1504,6 +1505,95 @@ fn spawn_fdacts_smoke() as void {
     }
 }
 
+// ============================================================
+// Embedded "keyboard child" CSE — proves the raw-input path from ring 3:
+// dev_open(DEV_KEYBOARD) → read(fd, &ev, 2) → exit(ev[0]). The kernel
+// injects a synthetic raw event (QEMU has no physical keyboard) and checks
+// the child exits with that scancode — read off the device by syscall.
+// ============================================================
+
+let is i64 as CSE_KB_ENTRY  = 0x401000;
+let is i64 as CSE_KB_BSS_VA = 0x402000;
+let is i64 as CSE_KB_FOFF   = 0x50;
+let is i64 as child_kb_len with mut = 0;
+let is [256]u8 as child_kb;
+
+fn build_kbd_child_cse() as void {
+    let is *u8 as e = cast(*u8, &child_kb[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, CSE_KB_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, CSE_KB_ENTRY);
+    write_le_u32(e, 0x28, CSE_KB_FOFF);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, CSE_KB_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_KB_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, CSE_KB_BSS_VA); c = c + 10;
+    // dev_open(DEV_KEYBOARD=1, 0, 0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,22
+    e[c+0]=cast(u8,0xBF); e[c+1]=cast(u8,1); e[c+2]=cast(u8,0); e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); c = c + 5;  // mov edi,1
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;                        // xor esi,esi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;                        // xor edx,edx
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;  // mov [r15+0],rax (fd)
+    // read(fd, r15+8, 2)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,10
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x08); c = c + 4;  // lea rsi,[r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,2); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rdx,2
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    // exit(byte [r15+8])
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x7F); e[c+4]=cast(u8,0x08); c = c + 5;  // movzx edi, byte [r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+
+    let is i64 as text_size = c - CSE_KB_FOFF;
+    write_le_u32(e, 0x2C, text_size);
+    write_le_u32(e, 0x30, text_size);
+    child_kb_len = c;
+}
+
+// Spawn the keyboard child, inject a synthetic raw event, confirm it exits
+// with the scancode it read off DEV_KEYBOARD (ring-3 dev_open + read).
+fn spawn_kbd_smoke() as void {
+    serial.println("userspace.kbd_smoke: start", 26);
+    build_kbd_child_cse();
+
+    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &child_kb[0]), child_kb_len);
+    if (child == 0) {
+        serial.println("userspace.kbd_smoke: spawn FAIL", 31);
+        return;
+    }
+    proc_start(child);
+    // Inject scancode 7, pressed (the child's blocking device-read wakes).
+    kbd.inject_event(7, 1);
+
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(child));
+    if (code == 7) {
+        serial.println("userspace.kbd_smoke: PASS", 25);
+    } else {
+        serial.print("userspace.kbd_smoke: exit=", 26);
+        util.print_num(code);
+        serial.println(" FAIL", 5);
+    }
+}
+
 fn spawn_user_cse_smoke() as void {
     serial.println("userspace.cse_smoke: start", 26);
 
@@ -2058,6 +2148,7 @@ fn smoke_thread() as void {
     spawn_user_fb_smoke();
     spawn_channel_smoke();
     spawn_fdacts_smoke();
+    spawn_kbd_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
 }

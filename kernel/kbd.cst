@@ -1,23 +1,126 @@
 // kbd.cst — PS/2 keyboard driver, spec-framework style.
-// Declares match + CAP_IRQ in kernel/kbd.cdvrspec. The framework
-// allocates the vector, programs the IOAPIC redirection, and registers
-// the handler — this file just exposes the ksym for the parser and
-// implements the handler (read scan code from port 0x60, log it).
+// Declares match + CAP_IRQ in kernel/kbd.cdvrspec. The framework allocates
+// the vector, programs the IOAPIC redirection, and registers the handler.
+//
+// The keyboard is a DEVICE that yields RAW events (docs/architecture.md §8):
+// the IRQ handler decodes the PS/2 set-1 protocol only as far as the device
+// itself defines it — scancode + down/up + the 0xE0 "extended" prefix — and
+// enqueues a 2-byte event. It applies NO keymap: layout, "Ctrl+C", which
+// scancode is which char — all userspace policy. dev_open(DEV_KEYBOARD)
+// hands back a KOBJ_DEVICE whose read drains the raw-event ring (lossless;
+// the holder sees presses AND releases). Mechanism in the kernel, policy out.
 
 use "driver.cst" as driver;
 use "ksym.cst" as ksym;
 use "port.cst" as port;
 use "serial.cst" as serial;
-use "util.cst" as util;
+use "kobject.cst" as kobject;
+use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "abi.cst" as abi;
+
+// 2-byte events: [scancode, flags]. flags bit0 = pressed (1) / released (0),
+// bit1 = extended (0xE0-prefixed). 256-byte ring = 128 events.
+let is i64 as KBD_CAP  = 256;
+let is i64 as KBD_MASK = 255;
+
+let is [256]u8 as kbd_buf with mut;
+let is i64 as kbd_head with mut = 0;
+let is i64 as kbd_tail with mut = 0;
+let is i64 as kbd_count with mut = 0;
+let is i64 as kbd_e0 with mut = 0;            // 0xE0 prefix pending
+let is lock.TicketLock as kbd_lk;
 
 let is ksym.KSym as ksym_handler;
+let is kobject.KObjectOps as KBD_OPS with mut;
 
+fn kbd_init() as void {
+    KBD_OPS.read  = fn_ptr(kbd_read);
+    KBD_OPS.close = fn_ptr(kbd_close);
+    // write/mmap/present/lseek/readdir stay null — a keyboard is a read-only
+    // raw-event stream, not a byte file, not a surface.
+}
+
+// Enqueue one 2-byte raw event. Full buffer drops the event (bounded; a
+// reader that vanishes can't make us grow without limit). Caller must NOT
+// hold kbd_lk.
+fn kbd_enqueue(sc as i64, flags as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&kbd_lk);
+    if (kbd_count + 2 <= KBD_CAP) {
+        kbd_buf[kbd_tail] = cast(u8, sc & 0xFF);
+        kbd_tail = (kbd_tail + 1) & KBD_MASK;
+        kbd_buf[kbd_tail] = cast(u8, flags & 0xFF);
+        kbd_tail = (kbd_tail + 1) & KBD_MASK;
+        kbd_count = kbd_count + 2;
+    }
+    lock.release_irq(&kbd_lk, fl);
+}
+
+// IRQ handler: read the scancode, decode the set-1 protocol (down/up +
+// the 0xE0 extended prefix), enqueue the raw event. No keymap, no logging.
 fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
-    let is i64 as sc = port.inb(0x60);
-    serial.print("kbd: sc=", 8);
-    util.print_hex(sc);
-    serial.println("", 0);
+    let is i64 as byte = port.inb(0x60);
+    if (byte == 0xE0) {
+        let is i64 as fl = lock.acquire_irq(&kbd_lk);
+        kbd_e0 = 1;
+        lock.release_irq(&kbd_lk, fl);
+        return 0;
+    }
+    let is i64 as pressed with mut = 1;
+    if ((byte & 0x80) != 0) { pressed = 0; }
+    let is i64 as sc = byte & 0x7F;
+    let is i64 as fl2 = lock.acquire_irq(&kbd_lk);
+    let is i64 as e0 = kbd_e0;
+    kbd_e0 = 0;
+    lock.release_irq(&kbd_lk, fl2);
+    let is i64 as flags with mut = pressed;
+    if (e0 != 0) { flags = flags | 2; }
+    kbd_enqueue(sc, flags);
     return 0;
+}
+
+// Test hook: inject a synthetic raw event (same path the IRQ uses), so the
+// device can be exercised without physical key presses (QEMU has no input).
+fn inject_event(sc as i64, flags as i64) as void {
+    kbd_enqueue(sc, flags);
+}
+
+// Device read op: drain raw-event bytes from the ring. Blocks (polling, like
+// the channel) until at least one byte is available — there is no EOF for a
+// keyboard. priv is unused (single keyboard, one shared ring).
+fn kbd_read(priv as i64, buf as i64, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    let is i64 as done with mut = 0;
+    let is i64 as result with mut = 0;
+    while (done == 0) {
+        let is i64 as fl = lock.acquire_irq(&kbd_lk);
+        let is i64 as avail = kbd_count;
+        let is i64 as take with mut = n;
+        if (take > avail) { take = avail; }
+        let is i64 as i with mut = 0;
+        while (i < take) {
+            let is *u8 as d = cast(*u8, buf + i);
+            d[0] = kbd_buf[kbd_head];
+            kbd_head = (kbd_head + 1) & KBD_MASK;
+            i = i + 1;
+        }
+        kbd_count = kbd_count - take;
+        lock.release_irq(&kbd_lk, fl);
+        if (take > 0) { result = take; done = 1; }
+        else { sched.sleep_for_ns(2000000); }      // 2 ms, no events yet
+    }
+    return result;
+}
+
+fn kbd_close(priv as i64) as i64 {
+    return abi.E_OK;                                // shared global ring — nothing to free
+}
+
+// dev_open(DEV_KEYBOARD) → a KOBJ_DEVICE over the raw-event ring. v0 has no
+// exclusivity enforcement (the preemptible grab stack is a refinement); the
+// single ring is shared by any holder.
+fn kbd_acquire() as i64 {
+    return kobject.ko_alloc(kobject.KOBJ_DEVICE, &KBD_OPS, 1);
 }
 
 fn register() as void {
