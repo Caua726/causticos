@@ -168,61 +168,114 @@ fn get_root() as *Hardware {
 // one more on_bind, kernel untouched.)
 // ============================================================
 
-let is i64 as MAX_DEVICE_CLASSES = 16;
+let is i64 as MAX_DEVICES = 16;
 
-struct DeviceClassEntry {
+// One entry per device INSTANCE — not per class. Several entries may share a
+// class (two keyboards = two entries, same class, two ctx). The index in
+// dev_open(class, index) selects among the entries of that class.
+struct DeviceEntry {
     in_use as i64;
     class as i64;          // abi.DEV_FB / DEV_KEYBOARD / ...
-    acquire as i64;        // fn() as i64 — returns a fresh *KObject (0 = OOM)
+    acquire as i64;        // fn(ctx as i64) as i64 — mints a fresh *KObject (0 = fail)
+    ctx as i64;            // instance discriminator handed to acquire (device-state ptr, or 0)
 }
 
-let is [16]DeviceClassEntry as device_classes with mut;
-let is lock.TicketLock as device_classes_lk;
+let is [16]DeviceEntry as device_table with mut;
+let is lock.TicketLock as device_table_lk;
 
-// Announce that `class` is served by `acquire`. Re-registering a class
-// replaces its handler (a later driver can take it over). OK, or
-// OUT_OF_MEMORY if the table is full.
-fn device_class_register(class as i64, acquire as i64) as i32 {
-    let is i64 as fl = lock.acquire_irq(&device_classes_lk);
+// Announce one device INSTANCE of `class`, served by acquire(ctx). Each call
+// is a distinct instance: a driver with two keyboards registers twice (two
+// ctx), and dev_open(class, 0) / (class, 1) resolve to each. Re-announcing the
+// same (class, ctx) is idempotent — it updates the handler instead of
+// appending, so a re-bind can't inflate the count. OK, or OUT_OF_MEMORY when
+// the table is full.
+fn device_register(class as i64, acquire as i64, ctx as i64) as i32 {
+    let is i64 as fl = lock.acquire_irq(&device_table_lk);
     let is i64 as i with mut = 0;
-    while (i < MAX_DEVICE_CLASSES) {
-        if (device_classes[i].in_use != 0 && device_classes[i].class == class) {
-            device_classes[i].acquire = acquire;
-            lock.release_irq(&device_classes_lk, fl);
+    while (i < MAX_DEVICES) {
+        if (device_table[i].in_use != 0 && device_table[i].class == class
+            && device_table[i].ctx == ctx) {
+            device_table[i].acquire = acquire;          // same instance — replace handler
+            lock.release_irq(&device_table_lk, fl);
             return OK;
         }
         i = i + 1;
     }
     i = 0;
-    while (i < MAX_DEVICE_CLASSES) {
-        if (device_classes[i].in_use == 0) {
-            device_classes[i].in_use = 1;
-            device_classes[i].class = class;
-            device_classes[i].acquire = acquire;
-            lock.release_irq(&device_classes_lk, fl);
+    while (i < MAX_DEVICES) {
+        if (device_table[i].in_use == 0) {
+            device_table[i].in_use = 1;
+            device_table[i].class = class;
+            device_table[i].acquire = acquire;
+            device_table[i].ctx = ctx;
+            lock.release_irq(&device_table_lk, fl);
             return OK;
         }
         i = i + 1;
     }
-    lock.release_irq(&device_classes_lk, fl);
+    lock.release_irq(&device_table_lk, fl);
     return OUT_OF_MEMORY;
 }
 
-// Resolve a class to its registered acquire fn (0 if no driver serves it).
-fn device_class_lookup(class as i64) as i64 {
-    let is i64 as fl = lock.acquire_irq(&device_classes_lk);
-    let is i64 as found with mut = 0;
+// Number of registered instances of `class` (>= 0). The userspace device
+// manager calls this (via SYS_DEV_COUNT) to learn how many it can dev_open.
+fn device_count(class as i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&device_table_lk);
+    let is i64 as n with mut = 0;
     let is i64 as i with mut = 0;
-    while (i < MAX_DEVICE_CLASSES) {
-        if (device_classes[i].in_use != 0 && device_classes[i].class == class) {
-            found = device_classes[i].acquire;
-            i = MAX_DEVICE_CLASSES;
+    while (i < MAX_DEVICES) {
+        if (device_table[i].in_use != 0 && device_table[i].class == class) { n = n + 1; }
+        i = i + 1;
+    }
+    lock.release_irq(&device_table_lk, fl);
+    return n;
+}
+
+// Resolve (class, index) to its acquire fn + ctx (written to *out_ctx) WITHOUT
+// minting — the caller invokes acquire(ctx) outside the lock (acquire kmallocs
+// / alloc_pages and must not run under the IRQ-off table lock). Returns the
+// acquire address, or 0 when there is no index-th instance of the class
+// (unserved class OR index >= count). The index is REAL: dev_open(kbd, 1) with
+// a single keyboard resolves to nothing — it does NOT alias instance 0.
+//
+// v0 never removes an entry (no unbind / no hotplug yet), so the (acquire, ctx)
+// captured here stay valid after the lock drops. When unbind lands, an entry
+// refcount will guard this window.
+fn device_resolve(class as i64, index as i64, out_ctx as *i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&device_table_lk);
+    let is i64 as seen with mut = 0;
+    let is i64 as acquire with mut = 0;
+    let is i64 as ctx with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_DEVICES) {
+        if (device_table[i].in_use != 0 && device_table[i].class == class) {
+            if (seen == index) {
+                acquire = device_table[i].acquire;
+                ctx = device_table[i].ctx;
+                i = MAX_DEVICES;
+            } else {
+                seen = seen + 1;
+                i = i + 1;
+            }
         } else {
             i = i + 1;
         }
     }
-    lock.release_irq(&device_classes_lk, fl);
-    return found;
+    lock.release_irq(&device_table_lk, fl);
+    *out_ctx = ctx;
+    return acquire;
+}
+
+// Kernel-side convenience: resolve (class, index) and mint its KObject, or 0
+// when there is no such instance / acquire failed. The syscall layer uses
+// device_resolve directly so it can tell 'no such device' (E_NOENT) from
+// 'acquire OOM' (E_NOMEM); a caller that doesn't care uses this.
+fn device_open(class as i64, index as i64) as i64 {
+    let is i64 as ctx with mut = 0;
+    let is i64 as af = device_resolve(class, index, &ctx);
+    if (af == 0) { return 0; }
+    let is fn(i64) as i64 as acquire = cast(fn(i64) as i64, af);
+    return call(acquire, ctx);
 }
 
 // ============================================================
