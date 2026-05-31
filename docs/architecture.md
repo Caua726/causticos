@@ -209,7 +209,7 @@ shell↔terminal, and all future IPC fall out of it.
 
 ---
 
-## 9. Terminal & shell  *(designed)* — not intrinsic
+## 9. Terminal & shell  *(launch built; the programs are userspace, to come)* — not intrinsic
 
 The kernel knows **nothing** about a shell, a terminal, or a tty. Both are ordinary
 userspace programs.
@@ -223,8 +223,13 @@ userspace programs.
   `wait`. It passes a console channel to each child it runs (that is how the child's
   stdio "inherits"). No special `spawn-by-path` syscall — the shell reads the file and
   passes the image.
-- **Launch.** init/root spawns the terminal; the terminal spawns the shell, handing it
-  a console channel. A fullscreen app may run with no terminal at all.
+- **Launch *(built)*.** The boot path loads `/init.cse` from the FAT32 disk
+  (`vfs.open → read → proc_spawn → proc_start`, behind a bounded mount-wait, failing
+  loud — never a silent hang) and runs it in ring 3. `init` is an ordinary file on the
+  disk, not embedded: drop the terminal in as `/init.cse` and it launches, no kernel
+  change. The terminal then `dev_open`s the surface + keyboard and spawns the shell with
+  a console channel. A fullscreen app may run with no terminal at all. (A stub `/init.cse`
+  proves the handoff today — it writes a ring-3 serial marker.)
 
 Contrast with Unix: the Unix TTY subsystem (line discipline, termios, sessions, job
 control, the controlling terminal) is a large *intrinsic kernel* thing. causticos
@@ -299,6 +304,10 @@ in a swappable userspace program.
   `open`/`read`/`write`/`close`/`lseek`, `spawn`/`wait`,
   `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`, `dev_open`/`dev_count`/`present`/
   `surface_info`, `channel_create`.
+- **Boot → userspace handoff**: the boot path loads `/init.cse` from the FAT32 disk and
+  runs it in ring 3 (bounded mount-wait, loud failure, no silent hang). Proven by a stub
+  that writes a ring-3 serial marker. **This is the last kernel mechanism before the
+  terminal — the kernel side of the userspace model is now complete.**
 
 **Designed here, not yet built:**
 - **Userspace keymap + focus relay** (the kernel side — raw keyboard as a device — is

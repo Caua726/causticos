@@ -214,12 +214,13 @@ what's missing:
    `fb_smoke`. The device-model is also complete: the `index` in `DEV_OPEN` is
    honest, `DEV_COUNT` (26) enumerates, and a driver declares its class in its
    `.cdvrspec` `device { }` block (the framework auto-registers).
-2. **Terminal bootstrap.** *(the one remaining kernel gap)* Today only
-   kernel-side smokes spawn ring-3 programs. To launch a real terminal the
-   kernel needs an "init userspace" step: `OPEN("/init.cse") → READ →
-   proc_spawn → proc_start` from the boot path (the `.cse` lives on the FAT32
-   disk you seed), or an embedded image. The terminal then `DEV_OPEN`s the
-   surface + keyboard itself.
+2. ~~**Terminal bootstrap.**~~ ✅ **Done** — the boot path loads `/init.cse`
+   from the FAT32 disk (`vfs.open → read → proc_spawn → proc_start`), behind a
+   bounded mount-wait, failing loud on serial (never a silent hang). It is an
+   ordinary file on the disk: drop your terminal `.cse` in as `/init.cse` and
+   it launches, no kernel change. A stub proves the path (writes a ring-3
+   serial marker). **This is the handoff point — the kernel side is complete;
+   the terminal is yours.**
 3. *(nice-to-have)* `SYS_PROC_KILL` for the shell to stop a runaway child;
    today only graceful exit + `WAIT`. Not required for a first terminal.
 
