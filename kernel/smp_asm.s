@@ -51,6 +51,15 @@ smp_inc_serving:
     .byte   0xF0, 0x83, 0x07, 0x01        # lock add DWORD PTR [rdi], 1
     ret
 
+# void smp_atomic_add_into(int64_t *p /*rdi*/, int64_t delta /*rsi*/, int64_t *out /*rdx*/)
+# Atomically adds delta to *p, stores the PREVIOUS value of *p in *out.
+# (lock xadd leaves the old value in the source register, here rsi.)
+.globl smp_atomic_add_into
+smp_atomic_add_into:
+    .byte   0xF0, 0x48, 0x0F, 0xC1, 0x37  # lock xadd QWORD PTR [rdi], rsi
+    .byte   0x48, 0x89, 0x32              # mov [rdx], rsi
+    ret
+
 # void smp_save_cli_into(uint64_t *out /*rdi*/)
 .globl smp_save_cli_into
 smp_save_cli_into:

@@ -23,6 +23,7 @@
 use "abi.cst" as abi;
 use "heap.cst" as heap;
 use "pmm.cst" as pmm;
+use "lock.cst" as lock;
 
 // ============================================================
 // Object kinds.
@@ -85,7 +86,7 @@ fn ko_alloc(otype as i64, ops as *KObjectOps, priv as i64) as i64 {
 fn ko_ref(ko as i64) as void {
     if (ko == 0) { return; }
     let is *KObject as k = cast(*KObject, ko);
-    k.refcount = k.refcount + 1;
+    lock.atomic_add(&k.refcount, 1);
 }
 
 // Drop one reference. At zero, run the close op (let the concrete object
@@ -94,15 +95,17 @@ fn ko_ref(ko as i64) as void {
 fn ko_unref(ko as i64) as i64 {
     if (ko == 0) { return abi.E_BADF; }
     let is *KObject as k = cast(*KObject, ko);
-    // Defensive: an already-released object (refcount <= 0) must not be
-    // decremented further or freed twice. A correct caller never hits
-    // this; the guard turns a double-unref bug into a no-op instead of a
-    // use-after-free. (Thread-safe atomic refcounting lands in Fatia 2,
-    // when fdacts lets two fd tables share one KObject; today each KObject
-    // is held by exactly one fd.)
-    if (k.refcount <= 0) { return abi.E_INVAL; }
-    k.refcount = k.refcount - 1;
-    if (k.refcount > 0) { return abi.E_OK; }
+    // Atomic decrement returning the PREVIOUS count — correct when two
+    // aspaces share this object (fdacts handoff) and both teardowns run on
+    // different cpus. old==1 means we took the last reference: run close +
+    // free. old<=0 is a double-unref bug; undo and refuse (best-effort), so
+    // it's a no-op rather than a use-after-free.
+    let is i64 as old = lock.atomic_add(&k.refcount, cast(i64, 0 - 1));
+    if (old <= 0) {
+        lock.atomic_add(&k.refcount, 1);
+        return abi.E_INVAL;
+    }
+    if (old > 1) { return abi.E_OK; }
     let is i64 as rc with mut = abi.E_OK;
     if (cast(i64, k.ops) != 0) {
         if (cast(i64, k.ops.close) != 0) {
