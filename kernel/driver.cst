@@ -158,6 +158,74 @@ fn get_root() as *Hardware {
 }
 
 // ============================================================
+// Userspace device-class registry. A driver announces, when it binds
+// (its `on_bind` callback), which userspace device class it serves
+// (`dev_open(class)`) and the acquire fn that mints a KObject for it.
+// Boot-provided pseudo-devices that never enter the Hardware tree — the
+// Limine framebuffer — register the same way at init. `sys_dev_open` is
+// then a lookup here, not a hardcoded switch: one device mechanism,
+// extended by registration, not edited in the core. (Adding mouse/disk =
+// one more on_bind, kernel untouched.)
+// ============================================================
+
+let is i64 as MAX_DEVICE_CLASSES = 16;
+
+struct DeviceClassEntry {
+    in_use as i64;
+    class as i64;          // abi.DEV_FB / DEV_KEYBOARD / ...
+    acquire as i64;        // fn() as i64 — returns a fresh *KObject (0 = OOM)
+}
+
+let is [16]DeviceClassEntry as device_classes with mut;
+let is lock.TicketLock as device_classes_lk;
+
+// Announce that `class` is served by `acquire`. Re-registering a class
+// replaces its handler (a later driver can take it over). OK, or
+// OUT_OF_MEMORY if the table is full.
+fn device_class_register(class as i64, acquire as i64) as i32 {
+    let is i64 as fl = lock.acquire_irq(&device_classes_lk);
+    let is i64 as i with mut = 0;
+    while (i < MAX_DEVICE_CLASSES) {
+        if (device_classes[i].in_use != 0 && device_classes[i].class == class) {
+            device_classes[i].acquire = acquire;
+            lock.release_irq(&device_classes_lk, fl);
+            return OK;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < MAX_DEVICE_CLASSES) {
+        if (device_classes[i].in_use == 0) {
+            device_classes[i].in_use = 1;
+            device_classes[i].class = class;
+            device_classes[i].acquire = acquire;
+            lock.release_irq(&device_classes_lk, fl);
+            return OK;
+        }
+        i = i + 1;
+    }
+    lock.release_irq(&device_classes_lk, fl);
+    return OUT_OF_MEMORY;
+}
+
+// Resolve a class to its registered acquire fn (0 if no driver serves it).
+fn device_class_lookup(class as i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&device_classes_lk);
+    let is i64 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_DEVICE_CLASSES) {
+        if (device_classes[i].in_use != 0 && device_classes[i].class == class) {
+            found = device_classes[i].acquire;
+            i = MAX_DEVICE_CLASSES;
+        } else {
+            i = i + 1;
+        }
+    }
+    lock.release_irq(&device_classes_lk, fl);
+    return found;
+}
+
+// ============================================================
 // Tree lock — single-CPU: block preemption, don't touch IRQ flag.
 // Composable: preempt_count is a counter, nested locks are safe.
 // Lock ordering (for future bus-type lock): always acquire tree_lock
