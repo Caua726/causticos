@@ -47,7 +47,7 @@ Args are listed by register. "→" is the `rax` return.
 | 11 | `WRITE` | fd | buf | n | | | bytes \| errno |
 | 12 | `CLOSE` | fd | | | | | 0 \| errno |
 | 13 | `LSEEK` | fd | off | whence | | | new offset \| errno |
-| 14 | `SPAWN` | img | img_len | fdacts | n_acts | | child pid \| errno |
+| 14 | `SPAWN` | img | img_len | fdacts | n_acts | argv | argc → child pid \| errno |
 | 15 | `WAIT` | pid | status_ptr | | | | exit code \| `E_AGAIN` |
 | 16 | `UNLINK` | path | path_len | | | | 0 \| errno |
 | 17 | `MKDIR` | path | path_len | | | | 0 \| errno |
@@ -81,6 +81,13 @@ Per-call notes:
   `n_acts ≤ 16`) is the *only* way it gets keys — see §6. `img` is the in-memory
   CSE image (≤ 64 KiB in v0). There is **no spawn-by-path**; read the file
   yourself and pass the bytes.
+  `argv` (r8) is an array of `argc` (r9, ≤ 32) `{str_ptr, str_len}` i64 pairs —
+  the child's argument vector, copied onto its initial System V stack (at
+  `_start`, `rsp` → `argc`, then `argv[0..n]`, NULL, **empty envp**, auxv). argv
+  is **data, not authority**: the kernel never resolves it (a path in argv is
+  just bytes; the child acts on it only through fds it was handed). `argc = 0`
+  → the child's argv defaults to `["child"]`. fds = capability, argv = data —
+  two separate explicit channels, nothing inherited.
 - **`WAIT`** (15): `pid > 0` waits that child; reaps it; returns its exit code
   (also written to `status_ptr` as i64 if non-zero). `E_AGAIN` if none exits
   in the window.
@@ -198,7 +205,8 @@ fd  = OPEN(path, len, O_RDONLY)
 sz  = LSEEK(fd, 0, SEEK_END);  LSEEK(fd, 0, SEEK_SET)
 buf = MMAP(0, sz, MMAP_PROT_READ|MMAP_PROT_WRITE)   # anonymous scratch
 READ(fd, buf, sz);  CLOSE(fd)
-pid = SPAWN(buf, sz, console_acts, n)               # hand it a console channel
+argv = [{ "cat",3 }, { "foo.txt",7 }]               # parsed from the command line
+pid = SPAWN(buf, sz, console_acts, n, argv, 2)      # console = capability, argv = data
 WAIT(pid, &status)
 ```
 
