@@ -233,6 +233,59 @@ fn thread_ptr(tid as i64) as i64 {
     return 0;  // not found
 }
 
+// Remove tid from the open-addressing table (backward-shift deletion,
+// Knuth 6.4 alg R). Keeps the no-tombstone invariant: thread_ptr's
+// stop-at-EMPTY probe stays correct and the table doesn't accumulate
+// dead slots under spawn/exit churn. Called by the reaper once a thread
+// is fully off-cpu. No-op if tid isn't present.
+fn tid_ht_remove(tid as i64) as void {
+    if (tid_ht_buf == 0) { return; }
+    let is i64 as mask = tid_ht_cap - 1;
+    let is i64 as i with mut = tid & mask;
+    let is i64 as steps with mut = 0;
+    let is i64 as found with mut = 0;
+    while (steps < tid_ht_cap) {
+        let is *i64 as slot = cast(*i64, tid_ht_buf + i * 16);
+        if (slot[0] == TID_HT_EMPTY) { return; }       // not present
+        if (slot[0] == tid) { found = 1; steps = tid_ht_cap; }   // found at i
+        else { i = (i + 1) & mask; steps = steps + 1; }
+    }
+    if (found == 0) { return; }
+    // Gap at i. Walk forward; pull back any entry whose home slot is not
+    // cyclically within (i, j], closing the gap so no live key is left
+    // unreachable past an EMPTY.
+    let is i64 as done with mut = 0;
+    while (done == 0) {
+        let is *i64 as si = cast(*i64, tid_ht_buf + i * 16);
+        si[0] = TID_HT_EMPTY;
+        let is i64 as j with mut = (i + 1) & mask;
+        let is i64 as inner with mut = 0;
+        while (inner == 0) {
+            let is *i64 as sj = cast(*i64, tid_ht_buf + j * 16);
+            if (sj[0] == TID_HT_EMPTY) { inner = 1; done = 1; }
+            else {
+                let is i64 as home = sj[0] & mask;
+                let is i64 as keep with mut = 0;        // 1 = leave in place
+                if (i <= j) {
+                    if (i < home) { if (home <= j) { keep = 1; } }
+                } else {
+                    if (i < home) { keep = 1; }
+                    if (home <= j) { keep = 1; }
+                }
+                if (keep == 1) {
+                    j = (j + 1) & mask;
+                } else {
+                    si[0] = sj[0];
+                    si[1] = sj[1];
+                    i = j;
+                    inner = 1;       // gap moved to j; restart outer
+                }
+            }
+        }
+    }
+    tid_ht_count = tid_ht_count - 1;
+}
+
 // thr_get/thr_set go through thread_ptr which returns 0 when the
 // tid isn't (yet) in the hash table. Without the null-guard the
 // dereference turns `0 + off` into a low-address read/write and page-
@@ -289,6 +342,27 @@ fn thr_user_rsp(tid as i64) as i64      { return thr_get(tid, 296); }
 // Aspace pointer — not just pml4 — to call mmap/fd_* against it. Stored
 // at create time, before the thread becomes runnable. 0 for kernel threads.
 fn thr_aspace_ptr(tid as i64) as i64    { return thr_get(tid, 304); }
+// *process.Process owning this thread (as i64; 0 for kernel threads).
+// The thread is execution; the Process is isolation/identity/lineage.
+fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
+
+// Is `tid` still a live scheduler object? Returns 0 once the deferred
+// reaper has freed it (removed from the tid table). The reaper can free a
+// DEAD thread before an observer polls its state, so "exited" detection
+// must treat reaped-and-gone the same as DEAD.
+fn thr_exists(tid as i64) as i32 {
+    if (thread_ptr(tid) == 0) { return cast(i32, 0); }
+    return cast(i32, 1);
+}
+fn thr_gone(tid as i64) as i32 {
+    if (thread_ptr(tid) == 0) { return cast(i32, 1); }   // reaped
+    if (thr_state(tid) == THREAD_DEAD) { return cast(i32, 1); }
+    return cast(i32, 0);
+}
+
+// Live thread count (idle + kernel + user). Bumped on create, dropped by
+// the reaper — a churn test reads it before/after to prove no leak.
+fn get_thread_count() as i64 { return thread_count; }
 
 // ============================================================
 // Per-band data
@@ -337,6 +411,18 @@ fn rq_ptr(cpu as i64) as i64 {
 fn sched_lock_ptr(cpu as i64) as *lock.TicketLock {
     return &per_cpu_sched_locks[cpu];
 }
+
+// Per-cpu reap list — head tid of a singly-linked list of DEAD threads
+// awaiting resource reclamation, chained via the thread's offset-96 slot
+// (the runlist link, unused once a thread is DEAD and off every runqueue).
+// schedule() enqueues a dying thread here BEFORE switching off it;
+// idle_fn drains and frees AFTER the switch, when the thread's kstack +
+// CR3 are provably no longer in use on this cpu — closing the
+// use-after-free race a parent-side immediate reap would open on SMP.
+// Initialised to -1 (empty) in init().
+let is [16]i64 as cpu_reap_heads with mut;
+fn cpu_reap_head(cpu as i64) as i64            { return cpu_reap_heads[cpu]; }
+fn set_cpu_reap_head(cpu as i64, v as i64) as void { cpu_reap_heads[cpu] = v; }
 
 // This-cpu shorthand: most schedule() / pick_next() / runlist_*
 // callers operate on the cpu currently executing them.
@@ -916,6 +1002,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     thr_set(tid, 64, stack_top - 56);
     thr_set(tid, 72, stack_base);
     thr_set(tid, 80, entry);
+    thr_set(tid, 312, cast(i64, stack_pfn));   // kstack pfn — for the reaper to free
     thr_set(tid, 96, 0 - 1);
     thr_set(tid, 104, 0 - 1);
     thr_set(tid, 112, 0);             // lag
@@ -950,8 +1037,9 @@ fn create_thread(entry as i64, band as i64) as i64 {
 // `kentry` is the kernel-side trampoline (typically
 // userspace.user_thread_trampoline) that reads thr_user_entry /
 // thr_user_rsp and runs the iretq.
-fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
-                      user_entry as i64, user_rsp as i64, aspace_ptr as i64) as i64 {
+fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
+                      user_entry as i64, user_rsp as i64, aspace_ptr as i64,
+                      process_ptr as i64, suspended as i64) as i64 {
     let is i64 as cpus = smp.get_cpu_count();
     let is i64 as home_cpu with mut = next_placement_cpu;
     if (home_cpu >= cpus) { home_cpu = 0; }
@@ -1023,16 +1111,50 @@ fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
     thr_set(tid, 288, user_entry);    // ring-3 RIP
     thr_set(tid, 296, user_rsp);      // ring-3 RSP
     thr_set(tid, 304, aspace_ptr);    // *vma.Aspace (for syscall handlers)
+    thr_set(tid, 248, process_ptr);   // owning Process (0 for none)
+    thr_set(tid, 312, cast(i64, stack_pfn));  // kstack pfn — for the reaper to free
+    // Suspended: created but parked. The state line above set RUNNABLE;
+    // override to SUSPENDED and skip the runqueue insert. proc_start /
+    // make_runnable enqueues it once the child's fd table is set up.
+    if (suspended != 0) { thr_set(tid, 8, THREAD_SUSPENDED); }
 
-    runlist_insert(home_cpu, band, tid);
-    set_nr_running(home_cpu, nr_running(home_cpu) + 1);
     thread_count = thread_count + 1;
 
-    let is *smp.PerCpu as hpc = smp.get_per_cpu(home_cpu);
-    if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
+    if (suspended == 0) {
+        runlist_insert(home_cpu, band, tid);
+        set_nr_running(home_cpu, nr_running(home_cpu) + 1);
+        let is *smp.PerCpu as hpc = smp.get_per_cpu(home_cpu);
+        if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
+    }
 
     lock.release_irq(sched_lock_ptr(home_cpu), saved_flags);
     return tid;
+}
+
+// Thin compatibility wrapper: a user thread with no owning Process,
+// started immediately. The pre-Process smokes (and any kernel-internal
+// user thread) use this.
+fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
+                      user_entry as i64, user_rsp as i64, aspace_ptr as i64) as i64 {
+    return create_user_thread_ex(kentry, band, aspace_pml4, user_entry,
+                                 user_rsp, aspace_ptr, 0, 0);
+}
+
+// Make a SUSPENDED thread runnable: insert it into its home cpu's
+// runqueue. The process spawn path calls this (proc_start) after the
+// child's fd table is set up. No-op if the thread isn't suspended.
+fn make_runnable(tid as i64) as void {
+    let is i64 as cpu = thr_home_cpu(tid);
+    let is i64 as band = thr_band(tid);
+    let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+    if (thr_state(tid) == THREAD_SUSPENDED) {
+        thr_set(tid, 8, THREAD_RUNNABLE);
+        runlist_insert(cpu, band, tid);
+        set_nr_running(cpu, nr_running(cpu) + 1);
+        let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
+        if (cast(i64, pc) != 0) { pc.need_resched = 1; }
+    }
+    lock.release_irq(sched_lock_ptr(cpu), f);
 }
 
 // ============================================================
@@ -1365,6 +1487,18 @@ fn schedule() as void {
                     runlist_insert(cpu, thr_band(prev), prev);
                 }
             }
+        }
+    }
+
+    // A thread that died this trip (state set DEAD by exit_current_thread
+    // or the kernel-thread trampoline, both of which then call schedule())
+    // is `prev` exactly once — here. Queue it for the deferred reaper and
+    // never touch it again. Freeing now would race the rsp/CR3 swap below;
+    // idle_fn frees it after the switch. Link via the now-free offset 96.
+    if (prev >= 0) {
+        if (thr_state(prev) == THREAD_DEAD) {
+            thr_set(prev, 96, cpu_reap_head(cpu));
+            set_cpu_reap_head(cpu, prev);
         }
     }
 
@@ -1812,6 +1946,46 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
     while (1 == 1) { asm(".byte 0xF4\n"); }
 }
 
+// Free one fully-dead thread's resources: kernel stack page, FPU area,
+// and the thread struct itself, and drop it from the tid table. Caller
+// (reap_drain) has popped it from the reap list, so it is off-cpu — its
+// kstack and CR3 are no longer live. Order matters: snapshot the fields,
+// remove from the table FIRST (so any tid<next_tid scanner now skips it),
+// then free the backing memory.
+fn reap_one(tid as i64) as void {
+    let is i64 as tptr = thread_ptr(tid);
+    if (tptr == 0) { return; }
+    let is i64 as pfn = thr_get(tid, 312);    // kstack pfn (0 if none)
+    let is i64 as fpu = thr_get(tid, 240);    // fpu_state_addr
+    tid_ht_remove(tid);
+    thread_count = thread_count - 1;
+    if (fpu != 0) { heap.kfree(fpu); }
+    if (thread_cache != 0) { heap.kcache_free(thread_cache, tptr); }
+    else { heap.kfree(tptr); }
+    if (pfn != 0) { pmm.free_pages(cast(i32, pfn)); }
+}
+
+// Drain this cpu's reap list. Pops each tid under the cpu's sched_lock
+// (so a timer-IRQ-driven schedule() on the same cpu can't corrupt the
+// list mid-pop), then frees outside the lock (heap/pmm/tid locks nest
+// below sched_lock, never above). Runs from idle — never IRQ context,
+// no lock held on entry.
+fn reap_drain(cpu as i64) as void {
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+        let is i64 as tid = cpu_reap_head(cpu);
+        if (tid < 0) {
+            lock.release_irq(sched_lock_ptr(cpu), f);
+            more = 0;
+        } else {
+            set_cpu_reap_head(cpu, thr_get(tid, 96));   // pop
+            lock.release_irq(sched_lock_ptr(cpu), f);
+            reap_one(tid);
+        }
+    }
+}
+
 fn idle_fn() as void {
     // APs enter with IF=0 (ap_entry deliberately does not sti before
     // calling ap_start so per_cpu_init publishes current_tid without
@@ -1821,6 +1995,7 @@ fn idle_fn() as void {
     asm(".byte 0xFB\n");   // sti
     while (1 == 1) {
         if (smp.this_cpu_need_resched() != 0) { schedule(); }
+        reap_drain(this_cpu());     // free threads that died on this cpu
         asm(".byte 0xF4\n");   // hlt
     }
 }
@@ -1838,6 +2013,11 @@ fn init() as void {
     while (zi < 8192) { rqz[zi] = 0; zi = zi + 1; }
 
     tid_ht_init(64);
+
+    // Reap lists start empty (-1). MUST be explicit — 0 is a valid tid,
+    // so a zero-initialised head would make the reaper try to free tid 0.
+    let is i64 as rc with mut = 0;
+    while (rc < 16) { cpu_reap_heads[rc] = 0 - 1; rc = rc + 1; }
 
     thread_cache = heap.kcache_create(THREAD_SIZE, 64, cast(i32, 0));
     if (thread_cache == 0) { pmm.panic("sched: thread_cache create fail", 31); }

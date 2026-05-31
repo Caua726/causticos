@@ -28,6 +28,7 @@ use "vfs.cst" as vfs;
 use "elf.cst" as elf;
 use "cse.cst" as cse;
 use "abi.cst" as abi;
+use "process.cst" as proc;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
 // pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
@@ -666,7 +667,7 @@ fn spawn_user_elf_smoke() as void {
                 serial.println("", 0);
                 time_ok = 1;
             }
-            if (exit_ok == 0 && sched.thr_state(tid) == sched.THREAD_DEAD) {
+            if (exit_ok == 0 && sched.thr_gone(tid) == cast(i32, 1)) {
                 exit_ok = 1;
                 // pid stored at BSS+8 must match the tid we spawned.
                 if (p[1] == tid) { getpid_ok = 1; }
@@ -1145,7 +1146,7 @@ fn spawn_user_cse_smoke() as void {
                 serial.println("", 0);
                 time_ok = 1;
             }
-            if (exit_ok == 0 && sched.thr_state(tid) == sched.THREAD_DEAD) {
+            if (exit_ok == 0 && sched.thr_gone(tid) == cast(i32, 1)) {
                 exit_ok = 1;
                 if (p[1] == tid) { getpid_ok = 1; }
                 if (p[2] >= 4096 && p[3] == cast(i64, 0xCAFEBABE) && p[4] == 0) {
@@ -1243,6 +1244,290 @@ fn spawn_user_cse_smoke() as void {
     serial.println(" FAIL", 5);
 }
 
+// Minimal exit-only child image: a CSE whose entire .text is
+// `mov rax,SYS_PROC_EXIT; mov rdi,code; syscall`. No file I/O, no BSS —
+// the churn/leak test spawns this hundreds of times, so it must be cheap
+// and deterministic (the heavy test_cse with FAT32 ops occasionally blew
+// the wait deadline under smp 4 + TCG). One R-X segment.
+let is i64 as CSE_MIN_ENTRY = 0x401000;
+let is i64 as CSE_MIN_FOFF  = 0x38;     // header(0x20) + 1 seg(0x18)
+let is [128]u8 as min_cse;
+let is i64 as min_cse_len with mut = 0;
+
+fn build_min_cse(code as i64) as void {
+    let is *u8 as e = cast(*u8, &min_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < 128) { e[z] = cast(u8, 0); z = z + 1; }
+    // header (32 bytes)
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0);                  // version u16 = 2
+    e[6]=cast(u8,1);                                   // arch = 1 (x86_64)
+    e[7]=cast(u8,0);                                   // flags
+    write_le_u64(e, 0x08, CSE_MIN_ENTRY);              // entry_point
+    write_le_u64(e, 0x10, 0x400000);                   // base (informative)
+    write_le_u32(e, 0x18, 1);                          // seg_count = 1
+    write_le_u32(e, 0x1C, 0);                          // app_version_off
+    // seg0 @0x20: .text, R-X
+    write_le_u64(e, 0x20, CSE_MIN_ENTRY);              // vaddr
+    write_le_u32(e, 0x28, CSE_MIN_FOFF);               // file_off
+    write_le_u32(e, 0x2C, 16);                         // file_size (shellcode)
+    write_le_u32(e, 0x30, 0x1000);                     // mem_size (one page)
+    write_le_u32(e, 0x34, 5);                          // perms = R|X
+    // shellcode @ CSE_MIN_FOFF
+    let is i64 as c with mut = CSE_MIN_FOFF;
+    //   mov rax,3  (SYS_PROC_EXIT)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    //   mov rdi, code  (imm32, sign-extended)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC7);
+    write_le_u32(e, c + 3, code); c = c + 7;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    min_cse_len = c;
+}
+
+// A parent CSE that exercises the SYS_SPAWN/SYS_WAIT syscalls from ring 3:
+// it embeds a child image (min_cse, exit 42) in its own R-X text, then
+//   spawn(child_va, child_len) -> wait(pid) -> exit(child_code)
+// so the parent's own exit code == the child's, proving the full ring-3
+// spawn+wait roundtrip (nested: kernel spawns parent, parent spawns child).
+let is i64 as SPAWN_ENTRY = 0x401000;
+let is i64 as SPAWN_FOFF  = 0x38;       // header(0x20) + 1 seg(0x18)
+let is [512]u8 as spawn_cse;
+let is i64 as spawn_cse_len with mut = 0;
+
+fn build_spawn_parent_cse() as void {
+    build_min_cse(42);                  // the child: exits 42
+    let is *u8 as m = cast(*u8, &min_cse[0]);
+    let is i64 as clen = min_cse_len;
+
+    let is *u8 as e = cast(*u8, &spawn_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < 512) { e[z] = cast(u8, 0); z = z + 1; }
+    // header
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[6]=cast(u8,1);
+    write_le_u64(e, 0x08, SPAWN_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 1);                          // seg_count = 1
+    write_le_u32(e, 0x20, 0);                          // (vaddr lo patched below)
+    write_le_u64(e, 0x20, SPAWN_ENTRY);                // seg0 vaddr
+    write_le_u32(e, 0x28, SPAWN_FOFF);                 // file_off
+    write_le_u32(e, 0x30, 0x2000);                     // mem_size (2 pages)
+    write_le_u32(e, 0x34, 5);                          // R-X
+
+    let is i64 as c with mut = SPAWN_FOFF;
+    //   jmp +clen  (skip the embedded child image)
+    e[c+0]=cast(u8,0xEB); e[c+1]=cast(u8, clen); c = c + 2;
+    let is i64 as child_foff = c;
+    let is i64 as ci with mut = 0;
+    while (ci < clen) { e[c+ci] = m[ci]; ci = ci + 1; }
+    c = c + clen;
+    let is i64 as child_va = SPAWN_ENTRY + (child_foff - SPAWN_FOFF);
+
+    //   movabs rdi, child_va
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, child_va); c = c + 10;
+    //   mov rsi, clen
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    write_le_u32(e, c+3, clen); c = c + 7;
+    //   mov rax, 14 (SYS_SPAWN)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,14); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    //   syscall  → rax = pid
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov rdi, rax  (pid)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xC7); c = c + 3;
+    //   xor esi, esi  (status ptr = 0)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;
+    //   mov rax, 15 (SYS_WAIT)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,15); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    //   syscall  → rax = child exit code
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    //   mov rdi, rax  (exit code)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xC7); c = c + 3;
+    //   mov rax, 3 (SYS_PROC_EXIT)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    //   syscall
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    write_le_u32(e, 0x2C, c - SPAWN_FOFF);             // file_size
+    spawn_cse_len = c;
+}
+
+// ----------------------------------------------------------------
+// Process spawn orchestration (Process != Thread).
+//
+// proc_spawn implements the create-suspended primitive: fresh aspace,
+// load image, create the Process object, then a SUSPENDED main thread
+// bound to it. The child's fd table starts EMPTY — authority is never
+// ambient; the caller installs handles explicitly (fd handoff) before
+// proc_start makes the thread runnable. No fork: the parent never runs
+// code in the child; it configures the child from the outside and starts
+// it. Image loading + thread creation live here (not in process.cst) so
+// that module stays free of sched/vma/loader imports.
+// ----------------------------------------------------------------
+fn proc_spawn(parent as i64, img as *u8, img_len as i64) as i64 {
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { return 0; }
+
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse(a, img, img_len, cast(*u8, "child"), 5,
+                                     &entry, &user_rsp);
+    if (rc != 0) {
+        vma.aspace_destroy(a);
+        return 0;
+    }
+
+    let is i64 as p = proc.process_create(parent, cast(i64, a), 0);
+    if (p == 0) {
+        vma.aspace_destroy(a);
+        return 0;
+    }
+
+    let is i64 as tid = sched.create_user_thread_ex(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        a.pml4_phys, entry, user_rsp, cast(i64, a),
+        p, 1                                   // process_ptr, suspended
+    );
+    proc.attach_main_thread(p, tid);
+    return p;
+}
+
+// Start a spawned (suspended) process: make its main thread runnable.
+fn proc_start(p as i64) as void {
+    sched.make_runnable(proc.proc_first_tid(p));
+}
+
+// Process smoke — Process != Thread end to end: spawn a child PROCESS
+// from the embedded CSE (which exits with code 7), start it, wait for it
+// to become a zombie, collect the exit code. Validates that the thread is
+// linked to its Process, the exit code propagates through the zombie, and
+// the deferred reaper reclaims the thread (no leak under churn).
+
+// Wait for a child PROCESS (pid>0; pid<=0 = any) to exit, then REAP it
+// race-free. A zombie is published at exit, but its thread may still be
+// finishing its last schedule() on its own kstack/CR3 — so we block until
+// the deferred reaper has freed the thread (thr_exists == 0). Only then is
+// it off-cpu and the aspace safe to tear down. Frees the aspace + Process
+// struct and detaches from the parent. Returns the exit code, or E_AGAIN.
+fn proc_wait(parent as i64, pid as i64) as i64 {
+    let is i64 as deadline = timer.current_time_ns() + 5000000000;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as child = proc.find_zombie_child(parent, pid);
+        if (child != 0) {
+            let is i64 as ctid = proc.proc_first_tid(child);
+            if (sched.thr_exists(ctid) == cast(i32, 0)) {
+                let is i64 as code = proc.proc_exit_code(child);
+                let is i64 as casp = proc.proc_aspace(child);
+                if (casp != 0) { vma.aspace_destroy(cast(*vma.Aspace, casp)); }
+                proc.process_free(parent, child);
+                return code;
+            }
+        }
+        sched.sleep_for_ns(10000000);
+    }
+    return abi.E_AGAIN;
+}
+
+fn spawn_user_proc_smoke() as void {
+    serial.println("userspace.proc_smoke: start", 27);
+
+    // (1) spawn → start → wait → reap. Verify pid != tid, thread→Process
+    //     link, exit code (7), and that the reaper freed the thread. Uses a
+    //     cheap exit-only child (no FAT32 I/O) so the wait deadline is
+    //     deterministic under smp 4 + TCG — the heavy file-I/O path is
+    //     already covered by cse_smoke.
+    build_min_cse(7);
+    let is i64 as p = proc_spawn(proc.init_proc, cast(*u8, &min_cse[0]), min_cse_len);
+    if (p == 0) {
+        serial.println("userspace.proc_smoke: spawn FAIL", 32);
+        return;
+    }
+    let is i64 as pid = proc.proc_pid(p);
+    let is i64 as tid = proc.proc_first_tid(p);
+    let is i32 as link_ok with mut = 0;
+    if (sched.thr_process_ptr(tid) == p) { link_ok = 1; }
+    proc_start(p);
+
+    let is i64 as code = proc_wait(proc.init_proc, pid);
+    let is i32 as reaped with mut = 0;
+    if (sched.thr_exists(tid) == cast(i32, 0)) { reaped = 1; }
+    serial.print("userspace.proc_smoke: pid=", 26);
+    util.print_num(pid);
+    serial.print(" exit_code=", 11);
+    util.print_num(code);
+    serial.print(" link_ok=", 9);
+    util.print_num(cast(i64, link_ok));
+    serial.print(" reaped=", 8);
+    util.print_num(cast(i64, reaped));
+    serial.println("", 0);
+
+    // (2) churn: spawn+wait 8×. The live thread count must return to its
+    //     starting value (each spawn +1, each reap -1) — proves the
+    //     deferred reaper reclaims kstack/FPU/struct with no leak.
+    build_min_cse(0);                          // cheap exit-only child
+    let is i64 as tc0 = sched.get_thread_count();
+    let is i64 as n with mut = 0;
+    let is i32 as churn_ok with mut = 1;
+    while (n < 8) {
+        let is i64 as q = proc_spawn(proc.init_proc, cast(*u8, &min_cse[0]), min_cse_len);
+        if (q == 0) { churn_ok = 0; n = 8; }
+        else {
+            proc_start(q);
+            let is i64 as qc = proc_wait(proc.init_proc, proc.proc_pid(q));
+            if (qc != 0) { churn_ok = 0; }
+            n = n + 1;
+        }
+    }
+    let is i64 as tc1 = sched.get_thread_count();
+    serial.print("userspace.proc_smoke: churn tc0=", 32);
+    util.print_num(tc0);
+    serial.print(" tc1=", 5);
+    util.print_num(tc1);
+    serial.println("", 0);
+
+    let is i32 as count_ok with mut = 0;
+    if (tc1 <= tc0 + 1) { count_ok = 1; }   // +1 slop for a not-yet-reaped tail
+    if (code == 7 && link_ok == 1 && reaped == 1 && churn_ok == 1 && count_ok == 1) {
+        serial.println("userspace.proc_smoke: PASS", 26);
+    } else {
+        serial.println("userspace.proc_smoke: FAIL", 26);
+    }
+}
+
+// Syscall smoke — SYS_SPAWN + SYS_WAIT from ring 3. The kernel spawns a
+// parent process; the parent (in ring 3) spawns its embedded child via
+// SYS_SPAWN, waits for it via SYS_WAIT, and exits with the child's code
+// (42). The kernel then waits on the parent and checks 42 came back up
+// through both levels — proving the userspace process ABI end to end.
+fn spawn_user_syscall_smoke() as void {
+    serial.println("userspace.spawn_smoke: start", 28);
+    build_spawn_parent_cse();
+    let is i64 as p = proc_spawn(proc.init_proc, cast(*u8, &spawn_cse[0]), spawn_cse_len);
+    if (p == 0) {
+        serial.println("userspace.spawn_smoke: spawn FAIL", 33);
+        return;
+    }
+    let is i64 as pid = proc.proc_pid(p);
+    proc_start(p);
+    let is i64 as code = proc_wait(proc.init_proc, pid);
+    serial.print("userspace.spawn_smoke: pid=", 27);
+    util.print_num(pid);
+    serial.print(" code=", 6);
+    util.print_num(code);
+    serial.println("", 0);
+    if (code == 42) {
+        serial.println("userspace.spawn_smoke: PASS", 27);
+    } else {
+        serial.println("userspace.spawn_smoke: FAIL", 27);
+    }
+}
+
 // FD table smoke — kernel-side test of the per-aspace fd table.
 // Opens /hello.txt twice, validates fd allocation / lookup / close /
 // install semantics. Doesn't go through the (yet-unwritten) syscall
@@ -1312,5 +1597,7 @@ fn smoke_thread() as void {
     fd_table_smoke();
     spawn_user_elf_smoke();
     spawn_user_cse_smoke();
+    spawn_user_proc_smoke();
+    spawn_user_syscall_smoke();
 }
 

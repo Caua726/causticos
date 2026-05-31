@@ -1,246 +1,153 @@
-// process.cst — Process model: Process, Limit, HandleTable
-// Based on causticos_process_spec_v1
+// process.cst — Process model: Process ≠ Thread.
+//
+// A Process is the OS's unit of isolation + ownership: it owns one
+// address space (*vma.Aspace — memory + the fd table = its authority)
+// plus identity (pid), lineage (parent/children), and lifecycle
+// (state, exit_code). It owns >=1 Thread; the Thread is the schedulable
+// execution unit and points back here via its process_ptr slot.
+//
+// causticos identity: "tudo é uma chave" — a process IS the set of
+// handles (fds) it holds, and that set lives in its Aspace's fd table.
+// Authority is never ambient: a child inherits nothing by default; the
+// spawner installs explicitly. This file is pure mechanism (the object
+// + tree + lifecycle state). Image loading + thread creation live in the
+// spawn orchestration (userspace.cst), and resource reclamation (reap)
+// is driven from there too — keeping this module free of sched/vma/loader
+// imports and the import cycles they'd close.
+//
+// Speculative scaffolding from the old v1 spec (refcounted Limit,
+// capability bitsets, a separate HandleTable) is intentionally gone: the
+// fd table already lives in the Aspace, and limits/caps land only when a
+// real workload forces them.
 
 use "serial.cst" as serial;
 use "pmm.cst" as pmm;
 use "heap.cst" as heap;
-use "vmm.cst" as vmm;
 use "util.cst" as util;
 use "timer.cst" as timer;
 
 // ============================================================
 // Process states
 // ============================================================
-
 let is i64 as PROC_ALIVE   = 1;
-let is i64 as PROC_EXITING = 2;
-let is i64 as PROC_ZOMBIE  = 3;
-let is i64 as PROC_DEAD    = 4;
+let is i64 as PROC_EXITING = 2;   // exit() entered; thread not yet off-cpu
+let is i64 as PROC_ZOMBIE  = 3;   // dead, exit_code valid, awaiting wait()
+let is i64 as PROC_DEAD    = 4;   // collected; struct about to be freed
 
 // Flags
-let is i64 as FLAG_DIE_WITH_PARENT = 1;
-let is i64 as FLAG_INIT            = 2;
-let is i64 as FLAG_SHARE_LIMIT     = 4;
-
-// Capabilities
-let is i64 as CAP_SET_LIMITS         = 1;
-let is i64 as CAP_PROCESS_KILL_ANY   = 2;
-let is i64 as CAP_PROCESS_CREATE_ROOT = 4;
+let is i64 as FLAG_INIT = 1;      // pid 1: root of the tree, reaps orphans, cannot exit
 
 // ============================================================
-// Limit struct (32 bytes)
-// ============================================================
-// 0   max_memory      i64
-// 8   current_memory  i64
-// 16  refcount        i64
-// 24  reserved        i64
-
-let is i64 as LIMIT_SIZE = 32;
-let is i64 as limit_cache with mut = 0;
-
-fn limit_create(max_mem as i64) as i64 {
-    let is i64 as lim = heap.kcache_alloc(limit_cache, cast(i32, 0));
-    if (lim == 0) { pmm.panic("limit alloc fail", 16); }
-    let is *i64 as p = cast(*i64, lim);
-    p[0] = max_mem;       // max_memory
-    p[1] = 0;             // current_memory
-    p[2] = 1;             // refcount
-    p[3] = 0;             // reserved
-    return lim;
-}
-
-fn limit_max(lim as i64) as i64     { let is *i64 as p = cast(*i64, lim); return p[0]; }
-fn limit_current(lim as i64) as i64 { let is *i64 as p = cast(*i64, lim); return p[1]; }
-fn limit_refcount(lim as i64) as i64 { let is *i64 as p = cast(*i64, lim); return p[2]; }
-
-fn limit_set_max(lim as i64, v as i64) as void { let is *i64 as p = cast(*i64, lim); p[0] = v; }
-fn limit_set_current(lim as i64, v as i64) as void { let is *i64 as p = cast(*i64, lim); p[1] = v; }
-fn limit_set_refcount(lim as i64, v as i64) as void { let is *i64 as p = cast(*i64, lim); p[2] = v; }
-
-fn limit_acquire(lim as i64) as void {
-    limit_set_refcount(lim, limit_refcount(lim) + 1);
-}
-
-fn limit_release(lim as i64) as void {
-    let is i64 as rc = limit_refcount(lim) - 1;
-    limit_set_refcount(lim, rc);
-    if (rc == 0) {
-        heap.kcache_free(limit_cache, lim);
-    }
-}
-
-// Check if allocation of 'size' bytes is within limit
-fn limit_try_alloc(lim as i64, size as i64) as i64 {
-    if (limit_current(lim) + size > limit_max(lim)) {
-        return 0;  // over limit
-    }
-    limit_set_current(lim, limit_current(lim) + size);
-    return 1;
-}
-
-fn limit_free(lim as i64, size as i64) as void {
-    limit_set_current(lim, limit_current(lim) - size);
-}
-
-// ============================================================
-// HandleTable (40 bytes inline + dynamic array)
-// ============================================================
-// 0   entries_ptr   i64   (kmalloc'd array of i64 pointers)
-// 8   capacity      i64
-// 16  next_search   i64
-// 24  used_bitmap   i64   (kmalloc'd bitmap)
-// 32  reserved      i64
-
-let is i64 as HTABLE_INIT_CAP = 16;
-
-fn htable_create() as i64 {
-    // Allocate the HandleTable struct (40 bytes)
-    let is i64 as ht = heap.kmalloc(40, pmm.ALLOC_ZERO);
-    if (ht == 0) { pmm.panic("htable alloc fail", 17); }
-    let is *i64 as p = cast(*i64, ht);
-    let is i64 as cap = HTABLE_INIT_CAP;
-    let is i64 as entries = heap.kmalloc(cap * 8, pmm.ALLOC_ZERO);
-    if (entries == 0) { pmm.panic("htable entries alloc fail", 25); }
-    // Bitmap: cap/8 bytes, minimum 8 bytes
-    let is i64 as bm_size with mut = cap / 8;
-    if (bm_size < 8) { bm_size = 8; }
-    let is i64 as bm = heap.kmalloc(bm_size, pmm.ALLOC_ZERO);
-    if (bm == 0) { pmm.panic("htable bitmap alloc fail", 24); }
-    p[0] = entries;
-    p[1] = cap;
-    p[2] = 0;       // next_search
-    p[3] = bm;
-    return ht;
-}
-
-fn htable_destroy(ht as i64) as void {
-    let is *i64 as p = cast(*i64, ht);
-    heap.kfree(p[0]);   // entries
-    heap.kfree(p[3]);   // bitmap
-    heap.kfree(ht);
-}
-
-// ============================================================
-// Process struct (192 bytes)
+// Process struct (128 bytes). Raw-offset accessors (same style the
+// scheduler uses for Thread) — no struct decl so the layout is explicit.
 // ============================================================
 // 0    pid              i64
-// 8    name             32 bytes (4 * i64)
-// 40   parent           i64   (ptr to Process)
-// 48   first_child      i64
-// 56   next_sibling     i64
-// 64   prev_sibling     i64
-// 72   aspace_pml4      i64   (PML4 phys addr, 0 = kernel AS)
-// 80   first_thread_tid i64   (tid of first thread, -1 = none)
-// 88   thread_count     i64
-// 96   htable           i64   (ptr to HandleTable)
-// 104  state            i64
-// 112  exit_code        i64
-// 120  capabilities     i64
-// 128  own_memory_usage i64
-// 136  limit_ptr        i64   (ptr to Limit)
-// 144  create_time      i64
-// 152  flags            i64
-// 160  reserved         32 bytes
-// Total: 192
-
-let is i64 as PROC_SIZE = 192;
+// 8    parent           i64   (*Process; 0 = no parent / init)
+// 16   first_child      i64   (*Process)
+// 24   next_sibling     i64   (*Process)
+// 32   prev_sibling     i64   (*Process)
+// 40   state            i64   (PROC_*)
+// 48   exit_code        i64   (valid once ZOMBIE)
+// 56   aspace           i64   (*vma.Aspace; 0 for init / kernel-side)
+// 64   first_tid        i64   (main thread tid; -1 = none)
+// 72   thread_count     i64
+// 80   create_time      i64   (ns)
+// 88   flags            i64   (FLAG_*)
+// 96   collected        i64   (1 once wait() has returned this child's status)
+// 104  reap_done        i64   (1 once the deferred reaper freed thread resources)
+// 112  reserved         16 bytes
+// Total: 128
+let is i64 as PROC_SIZE = 128;
 let is i64 as proc_cache with mut = 0;
 
-// PID counter (monotonic, never reused)
+// PID counter — monotonic, never reused (no PID-reuse aliasing bugs).
 let is i64 as next_pid with mut = 1;
 
-// Init process pointer
+// Init process (pid 1): root of the tree, reaper of orphans.
 let is i64 as init_proc with mut = 0;
 
-// Process accessors
 fn proc_get(proc as i64, off as i64) as i64 {
     let is *i64 as p = cast(*i64, proc + off);
     return p[0];
 }
-
 fn proc_set(proc as i64, off as i64, v as i64) as void {
     let is *i64 as p = cast(*i64, proc + off);
     p[0] = v;
 }
 
 fn proc_pid(proc as i64) as i64          { return proc_get(proc, 0); }
-fn proc_parent(proc as i64) as i64       { return proc_get(proc, 40); }
-fn proc_first_child(proc as i64) as i64  { return proc_get(proc, 48); }
-fn proc_next_sib(proc as i64) as i64     { return proc_get(proc, 56); }
-fn proc_prev_sib(proc as i64) as i64     { return proc_get(proc, 64); }
-fn proc_aspace(proc as i64) as i64       { return proc_get(proc, 72); }
-fn proc_first_tid(proc as i64) as i64    { return proc_get(proc, 80); }
-fn proc_thread_count(proc as i64) as i64 { return proc_get(proc, 88); }
-fn proc_htable(proc as i64) as i64       { return proc_get(proc, 96); }
-fn proc_state(proc as i64) as i64        { return proc_get(proc, 104); }
-fn proc_exit_code(proc as i64) as i64    { return proc_get(proc, 112); }
-fn proc_caps(proc as i64) as i64         { return proc_get(proc, 120); }
-fn proc_own_mem(proc as i64) as i64      { return proc_get(proc, 128); }
-fn proc_limit(proc as i64) as i64        { return proc_get(proc, 136); }
-fn proc_flags(proc as i64) as i64        { return proc_get(proc, 152); }
+fn proc_parent(proc as i64) as i64       { return proc_get(proc, 8); }
+fn proc_first_child(proc as i64) as i64  { return proc_get(proc, 16); }
+fn proc_next_sib(proc as i64) as i64     { return proc_get(proc, 24); }
+fn proc_prev_sib(proc as i64) as i64     { return proc_get(proc, 32); }
+fn proc_state(proc as i64) as i64        { return proc_get(proc, 40); }
+fn proc_exit_code(proc as i64) as i64    { return proc_get(proc, 48); }
+fn proc_aspace(proc as i64) as i64       { return proc_get(proc, 56); }
+fn proc_first_tid(proc as i64) as i64    { return proc_get(proc, 64); }
+fn proc_thread_count(proc as i64) as i64 { return proc_get(proc, 72); }
+fn proc_flags(proc as i64) as i64        { return proc_get(proc, 88); }
+fn proc_collected(proc as i64) as i64    { return proc_get(proc, 96); }
+fn proc_reap_done(proc as i64) as i64    { return proc_get(proc, 104); }
+
+fn proc_set_state(proc as i64, v as i64) as void     { proc_set(proc, 40, v); }
+fn proc_set_aspace(proc as i64, v as i64) as void    { proc_set(proc, 56, v); }
+fn proc_set_first_tid(proc as i64, v as i64) as void { proc_set(proc, 64, v); }
+fn proc_set_reap_done(proc as i64, v as i64) as void { proc_set(proc, 104, v); }
 
 // ============================================================
-// Hierarchy operations
+// Hierarchy (caller serialises; today only the boot/smoke path and
+// single-threaded exit touch these — a global proc lock lands with the
+// userspace spawn syscalls).
 // ============================================================
 
 fn add_child(parent as i64, child as i64) as void {
-    proc_set(child, 40, parent);            // child.parent = parent
+    proc_set(child, 8, parent);                 // child.parent = parent
     let is i64 as old_first = proc_first_child(parent);
-    proc_set(child, 56, old_first);         // child.next_sibling = old first
-    proc_set(child, 64, 0);                // child.prev_sibling = null
+    proc_set(child, 24, old_first);             // child.next_sibling = old first
+    proc_set(child, 32, 0);                     // child.prev_sibling = null
     if (old_first != 0) {
-        proc_set(old_first, 64, child);     // old_first.prev_sibling = child
+        proc_set(old_first, 32, child);         // old_first.prev_sibling = child
     }
-    proc_set(parent, 48, child);            // parent.first_child = child
+    proc_set(parent, 16, child);                // parent.first_child = child
 }
 
 fn remove_child(parent as i64, child as i64) as void {
     let is i64 as prev = proc_prev_sib(child);
     let is i64 as next = proc_next_sib(child);
     if (prev != 0) {
-        proc_set(prev, 56, next);
+        proc_set(prev, 24, next);
     } else {
-        proc_set(parent, 48, next);         // was first child
+        proc_set(parent, 16, next);             // child was first
     }
     if (next != 0) {
-        proc_set(next, 64, prev);
+        proc_set(next, 32, prev);
     }
-    proc_set(child, 56, 0);
-    proc_set(child, 64, 0);
+    proc_set(child, 24, 0);
+    proc_set(child, 32, 0);
 }
 
-// ============================================================
-// Reparent children to init
-// ============================================================
-
+// Orphans go to init (pid 1), which reaps them. No cascade-kill flag in
+// v0 — that's a sandbox/job-tree feature, deferred.
 fn reparent_children_to_init(proc as i64) as void {
     let is i64 as child with mut = proc_first_child(proc);
     while (child != 0) {
         let is i64 as next = proc_next_sib(child);
-
-        // Check cascade kill flag
-        if ((proc_flags(child) & FLAG_DIE_WITH_PARENT) != 0) {
-            // Cascade: kill child too
-            process_exit(child, 0 - 1);
-        } else {
-            // Reparent to init
-            remove_child(proc, child);
-            add_child(init_proc, child);
-        }
-
+        remove_child(proc, child);
+        add_child(init_proc, child);
         child = next;
     }
 }
 
 // ============================================================
-// Process creation
+// Lifecycle
 // ============================================================
 
-fn process_create(parent as i64, flags as i64, caps as i64) as i64 {
+// Create a Process around an already-built address space (aspace = 0 for
+// the init/kernel-side root). Adds it under `parent` (0 = no parent).
+// Returns the Process pointer (as i64), or 0 on alloc failure.
+fn process_create(parent as i64, aspace as i64, flags as i64) as i64 {
     let is i64 as proc = heap.kcache_alloc(proc_cache, cast(i32, 0));
     if (proc == 0) { return 0; }
-
-    // Zero it
     let is *u8 as zp = cast(*u8, proc);
     let is i64 as zi with mut = 0;
     while (zi < PROC_SIZE) { zp[zi] = 0; zi = zi + 1; }
@@ -248,131 +155,67 @@ fn process_create(parent as i64, flags as i64, caps as i64) as i64 {
     let is i64 as pid = next_pid;
     next_pid = next_pid + 1;
 
-    proc_set(proc, 0, pid);                 // pid
-    proc_set(proc, 80, 0 - 1);             // first_thread_tid = -1
-    proc_set(proc, 104, PROC_ALIVE);        // state
-    proc_set(proc, 152, flags);             // flags
+    proc_set(proc, 0, pid);                     // pid
+    proc_set(proc, 40, PROC_ALIVE);             // state
+    proc_set(proc, 56, aspace);                 // aspace
+    proc_set(proc, 64, 0 - 1);                  // first_tid = none
+    proc_set(proc, 72, 0);                      // thread_count
+    proc_set(proc, 80, timer.current_time_ns());// create_time
+    proc_set(proc, 88, flags);                  // flags
 
-    // Capabilities: inherit from parent, masked by requested caps
-    if (parent != 0) {
-        let is i64 as parent_caps = proc_caps(parent);
-        proc_set(proc, 120, parent_caps & caps);
-    } else {
-        proc_set(proc, 120, caps);
-    }
-
-    // Limit
-    if ((flags & FLAG_SHARE_LIMIT) != 0) {
-        if (parent != 0) {
-            let is i64 as plim = proc_limit(parent);
-            limit_acquire(plim);
-            proc_set(proc, 136, plim);
-        }
-    } else {
-        // New independent limit, inherit max from parent
-        let is i64 as max_mem with mut = 134217728;  // default 128 MiB
-        if (parent != 0) {
-            max_mem = limit_max(proc_limit(parent));
-        }
-        let is i64 as lim = limit_create(max_mem);
-        proc_set(proc, 136, lim);
-    }
-
-    // Address space
-    let is i64 as aspace = vmm.as_create();
-    if (aspace == 0) { pmm.panic("process: aspace alloc fail", 26); }
-    proc_set(proc, 72, aspace);
-
-    // Handle table
-    let is i64 as ht = htable_create();
-    proc_set(proc, 96, ht);
-
-    // Create time
-    proc_set(proc, 144, timer.current_time_ns());
-
-    // Add to parent's child list
-    if (parent != 0) {
-        add_child(parent, proc);
-    }
+    if (parent != 0) { add_child(parent, proc); }
 
     serial.print("proc: created pid=", 18);
     util.print_num(pid);
     serial.println("", 0);
-
     return proc;
 }
 
-// ============================================================
-// Process exit
-// ============================================================
+// Bind the main thread to a process (called by the spawn orchestration
+// right after create_user_thread_ex has set the thread's process_ptr).
+fn attach_main_thread(proc as i64, tid as i64) as void {
+    proc_set(proc, 64, tid);                    // first_tid
+    proc_set(proc, 72, proc_thread_count(proc) + 1);
+}
 
-fn process_exit(proc as i64, exit_code as i64) as void {
+// Called from the exiting thread's SYS_PROC_EXIT path (syshandlers),
+// BEFORE the thread schedules away. Records the exit code and publishes
+// the zombie; does NOT free the aspace (the thread still runs on it until
+// schedule() switches) — reclamation is the reaper's / wait()'s job.
+fn zombify(proc as i64, code as i64) as void {
+    if (proc == 0) { return; }
     if (proc_state(proc) != PROC_ALIVE) { return; }
-
-    // Init cannot exit
     if ((proc_flags(proc) & FLAG_INIT) != 0) {
         pmm.panic("init process exited", 19);
     }
-
-    proc_set(proc, 104, PROC_EXITING);
-    proc_set(proc, 112, exit_code);
-
-    // Reparent children to init (or cascade kill)
+    proc_set(proc, 40, PROC_EXITING);
+    proc_set(proc, 48, code);                   // exit_code
     reparent_children_to_init(proc);
-
-    // Release memory accounting
-    let is i64 as lim = proc_limit(proc);
-    if (lim != 0) {
-        let is i64 as own = proc_own_mem(proc);
-        if (own > 0) {
-            limit_free(lim, own);
-        }
-        limit_release(lim);
-        proc_set(proc, 136, 0);
-    }
-
-    // Destroy address space
-    let is i64 as aspace = proc_aspace(proc);
-    if (aspace != 0) {
-        vmm.as_destroy(aspace);
-        proc_set(proc, 72, 0);
-    }
-
-    // Destroy handle table
-    let is i64 as ht = proc_htable(proc);
-    if (ht != 0) {
-        htable_destroy(ht);
-        proc_set(proc, 96, 0);
-    }
-
-    // Transition to zombie
-    proc_set(proc, 104, PROC_ZOMBIE);
-    proc_set(proc, 88, 0);  // thread_count = 0
+    proc_set(proc, 40, PROC_ZOMBIE);
 }
 
-// ============================================================
-// Process wait (collect zombie child)
-// ============================================================
-
-fn process_wait(parent as i64) as i64 {
-    // Find first zombie child
+// Find a zombie child of `parent` (matching `pid` if pid > 0, else any).
+// Returns the child Process ptr, or 0 if none ready.
+fn find_zombie_child(parent as i64, pid as i64) as i64 {
     let is i64 as child with mut = proc_first_child(parent);
     while (child != 0) {
         if (proc_state(child) == PROC_ZOMBIE) {
-            let is i64 as exit_code = proc_exit_code(child);
-
-            // Transition ZOMBIE → DEAD
-            proc_set(child, 104, PROC_DEAD);
-            remove_child(parent, child);
-
-            // Free process struct
-            heap.kcache_free(proc_cache, child);
-
-            return exit_code;
+            if (pid <= 0) { return child; }
+            if (proc_pid(child) == pid) { return child; }
         }
         child = proc_next_sib(child);
     }
-    return 0 - 1;  // no zombie child found
+    return 0;
+}
+
+// Detach a (zombie) child from the parent tree and free the Process
+// struct. Caller has already collected exit_code and reclaimed the
+// child's thread + aspace (see the spawn/reap path). Marks DEAD first so
+// a racing scanner never sees a half-freed struct as a zombie.
+fn process_free(parent as i64, child as i64) as void {
+    proc_set(child, 40, PROC_DEAD);
+    remove_child(parent, child);
+    heap.kcache_free(proc_cache, child);
 }
 
 // ============================================================
@@ -381,21 +224,14 @@ fn process_wait(parent as i64) as i64 {
 
 fn init() as void {
     serial.println("proc: init", 10);
-
-    // Create caches
     proc_cache = heap.kcache_create(PROC_SIZE, 64, cast(i32, 0));
-    limit_cache = heap.kcache_create(LIMIT_SIZE, 16, cast(i32, 0));
 
-    // Create init process (pid 1, no parent)
-    init_proc = process_create(0, FLAG_INIT, CAP_SET_LIMITS | CAP_PROCESS_KILL_ANY | CAP_PROCESS_CREATE_ROOT);
-
-    // Create kernel process (pid 0 — lives before init, owns boot threads)
-    // Actually, init IS pid 1. Kernel threads belong to a "kernel process" pid 0.
-    // For now, init_proc is pid 1 and we create a separate kernel_proc for boot threads.
+    // pid 1 — the root. No address space (it runs no user code in v0);
+    // it exists as the tree root and the destination for orphans.
+    init_proc = process_create(0, 0, FLAG_INIT);
 
     serial.print("  init pid=", 11);
     util.print_num(proc_pid(init_proc));
     serial.println("", 0);
-
     serial.println("proc: ready", 11);
 }

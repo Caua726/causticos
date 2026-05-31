@@ -16,6 +16,8 @@ use "sched.cst" as sched;
 use "userspace.cst" as userspace;
 use "vma.cst" as vma;
 use "vfs.cst" as vfs;
+use "process.cst" as proc;
+use "heap.cst" as heap;
 
 // ============================================================
 // SYS_KERN_INFO(buf, buf_size) — fill `buf` with the static KernInfo
@@ -78,25 +80,33 @@ fn sys_time_sleep_ns(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64)
 
 // ============================================================
 // SYS_PROC_EXIT — terminate the current thread. Never returns.
-// Future: stash exit code on the thread / process so a wait()
-// equivalent can collect it.
+// If the thread belongs to a Process, publish the zombie (exit code +
+// reparent children) BEFORE scheduling away, so the parent's wait() can
+// collect the status. Resource reclamation (kstack/aspace/struct) is the
+// reaper's / wait()'s job — the thread still runs on its own kstack here.
 // ============================================================
 
 fn sys_proc_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     serial.print("sys.proc_exit: code=", 20);
     util.print_num(a);
     serial.println("", 0);
+    let is i64 as p = sched.thr_process_ptr(sched.current_tid());
+    if (p != 0) { proc.zombify(p, a); }
     sched.exit_current_thread();
     return 0;
 }
 
 // ============================================================
-// SYS_PROC_GETPID — current "pid". No Process struct linkage yet,
-// so we return tid as a stand-in.
+// SYS_PROC_GETPID — current pid. A thread that belongs to a Process
+// reports that Process's pid (pid != tid); a kernel-internal user thread
+// with no Process (the pre-Process smokes) falls back to its tid.
 // ============================================================
 
 fn sys_proc_getpid(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
-    return sched.current_tid();
+    let is i64 as tid = sched.current_tid();
+    let is i64 as p = sched.thr_process_ptr(tid);
+    if (p != 0) { return proc.proc_pid(p); }
+    return tid;
 }
 
 // ============================================================
@@ -351,6 +361,69 @@ fn sys_lseek(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
 // Adding a new syscall = append one install() line + one fn above.
 // ============================================================
 
+// ============================================================
+// SYS_SPAWN(img, len) — create a child PROCESS from an in-memory CSE
+// image and start it. Returns the child pid (a "key" the parent holds),
+// or an errno. The child's fd table starts EMPTY: authority is never
+// ambient, and explicit fd handoff (the fd-actions list) is deferred
+// until VfsFile carries a refcount — sharing a VfsFile across two fd
+// tables without one is a use-after-close. Only a process may spawn.
+// ============================================================
+
+fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as img_uptr = a;
+    let is i64 as img_len = b;
+    if (img_len <= 0) { return abi.E_INVAL; }
+    if (img_len > 65536) { return abi.E_INVAL; }       // bound v0 image size
+
+    let is i64 as tid = sched.current_tid();
+    let is i64 as parent = sched.thr_process_ptr(tid);
+    if (parent == 0) { return abi.E_PERM; }            // only processes spawn
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    // Snapshot the image into a kernel buffer; proc_spawn copies it into
+    // the child's fresh aspace, so the buffer is transient.
+    let is i64 as kbuf = heap.kmalloc(img_len, cast(i32, 0));
+    if (kbuf == 0) { return abi.E_NOMEM; }
+    let is i32 as crc = userspace.copy_from_user(pml4, cast(*u8, kbuf), img_uptr, img_len);
+    if (crc != 0) { heap.kfree(kbuf); return abi.E_FAULT; }
+
+    let is i64 as child = userspace.proc_spawn(parent, cast(*u8, kbuf), img_len);
+    heap.kfree(kbuf);
+    if (child == 0) { return abi.E_NOMEM; }
+
+    userspace.proc_start(child);
+    return proc.proc_pid(child);
+}
+
+// ============================================================
+// SYS_WAIT(pid, status_ptr) — block until a child (pid>0; pid<=0 = any)
+// exits, reap it, and return its exit code. If status_ptr != 0 the code
+// is also written there (i64). Returns E_AGAIN if no such child exits
+// within the wait window. Reaping (free aspace + Process struct) is
+// race-free: proc_wait blocks until the deferred reaper has the thread
+// off-cpu before tearing down the address space.
+// ============================================================
+
+fn sys_wait(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as pid = a;
+    let is i64 as status_uptr = b;
+    let is i64 as tid = sched.current_tid();
+    let is i64 as parent = sched.thr_process_ptr(tid);
+    if (parent == 0) { return abi.E_PERM; }
+
+    let is i64 as code = userspace.proc_wait(parent, pid);
+    if (code == abi.E_AGAIN) { return abi.E_AGAIN; }
+
+    if (status_uptr != 0) {
+        let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+        let is [1]i64 as sb;
+        sb[0] = code;
+        userspace.copy_to_user(pml4, status_uptr, cast(*u8, &sb[0]), 8);
+    }
+    return code;
+}
+
 let is i64 as install_fn_addr with mut = 0;
 
 fn install(nr as i64, fp as i64) as void {
@@ -375,4 +448,6 @@ fn install_all() as void {
     install(abi.SYS_WRITE,           cast(i64, fn_ptr(sys_write)));
     install(abi.SYS_CLOSE,           cast(i64, fn_ptr(sys_close)));
     install(abi.SYS_LSEEK,           cast(i64, fn_ptr(sys_lseek)));
+    install(abi.SYS_SPAWN,           cast(i64, fn_ptr(sys_spawn)));
+    install(abi.SYS_WAIT,            cast(i64, fn_ptr(sys_wait)));
 }
