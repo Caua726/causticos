@@ -233,9 +233,32 @@ fn load_segments(a as *vma.Aspace, buf as *u8, size as i64) as i32 {
 // stack). We honour that.
 // ============================================================
 
+// Build the System V initial process stack with a full argv (argc >= 1).
+// argv_ptrs[i] / argv_lens[i] describe each argument's bytes — KERNEL pointers,
+// valid for the duration of this call. The layout matches the System V x86-64
+// process-startup contract: at _start, rsp (16-aligned) points to argc, then
+// argv[0..argc-1], a NULL, envp (empty → one NULL), then auxv.
+//
+// Two deliberate boundaries (docs/architecture.md §2, no-ambient):
+//   - envp is EMPTY. No inherited environment (PATH/HOME/...) — that is the
+//     classic ambient-authority smell, rejected. argv (explicit, per-spawn) is
+//     data; environ (implicit, inherited) does not exist.
+//   - The kernel resolves NOTHING from argv. It copies the bytes onto the
+//     child's stack (mechanism); interpreting the strings is the program's job
+//     (policy). A path in argv is just bytes — the child acts on it only
+//     through the keys (fds) it was explicitly handed.
+// auxv carries loader facts only (page size, entry, AT_RANDOM) — process info,
+// not authority. Everything lays out in the top stack page; overflow errors
+// rather than corrupts.
+let is i64 as MAX_ARGV = 32;
+
 fn build_initial_stack(a as *vma.Aspace, entry as i64,
-                        argv0 as *u8, argv0_len as i64,
+                        argv_ptrs as *i64, argv_lens as *i64, argc as i64,
                         out_rsp as *i64) as i32 {
+    if (argc < 1 || argc > MAX_ARGV) {
+        serial.println("elf: argc out of range", 23);
+        return cast(i32, 0 - 4);
+    }
     let is i64 as stack_top = USER_STACK_TOP_VA;
     let is i64 as got = vma.mmap_anon(a, stack_top - USER_STACK_SIZE,
                                        USER_STACK_SIZE,
@@ -246,10 +269,9 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
         return cast(i32, 0 - 1);
     }
 
-    // Layout the stack inside our kernel-mapped view of the page.
-    // We work backwards from stack_top: first the strings (argv[0]
-    // text + a 16-byte AT_RANDOM blob), then the argv/envp/auxv
-    // arrays.
+    // Layout inside our kernel-mapped view of the top page, working backwards
+    // from stack_top: every argv string, then a 16-byte AT_RANDOM blob, then
+    // the argc/argv/envp/auxv scalar array.
     let is i64 as page_va = stack_top - pmm.PAGE_SIZE;
     let is i64 as page_phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
     if (page_phys == 0) {
@@ -258,63 +280,75 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
     }
     let is *u8 as page_kv = cast(*u8, pmm.phys_to_virt(page_phys));
 
-    // Cursor inside the page (offset from page base, growing down
-    // from PAGE_SIZE).
+    // Cursor inside the page (offset from page base, growing down).
     let is i64 as off with mut = pmm.PAGE_SIZE;
+    let is [32]i64 as argv_va;
 
-    // Write argv[0] string (NUL-terminated).
-    off = off - (argv0_len + 1);
-    page_kv[off + argv0_len] = cast(u8, 0);
-    let is i64 as i with mut = 0;
-    while (i < argv0_len) {
-        page_kv[off + i] = argv0[i];
-        i = i + 1;
+    // Write each argv string (NUL-terminated), recording its child VA.
+    let is i64 as k with mut = 0;
+    while (k < argc) {
+        let is i64 as slen with mut = argv_lens[k];
+        if (slen < 0) { slen = 0; }
+        if (off < slen + 1) {
+            serial.println("elf: initial stack overflow", 27);
+            return cast(i32, 0 - 3);
+        }
+        off = off - (slen + 1);
+        let is *u8 as src = cast(*u8, argv_ptrs[k]);
+        let is i64 as j with mut = 0;
+        while (j < slen) { page_kv[off + j] = src[j]; j = j + 1; }
+        page_kv[off + slen] = cast(u8, 0);
+        argv_va[k] = page_va + off;
+        k = k + 1;
     }
-    let is i64 as argv0_va = page_va + off;
 
-    // 16 bytes for AT_RANDOM (just zeros for now — real entropy
-    // arrives with the RNG syscall).
+    // 16 bytes for AT_RANDOM (zeros until the RNG syscall exists).
+    if (off < 16) { serial.println("elf: initial stack overflow", 27); return cast(i32, 0 - 3); }
     off = off - 16;
     let is i64 as random_va = page_va + off;
     let is i64 as zr with mut = 0;
     while (zr < 16) { page_kv[off + zr] = cast(u8, 0); zr = zr + 1; }
 
-    // Align cursor to 16 bytes before laying out the i64-array
-    // section so the SP at entry lands aligned.
-    off = off & cast(i64, 0 - 1) - 15;
-
-    // Compute total bytes for argv (1 + 1 NULL = 2 entries),
-    // envp (1 NULL = 1 entry), auxv (4 entries × 2 = 8 i64s),
-    // argc (1 i64). Total = 1 + 2 + 1 + 8 = 12 i64s = 96 bytes.
-    let is i64 as scalars_bytes = 12 * 8;
+    // Scalar block: argc + argv[argc] + argv NULL + envp NULL + auxv(8 words).
+    // = 1 + argc + 1 + 1 + 8 = argc + 11 i64s.
+    let is i64 as nwords = argc + 11;
+    let is i64 as scalars_bytes = nwords * 8;
     if (off < scalars_bytes) {
         serial.println("elf: initial stack overflow", 27);
         return cast(i32, 0 - 3);
     }
     off = off - scalars_bytes;
-
-    // Realign down to 16.
-    off = off & cast(i64, 0 - 1) - 15;
+    // Align the SP down to 16 so _start sees a 16-aligned rsp at argc.
+    off = off & cast(i64, 0 - 16);
 
     let is *i64 as words = cast(*i64, &page_kv[off]);
     let is i64 as user_rsp = page_va + off;
 
-    // Slot 0  : argc
-    // Slot 1  : argv[0] = argv0_va
-    // Slot 2  : argv[1] = NULL
-    // Slot 3  : envp[0] = NULL
-    // Slots 4..11 : 4 auxv entries (type, val) pairs
-    words[0] = 1;
-    words[1] = argv0_va;
-    words[2] = 0;
-    words[3] = 0;
-    words[4] = AT_PAGESZ;   words[5]  = pmm.PAGE_SIZE;
-    words[6] = AT_ENTRY;    words[7]  = entry;
-    words[8] = AT_RANDOM;   words[9]  = random_va;
-    words[10] = AT_NULL;    words[11] = 0;
+    words[0] = argc;
+    let is i64 as w with mut = 0;
+    while (w < argc) { words[1 + w] = argv_va[w]; w = w + 1; }
+    words[1 + argc] = 0;             // argv terminator
+    words[2 + argc] = 0;             // envp[0] = NULL — empty environment
+    let is i64 as ax = 3 + argc;     // auxv begins after the envp NULL
+    words[ax + 0] = AT_PAGESZ;  words[ax + 1] = pmm.PAGE_SIZE;
+    words[ax + 2] = AT_ENTRY;   words[ax + 3] = entry;
+    words[ax + 4] = AT_RANDOM;  words[ax + 5] = random_va;
+    words[ax + 6] = AT_NULL;    words[ax + 7] = 0;
 
     *out_rsp = user_rsp;
     return 0;
+}
+
+// Convenience for the single-argv (program-name only) callers — the smokes and
+// the ELF loader. Wraps the name in a 1-element argv.
+fn build_initial_stack_named(a as *vma.Aspace, entry as i64,
+                             argv0 as *u8, argv0_len as i64,
+                             out_rsp as *i64) as i32 {
+    let is [1]i64 as ptrs;
+    let is [1]i64 as lens;
+    ptrs[0] = cast(i64, argv0);
+    lens[0] = argv0_len;
+    return build_initial_stack(a, entry, cast(*i64, &ptrs[0]), cast(*i64, &lens[0]), 1, out_rsp);
 }
 
 // ============================================================
@@ -344,7 +378,7 @@ fn load_elf(a as *vma.Aspace, buf as *u8, size as i64,
         return src;
     }
 
-    let is i32 as ssrc = build_initial_stack(a, e_entry, argv0, argv0_len, out_user_rsp);
+    let is i32 as ssrc = build_initial_stack_named(a, e_entry, argv0, argv0_len, out_user_rsp);
     if (ssrc != 0) { return ssrc; }
 
     *out_entry = e_entry;

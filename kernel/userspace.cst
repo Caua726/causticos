@@ -1932,25 +1932,14 @@ fn build_spawn_parent_cse() as void {
 // it. Image loading + thread creation live here (not in process.cst) so
 // that module stays free of sched/vma/loader imports.
 // ----------------------------------------------------------------
-fn proc_spawn(parent as i64, img as *u8, img_len as i64) as i64 {
-    let is *vma.Aspace as a = vma.aspace_create();
-    if (cast(i64, a) == 0) { return 0; }
-
-    let is i64 as entry with mut = 0;
-    let is i64 as user_rsp with mut = 0;
-    let is i32 as rc = cse.load_cse(a, img, img_len, cast(*u8, "child"), 5,
-                                     &entry, &user_rsp);
-    if (rc != 0) {
-        vma.aspace_destroy(a);
-        return 0;
-    }
-
+// Shared tail: turn a freshly loaded aspace (entry + user_rsp already set) into
+// a suspended child Process. Destroys the aspace and returns 0 on failure.
+fn proc_from_loaded(parent as i64, a as *vma.Aspace, entry as i64, user_rsp as i64) as i64 {
     let is i64 as p = proc.process_create(parent, cast(i64, a), 0);
     if (p == 0) {
         vma.aspace_destroy(a);
         return 0;
     }
-
     let is i64 as tid = sched.create_user_thread_ex(
         cast(i64, fn_ptr(user_thread_trampoline)),
         sched.QOS_NORMAL,
@@ -1959,6 +1948,32 @@ fn proc_spawn(parent as i64, img as *u8, img_len as i64) as i64 {
     );
     proc.attach_main_thread(p, tid);
     return p;
+}
+
+fn proc_spawn(parent as i64, img as *u8, img_len as i64) as i64 {
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse(a, img, img_len, cast(*u8, "child"), 5,
+                                     &entry, &user_rsp);
+    if (rc != 0) { vma.aspace_destroy(a); return 0; }
+    return proc_from_loaded(parent, a, entry, user_rsp);
+}
+
+// argv-aware spawn: same as proc_spawn but the child receives a full argument
+// vector (argv_ptrs/argv_lens are KERNEL pointers, argc >= 1). SYS_SPAWN uses
+// this — argv is data laid on the child's stack, never resolved (architecture §2).
+fn proc_spawn_argv(parent as i64, img as *u8, img_len as i64,
+                   argv_ptrs as *i64, argv_lens as *i64, argc as i64) as i64 {
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse_argv(a, img, img_len, argv_ptrs, argv_lens, argc,
+                                          &entry, &user_rsp);
+    if (rc != 0) { vma.aspace_destroy(a); return 0; }
+    return proc_from_loaded(parent, a, entry, user_rsp);
 }
 
 // Start a spawned (suspended) process: make its main thread runnable.
@@ -2194,6 +2209,73 @@ fn close_on_exit_smoke() as void {
 // of phase-2 bind / mount finishes printing before our log lands,
 // then runs the smokes once each.
 // ============================================================
+// argv smoke — proves SYS_SPAWN's argv reaches the child's stack. The child
+// reads argv[1][0] off its initial System V stack and exits with that byte; we
+// spawn it with argv = ["child", "K"] and confirm exit == 'K' (0x4B). Proves
+// build_initial_stack's full-argv layout (argc, argv[], the strings) end to end
+// in ring 3. (sys_spawn's user-copy of argv mirrors the proven fdacts copy.)
+// ============================================================
+let is i64 as child_argv_len with mut = 0;
+let is [256]u8 as child_argv;
+
+fn build_argv_child_cse() as void {
+    let is *u8 as e = cast(*u8, &child_argv[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, 0x401000);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, 0x401000);
+    write_le_u32(e, 0x28, 0x50);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, 0x402000);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = 0x50;
+    // rsp -> argc ; argv[0]@[rsp+8] ; argv[1]@[rsp+0x10]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x74); e[c+3]=cast(u8,0x24); e[c+4]=cast(u8,0x10); c = c + 5; // mov rsi,[rsp+0x10]
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0xB6); e[c+2]=cast(u8,0x3E); c = c + 3;                                          // movzx edi,byte [rsi]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0); e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7; // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                                                // syscall
+
+    let is i64 as text_size = c - 0x50;
+    write_le_u32(e, 0x2C, text_size);
+    write_le_u32(e, 0x30, text_size);
+    child_argv_len = c;
+}
+
+fn spawn_argv_smoke() as void {
+    serial.println("userspace.argv_smoke: start", 27);
+    build_argv_child_cse();
+    let is [2]i64 as ptrs;
+    let is [2]i64 as lens;
+    ptrs[0] = cast(i64, cast(*u8, "child")); lens[0] = 5;
+    ptrs[1] = cast(i64, cast(*u8, "K"));     lens[1] = 1;
+    let is i64 as child = proc_spawn_argv(proc.init_proc, cast(*u8, &child_argv[0]), child_argv_len,
+                                           cast(*i64, &ptrs[0]), cast(*i64, &lens[0]), 2);
+    if (child == 0) {
+        serial.println("userspace.argv_smoke: spawn FAIL", 32);
+        return;
+    }
+    proc_start(child);
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(child));
+    if (code == 75) {                                  // 'K'
+        serial.println("userspace.argv_smoke: PASS", 26);
+    } else {
+        serial.print("userspace.argv_smoke: exit=", 27);
+        util.print_num(code);
+        serial.println(" FAIL", 5);
+    }
+}
+
+// ============================================================
 // Boot → userspace handoff: launch /init.cse from the FAT32 disk.
 //
 // The disk-loaded image is the first userspace program: open("/init.cse") →
@@ -2270,6 +2352,7 @@ fn smoke_thread() as void {
     spawn_kbd_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
+    spawn_argv_smoke();
     // The boot→userspace handoff: load and launch the first real program from
     // disk. Last, so the smokes above (which validate the mechanisms init uses)
     // run first; in production this is where the terminal takes over.
