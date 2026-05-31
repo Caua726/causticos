@@ -1376,6 +1376,134 @@ fn spawn_channel_smoke() as void {
     }
 }
 
+// ============================================================
+// Embedded "fdacts parent" CSE — proves the SYS_SPAWN fdacts path from
+// ring 3, end to end ring-3 → ring-3: the parent does
+//   channel_create → spawn(child, fdacts=[{0, fd_b}]) → write(fd_a, 7) →
+//   wait(child) → exit(code)
+// all via real syscalls. The child CSE (build_child_chan_cse) is embedded at
+// a fixed file offset so its VA is known. The kernel only spawns the parent
+// and checks it exits with 7 — the byte the child read off the handed-off
+// channel endpoint and echoed back.
+// ============================================================
+
+let is i64 as CSE_PF_ENTRY      = 0x401000;
+let is i64 as CSE_PF_BSS_VA     = 0x402000;
+let is i64 as CSE_PF_FOFF       = 0x50;
+let is i64 as CSE_PF_CHILD_FOFF = 0x200;     // child image embedded here (code fits below)
+let is i64 as parent_fd_len with mut = 0;
+let is [1024]u8 as parent_fd;
+
+fn build_parent_fdacts_cse() as void {
+    let is *u8 as e = cast(*u8, &parent_fd[0]);
+    let is i64 as z with mut = 0;
+    while (z < 1024) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, CSE_PF_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, CSE_PF_ENTRY);
+    write_le_u32(e, 0x28, CSE_PF_FOFF);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, CSE_PF_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    // child VA = where CSE_PF_CHILD_FOFF maps in the parent's .text.
+    let is i64 as child_va = CSE_PF_ENTRY + (CSE_PF_CHILD_FOFF - CSE_PF_FOFF);
+
+    // BSS layout (r15): +0 fd_a, +8 fd_b, +16/+24 fdacts{child_fd,src_fd},
+    //                   +32 child_pid, +40 sentinel byte, +48 wait status.
+    let is i64 as c with mut = CSE_PF_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, CSE_PF_BSS_VA); c = c + 10;
+
+    // channel_create(out = r15): mov rax,24; mov rdi,r15; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,24); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x4C); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xFF); c = c + 3;   // mov rdi,r15
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                          // syscall
+
+    // fdacts[0] = {child_fd=0, src_fd=fd_b}
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x10);
+    e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); e[c+7]=cast(u8,0); c = c + 8;   // mov qword [r15+16],0
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x08); c = c + 4;  // mov rax,[r15+8]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x18); c = c + 4;  // mov [r15+24],rax
+
+    // spawn(child_va, child_len, fdacts=r15+16, n_acts=1)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,14); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rax,14
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, child_va); c = c + 10;   // movabs rdi, child_va
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    write_le_u32(e, c+3, child_cc_len); c = c + 7;                                            // mov rsi, child_len
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x57); e[c+3]=cast(u8,0x10); c = c + 4;  // lea rdx,[r15+16]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;     // mov r10,1
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x20); c = c + 4;  // mov [r15+32],rax
+
+    // write(fd_a, &sentinel=r15+40, 1) — sentinel = 7
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0xC6); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x28); e[c+4]=cast(u8,7); c = c + 5;  // mov byte [r15+40],7
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,11); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;    // mov rax,11
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x28); c = c + 4;  // lea rsi,[r15+40]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;     // mov rdx,1
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+
+    // wait(child_pid, status=r15+48)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,15); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;    // mov rax,15
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x20); c = c + 4;  // mov rdi,[r15+32]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x30); c = c + 4;  // lea rsi,[r15+48]
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+
+    // exit(rax): mov rdi,rax; mov rax,3; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xC7); c = c + 3;               // mov rdi,rax
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;     // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+
+    // Embed the child image at CSE_PF_CHILD_FOFF (code above ends well before it).
+    let is i64 as j with mut = 0;
+    while (j < child_cc_len) { e[CSE_PF_CHILD_FOFF + j] = child_cc[j]; j = j + 1; }
+
+    let is i64 as text_size = (CSE_PF_CHILD_FOFF + child_cc_len) - CSE_PF_FOFF;
+    write_le_u32(e, 0x2C, text_size);     // seg0 file_size
+    write_le_u32(e, 0x30, text_size);     // seg0 mem_size
+    parent_fd_len = CSE_PF_CHILD_FOFF + child_cc_len;
+}
+
+// Spawn the parent (a Process — only a Process may SYS_SPAWN) and confirm it
+// exits with 7: the whole channel_create / spawn-with-fdacts / write / wait
+// dance happened in ring 3, child included.
+fn spawn_fdacts_smoke() as void {
+    serial.println("userspace.fdacts_smoke: start", 29);
+    build_child_chan_cse();        // must run first — parent embeds it + needs its len
+    build_parent_fdacts_cse();
+
+    let is i64 as parent = proc_spawn(proc.init_proc, cast(*u8, &parent_fd[0]), parent_fd_len);
+    if (parent == 0) {
+        serial.println("userspace.fdacts_smoke: spawn FAIL", 34);
+        return;
+    }
+    proc_start(parent);
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(parent));
+    if (code == 7) {
+        serial.println("userspace.fdacts_smoke: PASS", 28);
+    } else {
+        serial.print("userspace.fdacts_smoke: exit=", 29);
+        util.print_num(code);
+        serial.println(" FAIL", 5);
+    }
+}
+
 fn spawn_user_cse_smoke() as void {
     serial.println("userspace.cse_smoke: start", 26);
 
@@ -1929,6 +2057,7 @@ fn smoke_thread() as void {
     spawn_user_cse_smoke();
     spawn_user_fb_smoke();
     spawn_channel_smoke();
+    spawn_fdacts_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
 }
