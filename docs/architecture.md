@@ -255,15 +255,22 @@ in a swappable userspace program.
   honest errno, never an `ioctl`. File read/write/close/lseek/readdir dispatch through
   it. Close-on-exit drains the fd table on aspace teardown (coe_smoke green). (Atomic
   refcount deferred to the channel work, when two fd tables first share a KObject.)
-- Syscall ABI (flat-numbered, `SYS_COUNT = 22`): `kern_info`, `time_now`/`sleep`,
+- **Surface** (`KOBJ_SURFACE`): the display key. `dev_open(DEV_FB)` mints a surface over
+  the framebuffer; `SYS_MMAP|MMAP_FD` maps its kernel-allocated backbuffer into the
+  holder (a `VMA_FILE` the surface owns — teardown unmaps without freeing, close frees);
+  `SYS_PRESENT` blits the damage rect to the scanout. The scanout is mapped
+  write-combining (PAT PA1 → WC, per-cpu); `fb.cst` reads the real bpp from Limine.
+  Proven ring-3 → screen: the fb smoke does dev_open/mmap/present from a ring-3 CSE and
+  the kernel confirms the pixels (smp 1/2/4). v0 backbuffer is one contiguous ≤4 MiB
+  block (full-screen / non-contiguous is a refinement).
+- Syscall ABI (flat-numbered, `SYS_COUNT = 24`): `kern_info`, `time_now`/`sleep`,
   `proc exit`/`getpid`/`yield`, `io_write_serial`, `mmap`/`munmap`,
   `open`/`read`/`write`/`close`/`lseek`, `spawn`/`wait`,
-  `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`.
+  `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`, `dev_open`/`present`.
 
 **Designed here, not yet built:**
 - The **channel** object (founding IPC primitive) + endpoint handoff at spawn (`fdacts`
   + object refcount).
-- The **surface** object (backbuffer + present) + `dev_open(DEV_FB)` + fd-backed `mmap`.
 - **Raw keyboard** as a device fd; userspace keymap; focus relay.
 - **Preemptible device ownership** (grab stack).
 - The **terminal** and the **shell** (userspace programs); the optional **compositor**.
