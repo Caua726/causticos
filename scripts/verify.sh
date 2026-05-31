@@ -13,6 +13,8 @@ if [ ! -f /tmp/disk.pristine.img ] || [ build/causticos.iso -nt /tmp/disk.pristi
   python3 scripts/fat32_add_file.py /tmp/disk.pristine.img addfile "long-name-with-spaces and mixed case.txt" "LFN content here" >/dev/null
   python3 scripts/fat32_add_file.py /tmp/disk.pristine.img mkdir docs >/dev/null
   python3 scripts/fat32_add_file.py /tmp/disk.pristine.img addfile readme.md "# Docs readme\n\nInside docs subdir." 8 >/dev/null
+  python3 scripts/make_init_cse.py /tmp/init.cse >/dev/null 2>&1
+  python3 scripts/fat32_add_file.py /tmp/disk.pristine.img addfilebin init.cse /tmp/init.cse >/dev/null 2>&1
 fi
 
 PASS=0

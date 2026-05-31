@@ -65,6 +65,10 @@ if [ "${RESEED_DISK:-1}" = "1" ]; then
     python3 scripts/fat32_add_file.py build/disk.img mkdir docs >/dev/null
     python3 scripts/fat32_add_file.py build/disk.img addfile readme.md \
         "# Docs readme\n\nInside docs subdir." 8 >/dev/null
+    # /init.cse — the first userspace program the kernel launches from disk
+    # (boot→userspace handoff). A stub today; the terminal replaces it later.
+    python3 scripts/make_init_cse.py build/init.cse >/dev/null
+    python3 scripts/fat32_add_file.py build/disk.img addfilebin init.cse build/init.cse >/dev/null
 fi
 
 echo "==> Booting in QEMU..."

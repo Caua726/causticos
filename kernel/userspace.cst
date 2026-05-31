@@ -2193,6 +2193,57 @@ fn close_on_exit_smoke() as void {
 // Thread entry called from main.cst. Sleeps a moment so the rest
 // of phase-2 bind / mount finishes printing before our log lands,
 // then runs the smokes once each.
+// ============================================================
+// Boot → userspace handoff: launch /init.cse from the FAT32 disk.
+//
+// The disk-loaded image is the first userspace program: open("/init.cse") →
+// read → proc_spawn → proc_start. "Everything is a key / just a file" — init is
+// not special, it is a .cse on the disk you can swap without recompiling the
+// kernel (the real terminal, Fatia 4, replaces the stub with no kernel change).
+//
+// Production semantics: spawn + start, then return — init owns the machine from
+// here (the terminal runs forever, holding the surface + keyboard) and the boot
+// path does NOT wait on it. The stub proves the path by writing a serial marker
+// from ring 3 before it exits.
+//
+// Prod-ready against the flaky AHCI bind: the caller (smoke_thread) already
+// gates on vfs.boot_ready with a deadline, so reaching here means the mount
+// succeeded. Every failure below is LOUD (serial + return), never a silent
+// hang: a missing / short / unspawnable /init.cse is a real boot fault.
+// ============================================================
+let is [4096]u8 as init_image with mut;
+
+fn spawn_init_from_disk() as void {
+    serial.println("boot: open /init.cse", 20);
+    let is *vfs.VfsFile as f = vfs.open(cast(*u8, "/init.cse"), 9, cast(i32, abi.O_RDONLY));
+    if (cast(i64, f) == 0) {
+        serial.println("boot: /init.cse open FAIL", 25);
+        return;
+    }
+    let is i64 as sz = f.size;
+    if (sz <= 0 || sz > 4096) {
+        serial.print("boot: /init.cse bad size", 24);
+        serial.println("", 0);
+        vfs.close(f);
+        return;
+    }
+    let is i64 as got = vfs.read(f, cast(*u8, &init_image[0]), sz);
+    vfs.close(f);
+    if (got != sz) {
+        serial.println("boot: /init.cse short read", 26);
+        return;
+    }
+    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &init_image[0]), got);
+    if (child == 0) {
+        serial.println("boot: /init.cse spawn FAIL", 26);
+        return;
+    }
+    proc_start(child);
+    serial.print("boot: /init.cse launched pid=", 29);
+    util.print_num(proc.proc_pid(child));
+    serial.println("", 0);
+}
+
 fn smoke_thread() as void {
     // Wait for the boot self-tests (FAT32 phase-6 + VFS test) to finish
     // before running the userspace smokes — otherwise they spawn processes
@@ -2219,5 +2270,9 @@ fn smoke_thread() as void {
     spawn_kbd_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
+    // The boot→userspace handoff: load and launch the first real program from
+    // disk. Last, so the smokes above (which validate the mechanisms init uses)
+    // run first; in production this is where the terminal takes over.
+    spawn_init_from_disk();
 }
 

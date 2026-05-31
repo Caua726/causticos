@@ -316,6 +316,19 @@ def main():
             parent = int(sys.argv[5]) if len(sys.argv) > 5 else bpb["root_clus"]
             c = addfile(f, bpb, name, content, parent)
             print(f"file {name} cluster={c}")
+        elif op == "addfilebin":
+            # addfilebin <name> <hostpath> [<parent>] — content is raw bytes
+            # from a host file (binaries with NUL bytes, e.g. an .cse image,
+            # which can't survive a shell string arg).
+            if len(sys.argv) < 5:
+                print("addfilebin <name> <hostpath> [<parent>]", file=sys.stderr)
+                sys.exit(1)
+            name = sys.argv[3]
+            with open(sys.argv[4], "rb") as src:
+                content = src.read()
+            parent = int(sys.argv[5]) if len(sys.argv) > 5 else bpb["root_clus"]
+            c = addfile(f, bpb, name, content, parent)
+            print(f"file {name} cluster={c} ({len(content)} bytes, binary)")
         elif op == "mkdir":
             name = sys.argv[3]
             parent = int(sys.argv[4]) if len(sys.argv) > 4 else bpb["root_clus"]
