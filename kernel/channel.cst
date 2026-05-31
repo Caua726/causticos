@@ -1,0 +1,257 @@
+// channel.cst — the channel object (KOBJ_CHANNEL): the founding IPC
+// primitive. Two endpoints, each an fd; a byte stream in each direction.
+// Console, pipes, shell↔terminal all ride on this (docs/architecture.md §5).
+//
+// Data only, byte stream — no message framing, no handle-passing in the
+// kernel (that's userspace policy / a future op). read/write are the honest
+// ops (a channel genuinely IS a byte sequence, like a file); mmap/present/
+// lseek/readdir are null. read/write dispatch through ko_read/ko_write, so
+// SYS_READ/SYS_WRITE drive a channel fd for free.
+//
+// v0 blocking is by polling (sleep_for_ns, like proc_wait): simple and free
+// of the lost-wakeup race that a wait/wake scheme needs care to avoid; the
+// ~1 ms latency is imperceptible for a console. A wakeup_thread fast-path is
+// a later refinement.
+
+use "kobject.cst" as kobject;
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "lock.cst" as lock;
+use "abi.cst" as abi;
+use "sched.cst" as sched;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+let is i64 as BUF_CAP  = 1024;        // bytes per direction (power of 2)
+let is i64 as BUF_MASK = 1023;
+let is i64 as POLL_NS  = 1000000;     // 1 ms blocking poll
+
+// Tudo i64 (mixed-width rule); the two byte buffers go last.
+struct Channel {
+    refcount as i64;        // live endpoints (2 at create)
+    a2b_head as i64;
+    a2b_tail as i64;
+    a2b_count as i64;
+    b2a_head as i64;
+    b2a_tail as i64;
+    b2a_count as i64;
+    a_closed as i64;
+    b_closed as i64;
+    lk as lock.TicketLock;
+    a2b_buf as [1024]u8;    // A → B
+    b2a_buf as [1024]u8;    // B → A
+}
+
+struct ChannelEndpoint {
+    channel as i64;         // *Channel
+    side as i64;            // 0 = A, 1 = B
+}
+
+let is kobject.KObjectOps as CHANNEL_OPS with mut;
+
+fn init() as void {
+    CHANNEL_OPS.read  = fn_ptr(chan_read);
+    CHANNEL_OPS.write = fn_ptr(chan_write);
+    CHANNEL_OPS.close = fn_ptr(chan_close);
+    // mmap/present/lseek/readdir stay null — a channel is a byte stream.
+}
+
+// ============================================================
+// Ring buffer helpers — caller holds the channel lock.
+// ============================================================
+
+fn ring_pop(bufbase as i64, head as *i64, count as *i64, dst as i64, n as i64) as i64 {
+    let is i64 as avail = *count;
+    let is i64 as take with mut = n;
+    if (take > avail) { take = avail; }
+    let is i64 as h with mut = *head;
+    let is i64 as i with mut = 0;
+    while (i < take) {
+        let is *u8 as s = cast(*u8, bufbase + h);
+        let is *u8 as d = cast(*u8, dst + i);
+        d[0] = s[0];
+        h = (h + 1) & BUF_MASK;
+        i = i + 1;
+    }
+    *head = h;
+    *count = avail - take;
+    return take;
+}
+
+fn ring_push(bufbase as i64, tail as *i64, count as *i64, src as i64, n as i64) as i64 {
+    let is i64 as space = BUF_CAP - *count;
+    let is i64 as put with mut = n;
+    if (put > space) { put = space; }
+    let is i64 as t with mut = *tail;
+    let is i64 as i with mut = 0;
+    while (i < put) {
+        let is *u8 as s = cast(*u8, src + i);
+        let is *u8 as d = cast(*u8, bufbase + t);
+        d[0] = s[0];
+        t = (t + 1) & BUF_MASK;
+        i = i + 1;
+    }
+    *tail = t;
+    *count = *count + put;
+    return put;
+}
+
+// ============================================================
+// Ops. `buf` is a kernel address (the syscall layer staged the copy).
+// ============================================================
+
+// Read from the endpoint's INPUT direction (A reads b2a, B reads a2b).
+// Blocks until data arrives; returns 0 (EOF) once empty and the writer
+// side has closed.
+fn chan_read(priv as i64, buf as i64, n as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    if (n <= 0) { return 0; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as side = ep.side;
+    let is i64 as done with mut = 0;
+    let is i64 as result with mut = 0;
+    while (done == 0) {
+        let is i64 as fl = lock.acquire_irq(&ch.lk);
+        let is i64 as got with mut = 0;
+        if (side == 0) {
+            got = ring_pop(cast(i64, &ch.b2a_buf[0]), &ch.b2a_head, &ch.b2a_count, buf, n);
+        } else {
+            got = ring_pop(cast(i64, &ch.a2b_buf[0]), &ch.a2b_head, &ch.a2b_count, buf, n);
+        }
+        let is i64 as other_closed with mut = 0;
+        if (side == 0) { other_closed = ch.b_closed; } else { other_closed = ch.a_closed; }
+        lock.release_irq(&ch.lk, fl);
+        if (got > 0)              { result = got; done = 1; }
+        else if (other_closed != 0) { result = 0;   done = 1; }   // EOF
+        else                      { sched.sleep_for_ns(POLL_NS); }
+    }
+    return result;
+}
+
+// Write to the endpoint's OUTPUT direction (A writes a2b, B writes b2a).
+// Blocks until at least one byte fits; E_PIPE once the reader side closed.
+fn chan_write(priv as i64, buf as i64, n as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    if (n <= 0) { return 0; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as side = ep.side;
+    let is i64 as done with mut = 0;
+    let is i64 as result with mut = 0;
+    while (done == 0) {
+        let is i64 as fl = lock.acquire_irq(&ch.lk);
+        let is i64 as other_closed with mut = 0;
+        if (side == 0) { other_closed = ch.b_closed; } else { other_closed = ch.a_closed; }
+        let is i64 as put with mut = 0;
+        if (other_closed == 0) {
+            if (side == 0) {
+                put = ring_push(cast(i64, &ch.a2b_buf[0]), &ch.a2b_tail, &ch.a2b_count, buf, n);
+            } else {
+                put = ring_push(cast(i64, &ch.b2a_buf[0]), &ch.b2a_tail, &ch.b2a_count, buf, n);
+            }
+        }
+        lock.release_irq(&ch.lk, fl);
+        if (other_closed != 0) { result = abi.E_PIPE; done = 1; }
+        else if (put > 0)      { result = put;        done = 1; }
+        else                   { sched.sleep_for_ns(POLL_NS); }   // full
+    }
+    return result;
+}
+
+// Close one endpoint. Marks its side closed (so the peer sees EOF/E_PIPE),
+// drops the channel's endpoint refcount, frees the Channel when the last
+// endpoint goes, and frees the endpoint struct.
+fn chan_close(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as fl = lock.acquire_irq(&ch.lk);
+    if (ep.side == 0) { ch.a_closed = 1; } else { ch.b_closed = 1; }
+    lock.release_irq(&ch.lk, fl);
+    let is i64 as old = lock.atomic_add(&ch.refcount, cast(i64, 0 - 1));
+    if (old == 1) { heap.kfree(cast(i64, ch)); }   // last endpoint
+    heap.kfree(priv);
+    return abi.E_OK;
+}
+
+// ============================================================
+// Mint a connected pair. Returns the two endpoint *KObjects via out
+// params (Caustic has no multi-return). 0 on success, -1 on OOM.
+// ============================================================
+
+fn channel_create(out_ko_a as *i64, out_ko_b as *i64) as i32 {
+    let is i64 as ch_addr = heap.kmalloc(sizeof(Channel), pmm.ALLOC_ZERO);
+    if (ch_addr == 0) { return cast(i32, 0 - 1); }
+    let is *Channel as ch = cast(*Channel, ch_addr);
+    ch.refcount = 2;     // buffers + cursors + closed flags + lk zeroed by ALLOC_ZERO
+
+    let is i64 as ep_a = heap.kmalloc(sizeof(ChannelEndpoint), pmm.ALLOC_ZERO);
+    if (ep_a == 0) { heap.kfree(ch_addr); return cast(i32, 0 - 1); }
+    let is *ChannelEndpoint as epa = cast(*ChannelEndpoint, ep_a);
+    epa.channel = ch_addr;
+    epa.side = 0;
+
+    let is i64 as ep_b = heap.kmalloc(sizeof(ChannelEndpoint), pmm.ALLOC_ZERO);
+    if (ep_b == 0) { heap.kfree(ep_a); heap.kfree(ch_addr); return cast(i32, 0 - 1); }
+    let is *ChannelEndpoint as epb = cast(*ChannelEndpoint, ep_b);
+    epb.channel = ch_addr;
+    epb.side = 1;
+
+    let is i64 as ko_a = kobject.ko_alloc(kobject.KOBJ_CHANNEL, &CHANNEL_OPS, ep_a);
+    if (ko_a == 0) { heap.kfree(ep_b); heap.kfree(ep_a); heap.kfree(ch_addr); return cast(i32, 0 - 1); }
+    let is i64 as ko_b = kobject.ko_alloc(kobject.KOBJ_CHANNEL, &CHANNEL_OPS, ep_b);
+    // Error path uses raw kfree (not ko_unref): nothing is wired/shared yet,
+    // so no close op should run.
+    if (ko_b == 0) { heap.kfree(ko_a); heap.kfree(ep_b); heap.kfree(ep_a); heap.kfree(ch_addr); return cast(i32, 0 - 1); }
+
+    *out_ko_a = ko_a;
+    *out_ko_b = ko_b;
+    return 0;
+}
+
+// ============================================================
+// Kernel-side smoke: mint a pair, write on A, read it back on B.
+// ============================================================
+
+fn smoke() as void {
+    serial.println("channel_smoke: start", 20);
+    let is i64 as ko_a with mut = 0;
+    let is i64 as ko_b with mut = 0;
+    if (channel_create(&ko_a, &ko_b) != 0) {
+        serial.println("channel_smoke: create FAIL", 26);
+        return;
+    }
+    let is *kobject.KObject as ka = cast(*kobject.KObject, ko_a);
+    let is *kobject.KObject as kb = cast(*kobject.KObject, ko_b);
+
+    let is [4]u8 as msg;
+    msg[0] = cast(u8, 0x43); msg[1] = cast(u8, 0x48);     // 'C','H'
+    msg[2] = cast(u8, 0x41); msg[3] = cast(u8, 0x4E);     // 'A','N'
+    let is i64 as wrote = chan_write(ka.priv, cast(i64, &msg[0]), 4);
+
+    let is [4]u8 as got;
+    got[0] = cast(u8, 0); got[1] = cast(u8, 0); got[2] = cast(u8, 0); got[3] = cast(u8, 0);
+    let is i64 as red = chan_read(kb.priv, cast(i64, &got[0]), 4);
+
+    let is i64 as ok with mut = 1;
+    if (wrote != 4) { ok = 0; }
+    if (red != 4)   { ok = 0; }
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (got[i] != msg[i]) { ok = 0; }
+        i = i + 1;
+    }
+
+    kobject.ko_unref(ko_a);
+    kobject.ko_unref(ko_b);
+
+    if (ok == 1) { serial.println("channel_smoke: PASS", 19); }
+    else {
+        serial.print("channel_smoke: FAIL wrote=", 26);
+        util.print_num(wrote);
+        serial.print(" red=", 5);
+        util.print_num(red);
+        serial.println("", 0);
+    }
+}
