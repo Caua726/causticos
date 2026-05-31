@@ -172,7 +172,7 @@ shell↔terminal, and all future IPC fall out of it.
 
 ---
 
-## 8. Input  *(designed)*
+## 8. Input  *(device built; keymap/focus are userspace, pending the terminal)*
 
 - **Keyboard = a device yielding RAW events.** `dev_open(DEV_KEYBOARD)` → an fd whose
   reads return raw event records (scancode, key down/up, modifier snapshot). Lossless;
@@ -271,6 +271,11 @@ in a swappable userspace program.
   an endpoint. **Endpoint handoff at spawn is live**: `SYS_SPAWN`'s `fdacts` installs the
   parent's KObjects into the still-suspended child. Proven: a ring-3 child receives a
   channel endpoint as its fd, blocks on read, wakes on the byte (smp 1/2/4).
+- **Keyboard device** (`KOBJ_DEVICE`): `dev_open(DEV_KEYBOARD)` → an fd whose read drains
+  a ring of **raw 2-byte events** (scancode + down/up + 0xE0-extended). The PS/2 handler
+  decodes only the device protocol, **no keymap** — layout/meaning are userspace. Proven
+  ring-3: a child dev_opens the keyboard, blocks on read, the kernel injects an event,
+  the child exits with the scancode (smp 1/2/4). v0 has no exclusivity (grab stack later).
 - Syscall ABI (flat-numbered, `SYS_COUNT = 25`): `kern_info`, `time_now`/`sleep`,
   `proc exit`/`getpid`/`yield`, `io_write_serial`, `mmap`/`munmap`,
   `open`/`read`/`write`/`close`/`lseek`, `spawn`/`wait`,
@@ -278,7 +283,8 @@ in a swappable userspace program.
   `channel_create`.
 
 **Designed here, not yet built:**
-- **Raw keyboard** as a device fd; userspace keymap; focus relay.
+- **Userspace keymap + focus relay** (the kernel side — raw keyboard as a device — is
+  built; layout/cooking/routing land with the terminal).
 - **Preemptible device ownership** (grab stack).
 - The **terminal** and the **shell** (userspace programs); the optional **compositor**.
 - `SYS_PROC_KILL`; file-fd handoff at spawn; `thread_spawn` (multi-thread process);
