@@ -261,10 +261,15 @@ fn back_anon_page(pml4 as i64, va as i64, prot as i64) as i32 {
 // Walk every page in [v.start, v.end), unmap from pml4, free the
 // backing physical page.
 fn unmap_vma_pages(pml4 as i64, v as *Vma) as void {
+    // VMA_FILE pages are owned by the backing object (e.g. a surface's
+    // backbuffer), not by the VMA — unmap only, never free, or we'd
+    // double-free when the object's close op releases them. VMA_ANON
+    // pages are the VMA's own, so they're freed here.
+    let is i64 as is_file = v.flags & VMA_FILE;
     let is i64 as p with mut = v.start;
     while (p < v.end) {
         let is i64 as old_phys = vmm.vmm_unmap_page(pml4, p);
-        if (old_phys != 0) {
+        if (old_phys != 0 && is_file == 0) {
             let is i32 as pfn = pmm.phys_to_pfn(old_phys);
             pmm.free_pages(pfn);
         }
@@ -367,6 +372,43 @@ fn munmap(a as *Aspace, va as i64, len as i64) as i32 {
     lock.release_irq(lk_ptr(a), f_internal);
     if (removed_any == 0) { return cast(i32, 0 - 1); }
     return 0;
+}
+
+// mmap_phys: map an existing physically-contiguous range
+// [phys, phys + npages*PAGE) into the aspace as ONE VMA_FILE region. The
+// backing object (passed as `owner`, kept on the VMA for reference) owns
+// the pages; this VMA only maps them, so munmap/teardown unmaps without
+// freeing (see unmap_vma_pages). Used by surface mmap to expose a
+// kernel-allocated backbuffer to its holder. Returns the user VA, or -1.
+fn mmap_phys(a as *Aspace, phys as i64, npages as i64,
+             prot as i64, owner as i64) as i64 {
+    if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
+    if (npages <= 0) { return cast(i64, 0 - 1); }
+    let is i64 as size = npages * pmm.PAGE_SIZE;
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+
+    let is i64 as start = vma_find_free_va(a, pmm.PAGE_SIZE, size);
+    if (start < 0) {
+        lock.release_irq(lk_ptr(a), f_internal);
+        return cast(i64, 0 - 1);
+    }
+    let is *Vma as v = vma_alloc(start, start + size, prot, VMA_FILE);
+    if (cast(i64, v) == 0) {
+        lock.release_irq(lk_ptr(a), f_internal);
+        return cast(i64, 0 - 1);
+    }
+    v.file_handle = owner;
+
+    let is i64 as full = vmm.PTE_PRESENT | vmm.PTE_USER | prot;
+    let is i64 as rc = vmm.vmm_map_range(a.pml4_phys, start, phys, npages, full);
+    if (rc != 0) {
+        heap.kfree(cast(i64, v));
+        lock.release_irq(lk_ptr(a), f_internal);
+        return cast(i64, 0 - 1);
+    }
+    vma_insert_sorted(a, v);
+    lock.release_irq(lk_ptr(a), f_internal);
+    return start;
 }
 
 // ============================================================

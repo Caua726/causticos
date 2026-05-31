@@ -1,0 +1,206 @@
+// surface.cst — the surface object (KOBJ_SURFACE).
+//
+// A surface is the display key: a kernel-allocated backbuffer the holder
+// draws into, published to the scanout by present(damage). It is the one
+// non-stream object kind — its honest ops are mmap + present, not
+// read/write (see docs/architecture.md §7). dev_open(DEV_FB) mints one
+// over the framebuffer.
+//
+// Backbuffer + present (not direct scanout) on purpose: the surface object
+// is identical whether one fullscreen app holds the framebuffer or a
+// compositor composites N client surfaces — only the *target* of present
+// changes. The kernel owns the scanout; the holder only ever touches its
+// own backbuffer.
+//
+// v0 limitation: the backbuffer is a single physically-contiguous block
+// capped at MAX_BLOCK_ORDER (4 MiB). If the full screen doesn't fit, the
+// surface covers as many top rows as do — still a complete ring-3 → screen
+// path. A full-screen / non-contiguous backbuffer (kvalloc + per-page user
+// mapping) is a later refinement.
+
+use "kobject.cst" as kobject;
+use "vmm.cst" as vmm;
+use "pmm.cst" as pmm;
+use "vma.cst" as vma;
+use "fb.cst" as fb;
+use "heap.cst" as heap;
+use "abi.cst" as abi;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+// All scalars i64 (Caustic mixed-width rule).
+struct Surface {
+    width as i64;
+    height as i64;        // rows the backbuffer actually covers
+    pitch as i64;
+    bpp_bytes as i64;
+    size as i64;          // height * pitch
+    npages as i64;
+    bb_pfn as i64;        // backbuffer physical-frame number (for free)
+    bb_phys as i64;       // backbuffer physical base (for the user mapping)
+    backbuffer as i64;    // backbuffer kernel VA (HHDM) — for draw + blit
+    scanout as i64;       // real scanout kernel VA (fb)
+    user_va as i64;       // where it's mapped in the holder (0 = unmapped)
+}
+
+let is i64 as BB_MAX_PAGES = 1024;     // 2^MAX_BLOCK_ORDER pages = 4 MiB
+
+let is kobject.KObjectOps as SURFACE_OPS with mut;
+
+fn init() as void {
+    SURFACE_OPS.present = fn_ptr(surf_present);
+    SURFACE_OPS.mmap    = fn_ptr(surf_mmap);
+    SURFACE_OPS.close   = fn_ptr(surf_close);
+    // read/write/lseek/readdir stay null — a surface is not a byte stream;
+    // ko_read/ko_write on a surface fd return E_BADF, honestly.
+}
+
+// dev_open(DEV_FB) → a KOBJ_SURFACE over the framebuffer. Returns the
+// *KObject as i64, or 0 on failure.
+fn acquire_fb() as i64 {
+    let is i64 as w = fb.width();
+    let is i64 as full_h = fb.height();
+    let is i64 as pitch = fb.pitch();
+    if (w <= 0) { return 0; }
+    if (full_h <= 0) { return 0; }
+    if (pitch <= 0) { return 0; }
+
+    let is i64 as want_pages = (full_h * pitch + 4095) / 4096;
+    let is i64 as npages with mut = want_pages;
+    if (npages > BB_MAX_PAGES) { npages = BB_MAX_PAGES; }
+    let is i64 as h = (npages * 4096) / pitch;     // rows that fit
+    if (h <= 0) { return 0; }
+    let is i64 as size = h * pitch;
+
+    let is i32 as order = vmm.ceil_log2(npages);
+    let is i32 as pfn = pmm.alloc_pages(pmm.ZONE_NORMAL,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK,
+        order, pmm.USAGE_KERNEL, cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+
+    let is i64 as addr = heap.kmalloc(sizeof(Surface), pmm.ALLOC_ZERO);
+    if (addr == 0) { pmm.free_pages(pfn); return 0; }
+    let is *Surface as s = cast(*Surface, addr);
+    s.width = w;
+    s.height = h;
+    s.pitch = pitch;
+    s.bpp_bytes = fb.bpp_bytes();
+    s.size = size;
+    s.npages = npages;
+    s.bb_pfn = cast(i64, pfn);
+    s.bb_phys = phys;
+    s.backbuffer = pmm.phys_to_virt(phys);     // kernel HHDM VA
+    s.scanout = fb.scanout_virt();
+    s.user_va = 0;
+
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_SURFACE, &SURFACE_OPS, addr);
+    if (ko == 0) { pmm.free_pages(pfn); heap.kfree(addr); return 0; }
+    return ko;
+}
+
+// close op: free the backbuffer pages + the Surface struct. The fd-table
+// drain (aspace_destroy) runs this on the last reference, so a process
+// exiting with the surface open never leaks framebuffer-sized memory.
+fn surf_close(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *Surface as s = cast(*Surface, priv);
+    if (s.backbuffer != 0) {
+        pmm.free_pages(cast(i32, s.bb_pfn));
+        s.backbuffer = 0;
+    }
+    heap.kfree(priv);
+    return abi.E_OK;
+}
+
+// mmap op: map the contiguous backbuffer into the holder's aspace as a
+// single VMA_FILE region (the surface owns the pages, the VMA only maps
+// them — teardown unmaps without freeing). Returns the user VA or errno.
+fn surf_mmap(priv as i64, aspace as i64, hint as i64, prot as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    if (aspace == 0) { return abi.E_INVAL; }
+    let is *Surface as s = cast(*Surface, priv);
+    let is i64 as va = vma.mmap_phys(cast(*vma.Aspace, aspace),
+                                     s.bb_phys, s.npages, prot, priv);
+    if (va < 0) { return abi.E_NOMEM; }
+    s.user_va = va;
+    return va;
+}
+
+// present op: blit the dirty rectangle backbuffer→scanout. Clamps to the
+// surface bounds. v0 copies pixel-by-pixel (32bpp); the WC scanout (1b-PAT)
+// makes this fast on real hardware.
+fn surf_present(priv as i64, x as i64, y as i64, w as i64, h as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *Surface as s = cast(*Surface, priv);
+    let is i64 as x0 with mut = x;
+    let is i64 as y0 with mut = y;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x0 >= s.width) { return abi.E_OK; }
+    if (y0 >= s.height) { return abi.E_OK; }
+    let is i64 as x1 with mut = x + w;
+    let is i64 as y1 with mut = y + h;
+    if (x1 > s.width) { x1 = s.width; }
+    if (y1 > s.height) { y1 = s.height; }
+    if (x1 <= x0) { return abi.E_OK; }
+    if (y1 <= y0) { return abi.E_OK; }
+
+    let is i64 as row with mut = y0;
+    while (row < y1) {
+        let is i64 as base = row * s.pitch;
+        let is i64 as px with mut = x0;
+        while (px < x1) {
+            let is i64 as off = base + px * s.bpp_bytes;
+            let is *i32 as sp = cast(*i32, s.backbuffer + off);
+            let is *i32 as dp = cast(*i32, s.scanout + off);
+            dp[0] = sp[0];
+            px = px + 1;
+        }
+        row = row + 1;
+    }
+    return abi.E_OK;
+}
+
+// Kernel-side smoke: acquire the framebuffer surface, draw a known pattern
+// into its backbuffer, present it, and confirm the scanout received it.
+// Proves the surface mechanics (acquire / present / close + backbuffer →
+// scanout blit) ahead of the ring-3 path (the fb syscall smoke).
+let is i64 as SMOKE_PX = 0x00FF00FF;     // magenta sentinel
+
+fn smoke() as void {
+    serial.println("surface_smoke: start", 20);
+    let is i64 as ko = acquire_fb();
+    if (ko == 0) {
+        serial.println("surface_smoke: acquire FAIL", 27);
+        return;
+    }
+    let is *kobject.KObject as k = cast(*kobject.KObject, ko);
+    let is *Surface as s = cast(*Surface, k.priv);
+
+    // Paint the first 256 px of row 0 in the backbuffer.
+    let is i64 as i with mut = 0;
+    while (i < 256) {
+        let is *i32 as p = cast(*i32, s.backbuffer + i * s.bpp_bytes);
+        p[0] = cast(i32, SMOKE_PX);
+        i = i + 1;
+    }
+    surf_present(cast(i64, s), 0, 0, 256, 1);
+
+    // The scanout must now show the sentinel at a couple of those pixels.
+    let is *i32 as sp0 = cast(*i32, s.scanout);
+    let is *i32 as sp1 = cast(*i32, s.scanout + 128 * s.bpp_bytes);
+    let is i64 as v0 = cast(i64, sp0[0]) & 0xFFFFFF;
+    let is i64 as v1 = cast(i64, sp1[0]) & 0xFFFFFF;
+    let is i64 as want = SMOKE_PX & 0xFFFFFF;
+
+    kobject.ko_unref(ko);
+
+    if (v0 == want) {
+        if (v1 == want) {
+            serial.println("surface_smoke: PASS", 19);
+            return;
+        }
+    }
+    serial.println("surface_smoke: scanout mismatch FAIL", 36);
+}

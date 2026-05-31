@@ -17,6 +17,7 @@ use "userspace.cst" as userspace;
 use "vma.cst" as vma;
 use "vfs.cst" as vfs;
 use "kobject.cst" as kobject;
+use "surface.cst" as surface;
 use "process.cst" as proc;
 use "heap.cst" as heap;
 
@@ -174,17 +175,25 @@ fn sys_mmap(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is i64 as hint = a;
     let is i64 as len = b;
     let is i64 as uprot = c;
-    if (len <= 0) { return abi.E_INVAL; }
 
     let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
     if (asp == 0) { return abi.E_INVAL; }
 
-    // ABI prot bits → PTE leaf bits. mmap_anon adds PTE_PRESENT|PTE_USER;
+    // ABI prot bits → PTE leaf bits. The mapping adds PTE_PRESENT|PTE_USER;
     // read is implied by present. WRITE → PTE_WRITE; no EXEC → PTE_NX.
     let is i64 as vprot with mut = vma.PROT_USER;
     if ((uprot & abi.MMAP_PROT_WRITE) != 0) { vprot = vprot | vma.PROT_WRITE; }
     if ((uprot & abi.MMAP_PROT_EXEC) == 0)  { vprot = vprot | vma.PROT_NX; }
 
+    // fd-backed mapping (a surface backbuffer): the 4th arg is the fd; the
+    // object provides the pages and decides the size, so `len` is ignored.
+    if ((uprot & abi.MMAP_FD) != 0) {
+        let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), d);
+        if (ko == 0) { return abi.E_BADF; }
+        return kobject.ko_mmap(ko, asp, hint, vprot);
+    }
+
+    if (len <= 0) { return abi.E_INVAL; }
     let is i64 as flags with mut = vma.VMA_ANON;
     let is i64 as use_hint with mut = 0;
     if (hint != 0) { flags = flags | vma.VMA_FIXED; use_hint = hint; }
@@ -517,6 +526,40 @@ fn sys_wait(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     return code;
 }
 
+// ============================================================
+// SYS_DEV_OPEN(class, index, flags) — acquire a device by class, return an
+// fd (a key). v0: DEV_FB → a surface over the framebuffer. The fd backs a
+// KOBJ_SURFACE, not a VfsFile — the fd table is polymorphic. No /dev path,
+// no capability monopoly: any program may ask (docs/architecture.md §6).
+// ============================================================
+
+fn sys_dev_open(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as class = a;
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return abi.E_INVAL; }
+    if (class != abi.DEV_FB) { return abi.E_INVAL; }    // only the framebuffer in v0
+
+    let is i64 as ko = surface.acquire_fb();
+    if (ko == 0) { return abi.E_NOMEM; }
+    let is i64 as fd = vma.fd_alloc(cast(*vma.Aspace, asp), ko);
+    if (fd < 0) { kobject.ko_unref(ko); return abi.E_MFILE; }
+    return fd;
+}
+
+// ============================================================
+// SYS_PRESENT(fd, x, y, w, h) — publish a surface's dirty rectangle to the
+// scanout. Honest per-type op (no ioctl): present only exists on a surface,
+// so a non-surface fd returns E_INVAL via the null vtable slot.
+// ============================================================
+
+fn sys_present(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), a);
+    if (ko == 0) { return abi.E_BADF; }
+    return kobject.ko_present(ko, b, c, d, e);
+}
+
 let is i64 as install_fn_addr with mut = 0;
 
 fn install(nr as i64, fp as i64) as void {
@@ -549,4 +592,6 @@ fn install_all() as void {
     install(abi.SYS_RENAME,          cast(i64, fn_ptr(sys_rename)));
     install(abi.SYS_STAT,            cast(i64, fn_ptr(sys_stat)));
     install(abi.SYS_READDIR,         cast(i64, fn_ptr(sys_readdir)));
+    install(abi.SYS_DEV_OPEN,        cast(i64, fn_ptr(sys_dev_open)));
+    install(abi.SYS_PRESENT,         cast(i64, fn_ptr(sys_present)));
 }
