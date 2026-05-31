@@ -24,8 +24,14 @@
 
 .globl syscall_entry_asm
 syscall_entry_asm:
-    .byte 0x65, 0x48, 0x89, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00   # mov gs:[0x88], rsp   (save user rsp)
+    .byte 0x65, 0x48, 0x89, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00   # mov gs:[0x88], rsp   (stash user rsp in the per-cpu shuttle, IRQs still off)
     .byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x90, 0x00, 0x00, 0x00   # mov rsp, gs:[0x90]   (kernel kstack)
+    # Move the user rsp onto THIS thread's kstack immediately. gs:[0x88] is a
+    # single per-cpu slot; once we `sti` below, a blocking syscall (wait/read)
+    # can context-switch to another ring-3 thread whose own syscall overwrites
+    # gs:[0x88]. Restoring rsp from it on the way out would then hand us a
+    # foreign user rsp. The kstack is per-thread, so it survives the switch.
+    .byte 0x65, 0xFF, 0x34, 0x25, 0x88, 0x00, 0x00, 0x00         # push qword gs:[0x88]   (user rsp -> per-thread kstack)
     push rcx          # user RIP   (sysretq restores it)
     push r11          # user RFLAGS
     push rbx
@@ -53,7 +59,7 @@ syscall_entry_asm:
     pop rbx
     pop r11           # user RFLAGS
     pop rcx           # user RIP
-    .byte 0x65, 0x48, 0x8B, 0x24, 0x25, 0x88, 0x00, 0x00, 0x00   # mov rsp, gs:[0x88]   (restore user rsp)
+    .byte 0x5C        # pop rsp  — restore user rsp from the per-thread kstack (NOT shared gs:[0x88])
     .byte 0x48, 0x0F, 0x07   # sysretq
 
 # uint64_t syscall_entry_addr_get(void) -> &syscall_entry_asm in rax.

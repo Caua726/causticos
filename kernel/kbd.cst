@@ -11,6 +11,7 @@
 // the holder sees presses AND releases). Mechanism in the kernel, policy out.
 
 use "driver.cst" as driver;
+use "spec.cst" as spec;
 use "ksym.cst" as ksym;
 use "port.cst" as port;
 use "serial.cst" as serial;
@@ -33,7 +34,51 @@ let is lock.TicketLock as kbd_lk;
 
 let is ksym.KSym as ksym_handler;
 let is ksym.KSym as ksym_acquire;
+let is ksym.KSym as ksym_bind;
 let is kobject.KObjectOps as KBD_OPS with mut;
+
+// --- i8042 PS/2 controller bring-up (ports 0x60 data, 0x64 cmd/status) ---
+// Limine hands us a minimal machine; the firmware does not leave IRQ1 armed.
+// Without enabling it in the controller config byte the keyboard never raises
+// an interrupt, so the IOAPIC redirection the framework programs has nothing to
+// deliver — keypresses vanish. (The kbd_smoke only ever used inject_event, so
+// the real IRQ path was never exercised: hence the old "QEMU has no input".)
+fn i8042_wait_write() as void {
+    let is i64 as i with mut = 0;
+    while (i < 100000) { if ((port.inb(0x64) & 0x02) == 0) { return; } i = i + 1; }
+}
+fn i8042_wait_read() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 100000) { if ((port.inb(0x64) & 0x01) != 0) { return 1; } i = i + 1; }
+    return 0;
+}
+fn i8042_cmd(c as i64) as void { i8042_wait_write(); port.outb(0x64, c); }
+fn i8042_write_data(d as i64) as void { i8042_wait_write(); port.outb(0x60, d); }
+fn i8042_flush() as void {
+    let is i64 as i with mut = 0;
+    while (i < 64) { if ((port.inb(0x64) & 0x01) == 0) { return; } port.inb(0x60); i = i + 1; }
+}
+
+// on_bind: arm the controller so real keypresses raise IRQ1.
+fn kbd_bind(b as *spec.Binding) as i32 {
+    i8042_flush();                                   // drain any stale output byte
+    i8042_cmd(0xAD); i8042_cmd(0xA7); i8042_flush(); // disable both ports during config
+    i8042_cmd(0x20);                                 // read config byte -> data port
+    let is i64 as cfg with mut = 0;
+    if (i8042_wait_read() != 0) { cfg = port.inb(0x60); }
+    cfg = (cfg | 0x01) & 0xEF;                        // bit0=1 enable IRQ1; bit4=0 enable kbd clock
+    i8042_cmd(0x60); i8042_write_data(cfg);           // write config byte
+    i8042_cmd(0xAE);                                  // enable first PS/2 (keyboard) port
+    i8042_flush();
+    // Drop anything the bring-up enqueued (an ACK/spurious byte that fired the
+    // now-armed IRQ) so the first real keypress — and the kbd_smoke — start on a
+    // clean ring, with no phantom event.
+    let is i64 as flr = lock.acquire_irq(&kbd_lk);
+    kbd_head = 0; kbd_tail = 0; kbd_count = 0; kbd_e0 = 0;
+    lock.release_irq(&kbd_lk, flr);
+    serial.println("kbd: i8042 init (IRQ1 on)", 25);
+    return 0;
+}
 
 fn kbd_init() as void {
     KBD_OPS.read  = fn_ptr(kbd_read);
@@ -143,5 +188,10 @@ fn register() as void {
     ksym_acquire.addr     = cast(i64, fn_ptr(kbd_acquire));
     ksym_acquire.kind     = ksym.KIND_FUNC;
     ksym.register(&ksym_acquire);
+    ksym_bind.name_ptr = cast(*u8, "kbd.kbd_bind");
+    ksym_bind.name_len = 12;
+    ksym_bind.addr     = cast(i64, fn_ptr(kbd_bind));
+    ksym_bind.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_bind);
     serial.println("kbd: registered", 15);
 }
