@@ -29,6 +29,7 @@ use "elf.cst" as elf;
 use "cse.cst" as cse;
 use "abi.cst" as abi;
 use "process.cst" as proc;
+use "fb.cst" as fb;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
 // pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
@@ -1087,6 +1088,187 @@ fn build_test_cse() as void {
     test_cse_len = c;
 }
 
+// ============================================================
+// Embedded fb test CSE — proves the surface path end to end from ring 3:
+// dev_open(DEV_FB) → mmap(fd) → draw cyan → present, all via syscalls. The
+// kernel verifies by reading the scanout (no BSS read-back). r15 = BSS base
+// holds fd / mmap VA / present rc.
+//   bss+0x000 dev_open fd   bss+0x008 mmap VA   bss+0x010 present rc
+// ============================================================
+
+let is i64 as CSE_FB_ENTRY  = 0x401000;
+let is i64 as CSE_FB_BSS_VA = 0x402000;
+let is i64 as CSE_FB_FOFF   = 0x50;
+let is i64 as fb_cse_len with mut = 0;
+let is [512]u8 as fb_cse;
+
+fn build_fb_cse() as void {
+    let is *u8 as e = cast(*u8, &fb_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < 512) { e[z] = cast(u8, 0); z = z + 1; }
+
+    // ---- header (32 bytes) ----
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0);                  // version u16 = 2
+    e[6]=cast(u8,1);                                   // arch = 1 (x86_64)
+    e[7]=cast(u8,0);                                   // flags
+    write_le_u64(e, 0x08, CSE_FB_ENTRY);               // entry
+    write_le_u64(e, 0x10, 0x400000);                   // base (informative)
+    write_le_u32(e, 0x18, 2);                          // seg_count
+    write_le_u32(e, 0x1C, 0);
+
+    // ---- seg0 @0x20: .text R-X (perms=5) ----
+    write_le_u64(e, 0x20, CSE_FB_ENTRY);               // vaddr
+    write_le_u32(e, 0x28, CSE_FB_FOFF);                // file_off
+    write_le_u32(e, 0x34, 5);                          // perms R|X
+    // ---- seg1 @0x38: R-W bss page (perms=3) ----
+    write_le_u64(e, 0x38, CSE_FB_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_FB_FOFF;
+
+    // movabs r15, CSE_FB_BSS_VA  (callee-saved scratch for the results)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF);
+    write_le_u64(e, c + 2, CSE_FB_BSS_VA);
+    c = c + 10;
+
+    // --- dev_open(DEV_FB=0, 0, 0) → fd ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,22
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;              // xor edi,edi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;              // xor esi,esi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;              // xor edx,edx
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); // mov [r15+0],rax
+    c = c + 4;
+
+    // --- mmap(0, 0x1000, WRITE|MMAP_FD, fd) → VA ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,7
+    e[c+3]=cast(u8,7); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;              // xor edi,edi (hint=0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);   // mov rsi,0x1000
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x10); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);   // mov rdx,0x12 (WRITE|MMAP_FD)
+    e[c+3]=cast(u8,0x12); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x4D); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x57); e[c+3]=cast(u8,0x00); // mov r10,[r15+0] (fd)
+    c = c + 4;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x08); // mov [r15+8],rax (VA)
+    c = c + 4;
+
+    // --- fill 256 px with cyan 0x0000FFFF (rax still = VA) ---
+    e[c+0]=cast(u8,0xB9); e[c+1]=cast(u8,0x00); e[c+2]=cast(u8,0x01);   // mov ecx,256
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x00); c = c + 5;
+    e[c+0]=cast(u8,0xBA); e[c+1]=cast(u8,0xFF); e[c+2]=cast(u8,0xFF);   // mov edx,0x0000FFFF
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x00); c = c + 5;
+    // loop: mov [rax],edx ; add rax,4 ; dec ecx ; jnz loop
+    e[c+0]=cast(u8,0x89); e[c+1]=cast(u8,0x10); c = c + 2;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x83); e[c+2]=cast(u8,0xC0); e[c+3]=cast(u8,0x04); c = c + 4;
+    e[c+0]=cast(u8,0xFF); e[c+1]=cast(u8,0xC9); c = c + 2;
+    e[c+0]=cast(u8,0x75); e[c+1]=cast(u8,0xF6); c = c + 2;              // jnz -10
+
+    // --- present(fd, 0, 0, 256, 1) ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,23
+    e[c+3]=cast(u8,23); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); // mov rdi,[r15+0] (fd)
+    c = c + 4;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;              // xor esi,esi (x=0)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;              // xor edx,edx (y=0)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);   // mov r10,256 (w)
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x01); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov r8,1 (h)
+    e[c+3]=cast(u8,0x01); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x10); // mov [r15+16],rax
+    c = c + 4;
+
+    // --- exit(0) ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,3
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;              // xor edi,edi
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+
+    let is i64 as text_size = c - CSE_FB_FOFF;
+    write_le_u32(e, 0x2C, text_size);     // seg0 file_size
+    write_le_u32(e, 0x30, text_size);     // seg0 mem_size
+    fb_cse_len = c;
+}
+
+// Spawn the fb test program and confirm its cyan reached the scanout —
+// the full ring-3 → surface → screen path.
+fn spawn_user_fb_smoke() as void {
+    serial.println("userspace.fb_smoke: start", 25);
+    build_fb_cse();
+
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.fb_smoke: aspace FAIL", 31);
+        return;
+    }
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse(a, cast(*u8, &fb_cse[0]), fb_cse_len,
+                                     cast(*u8, "fb"), 2, &entry, &user_rsp);
+    if (rc != 0) {
+        serial.print("userspace.fb_smoke: load_cse rc=", 32);
+        util.print_num(cast(i64, rc));
+        serial.println(" FAIL", 5);
+        return;
+    }
+
+    // Clear row 0 (cols 0..255) on the scanout so we detect the app's write,
+    // not the boot surface_smoke's leftover magenta.
+    let is i64 as sv = fb.scanout_virt();
+    let is i64 as bpb = fb.bpp_bytes();
+    let is i64 as i with mut = 0;
+    while (i < 256) {
+        let is *i32 as p = cast(*i32, sv + i * bpb);
+        p[0] = cast(i32, 0);
+        i = i + 1;
+    }
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        a.pml4_phys, entry, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.fb_smoke: spawned tid=", 32);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Poll the scanout until the app's cyan lands (or time out).
+    let is i64 as deadline = timer.current_time_ns() + 1500000000;
+    let is i32 as ok with mut = 0;
+    let is i32 as timedout with mut = 0;
+    while (ok == 0 && timedout == 0) {
+        let is *i32 as q0 = cast(*i32, sv);
+        let is *i32 as q1 = cast(*i32, sv + 128 * bpb);
+        if ((cast(i64, q0[0]) & 0xFFFFFF) == 0x0000FFFF) {
+            if ((cast(i64, q1[0]) & 0xFFFFFF) == 0x0000FFFF) { ok = 1; }
+        }
+        if (ok == 0) {
+            if (timer.current_time_ns() >= deadline) { timedout = 1; }
+            else { sched.sleep_for_ns(20000000); }
+        }
+    }
+    if (ok == 1) {
+        serial.println("userspace.fb_smoke: PASS", 24);
+    } else {
+        serial.println("userspace.fb_smoke: no cyan on scanout FAIL", 43);
+    }
+}
+
 fn spawn_user_cse_smoke() as void {
     serial.println("userspace.cse_smoke: start", 26);
 
@@ -1638,6 +1820,7 @@ fn smoke_thread() as void {
     close_on_exit_smoke();
     spawn_user_elf_smoke();
     spawn_user_cse_smoke();
+    spawn_user_fb_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
 }
