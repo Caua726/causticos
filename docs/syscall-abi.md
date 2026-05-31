@@ -7,7 +7,7 @@ syscall lib) needs to talk to the kernel. Pairs with
 
 > Status: **v0, provisional** — numbers/layouts may still change until
 > self-host (then `ABI_MAJOR` gates incompatible changes). Source of truth:
-> `kernel/abi.cst` + the handlers in `kernel/syshandlers.cst`. `SYS_COUNT = 25`
+> `kernel/abi.cst` + the handlers in `kernel/syshandlers.cst`. `SYS_COUNT = 27`
 > (syscall `N` exists iff `N < SYS_COUNT`; probe it via `KERN_INFO`).
 
 ---
@@ -58,6 +58,8 @@ Args are listed by register. "→" is the `rax` return.
 | 22 | `DEV_OPEN` | class | index | flags | | | fd \| errno |
 | 23 | `PRESENT` | fd | x | y | w | h | 0 \| errno |
 | 24 | `CHANNEL_CREATE` | out_ptr | | | | | 0; writes `[fd_a, fd_b]` (2×i64) \| errno |
+| 25 | `SURFACE_INFO` | fd | out | | | | 0; writes `{w,h,pitch,bpp,fmt}` (5×i64) \| errno |
+| 26 | `DEV_COUNT` | class | | | | | count (≥ 0) |
 
 **Pointers are user virtual addresses**; the kernel copies in/out and
 validates them (bad pointer → `E_FAULT`). All sizes/counts are bytes unless
@@ -83,9 +85,21 @@ Per-call notes:
   (also written to `status_ptr` as i64 if non-zero). `E_AGAIN` if none exits
   in the window.
 - **`DEV_OPEN`** (22): acquire a device *by class* (§5). No `/dev` path, no
-  permission gate — any program may ask. `index`/`flags` are 0 in v0.
+  permission gate — any program may ask. `index` selects the *index-th*
+  instance of the class and is **real**: `DEV_OPEN(DEV_KEYBOARD, 1)` with one
+  keyboard is `E_NOENT`, never a silent alias of instance 0. `flags` is 0 in
+  v0. Pair with `DEV_COUNT` to enumerate. `E_NOMEM` means the instance exists
+  but minting its object failed.
 - **`PRESENT`** (23): publish a surface's damage rect `[x,y,w,h]` to the
   scanout. Only a surface fd has it; other fds → `E_INVAL`.
+- **`SURFACE_INFO`** (25): the read-counterpart of `PRESENT`. Copies the
+  surface's `{width, height, pitch, bpp_bytes, format}` (5×i64 = 40 B) to
+  `out` so the holder can index its `mmap`'d backbuffer (`pitch` may exceed
+  `width × bpp` when rows are padded). `format` is `SURFACE_FMT_XRGB8888 (0)`
+  in v0. Non-surface fd → `E_INVAL`.
+- **`DEV_COUNT`** (26): how many instances of `class` are registered (≥ 0).
+  The enumeration counterpart of `DEV_OPEN`: ask, then `DEV_OPEN` each index
+  `0..count-1`. An unserved class is honestly `0`, not an error. Pure query.
 
 ---
 
@@ -153,13 +167,11 @@ The kernel applies **no keymap** — scancode→char/layout is your job.
 **Draw on screen (fullscreen app or compositor):**
 ```
 fd  = DEV_OPEN(DEV_FB, 0, 0)
+SURFACE_INFO(fd, &info)                           # {w,h,pitch,bpp,fmt} (5×i64)
 va  = MMAP(0, 0, MMAP_PROT_WRITE | MMAP_FD, fd)   # backbuffer, len ignored
-... write 32bpp pixels into [va ..] ...
+... write 32bpp pixels at va + y*info.pitch + x*info.bpp ...
 PRESENT(fd, x, y, w, h)                            # blit damage to the scanout
 ```
-> ⚠ **Missing today (see §7):** there is no call to learn the surface's
-> width/height/pitch/bpp, so the app can't know the backbuffer geometry. This
-> is the one gap to close before a real terminal.
 
 **Read the keyboard (raw):**
 ```
@@ -197,15 +209,17 @@ WAIT(pid, &status)
 These are **my** side (kernel work), not yours — flagged so we both know
 what's missing:
 
-1. **Surface geometry query.** A surface fd gives you a backbuffer pointer but
-   no dimensions. Needs a small syscall, e.g. `SYS_SURFACE_INFO(fd, out)` →
-   `{width, height, pitch, bpp_bytes}` (4×i64), or `SYS_DEV_INFO(fd, out)`
-   generalised. **Blocking for any real drawing.**
-2. **Terminal bootstrap.** Today only kernel-side smokes spawn ring-3
-   programs. To launch a real terminal the kernel needs an "init userspace"
-   step: `OPEN("/bin/terminal.cse") → READ → proc_spawn → proc_start` from the
-   boot path (the `.cse` lives on the FAT32 disk you seed), or an embedded
-   image. The terminal then `DEV_OPEN`s the surface + keyboard itself.
+1. ~~**Surface geometry query.**~~ ✅ **Done** — `SURFACE_INFO` (25) copies
+   `{width, height, pitch, bpp_bytes, format}` (5×i64), proven from ring 3 via
+   `fb_smoke`. The device-model is also complete: the `index` in `DEV_OPEN` is
+   honest, `DEV_COUNT` (26) enumerates, and a driver declares its class in its
+   `.cdvrspec` `device { }` block (the framework auto-registers).
+2. **Terminal bootstrap.** *(the one remaining kernel gap)* Today only
+   kernel-side smokes spawn ring-3 programs. To launch a real terminal the
+   kernel needs an "init userspace" step: `OPEN("/init.cse") → READ →
+   proc_spawn → proc_start` from the boot path (the `.cse` lives on the FAT32
+   disk you seed), or an embedded image. The terminal then `DEV_OPEN`s the
+   surface + keyboard itself.
 3. *(nice-to-have)* `SYS_PROC_KILL` for the shell to stop a runaway child;
    today only graceful exit + `WAIT`. Not required for a first terminal.
 

@@ -133,10 +133,20 @@ shell↔terminal, and all future IPC fall out of it.
 
 ---
 
-## 6. Devices & acquisition  *(designed)*
+## 6. Devices & acquisition  *(acquisition built; preemptible grab stack designed)*
 
 - **`dev_open(class, index) → fd`** — e.g. `dev_open(DEV_KEYBOARD, 0)`,
   `dev_open(DEV_FB, 0)`. You ask the kernel for a device *by class*; it returns a key.
+  The **`index` is real**: it selects the index-th registered instance of the class,
+  and `dev_open(DEV_KEYBOARD, 1)` with a single keyboard is `E_NOENT` — never a silent
+  alias of instance 0. **`dev_count(class)`** enumerates (how many before you index).
+- **The class is a fact the driver declares, not a kernel value judgement.** A driver
+  announces its class in its `.cdvrspec` `device { class: <name>; acquire: <fn> }`
+  block; the framework registers the instance (with its Hardware node as the
+  discriminator) after a successful bind. The kernel doesn't "know what a keyboard is" —
+  `dev_open` is a query over the instances drivers declared. A boot-provided pseudo-
+  device (the Limine framebuffer) registers the same way at init. New device = one more
+  declaration, no syscall-layer edit.
 - **Not a `/dev` path** (that is a Unix reflex — an ambient global namespace). **Not
   capability-monopoly** (no "only the root/compositor may acquire"). **Any program may
   `dev_open` any device.**
@@ -260,9 +270,17 @@ in a swappable userspace program.
   holder (a `VMA_FILE` the surface owns — teardown unmaps without freeing, close frees);
   `SYS_PRESENT` blits the damage rect to the scanout. The scanout is mapped
   write-combining (PAT PA1 → WC, per-cpu); `fb.cst` reads the real bpp from Limine.
-  Proven ring-3 → screen: the fb smoke does dev_open/mmap/present from a ring-3 CSE and
-  the kernel confirms the pixels (smp 1/2/4). v0 backbuffer is one contiguous ≤4 MiB
-  block (full-screen / non-contiguous is a refinement).
+  `SYS_SURFACE_INFO` copies the surface's `{width, height, pitch, bpp_bytes, format}` so
+  the holder can index the padded backbuffer. Proven ring-3 → screen: the fb smoke
+  surface_info's the surface (and gates its draw on it), then does dev_open/mmap/present
+  from a ring-3 CSE and the kernel confirms the pixels (smp 1/2/4). v0 backbuffer is one
+  contiguous ≤4 MiB block (full-screen / non-contiguous is a refinement).
+- **Device model** (the registry behind `dev_open`): one entry per device *instance*, not
+  per class. `device_register(class, acquire, ctx)` appends; `dev_open(class, index)`
+  resolves the index-th instance (index is **honest** — out-of-range is `E_NOENT`, not an
+  alias); `dev_count(class)` enumerates. Drivers declare their class in the `.cdvrspec`
+  `device { class; acquire }` block and the framework auto-registers after bind — no glue,
+  no kernel-side switch. Proven: `devreg_smoke` (count + honest index, smp 1/2/4).
 - **Channel** (`KOBJ_CHANNEL`): the founding IPC primitive — two endpoints over a pair of
   byte ring buffers; read/write are honest ops (dispatch via ko_read/ko_write, so
   SYS_READ/SYS_WRITE drive a channel fd), no framing/handle-passing in the kernel.
@@ -276,11 +294,11 @@ in a swappable userspace program.
   decodes only the device protocol, **no keymap** — layout/meaning are userspace. Proven
   ring-3: a child dev_opens the keyboard, blocks on read, the kernel injects an event,
   the child exits with the scancode (smp 1/2/4). v0 has no exclusivity (grab stack later).
-- Syscall ABI (flat-numbered, `SYS_COUNT = 25`): `kern_info`, `time_now`/`sleep`,
+- Syscall ABI (flat-numbered, `SYS_COUNT = 27`): `kern_info`, `time_now`/`sleep`,
   `proc exit`/`getpid`/`yield`, `io_write_serial`, `mmap`/`munmap`,
   `open`/`read`/`write`/`close`/`lseek`, `spawn`/`wait`,
-  `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`, `dev_open`/`present`,
-  `channel_create`.
+  `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`, `dev_open`/`dev_count`/`present`/
+  `surface_info`, `channel_create`.
 
 **Designed here, not yet built:**
 - **Userspace keymap + focus relay** (the kernel side — raw keyboard as a device — is
