@@ -103,7 +103,7 @@ yielding raw event streams. The set stays small on purpose: one new concept, the
 
 ---
 
-## 5. IPC: the channel  *(designed)*
+## 5. IPC: the channel  *(built)*
 
 The channel is the **founding IPC primitive** — get it right and console, pipes,
 shell↔terminal, and all future IPC fall out of it.
@@ -263,14 +263,21 @@ in a swappable userspace program.
   Proven ring-3 → screen: the fb smoke does dev_open/mmap/present from a ring-3 CSE and
   the kernel confirms the pixels (smp 1/2/4). v0 backbuffer is one contiguous ≤4 MiB
   block (full-screen / non-contiguous is a refinement).
-- Syscall ABI (flat-numbered, `SYS_COUNT = 24`): `kern_info`, `time_now`/`sleep`,
+- **Channel** (`KOBJ_CHANNEL`): the founding IPC primitive — two endpoints over a pair of
+  byte ring buffers; read/write are honest ops (dispatch via ko_read/ko_write, so
+  SYS_READ/SYS_WRITE drive a channel fd), no framing/handle-passing in the kernel.
+  `SYS_CHANNEL_CREATE` mints a pair. Blocking is by polling (a wakeup_thread fast-path is
+  a refinement). The KObject **refcount is atomic** (lock xadd) so two aspaces can share
+  an endpoint. **Endpoint handoff at spawn is live**: `SYS_SPAWN`'s `fdacts` installs the
+  parent's KObjects into the still-suspended child. Proven: a ring-3 child receives a
+  channel endpoint as its fd, blocks on read, wakes on the byte (smp 1/2/4).
+- Syscall ABI (flat-numbered, `SYS_COUNT = 25`): `kern_info`, `time_now`/`sleep`,
   `proc exit`/`getpid`/`yield`, `io_write_serial`, `mmap`/`munmap`,
   `open`/`read`/`write`/`close`/`lseek`, `spawn`/`wait`,
-  `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`, `dev_open`/`present`.
+  `unlink`/`mkdir`/`rmdir`/`rename`/`stat`/`readdir`, `dev_open`/`present`,
+  `channel_create`.
 
 **Designed here, not yet built:**
-- The **channel** object (founding IPC primitive) + endpoint handoff at spawn (`fdacts`
-  + object refcount).
 - **Raw keyboard** as a device fd; userspace keymap; focus relay.
 - **Preemptible device ownership** (grab stack).
 - The **terminal** and the **shell** (userspace programs); the optional **compositor**.
