@@ -476,13 +476,30 @@ fn sys_readdir(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i6
 fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is i64 as img_uptr = a;
     let is i64 as img_len = b;
+    let is i64 as fdacts_uptr = c;
+    let is i64 as n_acts with mut = d;
     if (img_len <= 0) { return abi.E_INVAL; }
     if (img_len > 65536) { return abi.E_INVAL; }       // bound v0 image size
+    if (n_acts < 0) { n_acts = 0; }
+    if (n_acts > 16) { return abi.E_INVAL; }           // bound the fd-action list
 
     let is i64 as tid = sched.current_tid();
     let is i64 as parent = sched.thr_process_ptr(tid);
     if (parent == 0) { return abi.E_PERM; }            // only processes spawn
     let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    // Copy the fd-actions list up front (before creating a child) so a bad
+    // pointer fails cleanly without orphaning one. Each action is a pair of
+    // i64: {child_fd, src_fd} — install the KObject the parent holds at
+    // src_fd into the child's table at child_fd. Authority is never ambient:
+    // the child's table starts empty; fdacts is the only way it gets keys.
+    let is [256]u8 as actbuf;                          // 16 * 16 bytes
+    if (n_acts > 0) {
+        if (fdacts_uptr == 0) { return abi.E_INVAL; }
+        if (userspace.copy_from_user(pml4, cast(*u8, &actbuf[0]), fdacts_uptr, n_acts * 16) != 0) {
+            return abi.E_FAULT;
+        }
+    }
 
     // Snapshot the image into a kernel buffer; proc_spawn copies it into
     // the child's fresh aspace, so the buffer is transient.
@@ -494,6 +511,28 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     let is i64 as child = userspace.proc_spawn(parent, cast(*u8, kbuf), img_len);
     heap.kfree(kbuf);
     if (child == 0) { return abi.E_NOMEM; }
+
+    // Hand off the requested fds into the still-suspended child. ko_ref
+    // keeps the shared KObject (e.g. a channel endpoint) alive across both
+    // aspaces — the atomic refcount (Fatia 2a) sustains the double teardown.
+    if (n_acts > 0) {
+        let is i64 as parent_asp = sched.thr_aspace_ptr(tid);
+        let is i64 as child_asp = proc.proc_aspace(child);
+        let is *i64 as acts = cast(*i64, &actbuf[0]);
+        let is i64 as ai with mut = 0;
+        while (ai < n_acts) {
+            let is i64 as child_fd = acts[ai * 2 + 0];
+            let is i64 as src_fd   = acts[ai * 2 + 1];
+            let is i64 as ko = vma.fd_get(cast(*vma.Aspace, parent_asp), src_fd);
+            if (ko != 0) {
+                kobject.ko_ref(ko);
+                if (vma.fd_install(cast(*vma.Aspace, child_asp), child_fd, ko) != 0) {
+                    kobject.ko_unref(ko);              // slot busy / oob — undo
+                }
+            }
+            ai = ai + 1;
+        }
+    }
 
     userspace.proc_start(child);
     return proc.proc_pid(child);

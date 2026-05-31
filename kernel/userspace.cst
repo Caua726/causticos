@@ -30,6 +30,8 @@ use "cse.cst" as cse;
 use "abi.cst" as abi;
 use "process.cst" as proc;
 use "fb.cst" as fb;
+use "channel.cst" as channel;
+use "kobject.cst" as kobject;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
 // pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
@@ -1269,6 +1271,111 @@ fn spawn_user_fb_smoke() as void {
     }
 }
 
+// ============================================================
+// Embedded "channel child" CSE — proves the IPC handoff from ring 3:
+// read(fd 0, &b, 1) then exit(b). fd 0 is a channel endpoint handed to it
+// at spawn (the fdacts mechanism). The kernel writes a byte on the other
+// end; the child echoes it as its exit code.
+// ============================================================
+
+let is i64 as CSE_CC_ENTRY  = 0x401000;
+let is i64 as CSE_CC_BSS_VA = 0x402000;
+let is i64 as CSE_CC_FOFF   = 0x50;
+let is i64 as child_cc_len with mut = 0;
+let is [256]u8 as child_cc;
+
+fn build_child_chan_cse() as void {
+    let is *u8 as e = cast(*u8, &child_cc[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, CSE_CC_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, CSE_CC_ENTRY);
+    write_le_u32(e, 0x28, CSE_CC_FOFF);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, CSE_CC_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_CC_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, CSE_CC_BSS_VA); c = c + 10;
+    // read(0, r15, 1): mov rax,10; xor edi,edi; mov rsi,r15; mov rdx,1; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;                        // xor edi,edi
+    e[c+0]=cast(u8,0x4C); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xFE); c = c + 3;  // mov rsi,r15
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    // movzx edi, byte [r15]
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x3F); c = c + 4;
+    // exit(edi): mov rax,3; syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+
+    let is i64 as text_size = c - CSE_CC_FOFF;
+    write_le_u32(e, 0x2C, text_size);
+    write_le_u32(e, 0x30, text_size);
+    child_cc_len = c;
+}
+
+// Proves channel + handoff + ring-3 channel read end to end: mint a pair,
+// spawn the child with endpoint B as its fd 0 (the fdacts mechanism — same
+// ko_ref + fd_install the SYS_SPAWN handler does), write a byte on endpoint
+// A, and confirm the child exits with that byte.
+fn spawn_channel_smoke() as void {
+    serial.println("userspace.chan_smoke: start", 27);
+    build_child_chan_cse();
+
+    let is i64 as ko_a with mut = 0;
+    let is i64 as ko_b with mut = 0;
+    if (channel.channel_create(&ko_a, &ko_b) != 0) {
+        serial.println("userspace.chan_smoke: create FAIL", 33);
+        return;
+    }
+
+    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &child_cc[0]), child_cc_len);
+    if (child == 0) {
+        kobject.ko_unref(ko_a); kobject.ko_unref(ko_b);
+        serial.println("userspace.chan_smoke: spawn FAIL", 32);
+        return;
+    }
+
+    // Handoff: install endpoint B as the child's fd 0.
+    let is i64 as child_asp = proc.proc_aspace(child);
+    kobject.ko_ref(ko_b);
+    vma.fd_install(cast(*vma.Aspace, child_asp), 0, ko_b);
+    proc_start(child);
+
+    // Write the sentinel on endpoint A; the child's blocking read wakes.
+    let is *kobject.KObject as ka = cast(*kobject.KObject, ko_a);
+    let is [1]u8 as msg;
+    msg[0] = cast(u8, 7);
+    channel.chan_write(ka.priv, cast(i64, &msg[0]), 1);
+
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(child));
+
+    kobject.ko_unref(ko_a);     // my endpoint A
+    kobject.ko_unref(ko_b);     // my original ref to endpoint B (child's was freed at teardown)
+
+    if (code == 7) {
+        serial.println("userspace.chan_smoke: PASS", 26);
+    } else {
+        serial.print("userspace.chan_smoke: exit=", 27);
+        util.print_num(code);
+        serial.println(" FAIL", 5);
+    }
+}
+
 fn spawn_user_cse_smoke() as void {
     serial.println("userspace.cse_smoke: start", 26);
 
@@ -1821,6 +1928,7 @@ fn smoke_thread() as void {
     spawn_user_elf_smoke();
     spawn_user_cse_smoke();
     spawn_user_fb_smoke();
+    spawn_channel_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
 }
