@@ -73,6 +73,13 @@ let is i64 as KV_DATA = 1;   // anon RAM, zeroed, KMAP_DATA; kvunmap frees the f
 let is i64 as KV_MMIO = 2;   // caller's device phys, KMAP_MMIO (UC); frames are the device's
 let is i64 as KV_WC   = 3;   // caller's device phys, KMAP_WC (write-combining framebuffer)
 
+// kvmap `flags` bit. KV_GUARD wraps a KV_DATA allocation in one unmapped page
+// on each side (overrun/underrun trips a #PF instead of silently corrupting a
+// neighbour) — the one good idea kept from kvalloc. The same bit is stored in
+// the extent's `kind` (KV_DATA | KV_GUARD) so kvunmap knows to skip the guards.
+// High bit so it never collides with KV_DATA/KV_MMIO/KV_WC in the `kind` field.
+let is i64 as KV_GUARD = 256;
+
 // All-i64 (mixed-width struct fields miscompile). 5 fields = 40 bytes.
 struct KvExtent {
     va_start as i64;
@@ -696,16 +703,24 @@ fn kv_used_insert(base as i64, span as i64, kind as i64, pfns as i64) as void {
 // by `kind`, returning the virtual base (and the physical base in
 // kvmap_result_phys). KV_DATA allocates + zeroes fresh anon frames; KV_MMIO /
 // KV_WC map the caller's `phys` as-is (device frames), honouring a sub-page
-// phys offset. `flags` is reserved (KV_GUARD lands in sub-phase 3). Returns 0
-// on failure, with every partial allocation rolled back.
+// phys offset. KV_GUARD (in `flags`, KV_DATA only) brackets the data with an
+// unmapped guard page on each side. Returns 0 on failure, with every partial
+// allocation rolled back.
 fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
     if (size <= 0) { kvmap_result_phys = 0; return 0; }
+
+    // Guard pages apply to KV_DATA only (MMIO/WC map device-owned phys).
+    let is i64 as guard with mut = 0;
+    if (kind == KV_DATA) {
+        if ((flags & KV_GUARD) != 0) { guard = 1; }
+    }
 
     let is i64 as phys_aligned with mut = 0;
     let is i64 as phys_offset  with mut = 0;
     let is i64 as span with mut = 0;
     if (kind == KV_DATA) {
-        span = pmm.align_up(size, pmm.PAGE_SIZE);
+        // span = data pages + one guard page on each side (when guarded).
+        span = pmm.align_up(size, pmm.PAGE_SIZE) + guard * 2 * pmm.PAGE_SIZE;
     } else {
         phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
         phys_offset  = phys - phys_aligned;
@@ -721,7 +736,12 @@ fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
 
     // 2. Back + map OUTSIDE vmm_lock.
     if (kind == KV_DATA) {
-        let is i64 as pfn_array = heap.kmalloc(pages * 8, cast(i32, 0));
+        // Data occupies the inner pages; the guards (if any) at base and the
+        // last page stay unmapped, so an overrun/underrun faults.
+        let is i64 as data_pages = pages - guard * 2;
+        let is i64 as data_base  = base + guard * pmm.PAGE_SIZE;
+
+        let is i64 as pfn_array = heap.kmalloc(data_pages * 8, cast(i32, 0));
         if (pfn_array == 0) {
             vflags = lock.acquire_irq(&vmm_lock);
             kv_va_release(base, span);
@@ -731,18 +751,18 @@ fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
         }
         let is *i64 as pfns = cast(*i64, pfn_array);
         let is i64 as i with mut = 0;
-        while (i < pages) {
+        while (i < data_pages) {
             let is i32 as pfn = pmm.alloc_pages(
                 pmm.ALLOC_ZERO, cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0));
             if (pfn == pmm.PFN_NONE) {
                 // Rollback the pages mapped so far, the array, then the VA.
                 let is i64 as j with mut = 0;
                 while (j < i) {
-                    vmm_unmap_page(kas_pml4_phys, base + j * pmm.PAGE_SIZE);
+                    vmm_unmap_page(kas_pml4_phys, data_base + j * pmm.PAGE_SIZE);
                     pmm.free_pages(cast(i32, pfns[j]), cast(i32, 0));
                     j = j + 1;
                 }
-                flush_tlb_range(base, i);
+                flush_tlb_range(data_base, i);
                 heap.kfree(pfn_array);
                 vflags = lock.acquire_irq(&vmm_lock);
                 kv_va_release(base, span);
@@ -751,19 +771,23 @@ fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
                 return 0;
             }
             pfns[i] = cast(i64, pfn);
-            vmm_map_page(kas_pml4_phys, base + i * pmm.PAGE_SIZE,
+            vmm_map_page(kas_pml4_phys, data_base + i * pmm.PAGE_SIZE,
                 pmm.pfn_to_phys(pfn), KMAP_DATA);
             i = i + 1;
         }
-        flush_tlb_range(base, pages);
+        flush_tlb_range(data_base, data_pages);
 
-        // 3. Record the allocated extent under vmm_lock.
+        // 3. Record the allocated extent under vmm_lock. The extent owns the
+        //    whole span (guards included); kind carries the guard bit so
+        //    kvunmap knows the data window sits one page in.
+        let is i64 as storedkind with mut = KV_DATA;
+        if (guard == 1) { storedkind = KV_DATA | KV_GUARD; }
         vflags = lock.acquire_irq(&vmm_lock);
-        kv_used_insert(base, span, KV_DATA, pfn_array);
+        kv_used_insert(base, span, storedkind, pfn_array);
         lock.release_irq(&vmm_lock, vflags);
 
         kvmap_result_phys = 0;   // anon: no single contiguous phys
-        return base;
+        return data_base;
     }
 
     // KV_MMIO / KV_WC: map the caller's device phys with the right memory type.
@@ -817,22 +841,32 @@ fn kvunmap(vaddr as i64) as void {
     kvx_free(cur);
     lock.release_irq(&vmm_lock, vflags);
 
-    let is i64 as pages = span / pmm.PAGE_SIZE;
+    // Decode the guard bit: a guarded KV_DATA extent has its data one page in
+    // and two fewer mapped pages (the guards were never mapped).
+    let is i64 as basekind with mut = kind;
+    let is i64 as data_off with mut = 0;
+    let is i64 as map_pages with mut = span / pmm.PAGE_SIZE;
+    if ((kind & KV_GUARD) != 0) {
+        basekind = kind - KV_GUARD;
+        data_off = 1;
+        map_pages = map_pages - 2;
+    }
+    let is i64 as data_base = base + data_off * pmm.PAGE_SIZE;
 
-    // Unmap PTEs for every kind.
+    // Unmap the mapped pages (guard pages were never present).
     let is i64 as i with mut = 0;
-    while (i < pages) {
-        vmm_unmap_page(kas_pml4_phys, base + i * pmm.PAGE_SIZE);
+    while (i < map_pages) {
+        vmm_unmap_page(kas_pml4_phys, data_base + i * pmm.PAGE_SIZE);
         i = i + 1;
     }
-    flush_tlb_range(base, pages);
+    flush_tlb_range(data_base, map_pages);
 
     // Free the backing frames only for KV_DATA (MMIO/WC frames are the device's).
-    if (kind == KV_DATA) {
+    if (basekind == KV_DATA) {
         if (pfns != 0) {
             let is *i64 as pa = cast(*i64, pfns);
             let is i64 as f with mut = 0;
-            while (f < pages) {
+            while (f < map_pages) {
                 pmm.free_pages(cast(i32, pa[f]), cast(i32, 0));
                 f = f + 1;
             }
@@ -840,7 +874,7 @@ fn kvunmap(vaddr as i64) as void {
         }
     }
 
-    // Return the VA to the free-list (coalescing).
+    // Return the whole span (guards included) to the free-list (coalescing).
     vflags = lock.acquire_irq(&vmm_lock);
     kv_va_release(base, span);
     lock.release_irq(&vmm_lock, vflags);
@@ -866,10 +900,11 @@ fn kvmap_init() as void {
 }
 
 // kvmap_smoke — replaces the kvalloc/dma self-tests in vmm.init. Proves the
-// three live kinds round-trip and, critically, that KV_MMIO unmap RECLAIMS VA
-// (the bug Phase C fixes): map+unmap the same phys N times must reuse the VA,
-// not march a cursor off the window. Single-threaded at boot; pat_init already
-// ran for the BSP (KV_WC needs PA1=WC). Fail-loud.
+// three kinds round-trip, that KV_GUARD leaves the guard pages unmapped, and,
+// critically, that KV_MMIO unmap RECLAIMS VA (the bug Phase C fixes): map+unmap
+// the same phys N times must reuse the VA, not march a cursor off the window.
+// Single-threaded at boot; pat_init already ran for the BSP (KV_WC needs
+// PA1=WC). Fail-loud.
 fn kvmap_smoke() as void {
     serial.println("kvmap_smoke: start", 18);
     let is i32 as ok with mut = cast(i32, 1);
@@ -908,7 +943,22 @@ fn kvmap_smoke() as void {
     if (w == 0) { ok = cast(i32, 0); }
     else { kvunmap(w); }
 
-    // 4. After all the churn the window is whole again: one free extent over the
+    // 4. KV_GUARD: a guarded KV_DATA page is mapped, but the page on each side
+    //    is NOT (an overrun/underrun would #PF). We assert via the page walk
+    //    rather than faulting: data page resolves, both guards resolve to 0.
+    let is i64 as g = kvmap(4096, KV_DATA, KV_GUARD, 0);
+    if (g == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as gp = cast(*i64, g);
+        gp[0] = 0xFEEDFACE;
+        if (gp[0] != 0xFEEDFACE) { ok = cast(i32, 0); }
+        if (virt_to_phys_walk(kas_pml4_phys, g) == 0) { ok = cast(i32, 0); }            // data mapped
+        if (virt_to_phys_walk(kas_pml4_phys, g - 4096) != 0) { ok = cast(i32, 0); }     // lower guard unmapped
+        if (virt_to_phys_walk(kas_pml4_phys, g + 4096) != 0) { ok = cast(i32, 0); }     // upper guard unmapped
+        kvunmap(g);
+    }
+
+    // 5. After all the churn the window is whole again: one free extent over the
     //    entire span (every reserve was released + coalesced), nothing allocated.
     if (kv_free_head == 0) { ok = cast(i32, 0); }
     else {
