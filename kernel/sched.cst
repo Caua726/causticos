@@ -5,8 +5,9 @@
 //   deadline_tree.lock < qos_band.lock < cpu_runqueue.lock < global_capabilities.lock
 //   V1 single-CPU: all protected by IRQ disable. Locks become spinlocks for SMP.
 //
-// Thread allocation: kcache for structs + open-addressing hash table for
-// TID→Thread* lookup. Hash table grows dynamically (doubles at 75% load).
+// Thread allocation: a typed pool (heap.kpool) for the structs + an
+// open-addressing hash table for TID→Thread* lookup. Hash table grows
+// dynamically (doubles at 75% load).
 // Thread count limited only by available memory.
 
 use "serial.cst" as serial;
@@ -127,8 +128,11 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
-// Dynamic thread allocation via kcache
-let is i64 as thread_cache with mut = 0;
+// Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
+// Created lazily on first use under heap_lock (SMP-safe), so there is no
+// init-order dependency between sched.init and per_cpu_init / AP bring-up.
+let is i64 as thread_pool with mut = 0;
+let is i64 as fpu_pool with mut = 0;
 
 // TID → Thread* hash table (open addressing, power-of-2 size)
 // Each slot: [tid (i64), ptr (i64)] = 16 bytes. tid = -1 means empty.
@@ -951,12 +955,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
     let is i64 as tid = next_tid;
 
-    let is i64 as tptr with mut = 0;
-    if (thread_cache != 0) {
-        tptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
-    } else {
-        tptr = heap.kmalloc(THREAD_SIZE, pmm.ALLOC_ZERO);
-    }
+    let is i64 as tptr = heap.kpool_alloc_ensure(cast(i64, &thread_pool), THREAD_SIZE, 1);
     if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
     tid_set_ptr(tid, tptr);
     next_tid = tid + 1;
@@ -983,7 +982,13 @@ fn create_thread(entry as i64, band as i64) as i64 {
     sf[0] = switch_rsp;
     sf[1] = 0; sf[2] = 0; sf[3] = 0; sf[4] = 0; sf[5] = 0; sf[6] = 0;
 
-    let is i64 as fpu_addr = heap.kmalloc(FPU_STATE_SIZE, pmm.ALLOC_ZERO);
+    let is i64 as fpu_addr = heap.kpool_alloc_ensure(cast(i64, &fpu_pool), FPU_STATE_SIZE, 1);
+    if (fpu_addr != 0) {
+        // kpool does not zero reused slots; fxsave needs a clean, 16-aligned area.
+        let is *u8 as fz = cast(*u8, fpu_addr);
+        let is i64 as fzi with mut = 0;
+        while (fzi < FPU_STATE_SIZE) { fz[fzi] = 0; fzi = fzi + 1; }
+    }
 
     // EEVDF starts at THIS cpu's band min_vruntime.
     let is i64 as w = band_weight(band);
@@ -1051,12 +1056,7 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
     let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
     let is i64 as tid = next_tid;
 
-    let is i64 as tptr with mut = 0;
-    if (thread_cache != 0) {
-        tptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
-    } else {
-        tptr = heap.kmalloc(THREAD_SIZE, pmm.ALLOC_ZERO);
-    }
+    let is i64 as tptr = heap.kpool_alloc_ensure(cast(i64, &thread_pool), THREAD_SIZE, 1);
     if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
     tid_set_ptr(tid, tptr);
     next_tid = tid + 1;
@@ -1082,7 +1082,13 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
     sf[0] = switch_rsp;
     sf[1] = 0; sf[2] = 0; sf[3] = 0; sf[4] = 0; sf[5] = 0; sf[6] = 0;
 
-    let is i64 as fpu_addr = heap.kmalloc(FPU_STATE_SIZE, pmm.ALLOC_ZERO);
+    let is i64 as fpu_addr = heap.kpool_alloc_ensure(cast(i64, &fpu_pool), FPU_STATE_SIZE, 1);
+    if (fpu_addr != 0) {
+        // kpool does not zero reused slots; fxsave needs a clean, 16-aligned area.
+        let is *u8 as fz = cast(*u8, fpu_addr);
+        let is i64 as fzi with mut = 0;
+        while (fzi < FPU_STATE_SIZE) { fz[fzi] = 0; fzi = fzi + 1; }
+    }
 
     let is i64 as w = band_weight(band);
     let is i64 as mvrt = band_min_vruntime(home_cpu, band);
@@ -1959,9 +1965,8 @@ fn reap_one(tid as i64) as void {
     let is i64 as fpu = thr_get(tid, 240);    // fpu_state_addr
     tid_ht_remove(tid);
     thread_count = thread_count - 1;
-    if (fpu != 0) { heap.kfree(fpu); }
-    if (thread_cache != 0) { heap.kcache_free(thread_cache, tptr); }
-    else { heap.kfree(tptr); }
+    if (fpu != 0) { heap.kpool_free(fpu_pool, fpu); }
+    heap.kpool_free(thread_pool, tptr);
     if (pfn != 0) { pmm.free_pages(cast(i32, pfn)); }
 }
 
@@ -2019,8 +2024,7 @@ fn init() as void {
     let is i64 as rc with mut = 0;
     while (rc < 16) { cpu_reap_heads[rc] = 0 - 1; rc = rc + 1; }
 
-    thread_cache = heap.kcache_create(THREAD_SIZE, 64, cast(i32, 0));
-    if (thread_cache == 0) { pmm.panic("sched: thread_cache create fail", 31); }
+    // thread_pool / fpu_pool are created lazily on first alloc (kpool_alloc_ensure).
 
     // Init per-cpu band data + budgets for every possible cpu.
     let is i64 as ci with mut = 0;
@@ -2057,7 +2061,7 @@ fn per_cpu_init() as void {
     // concurrently and would otherwise race on next_tid / tid_ht.
     let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
     let is i64 as itid = next_tid;
-    let is i64 as iptr = heap.kcache_alloc(thread_cache, cast(i32, 0));
+    let is i64 as iptr = heap.kpool_alloc_ensure(cast(i64, &thread_pool), THREAD_SIZE, 1);
     if (iptr == 0) { pmm.panic("idle alloc fail", 15); }
     tid_set_ptr(itid, iptr);
     next_tid = itid + 1;

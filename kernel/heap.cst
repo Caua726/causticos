@@ -79,6 +79,19 @@ struct Bins {
     lookup_entries as i64;
 }
 
+// Typed pool (vendored from Caustic/std/mem/pool.cst, adapted to grow by
+// pmm chunks instead of one demand-paged region). A KPool is essentially a
+// single-class bins with NO per-object header (the pool is typed, so free
+// finds the chunk by address range and the slot index by offset). Reuses
+// the Slab struct + bslab_create for its chunks. All fields 8 bytes.
+struct KPool {
+    slot_size as i64;     // obj_size aligned up to 16 (covers fxsave's 16B need)
+    chunk_head as *u8;    // *Slab list (chunks grown lazily from pmm)
+    used_slots as i64;
+    debug as i64;         // 1 = bitmap double-free detection
+    chunk_bytes as i64;   // region size per chunk
+}
+
 // ============================================================
 // KmemCache — slab cache descriptor (128 bytes, manual layout)
 // ============================================================
@@ -307,6 +320,11 @@ let is Bins as kbins with mut;
 let is [4096]u8 as large_table_raw;
 let is i64 as large_count with mut = 0;
 let is i64 as LARGE_CAP = 256;
+
+// Typed-pool registry (BSS bounded). 16 KPool structs * sizeof(KPool)=40 = 640.
+let is [640]u8 as kpool_registry_raw;
+let is i64 as kpool_count with mut = 0;
+let is i64 as KPOOL_MAX = 16;
 
 // IRQ lock
 let is i64 as heap_saved_flags with mut = 0;
@@ -1547,6 +1565,131 @@ fn bins_init() as void {
         i = i + 1;
     }
     build_lookup(&kbins);
+}
+
+// ============================================================
+// Typed pool (kpool) — fixed-size slots, O(1), grows by pmm chunks
+// ============================================================
+// A pool is a chain of Slab chunks (reused from bins). Slots carry NO
+// header (the pool is typed): user pointer == slot. free locates the chunk
+// by address range and the slot index by offset. Chunk metadata + region
+// come from the PMM (bslab_create); the KPool control block lives in the
+// BSS registry. heap_lock serializes all mutation.
+
+// Caller holds heap_lock. Grabs a registry slot and inits the control block.
+fn kpool_create_locked(obj_size as i64, debug as i64) as i64 {
+    if (kpool_count >= KPOOL_MAX) {
+        pmm.panic("kpool registry exhausted", 24);
+    }
+    let is i64 as p = cast(i64, &kpool_registry_raw) + kpool_count * sizeof(KPool);
+    kpool_count = kpool_count + 1;
+    let is *KPool as kp = cast(*KPool, p);
+    // Align the slot up to 16 bytes: covers fxsave's 16-byte requirement and
+    // keeps every slot 16-aligned (chunk region is page-aligned from the PMM).
+    let is i64 as ss with mut = (obj_size + 15) & (0 - 16);
+    if (ss < 16) { ss = 16; }
+    kp.slot_size = ss;
+    kp.chunk_head = cast(*u8, 0);
+    kp.used_slots = 0;
+    kp.debug = debug;
+    kp.chunk_bytes = 65536;
+    return p;
+}
+
+// Caller holds heap_lock. Allocates one slot (grows by a chunk if needed).
+fn kpool_alloc_locked(kp as *KPool) as i64 {
+    let is *Slab as slab with mut = cast(*Slab, kp.chunk_head);
+    while (cast(i64, slab) != 0) {
+        if (cast(i64, slab.freelist) != 0) {
+            let is *u8 as slot = slab.freelist;
+            let is *i64 as np = cast(*i64, slot);
+            slab.freelist = cast(*u8, *np);
+            if (kp.debug == 1) {
+                let is i64 as si = (cast(i64, slot) - cast(i64, slab.region)) / kp.slot_size;
+                bit_clear(slab.bitmap, si);
+            }
+            slab.used_slots = slab.used_slots + 1;
+            kp.used_slots = kp.used_slots + 1;
+            return cast(i64, slot);   // no header: user pointer == slot
+        }
+        slab = cast(*Slab, slab.next);
+    }
+    // Grow: new chunk (alloc_size == slot_size, no header).
+    let is *Slab as nc = bslab_create(kp.slot_size, kp.chunk_bytes, 0);
+    if (cast(i64, nc) == 0) { return 0; }
+    nc.next = kp.chunk_head;
+    kp.chunk_head = cast(*u8, nc);
+    let is *u8 as slot = nc.freelist;
+    let is *i64 as np = cast(*i64, slot);
+    nc.freelist = cast(*u8, *np);
+    if (kp.debug == 1) { bit_clear(nc.bitmap, 0); }
+    nc.used_slots = 1;
+    kp.used_slots = kp.used_slots + 1;
+    return cast(i64, slot);
+}
+
+// Public: explicit creation (plan API). Returns a KPool handle (i64).
+fn kpool_create(obj_size as i64, debug as i64) as i64 {
+    hirq_save();
+    let is i64 as r = kpool_create_locked(obj_size, debug);
+    hirq_restore();
+    return r;
+}
+
+// Public: allocate from an existing pool handle.
+fn kpool_alloc(pool as i64) as i64 {
+    if (pool == 0) { return 0; }
+    hirq_save();
+    let is i64 as r = kpool_alloc_locked(cast(*KPool, pool));
+    hirq_restore();
+    return r;
+}
+
+// Public convenience: lazily create the pool (if *handle_ptr == 0) and
+// allocate, all under one heap_lock acquisition — SMP-safe, no init-order
+// dependency. handle_ptr is the address of a module-global i64 holding the
+// pool handle. Returns the slot, or 0 on OOM.
+fn kpool_alloc_ensure(handle_ptr as i64, obj_size as i64, debug as i64) as i64 {
+    hirq_save();
+    let is *i64 as hp = cast(*i64, handle_ptr);
+    if (hp[0] == 0) {
+        hp[0] = kpool_create_locked(obj_size, debug);
+    }
+    let is i64 as r = kpool_alloc_locked(cast(*KPool, hp[0]));
+    hirq_restore();
+    return r;
+}
+
+// Public: free a slot back to its pool. Fail-loud on bad ptr / double free.
+fn kpool_free(pool as i64, ptr as i64) as void {
+    if (ptr == 0) { return; }
+    if (pool == 0) { pmm.panic("kpool_free: null pool", 21); }
+    let is *KPool as kp = cast(*KPool, pool);
+    hirq_save();
+    let is *Slab as slab with mut = cast(*Slab, kp.chunk_head);
+    while (cast(i64, slab) != 0) {
+        let is i64 as start = cast(i64, slab.region);
+        let is i64 as end = start + slab.region_size;
+        if (ptr >= start && ptr < end) {
+            let is i64 as si = (ptr - start) / kp.slot_size;
+            if (kp.debug == 1) {
+                if (bit_test(slab.bitmap, si) == cast(i32, 1)) {
+                    pmm.panic("kpool_free: double free", 23);
+                }
+                bit_set(slab.bitmap, si);
+            }
+            let is *i64 as np = cast(*i64, ptr);
+            *np = cast(i64, slab.freelist);
+            slab.freelist = cast(*u8, ptr);
+            slab.used_slots = slab.used_slots - 1;
+            kp.used_slots = kp.used_slots - 1;
+            hirq_restore();
+            return;
+        }
+        slab = cast(*Slab, slab.next);
+    }
+    hirq_restore();
+    pmm.panic("kpool_free: ptr not in any chunk", 32);
 }
 
 // ============================================================
