@@ -564,19 +564,29 @@ fn sys_readdir(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i6
 // ============================================================
 
 fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
-    let is i64 as img_uptr = a;
-    let is i64 as img_len = b;
-    let is i64 as fdacts_uptr = c;
-    let is i64 as n_acts with mut = d;
-    if (img_len <= 0) { return abi.E_INVAL; }
-    if (img_len > 262144) { return abi.E_INVAL; }      // bound v0 image size (256 KiB — fb programs embed a font)
-    if (n_acts < 0) { n_acts = 0; }
-    if (n_acts > 16) { return abi.E_INVAL; }           // bound the fd-action list
-
+    let is i64 as params_uptr = a;                     // rdi = *SpawnParams
     let is i64 as tid = sched.current_tid();
     let is i64 as parent = sched.thr_process_ptr(tid);
     if (parent == 0) { return abi.E_PERM; }            // only processes spawn
     let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    // One copy of the whole parameter block (the 6 prior positional args + the
+    // budget grant). All later validation/use reads sp.field.
+    if (params_uptr == 0) { return abi.E_INVAL; }
+    let is abi.SpawnParams as sp;
+    if (userspace.copy_from_user(pml4, cast(*u8, &sp), params_uptr,
+                                 sizeof(abi.SpawnParams)) != 0) {
+        return abi.E_FAULT;
+    }
+    let is i64 as img_uptr = sp.img_uptr;
+    let is i64 as img_len = sp.img_len;
+    let is i64 as fdacts_uptr = sp.fdacts_uptr;
+    let is i64 as n_acts with mut = sp.n_acts;
+    if (img_len <= 0) { return abi.E_INVAL; }
+    if (img_len > 262144) { return abi.E_INVAL; }      // bound v0 image size (256 KiB — fb programs embed a font)
+    if (n_acts < 0) { n_acts = 0; }
+    if (n_acts > 16) { return abi.E_INVAL; }           // bound the fd-action list
+    if (sp.budget < 0) { return abi.E_INVAL; }         // budget is a ceiling, not negative
 
     // Copy the fd-actions list up front (before creating a child) so a bad
     // pointer fails cleanly without orphaning one. Each action is a pair of
@@ -591,15 +601,14 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
         }
     }
 
-    // Copy the argv vector up front too. e (r8) = argv array (argc entries of
-    // {str_ptr, str_len} i64s), f (r9) = argc. argv is DATA, not authority
+    // Copy the argv vector up front too. argv is DATA, not authority
     // (architecture §2): the kernel copies the strings and later lays them on
     // the child's stack, but resolves NOTHING from them — a path in argv is
     // just bytes. Authority still travels only as fds (fdacts above). argc == 0
     // → the child gets the default argv = ["child"]. Bounded: ≤32 args, ≤256 B
     // each, ≤2048 B total.
-    let is i64 as argv_uptr = e;
-    let is i64 as argc with mut = f;
+    let is i64 as argv_uptr = sp.argv_uptr;
+    let is i64 as argc with mut = sp.argc;
     let is [512]u8 as argdesc;                         // 32 × 16
     let is [2048]u8 as argstr;
     let is [32]i64 as argv_ptrs;
@@ -669,6 +678,19 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
                 }
             }
             ai = ai + 1;
+        }
+    }
+
+    // Grant the child its memory budget (Phase G): the parent's chosen ceiling
+    // on committed_bytes. 0 = unlimited (physical only). Written while the child
+    // is still suspended, before it runs; commit (Phase E) enforces it. Explicit
+    // authority, like fds via fdacts — without a grant, only the machine limits
+    // the child, and a reserve-bomb is confined to itself (radius = the child).
+    if (sp.budget > 0) {
+        let is i64 as casp = proc.proc_aspace(child);
+        if (casp != 0) {
+            let is *vma.Aspace as ca = cast(*vma.Aspace, casp);
+            ca.budget = sp.budget;
         }
     }
 
