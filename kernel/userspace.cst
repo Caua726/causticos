@@ -369,6 +369,121 @@ fn spawn_user_fault_smoke() as void {
     serial.println("userspace.fault_smoke: kernel still alive PASS", 46);
 }
 
+// Strict reserve/commit mechanics, kernel-side (no ring-3 thread). A page is
+// committed IFF its PTE is present — no per-page field. Proves: reserve leaves
+// the page absent; commit makes it present + zeroed; decommit drops it; a
+// recommit re-zeroes a fresh frame (not the stale value); committing outside a
+// reservation is E_INVAL (not a panic); release clears it. Reads/writes the
+// frame through the HHDM (this test aspace isn't the active CR3). Fail-loud.
+fn vma_strict_smoke() as void {
+    serial.println("userspace.strict_smoke: start", 29);
+    let is i32 as ok with mut = cast(i32, 1);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.strict_smoke: aspace FAIL", 35);
+        return;
+    }
+    let is i64 as RV = 0x0000000000440000;
+    let is i64 as pr = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+
+    // 1. reserve → the VMA exists, the PTE is absent (nothing backed).
+    if (vma.reserve(a, RV, 4096, pr, vma.VMA_FIXED) != RV) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RV) != 0) { ok = cast(i32, 0); }
+
+    // 2. commit → present + zeroed; write/read the frame via the HHDM.
+    if (vma.commit(a, RV, 4096, pr) != cast(i32, 0)) { ok = cast(i32, 0); }
+    let is i64 as pte = vmm.pte_lookup(a.pml4_phys, RV);
+    if (pte == 0) { ok = cast(i32, 0); }
+    if ((pte & vmm.PTE_USER) == 0) { ok = cast(i32, 0); }
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+    if (phys == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+        if (p[0] != 0) { ok = cast(i32, 0); }                    // commit zeroes
+        p[0] = cast(i64, 0xC0FFEE);
+        if (p[0] != cast(i64, 0xC0FFEE)) { ok = cast(i32, 0); }
+    }
+
+    // 3. decommit → the PTE is absent again.
+    if (vma.decommit(a, RV, 4096) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RV) != 0) { ok = cast(i32, 0); }
+
+    // 4. recommit → present with a FRESH zero frame (not the stale 0xC0FFEE).
+    if (vma.commit(a, RV, 4096, pr) != cast(i32, 0)) { ok = cast(i32, 0); }
+    let is i64 as phys2 = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+    if (phys2 == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as p2 = cast(*i64, pmm.phys_to_virt(phys2));
+        if (p2[0] != 0) { ok = cast(i32, 0); }                   // fresh zero
+    }
+
+    // 5. commit outside any reservation → E_INVAL, not a panic.
+    if (vma.commit(a, 0x0000000000900000, 4096, pr) != cast(i32, abi.E_INVAL)) { ok = cast(i32, 0); }
+
+    // 6. release → the VMA is gone, the PTE is absent.
+    if (vma.munmap(a, RV, 4096) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RV) != 0) { ok = cast(i32, 0); }
+
+    vma.aspace_destroy(a);
+    if (ok == cast(i32, 1)) { serial.println("userspace.strict_smoke: PASS", 28); }
+    else { pmm.panic("strict_smoke FAIL", 17); }
+}
+
+// A ring-3 thread that stores to a RESERVED-but-uncommitted page must take a
+// fatal #PF (strict policy #0): the kernel logs cr2 = the faulting VA and kills
+// the thread, surviving. Proves "touched uncommitted = bug" end to end.
+fn spawn_user_reserve_fault_smoke() as void {
+    serial.println("userspace.reserve_fault_smoke: start", 36);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.reserve_fault_smoke: aspace FAIL", 42);
+        return;
+    }
+
+    // Text (eager, executable): movabs rax, USER_DATA_VA ; mov qword [rax], 1.
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE,
+                                            cast(*u8, "rtext"), 5);
+    if (text_kv == 0) { return; }
+    let is *u8 as code = cast(*u8, text_kv);
+    let is i64 as c with mut = 0;
+    code[c + 0] = cast(u8, 0x48); code[c + 1] = cast(u8, 0xB8); c = c + 2;   // movabs rax, imm64
+    let is i64 as v with mut = USER_DATA_VA;
+    let is i64 as i with mut = 0;
+    while (i < 8) { code[c + i] = cast(u8, v & 0xFF); v = v >> 8; i = i + 1; }
+    c = c + 8;
+    code[c + 0] = cast(u8, 0x48); code[c + 1] = cast(u8, 0xC7); code[c + 2] = cast(u8, 0x00);   // mov qword [rax], imm32
+    code[c + 3] = cast(u8, 0x01); code[c + 4] = cast(u8, 0x00);
+    code[c + 5] = cast(u8, 0x00); code[c + 6] = cast(u8, 0x00);
+    c = c + 7;
+
+    // Stack (eager).
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "rstk"), 4);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    // Reserve USER_DATA_VA WITHOUT committing — the store below must fault.
+    if (vma.reserve(a, USER_DATA_VA, 4096,
+                    vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, vma.VMA_FIXED) != USER_DATA_VA) {
+        serial.println("userspace.reserve_fault_smoke: reserve FAIL", 43);
+        return;
+    }
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.reserve_fault_smoke: spawned tid=", 43);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    sched.sleep_for_ns(200000000);
+    serial.println("userspace.reserve_fault_smoke: kernel still alive PASS", 54);
+}
+
 // (spawn_user_syscall_smoke retired — spawn_user_elf_smoke exercises
 //  the same SYSCALL/SYSRETQ path through the real ABI now that
 //  TIME_NOW_NS / IO_WRITE / PROC_EXIT are wired up.)
@@ -2342,6 +2457,8 @@ fn smoke_thread() as void {
     sched.sleep_for_ns(100000000);     // let the bind/mount settle
     spawn_user_smoke();
     spawn_user_fault_smoke();
+    vma_strict_smoke();
+    spawn_user_reserve_fault_smoke();
     fd_table_smoke();
     close_on_exit_smoke();
     spawn_user_elf_smoke();

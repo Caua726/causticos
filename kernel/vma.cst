@@ -26,6 +26,7 @@ use "vmm.cst" as vmm;
 use "lock.cst" as lock;
 use "kobject.cst" as kobject;
 use "abi.cst" as abi;
+use "sched.cst" as sched;
 
 // ============================================================
 // Constants — flags + helpers
@@ -666,7 +667,35 @@ fn dump(a as *Aspace) as void {
 // the shape E needs, so E changes only this function body, not its callers.
 fn mem_handle_fault(cr2 as i64, errcode as i64, rip as i64,
                     fault_rsp as i64, cs as i64) as i32 {
-    // Strict policy #0: no fill path exists under eager mmap, so every fault is
-    // a real error. Fatal — the idt handler kills the thread / panics.
+    // Kernel-mode fault: never touch the aspace lock. The faulting kernel path
+    // may itself hold that lock (e.g. a bug inside commit_locked), and this
+    // handler runs on the SAME cpu — re-acquiring would deadlock. A kernel #PF
+    // is always a bug under the strict model, so return fatal immediately.
+    if ((cs & 3) != 3) { return cast(i32, 1); }
+
+    // User-mode fault. Resolve the faulting thread's aspace (same context the
+    // idt user-fault path already uses for exit_current_thread).
+    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    if (asp == 0) { return cast(i32, 1); }   // no aspace → fatal
+    let is *Aspace as a = cast(*Aspace, asp);
+
+    let is i64 as f = lock.acquire_irq(lk_ptr(a));
+    let is *Vma as v = vma_find(a, cr2);
+    if (cast(i64, v) == 0) {
+        lock.release_irq(lk_ptr(a), f);
+        return cast(i32, 1);                  // no VMA covers cr2 → segfault (fatal)
+    }
+    if (v.pager != 0) {
+        // AUTOFILL: delegate to a userspace pager (Phase F/future). No VMA
+        // carries a pager yet, so this is currently unreachable; the dispatch
+        // shape is here so that path slots in without touching the callers.
+        lock.release_irq(lk_ptr(a), f);
+        return cast(i32, 1);
+    }
+    // strict policy #0: inside a reserved VMA but the PTE is absent means the
+    // program touched memory it reserved-but-never-committed — a real bug, like
+    // dereferencing a null. Fatal, with cr2 in the idt log. (A committed page
+    // is present and never reaches here.)
+    lock.release_irq(lk_ptr(a), f);
     return cast(i32, 1);
 }
