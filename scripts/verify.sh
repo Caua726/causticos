@@ -22,9 +22,12 @@ FAIL=0
 for i in $(seq 1 "$RUNS"); do
   cp /tmp/disk.pristine.img build/disk.img
   TMPLOG=$(mktemp)
-  # Run qemu in background, watch its serial output. On success-marker
-  # or exception, kill qemu and stop. Hard timeout via `timeout`.
-  timeout "$TOUT" qemu-system-x86_64 \
+  # Launch qemu DIRECTLY (no `timeout` wrapper). QPID is then qemu's own
+  # pid, so the kill below terminates qemu itself. The old form ran qemu
+  # as a child of `timeout` and killed the wrapper — orphaning qemu, which
+  # kept build/disk.img locked and made the *next* run fail to boot (a
+  # spurious "no-phase6 (timeout?)"). We enforce the hard deadline here.
+  qemu-system-x86_64 \
     -cdrom build/causticos.iso -m 128M -machine q35 \
     -drive id=disk,file=build/disk.img,if=none,format=raw \
     -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
@@ -32,15 +35,22 @@ for i in $(seq 1 "$RUNS"); do
     -boot d -serial stdio -display none -no-reboot -smp "$SMP" \
     > "$TMPLOG" 2>&1 &
   QPID=$!
-  # Poll for success marker or exception, then kill.
+  # Poll the serial for a terminal marker, with a hard deadline of TOUT
+  # seconds. Strip NULs before grep — the kernel's serial output
+  # interleaves NUL bytes and a raw grep misses the marker, which used to
+  # leave every run spinning to the deadline (and mis-report it).
+  DEADLINE=$((SECONDS + TOUT))
   while kill -0 $QPID 2>/dev/null; do
-    if grep -qE "vfs\.test: ALL PASS|EXCEPTION|panic:|kernel halted" "$TMPLOG" 2>/dev/null; then
-      kill -9 $QPID 2>/dev/null
+    if tr -d '\000' < "$TMPLOG" | grep -qE "vfs\.test: ALL PASS|EXCEPTION|panic:|kernel halted"; then
+      break
+    fi
+    if [ "$SECONDS" -ge "$DEADLINE" ]; then
       break
     fi
     sleep 0.2
   done
-  wait $QPID 2>/dev/null
+  kill -9 $QPID 2>/dev/null
+  wait $QPID 2>/dev/null      # reap qemu so its disk-image lock is gone before the next cp
 
   RAW=$(tr -d '\000' < "$TMPLOG")
   rm -f "$TMPLOG"
