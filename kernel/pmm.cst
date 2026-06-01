@@ -57,21 +57,27 @@ let is i32 as FM_USAGE_MASK  = 7;
 // value can't be an i32 literal in global init, so it's set in init().
 let is i32 as FREE_MAGIC with mut = 0;
 
-// Zones
-let is i32 as ZONE_DMA32         = 0;
-let is i32 as ZONE_NORMAL        = 1;
-let is i32 as NUM_ZONES          = 2;
-let is i32 as ZONE_DMA32_END_PFN with mut = 0; // set to 1048576 in init
+// Single physical address space (zones collapsed in A2a). The only
+// remaining low-memory distinction is a per-allocation flag,
+// ALLOC_BELOW_4G, for 32-bit DMA — served by preferring blocks whose
+// head pfn is below this limit. 4 GiB >> 12 = 1048576; set in init().
+let is i32 as PFN_4G_LIMIT with mut = 0;
 
 // Alloc flags
-let is i32 as ALLOC_ZERO           = 1;
-let is i32 as ALLOC_ALLOW_FALLBACK = 2;
-let is i32 as ALLOC_DMA32_ONLY     = 4;
-let is i32 as ALLOC_EMERGENCY      = 8;
+let is i32 as ALLOC_ZERO       = 1;
+let is i32 as ALLOC_BELOW_4G   = 2;   // 32-bit DMA: the frame must be < 4 GiB
+let is i32 as ALLOC_EMERGENCY  = 8;   // dip into the atomic reserve (IRQ/panic only)
 
-// Zone reserves (i32 page counts)
-let is [2]i32 as zone_min_reserve;
-let is [2]i32 as zone_atomic_reserve;
+// Reserves over the single free pool (i32 page counts)
+let is i32 as min_reserve    with mut = 0;
+let is i32 as atomic_reserve with mut = 0;
+
+// Last allocation failure, recorded under the lock on every PFN_NONE
+// return, for honest OOM reporting at the call site.
+let is i32 as last_fail_order   with mut = 0;
+let is i32 as last_fail_flags   with mut = 0;
+let is i32 as last_fail_free    with mut = 0;
+let is i32 as last_fail_largest with mut = 0;
 
 // IRQ lock state
 let is i64 as saved_flags with mut = 0;
@@ -182,25 +188,37 @@ fn section_get(idx as i32) as *MemSection {
 }
 
 // ============================================================
-// Zone free lists — flat array [NUM_ZONES * NUM_ORDERS]
-// Each entry is a PFN (i32). PFN_NONE = empty.
+// Free lists — one head per order (NUM_ORDERS=11) over the single
+// physical address space. Each entry is the head PFN of a doubly-linked
+// list whose links live in the page bodies (FreeNode); PFN_NONE = empty.
 // ============================================================
 
-let is [22]i32 as free_list_heads;
-let is [2]i32 as zone_free_totals;
+let is [11]i32 as free_list_heads;
+let is i32 as free_total with mut = 0;
 
-fn fl_idx(zone as i32, order as i32) as i64 {
-    return cast(i64, zone) * cast(i64, NUM_ORDERS) + cast(i64, order);
+fn fl_get(order as i32) as i32 {
+    let is *i32 as heads = cast(*i32, &free_list_heads);
+    return heads[cast(i64, order)];
 }
 
-fn fl_get(zone as i32, order as i32) as i32 {
+fn fl_set(order as i32, pfn as i32) as void {
     let is *i32 as heads = cast(*i32, &free_list_heads);
-    return heads[fl_idx(zone, order)];
+    heads[cast(i64, order)] = pfn;
 }
 
-fn fl_set(zone as i32, order as i32, pfn as i32) as void {
-    let is *i32 as heads = cast(*i32, &free_list_heads);
-    heads[fl_idx(zone, order)] = pfn;
+// Pick a block off the order's list. Without the below-4G constraint,
+// that's the LIFO head (O(1)). With it, walk the list for the first
+// block whose head pfn is below the limit — an order-aligned block with
+// head < PFN_4G_LIMIT lies entirely below 4 GiB. PFN_NONE if none.
+fn fl_find(order as i32, below as i32) as i32 {
+    let is i32 as head = fl_get(order);
+    if (below == cast(i32, 0)) { return head; }
+    let is i32 as cur with mut = head;
+    while (cur != PFN_NONE) {
+        if (cur < PFN_4G_LIMIT) { return cur; }
+        cur = fn_next(cur);
+    }
+    return PFN_NONE;
 }
 
 // ============================================================
@@ -486,12 +504,6 @@ fn freenode_ok(pfn as i32) as i32 {
     return cast(i32, 1);
 }
 
-fn pfn_to_zone(pfn as i32) as i32 {
-    if (pfn < ZONE_DMA32_END_PFN) {
-        return ZONE_DMA32;
-    }
-    return ZONE_NORMAL;
-}
 
 // ============================================================
 // Phase B+C: Create sections
@@ -625,18 +637,18 @@ fn init_pageinfo() as void {
 // Free list operations
 // ============================================================
 
-fn insert_free(zone as i32, order as i32, pfn as i32) as void {
-    let is i32 as old = fl_get(zone, order);
+fn insert_free(order as i32, pfn as i32) as void {
+    let is i32 as old = fl_get(order);
     fn_set_next(pfn, old);
     fn_set_prev(pfn, PFN_NONE);
     fn_set_magic(pfn, FREE_MAGIC);
     if (old != PFN_NONE) {
         fn_set_prev(old, pfn);
     }
-    fl_set(zone, order, pfn);
+    fl_set(order, pfn);
 }
 
-fn remove_free(zone as i32, order as i32, pfn as i32) as void {
+fn remove_free(order as i32, pfn as i32) as void {
     // Structural integrity: a page on a free list must carry the magic.
     // A miss means corruption or a double-free that reached the list.
     if (freenode_ok(pfn) == cast(i32, 0)) {
@@ -647,7 +659,7 @@ fn remove_free(zone as i32, order as i32, pfn as i32) as void {
     if (prv != PFN_NONE) {
         fn_set_next(prv, nxt);
     } else {
-        fl_set(zone, order, nxt);
+        fl_set(order, nxt);
     }
     if (nxt != PFN_NONE) {
         fn_set_prev(nxt, prv);
@@ -721,17 +733,15 @@ fn min3(a as i32, b as i32, c as i32) as i32 {
     return m;
 }
 
-fn seed_range(zone as i32, start as i32, end as i32) as void {
+fn seed_range(start as i32, end as i32) as void {
     let is i32 as pfn with mut = start;
-    let is i32 as blocks with mut = 0;
-    let is *i32 as totals = cast(*i32, &zone_free_totals);
 
     while (pfn < end) {
         let is i32 as left = end - pfn;
         let is i32 as ord = min3(floor_log2(left), ctz(pfn), MAX_BLOCK_ORDER);
         let is i32 as bsize = cast(i32, 1) << ord;
 
-        // Bug #6 fix: defensive check — all pages in block must be PAGE_FREE
+        // Defensive check — all pages in block must be PAGE_FREE
         let is i32 as ok with mut = cast(i32, 1);
         let is i32 as chk with mut = 0;
         while (chk < bsize) {
@@ -749,32 +759,10 @@ fn seed_range(zone as i32, start as i32, end as i32) as void {
 
         if (ok != cast(i32, 0)) {
             mark_free(pfn, ord);
-            insert_free(zone, ord, pfn);
-            totals[cast(i64, zone)] = totals[cast(i64, zone)] + bsize;
-            blocks = blocks + cast(i32, 1);
+            insert_free(ord, pfn);
+            free_total = free_total + bsize;
         }
         pfn = pfn + bsize;
-    }
-
-    serial.print("  zone ", 7);
-    util.print_num(cast(i64, zone));
-    serial.print(": ", 2);
-    util.print_num(cast(i64, blocks));
-    serial.print(" blocks, ", 9);
-    util.print_num(cast(i64, totals[cast(i64, zone)]));
-    serial.println(" pages", 6);
-}
-
-// Bug #5 fix: split run at zone boundary before seeding
-fn flush_run(start as i32, end as i32) as void {
-    let is i32 as zs = pfn_to_zone(start);
-    let is i32 as ze = pfn_to_zone(end - cast(i32, 1));
-    if (zs != ze) {
-        // Run crosses DMA32/NORMAL boundary — split
-        seed_range(ZONE_DMA32, start, ZONE_DMA32_END_PFN);
-        seed_range(ZONE_NORMAL, ZONE_DMA32_END_PFN, end);
-    } else {
-        seed_range(zs, start, end);
     }
 }
 
@@ -782,17 +770,16 @@ fn seed_buddy() as void {
     // Init free lists to PFN_NONE
     let is *i32 as heads = cast(*i32, &free_list_heads);
     let is i64 as i with mut = 0;
-    while (i < cast(i64, NUM_ZONES) * cast(i64, NUM_ORDERS)) {
+    while (i < cast(i64, NUM_ORDERS)) {
         heads[i] = PFN_NONE;
         i = i + 1;
     }
-    let is *i32 as totals = cast(*i32, &zone_free_totals);
-    totals[0] = cast(i32, 0);
-    totals[1] = cast(i32, 0);
+    free_total = cast(i32, 0);
 
     serial.println("seeding buddy:", 14);
 
-    // Scan sections for contiguous free runs
+    // Scan sections for contiguous free runs. With zones gone there is no
+    // boundary split — each run is seeded as one span over the single space.
     let is i32 as sid with mut = 0;
     while (sid < MAX_SECTIONS) {
         let is *MemSection as sec = section_get(sid);
@@ -811,7 +798,7 @@ fn seed_buddy() as void {
                     }
                 } else {
                     if (run != PFN_NONE) {
-                        flush_run(run, pfn);
+                        seed_range(run, pfn);
                         run = PFN_NONE;
                     }
                 }
@@ -819,11 +806,15 @@ fn seed_buddy() as void {
             }
             if (run != PFN_NONE) {
                 let is i32 as ep = bpfn + PAGES_PER_SECTION;
-                flush_run(run, ep);
+                seed_range(run, ep);
             }
         }
         sid = sid + cast(i32, 1);
     }
+
+    serial.print("  seeded ", 9);
+    util.print_num(cast(i64, free_total));
+    serial.println(" pages total", 12);
 }
 
 // Merge optimization: when absorbed buddy is upper, only rewrite
@@ -846,13 +837,12 @@ fn extend_free_up(hpfn as i32, old_order as i32) as void {
 // Merge check
 // ============================================================
 
-fn can_merge(zone as i32, bpfn as i32, order as i32) as i32 {
+fn can_merge(bpfn as i32, order as i32) as i32 {
     if (page_present(bpfn) == cast(i32, 0)) { return cast(i32, 0); }
     let is i32 as m = frame_meta_read(bpfn);
     if (fm_state(m) != PAGE_FREE) { return cast(i32, 0); }
     if (fm_head(m) == cast(i32, 0)) { return cast(i32, 0); }
     if (fm_order(m) != order) { return cast(i32, 0); }
-    if (pfn_to_zone(bpfn) != zone) { return cast(i32, 0); }
     return cast(i32, 1);
 }
 
@@ -860,16 +850,11 @@ fn can_merge(zone as i32, bpfn as i32, order as i32) as i32 {
 // Allocation
 // ============================================================
 
-// Bug #3 fix: zone budget check with reserves
-fn zone_has_budget(zone as i32, flags as i32, need as i32) as i32 {
-    let is *i32 as totals = cast(*i32, &zone_free_totals);
-    let is *i32 as minres = cast(*i32, &zone_min_reserve);
-    let is *i32 as atomres = cast(*i32, &zone_atomic_reserve);
-    let is i64 as zi = cast(i64, zone);
-
-    let is i32 as avail with mut = totals[zi] - minres[zi];
+// Budget check with reserves over the single free pool.
+fn has_budget(flags as i32, need as i32) as i32 {
+    let is i32 as avail with mut = free_total - min_reserve;
     if ((flags & ALLOC_EMERGENCY) != cast(i32, 0)) {
-        avail = avail + atomres[zi];
+        avail = avail + atomic_reserve;
     }
     if (avail >= need) {
         return cast(i32, 1);
@@ -877,7 +862,27 @@ fn zone_has_budget(zone as i32, flags as i32, need as i32) as i32 {
     return cast(i32, 0);
 }
 
-fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as i32) as i32 {
+// Record why an allocation failed, for honest reporting at the call site.
+// Called under pmm_lock so free_total / the free lists are consistent.
+fn record_fail(order as i32, flags as i32) as void {
+    last_fail_order = order;
+    last_fail_flags = flags;
+    last_fail_free = free_total;
+    let is i32 as largest with mut = cast(i32, 0 - 1);
+    let is i32 as o with mut = MAX_BLOCK_ORDER;
+    while (o >= cast(i32, 0)) {
+        if (fl_get(o) != PFN_NONE) {
+            largest = o;
+            o = cast(i32, 0 - 1);
+        }
+        o = o - cast(i32, 1);
+    }
+    last_fail_largest = largest;
+}
+
+// owner is kept for API stability; A1 dropped per-page owner tracking
+// (it returns with refcount/CoW later), so it is not threaded down here.
+fn alloc_pages(flags as i32, order as i32, usage as i32, owner as i32) as i32 {
     if (order > MAX_BLOCK_ORDER) { return PFN_NONE; }
 
     // ALLOC_EMERGENCY enforcement: panic if used outside permitted context
@@ -887,82 +892,68 @@ fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as 
         }
     }
 
-    // Bug #4 fix: correct zone fallback policy
-    // DMA32 request: only DMA32
-    // DMA32_ONLY flag: only DMA32
-    // NORMAL request: try NORMAL, fallback to DMA32 if allowed
-    let is i32 as zone with mut = zpref;
-    let is i32 as att with mut = 0;
+    let is i32 as below = flags & ALLOC_BELOW_4G;
+    let is i32 as need = cast(i32, 1) << order;
 
-    while (att < NUM_ZONES) {
-        let is i32 as need = cast(i32, 1) << order;
+    // Serialise the buddy allocator under pmm_lock. acquire_irq grabs the
+    // lock AND saves RFLAGS on this stack frame (no shared saved_flags
+    // slot), so concurrent cpus neither corrupt the freelist nor mis-
+    // restore IF on exit.
+    let is i64 as pflags = lock.acquire_irq(&pmm_lock);
 
-        // Serialise the buddy allocator under pmm_lock. The legacy
-        // irq_save/irq_restore primitives stored their flags in a
-        // module global — fine on uniprocessor, SMP-fatal because
-        // two cpus doing irq_save concurrently stomp the same
-        // saved_flags slot. acquire_irq grabs the lock AND saves
-        // flags on this stack frame, so neither concern survives.
-        let is i64 as pflags = lock.acquire_irq(&pmm_lock);
-
-        if (zone_has_budget(zone, flags, need) != cast(i32, 0)) {
-            // Find smallest sufficient order
-            let is i32 as so with mut = order;
-            let is i32 as fo with mut = cast(i32, 0 - 1);
-            while (so <= MAX_BLOCK_ORDER) {
-                if (fl_get(zone, so) != PFN_NONE) {
-                    fo = so;
-                    so = MAX_BLOCK_ORDER + cast(i32, 1);
-                }
-                so = so + cast(i32, 1);
+    if (has_budget(flags, need) != cast(i32, 0)) {
+        // Smallest order >= requested that has a block satisfying `below`.
+        let is i32 as fo with mut = cast(i32, 0 - 1);
+        let is i32 as pfn with mut = PFN_NONE;
+        let is i32 as so with mut = order;
+        while (so <= MAX_BLOCK_ORDER) {
+            let is i32 as cand = fl_find(so, below);
+            if (cand != PFN_NONE) {
+                fo = so;
+                pfn = cand;
+                so = MAX_BLOCK_ORDER + cast(i32, 1);
             }
-
-            if (fo >= cast(i32, 0)) {
-                let is *i32 as totals = cast(*i32, &zone_free_totals);
-                let is i32 as pfn = fl_get(zone, fo);
-                remove_free(zone, fo, pfn);
-
-                // Split
-                let is i32 as co with mut = fo;
-                while (co > order) {
-                    co = co - cast(i32, 1);
-                    let is i32 as upper = pfn + (cast(i32, 1) << co);
-                    mark_free(upper, co);
-                    insert_free(zone, co, upper);
-                }
-
-                mark_alloc(pfn, order, usage);
-                totals[cast(i64, zone)] = totals[cast(i64, zone)] - need;
-
-                lock.release_irq(&pmm_lock, pflags);
-
-                // Zero OUTSIDE lock (spec section 16.1)
-                if ((flags & ALLOC_ZERO) != cast(i32, 0)) {
-                    let is i64 as phys = pfn_to_phys(pfn);
-                    let is *u8 as ptr = cast(*u8, phys_to_virt(phys));
-                    let is i64 as zlen = cast(i64, need) << PAGE_SHIFT;
-                    let is i64 as zz with mut = 0;
-                    while (zz < zlen) {
-                        ptr[zz] = 0;
-                        zz = zz + 1;
-                    }
-                }
-
-                return pfn;
-            }
+            so = so + cast(i32, 1);
         }
 
-        lock.release_irq(&pmm_lock, pflags);
+        if (fo >= cast(i32, 0)) {
+            remove_free(fo, pfn);
 
-        // Bug #4 fix: DMA32 never falls back to NORMAL
-        if (zone == ZONE_DMA32) { return PFN_NONE; }
-        if ((flags & ALLOC_DMA32_ONLY) != cast(i32, 0)) { return PFN_NONE; }
-        if ((flags & ALLOC_ALLOW_FALLBACK) == cast(i32, 0)) { return PFN_NONE; }
-        // NORMAL -> fallback to DMA32
-        zone = ZONE_DMA32;
-        att = att + cast(i32, 1);
+            // Split down to the requested order. Sub-blocks stay below 4G
+            // if the parent was (blocks are order-aligned), so the served
+            // pfn keeps the below-4G guarantee.
+            let is i32 as co with mut = fo;
+            while (co > order) {
+                co = co - cast(i32, 1);
+                let is i32 as upper = pfn + (cast(i32, 1) << co);
+                mark_free(upper, co);
+                insert_free(co, upper);
+            }
+
+            mark_alloc(pfn, order, usage);
+            free_total = free_total - need;
+
+            lock.release_irq(&pmm_lock, pflags);
+
+            // Zero OUTSIDE lock (spec section 16.1)
+            if ((flags & ALLOC_ZERO) != cast(i32, 0)) {
+                let is i64 as phys = pfn_to_phys(pfn);
+                let is *u8 as ptr = cast(*u8, phys_to_virt(phys));
+                let is i64 as zlen = cast(i64, need) << PAGE_SHIFT;
+                let is i64 as zz with mut = 0;
+                while (zz < zlen) {
+                    ptr[zz] = 0;
+                    zz = zz + 1;
+                }
+            }
+
+            return pfn;
+        }
     }
 
+    // OOM (or no below-4G block of sufficient order): honest failure.
+    record_fail(order, flags);
+    lock.release_irq(&pmm_lock, pflags);
     return PFN_NONE;
 }
 
@@ -970,7 +961,7 @@ fn alloc_pages(zpref as i32, flags as i32, order as i32, usage as i32, owner as 
 // Free with merge
 // ============================================================
 
-fn merge_insert(zone as i32, pfn as i32, order as i32) as void {
+fn merge_insert(pfn as i32, order as i32) as void {
     let is i32 as cp with mut = pfn;
     let is i32 as co with mut = order;
     let is i32 as merging with mut = cast(i32, 1);
@@ -980,10 +971,10 @@ fn merge_insert(zone as i32, pfn as i32, order as i32) as void {
             merging = cast(i32, 0);
         } else {
             let is i32 as buddy = cp ^ (cast(i32, 1) << co);
-            if (can_merge(zone, buddy, co) == cast(i32, 0)) {
+            if (can_merge(buddy, co) == cast(i32, 0)) {
                 merging = cast(i32, 0);
             } else {
-                remove_free(zone, co, buddy);
+                remove_free(co, buddy);
                 if (buddy < cp) {
                     // Absorbed buddy is LOWER — head moves down
                     // Must rewrite all tails because head_pfn changed
@@ -1000,7 +991,7 @@ fn merge_insert(zone as i32, pfn as i32, order as i32) as void {
         }
     }
 
-    insert_free(zone, co, cp);
+    insert_free(co, cp);
 }
 
 fn free_pages(pfn as i32) as void {
@@ -1013,14 +1004,12 @@ fn free_pages(pfn as i32) as void {
     if (fm_head(m) == cast(i32, 0)) { panic("free: not head", 14); }
 
     let is i32 as order = fm_order(m);
-    let is i32 as zone = pfn_to_zone(pfn);
 
     let is i64 as pflags = lock.acquire_irq(&pmm_lock);
 
-    let is *i32 as totals = cast(*i32, &zone_free_totals);
     mark_free(pfn, order);
-    totals[cast(i64, zone)] = totals[cast(i64, zone)] + (cast(i32, 1) << order);
-    merge_insert(zone, pfn, order);
+    free_total = free_total + (cast(i32, 1) << order);
+    merge_insert(pfn, order);
 
     lock.release_irq(&pmm_lock, pflags);
 }
@@ -1035,16 +1024,15 @@ fn free_pages(pfn as i32) as void {
 fn buddy_selftest() as void {
     serial.println("pmm.selftest: buddy", 19);
 
-    let is *i32 as totals = cast(*i32, &zone_free_totals);
-    let is i64 as base_total = cast(i64, totals[0]) + cast(i64, totals[1]);
-    let is i32 as fl = ALLOC_ALLOW_FALLBACK;
+    let is i64 as base_total = cast(i64, free_total);
+    let is i32 as fl = cast(i32, 0);
 
     // 1. Allocate blocks of varied orders.
-    let is i32 as p0  = alloc_pages(ZONE_DMA32, fl, cast(i32, 0),  USAGE_KERNEL, cast(i32, 0));
-    let is i32 as p1  = alloc_pages(ZONE_DMA32, fl, cast(i32, 1),  USAGE_KERNEL, cast(i32, 0));
-    let is i32 as p2  = alloc_pages(ZONE_DMA32, fl, cast(i32, 2),  USAGE_KERNEL, cast(i32, 0));
-    let is i32 as p5  = alloc_pages(ZONE_DMA32, fl, cast(i32, 5),  USAGE_KERNEL, cast(i32, 0));
-    let is i32 as p10 = alloc_pages(ZONE_DMA32, fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
+    let is i32 as p0  = alloc_pages(fl, cast(i32, 0),  USAGE_KERNEL, cast(i32, 0));
+    let is i32 as p1  = alloc_pages(fl, cast(i32, 1),  USAGE_KERNEL, cast(i32, 0));
+    let is i32 as p2  = alloc_pages(fl, cast(i32, 2),  USAGE_KERNEL, cast(i32, 0));
+    let is i32 as p5  = alloc_pages(fl, cast(i32, 5),  USAGE_KERNEL, cast(i32, 0));
+    let is i32 as p10 = alloc_pages(fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
     if (p0  == PFN_NONE) { panic("selftest: alloc o0", 18); }
     if (p1  == PFN_NONE) { panic("selftest: alloc o1", 18); }
     if (p2  == PFN_NONE) { panic("selftest: alloc o2", 18); }
@@ -1065,20 +1053,20 @@ fn buddy_selftest() as void {
     free_pages(p10);
     free_pages(p2);
     free_pages(p0);
-    let is i64 as after_total = cast(i64, totals[0]) + cast(i64, totals[1]);
+    let is i64 as after_total = cast(i64, free_total);
     if (after_total != base_total) { panic("selftest: leak", 14); }
 
     // 4. Coalescing proof (deterministic): an order-10 block, once freed,
     //    is a coherent order-10 free block (it can't coalesce past the
     //    max order) sitting at the LIFO head, so re-allocating order 10
     //    returns the same pfn. A broken free/merge would not reproduce it.
-    let is i32 as g = alloc_pages(ZONE_DMA32, fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
+    let is i32 as g = alloc_pages(fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
     if (g == PFN_NONE) { panic("selftest: alloc g", 17); }
     free_pages(g);
     if (page_state(g) != PAGE_FREE)      { panic("selftest: g not free", 20); }
     if (page_order(g) != cast(i32, 10))  { panic("selftest: g order", 17); }
     if (page_is_head(g) == cast(i32, 0)) { panic("selftest: g head", 16); }
-    let is i32 as g2 = alloc_pages(ZONE_DMA32, fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
+    let is i32 as g2 = alloc_pages(fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
     if (g2 != g) { panic("selftest: g2!=g (coalesce)", 26); }
 
     // 5. Double-free / corruption detection, in isolation. We do NOT
@@ -1098,8 +1086,15 @@ fn buddy_selftest() as void {
     fn_set_magic(g2, FREE_MAGIC);
     if (freenode_ok(g2) == cast(i32, 0)) { panic("selftest: magic false-bad", 25); }
 
+    // 6. below-4G path: in 128MB every frame qualifies; confirm the flag
+    //    returns a frame under the limit (fl_find), then free it back.
+    let is i32 as b = alloc_pages(ALLOC_BELOW_4G | ALLOC_ZERO, cast(i32, 0), USAGE_KERNEL, cast(i32, 0));
+    if (b == PFN_NONE) { panic("selftest: below4g alloc", 23); }
+    if (b >= PFN_4G_LIMIT) { panic("selftest: below4g range", 23); }
+    free_pages(b);
+
     // Nothing left allocated; pool back to baseline.
-    let is i64 as final_total = cast(i64, totals[0]) + cast(i64, totals[1]);
+    let is i64 as final_total = cast(i64, free_total);
     if (final_total != base_total) { panic("selftest: final leak", 20); }
 
     // Footprint: frame_meta (2 B/page) vs the old 12-byte PageInfo.
@@ -1127,7 +1122,7 @@ fn buddy_selftest() as void {
 fn init() as void {
     // Init constants that can't use expressions in global scope
     PFN_NONE = cast(i32, 0 - 1);
-    ZONE_DMA32_END_PFN = cast(i32, 1048576);
+    PFN_4G_LIMIT = cast(i32, 1048576);   // 4 GiB >> 12
     // FreeNode magic (0xF2EE600D, "free good"). Set before seed_buddy
     // writes any free page's body via insert_free.
     FREE_MAGIC = cast(i32, 0xF2EE600D);
@@ -1149,25 +1144,16 @@ fn init() as void {
     seed_buddy();
     mb_freeze();
 
-    // Set zone reserves (1% of zone free pages, min 16 pages)
-    let is *i32 as totals = cast(*i32, &zone_free_totals);
-    let is *i32 as minres = cast(*i32, &zone_min_reserve);
-    let is *i32 as atomres = cast(*i32, &zone_atomic_reserve);
-
-    let is i32 as i with mut = 0;
-    while (i < NUM_ZONES) {
-        let is i32 as total = totals[cast(i64, i)];
-        let is i32 as res with mut = total >> cast(i32, 7);  // ~0.8%
-        if (res < cast(i32, 16)) {
-            res = cast(i32, 16);
-        }
-        if (res > total) {
-            res = cast(i32, 0);
-        }
-        minres[cast(i64, i)] = res;
-        atomres[cast(i64, i)] = res >> cast(i32, 2);  // 1/4 of min
-        i = i + cast(i32, 1);
+    // Reserves over the single free pool (~0.8%, min 16 pages).
+    let is i32 as res with mut = free_total >> cast(i32, 7);
+    if (res < cast(i32, 16)) {
+        res = cast(i32, 16);
     }
+    if (res > free_total) {
+        res = cast(i32, 0);
+    }
+    min_reserve = res;
+    atomic_reserve = res >> cast(i32, 2);  // 1/4 of min
 
     serial.println("pmm: ready", 10);
 }
