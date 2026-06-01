@@ -554,6 +554,55 @@ fn preempt_enable() as void {
     }
 }
 
+// ============================================================
+// TLB shootdown — invalidate stale TLB entries on the OTHER cpus after a
+// present page is unmapped, before the freed frame is reused. The initiator
+// (vma.decommit / vma.release through here) has already cleared the PTE +
+// invlpg'd locally; this makes the remote cpus catch up.
+// ============================================================
+
+// Serialises shooters so they share one ack counter cleanly. A PLAIN spinlock
+// (no IRQ disable): a shooter waiting for acks must keep IRQs enabled so it can
+// still service an incoming shootdown IPI from another shooter — that's what
+// breaks the mutual two-shooter deadlock. Preemption is disabled around the
+// critical section instead, so the holder isn't switched off mid-shootdown.
+let is lock.TicketLock as tlb_lock with mut;
+let is i64 as tlb_ack with mut = 0;
+
+// Called by the TLB-shootdown IPI handler (idt) on each target cpu AFTER it has
+// flushed its TLB. Atomic so the initiator's wait reads a consistent count.
+fn tlb_shootdown_ack() as void {
+    lock.atomic_add(&tlb_ack, 1);
+}
+
+// Flush the OTHER cpus' TLBs (this cpu already did its local invlpg). No-op on
+// a uniprocessor. Full-flush broadcast: reset the ack, send the IPI to all-
+// except-self, spin until every other cpu acks or a bounded deadline elapses (a
+// wedged cpu must not hang the unmapper). IRQs stay ENABLED while waiting so a
+// concurrent shooter's IPI is serviced (no deadlock); preemption is off so we
+// keep tlb_lock for the whole short window.
+fn tlb_shootdown_all() as void {
+    let is i64 as others = smp.cpu_count - 1;
+    if (others <= 0) { return; }
+    preempt_disable();
+    lock.acquire(&tlb_lock);
+    // Reset the ack counter before sending. A 64-bit aligned store is atomic on
+    // x86 and visible to the targets via cache coherency; it happens-before the
+    // IPI send (and the prior shooter already drained under tlb_lock), so the
+    // only writers after this point are the targets of the IPI we send next.
+    tlb_ack = 0;
+    lapic.send_tlb_shootdown_ipi_all_except_self();
+    let is i64 as deadline = timer.current_time_ns() + 100000000;   // 100 ms
+    let is i64 as done with mut = 0;
+    while (done == 0) {
+        if (lock.atomic_add(&tlb_ack, 0) >= others) { done = 1; }
+        else if (timer.current_time_ns() >= deadline) { done = 1; }
+        else { asm(".byte 0xF3, 0x90\n"); }   // pause
+    }
+    lock.release(&tlb_lock);
+    preempt_enable();
+}
+
 fn cond_resched() as void {
     if (smp.this_cpu_preempt_count() > 0) { return; }
     if (smp.this_cpu_in_irq_context() != 0) { return; }

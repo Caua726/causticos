@@ -140,7 +140,7 @@ fn aspace_destroy(a as *Aspace) as void {
     let is *Vma as v with mut = a.vma_head;
     while (cast(i64, v) != 0) {
         let is *Vma as next = v.next;
-        unmap_vma_pages(a.pml4_phys, v);
+        unmap_vma_pages(a.pml4_phys, v, cast(i32, 0));   // dying aspace: no remote TLB
         heap.kpool_free(vma_pool, cast(i64, v));
         v = next;
     }
@@ -280,17 +280,23 @@ fn back_anon_page(pml4 as i64, va as i64, prot as i64) as i32 {
 // Walk every page in [v.start, v.end), unmap from pml4, free the backing
 // physical page. Returns the number of anon (committed) pages freed — the
 // committed_bytes delta for the accounting in release_locked.
-fn unmap_vma_pages(pml4 as i64, v as *Vma) as i64 {
+fn unmap_vma_pages(pml4 as i64, v as *Vma, do_shootdown as i32) as i64 {
     // VMA_FILE pages are owned by the backing object (e.g. a surface's
     // backbuffer), not by the VMA — unmap only, never free, or we'd
     // double-free when the object's close op releases them. VMA_ANON
     // pages are the VMA's own, so they're freed here.
+    //
+    // do_shootdown: release (a live aspace) sets 1 so a stale TLB entry on
+    // another cpu is killed before the frame is freed. aspace_destroy sets 0 —
+    // the dying aspace is no cpu's active CR3 (the exiting thread's cpu already
+    // reloaded CR3 on switch), so no remote TLB holds its pages.
     let is i64 as is_file = v.flags & VMA_FILE;
     let is i64 as freed with mut = 0;
     let is i64 as p with mut = v.start;
     while (p < v.end) {
         let is i64 as old_phys = vmm.vmm_unmap_page(pml4, p);
         if (old_phys != 0 && is_file == 0) {
+            if (do_shootdown == cast(i32, 1)) { sched.tlb_shootdown_all(); }
             let is i32 as pfn = pmm.phys_to_pfn(old_phys);
             pmm.free_pages(pfn, cast(i32, 0));
             freed = freed + 1;
@@ -410,6 +416,12 @@ fn decommit_locked(a as *Aspace, vaddr as i64, len as i64) as void {
     while (p < end) {
         let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, p);
         if (old != 0) {
+            // The page was present, so other cpus may hold a stale TLB entry
+            // for it. Shoot it down (no-op on a uniprocessor) BEFORE freeing the
+            // frame, so the freed frame can't be reused while a stale entry
+            // still points at it. (Per-page today; a batched array + single
+            // shootdown is a future optimisation when large ranges appear.)
+            sched.tlb_shootdown_all();
             pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0));
             dropped = dropped + 1;
         }
@@ -428,7 +440,7 @@ fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
     while (cast(i64, cur) != 0) {
         let is *Vma as next with mut = cur.next;
         if (cur.start >= start && cur.end <= end) {
-            let is i64 as freed = unmap_vma_pages(a.pml4_phys, cur);
+            let is i64 as freed = unmap_vma_pages(a.pml4_phys, cur, cast(i32, 1));   // live aspace: shoot down
             a.committed_bytes = a.committed_bytes - freed * pmm.PAGE_SIZE;
             a.bookkeeping_bytes = a.bookkeeping_bytes - sizeof(Vma);
             vma_unlink(a, cur);

@@ -229,6 +229,17 @@ fn resched_ipi_handler() as void {
     lapic.eoi();
 }
 
+// TLB-shootdown IPI handler — called from vector 0x42 (66). The stub already
+// reloaded CR3 (flushing this cpu's non-global TLB) in pure asm BEFORE calling
+// us, so we only ack (the initiator counts acks) and EOI. The flush is inline
+// in the stub on purpose: vmm.flush_tlb_full routes through read_cr3's shared
+// global shuttle, which two cpus flushing at once would corrupt — a register-
+// only `mov rax,cr3; mov cr3,rax` has no shared state.
+fn tlb_shootdown_handler() as void {
+    sched.tlb_shootdown_ack();
+    lapic.eoi();
+}
+
 // LAPIC timer handler — called from vector 0x40 (64)
 fn lapic_timer_handler() as void {
     timer.on_lapic_tick();
@@ -460,6 +471,29 @@ fn install_stubs() as void {
     asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
     asm(".byte 0x48, 0xCF\n");    // iretq
 
+    // --- TLB-shootdown IPI stub (vector 0x42 = 66). Reload CR3 in registers
+    //     (flushes this cpu's non-global TLB) BEFORE the handler — register-
+    //     only, so no shared cr3 shuttle is touched — then ack + EOI. Same GPR
+    //     save/restore frame as the resched stub.
+    asm(".Ltlb_shootdown:\n");
+    asm("push r15\n"); asm("push r14\n"); asm("push r13\n"); asm("push r12\n");
+    asm("push r11\n"); asm("push r10\n"); asm("push r9\n");  asm("push r8\n");
+    asm("push rbp\n"); asm("push rdi\n"); asm("push rsi\n"); asm("push rdx\n");
+    asm("push rcx\n"); asm("push rbx\n"); asm("push rax\n");
+    asm(".byte 0x65, 0x48, 0xC7, 0x04, 0x25, 0x70, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00\n");    // mov QWORD PTR gs:[0x70], 1
+    asm(".byte 0x0F, 0x20, 0xD8\n");    // mov rax, cr3
+    asm(".byte 0x0F, 0x22, 0xD8\n");    // mov cr3, rax  (reload → flush non-global TLB)
+    asm("mov rbp, rsp\n");
+    asm("and rsp, -16\n");
+    asm("call _kernel_idt_cst_tlb_shootdown_handler\n");
+    asm("mov rsp, rbp\n");
+    asm(".byte 0x65, 0x48, 0xC7, 0x04, 0x25, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00\n");    // mov QWORD PTR gs:[0x70], 0
+    asm("pop rax\n"); asm("pop rbx\n"); asm("pop rcx\n"); asm("pop rdx\n");
+    asm("pop rsi\n"); asm("pop rdi\n"); asm("pop rbp\n");
+    asm("pop r8\n");  asm("pop r9\n");  asm("pop r10\n"); asm("pop r11\n");
+    asm("pop r12\n"); asm("pop r13\n"); asm("pop r14\n"); asm("pop r15\n");
+    asm(".byte 0x48, 0xCF\n");    // iretq
+
     // --- Driver IRQ stubs (vectors 48..63). Each stub is a tiny
     //     per-vector prologue: save the caller's rdi, load the vector
     //     number into rdi, and jump to the shared dispatch body.
@@ -580,6 +614,8 @@ fn install_stubs() as void {
     asm("lea rax, [rip+.Ldrvirq63]\n"); asm("mov QWORD PTR [rbx+408], rax\n");
     // Reschedule IPI stub at index 52 (offset 416) — vector 0x41.
     asm("lea rax, [rip+.Lresched_ipi]\n"); asm("mov QWORD PTR [rbx+416], rax\n");
+    // TLB-shootdown IPI stub at index 53 (offset 424) — vector 0x42.
+    asm("lea rax, [rip+.Ltlb_shootdown]\n"); asm("mov QWORD PTR [rbx+424], rax\n");
 }
 
 // ============================================================
@@ -611,6 +647,9 @@ fn init() as void {
 
     // Reschedule IPI -> vector 65 (0x41)
     set_gate(65, addrs[52], 0x08, 0, 0x8E);
+
+    // TLB-shootdown IPI -> vector 66 (0x42)
+    set_gate(66, addrs[53], 0x08, 0, 0x8E);
 
     // Driver IRQ vectors 48..63 — 16 slots for IOAPIC-routed device
     // interrupts (PS/2 kbd, AHCI, future NVMe/USB/etc). ioapic.cst
