@@ -312,6 +312,12 @@ fn bins_which(b as *Bins, size as i64) as i64 {
 }
 
 // --- Alloc: O(1) lookup + O(1) freelist pop (from bins.cst:262) ---
+// Self-locking. lookup_bin / bin_at read the immutable lookup table + the
+// stable BSS Bin[] (no lock needed); the slab freelist/bitmap mutation runs
+// under heap_lock. On a grow the lock is RELEASED across the slow chunk build
+// (2x pmm.alloc_pages + freelist/bitmap init) and re-acquired to link — so
+// that O(slots) work never runs with IRQs disabled and the global lock held
+// (mirrors the old kcache_alloc, which released around init_slab).
 fn bins_alloc(b as *Bins, size as i64) as *u8 {
     if (size <= 0) { return cast(*u8, 0); }
 
@@ -322,6 +328,7 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
 
     let is *Bin as bin = bin_at(b, idx);
 
+    hirq_save();
     // Search existing slabs for a free slot.
     let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
     while (cast(i64, slab) != 0) {
@@ -337,15 +344,20 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
             hdr[3] = cast(u8, (si >> 16) & 255);
             bit_clear(slab.bitmap, si);
             slab.used_slots = slab.used_slots + 1;
+            hirq_restore();
             return cast(*u8, cast(i64, slot) + HEADER_SIZE);
         }
         slab = cast(*Slab, slab.next);
     }
 
-    // No free slot — grow: create a new slab.
+    // No free slot — grow. Release the lock across the slow chunk build.
+    hirq_restore();
     let is *Slab as new_slab = bslab_create(bin.alloc_size, bin.page_size, idx);
     if (cast(i64, new_slab) == 0) { return cast(*u8, 0); }
-
+    hirq_save();
+    // bin.slab_head may have advanced while unlocked (a concurrent grower or
+    // an IRQ-context kmalloc). Link our chunk at the head and serve from it;
+    // any other new chunk stays usable for later allocs.
     new_slab.next = bin.slab_head;
     bin.slab_head = cast(*u8, new_slab);
 
@@ -359,12 +371,15 @@ fn bins_alloc(b as *Bins, size as i64) as *u8 {
     hdr[3] = 0;
     bit_clear(new_slab.bitmap, 0);
     new_slab.used_slots = 1;
+    hirq_restore();
     return cast(*u8, cast(i64, slot) + HEADER_SIZE);
 }
 
 // --- Free: O(1) header read + bitmap test + freelist push (bins.cst:329) ---
 // Fail-loud (kernel posture): the std silently returns on a bad/double
 // free; here we panic, matching the old slab path's verify_* panics.
+// Self-locking. Reads the 8-byte header (caller-owned block, no lock) then
+// mutates the slab freelist/bitmap under heap_lock.
 fn bins_free(b as *Bins, ptr as *u8) as void {
     if (cast(i64, ptr) == 0) { return; }
 
@@ -379,6 +394,7 @@ fn bins_free(b as *Bins, ptr as *u8) as void {
 
     let is *Bin as bin = bin_at(b, idx);
 
+    hirq_save();
     let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
     while (cast(i64, slab) != 0) {
         let is i64 as start = cast(i64, slab.region);
@@ -392,10 +408,12 @@ fn bins_free(b as *Bins, ptr as *u8) as void {
             let is *i64 as np = cast(*i64, slot);
             *np = cast(i64, slab.freelist);
             slab.freelist = slot;
+            hirq_restore();
             return;
         }
         slab = cast(*Slab, slab.next);
     }
+    hirq_restore();
     pmm.panic("kfree: ptr not in any slab", 26);
 }
 
@@ -433,8 +451,9 @@ fn large_find(vaddr as i64) as i64 {
     return 0 - 1;
 }
 
-// Insert keeping the table sorted ascending by vaddr.
+// Insert keeping the table sorted ascending by vaddr. Self-locking.
 fn large_insert(vaddr as i64, order as i64) as void {
+    hirq_save();
     if (large_count >= LARGE_CAP) {
         pmm.panic("large_extents table exhausted", 29);
     }
@@ -447,6 +466,7 @@ fn large_insert(vaddr as i64, order as i64) as void {
     }
     large_set(i, vaddr, order);
     large_count = large_count + 1;
+    hirq_restore();
 }
 
 // Remove the entry at idx (shift the tail down by one).
@@ -524,7 +544,10 @@ fn kpool_create_locked(obj_size as i64, debug as i64) as i64 {
     return p;
 }
 
-// Caller holds heap_lock. Allocates one slot (grows by a chunk if needed).
+// Lock held on entry & exit. On a grow it RELEASES the lock across the slow
+// chunk build (bslab_create) and re-acquires to link — so that work never
+// runs IRQ-off under the global lock. The release/re-acquire keeps the
+// gs:[0x80]/heap_load_shuttle invariant (hirq_restore only by the holder).
 fn kpool_alloc_locked(kp as *KPool) as i64 {
     let is *Slab as slab with mut = cast(*Slab, kp.chunk_head);
     while (cast(i64, slab) != 0) {
@@ -542,10 +565,12 @@ fn kpool_alloc_locked(kp as *KPool) as i64 {
         }
         slab = cast(*Slab, slab.next);
     }
-    // Grow: new chunk (alloc_size == slot_size, no header).
+    // Grow: new chunk (alloc_size == slot_size, no header). Build it unlocked.
+    hirq_restore();
     let is *Slab as nc = bslab_create(kp.slot_size, kp.chunk_bytes, 0);
+    hirq_save();
     if (cast(i64, nc) == 0) { return 0; }
-    nc.next = kp.chunk_head;
+    nc.next = kp.chunk_head;            // re-read head (may have advanced)
     kp.chunk_head = cast(*u8, nc);
     let is *u8 as slot = nc.freelist;
     let is *i64 as np = cast(*i64, slot);
@@ -636,18 +661,12 @@ fn kmalloc(size as i64, flags as i32) as i64 {
         let is i32 as pfn = pmm.alloc_pages(flags, order, pmm.USAGE_KERNEL, cast(i32, 0));
         if (pfn == pmm.PFN_NONE) { return 0; }
         let is i64 as ptr = pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
-        hirq_save();
-        large_insert(ptr, cast(i64, order));
-        hirq_restore();
+        large_insert(ptr, cast(i64, order));   // self-locking (may grow the table)
         return ptr;
     }
 
-    // Small: bins. heap_lock serializes kbins/slab freelist mutation;
-    // bins_alloc may call pmm.alloc_pages on a new-slab miss (heap nests
-    // OUTSIDE pmm, so holding heap_lock across it is the correct order).
-    hirq_save();
+    // Small: bins (self-locking; releases the lock across any slab grow).
     let is i64 as ptr = cast(i64, bins_alloc(&kbins, size));
-    hirq_restore();
     if (ptr == 0) { return 0; }
 
     // ALLOC_ZERO contract: bins does NOT re-zero reused slots, so zero the
@@ -669,28 +688,20 @@ fn kfree(ptr as i64) as void {
     // non-page-aligned ptr is definitely a bins block. A page-aligned ptr
     // MIGHT be large OR a bins slot that happens to be page-aligned — the
     // large_extents membership test is authoritative; a miss falls through
-    // to bins_free.
-    let is i32 as do_free_pfn with mut = cast(i32, 0);
-    let is i32 as pfn with mut = cast(i32, 0);
-
-    hirq_save();
-    let is i64 as lidx with mut = 0 - 1;
+    // to bins_free. Hold heap_lock only for the (allocation-free) table probe;
+    // bins_free is self-locking and pmm.free_pages has its own lock.
     if ((ptr & 0xFFF) == 0) {
-        lidx = large_find(ptr);
+        hirq_save();
+        let is i64 as lidx = large_find(ptr);
+        if (lidx >= 0) {
+            large_remove_at(lidx);
+            hirq_restore();
+            pmm.free_pages(virt_to_pfn(ptr));
+            return;
+        }
+        hirq_restore();
     }
-    if (lidx >= 0) {
-        large_remove_at(lidx);
-        pfn = virt_to_pfn(ptr);
-        do_free_pfn = cast(i32, 1);
-    } else {
-        bins_free(&kbins, cast(*u8, ptr));
-    }
-    hirq_restore();
-
-    // Deferred outside heap_lock (pmm has its own lock).
-    if (do_free_pfn != cast(i32, 0)) {
-        pmm.free_pages(pfn);
-    }
+    bins_free(&kbins, cast(*u8, ptr));
 }
 
 // ============================================================
