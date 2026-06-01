@@ -28,18 +28,24 @@ use "abi.cst" as abi;
 use "lock.cst" as lock;
 use "serial.cst" as serial;
 
-// All scalars i64 (Caustic mixed-width rule).
+// All scalars i64 (Caustic mixed-width rule). Two backings: a contiguous buddy
+// block (frames/pfn/order; best for <=4 MiB and DMA) or a NON-contiguous
+// page-list (pages_ptr -> i64[npages] of pfns; for >4 MiB or sparse). pages_ptr
+// == 0 means the contiguous backing is in use.
 struct SegPriv {
-    frames   as i64;    // contiguous physical base
-    npages   as i64;
-    refcount as i64;    // # of KObjects sharing this SegPriv (atomic)
-    flags    as i64;    // SEG_OWNED | SEG_FOREIGN
-    pfn      as i64;    // head pfn (for free_pages)
-    order    as i64;    // buddy order (for free_pages)
+    frames    as i64;    // contiguous physical base (0 if page-list)
+    npages    as i64;
+    refcount  as i64;    // # of KObjects sharing this SegPriv (atomic)
+    flags     as i64;    // SEG_OWNED | SEG_FOREIGN | SEG_PAGELIST
+    pfn       as i64;    // head pfn (contiguous; 0 if page-list)
+    order     as i64;    // buddy order (contiguous; for free_pages)
+    pages_ptr as i64;    // *i64 array of npages pfns (page-list; 0 if contiguous)
 }
 
-let is i64 as SEG_OWNED   = 1;    // frames are ours; free on the last detach
-let is i64 as SEG_FOREIGN = 2;    // frames belong elsewhere (e.g. a surface); never free
+let is i64 as SEG_OWNED    = 1;   // frames are ours; free on the last detach
+let is i64 as SEG_FOREIGN  = 2;   // frames belong elsewhere (e.g. a surface); never free
+let is i64 as SEG_PAGELIST = 4;   // force the non-contiguous page-list backing
+let is i64 as SEG_MAX_CONTIG = 1024;   // pages that fit a single 4 MiB buddy block
 
 let is kobject.KObjectOps as SEGMENT_OPS with mut;
 
@@ -50,28 +56,71 @@ fn init() as void {
     // RAM, not a stream. ko_read/ko_write on a segment fd return E_BADF.
 }
 
-// seg_create: allocate `npages` of contiguous zeroed RAM and wrap it in a
-// KOBJ_SEGMENT. Returns the *KObject as i64, or 0 on OOM.
+// seg_create: allocate `npages` of zeroed RAM and wrap it in a KOBJ_SEGMENT.
+// Small (<=4 MiB) and not SEG_PAGELIST-forced → one contiguous buddy block;
+// larger or forced → a non-contiguous page-list of order-0 frames. Returns the
+// *KObject as i64, or 0 on OOM (with everything rolled back).
 fn seg_create(npages as i64, flags as i64) as i64 {
     if (npages <= 0) { return 0; }
-    let is i32 as order = vmm.ceil_log2(npages);
-    let is i32 as pfn = pmm.alloc_pages(pmm.ALLOC_ZERO, order, pmm.USAGE_KERNEL, cast(i32, 0));
-    if (pfn == pmm.PFN_NONE) { return 0; }
-    let is i64 as phys = pmm.pfn_to_phys(pfn);
+
+    let is i64 as want_pagelist with mut = 0;
+    if ((flags & SEG_PAGELIST) != 0) { want_pagelist = 1; }
+    if (npages > SEG_MAX_CONTIG) { want_pagelist = 1; }
 
     let is i64 as addr = heap.kmalloc(sizeof(SegPriv), pmm.ALLOC_ZERO);
-    if (addr == 0) { pmm.free_pages(pfn, order); return 0; }
+    if (addr == 0) { return 0; }
     let is *SegPriv as s = cast(*SegPriv, addr);
-    s.frames = phys;
     s.npages = npages;
     s.refcount = 1;
     s.flags = flags | SEG_OWNED;     // seg_create always owns its frames
-    s.pfn = cast(i64, pfn);
-    s.order = cast(i64, order);
+
+    if (want_pagelist == 0) {
+        // Contiguous buddy block.
+        let is i32 as order = vmm.ceil_log2(npages);
+        let is i32 as pfn = pmm.alloc_pages(pmm.ALLOC_ZERO, order, pmm.USAGE_KERNEL, cast(i32, 0));
+        if (pfn == pmm.PFN_NONE) { heap.kfree(addr); return 0; }
+        s.frames = pmm.pfn_to_phys(pfn);
+        s.pfn = cast(i64, pfn);
+        s.order = cast(i64, order);
+        s.pages_ptr = 0;
+    } else {
+        // Non-contiguous page-list: an i64[npages] of order-0 pfns.
+        let is i64 as arr = heap.kmalloc(npages * 8, cast(i32, 0));
+        if (arr == 0) { heap.kfree(addr); return 0; }
+        let is *i64 as parr = cast(*i64, arr);
+        let is i64 as i with mut = 0;
+        while (i < npages) {
+            let is i32 as p = pmm.alloc_pages(pmm.ALLOC_ZERO, cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0));
+            if (p == pmm.PFN_NONE) {
+                let is i64 as j with mut = 0;
+                while (j < i) { pmm.free_pages(cast(i32, parr[j]), cast(i32, 0)); j = j + 1; }
+                heap.kfree(arr); heap.kfree(addr);
+                return 0;
+            }
+            parr[i] = cast(i64, p);
+            i = i + 1;
+        }
+        s.frames = 0; s.pfn = 0; s.order = 0;
+        s.flags = s.flags | SEG_PAGELIST;
+        s.pages_ptr = arr;
+    }
 
     let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_SEGMENT, &SEGMENT_OPS, addr);
-    if (ko == 0) { pmm.free_pages(pfn, order); heap.kfree(addr); return 0; }
+    if (ko == 0) { seg_free_frames(s); heap.kfree(addr); return 0; }
     return ko;
+}
+
+// Free a SegPriv's backing frames (not the SegPriv struct). SEG_OWNED only.
+fn seg_free_frames(s as *SegPriv) as void {
+    if ((s.flags & SEG_OWNED) == 0) { return; }
+    if (s.pages_ptr != 0) {
+        let is *i64 as parr = cast(*i64, s.pages_ptr);
+        let is i64 as i with mut = 0;
+        while (i < s.npages) { pmm.free_pages(cast(i32, parr[i]), cast(i32, 0)); i = i + 1; }
+        heap.kfree(s.pages_ptr);
+    } else {
+        pmm.free_pages(cast(i32, s.pfn), cast(i32, s.order));
+    }
 }
 
 // seg_attach (mmap slot): map the segment's frames into `aspace` as a VMA_FILE
@@ -81,7 +130,12 @@ fn seg_attach(priv as i64, aspace as i64, hint as i64, prot as i64) as i64 {
     if (priv == 0) { return abi.E_BADF; }
     if (aspace == 0) { return abi.E_INVAL; }
     let is *SegPriv as s = cast(*SegPriv, priv);
-    let is i64 as va = vma.mmap_phys(cast(*vma.Aspace, aspace), s.frames, s.npages, prot, priv);
+    let is i64 as va with mut = 0;
+    if (s.pages_ptr != 0) {
+        va = vma.mmap_pages(cast(*vma.Aspace, aspace), s.pages_ptr, s.npages, prot, priv);
+    } else {
+        va = vma.mmap_phys(cast(*vma.Aspace, aspace), s.frames, s.npages, prot, priv);
+    }
     if (va < 0) { return abi.E_NOMEM; }
     return va;
 }
@@ -100,9 +154,7 @@ fn seg_detach(priv as i64) as i64 {
         return abi.E_INVAL;
     }
     if (old > 1) { return abi.E_OK; }        // other KObjects still share it
-    if ((s.flags & SEG_OWNED) != 0) {
-        pmm.free_pages(cast(i32, s.pfn), cast(i32, s.order));
-    }
+    seg_free_frames(s);                      // contiguous block OR page-list (SEG_OWNED only)
     heap.kfree(priv);
     return abi.E_OK;
 }
@@ -197,6 +249,42 @@ fn smoke() as void {
     // returns to PAGE_FREE — freed exactly once.
     vma.aspace_destroy(ac);
     if (pmm.page_state(seg_pfn) != pmm.PAGE_FREE) { ok = cast(i32, 0); }
+
+    // Page-list (non-contiguous) segment: create with SEG_PAGELIST, attach, and
+    // write+read a sentinel in EACH page (proving every frame in the list is
+    // mapped), then drop the last ref so all the page-list frames free.
+    let is i64 as plko = seg_create(4, SEG_PAGELIST);
+    if (plko == 0) { ok = cast(i32, 0); }
+    else {
+        let is *kobject.KObject as plk = cast(*kobject.KObject, plko);
+        let is *SegPriv as pls = cast(*SegPriv, plk.priv);
+        if ((pls.flags & SEG_PAGELIST) == 0) { ok = cast(i32, 0); }   // page-list backing chosen
+        if (pls.pages_ptr == 0) { ok = cast(i32, 0); }
+        let is *i64 as plpfns = cast(*i64, pls.pages_ptr);
+        let is i32 as pl_pfn0 = cast(i32, plpfns[0]);
+        let is *vma.Aspace as a3 = vma.aspace_create();
+        if (cast(i64, a3) == 0) { ok = cast(i32, 0); }
+        else {
+            let is i64 as plva = seg_attach(plk.priv, cast(i64, a3), 0, pr);
+            if (plva < 0) { ok = cast(i32, 0); }
+            else {
+                let is i64 as pg with mut = 0;
+                while (pg < 4) {
+                    let is i64 as ph = vmm.virt_to_phys_walk(a3.pml4_phys, plva + pg * 4096);
+                    if (ph == 0) { ok = cast(i32, 0); }
+                    else {
+                        let is *i64 as pp = cast(*i64, pmm.phys_to_virt(ph));
+                        pp[0] = cast(i64, 0xBEEF) + pg;
+                        if (pp[0] != cast(i64, 0xBEEF) + pg) { ok = cast(i32, 0); }
+                    }
+                    pg = pg + 1;
+                }
+            }
+            vma.aspace_destroy(a3);                 // VMA_FILE: unmap, never free
+        }
+        kobject.ko_unref(plko);                     // last ref -> frees the page-list frames
+        if (pmm.page_state(pl_pfn0) != pmm.PAGE_FREE) { ok = cast(i32, 0); }
+    }
 
     if (ok == cast(i32, 1)) { serial.println("segment_smoke: PASS", 19); }
     else { pmm.panic("segment_smoke FAIL", 18); }
