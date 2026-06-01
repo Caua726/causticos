@@ -84,6 +84,15 @@ struct Aspace {
     // Dynamic-resize for >FD_TABLE_CAP comes later.
     fd_count as i64;
     fd_entries as [64]i64;
+    // Accounting (Phase E), NOT a quota. committed_bytes = anon RAM backed;
+    // bookkeeping_bytes = VMAs * sizeof(Vma) (lives in the kernel but charged
+    // to the process); budget = self-imposed ceiling (0 = unlimited until a
+    // parent grants one at spawn, Phase G). commit/reserve pre-check against
+    // budget AND the real pmm free count. Appended last — existing offsets
+    // unchanged. Zeroed by aspace_create's ALLOC_ZERO.
+    committed_bytes as i64;
+    bookkeeping_bytes as i64;
+    budget as i64;
 }
 
 fn lk_ptr(a as *Aspace) as *lock.TicketLock {
@@ -268,23 +277,27 @@ fn back_anon_page(pml4 as i64, va as i64, prot as i64) as i32 {
     return 0;
 }
 
-// Walk every page in [v.start, v.end), unmap from pml4, free the
-// backing physical page.
-fn unmap_vma_pages(pml4 as i64, v as *Vma) as void {
+// Walk every page in [v.start, v.end), unmap from pml4, free the backing
+// physical page. Returns the number of anon (committed) pages freed — the
+// committed_bytes delta for the accounting in release_locked.
+fn unmap_vma_pages(pml4 as i64, v as *Vma) as i64 {
     // VMA_FILE pages are owned by the backing object (e.g. a surface's
     // backbuffer), not by the VMA — unmap only, never free, or we'd
     // double-free when the object's close op releases them. VMA_ANON
     // pages are the VMA's own, so they're freed here.
     let is i64 as is_file = v.flags & VMA_FILE;
+    let is i64 as freed with mut = 0;
     let is i64 as p with mut = v.start;
     while (p < v.end) {
         let is i64 as old_phys = vmm.vmm_unmap_page(pml4, p);
         if (old_phys != 0 && is_file == 0) {
             let is i32 as pfn = pmm.phys_to_pfn(old_phys);
             pmm.free_pages(pfn, cast(i32, 0));
+            freed = freed + 1;
         }
         p = p + pmm.PAGE_SIZE;
     }
+    return freed;
 }
 
 // ============================================================
@@ -316,9 +329,17 @@ fn reserve_locked(a as *Aspace, va_hint as i64, len as i64,
         start = picked;
     }
 
+    // Budget pre-check: the new VMA's bookkeeping must fit (0 = unlimited).
+    if (a.budget != 0) {
+        if (a.committed_bytes + a.bookkeeping_bytes + sizeof(Vma) > a.budget) {
+            return cast(i64, 0 - 1);
+        }
+    }
+
     let is *Vma as v = vma_alloc(start, start + size, prot, flags | VMA_ANON);
     if (cast(i64, v) == 0) { return cast(i64, 0 - 1); }
     vma_insert_sorted(a, v);
+    a.bookkeeping_bytes = a.bookkeeping_bytes + sizeof(Vma);
     return start;
 }
 
@@ -333,12 +354,28 @@ fn commit_locked(a as *Aspace, vaddr as i64, len as i64, prot as i64) as i32 {
     let is i64 as start = page_align_down(vaddr);
     let is i64 as end = page_align_up(vaddr + len);
 
-    // Coverage: every page must be inside a reserved VMA.
+    // Coverage check + count the absent pages this call would back. Every page
+    // must be inside a reserved VMA (else E_INVAL).
+    let is i64 as absent with mut = 0;
     let is i64 as c with mut = start;
     while (c < end) {
         if (cast(i64, vma_find(a, c)) == 0) { return cast(i32, abi.E_INVAL); }
+        if (vmm.pte_lookup(a.pml4_phys, c) == 0) { absent = absent + 1; }
         c = c + pmm.PAGE_SIZE;
     }
+    if (absent == 0) { return 0; }   // fully committed already (idempotent)
+    let is i64 as need_bytes = absent * pmm.PAGE_SIZE;
+
+    // PRE-CHECK before touching anything → honest E_NOMEM with no rollback on
+    // the normal path. Budget (if set) AND the real physical free count. The
+    // pmm.free_total read races other allocators, but it's only a fast reject;
+    // back_anon_page under pmm_lock is the authority and rolls back on failure.
+    if (a.budget != 0) {
+        if (a.committed_bytes + a.bookkeeping_bytes + need_bytes > a.budget) {
+            return cast(i32, abi.E_NOMEM);
+        }
+    }
+    if (cast(i64, pmm.free_total) < absent) { return cast(i32, abi.E_NOMEM); }
 
     let is i64 as p with mut = start;
     while (p < end) {
@@ -356,6 +393,7 @@ fn commit_locked(a as *Aspace, vaddr as i64, len as i64, prot as i64) as i32 {
         }
         p = p + pmm.PAGE_SIZE;
     }
+    a.committed_bytes = a.committed_bytes + need_bytes;
     return 0;
 }
 
@@ -367,12 +405,17 @@ fn commit_locked(a as *Aspace, vaddr as i64, len as i64, prot as i64) as i32 {
 fn decommit_locked(a as *Aspace, vaddr as i64, len as i64) as void {
     let is i64 as start = page_align_down(vaddr);
     let is i64 as end = page_align_up(vaddr + len);
+    let is i64 as dropped with mut = 0;
     let is i64 as p with mut = start;
     while (p < end) {
         let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, p);
-        if (old != 0) { pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0)); }
+        if (old != 0) {
+            pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0));
+            dropped = dropped + 1;
+        }
         p = p + pmm.PAGE_SIZE;
     }
+    a.committed_bytes = a.committed_bytes - dropped * pmm.PAGE_SIZE;
 }
 
 // release_locked: remove every VMA whose range falls fully inside [start, end)
@@ -385,7 +428,9 @@ fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
     while (cast(i64, cur) != 0) {
         let is *Vma as next with mut = cur.next;
         if (cur.start >= start && cur.end <= end) {
-            unmap_vma_pages(a.pml4_phys, cur);
+            let is i64 as freed = unmap_vma_pages(a.pml4_phys, cur);
+            a.committed_bytes = a.committed_bytes - freed * pmm.PAGE_SIZE;
+            a.bookkeeping_bytes = a.bookkeeping_bytes - sizeof(Vma);
             vma_unlink(a, cur);
             heap.kpool_free(vma_pool, cast(i64, cur));
             removed_any = 1;
