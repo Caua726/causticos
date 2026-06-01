@@ -37,6 +37,8 @@ struct Channel {
     b2a_count as i64;
     a_closed as i64;
     b_closed as i64;
+    to_a_pending as i64;    // a KObject sent by B, awaiting A's recv (0 = none)
+    to_b_pending as i64;    // a KObject sent by A, awaiting B's recv (0 = none)
     lk as lock.TicketLock;
     a2b_buf as [1024]u8;    // A → B
     b2a_buf as [1024]u8;    // B → A
@@ -162,6 +164,39 @@ fn chan_write(priv as i64, buf as i64, n as i64) as i64 {
 // Close one endpoint. Marks its side closed (so the peer sees EOF/E_PIPE),
 // drops the channel's endpoint refcount, frees the Channel when the last
 // endpoint goes, and frees the endpoint struct.
+// chan_send_ko / chan_recv_ko — out-of-band KObject (fd) passing over a channel,
+// the SCM_RIGHTS analogue. send from side X parks one ALREADY-REF'd KObject in
+// the slot the OTHER side reads; recv takes it. One slot per direction (v0): a
+// second send before the peer recvs is E_AGAIN. The kernel only moves a
+// reference the sender holds — authority transfer, not fabrication.
+fn chan_send_ko(priv as i64, ko as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as fl = lock.acquire_irq(&ch.lk);
+    let is i64 as rc with mut = abi.E_OK;
+    if (ep.side == 0) {
+        if (ch.to_b_pending != 0) { rc = abi.E_AGAIN; } else { ch.to_b_pending = ko; }
+    } else {
+        if (ch.to_a_pending != 0) { rc = abi.E_AGAIN; } else { ch.to_a_pending = ko; }
+    }
+    lock.release_irq(&ch.lk, fl);
+    return rc;
+}
+
+// Returns the pending *KObject for this side (ref already held), or 0 if none.
+fn chan_recv_ko(priv as i64) as i64 {
+    if (priv == 0) { return 0; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as fl = lock.acquire_irq(&ch.lk);
+    let is i64 as ko with mut = 0;
+    if (ep.side == 0) { ko = ch.to_a_pending; ch.to_a_pending = 0; }
+    else             { ko = ch.to_b_pending; ch.to_b_pending = 0; }
+    lock.release_irq(&ch.lk, fl);
+    return ko;
+}
+
 fn chan_close(priv as i64) as i64 {
     if (priv == 0) { return abi.E_BADF; }
     let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
@@ -170,7 +205,13 @@ fn chan_close(priv as i64) as i64 {
     if (ep.side == 0) { ch.a_closed = 1; } else { ch.b_closed = 1; }
     lock.release_irq(&ch.lk, fl);
     let is i64 as old = lock.atomic_add(&ch.refcount, cast(i64, 0 - 1));
-    if (old == 1) { heap.kfree(cast(i64, ch)); }   // last endpoint
+    if (old == 1) {
+        // Last endpoint: drop any never-received in-flight references so they
+        // don't leak (the peer that would have recv'd them is gone).
+        if (ch.to_a_pending != 0) { kobject.ko_unref(ch.to_a_pending); }
+        if (ch.to_b_pending != 0) { kobject.ko_unref(ch.to_b_pending); }
+        heap.kfree(cast(i64, ch));
+    }
     heap.kfree(priv);
     return abi.E_OK;
 }
@@ -254,4 +295,41 @@ fn smoke() as void {
         util.print_num(red);
         serial.println("", 0);
     }
+}
+
+// fd_pass_smoke — out-of-band KObject passing over a channel. Use a SECOND
+// channel's endpoint as the object to pass (any KObject works), so this needs
+// no segment dependency: send endpoint b2 over channel-1 from side A, recv it on
+// side B, and confirm the SAME KObject is delivered, a second recv is empty, and
+// the refcounts unwind with no leak. Mirrors what sys_fd_send/recv do.
+fn fd_pass_smoke() as void {
+    serial.println("chan_fdpass_smoke: start", 24);
+    let is i32 as ok with mut = cast(i32, 1);
+
+    let is i64 as a1 with mut = 0;
+    let is i64 as b1 with mut = 0;
+    let is i64 as a2 with mut = 0;
+    let is i64 as b2 with mut = 0;
+    if (channel_create(&a1, &b1) != cast(i32, 0)) { pmm.panic("fdpass: chan1 FAIL", 18); }
+    if (channel_create(&a2, &b2) != cast(i32, 0)) { pmm.panic("fdpass: chan2 FAIL", 18); }
+
+    // Send b2 over channel-1 from side A (a1); the kernel would ko_ref first.
+    kobject.ko_ref(b2);
+    if (chan_send_ko(kobject.ko_priv(a1), b2) != abi.E_OK) { ok = cast(i32, 0); }
+    // A second send before recv is E_AGAIN (one slot per direction).
+    if (chan_send_ko(kobject.ko_priv(a1), b2) != abi.E_AGAIN) { ok = cast(i32, 0); }
+
+    // Recv on side B (b1) -> the same KObject.
+    let is i64 as got = chan_recv_ko(kobject.ko_priv(b1));
+    if (got != b2) { ok = cast(i32, 0); }
+    if (chan_recv_ko(kobject.ko_priv(b1)) != 0) { ok = cast(i32, 0); }   // nothing more
+    kobject.ko_unref(got);                                               // recv side drops its ref
+
+    kobject.ko_unref(a1);
+    kobject.ko_unref(b1);
+    kobject.ko_unref(a2);
+    kobject.ko_unref(b2);
+
+    if (ok == cast(i32, 1)) { serial.println("chan_fdpass_smoke: PASS", 23); }
+    else { pmm.panic("chan_fdpass_smoke FAIL", 22); }
 }
