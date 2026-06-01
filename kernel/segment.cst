@@ -1,0 +1,203 @@
+// segment.cst — KOBJ_SEGMENT: a shareable block of anonymous RAM behind an fd.
+//
+// Generalises the "memory object mapped by fd" pattern the surface already
+// implements into an honest, generic key. Its vtable fills mmap (attach) +
+// close (detach) and NOTHING else — no read/write/lseek: a segment is
+// random-access RAM, not a byte stream, so "memory as a file" is inexpressible
+// by construction (the no-ioctl, honest-ops rule from docs/architecture.md §1).
+//
+// Two reference counters, mirroring the channel (docs/architecture.md §5):
+//   KObject.refcount  — number of fds naming a given KObject (ko_ref/ko_unref;
+//                       fdacts bumps it at spawn). ->0 runs close = seg_detach.
+//   SegPriv.refcount  — number of KObjects sharing one SegPriv (seg_clone bumps
+//                       it). ->0 frees the frames. The common share-via-spawn
+//                       case is ONE KObject ref'd to two fds: SegPriv.refcount=1.
+//
+// Frames are a single physically-contiguous block (v0, mirrors the surface's
+// backbuffer); a page-list refinement comes if a non-contiguous segment is ever
+// needed. mmap_phys lays them into an aspace as a VMA_FILE region (the segment
+// owns the pages; the VMA only maps them — teardown unmaps without freeing, so
+// two aspaces can attach the SAME frames = shared memory).
+
+use "kobject.cst" as kobject;
+use "vmm.cst" as vmm;
+use "pmm.cst" as pmm;
+use "vma.cst" as vma;
+use "heap.cst" as heap;
+use "abi.cst" as abi;
+use "lock.cst" as lock;
+use "serial.cst" as serial;
+
+// All scalars i64 (Caustic mixed-width rule).
+struct SegPriv {
+    frames   as i64;    // contiguous physical base
+    npages   as i64;
+    refcount as i64;    // # of KObjects sharing this SegPriv (atomic)
+    flags    as i64;    // SEG_OWNED | SEG_FOREIGN
+    pfn      as i64;    // head pfn (for free_pages)
+    order    as i64;    // buddy order (for free_pages)
+}
+
+let is i64 as SEG_OWNED   = 1;    // frames are ours; free on the last detach
+let is i64 as SEG_FOREIGN = 2;    // frames belong elsewhere (e.g. a surface); never free
+
+let is kobject.KObjectOps as SEGMENT_OPS with mut;
+
+fn init() as void {
+    SEGMENT_OPS.mmap  = fn_ptr(seg_attach);
+    SEGMENT_OPS.close = fn_ptr(seg_detach);
+    // read/write/lseek/readdir/present stay NULL — a segment is random-access
+    // RAM, not a stream. ko_read/ko_write on a segment fd return E_BADF.
+}
+
+// seg_create: allocate `npages` of contiguous zeroed RAM and wrap it in a
+// KOBJ_SEGMENT. Returns the *KObject as i64, or 0 on OOM.
+fn seg_create(npages as i64, flags as i64) as i64 {
+    if (npages <= 0) { return 0; }
+    let is i32 as order = vmm.ceil_log2(npages);
+    let is i32 as pfn = pmm.alloc_pages(pmm.ALLOC_ZERO, order, pmm.USAGE_KERNEL, cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    let is i64 as phys = pmm.pfn_to_phys(pfn);
+
+    let is i64 as addr = heap.kmalloc(sizeof(SegPriv), pmm.ALLOC_ZERO);
+    if (addr == 0) { pmm.free_pages(pfn, order); return 0; }
+    let is *SegPriv as s = cast(*SegPriv, addr);
+    s.frames = phys;
+    s.npages = npages;
+    s.refcount = 1;
+    s.flags = flags | SEG_OWNED;     // seg_create always owns its frames
+    s.pfn = cast(i64, pfn);
+    s.order = cast(i64, order);
+
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_SEGMENT, &SEGMENT_OPS, addr);
+    if (ko == 0) { pmm.free_pages(pfn, order); heap.kfree(addr); return 0; }
+    return ko;
+}
+
+// seg_attach (mmap slot): map the segment's frames into `aspace` as a VMA_FILE
+// region (unmap-never-free). Two aspaces attaching = the same frames in two
+// PML4s = shared memory. priv = the SegPriv, recorded as the VMA's owner.
+fn seg_attach(priv as i64, aspace as i64, hint as i64, prot as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    if (aspace == 0) { return abi.E_INVAL; }
+    let is *SegPriv as s = cast(*SegPriv, priv);
+    let is i64 as va = vma.mmap_phys(cast(*vma.Aspace, aspace), s.frames, s.npages, prot, priv);
+    if (va < 0) { return abi.E_NOMEM; }
+    return va;
+}
+
+// seg_detach (close slot): called by ko_unref when a KObject's refcount hits 0
+// (its last fd closed). Drop one KObject reference to the shared SegPriv; on the
+// last one, free the frames (if owned) and the SegPriv. The aspaces that mapped
+// it had those VMAs torn down as VMA_FILE (unmap-never-free), so the frames only
+// disappear here.
+fn seg_detach(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *SegPriv as s = cast(*SegPriv, priv);
+    let is i64 as old = lock.atomic_add(&s.refcount, cast(i64, 0 - 1));
+    if (old <= 0) {
+        lock.atomic_add(&s.refcount, 1);     // double-detach guard
+        return abi.E_INVAL;
+    }
+    if (old > 1) { return abi.E_OK; }        // other KObjects still share it
+    if ((s.flags & SEG_OWNED) != 0) {
+        pmm.free_pages(cast(i32, s.pfn), cast(i32, s.order));
+    }
+    heap.kfree(priv);
+    return abi.E_OK;
+}
+
+// seg_clone: a second KObject for the same SegPriv (independent fd lifetime,
+// shared frames). Bumps SegPriv.refcount. Returns the new *KObject as i64, or 0.
+fn seg_clone(ko as i64) as i64 {
+    if (ko == 0) { return 0; }
+    let is *kobject.KObject as k = cast(*kobject.KObject, ko);
+    if (k.otype != kobject.KOBJ_SEGMENT) { return 0; }
+    let is i64 as priv = k.priv;
+    let is *SegPriv as s = cast(*SegPriv, priv);
+    lock.atomic_add(&s.refcount, 1);
+    let is i64 as ko2 = kobject.ko_alloc(kobject.KOBJ_SEGMENT, &SEGMENT_OPS, priv);
+    if (ko2 == 0) { lock.atomic_add(&s.refcount, cast(i64, 0 - 1)); return 0; }
+    return ko2;
+}
+
+// Kernel-side smoke exercising the REAL share path (fds + fdacts + ko_mmap),
+// not direct calls: a "parent" creates a segment at an fd, the "child" gets it
+// via the fdacts handoff (ko_ref + fd_install — exactly what sys_spawn does),
+// both attach through their fd (ko_mmap -> seg_attach), and a write by one is
+// seen by the other (shared memory). read/write are E_BADF (no stream face). A
+// clone bumps SegPriv.refcount. Teardown drains each aspace's fd table
+// (fd_close -> ko_unref -> seg_detach): the frames survive until the LAST
+// KObject drops, then free exactly once (checked via the head pfn's state — a
+// double-free would panic in free_pages). Fail-loud.
+fn smoke() as void {
+    serial.println("segment_smoke: start", 20);
+    let is i32 as ok with mut = cast(i32, 1);
+
+    let is *vma.Aspace as ap = vma.aspace_create();   // "parent"
+    let is *vma.Aspace as ac = vma.aspace_create();   // "child"
+    if (cast(i64, ap) == 0 || cast(i64, ac) == 0) { pmm.panic("segment_smoke: aspace FAIL", 26); }
+    let is i64 as pr = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+
+    // Parent creates the segment and holds it at an fd (ko_alloc gave refcount
+    // 1 — that first reference covers this fd).
+    let is i64 as ko = seg_create(4, 0);
+    if (ko == 0) { pmm.panic("segment_smoke: create FAIL", 26); }
+    let is *kobject.KObject as k = cast(*kobject.KObject, ko);
+    let is *SegPriv as s = cast(*SegPriv, k.priv);
+    let is i32 as seg_pfn = cast(i32, s.pfn);
+    if (s.refcount != 1) { ok = cast(i32, 0); }
+    if (pmm.page_state(seg_pfn) != pmm.PAGE_ALLOCATED) { ok = cast(i32, 0); }
+    let is i64 as fd_p = vma.fd_alloc(ap, ko);
+    if (fd_p < 0) { ok = cast(i32, 0); }
+
+    // fdacts handoff to the child (what sys_spawn does): ko_ref + fd_install.
+    kobject.ko_ref(ko);
+    if (vma.fd_install(ac, 0, ko) != 0) { ok = cast(i32, 0); }
+    let is i64 as fd_c = 0;
+
+    // Both attach through their fd: fd_get -> ko_mmap -> seg_attach.
+    let is i64 as va_p = kobject.ko_mmap(vma.fd_get(ap, fd_p), cast(i64, ap), 0, pr);
+    let is i64 as va_c = kobject.ko_mmap(vma.fd_get(ac, fd_c), cast(i64, ac), 0, pr);
+    if (va_p < 0 || va_c < 0) { ok = cast(i32, 0); }
+
+    // Shared: both VAs resolve to the SAME frames. Write via parent, read via
+    // child (through the HHDM — neither aspace is the active CR3).
+    let is i64 as php = vmm.virt_to_phys_walk(ap.pml4_phys, va_p);
+    let is i64 as phc = vmm.virt_to_phys_walk(ac.pml4_phys, va_c);
+    if (php == 0 || php != phc) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as wp = cast(*i64, pmm.phys_to_virt(php));
+        let is *i64 as rc = cast(*i64, pmm.phys_to_virt(phc));
+        wp[0] = cast(i64, 0x5E6);
+        if (rc[0] != cast(i64, 0x5E6)) { ok = cast(i32, 0); }   // shared memory proved
+    }
+
+    // No stream face: read/write slots are NULL -> E_BADF.
+    if (kobject.ko_read(ko, 0, 0) != abi.E_BADF) { ok = cast(i32, 0); }
+    if (kobject.ko_write(ko, 0, 0) != abi.E_BADF) { ok = cast(i32, 0); }
+
+    // clone -> a second KObject (a second fd in the parent) over the same
+    // SegPriv: SegPriv.refcount 1 -> 2.
+    let is i64 as ko2 = seg_clone(ko);
+    if (ko2 == 0) { ok = cast(i32, 0); }
+    if (s.refcount != 2) { ok = cast(i32, 0); }
+    let is i64 as fd_clone = vma.fd_alloc(ap, ko2);
+    if (fd_clone < 0) { ok = cast(i32, 0); }
+
+    // Destroy the parent: its fd-table drain closes fd_p (ko: KObject.refcount
+    // 2 -> 1, child still holds it -> no detach) and fd_clone (ko2: refcount
+    // 1 -> 0 -> seg_detach -> SegPriv.refcount 2 -> 1). Its VMA_FILE mappings
+    // unmap without freeing. Frames stay (the child still references them).
+    vma.aspace_destroy(ap);
+    if (pmm.page_state(seg_pfn) != pmm.PAGE_ALLOCATED) { ok = cast(i32, 0); }
+
+    // Destroy the child: drains fd_c (ko: refcount 1 -> 0 -> seg_detach ->
+    // SegPriv.refcount 1 -> 0 -> frames freed + SegPriv freed). The head pfn
+    // returns to PAGE_FREE — freed exactly once.
+    vma.aspace_destroy(ac);
+    if (pmm.page_state(seg_pfn) != pmm.PAGE_FREE) { ok = cast(i32, 0); }
+
+    if (ok == cast(i32, 1)) { serial.println("segment_smoke: PASS", 19); }
+    else { pmm.panic("segment_smoke FAIL", 18); }
+}
