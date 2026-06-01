@@ -5,6 +5,8 @@ use "port.cst" as port;
 use "timer.cst" as timer;
 use "sched.cst" as sched;
 use "lapic.cst" as lapic;
+use "vmm.cst" as vmm;
+use "vma.cst" as vma;
 
 // ============================================================
 // IDT entries — 256 entries, each 16 bytes = 4096 bytes
@@ -121,6 +123,20 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
         return;
     }
 
+    // #PF (14): route through the L4 policy seam BEFORE the generic kill/panic.
+    // CR2 (the faulting linear address) holds its value until the next #PF, so
+    // capture it as the FIRST op of this branch — before any call that could
+    // itself fault and overwrite it. Today policy #0 (strict) returns fatal for
+    // every fault (eager mmap has no fill path), so this falls through to the
+    // existing kill/panic unchanged — only now cr2 is in the log. Phase E makes
+    // mem_handle_fault return 0 for a serviced fault (iretq re-runs the insn).
+    let is i64 as fault_cr2 with mut = 0;
+    if (vector == 14) {
+        fault_cr2 = vmm.read_cr2();
+        let is i32 as rc = vma.mem_handle_fault(fault_cr2, error_code, rip, fault_rsp, cs);
+        if (rc == cast(i32, 0)) { return; }
+    }
+
     let is i32 as from_user with mut = 0;
     if ((cs & 3) == 3) { from_user = 1; }
 
@@ -139,6 +155,10 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
         print_hex(rip);
         serial.print(" cs=", 4);
         print_hex(cs);
+        if (vector == 14) {
+            serial.print(" cr2=", 5);
+            print_hex(fault_cr2);
+        }
         serial.println(" — killing thread", 17);
         sched.exit_current_thread();
         // exit_current_thread never returns — it schedules another
@@ -157,6 +177,10 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
     print_hex(fault_rsp);
     serial.print(" cs=", 4);
     print_hex(cs);
+    if (vector == 14) {
+        serial.print(" cr2=", 5);
+        print_hex(fault_cr2);
+    }
     serial.println(" (kernel)", 9);
 
     // Kernel-mode fault. Dump a few words from the kstack so the
