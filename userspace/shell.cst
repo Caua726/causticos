@@ -16,7 +16,7 @@ use "../../Caustic/std/os/causticos.cst" as sys;
 
 let is i64 as MAX_ARGS  with imut = 16;
 let is i64 as LINE_CAP  with imut = 256;
-let is i64 as IMG_CAP   with imut = 65536;
+let is i64 as IMG_CAP   with imut = 262144;
 
 // Palette (soft Tango-ish console colours, not harsh #fff-on-#000).
 let is u32 as C_TEXT   with imut = 0x00d3d7cf;   // body text — soft light grey
@@ -25,6 +25,13 @@ let is u32 as C_ERR    with imut = 0x00ef5350;   // errors — red
 let is u32 as C_DIM    with imut = 0x00888a8c;   // secondary text — dim grey
 let is u32 as C_TITLE  with imut = 0x0073d0ff;   // headings — soft cyan-blue
 let is u32 as C_BG     with imut = 0x00121417;   // background
+
+// Command history (a 16-deep ring; Up/Down walk it).
+let is [4096]u8 as hbuf;             // 16 slots * 256 bytes
+let is [16]i64 as hlen;              // length stored in each slot
+let is i64 as hhead with mut = 0;    // next write slot
+let is i64 as hsize with mut = 0;    // commands stored (<=16)
+let is i64 as hnav with mut = 0;     // 0 = editing fresh; 1..hsize = walking back
 
 // --- small helpers ---
 fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
@@ -126,6 +133,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     let is i64 as status with mut = 0;
     _log("shell: waiting\n");
     sys.wait(pid, &status);
+    sys.munmap(cast(i64, img), IMG_CAP);                 // free the program image buffer
     _log("shell: exit="); _lognum(status); _log("\n");
 }
 
@@ -161,9 +169,11 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as void {
     if (argc == 0) { return; }
     let is *u8 as cmd = cast(*u8, argv_ptr[0]);
     let is i64 as cl = argv_len[0];
+    if (streq(cmd, cl, "clear") == 1 || streq(cmd, cl, "reset") == 1) { term.clear(t); return; }
     if (streq(cmd, cl, "help") == 1) {
         _col(t, C_DIM); puts(t, "built-in\n"); _col(t, C_TEXT);
         puts(t, "  help              show this help\n");
+        puts(t, "  clear / reset     clear the screen\n");
         _col(t, C_DIM); puts(t, "programs  (/<name>.cse)\n"); _col(t, C_TEXT);
         puts(t, "  echo <args...>    print the arguments\n");
         puts(t, "  cat  <file>       print a file\n");
@@ -173,6 +183,85 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as void {
         return;
     }
     run_program(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc);
+}
+
+// recall — replace the current input line with `src[0..srclen]`: erase what's
+// typed (backspaces), then echo the recalled text. Used by Up/Down history.
+fn recall(t as *term.Term, line as *u8, llen_ptr as *i64, src as *u8, srclen as i64) as void {
+    let is i64 as j with mut = 0;
+    while (j < llen_ptr[0]) { term.putc(t, 0x08); j = j + 1; }
+    let is i64 as i with mut = 0;
+    while (i < srclen && i < LINE_CAP - 1) { line[i] = src[i]; term.putc(t, cast(i64, src[i])); i = i + 1; }
+    llen_ptr[0] = i;
+    term.flush(t);
+}
+
+// --- Tab completion ---
+// does cand[0..cl] start with the typed prefix line[ts..ts+plen]?
+fn _cand_match(cand as *u8, cl as i64, line as *u8, ts as i64, plen as i64) as i64 {
+    if (cl < plen) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < plen) { if (cand[k] != line[ts + k]) { return 0; } k = k + 1; }
+    return 1;
+}
+// fold a matching candidate into the longest-common-prefix accumulator.
+fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
+    nmatch_ptr[0] = nmatch_ptr[0] + 1;
+    if (acclen_ptr[0] < 0) {                                  // first match -> acc = candidate
+        let is i64 as i with mut = 0;
+        while (i < cl && i < 255) { acc[i] = cand[i]; i = i + 1; }
+        acclen_ptr[0] = i;
+    } else {                                                  // shrink acc to the shared prefix
+        let is i64 as i with mut = 0; let is i64 as al = acclen_ptr[0];
+        while (i < al && i < cl && acc[i] == cand[i]) { i = i + 1; }
+        acclen_ptr[0] = i;
+    }
+}
+// Tab: complete the last token against `help` + the programs (/*.cse, suffix
+// stripped) when it's the command, or against every file in / when it's an arg.
+fn complete(t as *term.Term, line as *u8, llen_ptr as *i64) as void {
+    let is i64 as llen = llen_ptr[0];
+    let is i64 as ts with mut = llen;
+    while (ts > 0 && line[ts - 1] != 32) { ts = ts - 1; }     // start of the last token
+    let is i64 as plen = llen - ts;
+    let is i64 as is_cmd with mut = 0;
+    if (ts == 0) { is_cmd = 1; }
+    let is [256]u8 as acc;
+    let is i64 as acclen with mut = 0 - 1;
+    let is i64 as nmatch with mut = 0;
+    if (is_cmd == 1) {
+        if (_cand_match("help", 4, line, ts, plen) == 1) { _acc_update("help", 4, cast(*u8, &acc[0]), &acclen, &nmatch); }
+        if (_cand_match("clear", 5, line, ts, plen) == 1) { _acc_update("clear", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
+        if (_cand_match("reset", 5, line, ts, plen) == 1) { _acc_update("reset", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
+    }
+    let is i64 as fd = sys.open_read("/");
+    if (fd < 0) { return; }
+    let is [320]u8 as de;
+    while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+        let is *u8 as nm = cast(*u8, &de[0]);
+        let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
+        let is i64 as nl = nlp[0];
+        let is i64 as cl with mut = nl;
+        let is i64 as ok with mut = 1;
+        if (is_cmd == 1) {                                    // only ".cse" programs; strip the suffix
+            if (nl >= 4 && nm[nl-4] == 46 && nm[nl-3] == 99 && nm[nl-2] == 115 && nm[nl-1] == 101) { cl = nl - 4; }
+            else { ok = 0; }
+        }
+        if (ok == 1 && _cand_match(nm, cl, line, ts, plen) == 1) { _acc_update(nm, cl, cast(*u8, &acc[0]), &acclen, &nmatch); }
+    }
+    sys.close(fd);
+    if (nmatch == 0) { return; }
+    let is i64 as i with mut = plen;                          // append acc[plen..acclen] to the line
+    while (i < acclen && llen_ptr[0] < LINE_CAP - 1) {
+        line[llen_ptr[0]] = acc[i];
+        term.putc(t, cast(i64, acc[i]));
+        llen_ptr[0] = llen_ptr[0] + 1;
+        i = i + 1;
+    }
+    if (nmatch == 1 && llen_ptr[0] < LINE_CAP - 1) {          // sole match -> trailing space
+        line[llen_ptr[0]] = cast(u8, 32); term.putc(t, 0x20); llen_ptr[0] = llen_ptr[0] + 1;
+    }
+    term.flush(t);
 }
 
 fn main() as i32 {
@@ -199,13 +288,40 @@ fn main() as i32 {
     while (1 == 1) {
         if (input.read_event(kfd, &ev) == 1) {
             if (input.is_shift(ev.scancode) == 1) { shift = ev.pressed; }
+            else if (ev.pressed == 1 && ev.extended == 1 && ev.scancode == 0x48) {   // Up — older history
+                if (hnav < hsize) {
+                    hnav = hnav + 1;
+                    let is i64 as slot = (hhead - hnav + 16) % 16;
+                    recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
+                }
+            }
+            else if (ev.pressed == 1 && ev.extended == 1 && ev.scancode == 0x50) {   // Down — newer history
+                if (hnav > 0) {
+                    hnav = hnav - 1;
+                    if (hnav == 0) { recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &line[0]), 0); }
+                    else {
+                        let is i64 as slot = (hhead - hnav + 16) % 16;
+                        recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
+                    }
+                }
+            }
             else if (ev.pressed == 1) {
                 let is i64 as c = input.scancode_to_ascii(ev.scancode, shift);
                 if (c == 0x0A) {
                     term.putc(&t, 0x0A); term.flush(&t);
+                    if (llen > 0) {                            // push the command onto the history ring
+                        let is i64 as hi with mut = 0;
+                        while (hi < llen) { hbuf[hhead * 256 + hi] = line[hi]; hi = hi + 1; }
+                        hlen[hhead] = llen;
+                        hhead = (hhead + 1) % 16;
+                        if (hsize < 16) { hsize = hsize + 1; }
+                    }
+                    hnav = 0;
                     run_line(&t, cast(*u8, &line[0]), llen);
                     llen = 0;
                     prompt(&t); term.flush(&t);
+                } else if (c == 0x09) {                       // Tab — autocomplete
+                    complete(&t, cast(*u8, &line[0]), &llen);
                 } else if (c == 0x08) {
                     if (llen > 0) { llen = llen - 1; term.putc(&t, 0x08); term.flush(&t); }
                 } else if (c != 0) {

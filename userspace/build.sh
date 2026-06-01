@@ -15,7 +15,7 @@ CAUSTIC="$CAUSTIC_DIR/caustic"
 OUT="$HERE/build"; mkdir -p "$OUT"
 cd "$OUT"; rm -rf .caustic            # the module cache lands in cwd
 
-PROGS="shell echo cat ls uptime sysinfo"
+PROGS="shell echo cat ls uptime sysinfo vic"
 for p in $PROGS; do
     if ! "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse" >/dev/null 2>&1; then
         echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse"; exit 1

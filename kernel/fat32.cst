@@ -581,6 +581,17 @@ let is i64 as lfn_len with mut = 0;
 let is i64 as lfn_expected_seq with mut = 0;   // 0 if no LFN in progress
 let is i64 as lfn_total_entries with mut = 0;  // N from the last-physical marker
 
+// Physical location of the SFN slot matched by the most recent dir_find
+// hit: the directory cluster holding it + the 32-byte slot's byte offset
+// inside that cluster. This is the *stable* identity of a directory entry
+// — unlike first_cluster, it never changes while the file exists (only
+// rename moves it, which re-resolves). The write path captures it at open
+// (via vfs_resolve) so update_entry can patch the exact slot regardless of
+// whether first_cluster was zeroed by an intervening O_TRUNC. dir_find is
+// single-threaded today, same as target_name/lfn_buf above, so no locking.
+let is i64 as found_ent_cluster with mut = 0;
+let is i64 as found_ent_off with mut = 0;
+
 fn dir_find(v as *Fat32Volume,
             start_cluster as i64,
             name as *u8,
@@ -642,6 +653,8 @@ fn dir_find(v as *Fat32Volume,
                     *out_cluster = lo | (hi << 16);
                     *out_size    = read_u32(buf, i + 28);
                     *out_attr    = attr;
+                    found_ent_cluster = cluster;   // stable slot identity for update_entry
+                    found_ent_off    = i;
                     return 0;
                 }
                 // Consumed the preceding LFN run regardless of match.
@@ -2176,9 +2189,14 @@ fn vfs_resolve(priv as *u8, path as *u8, path_len as i64,
                out_parent_cluster as *i64,
                out_first_cluster as *i64,
                out_size as *i64,
-               out_attr as *i32) as i32 {
+               out_attr as *i32,
+               out_ent_cluster as *i64,
+               out_ent_off as *i64) as i32 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
     if (cast(i64, v) == 0 || v.is_mounted == 0) { return cast(i32, 0 - 1); }
+    // Default: no patchable slot (root, or any path with no SFN entry).
+    *out_ent_cluster = 0;
+    *out_ent_off     = 0;
 
     // Special-case the root directory: parent is itself, first cluster
     // is root_cluster, no size, attr=DIRECTORY.
@@ -2220,6 +2238,10 @@ fn vfs_resolve(priv as *u8, path as *u8, path_len as i64,
     *out_first_cluster  = fc;
     *out_size           = fs;
     *out_attr           = fa;
+    // dir_find stashed the matched SFN slot location — hand it back so the
+    // open handle can update this exact entry later (see found_ent_*).
+    *out_ent_cluster = found_ent_cluster;
+    *out_ent_off     = found_ent_off;
     return 0;
 }
 
@@ -2229,8 +2251,10 @@ fn vfs_stat(priv as *u8, path as *u8, path_len as i64,
     let is i64 as fc with mut = 0;
     let is i64 as sz with mut = 0;
     let is i32 as at with mut = 0;
+    let is i64 as ec with mut = 0;   // entry slot location — unused by stat
+    let is i64 as eo with mut = 0;
     let is i32 as rc = vfs_resolve(priv, path, path_len,
-                                   &pc, &fc, &sz, &at);
+                                   &pc, &fc, &sz, &at, &ec, &eo);
     if (rc != 0) { return rc; }
     out.size = sz;
     out.first_cluster = fc;
@@ -2295,76 +2319,42 @@ fn vfs_truncate(priv as *u8, first_cluster as i64, old_size as i64,
                          out_first_cluster);
 }
 
-fn vfs_update_entry(priv as *u8, parent_cluster as i64,
-                    old_first as i64, new_first as i64,
+// Patch the first-cluster (hi/lo) and size fields of the SFN slot at a
+// KNOWN physical location (ent_cluster:ent_off, captured by dir_find at
+// resolve time). O(1): one cluster read + one write, no directory scan,
+// no first_cluster matching — so it is immune to the empty-file (fc==0)
+// ambiguity that bit the old by-cluster scan when several entries shared
+// first_cluster==0 (e.g. an O_TRUNC'd file alongside another empty one).
+// ent_cluster < 2 means "no slot" (root / unresolved) → no-op success.
+fn dir_update_entry_at(v as *Fat32Volume, ent_cluster as i64, ent_off as i64,
+                       new_first_cluster as i64, new_size as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (ent_cluster < 2) { return 0; }
+    if (ensure_scratch() != 0) { return cast(i32, 0 - 1); }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    if (cluster_read(v, ent_cluster, buf) != 0) { return cast(i32, 0 - 2); }
+    let is i64 as hi = (new_first_cluster >> 16) & 0xFFFF;
+    let is i64 as lo = new_first_cluster & 0xFFFF;
+    buf[ent_off + 20] = cast(u8, hi & 0xFF);
+    buf[ent_off + 21] = cast(u8, (hi >> 8) & 0xFF);
+    buf[ent_off + 26] = cast(u8, lo & 0xFF);
+    buf[ent_off + 27] = cast(u8, (lo >> 8) & 0xFF);
+    buf[ent_off + 28] = cast(u8, new_size & 0xFF);
+    buf[ent_off + 29] = cast(u8, (new_size >> 8) & 0xFF);
+    buf[ent_off + 30] = cast(u8, (new_size >> 16) & 0xFF);
+    buf[ent_off + 31] = cast(u8, (new_size >> 24) & 0xFF);
+    if (cluster_write(v, ent_cluster, buf) != 0) { return cast(i32, 0 - 5); }
+    return 0;
+}
+
+// update_entry adapter — the first two i64 params are the entry's stable
+// slot location (ent_cluster, ent_off) captured at open via vfs_resolve,
+// NOT (parent_cluster, old_first) as in the original by-cluster design.
+fn vfs_update_entry(priv as *u8, ent_cluster as i64,
+                    ent_off as i64, new_first as i64,
                     new_size as i64) as i32 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
-    if (parent_cluster == v.root_cluster && old_first == v.root_cluster) {
-        // The root has no entry in any parent directory; nothing to
-        // persist (and no valid parent to scan).
-        return 0;
-    }
-    // If the file was previously empty (old_first == 0) we must locate
-    // the entry by name, not by cluster. Callers in the write path
-    // stash parent+first; if first is 0 we need a different hook. For
-    // now ensure callers only invoke update_entry after first_cluster
-    // has been allocated.
-    if (old_first == 0) {
-        // Locate the one-and-only entry in the parent whose first
-        // cluster is 0 — that's us. This is a linear scan over the
-        // parent but it only happens once per file (second write
-        // brings old_first != 0).
-        if (ensure_scratch() != 0) { return cast(i32, 0 - 1); }
-        let is *u8 as buf = cast(*u8, clus_scratch_virt);
-        let is i64 as cluster with mut = parent_cluster;
-        let is i64 as guard with mut = 0;
-        let is i64 as max_steps = v.cluster_count + 2;
-        let is i64 as n_slots = v.cluster_size_bytes / 32;
-        while (cluster >= 2 && cluster < v.cluster_count + 2) {
-            if (guard > max_steps) { return cast(i32, 0 - 2); }
-            guard = guard + 1;
-            if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 3); }
-            let is i64 as i with mut = 0;
-            while (i < n_slots) {
-                let is i64 as boff = i * 32;
-                let is u8 as m = buf[boff];
-                if (m == cast(u8, 0)) { return cast(i32, 0 - 4); }
-                if (m != cast(u8, 0xE5)) {
-                    let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
-                    if (a != ATTR_LFN) {
-                        let is i64 as lo = read_u16(buf, boff + 26);
-                        let is i64 as hi = read_u16(buf, boff + 20);
-                        let is i64 as fc = lo | (hi << 16);
-                        let is i64 as sz = read_u32(buf, boff + 28);
-                        if (fc == 0 && sz == 0) {
-                            let is i64 as nh = (new_first >> 16) & 0xFFFF;
-                            let is i64 as nl = new_first & 0xFFFF;
-                            buf[boff + 20] = cast(u8, nh & 0xFF);
-                            buf[boff + 21] = cast(u8, (nh >> 8) & 0xFF);
-                            buf[boff + 26] = cast(u8, nl & 0xFF);
-                            buf[boff + 27] = cast(u8, (nl >> 8) & 0xFF);
-                            buf[boff + 28] = cast(u8, new_size & 0xFF);
-                            buf[boff + 29] = cast(u8, (new_size >> 8) & 0xFF);
-                            buf[boff + 30] = cast(u8, (new_size >> 16) & 0xFF);
-                            buf[boff + 31] = cast(u8, (new_size >> 24) & 0xFF);
-                            if (cluster_write(v, cluster, buf) != 0) {
-                                return cast(i32, 0 - 5);
-                            }
-                            return 0;
-                        }
-                    }
-                }
-                i = i + 1;
-            }
-            let is i64 as nxt = fat_read(v, cluster);
-            if (nxt < 0) { return cast(i32, 0 - 3); }
-            if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 4); }
-            cluster = nxt;
-        }
-        return cast(i32, 0 - 4);
-    }
-    return dir_update_entry(v, parent_cluster, old_first,
-                            new_first, new_size);
+    return dir_update_entry_at(v, ent_cluster, ent_off, new_first, new_size);
 }
 
 fn vfs_create(priv as *u8, path as *u8, path_len as i64) as i32 {

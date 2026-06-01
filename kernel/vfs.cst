@@ -107,10 +107,11 @@ struct ReaddirOut {
 // for mount "/boot" a caller's "/boot/kernel.elf" becomes the FS-
 // relative "/kernel.elf". Mount root is always a leading '/'.
 struct FileSystemOps {
-    // resolve path → parent_cluster + first_cluster + size + attr.
-    // Used by open() to cache handle state.
+    // resolve path → parent_cluster + first_cluster + size + attr, plus
+    // the entry's stable slot location (ent_cluster, ent_off) for later
+    // update_entry. Used by open() to cache handle state.
     resolve as fn(*u8, *u8, i64,
-                  *i64, *i64, *i64, *i32) as i32;
+                  *i64, *i64, *i64, *i32, *i64, *i64) as i32;
     // Stat: lighter resolve variant, doesn't need parent. Path based.
     stat as fn(*u8, *u8, i64, *VfsStat) as i32;
     // read/write by first_cluster + size — O(1) from already-open file.
@@ -123,9 +124,11 @@ struct FileSystemOps {
     // grow by allocating zeroed clusters. *out_first_cluster reflects
     // the (possibly new) head.
     truncate as fn(*u8, i64, i64, i64, *i64) as i32;
-    // Persist a new (first_cluster, size) for the entry pointing at
-    // old_first_cluster in `parent_cluster`. Called after write_at or
-    // truncate changes the chain so the directory entry matches.
+    // Persist a new (first_cluster, size) into the directory entry at the
+    // stable slot location (ent_cluster, ent_off) captured by resolve.
+    // Called after write_at or truncate reshapes the chain. Keyed by slot,
+    // not by first_cluster, so it is correct even after O_TRUNC zeroes it.
+    //   args: (priv, ent_cluster, ent_off, new_first_cluster, new_size)
     update_entry as fn(*u8, i64, i64, i64, i64) as i32;
     // Metadata operations, all path-based. create makes an empty
     // regular file, unlink removes a regular file, mkdir/rmdir for
@@ -164,6 +167,11 @@ struct VfsFile {
     // Filesystem pointers.
     mount as *VfsMount;
     parent_cluster as i64;   // used for update_entry after writes
+    // Stable physical location of this file's directory entry (FS cluster
+    // + 32-byte slot offset), captured at open. update_entry patches THIS
+    // slot — surviving O_TRUNC zeroing first_cluster (see fat32 found_ent_*).
+    ent_cluster as i64;
+    ent_off as i64;
     first_cluster as i64;
     size as i64;
     offset as i64;
@@ -358,20 +366,24 @@ fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     let is i64 as first_cluster with mut = 0;
     let is i64 as size with mut = 0;
     let is i32 as attr with mut = 0;
+    let is i64 as ent_cluster with mut = 0;
+    let is i64 as ent_off with mut = 0;
     let is i32 as rc with mut = call(mnt.ops.resolve,
                                      mnt.priv, effective_path, effective_len,
-                                     &parent_cluster, &first_cluster, &size, &attr);
+                                     &parent_cluster, &first_cluster, &size, &attr,
+                                     &ent_cluster, &ent_off);
 
     if (rc != 0) {
         if ((flags & O_CREAT) == 0) { return cast(*VfsFile, 0); }
         // Create path requested — attempt file creation (empty), then
-        // resolve again.
+        // resolve again (the second resolve captures the new entry's slot).
         let is i32 as cc = call(mnt.ops.create,
                                 mnt.priv, effective_path, effective_len);
         if (cc != 0) { return cast(*VfsFile, 0); }
         rc = call(mnt.ops.resolve,
                   mnt.priv, effective_path, effective_len,
-                  &parent_cluster, &first_cluster, &size, &attr);
+                  &parent_cluster, &first_cluster, &size, &attr,
+                  &ent_cluster, &ent_off);
         if (rc != 0) { return cast(*VfsFile, 0); }
     } else {
         // Exists; honour O_EXCL.
@@ -386,6 +398,8 @@ fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     f.flags = flags;
     f.mount = mnt;
     f.parent_cluster = parent_cluster;
+    f.ent_cluster = ent_cluster;
+    f.ent_off = ent_off;
     f.first_cluster = first_cluster;
     f.size = size;
     f.attr = attr;
@@ -404,8 +418,8 @@ fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
         if (tc == 0) {
             if (new_first != f.first_cluster || f.size != 0) {
                 call(mnt.ops.update_entry,
-                     mnt.priv, f.parent_cluster,
-                     f.first_cluster, new_first, cast(i64, 0));
+                     mnt.priv, f.ent_cluster, f.ent_off,
+                     new_first, cast(i64, 0));
             }
             f.first_cluster = new_first;
             f.size = 0;
@@ -466,10 +480,11 @@ fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
                                   write_off, buf, n, &new_first);
     if (new_size < 0) { return new_size; }
 
-    // Persist the new (first_cluster, size) in the dir entry.
+    // Persist the new (first_cluster, size) into our directory entry's
+    // stable slot — correct even when first_cluster was 0 before this write.
     let is i32 as ue = call(f.mount.ops.update_entry,
-                            f.mount.priv, f.parent_cluster,
-                            f.first_cluster, new_first, new_size);
+                            f.mount.priv, f.ent_cluster, f.ent_off,
+                            new_first, new_size);
     if (ue != 0) { return cast(i64, ue); }
 
     f.first_cluster = new_first;
