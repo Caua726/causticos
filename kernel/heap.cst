@@ -260,6 +260,46 @@ let is i32 as freed_slab_count with mut = 0;
 let is i64 as heap_saved_flags with mut = 0;
 
 // ============================================================
+// Per-pfn slab id (heap-owned; was pmm PageInfo.aux1)
+// ============================================================
+// kfree/kcache_free need pfn -> slab_id in O(1). That datum belongs to
+// the heap, not the PMM, so the heap keeps its own i32-per-pfn table.
+// It's allocated from the PMM at heap.init, sized to installed RAM
+// (pmm.phys_end), so it costs 4 B/pfn proportional to memory rather
+// than a fixed worst-case BSS array.
+let is i64 as slab_id_base with mut = 0;   // virt base of the i32 array
+let is i64 as slab_id_count with mut = 0;  // number of pfns it covers
+
+fn slab_id_init() as void {
+    let is i64 as npfn = (pmm.phys_end + pmm.PAGE_SIZE - 1) >> pmm.PAGE_SHIFT;
+    let is i64 as bytes = npfn * 4;
+    let is i64 as pages = (bytes + pmm.PAGE_SIZE - 1) >> pmm.PAGE_SHIFT;
+    let is i32 as order = ceil_log2(pages);
+    let is i32 as pfn = pmm.alloc_pages(pmm.ZONE_DMA32,
+        pmm.ALLOC_ZERO | pmm.ALLOC_ALLOW_FALLBACK, order,
+        pmm.USAGE_KERNEL, cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) {
+        pmm.panic("heap: slab_id alloc failed", 26);
+    }
+    slab_id_base = pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
+    slab_id_count = npfn;
+}
+
+fn slab_id_get_pfn(pfn as i32) as i32 {
+    if (cast(i64, pfn) < 0) { return SLAB_NONE; }
+    if (cast(i64, pfn) >= slab_id_count) { return SLAB_NONE; }
+    let is *i32 as t = cast(*i32, slab_id_base);
+    return t[cast(i64, pfn)];
+}
+
+fn slab_id_set_pfn(pfn as i32, v as i32) as void {
+    if (cast(i64, pfn) < 0) { return; }
+    if (cast(i64, pfn) >= slab_id_count) { return; }
+    let is *i32 as t = cast(*i32, slab_id_base);
+    t[cast(i64, pfn)] = v;
+}
+
+// ============================================================
 // Table accessors
 // ============================================================
 
@@ -566,17 +606,14 @@ fn list_move(c as i64, sid as i32, new_state as i32) as void {
 }
 
 // ============================================================
-// Register/unregister slab pages in PMM PageInfo
+// Register/unregister slab pages in the heap's per-pfn slab-id table
 // ============================================================
 
 fn register_slab_pages(pfn as i32, order as i32, sid as i32) as void {
     let is i32 as count = cast(i32, 1) << order;
     let is i32 as i with mut = 0;
     while (i < count) {
-        let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn + i);
-        if (cast(i64, pi) != 0) {
-            pi.aux1 = sid;
-        }
+        slab_id_set_pfn(pfn + i, sid);
         i = i + cast(i32, 1);
     }
 }
@@ -585,10 +622,7 @@ fn unregister_slab_pages(pfn as i32, order as i32) as void {
     let is i32 as count = cast(i32, 1) << order;
     let is i32 as i with mut = 0;
     while (i < count) {
-        let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn + i);
-        if (cast(i64, pi) != 0) {
-            pi.aux1 = cast(i32, 0);
-        }
+        slab_id_set_pfn(pfn + i, cast(i32, 0));
         i = i + cast(i32, 1);
     }
 }
@@ -907,13 +941,12 @@ fn kcache_free(c as i64, ptr as i64) as void {
         }
     }
 
-    // Find slab via PageInfo
+    // Find slab via the per-pfn slab-id table
     let is i32 as pfn = virt_to_pfn(ptr);
-    let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn);
-    if (cast(i64, pi) == 0) {
+    if (pmm.page_present(pfn) == cast(i32, 0)) {
         pmm.panic("kcache_free: bad ptr", 20);
     }
-    let is i32 as sid = pi.aux1;
+    let is i32 as sid = slab_id_get_pfn(pfn);
     if (sid == SLAB_NONE) {
         pmm.panic("kcache_free: not slab page", 26);
     }
@@ -1173,12 +1206,11 @@ fn kfree(ptr as i64) as void {
     if (ptr == 0) { return; }
 
     let is i32 as pfn = virt_to_pfn(ptr);
-    let is *pmm.PageInfo as pi = pmm.pfn_to_pageinfo(pfn);
-    if (cast(i64, pi) == 0) {
+    if (pmm.page_present(pfn) == cast(i32, 0)) {
         pmm.panic("kfree: bad ptr", 14);
     }
 
-    let is i32 as usage = pmm.meta_get_usage(pi.meta);
+    let is i32 as usage = pmm.page_usage(pfn);
 
     if (usage == cast(i32, pmm.USAGE_KERNEL)) {
         // Large kmalloc — return to buddy (pmm has its own lock).
@@ -1187,7 +1219,7 @@ fn kfree(ptr as i64) as void {
     }
 
     if (usage == cast(i32, pmm.USAGE_KERNEL_HEAP)) {
-        let is i32 as sid = pi.aux1;
+        let is i32 as sid = slab_id_get_pfn(pfn);
         if (sid == SLAB_NONE) {
             pmm.panic("kfree: no slab_id", 17);
         }
@@ -1211,6 +1243,11 @@ fn kfree(ptr as i64) as void {
 
 fn init() as void {
     serial.println("heap: init", 10);
+
+    // Per-pfn slab-id table first — register_slab_pages writes into it as
+    // soon as the first cache allocates a slab (during cache creation
+    // below), so it must exist before any kcache_create.
+    slab_id_init();
 
     // Zero tables
     let is *u8 as st = cast(*u8, &slab_table_raw);
