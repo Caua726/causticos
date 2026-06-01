@@ -277,33 +277,55 @@ fn back_anon_page(pml4 as i64, va as i64, prot as i64) as i32 {
     return 0;
 }
 
-// Walk every page in [v.start, v.end), unmap from pml4, free the backing
-// physical page. Returns the number of anon (committed) pages freed — the
-// committed_bytes delta for the accounting in release_locked.
-fn unmap_vma_pages(pml4 as i64, v as *Vma, do_shootdown as i32) as i64 {
-    // VMA_FILE pages are owned by the backing object (e.g. a surface's
-    // backbuffer), not by the VMA — unmap only, never free, or we'd
-    // double-free when the object's close op releases them. VMA_ANON
-    // pages are the VMA's own, so they're freed here.
-    //
-    // do_shootdown: release (a live aspace) sets 1 so a stale TLB entry on
-    // another cpu is killed before the frame is freed. aspace_destroy sets 0 —
-    // the dying aspace is no cpu's active CR3 (the exiting thread's cpu already
-    // reloaded CR3 on switch), so no remote TLB holds its pages.
-    let is i64 as is_file = v.flags & VMA_FILE;
+// Frames per TLB-shootdown batch. The frames freed by one unmap pass are
+// buffered, the whole chunk unmapped (local invlpg per page), ONE shootdown
+// fires for the chunk, then the chunk's frames free — so a freed frame is never
+// reused while a stale remote TLB entry points at it, but we pay one IPI per
+// chunk instead of per page. 64 i64 = 512 B on the stack.
+let is i64 as TLB_BATCH = 64;
+
+// Unmap npages from `start`, freeing the present anon frames (is_file==0 →
+// VMA_FILE frames belong to the owner, unmap only). Batched: per chunk, unmap +
+// collect phys, one shootdown if any anon frame will be freed (and
+// do_shootdown), then free. Returns the anon page count freed (committed_bytes
+// delta). do_shootdown=0 for a dying aspace (no cpu holds its CR3).
+fn tlb_batch_unmap_free(pml4 as i64, start as i64, npages as i64,
+                        is_file as i64, do_shootdown as i32) as i64 {
+    let is [64]i64 as phys_buf;
     let is i64 as freed with mut = 0;
-    let is i64 as p with mut = v.start;
-    while (p < v.end) {
-        let is i64 as old_phys = vmm.vmm_unmap_page(pml4, p);
-        if (old_phys != 0 && is_file == 0) {
-            if (do_shootdown == cast(i32, 1)) { sched.tlb_shootdown_all(); }
-            let is i32 as pfn = pmm.phys_to_pfn(old_phys);
-            pmm.free_pages(pfn, cast(i32, 0));
-            freed = freed + 1;
+    let is i64 as done with mut = 0;
+    while (done < npages) {
+        let is i64 as chunk with mut = npages - done;
+        if (chunk > TLB_BATCH) { chunk = TLB_BATCH; }
+        let is i64 as nfree with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < chunk) {
+            let is i64 as old = vmm.vmm_unmap_page(pml4, start + (done + i) * pmm.PAGE_SIZE);
+            if (old != 0 && is_file == 0) {
+                phys_buf[nfree] = old;
+                nfree = nfree + 1;
+            }
+            i = i + 1;
         }
-        p = p + pmm.PAGE_SIZE;
+        if (nfree > 0 && do_shootdown == cast(i32, 1)) { sched.tlb_shootdown_all(); }
+        let is i64 as f with mut = 0;
+        while (f < nfree) {
+            pmm.free_pages(pmm.phys_to_pfn(phys_buf[f]), cast(i32, 0));
+            f = f + 1;
+        }
+        freed = freed + nfree;
+        done = done + chunk;
     }
     return freed;
+}
+
+// Unmap a whole VMA's pages, freeing its anon frames. Returns the anon page
+// count freed (the committed_bytes delta in release_locked). do_shootdown=0 for
+// aspace_destroy (dying aspace is no cpu's active CR3).
+fn unmap_vma_pages(pml4 as i64, v as *Vma, do_shootdown as i32) as i64 {
+    let is i64 as is_file = v.flags & VMA_FILE;
+    let is i64 as npages = (v.end - v.start) / pmm.PAGE_SIZE;
+    return tlb_batch_unmap_free(pml4, v.start, npages, is_file, do_shootdown);
 }
 
 // ============================================================
@@ -403,50 +425,23 @@ fn commit_locked(a as *Aspace, vaddr as i64, len as i64, prot as i64) as i32 {
     return 0;
 }
 
-// decommit_locked: drop the frames backing the present pages in [vaddr,
-// vaddr+len), keeping the reservation (the VMA stays). The pages were present,
-// so this needs a cross-cpu TLB shootdown on SMP — added in a later sub-step;
-// today it does the local invlpg vmm_unmap_page already issues (same property
-// as the existing munmap path).
+// decommit_locked: drop the frames backing [vaddr, vaddr+len), keeping the
+// reservation (the VMA stays). All anon, so the batch helper frees every present
+// page with a batched cross-cpu shootdown before reuse.
 fn decommit_locked(a as *Aspace, vaddr as i64, len as i64) as void {
     let is i64 as start = page_align_down(vaddr);
     let is i64 as end = page_align_up(vaddr + len);
-    let is i64 as dropped with mut = 0;
-    let is i64 as p with mut = start;
-    while (p < end) {
-        let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, p);
-        if (old != 0) {
-            // The page was present, so other cpus may hold a stale TLB entry
-            // for it. Shoot it down (no-op on a uniprocessor) BEFORE freeing the
-            // frame, so the freed frame can't be reused while a stale entry
-            // still points at it. (Per-page today; a batched array + single
-            // shootdown is a future optimisation when large ranges appear.)
-            sched.tlb_shootdown_all();
-            pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0));
-            dropped = dropped + 1;
-        }
-        p = p + pmm.PAGE_SIZE;
-    }
+    let is i64 as npages = (end - start) / pmm.PAGE_SIZE;
+    let is i64 as dropped = tlb_batch_unmap_free(a.pml4_phys, start, npages, 0, cast(i32, 1));
     a.committed_bytes = a.committed_bytes - dropped * pmm.PAGE_SIZE;
 }
 
-// unmap_range_pages: unmap [os, oe) of a live aspace, freeing the present anon
-// frames (VMA_FILE frames belong to the owner — unmap only). Shoots down before
-// freeing each page. Returns the anon page count freed (the committed_bytes
-// delta). The partial-range counterpart of unmap_vma_pages.
+// unmap_range_pages: unmap [os, oe) of a live aspace (partial-overlap munmap),
+// freeing the present anon frames (VMA_FILE frames belong to the owner). Thin
+// wrapper over the batch helper. Returns the anon page count freed.
 fn unmap_range_pages(pml4 as i64, os as i64, oe as i64, is_file as i64) as i64 {
-    let is i64 as freed with mut = 0;
-    let is i64 as p with mut = os;
-    while (p < oe) {
-        let is i64 as old = vmm.vmm_unmap_page(pml4, p);
-        if (old != 0 && is_file == 0) {
-            sched.tlb_shootdown_all();
-            pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0));
-            freed = freed + 1;
-        }
-        p = p + pmm.PAGE_SIZE;
-    }
-    return freed;
+    let is i64 as npages = (oe - os) / pmm.PAGE_SIZE;
+    return tlb_batch_unmap_free(pml4, os, npages, is_file, cast(i32, 1));
 }
 
 // release_locked: unmap [start, end) — the real munmap. A VMA may be wholly
