@@ -45,6 +45,41 @@ let is i32 as DEBUG_HEAP        = 1;
 let is u8 as POISON_BYTE        = 222;   // 0xDE
 
 // ============================================================
+// Bins allocator structs (vendored from Caustic/std/mem/bins.cst)
+// ============================================================
+// Backs the generic kmalloc(<=4096) path (Phase B sub-phase 1). The
+// std bins' core.mmap_anon seam is rerouted to pmm.alloc_pages (see
+// heap_pages_alloc/free). All fields are 8 bytes wide (pointers + i64)
+// to stay clear of the mixed-width struct-field miscompile.
+
+let is i64 as HEADER_SIZE = 8;   // self-identifying 8-byte block header
+
+struct Slab {
+    region as *u8;
+    bitmap as *u8;
+    freelist as *u8;
+    region_size as i64;
+    total_slots as i64;
+    used_slots as i64;
+    next as *u8;
+}
+
+struct Bin {
+    slot_size as i64;
+    alloc_size as i64;
+    slab_head as *u8;
+    page_size as i64;
+}
+
+struct Bins {
+    bin_data as *u8;
+    bin_count as i64;
+    page_size as i64;
+    lookup as *u8;
+    lookup_entries as i64;
+}
+
+// ============================================================
 // KmemCache — slab cache descriptor (128 bytes, manual layout)
 // ============================================================
 // Offset  Field              Type   Size
@@ -255,6 +290,23 @@ let is [112]u8 as kmalloc_caches_raw;  // 14 * 8 bytes
 // Slab ID free stack for recycling
 let is [4096]u8 as freed_slab_ids_raw;  // 1024 * i32
 let is i32 as freed_slab_count with mut = 0;
+
+// ============================================================
+// Bins allocator state (BSS — Phase B sub-phase 1)
+// ============================================================
+// 14 Bin structs * sizeof(Bin)=32 = 448 bytes
+let is [448]u8 as kbins_bin_data;
+// lookup table: lookup_entries=(4096>>3)+2=514 entries * 2 bytes = 1028
+let is [1028]u8 as kbins_lookup;
+// Bins control block (struct-typed BSS global; wired in bins_init —
+// Caustic globals cannot be initialized with cast(*u8,0), so BSS + runtime).
+let is Bins as kbins with mut;
+
+// Large-allocation extents (>4096): ordered table of {i64 vaddr, i64 order}.
+// 256 entries * 16 bytes = 4096. Overflow -> loud panic (see large_insert).
+let is [4096]u8 as large_table_raw;
+let is i64 as large_count with mut = 0;
+let is i64 as LARGE_CAP = 256;
 
 // IRQ lock
 let is i64 as heap_saved_flags with mut = 0;
@@ -1171,6 +1223,333 @@ fn ceil_log2(v as i64) as i32 {
 }
 
 // ============================================================
+// Bins allocator — vendored from Caustic/std/mem/bins.cst
+// (Phase B sub-phase 1). core.mmap_anon -> pmm (heap_pages_*);
+// core.bit_* vendored below; core.write_str errors -> pmm.panic;
+// the std lazy auto-init is dropped (kbins is wired in bins_init).
+// ============================================================
+
+// --- Bitmap helpers (from core.cst:120-137) ---
+fn bit_test(bitmap as *u8, idx as i64) as i32 {
+    let is i64 as bi = idx >> 3;
+    let is i64 as bit = idx & 7;
+    if (((cast(i64, bitmap[bi]) >> bit) & 1) == 1) { return cast(i32, 1); }
+    return cast(i32, 0);
+}
+
+fn bit_set(bitmap as *u8, idx as i64) as void {
+    let is i64 as bi = idx >> 3;
+    let is i64 as bit = idx & 7;
+    bitmap[bi] = cast(u8, cast(i64, bitmap[bi]) | (1 << bit));
+}
+
+fn bit_clear(bitmap as *u8, idx as i64) as void {
+    let is i64 as bi = idx >> 3;
+    let is i64 as bit = idx & 7;
+    bitmap[bi] = cast(u8, cast(i64, bitmap[bi]) & (255 ^ (1 << bit)));
+}
+
+// --- The mmap_anon -> pmm seam ---
+// Returns an HHDM virtual address (i64), or 0 on failure. The pages come
+// zeroed from the PMM (ALLOC_ZERO) and are tagged USAGE_KERNEL_HEAP.
+fn heap_pages_alloc(n as i64) as i64 {
+    let is i64 as pages = align_up64(n, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
+    let is i32 as order = ceil_log2(pages);
+    let is i32 as pfn = pmm.alloc_pages(pmm.ALLOC_ZERO, order, pmm.USAGE_KERNEL_HEAP, cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    return pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
+}
+
+fn heap_pages_free(vaddr as i64) as void {
+    pmm.free_pages(virt_to_pfn(vaddr));   // order is read back from frame_meta
+}
+
+// --- Slab backing (adapted from bins._slab_create:52) ---
+fn bslab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
+    if (alloc_size > page_size) { return cast(*Slab, 0); }
+
+    let is i64 as total_slots = page_size / alloc_size;
+    if (total_slots == 0) { return cast(*Slab, 0); }
+
+    let is i64 as bitmap_bytes = (total_slots + 7) >> 3;
+    let is i64 as meta_size = sizeof(Slab) + bitmap_bytes;
+
+    let is i64 as meta = heap_pages_alloc(meta_size);
+    if (meta == 0) { return cast(*Slab, 0); }
+
+    let is i64 as region = heap_pages_alloc(page_size);
+    if (region == 0) {
+        heap_pages_free(meta);
+        return cast(*Slab, 0);
+    }
+
+    let is *Slab as slab = cast(*Slab, meta);
+    slab.region = cast(*u8, region);
+    slab.bitmap = cast(*u8, meta + sizeof(Slab));
+    slab.region_size = page_size;
+    slab.total_slots = total_slots;
+    slab.used_slots = 0;
+    slab.next = cast(*u8, 0);
+
+    // Init bitmap: all 1s (all free); trim the unused tail bits.
+    let is i64 as i with mut = 0;
+    while (i < bitmap_bytes) {
+        slab.bitmap[i] = 255;
+        i = i + 1;
+    }
+    let is i64 as extra = bitmap_bytes * 8 - total_slots;
+    if (extra > 0) {
+        let is i64 as last = bitmap_bytes - 1;
+        slab.bitmap[last] = cast(u8, (1 << (8 - extra)) - 1);
+    }
+
+    // Build freelist (next-pointer in the first 8 bytes of each free slot).
+    i = 0;
+    while (i < total_slots - 1) {
+        let is *i64 as np = cast(*i64, region + i * alloc_size);
+        *np = region + (i + 1) * alloc_size;
+        i = i + 1;
+    }
+    let is *i64 as last_np = cast(*i64, region + (total_slots - 1) * alloc_size);
+    *last_np = 0;
+
+    slab.freelist = cast(*u8, region);
+    return slab;
+}
+
+// --- Bin helpers (from bins.cst:114,118,144,384) ---
+fn bin_at(b as *Bins, idx as i64) as *Bin {
+    return cast(*Bin, cast(i64, b.bin_data) + idx * sizeof(Bin));
+}
+
+fn build_lookup(b as *Bins) as void {
+    let is i64 as entries = b.lookup_entries;
+    let is i64 as i with mut = 0;
+    while (i < entries * 2) {
+        b.lookup[i] = 255;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < entries) {
+        let is i64 as size with mut = i * 8;
+        if (size == 0) { size = 1; }
+        let is i64 as j with mut = 0;
+        while (j < b.bin_count) {
+            let is *Bin as bin = bin_at(b, j);
+            if (bin.slot_size >= size) {
+                let is *u8 as lp = cast(*u8, cast(i64, b.lookup) + i * 2);
+                lp[0] = cast(u8, j & 255);
+                lp[1] = cast(u8, (j >> 8) & 255);
+                break;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn lookup_bin(b as *Bins, size as i64) as i64 {
+    let is i64 as idx with mut = size >> 3;
+    if ((size & 7) != 0) { idx = idx + 1; }
+    if (idx >= b.lookup_entries) { return 0 - 1; }
+    let is *u8 as lp = cast(*u8, cast(i64, b.lookup) + idx * 2);
+    let is i64 as bin_idx = cast(i64, lp[0]) + cast(i64, lp[1]) * 256;
+    if (bin_idx >= 255) { return 0 - 1; }
+    return bin_idx;
+}
+
+fn bins_which(b as *Bins, size as i64) as i64 {
+    if (size <= 0) { return 0; }
+    let is i64 as idx = lookup_bin(b, size);
+    if (idx < 0) { return 0; }
+    return bin_at(b, idx).slot_size;
+}
+
+// --- Alloc: O(1) lookup + O(1) freelist pop (from bins.cst:262) ---
+fn bins_alloc(b as *Bins, size as i64) as *u8 {
+    if (size <= 0) { return cast(*u8, 0); }
+
+    let is i64 as idx = lookup_bin(b, size);
+    if (idx < 0) {
+        pmm.panic("bins: bad size class", 20);   // unreachable: >4096 -> large
+    }
+
+    let is *Bin as bin = bin_at(b, idx);
+
+    // Search existing slabs for a free slot.
+    let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
+    while (cast(i64, slab) != 0) {
+        if (cast(i64, slab.freelist) != 0) {
+            let is *u8 as slot = slab.freelist;
+            let is *i64 as np = cast(*i64, slot);
+            slab.freelist = cast(*u8, *np);
+            let is i64 as si = (cast(i64, slot) - cast(i64, slab.region)) / bin.alloc_size;
+            let is *u8 as hdr = cast(*u8, slot);
+            hdr[0] = cast(u8, idx);
+            hdr[1] = cast(u8, si & 255);
+            hdr[2] = cast(u8, (si >> 8) & 255);
+            hdr[3] = cast(u8, (si >> 16) & 255);
+            bit_clear(slab.bitmap, si);
+            slab.used_slots = slab.used_slots + 1;
+            return cast(*u8, cast(i64, slot) + HEADER_SIZE);
+        }
+        slab = cast(*Slab, slab.next);
+    }
+
+    // No free slot — grow: create a new slab.
+    let is *Slab as new_slab = bslab_create(bin.alloc_size, bin.page_size, idx);
+    if (cast(i64, new_slab) == 0) { return cast(*u8, 0); }
+
+    new_slab.next = bin.slab_head;
+    bin.slab_head = cast(*u8, new_slab);
+
+    let is *u8 as slot = new_slab.freelist;
+    let is *i64 as np = cast(*i64, slot);
+    new_slab.freelist = cast(*u8, *np);
+    let is *u8 as hdr = cast(*u8, slot);
+    hdr[0] = cast(u8, idx);
+    hdr[1] = 0;
+    hdr[2] = 0;
+    hdr[3] = 0;
+    bit_clear(new_slab.bitmap, 0);
+    new_slab.used_slots = 1;
+    return cast(*u8, cast(i64, slot) + HEADER_SIZE);
+}
+
+// --- Free: O(1) header read + bitmap test + freelist push (bins.cst:329) ---
+// Fail-loud (kernel posture): the std silently returns on a bad/double
+// free; here we panic, matching the old slab path's verify_* panics.
+fn bins_free(b as *Bins, ptr as *u8) as void {
+    if (cast(i64, ptr) == 0) { return; }
+
+    let is *u8 as slot = cast(*u8, cast(i64, ptr) - HEADER_SIZE);
+    let is *u8 as hdr = cast(*u8, slot);
+    let is i64 as idx = cast(i64, hdr[0]);
+    let is i64 as si = cast(i64, hdr[1]) + cast(i64, hdr[2]) * 256 + cast(i64, hdr[3]) * 65536;
+
+    if (idx >= b.bin_count) {
+        pmm.panic("kfree: bad bins header", 22);
+    }
+
+    let is *Bin as bin = bin_at(b, idx);
+
+    let is *Slab as slab with mut = cast(*Slab, bin.slab_head);
+    while (cast(i64, slab) != 0) {
+        let is i64 as start = cast(i64, slab.region);
+        let is i64 as end = start + slab.region_size;
+        if (cast(i64, slot) >= start && cast(i64, slot) < end) {
+            if (bit_test(slab.bitmap, si) == cast(i32, 1)) {
+                pmm.panic("kfree: double free", 18);
+            }
+            bit_set(slab.bitmap, si);
+            slab.used_slots = slab.used_slots - 1;
+            let is *i64 as np = cast(*i64, slot);
+            *np = cast(i64, slab.freelist);
+            slab.freelist = slot;
+            return;
+        }
+        slab = cast(*Slab, slab.next);
+    }
+    pmm.panic("kfree: ptr not in any slab", 26);
+}
+
+// ============================================================
+// Large-allocation extents (>4096) — ordered {vaddr, order} table
+// ============================================================
+
+fn large_vaddr_at(i as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &large_table_raw) + i * 16);
+    return p[0];
+}
+
+fn large_order_at(i as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &large_table_raw) + i * 16 + 8);
+    return p[0];
+}
+
+fn large_set(i as i64, vaddr as i64, order as i64) as void {
+    let is *i64 as pv = cast(*i64, cast(i64, &large_table_raw) + i * 16);
+    pv[0] = vaddr;
+    let is *i64 as po = cast(*i64, cast(i64, &large_table_raw) + i * 16 + 8);
+    po[0] = order;
+}
+
+// Binary search by vaddr; returns the entry index or -1.
+fn large_find(vaddr as i64) as i64 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = large_count - 1;
+    while (lo <= hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as m = large_vaddr_at(mid);
+        if (m == vaddr) { return mid; }
+        if (m < vaddr) { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return 0 - 1;
+}
+
+// Insert keeping the table sorted ascending by vaddr.
+fn large_insert(vaddr as i64, order as i64) as void {
+    if (large_count >= LARGE_CAP) {
+        pmm.panic("large_extents table exhausted", 29);
+    }
+    let is i64 as i with mut = large_count;
+    while (i > 0) {
+        let is i64 as prev = large_vaddr_at(i - 1);
+        if (prev <= vaddr) { break; }
+        large_set(i, prev, large_order_at(i - 1));
+        i = i - 1;
+    }
+    large_set(i, vaddr, order);
+    large_count = large_count + 1;
+}
+
+// Remove the entry at idx (shift the tail down by one).
+fn large_remove_at(idx as i64) as void {
+    let is i64 as i with mut = idx;
+    while (i < large_count - 1) {
+        large_set(i, large_vaddr_at(i + 1), large_order_at(i + 1));
+        i = i + 1;
+    }
+    large_count = large_count - 1;
+}
+
+fn large_extents_init() as void {
+    large_count = 0;
+}
+
+// ============================================================
+// Bins init — wire the static kbins control block (14 kernel classes)
+// ============================================================
+fn bins_init() as void {
+    // bins trusts sizeof(Bin)/sizeof(Slab) for its strides — guard it.
+    if (sizeof(Bin) != 32)  { pmm.panic("bins: sizeof(Bin) != 32", 23); }
+    if (sizeof(Slab) != 56) { pmm.panic("bins: sizeof(Slab) != 56", 24); }
+
+    kbins.bin_data = cast(*u8, &kbins_bin_data);
+    kbins.bin_count = 14;
+    kbins.page_size = 65536;
+    kbins.lookup = cast(*u8, &kbins_lookup);
+    kbins.lookup_entries = 514;
+
+    let is [14]i64 as sizes;
+    sizes[0] = 16;    sizes[1] = 32;    sizes[2] = 64;    sizes[3] = 96;
+    sizes[4] = 128;   sizes[5] = 192;   sizes[6] = 256;   sizes[7] = 384;
+    sizes[8] = 512;   sizes[9] = 768;   sizes[10] = 1024; sizes[11] = 1536;
+    sizes[12] = 2048; sizes[13] = 4096;
+
+    let is i64 as i with mut = 0;
+    while (i < 14) {
+        let is *Bin as bin = bin_at(&kbins, i);
+        bin.slot_size = sizes[i];
+        bin.alloc_size = sizes[i] + HEADER_SIZE;
+        bin.slab_head = cast(*u8, 0);
+        bin.page_size = 65536;
+        i = i + 1;
+    }
+    build_lookup(&kbins);
+}
+
+// ============================================================
 // kmalloc / kfree
 // ============================================================
 
@@ -1178,62 +1557,70 @@ fn kmalloc(size as i64, flags as i32) as i64 {
     if (size == 0) { return 0; }
 
     if (size > KMALLOC_MAX_SIZE) {
-        // Large kmalloc: direct buddy allocation — pmm.alloc_pages
-        // has its own lock, so no heap_lock needed here.
+        // Large: page allocation + record in the large_extents table.
+        // pmm.alloc_pages has its own lock and honors ALLOC_ZERO natively
+        // (flags passthrough), so the page comes zeroed when requested.
         let is i64 as pages_needed = pmm.align_up(size, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
         let is i32 as order = ceil_log2(pages_needed);
         let is i32 as pfn = pmm.alloc_pages(flags, order, pmm.USAGE_KERNEL, cast(i32, 0));
         if (pfn == pmm.PFN_NONE) { return 0; }
         let is i64 as ptr = pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
+        hirq_save();
+        large_insert(ptr, cast(i64, order));
+        hirq_restore();
         return ptr;
     }
 
-    let is i32 as cls = size_to_class(size);
-    if (cls < cast(i32, 0)) {
-        // Unreachable: size > KMALLOC_MAX_SIZE is handled above,
-        // size <= 4096 always yields a valid class
-        pmm.panic("kmalloc: invalid size class", 28);
+    // Small: bins. heap_lock serializes kbins/slab freelist mutation;
+    // bins_alloc may call pmm.alloc_pages on a new-slab miss (heap nests
+    // OUTSIDE pmm, so holding heap_lock across it is the correct order).
+    hirq_save();
+    let is i64 as ptr = cast(i64, bins_alloc(&kbins, size));
+    hirq_restore();
+    if (ptr == 0) { return 0; }
+
+    // ALLOC_ZERO contract: bins does NOT re-zero reused slots, so zero the
+    // slot here (outside the lock, like the old alloc_debug_checks path).
+    // Zero the class slot_size — matches the old behavior (it zeroed the
+    // cache's object_size = class size), and exactly fills the slot body.
+    if ((flags & cast(i32, pmm.ALLOC_ZERO)) != cast(i32, 0)) {
+        let is i64 as zlen = bins_which(&kbins, size);
+        let is *u8 as p = cast(*u8, ptr);
+        let is i64 as i with mut = 0;
+        while (i < zlen) { p[i] = 0; i = i + 1; }
     }
-    // kmalloc_cache_get is a plain table read; kcache_alloc takes
-    // heap_lock internally, so callers don't have to.
-    let is i64 as c = kmalloc_cache_get(cls);
-    if (c == 0) { return 0; }
-    return kcache_alloc(c, flags);
+    return ptr;
 }
 
 fn kfree(ptr as i64) as void {
     if (ptr == 0) { return; }
 
-    let is i32 as pfn = virt_to_pfn(ptr);
-    if (pmm.page_present(pfn) == cast(i32, 0)) {
-        pmm.panic("kfree: bad ptr", 14);
+    // No pmm.page_usage read: large allocations are page-aligned, so a
+    // non-page-aligned ptr is definitely a bins block. A page-aligned ptr
+    // MIGHT be large OR a bins slot that happens to be page-aligned — the
+    // large_extents membership test is authoritative; a miss falls through
+    // to bins_free.
+    let is i32 as do_free_pfn with mut = cast(i32, 0);
+    let is i32 as pfn with mut = cast(i32, 0);
+
+    hirq_save();
+    let is i64 as lidx with mut = 0 - 1;
+    if ((ptr & 0xFFF) == 0) {
+        lidx = large_find(ptr);
     }
+    if (lidx >= 0) {
+        large_remove_at(lidx);
+        pfn = virt_to_pfn(ptr);
+        do_free_pfn = cast(i32, 1);
+    } else {
+        bins_free(&kbins, cast(*u8, ptr));
+    }
+    hirq_restore();
 
-    let is i32 as usage = pmm.page_usage(pfn);
-
-    if (usage == cast(i32, pmm.USAGE_KERNEL)) {
-        // Large kmalloc — return to buddy (pmm has its own lock).
+    // Deferred outside heap_lock (pmm has its own lock); mirrors kcache_free.
+    if (do_free_pfn != cast(i32, 0)) {
         pmm.free_pages(pfn);
-        return;
     }
-
-    if (usage == cast(i32, pmm.USAGE_KERNEL_HEAP)) {
-        let is i32 as sid = slab_id_get_pfn(pfn);
-        if (sid == SLAB_NONE) {
-            pmm.panic("kfree: no slab_id", 17);
-        }
-        // slab_table_get is a plain table read; kcache_free takes
-        // heap_lock internally.
-        let is i64 as s = slab_table_get(sid);
-        if (s == 0) {
-            pmm.panic("kfree: null slab", 16);
-        }
-        let is i64 as c = slab_cache_addr(s);
-        kcache_free(c, ptr);
-        return;
-    }
-
-    pmm.panic("kfree: bad usage", 16);
 }
 
 // ============================================================
@@ -1283,6 +1670,15 @@ fn init() as void {
         cls = cls + cast(i32, 1);
     }
     serial.println("  14 kmalloc caches ok", 22);
+
+    // Phase B sub-phase 1: bins for the generic kmalloc(<=4096) path and the
+    // large_extents table for >4096. PMM is up (main.cst:120 precedes :122).
+    // The slab bootstrap above stays — sched/process call kcache_* directly
+    // for thread_cache/proc_cache (lean-out is sub-phase 3).
+    bins_init();
+    serial.println("  bins ok", 9);
+    large_extents_init();
+    serial.println("  large_extents ok", 18);
 
     serial.println("heap: ready", 11);
 }
