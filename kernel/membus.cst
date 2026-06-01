@@ -1,0 +1,179 @@
+// membus.cst — the memory bus: RAM regions as nodes in the hardware tree.
+//
+// Part of the L0 model (memory-model.md): the Limine memory map becomes
+// the enumerate of a synthetic Bus, so each usable RAM region is a node
+// in the hardware tree, DFS-navigable like any device. This is the
+// native introspection mechanism in causticos (walk the tree), not a
+// /proc/mem file. The driver framework is untouched — a new bus is just
+// a new Bus struct with fn pointers, exactly like pci/dummybus.
+//
+// R1: this is representation only. The PMM stays the in-kernel allocator
+// (it can't be bound by the framework it bootstraps); these nodes export
+// what the PMM already knows so it's introspectable and so CAP_DMA (A2c)
+// has a place to hang.
+
+use "driver.cst" as driver;
+use "pmm.cst" as pmm;
+use "heap.cst" as heap;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+// Statically-allocated, zero-initialized in .bss.
+let is driver.Bus as mem_bt;
+let is driver.BusNode as mem_bi;
+
+// 4 GiB, the 32-bit DMA boundary.
+let is i64 as FOUR_GIB = 4294967296;
+
+// Per-region info hung off each RAM Hardware's `private`. All-i64 to
+// avoid the mixed-width struct miscompile (caustic_language_gotchas #6).
+struct MemRegion {
+    base as i64;       // physical base
+    len as i64;        // bytes
+    below_4g as i64;   // 1 iff [base, base+len) lies entirely below 4 GiB
+}
+
+// get_match_field selectors for the memory bus.
+let is i64 as MEM_FIELD_BELOW_4G   = 0;
+let is i64 as MEM_FIELD_SIZE_PAGES = 1;
+let is i64 as MEM_FIELD_BASE_PFN   = 2;
+
+// Name a RAM node "ramN" (N decimal, regions are few).
+fn set_ram_name(d as *driver.Hardware, idx as i64) as void {
+    let is *u8 as nm = cast(*u8, d);
+    nm[0] = cast(u8, 114);   // 'r'
+    nm[1] = cast(u8, 97);    // 'a'
+    nm[2] = cast(u8, 109);   // 'm'
+    if (idx < 10) {
+        nm[3] = cast(u8, 48 + idx);
+        nm[4] = cast(u8, 0);
+    } else {
+        nm[3] = cast(u8, 48 + (idx / 10));
+        nm[4] = cast(u8, 48 + (idx % 10));
+        nm[5] = cast(u8, 0);
+    }
+}
+
+// Bus enumerate: create one Hardware per usable RAM region the PMM knows.
+fn mem_enumerate(bi as *driver.BusNode) as void {
+    let is i64 as n = pmm.region_count();
+    serial.print("membus: enumerate ", 18);
+    util.print_num(n);
+    serial.println(" regions", 8);
+
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as base = pmm.region_base(i);
+        let is i64 as len = pmm.region_len(i);
+
+        let is *driver.Hardware as d = driver.hardware_alloc(sizeof(driver.Hardware), 8);
+        if (cast(i64, d) == 0) {
+            serial.println("membus: hardware_alloc failed", 29);
+            return;
+        }
+        set_ram_name(d, i);
+
+        let is i64 as ra = heap.kmalloc(sizeof(MemRegion), 0);
+        if (ra == 0) {
+            serial.println("membus: region alloc failed", 27);
+            return;
+        }
+        let is *MemRegion as r = cast(*MemRegion, ra);
+        r.base = base;
+        r.len = len;
+        if ((base + len) <= FOUR_GIB) {
+            r.below_4g = cast(i64, 1);
+        } else {
+            r.below_4g = cast(i64, 0);
+        }
+        d.private = cast(*u8, ra);
+
+        let is i32 as rc = driver.hardware_register(d, cast(*driver.Hardware, bi));
+        if (rc != driver.OK) {
+            serial.println("membus: hardware_register failed", 31);
+        }
+        i = i + 1;
+    }
+}
+
+fn mem_get_match_field(hw as *driver.Hardware, field as i64) as i64 {
+    let is *MemRegion as r = cast(*MemRegion, hw.private);
+    if (cast(i64, r) == 0) { return cast(i64, 0 - 1); }
+    if (field == MEM_FIELD_BELOW_4G)   { return r.below_4g; }
+    if (field == MEM_FIELD_SIZE_PAGES) { return r.len >> 12; }
+    if (field == MEM_FIELD_BASE_PFN)   { return r.base >> 12; }
+    return cast(i64, 0 - 1);
+}
+
+// RAM nodes carry no BARs and no IRQ line — N/A for both resolvers.
+fn mem_get_bar_info(hw as *driver.Hardware, idx as i64, out_phys as *i64) as i32 {
+    return driver.NOT_SUPPORTED;
+}
+
+fn mem_get_irq_line(hw as *driver.Hardware) as i64 {
+    return cast(i64, 0 - 1);
+}
+
+// DFS the hardware tree from root, logging RAM regions (proof that the
+// regions are tree nodes reachable by structural navigation).
+fn dfs_log(d as *driver.Hardware) as void {
+    if (cast(i64, d) == 0) { return; }
+    // RAM nodes: on the mem bus AND carrying a MemRegion (the bus node
+    // itself is on the mem bus but has no private region).
+    if (cast(i64, d.bus) == cast(i64, &mem_bt)) {
+        if (cast(i64, d.private) != 0) {
+            let is *MemRegion as r = cast(*MemRegion, d.private);
+            let is i32 as nl with mut = 0;
+            let is *u8 as nm = cast(*u8, d);
+            while (nl < 32) {
+                if (nm[nl] == cast(u8, 0)) { nl = 32; }
+                else { nl = nl + 1; }
+            }
+            // recompute exact length (loop above stops at 32 on null)
+            let is i32 as ln with mut = 0;
+            while (ln < 32 && nm[ln] != cast(u8, 0)) { ln = ln + 1; }
+            serial.print("  ", 2);
+            serial.print(nm, cast(i64, ln));
+            serial.print(" base=", 6);
+            util.print_hex(r.base);
+            serial.print(" size=", 6);
+            util.print_hex(r.len);
+            serial.print(" below4g=", 9);
+            util.print_num(r.below_4g);
+            serial.println("", 0);
+        }
+    }
+    let is *driver.Hardware as c with mut = d.first_child;
+    while (cast(i64, c) != 0) {
+        dfs_log(c);
+        c = c.next_sibling;
+    }
+}
+
+fn smoke() as void {
+    serial.println("membus.smoke: RAM regions via DFS:", 33);
+    dfs_log(driver.get_root());
+    serial.println("membus.smoke: done", 18);
+}
+
+// Called from _kernel_start during Phase 1, before driver_enumerate_all.
+fn register() as void {
+    mem_bt.name[0] = cast(u8, 109);   // 'm'
+    mem_bt.name[1] = cast(u8, 101);   // 'e'
+    mem_bt.name[2] = cast(u8, 109);   // 'm'
+    mem_bt.enumerate_node = fn_ptr(mem_enumerate);
+    mem_bt.get_match_field = fn_ptr(mem_get_match_field);
+    mem_bt.get_bar_info = fn_ptr(mem_get_bar_info);
+    mem_bt.get_irq_line = fn_ptr(mem_get_irq_line);
+    driver.bus_register(&mem_bt);
+
+    // BusNode: preset base.bus before register (spec fix #15).
+    mem_bi.base.bus = &mem_bt;
+    mem_bi.base.name[0] = cast(u8, 109);  // 'm'
+    mem_bi.base.name[1] = cast(u8, 101);  // 'e'
+    mem_bi.base.name[2] = cast(u8, 109);  // 'm'
+    mem_bi.base.name[3] = cast(u8, 48);   // '0'
+    driver.bus_node_register(&mem_bi, driver.get_root());
+
+    serial.println("membus: registered", 18);
+}
