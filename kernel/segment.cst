@@ -110,6 +110,29 @@ fn seg_create(npages as i64, flags as i64) as i64 {
     return ko;
 }
 
+// seg_create_foreign: a segment over frames the caller ALREADY owns (a contiguous
+// physical range — a kernel-allocated buffer, a device's MMIO, a surface's
+// backbuffer). SEG_FOREIGN: detach unmaps but NEVER frees the frames; the
+// external owner's lifetime governs them. This is the honest mechanism behind
+// "memory I don't own, shared by fd" — what the surface's backbuffer-by-fd does,
+// now a generic key. Returns the *KObject as i64, or 0 on OOM.
+fn seg_create_foreign(phys as i64, npages as i64, flags as i64) as i64 {
+    if (phys == 0 || npages <= 0) { return 0; }
+    let is i64 as addr = heap.kmalloc(sizeof(SegPriv), pmm.ALLOC_ZERO);
+    if (addr == 0) { return 0; }
+    let is *SegPriv as s = cast(*SegPriv, addr);
+    s.frames = phys;
+    s.npages = npages;
+    s.refcount = 1;
+    s.flags = (flags & ~SEG_OWNED) | SEG_FOREIGN;   // not ours: detach never frees
+    s.pfn = 0;
+    s.order = 0;
+    s.pages_ptr = 0;
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_SEGMENT, &SEGMENT_OPS, addr);
+    if (ko == 0) { heap.kfree(addr); return 0; }
+    return ko;
+}
+
 // Free a SegPriv's backing frames (not the SegPriv struct). SEG_OWNED only.
 fn seg_free_frames(s as *SegPriv) as void {
     if ((s.flags & SEG_OWNED) == 0) { return; }
@@ -339,6 +362,40 @@ fn smoke() as void {
         }
         kobject.ko_unref(plko);                     // last ref -> frees the page-list frames
         if (pmm.page_state(pl_pfn0) != pmm.PAGE_FREE) { ok = cast(i32, 0); }
+    }
+
+    // SEG_FOREIGN: a segment over frames WE own externally. Attach + read/write
+    // works, but detach must NOT free the frames — the external owner does.
+    let is i32 as fpfn = pmm.alloc_pages(pmm.ALLOC_ZERO, cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0));
+    if (fpfn == pmm.PFN_NONE) { ok = cast(i32, 0); }
+    else {
+        let is i64 as fphys = pmm.pfn_to_phys(fpfn);
+        let is i64 as fko = seg_create_foreign(fphys, 1, 0);
+        if (fko == 0) { ok = cast(i32, 0); }
+        else {
+            let is *kobject.KObject as fk = cast(*kobject.KObject, fko);
+            let is *SegPriv as fs = cast(*SegPriv, fk.priv);
+            if ((fs.flags & SEG_FOREIGN) == 0) { ok = cast(i32, 0); }
+            if ((fs.flags & SEG_OWNED) != 0) { ok = cast(i32, 0); }   // not owned
+            let is *vma.Aspace as a4 = vma.aspace_create();
+            if (cast(i64, a4) == 0) { ok = cast(i32, 0); }
+            else {
+                let is i64 as fva = seg_attach(fk.priv, cast(i64, a4), 0, pr);
+                if (fva < 0) { ok = cast(i32, 0); }
+                else {
+                    let is i64 as fph = vmm.virt_to_phys_walk(a4.pml4_phys, fva);
+                    if (fph != fphys) { ok = cast(i32, 0); }            // maps OUR frame
+                    let is *i64 as fp = cast(*i64, pmm.phys_to_virt(fph));
+                    fp[0] = cast(i64, 0xF0E1);
+                    if (fp[0] != cast(i64, 0xF0E1)) { ok = cast(i32, 0); }
+                }
+                vma.aspace_destroy(a4);
+            }
+            kobject.ko_unref(fko);                                     // detach: SEG_FOREIGN -> no free
+            if (pmm.page_state(fpfn) != pmm.PAGE_ALLOCATED) { ok = cast(i32, 0); }   // frame survived
+        }
+        pmm.free_pages(fpfn, cast(i32, 0));                            // WE free it
+        if (pmm.page_state(fpfn) != pmm.PAGE_FREE) { ok = cast(i32, 0); }
     }
 
     if (ok == cast(i32, 1)) { serial.println("segment_smoke: PASS", 19); }
