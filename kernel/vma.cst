@@ -25,6 +25,7 @@ use "pmm.cst" as pmm;
 use "vmm.cst" as vmm;
 use "lock.cst" as lock;
 use "kobject.cst" as kobject;
+use "abi.cst" as abi;
 
 // ============================================================
 // Constants — flags + helpers
@@ -286,83 +287,98 @@ fn unmap_vma_pages(pml4 as i64, v as *Vma) as void {
 }
 
 // ============================================================
-// Public mmap / munmap
+// reserve / commit / decommit / release — the strict split (Phase E)
+//
+// reserve = the VMA's existence (VA claimed, ZERO pages backed). commit = back
+// the absent pages with fresh zero frames. "committed" is STRUCTURAL: a page is
+// committed iff its PTE is present; there is no per-page state field. decommit
+// drops the frames but keeps the reservation; release (munmap) removes the VMA.
+// The legacy SYS_MMAP path = reserve+commit-eager in one shot (mmap_anon below).
+// The *_locked primitives assume the caller holds the aspace lock.
 // ============================================================
 
-// mmap_anon: reserve a `len`-byte region (rounded up to pages) at
-// `va_hint` (rounded down) and back it with zero pages.
-//
-// `prot` is a leaf-PTE bit set already containing PTE_USER /
-// PTE_WRITE / PTE_NX as appropriate (no PTE_PRESENT — we add that).
-// `flags` is the VMA_* bitmask. If VMA_FIXED is set the VMA must
-// land at the exact hint or fail; otherwise we walk forward until
-// we find a free spot.
-//
-// Returns the start VA on success, -1 on overlap / OOM.
-fn mmap_anon(a as *Aspace, va_hint as i64, len as i64,
-             prot as i64, flags as i64) as i64 {
-    if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
-    if (len <= 0) { return cast(i64, 0 - 1); }
-
+// reserve_locked: claim a `len`-byte VA window at `va_hint` (VMA_FIXED) or the
+// first free spot (else), create the VMA, and return its start VA — backing
+// NOTHING. Returns -1 on overlap / no-fit / OOM.
+fn reserve_locked(a as *Aspace, va_hint as i64, len as i64,
+                  prot as i64, flags as i64) as i64 {
     let is i64 as start with mut = page_align_down(va_hint);
     let is i64 as size = page_align_up(len);
-    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
 
     if ((flags & VMA_FIXED) != 0) {
         if (vma_range_overlaps(a, start, start + size) != 0) {
-            lock.release_irq(lk_ptr(a), f_internal);
             return cast(i64, 0 - 1);
         }
     } else {
         let is i64 as picked = vma_find_free_va(a, start, size);
-        if (picked < 0) {
-            lock.release_irq(lk_ptr(a), f_internal);
-            return cast(i64, 0 - 1);
-        }
+        if (picked < 0) { return cast(i64, 0 - 1); }
         start = picked;
     }
 
     let is *Vma as v = vma_alloc(start, start + size, prot, flags | VMA_ANON);
-    if (cast(i64, v) == 0) {
-        lock.release_irq(lk_ptr(a), f_internal);
-        return cast(i64, 0 - 1);
-    }
-
-    // Eager backing: allocate + map every page now. Demand paging
-    // (via #PF on first touch) lands in a later step once the
-    // page-fault dispatcher learns to consult VMAs.
-    let is i64 as p with mut = start;
-    while (p < start + size) {
-        if (back_anon_page(a.pml4_phys, p, prot) != 0) {
-            // Roll back: unmap everything we already mapped, free
-            // the partially-built VMA.
-            let is i64 as q with mut = start;
-            while (q < p) {
-                let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, q);
-                if (old != 0) { pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0)); }
-                q = q + pmm.PAGE_SIZE;
-            }
-            heap.kpool_free(vma_pool, cast(i64, v));
-            lock.release_irq(lk_ptr(a), f_internal);
-            return cast(i64, 0 - 1);
-        }
-        p = p + pmm.PAGE_SIZE;
-    }
-
+    if (cast(i64, v) == 0) { return cast(i64, 0 - 1); }
     vma_insert_sorted(a, v);
-    lock.release_irq(lk_ptr(a), f_internal);
     return start;
 }
 
-// munmap: drop every VMA whose range falls fully inside [va, va+len).
-// Partial-overlap split is left for a later commit; today's user
-// code only unmaps regions it mapped whole.
-fn munmap(a as *Aspace, va as i64, len as i64) as i32 {
-    if (cast(i64, a) == 0) { return cast(i32, 0 - 1); }
-    let is i64 as start = page_align_down(va);
-    let is i64 as end = page_align_up(va + len);
-    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+// commit_locked: back every not-yet-present page in [vaddr, vaddr+len) with a
+// fresh zero frame. Every page must fall inside a reserved VMA (else E_INVAL).
+// Already-present pages are skipped (idempotent; avoids the double-map panic).
+// Returns 0 / E_INVAL / E_NOMEM. On allocator failure the pages this call
+// backed are rolled back (the range is reserved-and-absent by construction:
+// reserve backs nothing, commit is the only backer).
+fn commit_locked(a as *Aspace, vaddr as i64, len as i64, prot as i64) as i32 {
+    if (len <= 0) { return cast(i32, abi.E_INVAL); }
+    let is i64 as start = page_align_down(vaddr);
+    let is i64 as end = page_align_up(vaddr + len);
 
+    // Coverage: every page must be inside a reserved VMA.
+    let is i64 as c with mut = start;
+    while (c < end) {
+        if (cast(i64, vma_find(a, c)) == 0) { return cast(i32, abi.E_INVAL); }
+        c = c + pmm.PAGE_SIZE;
+    }
+
+    let is i64 as p with mut = start;
+    while (p < end) {
+        if (vmm.pte_lookup(a.pml4_phys, p) == 0) {
+            if (back_anon_page(a.pml4_phys, p, prot) != 0) {
+                // Roll back the pages backed so far in this call.
+                let is i64 as q with mut = start;
+                while (q < p) {
+                    let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, q);
+                    if (old != 0) { pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0)); }
+                    q = q + pmm.PAGE_SIZE;
+                }
+                return cast(i32, abi.E_NOMEM);
+            }
+        }
+        p = p + pmm.PAGE_SIZE;
+    }
+    return 0;
+}
+
+// decommit_locked: drop the frames backing the present pages in [vaddr,
+// vaddr+len), keeping the reservation (the VMA stays). The pages were present,
+// so this needs a cross-cpu TLB shootdown on SMP — added in a later sub-step;
+// today it does the local invlpg vmm_unmap_page already issues (same property
+// as the existing munmap path).
+fn decommit_locked(a as *Aspace, vaddr as i64, len as i64) as void {
+    let is i64 as start = page_align_down(vaddr);
+    let is i64 as end = page_align_up(vaddr + len);
+    let is i64 as p with mut = start;
+    while (p < end) {
+        let is i64 as old = vmm.vmm_unmap_page(a.pml4_phys, p);
+        if (old != 0) { pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0)); }
+        p = p + pmm.PAGE_SIZE;
+    }
+}
+
+// release_locked: remove every VMA whose range falls fully inside [start, end)
+// — decommitting its pages (unmap_vma_pages frees the present ones) and freeing
+// the VMA node. Returns 1 if it removed anything, 0 otherwise. This is munmap's
+// body and mmap_anon's rollback. The sorted list lets us early-exit.
+fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
     let is *Vma as cur with mut = a.vma_head;
     let is i32 as removed_any with mut = 0;
     while (cast(i64, cur) != 0) {
@@ -377,8 +393,82 @@ fn munmap(a as *Aspace, va as i64, len as i64) as i32 {
         }
         cur = next;
     }
+    return removed_any;
+}
+
+// ============================================================
+// Public mmap / munmap
+// ============================================================
+
+// mmap_anon: the legacy eager path = reserve + commit in one shot, under a
+// single lock so it stays atomic (rollback removes the reservation on commit
+// failure). `prot` already carries PTE_USER/PTE_WRITE/PTE_NX (no PTE_PRESENT —
+// back_anon_page adds it). VMA_FIXED honours the exact hint or fails.
+// Returns the start VA, or -1 on overlap / OOM.
+fn mmap_anon(a as *Aspace, va_hint as i64, len as i64,
+             prot as i64, flags as i64) as i64 {
+    if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
+    if (len <= 0) { return cast(i64, 0 - 1); }
+
+    let is i64 as size = page_align_up(len);
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+
+    let is i64 as start = reserve_locked(a, va_hint, len, prot, flags);
+    if (start < 0) {
+        lock.release_irq(lk_ptr(a), f_internal);
+        return cast(i64, 0 - 1);
+    }
+
+    if (commit_locked(a, start, size, prot) != cast(i32, 0)) {
+        // Undo the reservation (and any partial backing) and fail.
+        release_locked(a, start, start + size);
+        lock.release_irq(lk_ptr(a), f_internal);
+        return cast(i64, 0 - 1);
+    }
+
     lock.release_irq(lk_ptr(a), f_internal);
-    if (removed_any == 0) { return cast(i32, 0 - 1); }
+    return start;
+}
+
+// munmap = release: drop every VMA fully inside [va, va+len). Partial-overlap
+// split is left for later; today's user code only unmaps whole regions.
+fn munmap(a as *Aspace, va as i64, len as i64) as i32 {
+    if (cast(i64, a) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as start = page_align_down(va);
+    let is i64 as end = page_align_up(va + len);
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+    let is i32 as removed = release_locked(a, start, end);
+    lock.release_irq(lk_ptr(a), f_internal);
+    if (removed == 0) { return cast(i32, 0 - 1); }
+    return 0;
+}
+
+// reserve: claim a VA window, back nothing. Returns start VA or -1.
+fn reserve(a as *Aspace, va_hint as i64, len as i64,
+           prot as i64, flags as i64) as i64 {
+    if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
+    if (len <= 0) { return cast(i64, 0 - 1); }
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+    let is i64 as start = reserve_locked(a, va_hint, len, prot, flags);
+    lock.release_irq(lk_ptr(a), f_internal);
+    return start;
+}
+
+// commit: back [vaddr, vaddr+len) with zero frames. Returns 0 / E_INVAL / E_NOMEM.
+fn commit(a as *Aspace, vaddr as i64, len as i64, prot as i64) as i32 {
+    if (cast(i64, a) == 0) { return cast(i32, abi.E_INVAL); }
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+    let is i32 as rc = commit_locked(a, vaddr, len, prot);
+    lock.release_irq(lk_ptr(a), f_internal);
+    return rc;
+}
+
+// decommit: drop the frames for [vaddr, vaddr+len), keep the reservation.
+fn decommit(a as *Aspace, vaddr as i64, len as i64) as i32 {
+    if (cast(i64, a) == 0) { return cast(i32, abi.E_INVAL); }
+    let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
+    decommit_locked(a, vaddr, len);
+    lock.release_irq(lk_ptr(a), f_internal);
     return 0;
 }
 
