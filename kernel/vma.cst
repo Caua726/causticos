@@ -430,28 +430,83 @@ fn decommit_locked(a as *Aspace, vaddr as i64, len as i64) as void {
     a.committed_bytes = a.committed_bytes - dropped * pmm.PAGE_SIZE;
 }
 
-// release_locked: remove every VMA whose range falls fully inside [start, end)
-// — decommitting its pages (unmap_vma_pages frees the present ones) and freeing
-// the VMA node. Returns 1 if it removed anything, 0 otherwise. This is munmap's
-// body and mmap_anon's rollback. The sorted list lets us early-exit.
+// unmap_range_pages: unmap [os, oe) of a live aspace, freeing the present anon
+// frames (VMA_FILE frames belong to the owner — unmap only). Shoots down before
+// freeing each page. Returns the anon page count freed (the committed_bytes
+// delta). The partial-range counterpart of unmap_vma_pages.
+fn unmap_range_pages(pml4 as i64, os as i64, oe as i64, is_file as i64) as i64 {
+    let is i64 as freed with mut = 0;
+    let is i64 as p with mut = os;
+    while (p < oe) {
+        let is i64 as old = vmm.vmm_unmap_page(pml4, p);
+        if (old != 0 && is_file == 0) {
+            sched.tlb_shootdown_all();
+            pmm.free_pages(pmm.phys_to_pfn(old), cast(i32, 0));
+            freed = freed + 1;
+        }
+        p = p + pmm.PAGE_SIZE;
+    }
+    return freed;
+}
+
+// release_locked: unmap [start, end) — the real munmap. A VMA may be wholly
+// inside the range (removed), straddle one end (trimmed head or tail), or
+// contain the range (split in two). Only the overlapping pages are decommitted;
+// the surviving VMA halves keep their pages. Returns 1 if anything changed.
 fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
     let is *Vma as cur with mut = a.vma_head;
-    let is i32 as removed_any with mut = 0;
+    let is i32 as changed with mut = 0;
     while (cast(i64, cur) != 0) {
-        let is *Vma as next with mut = cur.next;
-        if (cur.start >= start && cur.end <= end) {
-            let is i64 as freed = unmap_vma_pages(a.pml4_phys, cur, cast(i32, 1));   // live aspace: shoot down
-            a.committed_bytes = a.committed_bytes - freed * pmm.PAGE_SIZE;
-            a.bookkeeping_bytes = a.bookkeeping_bytes - sizeof(Vma);
-            vma_unlink(a, cur);
-            heap.kpool_free(vma_pool, cast(i64, cur));
-            removed_any = 1;
-        } else if (cur.start >= end) {
-            next = cast(*Vma, 0);
+        let is i64 as vs = cur.start;
+        let is i64 as ve = cur.end;
+        if (vs >= end) { cur = cast(*Vma, 0); }        // sorted: past the range, stop
+        else {
+            let is *Vma as next = cur.next;
+            if (ve <= start) {                          // entirely before the range
+                cur = next;
+            } else {
+                // Overlap [os, oe). Decommit just those pages.
+                let is i64 as os with mut = vs;
+                if (start > os) { os = start; }
+                let is i64 as oe with mut = ve;
+                if (end < oe) { oe = end; }
+                let is i64 as is_file = cur.flags & VMA_FILE;
+                let is i64 as freed = unmap_range_pages(a.pml4_phys, os, oe, is_file);
+                a.committed_bytes = a.committed_bytes - freed * pmm.PAGE_SIZE;
+                changed = 1;
+
+                if (vs >= start) {
+                    if (ve <= end) {
+                        // wholly inside → remove the VMA
+                        a.bookkeeping_bytes = a.bookkeeping_bytes - sizeof(Vma);
+                        vma_unlink(a, cur);
+                        heap.kpool_free(vma_pool, cast(i64, cur));
+                    } else {
+                        cur.start = end;                // straddles the low end → trim head
+                    }
+                } else {
+                    if (ve <= end) {
+                        cur.end = start;                // straddles the high end → trim tail
+                    } else {
+                        // range in the middle → split into [vs,start) and [end,ve)
+                        let is *Vma as nv = vma_alloc(end, ve, cur.prot, cur.flags);
+                        if (cast(i64, nv) != 0) {
+                            nv.file_handle = cur.file_handle;
+                            nv.file_offset = cur.file_offset + (end - vs);
+                            nv.pager = cur.pager;
+                            cur.end = start;
+                            vma_insert_sorted(a, nv);
+                            a.bookkeeping_bytes = a.bookkeeping_bytes + sizeof(Vma);
+                        } else {
+                            cur.end = start;            // OOM: keep the head; tail reservation lost
+                        }
+                    }
+                }
+                cur = next;
+            }
         }
-        cur = next;
     }
-    return removed_any;
+    return changed;
 }
 
 // ============================================================
