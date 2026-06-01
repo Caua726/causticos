@@ -353,9 +353,10 @@ fn match_all() as void {
 // to translate a BAR index into a physical address, then drives
 // driver.mmio_map to produce a virtual pointer. IRQ allocates a
 // driver-framework vector, programs the IOAPIC redirection entry,
-// and registers the spec's on_irq callback. DMA / PORTIO / MEMORY
-// are accepted by the parser but not yet resolved here — added
-// when a real driver needs them.
+// and registers the spec's on_irq callback. DMA allocates a
+// page-aligned (optionally below-4G) buffer tracked on hw.dma_list.
+// PORTIO / MEMORY are accepted by the parser but not yet resolved
+// here — added when a real driver needs them.
 fn populate_caps(b as *Binding) as i32 {
     let is *Spec as s = b.spec;
     let is *driver.Hardware as hw = b.hardware;
@@ -435,6 +436,20 @@ fn populate_caps(b as *Binding) as i32 {
                 }
             }
             b.caps.irq_vector = vector;
+        } else if (req.kind == CAP_DMA) {
+            // req.p1 = size (bytes); req.p2 = flags (bit 0 = 32-bit-only
+            // DMA -> below 4 GiB). The framework allocates a page-aligned,
+            // zeroed buffer, tracks it on hw.dma_list (freed on unbind /
+            // rollback), and hands the driver caps.dma_pool / dma_phys —
+            // so a driver can declare `dma: N` instead of calling
+            // driver.dma_alloc imperatively.
+            let is *driver.DmaBuffer as buf with mut = cast(*driver.DmaBuffer, 0);
+            let is i32 as drc = driver.dma_alloc(hw, cast(u64, req.p1),
+                                                 cast(u64, 4096), cast(u32, req.p2), &buf);
+            if (drc != driver.OK) { rollback_caps(b); return drc; }
+            b.caps.dma_pool = buf.virt;
+            b.caps.dma_phys = buf.phys;
+            b.caps.dma_size = req.p1;
         }
         i = i + 1;
     }
@@ -463,6 +478,20 @@ fn rollback_caps(b as *Binding) as void {
         driver.irq_unregister(b.hardware, cast(u32, b.caps.irq_vector));
         ioapic.release_vector(b.caps.irq_vector);
         b.caps.irq_vector = 0;
+    }
+    if (cast(i64, b.caps.dma_pool) != 0) {
+        let is *driver.DmaBuffer as d with mut = b.hardware.dma_list;
+        while (cast(i64, d) != 0) {
+            if (cast(i64, d.virt) == cast(i64, b.caps.dma_pool)) {
+                driver.dma_free(b.hardware, d);
+                d = cast(*driver.DmaBuffer, 0);
+            } else {
+                d = d.next;
+            }
+        }
+        b.caps.dma_pool = cast(*u8, 0);
+        b.caps.dma_phys = 0;
+        b.caps.dma_size = 0;
     }
 }
 
