@@ -81,11 +81,14 @@ let is [1028]u8 as kbins_lookup;
 // Caustic globals cannot be initialized with cast(*u8,0), so BSS + runtime).
 let is Bins as kbins with mut;
 
-// Large-allocation extents (>4096): ordered table of {i64 vaddr, i64 order}.
-// 256 entries * 16 bytes = 4096. Overflow -> loud panic (see large_insert).
-let is [4096]u8 as large_table_raw;
-let is i64 as large_count with mut = 0;
-let is i64 as LARGE_CAP = 256;
+// Large-allocation extents (>4096): a chain of fixed blocks. The first block
+// lives in BSS; when it fills, more are allocated via kmalloc (LB_BYTES==4096
+// -> bins, never the large path, so no circularity). Unbounded, no hard cap.
+// Block layout: next(8) + count(8) + LB_ENTRIES * {vaddr(8), order(8)}.
+let is [4096]u8 as large_block0_raw;   // first block (BSS)
+let is i64 as large_head with mut = 0; // head of the chain (set in large_extents_init)
+let is i64 as LB_ENTRIES = 255;        // (4096 - 16) / 16 entries per block
+let is i64 as LB_BYTES = 4096;         // 16 + 255*16 == 4096 (<=KMALLOC_MAX -> bins)
 
 // Typed-pool registry (BSS bounded). 16 KPool structs * sizeof(KPool)=40 = 640.
 let is [640]u8 as kpool_registry_raw;
@@ -418,69 +421,115 @@ fn bins_free(b as *Bins, ptr as *u8) as void {
 }
 
 // ============================================================
-// Large-allocation extents (>4096) — ordered {vaddr, order} table
+// Large-allocation extents (>4096) — chained blocks (unbounded)
 // ============================================================
+// A page-aligned kmalloc ptr is a large extent iff it is recorded here. The
+// live large set is tiny, so the chain is walked linearly (no sorting). order
+// is kept for introspection (pmm.free_pages derives the real order from
+// frame_meta). All accessed under heap_lock.
 
-fn large_vaddr_at(i as i64) as i64 {
-    let is *i64 as p = cast(*i64, cast(i64, &large_table_raw) + i * 16);
+fn lb_next(blk as i64) as i64 {
+    let is *i64 as p = cast(*i64, blk);
     return p[0];
 }
-
-fn large_order_at(i as i64) as i64 {
-    let is *i64 as p = cast(*i64, cast(i64, &large_table_raw) + i * 16 + 8);
+fn lb_set_next(blk as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, blk);
+    p[0] = v;
+}
+fn lb_count(blk as i64) as i64 {
+    let is *i64 as p = cast(*i64, blk + 8);
     return p[0];
 }
-
-fn large_set(i as i64, vaddr as i64, order as i64) as void {
-    let is *i64 as pv = cast(*i64, cast(i64, &large_table_raw) + i * 16);
+fn lb_set_count(blk as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, blk + 8);
+    p[0] = v;
+}
+fn lb_ent_vaddr(blk as i64, i as i64) as i64 {
+    let is *i64 as p = cast(*i64, blk + 16 + i * 16);
+    return p[0];
+}
+fn lb_ent_order(blk as i64, i as i64) as i64 {
+    let is *i64 as p = cast(*i64, blk + 16 + i * 16 + 8);
+    return p[0];
+}
+fn lb_set_ent(blk as i64, i as i64, vaddr as i64, order as i64) as void {
+    let is *i64 as pv = cast(*i64, blk + 16 + i * 16);
     pv[0] = vaddr;
-    let is *i64 as po = cast(*i64, cast(i64, &large_table_raw) + i * 16 + 8);
+    let is *i64 as po = cast(*i64, blk + 16 + i * 16 + 8);
     po[0] = order;
 }
 
-// Binary search by vaddr; returns the entry index or -1.
-fn large_find(vaddr as i64) as i64 {
-    let is i64 as lo with mut = 0;
-    let is i64 as hi with mut = large_count - 1;
-    while (lo <= hi) {
-        let is i64 as mid = (lo + hi) / 2;
-        let is i64 as m = large_vaddr_at(mid);
-        if (m == vaddr) { return mid; }
-        if (m < vaddr) { lo = mid + 1; } else { hi = mid - 1; }
-    }
-    return 0 - 1;
-}
-
-// Insert keeping the table sorted ascending by vaddr. Self-locking.
+// Self-locking. Records {vaddr, order}; when the tail block is full it grows
+// the chain by a bins-backed block, BUILT UNLOCKED (LB_BYTES<=KMALLOC_MAX so
+// kmalloc routes to bins, never back to the large path — no circularity).
 fn large_insert(vaddr as i64, order as i64) as void {
     hirq_save();
-    if (large_count >= LARGE_CAP) {
-        pmm.panic("large_extents table exhausted", 29);
+    let is i64 as blk with mut = large_head;
+    let is i32 as done with mut = cast(i32, 0);
+    while (done == cast(i32, 0)) {
+        let is i64 as c = lb_count(blk);
+        if (c < LB_ENTRIES) {
+            lb_set_ent(blk, c, vaddr, order);
+            lb_set_count(blk, c + 1);
+            done = cast(i32, 1);
+        } else {
+            let is i64 as nx = lb_next(blk);
+            if (nx != 0) {
+                blk = nx;
+            } else {
+                // Tail full — allocate another block unlocked, then link it.
+                hirq_restore();
+                let is i64 as nb = kmalloc(LB_BYTES, cast(i32, pmm.ALLOC_ZERO));
+                if (nb == 0) { pmm.panic("large_extents OOM", 17); }
+                hirq_save();
+                let is i64 as t with mut = large_head;
+                while (lb_next(t) != 0) { t = lb_next(t); }
+                lb_set_next(t, nb);
+                blk = nb;   // fresh block (count 0) — next iteration inserts here
+            }
+        }
     }
-    let is i64 as i with mut = large_count;
-    while (i > 0) {
-        let is i64 as prev = large_vaddr_at(i - 1);
-        if (prev <= vaddr) { break; }
-        large_set(i, prev, large_order_at(i - 1));
-        i = i - 1;
-    }
-    large_set(i, vaddr, order);
-    large_count = large_count + 1;
     hirq_restore();
 }
 
-// Remove the entry at idx (shift the tail down by one).
-fn large_remove_at(idx as i64) as void {
-    let is i64 as i with mut = idx;
-    while (i < large_count - 1) {
-        large_set(i, large_vaddr_at(i + 1), large_order_at(i + 1));
-        i = i + 1;
+// Caller holds heap_lock. Removes the entry for vaddr (swap with the block's
+// last entry — unordered). Shrinks the chain: if a non-head block becomes
+// empty it is unlinked here and RETURNED so the caller can bins-free it
+// outside the lock (kfree of a bins block would re-take heap_lock -> deadlock).
+// Return: 0 = not a large extent; 1 = removed, nothing to free; otherwise the
+// returned value is an emptied chain block for the caller to kfree.
+fn large_remove(vaddr as i64) as i64 {
+    let is i64 as prev with mut = 0;
+    let is i64 as blk with mut = large_head;
+    while (blk != 0) {
+        let is i64 as c = lb_count(blk);
+        let is i64 as i with mut = 0;
+        while (i < c) {
+            if (lb_ent_vaddr(blk, i) == vaddr) {
+                let is i64 as last = c - 1;
+                if (i != last) {
+                    lb_set_ent(blk, i, lb_ent_vaddr(blk, last), lb_ent_order(blk, last));
+                }
+                lb_set_count(blk, last);
+                // Shrink: an emptied non-head block leaves the chain.
+                if (last == 0 && prev != 0) {
+                    lb_set_next(prev, lb_next(blk));
+                    return blk;   // caller bins-frees it outside the lock
+                }
+                return 1;
+            }
+            i = i + 1;
+        }
+        prev = blk;
+        blk = lb_next(blk);
     }
-    large_count = large_count - 1;
+    return 0;
 }
 
 fn large_extents_init() as void {
-    large_count = 0;
+    large_head = cast(i64, &large_block0_raw);
+    lb_set_next(large_head, 0);
+    lb_set_count(large_head, 0);
 }
 
 // ============================================================
@@ -692,14 +741,14 @@ fn kfree(ptr as i64) as void {
     // bins_free is self-locking and pmm.free_pages has its own lock.
     if ((ptr & 0xFFF) == 0) {
         hirq_save();
-        let is i64 as lidx = large_find(ptr);
-        if (lidx >= 0) {
-            large_remove_at(lidx);
-            hirq_restore();
+        let is i64 as lr = large_remove(ptr);
+        hirq_restore();
+        if (lr != 0) {
             pmm.free_pages(virt_to_pfn(ptr));
+            // lr > 1 -> an emptied chain block (a bins allocation) to release.
+            if (lr != 1) { kfree(lr); }
             return;
         }
-        hirq_restore();
     }
     bins_free(&kbins, cast(*u8, ptr));
 }
@@ -788,6 +837,35 @@ fn heap_smoke() as void {
     if (bit_test(ch.bitmap, si) != cast(i32, 1)) { ok = cast(i32, 0); }   // freed -> bit set (gate armed)
     kpool_free(tp, k2);
     if (kpp.used_slots != 0) { ok = cast(i32, 0); }                       // every slot returned
+
+    // 5) large_extents chain growth + shrink: the first block holds LB_ENTRIES
+    //    (255) extents, so the (255+1)th large alloc forces a new block; then
+    //    freeing them all drains both blocks and the grown one is unlinked +
+    //    released. Exercises cross-block insert and swap-remove. A broken chain
+    //    would lose a vaddr -> kfree falls to bins_free -> panic. Bounded:
+    //    (LB_ENTRIES+1) * 8 KiB transient (~2 MiB); pmm has it free this early.
+    let is i64 as nl = LB_ENTRIES + 1;
+    let is i64 as lbuf = kmalloc(nl * 8, cast(i32, 0));   // <=4096 -> bins
+    if (lbuf == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as lv = cast(*i64, lbuf);
+        let is i64 as j with mut = 0;
+        while (j < nl) {
+            let is i64 as q = kmalloc(8192, cast(i32, 0));
+            if (q == 0) { ok = cast(i32, 0); }
+            if ((q & 0xFFF) != 0) { ok = cast(i32, 0); }   // large -> page-aligned
+            lv[j] = q;
+            j = j + 1;
+        }
+        // The grow must have linked a 2nd block (block0 holds only LB_ENTRIES).
+        if (lb_next(large_head) == 0) { ok = cast(i32, 0); }
+        j = 0;
+        while (j < nl) { kfree(lv[j]); j = j + 1; }
+        // After draining, the grown (2nd) block is empty and unlinked + freed.
+        if (lb_next(large_head) != 0) { ok = cast(i32, 0); }
+        if (lb_count(large_head) != 0) { ok = cast(i32, 0); }
+        kfree(lbuf);
+    }
 
     if (ok == cast(i32, 1)) { serial.println("heap_smoke: PASS", 16); }
     else { pmm.panic("heap_smoke FAILED", 17); }
