@@ -173,6 +173,47 @@ fn seg_clone(ko as i64) as i64 {
     return ko2;
 }
 
+// seg_copy_range — random-access copy of `len` bytes between the segment at
+// [seg_off, seg_off+len) and a KERNEL buffer kbuf. to_seg: 1 = kbuf -> segment
+// (write), 0 = segment -> kbuf (read). This is NOT read/write: no cursor, no
+// sequence — a pointed access for a debugger / pointed read, the one honest way
+// to touch a segment's bytes without mapping it. Copies page-chunk by page-chunk
+// so it works for both the contiguous and the page-list backing (and crosses
+// page boundaries). Returns E_OK / E_INVAL (out of bounds).
+fn seg_copy_range(priv as i64, seg_off as i64, kbuf as i64, len as i64, to_seg as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    if (seg_off < 0 || len < 0) { return abi.E_INVAL; }
+    let is *SegPriv as s = cast(*SegPriv, priv);
+    if (seg_off + len > s.npages * pmm.PAGE_SIZE) { return abi.E_INVAL; }
+
+    let is i64 as done with mut = 0;
+    while (done < len) {
+        let is i64 as off = seg_off + done;
+        let is i64 as page_idx = off / pmm.PAGE_SIZE;
+        let is i64 as page_off = off - page_idx * pmm.PAGE_SIZE;
+        let is i64 as chunk with mut = pmm.PAGE_SIZE - page_off;
+        if (chunk > len - done) { chunk = len - done; }
+
+        let is i64 as phys with mut = 0;
+        if (s.pages_ptr != 0) {
+            let is *i64 as parr = cast(*i64, s.pages_ptr);
+            phys = pmm.pfn_to_phys(cast(i32, parr[page_idx])) + page_off;
+        } else {
+            phys = s.frames + page_idx * pmm.PAGE_SIZE + page_off;
+        }
+        let is *u8 as sv = cast(*u8, pmm.phys_to_virt(phys));
+        let is *u8 as kb = cast(*u8, kbuf + done);
+        let is i64 as i with mut = 0;
+        if (to_seg != 0) {
+            while (i < chunk) { sv[i] = kb[i]; i = i + 1; }
+        } else {
+            while (i < chunk) { kb[i] = sv[i]; i = i + 1; }
+        }
+        done = done + chunk;
+    }
+    return abi.E_OK;
+}
+
 // Kernel-side smoke exercising the REAL share path (fds + fdacts + ko_mmap),
 // not direct calls: a "parent" creates a segment at an fd, the "child" gets it
 // via the fdacts handoff (ko_ref + fd_install — exactly what sys_spawn does),
@@ -200,6 +241,20 @@ fn smoke() as void {
     let is i32 as seg_pfn = cast(i32, s.pfn);
     if (s.refcount != 1) { ok = cast(i32, 0); }
     if (pmm.page_state(seg_pfn) != pmm.PAGE_ALLOCATED) { ok = cast(i32, 0); }
+
+    // copy_range: write a 16-byte pattern crossing the page-0/page-1 boundary
+    // (offset 4090) without mapping, read it back, compare; out-of-bounds is
+    // rejected. Proves random-access copy_range over the segment's bytes.
+    let is [16]u8 as cwbuf;
+    let is [16]u8 as crbuf;
+    let is i64 as ci with mut = 0;
+    while (ci < 16) { cwbuf[ci] = cast(u8, 0xA0 + ci); ci = ci + 1; }
+    if (seg_copy_range(k.priv, 4090, cast(i64, &cwbuf[0]), 16, 1) != abi.E_OK) { ok = cast(i32, 0); }
+    if (seg_copy_range(k.priv, 4090, cast(i64, &crbuf[0]), 16, 0) != abi.E_OK) { ok = cast(i32, 0); }
+    ci = 0;
+    while (ci < 16) { if (crbuf[ci] != cast(u8, 0xA0 + ci)) { ok = cast(i32, 0); } ci = ci + 1; }
+    if (seg_copy_range(k.priv, 4 * 4096 - 4, cast(i64, &crbuf[0]), 16, 0) != abi.E_INVAL) { ok = cast(i32, 0); }
+
     let is i64 as fd_p = vma.fd_alloc(ap, ko);
     if (fd_p < 0) { ok = cast(i32, 0); }
 
