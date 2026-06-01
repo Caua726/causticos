@@ -46,17 +46,6 @@ let is i64 as USER_SPACE_END with mut = 0;
 let is i64 as PML4_KERNEL_START = 256;
 let is i64 as PML4_KERNEL_END  = 511;
 
-// kvalloc range
-let is i64 as KVALLOC_BASE  = 0xFFFFC00000000000;
-let is i64 as KVALLOC_PAGES = 262144;       // 1 GiB / 4 KiB
-
-// MMIO virtual range — bump-allocated, uncached pages for device registers.
-// Not reclaimed on unmap today (small, boot-time use); a bitmap is easy to
-// add later if drivers churn MMIO ranges.
-let is i64 as MMIO_BASE      = 0xFFFFD00000000000;
-let is i64 as MMIO_SIZE_LIMIT = 0x40000000;  // 1 GiB of virtual MMIO space
-let is i64 as mmio_next_offset with mut = 0;
-
 // ============================================================
 // kvmap — unified kernel VA allocator (Phase C, L3)
 //
@@ -72,10 +61,11 @@ let is i64 as mmio_next_offset with mut = 0;
 // alloc/coalesce algorithm is freelist.cst's (first-fit + split; free =
 // address-ordered insert + coalesce fwd/bwd), adapted to out-of-line nodes.
 //
-// The old kvalloc/mmio_map/iomap_wc/dma_alloc stay compiled (dormant) until
-// sub-phase 2's flip is proven in the real world.
+// This replaced the kvalloc bitmap+range allocator, the leaking mmio bump,
+// and vmm.dma_alloc (deleted in sub-phase 2 — DMA goes through driver.dma_alloc
+// straight to the PMM + HHDM).
 // ============================================================
-let is i64 as KVMAP_BASE = 0xFFFFC00000000000;   // reuse the (now-dormant) kvalloc window
+let is i64 as KVMAP_BASE = 0xFFFFC00000000000;   // single kernel-VA window
 let is i64 as KVMAP_SIZE = 0x40000000;           // 1 GiB of kernel VA
 
 // kind tags (0 = a FREE extent)
@@ -157,17 +147,15 @@ fn flush_tlb_range(vaddr as i64, count as i64) as void {
 // ============================================================
 // VMM lock
 //
-// Protects kvalloc's bitmap + range table, mmio_map's bump cursor,
-// and kernel_pml4_sync / as_create. Pre-SMP this was a stash-IF-and-
-// cli pair over a module-global `vmm_saved_flags` word. Two cpus
-// simultaneously racing kvalloc on phase2_thread + fat32 mount
-// would trash each other's saved flags and mis-restore IF on exit,
-// plus stomp kv_bitmap / kv_ranges half-writes. A ticket lock with
-// acquire_irq/release_irq gives per-cpu IF preservation AND mutual
-// exclusion for the shared data structures. Ordering: sched_lock >
-// vmm_lock > heap_lock > pmm_lock. kvalloc takes vmm_lock first,
-// then calls heap.kmalloc which takes heap_lock; never the other
-// way round.
+// Protects the kvmap free-list / used-list and kernel_pml4_sync / as_create.
+// Pre-SMP this was a stash-IF-and-cli pair over a module-global
+// `vmm_saved_flags` word. Two cpus simultaneously racing kvmap on
+// phase2_thread + fat32 mount would trash each other's saved flags and
+// mis-restore IF on exit, plus corrupt the extent lists with half-writes. A
+// ticket lock with acquire_irq/release_irq gives per-cpu IF preservation AND
+// mutual exclusion for the shared data structures. Ordering: sched_lock >
+// vmm_lock > heap_lock > pmm_lock. kvmap takes vmm_lock first, then reaches
+// the kpool/pmm which take heap_lock/pmm_lock; never the other way round.
 let is lock.TicketLock as vmm_lock with mut;
 
 // ============================================================
@@ -564,333 +552,18 @@ fn vmm_alloc_user_page(pml4_phys as i64, vaddr as i64, flags as i64) as i64 {
     return 0;
 }
 
-// ============================================================
-// kvalloc — virtual kernel allocator
-// ============================================================
-
-// Bitmap: 262144 pages / 8 bits = 32768 bytes
-let is [32768]u8 as kv_bitmap;
-
-// Range tracking: sorted array of {vaddr, pages, bm_start, bm_count, pfns_ptr}
-// Each entry = 40 bytes (5 x i64)
-let is i64 as KV_MAX_RANGES  = 256;
-let is [10240]u8 as kv_ranges_raw;  // 256 * 40
-let is i64 as kv_range_count with mut = 0;
-
-fn kvr_get(idx as i64, field as i64) as i64 {
-    let is *i64 as p = cast(*i64, cast(i64, &kv_ranges_raw) + idx * 40);
-    return p[field];
-}
-
-fn kvr_set(idx as i64, field as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, cast(i64, &kv_ranges_raw) + idx * 40);
-    p[field] = v;
-}
-// Fields: 0=vaddr, 1=pages, 2=bm_start, 3=bm_count, 4=pfns_ptr
-
-// Bitmap operations
-fn bm_test(bit as i64) as i64 {
-    let is *u8 as bm = cast(*u8, &kv_bitmap);
-    let is i64 as byte_idx = bit >> 3;
-    let is i64 as bit_idx = bit & 7;
-    return (cast(i64, bm[byte_idx]) >> bit_idx) & 1;
-}
-
-fn bm_set(start as i64, count as i64) as void {
-    let is *u8 as bm = cast(*u8, &kv_bitmap);
-    let is i64 as i with mut = start;
-    while (i < start + count) {
-        let is i64 as byte_idx = i >> 3;
-        let is i64 as bit_idx = i & 7;
-        bm[byte_idx] = cast(u8, cast(i64, bm[byte_idx]) | (1 << bit_idx));
-        i = i + 1;
+// Smallest order (power-of-2 pages) whose block covers `v` pages. A generic
+// helper, kept on the vmm (surface.acquire_fb sizes its contiguous backbuffer
+// with it); unrelated to the deleted region allocators it used to sit next to.
+fn ceil_log2(v as i64) as i32 {
+    if (v <= 1) { return cast(i32, 0); }
+    let is i32 as n with mut = 0;
+    let is i64 as x with mut = v - 1;
+    while (x > 0) {
+        n = n + cast(i32, 1);
+        x = x >> 1;
     }
-}
-
-fn bm_clear(start as i64, count as i64) as void {
-    let is *u8 as bm = cast(*u8, &kv_bitmap);
-    let is i64 as i with mut = start;
-    while (i < start + count) {
-        let is i64 as byte_idx = i >> 3;
-        let is i64 as bit_idx = i & 7;
-        let is i64 as mask = (1 << bit_idx) ^ 0xFF;
-        bm[byte_idx] = cast(u8, cast(i64, bm[byte_idx]) & mask);
-        i = i + 1;
-    }
-}
-
-fn bm_find_free(count as i64) as i64 {
-    let is i64 as run_start with mut = 0 - 1;
-    let is i64 as run_len with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < KVALLOC_PAGES) {
-        if (bm_test(i) == 0) {
-            if (run_len == 0) {
-                run_start = i;
-            }
-            run_len = run_len + 1;
-            if (run_len == count) {
-                return run_start;
-            }
-        } else {
-            run_len = 0;
-        }
-        i = i + 1;
-    }
-    return 0 - 1;
-}
-
-// Range insert (sorted by vaddr)
-fn kvr_insert(vaddr as i64, pages as i64, bm_start as i64, bm_count as i64, pfns as i64) as void {
-    if (kv_range_count >= KV_MAX_RANGES) {
-        pmm.panic("kvalloc: range table full", 25);
-    }
-    // Find insertion point
-    let is i64 as pos with mut = kv_range_count;
-    let is i64 as i with mut = 0;
-    while (i < kv_range_count) {
-        if (kvr_get(i, 0) > vaddr) {
-            pos = i;
-            i = kv_range_count; // break
-        }
-        i = i + 1;
-    }
-    // Shift entries after pos
-    let is i64 as j with mut = kv_range_count;
-    while (j > pos) {
-        let is i64 as k with mut = 0;
-        while (k < 5) {
-            kvr_set(j, k, kvr_get(j - 1, k));
-            k = k + 1;
-        }
-        j = j - 1;
-    }
-    kvr_set(pos, 0, vaddr);
-    kvr_set(pos, 1, pages);
-    kvr_set(pos, 2, bm_start);
-    kvr_set(pos, 3, bm_count);
-    kvr_set(pos, 4, pfns);
-    kv_range_count = kv_range_count + 1;
-}
-
-// Range find by vaddr
-fn kvr_find(vaddr as i64) as i64 {
-    let is i64 as i with mut = 0;
-    while (i < kv_range_count) {
-        if (kvr_get(i, 0) == vaddr) {
-            return i;
-        }
-        i = i + 1;
-    }
-    return 0 - 1;
-}
-
-// Range remove by index
-fn kvr_remove(idx as i64) as void {
-    let is i64 as i with mut = idx;
-    while (i < kv_range_count - 1) {
-        let is i64 as k with mut = 0;
-        while (k < 5) {
-            kvr_set(i, k, kvr_get(i + 1, k));
-            k = k + 1;
-        }
-        i = i + 1;
-    }
-    kv_range_count = kv_range_count - 1;
-}
-
-fn kvalloc(size as i64, flags as i64) as i64 {
-    if (size == 0) { return 0; }
-
-    let is i64 as data_pages = pmm.align_up(size, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
-    let is i64 as total_pages = data_pages + 2;  // guard + data + guard
-
-    // Reserve bitmap range under vmm_lock (fine-grained).
-    let is i64 as vflags with mut = lock.acquire_irq(&vmm_lock);
-    let is i64 as bm_start = bm_find_free(total_pages);
-    if (bm_start < 0) {
-        lock.release_irq(&vmm_lock, vflags);
-        return 0;
-    }
-    bm_set(bm_start, total_pages);
-    lock.release_irq(&vmm_lock, vflags);
-
-    let is i64 as data_vaddr = KVALLOC_BASE + (bm_start + 1) * pmm.PAGE_SIZE;
-
-    // Allocate PFN array via kmalloc — outside vmm_lock to honour
-    // ordering sched > vmm > heap (heap.kmalloc takes heap_lock).
-    let is i64 as pfn_array = heap.kmalloc(data_pages * 8, cast(i32, 0));
-    if (pfn_array == 0) {
-        vflags = lock.acquire_irq(&vmm_lock);
-        bm_clear(bm_start, total_pages);
-        lock.release_irq(&vmm_lock, vflags);
-        return 0;
-    }
-
-    // Allocate physical pages
-    let is *i64 as pfns = cast(*i64, pfn_array);
-    let is i64 as i with mut = 0;
-    while (i < data_pages) {
-        let is i32 as pfn = pmm.alloc_pages(
-            cast(i32, 0),
-            cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0)
-        );
-        if (pfn == pmm.PFN_NONE) {
-            // Rollback
-            let is i64 as j with mut = 0;
-            while (j < i) {
-                pmm.free_pages(cast(i32, pfns[j]), cast(i32, 0));
-                j = j + 1;
-            }
-            heap.kfree(pfn_array);
-            vflags = lock.acquire_irq(&vmm_lock);
-            bm_clear(bm_start, total_pages);
-            lock.release_irq(&vmm_lock, vflags);
-            return 0;
-        }
-        pfns[i] = cast(i64, pfn);
-        i = i + 1;
-    }
-
-    // Map data pages (guards stay unmapped). vmm_map_page may call
-    // kernel_pml4_sync which takes vmm_lock internally — so we must
-    // NOT be holding it here.
-    i = 0;
-    while (i < data_pages) {
-        vmm_map_page(kas_pml4_phys,
-            data_vaddr + i * pmm.PAGE_SIZE,
-            pmm.pfn_to_phys(cast(i32, pfns[i])),
-            KMAP_DATA);
-        i = i + 1;
-    }
-
-    flush_tlb_range(data_vaddr, data_pages);
-
-    // Register range under vmm_lock.
-    vflags = lock.acquire_irq(&vmm_lock);
-    kvr_insert(data_vaddr, data_pages, bm_start, total_pages, pfn_array);
-    lock.release_irq(&vmm_lock, vflags);
-
-    // Zero if requested
-    if ((flags & cast(i64, pmm.ALLOC_ZERO)) != 0) {
-        let is *u8 as p = cast(*u8, data_vaddr);
-        let is i64 as z with mut = 0;
-        let is i64 as zlen = data_pages * pmm.PAGE_SIZE;
-        while (z < zlen) {
-            p[z] = 0;
-            z = z + 1;
-        }
-    }
-
-    return data_vaddr;
-}
-
-fn kvfree(ptr as i64) as void {
-    if (ptr == 0) { return; }
-
-    // Remove the range atomically; snapshot the metadata we need
-    // before dropping the lock. Unmap + free happen outside vmm_lock
-    // to respect ordering (unmap calls kernel_pml4_sync which
-    // re-acquires).
-    let is i64 as vflags = lock.acquire_irq(&vmm_lock);
-    let is i64 as ridx = kvr_find(ptr);
-    if (ridx < 0) {
-        lock.release_irq(&vmm_lock, vflags);
-        pmm.panic("kvfree: unknown ptr", 19);
-    }
-    let is i64 as data_pages = kvr_get(ridx, 1);
-    let is i64 as bm_start   = kvr_get(ridx, 2);
-    let is i64 as bm_count   = kvr_get(ridx, 3);
-    let is i64 as pfn_array  = kvr_get(ridx, 4);
-    kvr_remove(ridx);
-    bm_clear(bm_start, bm_count);
-    lock.release_irq(&vmm_lock, vflags);
-
-    let is *i64 as pfns = cast(*i64, pfn_array);
-
-    // Unmap data pages
-    let is i64 as i with mut = 0;
-    while (i < data_pages) {
-        vmm_unmap_page(kas_pml4_phys, ptr + i * pmm.PAGE_SIZE);
-        i = i + 1;
-    }
-
-    flush_tlb_range(ptr, data_pages);
-
-    // Free physical pages
-    i = 0;
-    while (i < data_pages) {
-        pmm.free_pages(cast(i32, pfns[i]), cast(i32, 0));
-        i = i + 1;
-    }
-
-    // Free metadata
-    heap.kfree(pfn_array);
-}
-
-// ============================================================
-// DMA allocator
-// ============================================================
-
-// DmaAddr: vaddr(i64), phys(i64), order(i32 in i64 slot)
-// Returned as 3 values packed into globals (Caustic has no multi-return)
-let is i64 as dma_result_vaddr with mut = 0;
-let is i64 as dma_result_phys with mut = 0;
-let is i64 as dma_result_order with mut = 0;
-
-// ============================================================
-// MMIO: uncached mapping of device-owned physical memory.
-// Bump allocator over [MMIO_BASE, MMIO_BASE + MMIO_SIZE_LIMIT).
-// Returns 0 on exhaustion. Unmap tears down PTEs but does not reclaim VA.
-// ============================================================
-
-fn mmio_map(phys as i64, size as i64) as i64 {
-    if (size <= 0) { return 0; }
-
-    let is i64 as phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
-    let is i64 as phys_offset  = phys - phys_aligned;
-    let is i64 as span         = pmm.align_up(size + phys_offset, pmm.PAGE_SIZE);
-    let is i64 as pages        = span / pmm.PAGE_SIZE;
-
-    // Reserve VA range under vmm_lock. Pre-SMP this was a bare
-    // cli/sti around the bump cursor — two cpus racing would both
-    // read the same mmio_next_offset, write the same vaddr, then
-    // each vmm_map_page the same VA and panic on double-map. Ticket
-    // lock + acquire_irq gives the bump an atomic reservation.
-    let is i64 as vflags = lock.acquire_irq(&vmm_lock);
-    if (mmio_next_offset + span > MMIO_SIZE_LIMIT) {
-        lock.release_irq(&vmm_lock, vflags);
-        return 0;
-    }
-    let is i64 as vaddr = MMIO_BASE + mmio_next_offset;
-    mmio_next_offset = mmio_next_offset + span;
-    lock.release_irq(&vmm_lock, vflags);
-
-    let is i64 as i with mut = 0;
-    while (i < pages) {
-        vmm_map_page(kas_pml4_phys,
-            vaddr + i * pmm.PAGE_SIZE,
-            phys_aligned + i * pmm.PAGE_SIZE,
-            KMAP_MMIO);
-        i = i + 1;
-    }
-    flush_tlb_range(vaddr, pages);
-    return vaddr + phys_offset;
-}
-
-fn mmio_unmap(vaddr as i64, size as i64) as void {
-    if (size <= 0) { return; }
-    let is i64 as va_aligned = vaddr & ~(pmm.PAGE_SIZE - 1);
-    let is i64 as va_offset  = vaddr - va_aligned;
-    let is i64 as pages      = pmm.align_up(size + va_offset, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
-
-    let is i64 as i with mut = 0;
-    while (i < pages) {
-        vmm_unmap_page(kas_pml4_phys, va_aligned + i * pmm.PAGE_SIZE);
-        i = i + 1;
-    }
-    flush_tlb_range(va_aligned, pages);
-    // VA slot remains leaked by the bump allocator (see MMIO_SIZE_LIMIT).
+    return n;
 }
 
 // Program IA32_PAT so PA1 = write-combining. Per-CPU MSR: called on the
@@ -908,78 +581,6 @@ fn pat_init() as void {
     asm("mov ecx, 0x277\n");             // IA32_PAT
     asm(".byte 0x0F, 0x30\n");           // wrmsr
     flush_tlb_full();
-}
-
-// Like mmio_map, but write-combining (KMAP_WC) instead of uncached. Used
-// for the framebuffer scanout: WC coalesces the per-pixel writes into
-// burst transfers — the right memory type for a linear framebuffer, where
-// UC would be slow and WB (no automatic flush to the device) is wrong.
-fn iomap_wc(phys as i64, size as i64) as i64 {
-    if (size <= 0) { return 0; }
-    let is i64 as phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
-    let is i64 as phys_offset  = phys - phys_aligned;
-    let is i64 as span         = pmm.align_up(size + phys_offset, pmm.PAGE_SIZE);
-    let is i64 as pages        = span / pmm.PAGE_SIZE;
-
-    let is i64 as vflags = lock.acquire_irq(&vmm_lock);
-    if (mmio_next_offset + span > MMIO_SIZE_LIMIT) {
-        lock.release_irq(&vmm_lock, vflags);
-        return 0;
-    }
-    let is i64 as vaddr = MMIO_BASE + mmio_next_offset;
-    mmio_next_offset = mmio_next_offset + span;
-    lock.release_irq(&vmm_lock, vflags);
-
-    let is i64 as i with mut = 0;
-    while (i < pages) {
-        vmm_map_page(kas_pml4_phys,
-            vaddr + i * pmm.PAGE_SIZE,
-            phys_aligned + i * pmm.PAGE_SIZE,
-            KMAP_WC);
-        i = i + 1;
-    }
-    flush_tlb_range(vaddr, pages);
-    return vaddr + phys_offset;
-}
-
-fn ceil_log2(v as i64) as i32 {
-    if (v <= 1) { return cast(i32, 0); }
-    let is i32 as n with mut = 0;
-    let is i64 as x with mut = v - 1;
-    while (x > 0) {
-        n = n + cast(i32, 1);
-        x = x >> 1;
-    }
-    return n;
-}
-
-fn dma_alloc(size as i64) as void {
-    dma_result_vaddr = 0;
-    dma_result_phys = 0;
-    dma_result_order = 0;
-
-    if (size == 0) { return; }
-
-    let is i64 as pages = pmm.align_up(size, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
-    let is i32 as order = ceil_log2(pages);
-
-    let is i32 as pfn = pmm.alloc_pages(
-        pmm.ALLOC_BELOW_4G | pmm.ALLOC_ZERO,
-        order, pmm.USAGE_KERNEL, cast(i32, 0)
-    );
-    if (pfn == pmm.PFN_NONE) { return; }
-
-    let is i64 as phys = pmm.pfn_to_phys(pfn);
-    dma_result_vaddr = pmm.phys_to_virt(phys);
-    dma_result_phys = phys;
-    dma_result_order = cast(i64, order);
-}
-
-fn dma_free(vaddr as i64) as void {
-    if (vaddr == 0) { return; }
-    let is i64 as phys = vaddr - pmm.hhdm;
-    // Single-result DMA slot: the order of the buffer just allocated.
-    pmm.free_pages(pmm.phys_to_pfn(phys), cast(i32, dma_result_order));
 }
 
 // ============================================================
@@ -1427,16 +1028,6 @@ fn init() as void {
     serial.print("  kernel cr3=", 13);
     util.print_hex(kas_pml4_phys);
     serial.println("", 0);
-
-    // Zero kvalloc bitmap (kvalloc is dormant in sub-phase 1 but stays
-    // compiled until the sub-phase 2 flip; its BSS bitmap is already zero,
-    // this keeps it self-consistent if ever called).
-    let is *u8 as bm = cast(*u8, &kv_bitmap);
-    i = 0;
-    while (i < 32768) {
-        bm[i] = 0;
-        i = i + 1;
-    }
 
     // Self-test: page walk.
     let is i64 as tv = cast(i64, &kas_pml4_phys);
