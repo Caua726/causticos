@@ -58,6 +58,46 @@ let is i64 as MMIO_SIZE_LIMIT = 0x40000000;  // 1 GiB of virtual MMIO space
 let is i64 as mmio_next_offset with mut = 0;
 
 // ============================================================
+// kvmap — unified kernel VA allocator (Phase C, L3)
+//
+// One coalescing free-list of VA *extents* over a single kernel window.
+// Caching is per-extent via `kind` (DATA / MMIO-UC / WC), so ONE window
+// serves all three — no separate kvalloc/mmio/iomap_wc ranges. This both
+// removes the kvalloc 256-range cap + 32 KiB bitmap AND fixes the mmio bump's
+// VA leak: kvunmap returns the VA to the free-list (coalescing), so a
+// map/unmap churn reuses VA instead of marching a cursor off the window.
+//
+// Extent nodes are OUT-OF-LINE (a kpool), never stored inside the VA they
+// describe — that VA may be unmapped (MMIO) or about to be (free). The
+// alloc/coalesce algorithm is freelist.cst's (first-fit + split; free =
+// address-ordered insert + coalesce fwd/bwd), adapted to out-of-line nodes.
+//
+// The old kvalloc/mmio_map/iomap_wc/dma_alloc stay compiled (dormant) until
+// sub-phase 2's flip is proven in the real world.
+// ============================================================
+let is i64 as KVMAP_BASE = 0xFFFFC00000000000;   // reuse the (now-dormant) kvalloc window
+let is i64 as KVMAP_SIZE = 0x40000000;           // 1 GiB of kernel VA
+
+// kind tags (0 = a FREE extent)
+let is i64 as KV_DATA = 1;   // anon RAM, zeroed, KMAP_DATA; kvunmap frees the frames
+let is i64 as KV_MMIO = 2;   // caller's device phys, KMAP_MMIO (UC); frames are the device's
+let is i64 as KV_WC   = 3;   // caller's device phys, KMAP_WC (write-combining framebuffer)
+
+// All-i64 (mixed-width struct fields miscompile). 5 fields = 40 bytes.
+struct KvExtent {
+    va_start as i64;
+    len      as i64;     // bytes, page-multiple
+    kind     as i64;     // KV_DATA|KV_MMIO|KV_WC (0 = free)
+    pfns     as i64;     // *i64 array of page pfns (KV_DATA); 0 for MMIO/WC/free
+    next     as i64;     // *KvExtent
+}
+
+let is i64 as kv_node_pool with mut = 0;       // kpool handle for KvExtent nodes
+let is i64 as kv_free_head with mut = 0;       // FREE extents, address-ordered, coalescing
+let is i64 as kv_used_head with mut = 0;       // ALLOCATED extents, looked up by va on unmap
+let is i64 as kvmap_result_phys with mut = 0;  // 2nd return of kvmap: physical base (Caustic has no multi-return)
+
+// ============================================================
 // Paging index extraction
 // ============================================================
 
@@ -943,6 +983,346 @@ fn dma_free(vaddr as i64) as void {
 }
 
 // ============================================================
+// kvmap implementation
+//
+// Lock discipline (ordering sched > vmm > heap > pmm): the free-list/used-list
+// mutations run under vmm_lock; kvx_new/kvx_free reach the kpool (heap_lock)
+// from inside vmm_lock — never the inverse. vmm_map_page may re-take vmm_lock
+// via kernel_pml4_sync, so all mapping happens OUTSIDE the lock (same rule the
+// old kvalloc followed).
+// ============================================================
+
+// Out-of-line extent node alloc/free (kpool-backed). Callers hold vmm_lock;
+// the kpool is self-locking on heap_lock, so the nesting is vmm > heap.
+fn kvx_new() as i64 {
+    let is i64 as n = heap.kpool_alloc(kv_node_pool);
+    if (n == 0) { pmm.panic("kvmap: node pool OOM", 20); }
+    return n;
+}
+
+fn kvx_free(n as i64) as void {
+    heap.kpool_free(kv_node_pool, n);
+}
+
+// Caller holds vmm_lock. First-fit a free extent >= span, split it: shrink
+// from the front (keeps the list address-ordered) or, if consumed whole,
+// unlink and recycle the node. Returns the base VA, or 0 if the window can't
+// satisfy the request (exhausted / too fragmented).
+fn kv_va_reserve(span as i64) as i64 {
+    let is i64 as prev with mut = 0;
+    let is i64 as cur with mut = kv_free_head;
+    while (cur != 0) {
+        let is *KvExtent as c = cast(*KvExtent, cur);
+        if (c.len >= span) {
+            let is i64 as base = c.va_start;
+            if (c.len == span) {
+                if (prev == 0) { kv_free_head = c.next; }
+                else { let is *KvExtent as p = cast(*KvExtent, prev); p.next = c.next; }
+                kvx_free(cur);
+            } else {
+                c.va_start = c.va_start + span;
+                c.len = c.len - span;
+            }
+            return base;
+        }
+        prev = cur;
+        cur = c.next;
+    }
+    return 0;
+}
+
+// Caller holds vmm_lock. Return [base, base+span) to the free-list: insert in
+// address order, then coalesce forward (with the next extent) and backward
+// (with the prev extent) — the freelist.cst algorithm, at most two merges.
+fn kv_va_release(base as i64, span as i64) as void {
+    let is i64 as bend = base + span;
+
+    // prev = last free extent strictly before base; cur = first at/after base.
+    let is i64 as prev with mut = 0;
+    let is i64 as cur with mut = kv_free_head;
+    while (cur != 0) {
+        let is *KvExtent as c = cast(*KvExtent, cur);
+        if (c.va_start >= base) { break; }
+        prev = cur;
+        cur = c.next;
+    }
+
+    // Link a fresh node for the freed range between prev and cur.
+    let is i64 as node = kvx_new();
+    let is *KvExtent as nb = cast(*KvExtent, node);
+    nb.va_start = base;
+    nb.len = span;
+    nb.kind = 0;
+    nb.pfns = 0;
+    nb.next = cur;
+    if (prev == 0) { kv_free_head = node; }
+    else { let is *KvExtent as p = cast(*KvExtent, prev); p.next = node; }
+
+    // Coalesce forward: freed block's end meets cur's start.
+    if (cur != 0) {
+        let is *KvExtent as c = cast(*KvExtent, cur);
+        if (bend == c.va_start) {
+            nb.len = nb.len + c.len;
+            nb.next = c.next;
+            kvx_free(cur);
+        }
+    }
+
+    // Coalesce backward: prev's end meets the freed block's start.
+    if (prev != 0) {
+        let is *KvExtent as p = cast(*KvExtent, prev);
+        if (p.va_start + p.len == base) {
+            p.len = p.len + nb.len;
+            p.next = nb.next;
+            kvx_free(node);
+        }
+    }
+}
+
+// Caller holds vmm_lock. Prepend an allocated extent to the used-list.
+fn kv_used_insert(base as i64, span as i64, kind as i64, pfns as i64) as void {
+    let is i64 as node = kvx_new();
+    let is *KvExtent as e = cast(*KvExtent, node);
+    e.va_start = base;
+    e.len = span;
+    e.kind = kind;
+    e.pfns = pfns;
+    e.next = kv_used_head;
+    kv_used_head = node;
+}
+
+// kvmap — map `size` bytes into the kernel window with the memory type dictated
+// by `kind`, returning the virtual base (and the physical base in
+// kvmap_result_phys). KV_DATA allocates + zeroes fresh anon frames; KV_MMIO /
+// KV_WC map the caller's `phys` as-is (device frames), honouring a sub-page
+// phys offset. `flags` is reserved (KV_GUARD lands in sub-phase 3). Returns 0
+// on failure, with every partial allocation rolled back.
+fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
+    if (size <= 0) { kvmap_result_phys = 0; return 0; }
+
+    let is i64 as phys_aligned with mut = 0;
+    let is i64 as phys_offset  with mut = 0;
+    let is i64 as span with mut = 0;
+    if (kind == KV_DATA) {
+        span = pmm.align_up(size, pmm.PAGE_SIZE);
+    } else {
+        phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
+        phys_offset  = phys - phys_aligned;
+        span = pmm.align_up(size + phys_offset, pmm.PAGE_SIZE);
+    }
+    let is i64 as pages = span / pmm.PAGE_SIZE;
+
+    // 1. Reserve VA under vmm_lock.
+    let is i64 as vflags with mut = lock.acquire_irq(&vmm_lock);
+    let is i64 as base = kv_va_reserve(span);
+    lock.release_irq(&vmm_lock, vflags);
+    if (base == 0) { kvmap_result_phys = 0; return 0; }
+
+    // 2. Back + map OUTSIDE vmm_lock.
+    if (kind == KV_DATA) {
+        let is i64 as pfn_array = heap.kmalloc(pages * 8, cast(i32, 0));
+        if (pfn_array == 0) {
+            vflags = lock.acquire_irq(&vmm_lock);
+            kv_va_release(base, span);
+            lock.release_irq(&vmm_lock, vflags);
+            kvmap_result_phys = 0;
+            return 0;
+        }
+        let is *i64 as pfns = cast(*i64, pfn_array);
+        let is i64 as i with mut = 0;
+        while (i < pages) {
+            let is i32 as pfn = pmm.alloc_pages(
+                pmm.ALLOC_ZERO, cast(i32, 0), pmm.USAGE_KERNEL, cast(i32, 0));
+            if (pfn == pmm.PFN_NONE) {
+                // Rollback the pages mapped so far, the array, then the VA.
+                let is i64 as j with mut = 0;
+                while (j < i) {
+                    vmm_unmap_page(kas_pml4_phys, base + j * pmm.PAGE_SIZE);
+                    pmm.free_pages(cast(i32, pfns[j]), cast(i32, 0));
+                    j = j + 1;
+                }
+                flush_tlb_range(base, i);
+                heap.kfree(pfn_array);
+                vflags = lock.acquire_irq(&vmm_lock);
+                kv_va_release(base, span);
+                lock.release_irq(&vmm_lock, vflags);
+                kvmap_result_phys = 0;
+                return 0;
+            }
+            pfns[i] = cast(i64, pfn);
+            vmm_map_page(kas_pml4_phys, base + i * pmm.PAGE_SIZE,
+                pmm.pfn_to_phys(pfn), KMAP_DATA);
+            i = i + 1;
+        }
+        flush_tlb_range(base, pages);
+
+        // 3. Record the allocated extent under vmm_lock.
+        vflags = lock.acquire_irq(&vmm_lock);
+        kv_used_insert(base, span, KV_DATA, pfn_array);
+        lock.release_irq(&vmm_lock, vflags);
+
+        kvmap_result_phys = 0;   // anon: no single contiguous phys
+        return base;
+    }
+
+    // KV_MMIO / KV_WC: map the caller's device phys with the right memory type.
+    let is i64 as mflags with mut = KMAP_MMIO;
+    if (kind == KV_WC) { mflags = KMAP_WC; }
+    let is i64 as k with mut = 0;
+    while (k < pages) {
+        vmm_map_page(kas_pml4_phys, base + k * pmm.PAGE_SIZE,
+            phys_aligned + k * pmm.PAGE_SIZE, mflags);
+        k = k + 1;
+    }
+    flush_tlb_range(base, pages);
+
+    vflags = lock.acquire_irq(&vmm_lock);
+    kv_used_insert(base, span, kind, 0);
+    lock.release_irq(&vmm_lock, vflags);
+
+    kvmap_result_phys = phys_aligned;
+    return base + phys_offset;
+}
+
+// kvunmap — tear down a mapping created by kvmap, given any VA inside it (the
+// returned base, with or without the MMIO sub-page offset). KV_DATA frees its
+// frames; MMIO/WC leave the device frames alone. The VA returns to the
+// free-list (coalescing) — this is the fix for the old MMIO VA leak.
+fn kvunmap(vaddr as i64) as void {
+    if (vaddr == 0) { return; }
+
+    // Unlink the extent from the used-list under vmm_lock; snapshot its fields
+    // before dropping the lock (unmap re-takes vmm_lock via kernel_pml4_sync).
+    let is i64 as vflags with mut = lock.acquire_irq(&vmm_lock);
+    let is i64 as prev with mut = 0;
+    let is i64 as cur with mut = kv_used_head;
+    while (cur != 0) {
+        let is *KvExtent as c = cast(*KvExtent, cur);
+        if (vaddr >= c.va_start && vaddr < c.va_start + c.len) { break; }
+        prev = cur;
+        cur = c.next;
+    }
+    if (cur == 0) {
+        lock.release_irq(&vmm_lock, vflags);
+        pmm.panic("kvunmap: unknown vaddr", 22);
+    }
+    let is *KvExtent as e = cast(*KvExtent, cur);
+    let is i64 as base = e.va_start;
+    let is i64 as span = e.len;
+    let is i64 as kind = e.kind;
+    let is i64 as pfns = e.pfns;
+    if (prev == 0) { kv_used_head = e.next; }
+    else { let is *KvExtent as p = cast(*KvExtent, prev); p.next = e.next; }
+    kvx_free(cur);
+    lock.release_irq(&vmm_lock, vflags);
+
+    let is i64 as pages = span / pmm.PAGE_SIZE;
+
+    // Unmap PTEs for every kind.
+    let is i64 as i with mut = 0;
+    while (i < pages) {
+        vmm_unmap_page(kas_pml4_phys, base + i * pmm.PAGE_SIZE);
+        i = i + 1;
+    }
+    flush_tlb_range(base, pages);
+
+    // Free the backing frames only for KV_DATA (MMIO/WC frames are the device's).
+    if (kind == KV_DATA) {
+        if (pfns != 0) {
+            let is *i64 as pa = cast(*i64, pfns);
+            let is i64 as f with mut = 0;
+            while (f < pages) {
+                pmm.free_pages(cast(i32, pa[f]), cast(i32, 0));
+                f = f + 1;
+            }
+            heap.kfree(pfns);
+        }
+    }
+
+    // Return the VA to the free-list (coalescing).
+    vflags = lock.acquire_irq(&vmm_lock);
+    kv_va_release(base, span);
+    lock.release_irq(&vmm_lock, vflags);
+}
+
+// Initialize the kvmap window: a kpool for the out-of-line nodes plus one free
+// extent spanning the whole window. Runs once on the BSP in vmm.init, after
+// heap.init (main.cst ordering) so the kpool is available. APs share the
+// window (protected by vmm_lock); they never re-init it.
+fn kvmap_init() as void {
+    kv_node_pool = heap.kpool_create(sizeof(KvExtent), 1);   // debug=1: double-free gate
+    kv_free_head = 0;
+    kv_used_head = 0;
+    let is i64 as node = heap.kpool_alloc(kv_node_pool);
+    if (node == 0) { pmm.panic("kvmap_init: node pool OOM", 25); }
+    let is *KvExtent as e = cast(*KvExtent, node);
+    e.va_start = KVMAP_BASE;
+    e.len = KVMAP_SIZE;
+    e.kind = 0;
+    e.pfns = 0;
+    e.next = 0;
+    kv_free_head = node;
+}
+
+// kvmap_smoke — replaces the kvalloc/dma self-tests in vmm.init. Proves the
+// three live kinds round-trip and, critically, that KV_MMIO unmap RECLAIMS VA
+// (the bug Phase C fixes): map+unmap the same phys N times must reuse the VA,
+// not march a cursor off the window. Single-threaded at boot; pat_init already
+// ran for the BSP (KV_WC needs PA1=WC). Fail-loud.
+fn kvmap_smoke() as void {
+    serial.println("kvmap_smoke: start", 18);
+    let is i32 as ok with mut = cast(i32, 1);
+
+    // 1. KV_DATA round-trip: write/read a sentinel through a fresh anon page.
+    let is i64 as d = kvmap(4096, KV_DATA, 0, 0);
+    if (d == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as dp = cast(*i64, d);
+        dp[0] = 0xCAFEBABE;
+        if (dp[0] != 0xCAFEBABE) { ok = cast(i32, 0); }
+        kvunmap(d);
+    }
+
+    // 2. KV_MMIO no-leak: map+unmap the LAPIC page (0xFEE00000, UC; present on
+    //    QEMU + real hw, never dereferenced) 64x. With the old bump cursor each
+    //    map consumed a fresh span; with the free-list the released VA coalesces
+    //    back to the window front, so every returned VA equals the first.
+    let is i64 as first with mut = 0;
+    let is i64 as reused with mut = 1;
+    let is i64 as n with mut = 0;
+    while (n < 64) {
+        let is i64 as m = kvmap(4096, KV_MMIO, 0, 0xFEE00000);
+        if (m == 0) { ok = cast(i32, 0); n = 64; }
+        else {
+            if (n == 0) { first = m; }
+            else { if (m != first) { reused = 0; } }
+            kvunmap(m);
+        }
+        n = n + 1;
+    }
+    if (reused == 0) { ok = cast(i32, 0); }
+
+    // 3. KV_WC round-trip on the same phys (write-combining map path).
+    let is i64 as w = kvmap(4096, KV_WC, 0, 0xFEE00000);
+    if (w == 0) { ok = cast(i32, 0); }
+    else { kvunmap(w); }
+
+    // 4. After all the churn the window is whole again: one free extent over the
+    //    entire span (every reserve was released + coalesced), nothing allocated.
+    if (kv_free_head == 0) { ok = cast(i32, 0); }
+    else {
+        let is *KvExtent as fh = cast(*KvExtent, kv_free_head);
+        if (fh.va_start != KVMAP_BASE) { ok = cast(i32, 0); }
+        if (fh.len != KVMAP_SIZE) { ok = cast(i32, 0); }
+        if (fh.next != 0) { ok = cast(i32, 0); }
+    }
+    if (kv_used_head != 0) { ok = cast(i32, 0); }
+
+    if (ok == cast(i32, 1)) { serial.println("kvmap_smoke: PASS", 17); }
+    else { pmm.panic("kvmap_smoke FAILED", 18); }
+}
+
+// ============================================================
 // Init
 // ============================================================
 
@@ -1048,7 +1428,9 @@ fn init() as void {
     util.print_hex(kas_pml4_phys);
     serial.println("", 0);
 
-    // Zero kvalloc bitmap
+    // Zero kvalloc bitmap (kvalloc is dormant in sub-phase 1 but stays
+    // compiled until the sub-phase 2 flip; its BSS bitmap is already zero,
+    // this keeps it self-consistent if ever called).
     let is *u8 as bm = cast(*u8, &kv_bitmap);
     i = 0;
     while (i < 32768) {
@@ -1056,8 +1438,7 @@ fn init() as void {
         i = i + 1;
     }
 
-    // Self-tests
-    // Test 1: page walk
+    // Self-test: page walk.
     let is i64 as tv = cast(i64, &kas_pml4_phys);
     let is i64 as tp = virt_to_phys_walk(kas_pml4_phys, tv);
     serial.print("  walk: ", 8);
@@ -1066,31 +1447,17 @@ fn init() as void {
     util.print_hex(tp);
     serial.println("", 0);
 
-    // Test 2: kvalloc
-    let is i64 as kv1 = kvalloc(4096, cast(i64, pmm.ALLOC_ZERO));
-    if (kv1 != 0) {
-        let is *i64 as kvp = cast(*i64, kv1);
-        kvp[0] = 0xCAFEBABE;
-        if (kvp[0] == 0xCAFEBABE) {
-            serial.println("  kvalloc test: ok", 18);
-        } else {
-            serial.println("  kvalloc test: FAIL", 20);
-        }
-        kvfree(kv1);
-    }
-
-    // Test 3: DMA alloc
-    dma_alloc(4096);
-    if (dma_result_vaddr != 0) {
-        serial.print("  dma phys=", 11);
-        util.print_hex(dma_result_phys);
-        serial.println(" ok", 3);
-        dma_free(dma_result_vaddr);
-    }
+    // Seed the kvmap window (kpool + one free extent) before any kvmap use.
+    kvmap_init();
 
     // Write-combining PAT entry for the BSP. APs run pat_init() themselves
-    // from ap_entry, after they load this PML4.
+    // from ap_entry, after they load this PML4. Must precede kvmap_smoke's
+    // KV_WC test (PA1=WC).
     pat_init();
+
+    // Exercise kvmap (KV_DATA/KV_MMIO/KV_WC + the MMIO no-leak proof). Replaces
+    // the old kvalloc + dma self-tests.
+    kvmap_smoke();
 
     serial.println("vmm: ready", 10);
 }
