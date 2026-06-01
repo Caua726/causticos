@@ -500,6 +500,106 @@ fn spawn_user_reserve_fault_smoke() as void {
     serial.println("userspace.reserve_fault_smoke: kernel still alive PASS", 54);
 }
 
+// Emit a little-endian u32 at dst[at..at+4).
+fn emit_u32(dst as *u8, at as i64, v as i64) as void {
+    dst[at + 0] = cast(u8, v & 0xFF);
+    dst[at + 1] = cast(u8, (v >> 8) & 0xFF);
+    dst[at + 2] = cast(u8, (v >> 16) & 0xFF);
+    dst[at + 3] = cast(u8, (v >> 24) & 0xFF);
+}
+
+// Shellcode: SYS_MMAP(rv, 16 pages, WRITE|MMAP_RESERVE) then commit it in two
+// 8-page chunks (SYS_COMMIT), writing a sentinel into each chunk after it is
+// committed, then SYS_PROC_EXIT(0). Mirrors how a userspace allocator reserves
+// a large window and commits chunks on demand — the std/mem reserve+commit path.
+fn write_commit_chunk_shellcode(dst as *u8, rv as i64) as i64 {
+    let is i64 as c with mut = 0;
+    // mov eax, 7 (SYS_MMAP) ; mov edi, rv ; mov esi, 0x10000 ; mov edx, 0x22 ; syscall
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 7); c = c + 4;
+    dst[c] = cast(u8, 0xBF); c = c + 1; emit_u32(dst, c, rv); c = c + 4;
+    dst[c] = cast(u8, 0xBE); c = c + 1; emit_u32(dst, c, 0x10000); c = c + 4;
+    dst[c] = cast(u8, 0xBA); c = c + 1; emit_u32(dst, c, 0x22); c = c + 4;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    // SYS_COMMIT(rv, 0x8000, WRITE)
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 27); c = c + 4;
+    dst[c] = cast(u8, 0xBF); c = c + 1; emit_u32(dst, c, rv); c = c + 4;
+    dst[c] = cast(u8, 0xBE); c = c + 1; emit_u32(dst, c, 0x8000); c = c + 4;
+    dst[c] = cast(u8, 0xBA); c = c + 1; emit_u32(dst, c, 2); c = c + 4;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    // mov dword [rv], 0xAA   (C7 04 25 <rv32> <imm32>)
+    dst[c] = cast(u8, 0xC7); dst[c + 1] = cast(u8, 0x04); dst[c + 2] = cast(u8, 0x25); c = c + 3;
+    emit_u32(dst, c, rv); c = c + 4; emit_u32(dst, c, 0xAA); c = c + 4;
+    // SYS_COMMIT(rv+0x8000, 0x8000, WRITE)
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 27); c = c + 4;
+    dst[c] = cast(u8, 0xBF); c = c + 1; emit_u32(dst, c, rv + 0x8000); c = c + 4;
+    dst[c] = cast(u8, 0xBE); c = c + 1; emit_u32(dst, c, 0x8000); c = c + 4;
+    dst[c] = cast(u8, 0xBA); c = c + 1; emit_u32(dst, c, 2); c = c + 4;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    // mov dword [rv+0x8000], 0xBB
+    dst[c] = cast(u8, 0xC7); dst[c + 1] = cast(u8, 0x04); dst[c + 2] = cast(u8, 0x25); c = c + 3;
+    emit_u32(dst, c, rv + 0x8000); c = c + 4; emit_u32(dst, c, 0xBB); c = c + 4;
+    // mov eax, 3 (SYS_PROC_EXIT) ; xor edi, edi ; syscall
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 3); c = c + 4;
+    dst[c] = cast(u8, 0x31); dst[c + 1] = cast(u8, 0xFF); c = c + 2;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    return c;
+}
+
+// A ring-3 program that reserves a 16-page window then commits it in two 8-page
+// chunks, writing a sentinel into each only after committing it. Proves strict
+// reserve+commit-by-chunk end to end from userspace (criterion 3): if a chunk
+// weren't committed, the store would #PF and the sentinel wouldn't land. The
+// cross-repo std/mem (os.reserve/os.commit) rides the same SYS_MMAP+MMAP_RESERVE
+// / SYS_COMMIT path this exercises.
+fn spawn_user_commit_chunk_smoke() as void {
+    serial.println("userspace.commit_smoke: start", 29);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.commit_smoke: aspace FAIL", 35);
+        return;
+    }
+    let is i64 as RV = 0x0000000000500000;
+
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE,
+                                            cast(*u8, "ctext"), 5);
+    if (text_kv == 0) { return; }
+    write_commit_chunk_shellcode(cast(*u8, text_kv), RV);
+
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "cstk"), 4);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(user_thread_trampoline)),
+        sched.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.commit_smoke: spawned tid=", 36);
+    util.print_num(tid);
+    serial.println("", 0);
+    sched.sleep_for_ns(200000000);
+
+    // Read both chunk sentinels via the aspace's phys (the program ran in its
+    // own aspace, not our CR3). 0xAA + 0xBB present => both chunks committed +
+    // written from ring 3.
+    let is i64 as ok with mut = 1;
+    let is i64 as ph0 = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+    let is i64 as ph1 = vmm.virt_to_phys_walk(a.pml4_phys, RV + 0x8000);
+    if (ph0 == 0 || ph1 == 0) { ok = 0; }
+    else {
+        let is *i64 as p0 = cast(*i64, pmm.phys_to_virt(ph0));
+        let is *i64 as p1 = cast(*i64, pmm.phys_to_virt(ph1));
+        if ((p0[0] & 0xFF) != 0xAA) { ok = 0; }
+        if ((p1[0] & 0xFF) != 0xBB) { ok = 0; }
+    }
+    vma.aspace_destroy(a);
+    if (ok == 1) { serial.println("userspace.commit_smoke: chunks committed PASS", 46); }
+    else { pmm.panic("commit_smoke FAIL", 17); }
+}
+
 // (spawn_user_syscall_smoke retired — spawn_user_elf_smoke exercises
 //  the same SYSCALL/SYSRETQ path through the real ABI now that
 //  TIME_NOW_NS / IO_WRITE / PROC_EXIT are wired up.)
@@ -2475,6 +2575,7 @@ fn smoke_thread() as void {
     spawn_user_fault_smoke();
     vma_strict_smoke();
     spawn_user_reserve_fault_smoke();
+    spawn_user_commit_chunk_smoke();
     fd_table_smoke();
     close_on_exit_smoke();
     spawn_user_elf_smoke();
