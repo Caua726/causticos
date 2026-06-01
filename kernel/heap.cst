@@ -209,8 +209,11 @@ fn heap_pages_alloc(n as i64) as i64 {
     return pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
 }
 
-fn heap_pages_free(vaddr as i64) as void {
-    pmm.free_pages(virt_to_pfn(vaddr));   // order is read back from frame_meta
+// `n` is the byte size passed to heap_pages_alloc — the order is recomputed
+// from it identically (the PMM no longer stores a freed page's order).
+fn heap_pages_free(vaddr as i64, n as i64) as void {
+    let is i64 as pages = align_up64(n, pmm.PAGE_SIZE) / pmm.PAGE_SIZE;
+    pmm.free_pages(virt_to_pfn(vaddr), ceil_log2(pages));
 }
 
 // --- Slab backing (adapted from bins._slab_create:52) ---
@@ -228,7 +231,7 @@ fn bslab_create(alloc_size as i64, page_size as i64, bin_idx as i64) as *Slab {
 
     let is i64 as region = heap_pages_alloc(page_size);
     if (region == 0) {
-        heap_pages_free(meta);
+        heap_pages_free(meta, meta_size);
         return cast(*Slab, 0);
     }
 
@@ -493,12 +496,13 @@ fn large_insert(vaddr as i64, order as i64) as void {
 }
 
 // Caller holds heap_lock. Removes the entry for vaddr (swap with the block's
-// last entry — unordered). Shrinks the chain: if a non-head block becomes
-// empty it is unlinked here and RETURNED so the caller can bins-free it
-// outside the lock (kfree of a bins block would re-take heap_lock -> deadlock).
-// Return: 0 = not a large extent; 1 = removed, nothing to free; otherwise the
-// returned value is an emptied chain block for the caller to kfree.
-fn large_remove(vaddr as i64) as i64 {
+// last entry — unordered) and writes the freed extent's order to *order_out
+// (so the caller can pass it to pmm.free_pages). Shrinks the chain: if a
+// non-head block becomes empty it is unlinked here and RETURNED so the caller
+// can bins-free it outside the lock (kfree of a bins block would re-take
+// heap_lock -> deadlock). Return: 0 = not a large extent; 1 = removed, nothing
+// to free; otherwise the returned value is an emptied chain block to kfree.
+fn large_remove(vaddr as i64, order_out as i64) as i64 {
     let is i64 as prev with mut = 0;
     let is i64 as blk with mut = large_head;
     while (blk != 0) {
@@ -506,6 +510,8 @@ fn large_remove(vaddr as i64) as i64 {
         let is i64 as i with mut = 0;
         while (i < c) {
             if (lb_ent_vaddr(blk, i) == vaddr) {
+                let is *i64 as op = cast(*i64, order_out);
+                op[0] = lb_ent_order(blk, i);   // capture order before the swap
                 let is i64 as last = c - 1;
                 if (i != last) {
                     lb_set_ent(blk, i, lb_ent_vaddr(blk, last), lb_ent_order(blk, last));
@@ -740,11 +746,12 @@ fn kfree(ptr as i64) as void {
     // to bins_free. Hold heap_lock only for the (allocation-free) table probe;
     // bins_free is self-locking and pmm.free_pages has its own lock.
     if ((ptr & 0xFFF) == 0) {
+        let is i64 as ford with mut = 0;
         hirq_save();
-        let is i64 as lr = large_remove(ptr);
+        let is i64 as lr = large_remove(ptr, cast(i64, &ford));
         hirq_restore();
         if (lr != 0) {
-            pmm.free_pages(virt_to_pfn(ptr));
+            pmm.free_pages(virt_to_pfn(ptr), cast(i32, ford));   // order from the extent entry
             // lr > 1 -> an emptied chain block (a bins allocation) to release.
             if (lr != 1) { kfree(lr); }
             return;

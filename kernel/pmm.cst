@@ -35,19 +35,18 @@ let is i32 as USAGE_PAGE_TABLE  = 2;
 let is i32 as USAGE_KERNEL_HEAP = 3;
 let is i32 as USAGE_BOOT_RESERVED = 5;
 
-// frame_meta[pfn] — one u16 per page (2 bytes), replacing the 12-byte
-// PageInfo (6x less resident: ~384KB -> ~64KB in 128MB). Packs every
-// field the buddy + free_pages + heap.kfree + vmm.validate_pt_page
-// need to recover from a pfn, so the external API doesn't change:
-//   bits [3:0]  order  (0..10)
-//   bits [5:4]  state  (ABSENT / FREE / ALLOCATED / RESERVED)
-//   bit  [6]    head   (1 = head of a buddy block; 0 = tail)
-//   bits [9:7]  usage  (NONE / KERNEL / PAGE_TABLE / KERNEL_HEAP / BOOT_RESERVED)
-let is i32 as FM_ORDER_SHIFT = 0;
-let is i32 as FM_STATE_SHIFT = 4;
-let is i32 as FM_HEAD_SHIFT  = 6;
-let is i32 as FM_USAGE_SHIFT = 7;
-let is i32 as FM_ORDER_MASK  = 15;
+// frame_meta[pfn] — one u8 per page (1 byte), down from the 12-byte
+// PageInfo (12x less resident: ~384KB -> ~32KB in 128MB). The block's
+// `order` no longer lives here — a free block carries it in its FreeNode,
+// and free_pages takes the freed block's order from its caller — so an
+// allocated page needs no order. What remains is what the buddy +
+// vmm.validate_pt_page must recover from a pfn:
+//   bits [1:0]  state  (ABSENT / FREE / ALLOCATED / RESERVED)
+//   bit  [2]    head   (1 = head of a buddy block; 0 = tail)
+//   bits [5:3]  usage  (NONE / KERNEL / PAGE_TABLE / KERNEL_HEAP / BOOT_RESERVED)
+let is i32 as FM_STATE_SHIFT = 0;
+let is i32 as FM_HEAD_SHIFT  = 2;
+let is i32 as FM_USAGE_SHIFT = 3;
 let is i32 as FM_STATE_MASK  = 3;
 let is i32 as FM_USAGE_MASK  = 7;
 
@@ -152,17 +151,15 @@ fn fm_usage(m as i32) as i32 {
     return (m >> FM_USAGE_SHIFT) & FM_USAGE_MASK;
 }
 
-fn fm_order(m as i32) as i32 {
-    return (m >> FM_ORDER_SHIFT) & FM_ORDER_MASK;
-}
-
 fn fm_head(m as i32) as i32 {
     return (m >> FM_HEAD_SHIFT) & cast(i32, 1);
 }
 
+// `order` is accepted for call-site symmetry but NOT stored — it lives in
+// the FreeNode (free blocks) / the caller (free_pages). Kept so mark_alloc/
+// mark_free/seed need no change.
 fn fm_build(state as i32, usage as i32, order as i32, head as i32) as i32 {
-    return ((order & FM_ORDER_MASK) << FM_ORDER_SHIFT)
-         | ((state & FM_STATE_MASK) << FM_STATE_SHIFT)
+    return ((state & FM_STATE_MASK) << FM_STATE_SHIFT)
          | ((head  & cast(i32, 1))  << FM_HEAD_SHIFT)
          | ((usage & FM_USAGE_MASK) << FM_USAGE_SHIFT);
 }
@@ -445,28 +442,28 @@ fn phys_to_pfn(addr as i64) as i32 {
     return cast(i32, addr >> PAGE_SHIFT);
 }
 
-fn frame_meta_ptr(pfn as i32) as *u16 {
+fn frame_meta_ptr(pfn as i32) as *u8 {
     let is i32 as sid = pfn >> SECTION_PAGE_SHIFT;
     if (sid >= MAX_SECTIONS) {
-        return cast(*u16, 0);
+        return cast(*u8, 0);
     }
     let is *MemSection as sec = section_get(sid);
     if (sec.present == cast(i32, 0)) {
-        return cast(*u16, 0);
+        return cast(*u8, 0);
     }
     let is i64 as idx = cast(i64, pfn & SECTION_PAGE_MASK);
-    return cast(*u16, phys_to_virt(sec.pages) + idx * 2);
+    return cast(*u8, phys_to_virt(sec.pages) + idx);
 }
 
 fn frame_meta_read(pfn as i32) as i32 {
-    let is *u16 as p = frame_meta_ptr(pfn);
+    let is *u8 as p = frame_meta_ptr(pfn);
     if (cast(i64, p) == 0) { return cast(i32, 0); }   // absent → state ABSENT
     return cast(i32, p[0]);
 }
 
 fn frame_meta_write(pfn as i32, v as i32) as void {
-    let is *u16 as p = frame_meta_ptr(pfn);
-    if (cast(i64, p) != 0) { p[0] = cast(u16, v); }
+    let is *u8 as p = frame_meta_ptr(pfn);
+    if (cast(i64, p) != 0) { p[0] = cast(u8, v); }
 }
 
 // Per-pfn metadata accessors. These are also the external read API:
@@ -474,7 +471,6 @@ fn frame_meta_write(pfn as i32, v as i32) as void {
 // reads order/state/head off them.
 fn page_state(pfn as i32) as i32 { return fm_state(frame_meta_read(pfn)); }
 fn page_usage(pfn as i32) as i32 { return fm_usage(frame_meta_read(pfn)); }
-fn page_order(pfn as i32) as i32 { return fm_order(frame_meta_read(pfn)); }
 fn page_is_head(pfn as i32) as i32 { return fm_head(frame_meta_read(pfn)); }
 
 fn page_set(pfn as i32, state as i32, usage as i32, order as i32, head as i32) as void {
@@ -544,7 +540,7 @@ fn init_sections() as void {
             if (sid < MAX_SECTIONS) {
                 let is *MemSection as sec = section_get(sid);
                 if (sec.present == cast(i32, 0)) {
-                    let is i64 as pi_size = cast(i64, PAGES_PER_SECTION) * 2;
+                    let is i64 as pi_size = cast(i64, PAGES_PER_SECTION);   // 1 byte/page
                     let is i64 as pi_addr = mb_alloc(pi_size);
                     sec.present = cast(i32, 1);
                     sec.base_pfn = sid << SECTION_PAGE_SHIFT;
@@ -1008,7 +1004,10 @@ fn merge_insert(pfn as i32, order as i32) as void {
     insert_free(co, cp);
 }
 
-fn free_pages(pfn as i32) as void {
+// `order` is supplied by the caller (the allocator no longer stores a freed
+// page's order in frame_meta). The caller allocated the block, so it knows
+// the order — directly (constant), from a tracking field, or from a table.
+fn free_pages(pfn as i32, order as i32) as void {
     if (page_present(pfn) == cast(i32, 0)) { panic("free: bad pfn", 13); }
     let is i32 as m = frame_meta_read(pfn);
     // Double-free guard: a previously freed page is FREE, not ALLOCATED,
@@ -1016,8 +1015,6 @@ fn free_pages(pfn as i32) as void {
     // structural variant). The old refcount!=1 panic is gone with aux0.
     if (fm_state(m) != PAGE_ALLOCATED) { panic("free: not alloc", 15); }
     if (fm_head(m) == cast(i32, 0)) { panic("free: not head", 14); }
-
-    let is i32 as order = fm_order(m);
 
     let is i64 as pflags = lock.acquire_irq(&pmm_lock);
 
@@ -1053,8 +1050,8 @@ fn buddy_selftest() as void {
     if (p5  == PFN_NONE) { panic("selftest: alloc o5", 18); }
     if (p10 == PFN_NONE) { panic("selftest: alloc o10", 19); }
 
-    // 2. Metadata round-trips through frame_meta.
-    if (page_order(p5)  != cast(i32, 5))    { panic("selftest: order rt", 18); }
+    // 2. Metadata round-trips through frame_meta (order is no longer stored
+    //    on an allocated page — it's the caller's to track now).
     if (page_state(p5)  != PAGE_ALLOCATED)  { panic("selftest: state rt", 18); }
     if (page_is_head(p5) == cast(i32, 0))   { panic("selftest: head rt", 17); }
     if (page_usage(p5)  != USAGE_KERNEL)    { panic("selftest: usage rt", 18); }
@@ -1062,11 +1059,11 @@ fn buddy_selftest() as void {
 
     // 3. Free in mixed order; no page may leak (the pool total returns
     //    to baseline once everything is freed and coalesced).
-    free_pages(p5);
-    free_pages(p1);
-    free_pages(p10);
-    free_pages(p2);
-    free_pages(p0);
+    free_pages(p5, cast(i32, 5));
+    free_pages(p1, cast(i32, 1));
+    free_pages(p10, cast(i32, 10));
+    free_pages(p2, cast(i32, 2));
+    free_pages(p0, cast(i32, 0));
     let is i64 as after_total = cast(i64, free_total);
     if (after_total != base_total) { panic("selftest: leak", 14); }
 
@@ -1076,9 +1073,9 @@ fn buddy_selftest() as void {
     //    returns the same pfn. A broken free/merge would not reproduce it.
     let is i32 as g = alloc_pages(fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
     if (g == PFN_NONE) { panic("selftest: alloc g", 17); }
-    free_pages(g);
+    free_pages(g, cast(i32, 10));
     if (page_state(g) != PAGE_FREE)      { panic("selftest: g not free", 20); }
-    if (page_order(g) != cast(i32, 10))  { panic("selftest: g order", 17); }
+    if (fn_order(g) != cast(i32, 10))    { panic("selftest: g order", 17); }
     if (page_is_head(g) == cast(i32, 0)) { panic("selftest: g head", 16); }
     let is i32 as g2 = alloc_pages(fl, cast(i32, 10), USAGE_KERNEL, cast(i32, 0));
     if (g2 != g) { panic("selftest: g2!=g (coalesce)", 26); }
@@ -1088,7 +1085,7 @@ fn buddy_selftest() as void {
     //    design) — we verify the exact conditions those guards test:
     //    (a) state guard — after one free, the page is FREE not ALLOCATED,
     //        so a second free_pages() would trip "free: not alloc".
-    free_pages(g2);
+    free_pages(g2, cast(i32, 10));
     if (page_state(g2) == PAGE_ALLOCATED) { panic("selftest: dfree guard", 21); }
     //    (b) freelist magic — g2 is now a free-list head, body carries
     //        FREE_MAGIC. freenode_ok is the same predicate remove_free
@@ -1105,7 +1102,7 @@ fn buddy_selftest() as void {
     let is i32 as b = alloc_pages(ALLOC_BELOW_4G | ALLOC_ZERO, cast(i32, 0), USAGE_KERNEL, cast(i32, 0));
     if (b == PFN_NONE) { panic("selftest: below4g alloc", 23); }
     if (b >= PFN_4G_LIMIT) { panic("selftest: below4g range", 23); }
-    free_pages(b);
+    free_pages(b, cast(i32, 0));
 
     // Nothing left allocated; pool back to baseline.
     let is i64 as final_total = cast(i64, free_total);
@@ -1119,7 +1116,7 @@ fn buddy_selftest() as void {
         if (sec.present != cast(i32, 0)) { nsec = nsec + cast(i32, 1); }
         sid = sid + cast(i32, 1);
     }
-    let is i64 as fm_bytes = cast(i64, nsec) * cast(i64, PAGES_PER_SECTION) * 2;
+    let is i64 as fm_bytes = cast(i64, nsec) * cast(i64, PAGES_PER_SECTION);
     let is i64 as pi_bytes = cast(i64, nsec) * cast(i64, PAGES_PER_SECTION) * 12;
     serial.print("pmm.selftest: frame_meta=", 25);
     util.print_num(fm_bytes);
