@@ -98,6 +98,23 @@ smp_read_cr3:
     .byte   0x0F, 0x20, 0xD8              # mov rax, cr3
     ret
 
+# void smp_read_cr3_into(uint64_t *out /*rdi*/) -> *out = CR3
+# Output-pointer form so the value lands in a caller stack local (per-cpu by
+# nature) instead of a shared module global — two cpus reading CR3 at once then
+# never corrupt each other (the old cr3_val shuttle could load the wrong CR3).
+.globl smp_read_cr3_into
+smp_read_cr3_into:
+    .byte   0x0F, 0x20, 0xD8              # mov rax, cr3
+    .byte   0x48, 0x89, 0x07              # mov [rdi], rax
+    ret
+
+# void smp_read_cr2_into(uint64_t *out /*rdi*/) -> *out = CR2 (faulting addr)
+.globl smp_read_cr2_into
+smp_read_cr2_into:
+    .byte   0x0F, 0x20, 0xD0              # mov rax, cr2
+    .byte   0x48, 0x89, 0x07              # mov [rdi], rax
+    ret
+
 # void smp_call_ptr(uint64_t target /*rdi*/)
 # Calls target via a register indirection — keeps the function pointer
 # in a register that doesn't survive a preempt/resume in any corrupted
