@@ -77,6 +77,8 @@ let is i64 as KVMAP_SIZE = 0x40000000;           // 1 GiB of kernel VA
 let is i64 as KV_DATA = 1;   // anon RAM, zeroed, KMAP_DATA; kvunmap frees the frames
 let is i64 as KV_MMIO = 2;   // caller's device phys, KMAP_MMIO (UC); frames are the device's
 let is i64 as KV_WC   = 3;   // caller's device phys, KMAP_WC (write-combining framebuffer)
+let is i64 as KV_DMA  = 4;   // anon RAM, zeroed, CONTIGUOUS + below-4G (32-bit DMA), KMAP_DATA;
+                             // kvmap_result_phys = the contiguous physical base; frees the block
 
 // kvmap `flags` bit. KV_GUARD wraps a KV_DATA allocation in one unmapped page
 // on each side (overrun/underrun trips a #PF instead of silently corrupting a
@@ -740,6 +742,8 @@ fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
     if (kind == KV_DATA) {
         // span = data pages + one guard page on each side (when guarded).
         span = pmm.align_up(size, pmm.PAGE_SIZE) + guard * 2 * pmm.PAGE_SIZE;
+    } else if (kind == KV_DMA) {
+        span = pmm.align_up(size, pmm.PAGE_SIZE);   // contiguous, no guard, no phys offset
     } else {
         phys_aligned = phys & ~(pmm.PAGE_SIZE - 1);
         phys_offset  = phys - phys_aligned;
@@ -807,6 +811,38 @@ fn kvmap(size as i64, kind as i64, flags as i64, phys as i64) as i64 {
 
         kvmap_result_phys = 0;   // anon: no single contiguous phys
         return data_base;
+    }
+
+    if (kind == KV_DMA) {
+        // One physically-contiguous, below-4G, zeroed block (32-bit DMA). The
+        // pfn base goes in the extent's pfns slot; the block's order is recovered
+        // from the span on free. kvmap_result_phys = the contiguous phys base
+        // (what the device programs).
+        let is i32 as order = ceil_log2(pages);
+        let is i32 as pfn = pmm.alloc_pages(
+            pmm.ALLOC_BELOW_4G | pmm.ALLOC_ZERO, order, pmm.USAGE_KERNEL, cast(i32, 0));
+        if (pfn == pmm.PFN_NONE) {
+            vflags = lock.acquire_irq(&vmm_lock);
+            kv_va_release(base, span);
+            lock.release_irq(&vmm_lock, vflags);
+            kvmap_result_phys = 0;
+            return 0;
+        }
+        let is i64 as dphys = pmm.pfn_to_phys(pfn);
+        let is i64 as i with mut = 0;
+        while (i < pages) {
+            vmm_map_page(kas_pml4_phys, base + i * pmm.PAGE_SIZE,
+                dphys + i * pmm.PAGE_SIZE, KMAP_DATA);
+            i = i + 1;
+        }
+        flush_tlb_range(base, pages);
+
+        vflags = lock.acquire_irq(&vmm_lock);
+        kv_used_insert(base, span, KV_DMA, cast(i64, pfn));   // pfns = pfn base
+        lock.release_irq(&vmm_lock, vflags);
+
+        kvmap_result_phys = dphys;
+        return base;
     }
 
     // KV_MMIO / KV_WC: map the caller's device phys with the right memory type.
@@ -880,7 +916,9 @@ fn kvunmap(vaddr as i64) as void {
     }
     flush_tlb_range(data_base, map_pages);
 
-    // Free the backing frames only for KV_DATA (MMIO/WC frames are the device's).
+    // Free the backing frames only for anon kinds (MMIO/WC frames are the
+    // device's). KV_DATA: per-page array. KV_DMA: one contiguous block whose
+    // order is recovered from the span (pfns slot holds the head pfn).
     if (basekind == KV_DATA) {
         if (pfns != 0) {
             let is *i64 as pa = cast(*i64, pfns);
@@ -891,6 +929,8 @@ fn kvunmap(vaddr as i64) as void {
             }
             heap.kfree(pfns);
         }
+    } else if (basekind == KV_DMA) {
+        pmm.free_pages(cast(i32, pfns), ceil_log2(map_pages));
     }
 
     // Return the whole span (guards included) to the free-list (coalescing).
@@ -961,6 +1001,23 @@ fn kvmap_smoke() as void {
     let is i64 as w = kvmap(4096, KV_WC, 0, 0xFEE00000);
     if (w == 0) { ok = cast(i32, 0); }
     else { kvunmap(w); }
+
+    // 3b. KV_DMA: a 3-page contiguous below-4G block. Prove the phys base is
+    //     reported, lies below 4 GiB, the pages are physically contiguous, and
+    //     it round-trips; then free the block.
+    let is i64 as dm = kvmap(3 * 4096, KV_DMA, 0, 0);
+    if (dm == 0) { ok = cast(i32, 0); }
+    else {
+        let is i64 as dphys = kvmap_result_phys;
+        if (dphys == 0) { ok = cast(i32, 0); }
+        if (dphys >= 0x100000000) { ok = cast(i32, 0); }                       // below 4 GiB
+        if (virt_to_phys_walk(kas_pml4_phys, dm) != dphys) { ok = cast(i32, 0); }
+        if (virt_to_phys_walk(kas_pml4_phys, dm + 2 * 4096) != dphys + 2 * 4096) { ok = cast(i32, 0); }  // contiguous
+        let is *i64 as dp2 = cast(*i64, dm);
+        dp2[0] = 0xD11A;
+        if (dp2[0] != 0xD11A) { ok = cast(i32, 0); }
+        kvunmap(dm);
+    }
 
     // 4. KV_GUARD: a guarded KV_DATA page is mapped, but the page on each side
     //    is NOT (an overrun/underrun would #PF). We assert via the page walk
