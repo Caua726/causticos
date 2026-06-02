@@ -27,6 +27,16 @@ use "sched.cst"  as sched;
 use "timer.cst"  as timer;
 use "abi.cst"    as abi;
 use "kobject.cst" as kobject;
+use "lock.cst"    as lock;
+
+// Serialises filesystem operations. The backing FS (fat32) keeps shared
+// scratch buffers with no internal lock, so two processes doing file I/O on
+// different cpus would race on them; this coarse lock (one mount today) makes
+// every public VFS op mutually exclusive. The op bodies are X_inner; the public
+// X wraps acquire/inner/release so multiple internal returns can't leak the
+// lock. The fat32 self-test bypasses VFS but runs exclusively before vfs.mount,
+// so it needs no lock. lseek is purely local (VfsFile offset) and stays unlocked.
+let is lock.TicketLock as fs_lock;
 
 // ============================================================
 // Error codes. Negative to play nice with syscalls that return -errno.
@@ -346,7 +356,7 @@ fn pool_release(f as *VfsFile) as void {
 // open/close/read/write/seek/stat
 // ============================================================
 
-fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
+fn open_inner(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     if (path_len <= 0) { return cast(*VfsFile, 0); }
     let is i64 as rel_off with mut = 0;
     let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
@@ -435,7 +445,7 @@ fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     return f;
 }
 
-fn close(f as *VfsFile) as i32 {
+fn close_inner(f as *VfsFile) as i32 {
     if (cast(i64, f) == 0) { return VFS_EBADF; }
     if (f.in_use == 0)     { return VFS_EBADF; }
     // Reader/writer synchronisation barrier — let the FS flush any
@@ -447,7 +457,7 @@ fn close(f as *VfsFile) as i32 {
     return VFS_OK;
 }
 
-fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
+fn read_inner(f as *VfsFile, buf as *u8, n as i64) as i64 {
     if (cast(i64, f) == 0 || f.in_use == 0) { return cast(i64, VFS_EBADF); }
     if (f.is_dir == 1)                       { return cast(i64, VFS_EISDIR); }
     if ((f.flags & O_ACCMODE) == O_WRONLY)   { return cast(i64, VFS_EBADF); }
@@ -464,7 +474,7 @@ fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
     return got;
 }
 
-fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
+fn write_inner(f as *VfsFile, buf as *u8, n as i64) as i64 {
     if (cast(i64, f) == 0 || f.in_use == 0)    { return cast(i64, VFS_EBADF); }
     if (f.is_dir == 1)                          { return cast(i64, VFS_EISDIR); }
     if ((f.flags & O_ACCMODE) == O_RDONLY)      { return cast(i64, VFS_EBADF); }
@@ -505,7 +515,7 @@ fn lseek(f as *VfsFile, off as i64, whence as i32) as i64 {
     return new_off;
 }
 
-fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
+fn stat_path_inner(path as *u8, path_len as i64, out as *VfsStat) as i32 {
     if (path_len <= 0)        { return VFS_EINVAL; }
     let is i64 as rel_off with mut = 0;
     let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
@@ -522,7 +532,7 @@ fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
 // Metadata dispatch
 // ============================================================
 
-fn unlink(path as *u8, path_len as i64) as i32 {
+fn unlink_inner(path as *u8, path_len as i64) as i32 {
     let is i64 as rel_off with mut = 0;
     let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
     if (cast(i64, mnt) == 0) { return VFS_ENOENT; }
@@ -534,7 +544,7 @@ fn unlink(path as *u8, path_len as i64) as i32 {
     return call(mnt.ops.unlink, mnt.priv, ef_path, ef_len);
 }
 
-fn mkdir(path as *u8, path_len as i64) as i32 {
+fn mkdir_inner(path as *u8, path_len as i64) as i32 {
     let is i64 as rel_off with mut = 0;
     let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
     if (cast(i64, mnt) == 0) { return VFS_ENOENT; }
@@ -546,7 +556,7 @@ fn mkdir(path as *u8, path_len as i64) as i32 {
     return call(mnt.ops.mkdir, mnt.priv, ef_path, ef_len);
 }
 
-fn rmdir(path as *u8, path_len as i64) as i32 {
+fn rmdir_inner(path as *u8, path_len as i64) as i32 {
     let is i64 as rel_off with mut = 0;
     let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
     if (cast(i64, mnt) == 0) { return VFS_ENOENT; }
@@ -558,7 +568,7 @@ fn rmdir(path as *u8, path_len as i64) as i32 {
     return call(mnt.ops.rmdir, mnt.priv, ef_path, ef_len);
 }
 
-fn rename(src as *u8, src_len as i64,
+fn rename_inner(src as *u8, src_len as i64,
           dst as *u8, dst_len as i64) as i32 {
     let is i64 as src_off with mut = 0;
     let is *VfsMount as m1 = resolve_mount(src, src_len, &src_off);
@@ -573,7 +583,7 @@ fn rename(src as *u8, src_len as i64,
                 rd, dst_len - dst_off);
 }
 
-fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
+fn readdir_inner(f as *VfsFile, out as *VfsDirEntry) as i32 {
     if (cast(i64, f) == 0 || f.in_use == 0) { return VFS_EBADF; }
     if (f.is_dir == 0) { return VFS_ENOTDIR; }
     let is ReaddirOut as ro;
@@ -611,6 +621,72 @@ fn err_to_abi(rc as i64) as i64 {
     if (rc == cast(i64, VFS_ENOSPC))    { return abi.E_NOSPC; }
     if (rc == cast(i64, VFS_EIO))       { return abi.E_IO; }
     return abi.E_INVAL;
+}
+
+// ============================================================
+// Public op wrappers — acquire fs_lock, run the _inner body, release. One
+// acquire/release per op regardless of the body's internal returns, so the
+// shared fat32 scratch buffers are never touched by two cpus at once.
+// ============================================================
+fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
+    lock.acquire(&fs_lock);
+    let is *VfsFile as r = open_inner(path, path_len, flags);
+    lock.release(&fs_lock);
+    return r;
+}
+fn close(f as *VfsFile) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = close_inner(f);
+    lock.release(&fs_lock);
+    return r;
+}
+fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
+    lock.acquire(&fs_lock);
+    let is i64 as r = read_inner(f, buf, n);
+    lock.release(&fs_lock);
+    return r;
+}
+fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
+    lock.acquire(&fs_lock);
+    let is i64 as r = write_inner(f, buf, n);
+    lock.release(&fs_lock);
+    return r;
+}
+fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = stat_path_inner(path, path_len, out);
+    lock.release(&fs_lock);
+    return r;
+}
+fn unlink(path as *u8, path_len as i64) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = unlink_inner(path, path_len);
+    lock.release(&fs_lock);
+    return r;
+}
+fn mkdir(path as *u8, path_len as i64) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = mkdir_inner(path, path_len);
+    lock.release(&fs_lock);
+    return r;
+}
+fn rmdir(path as *u8, path_len as i64) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = rmdir_inner(path, path_len);
+    lock.release(&fs_lock);
+    return r;
+}
+fn rename(src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = rename_inner(src, src_len, dst, dst_len);
+    lock.release(&fs_lock);
+    return r;
+}
+fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
+    lock.acquire(&fs_lock);
+    let is i32 as r = readdir_inner(f, out);
+    lock.release(&fs_lock);
+    return r;
 }
 
 fn file_op_read(priv as i64, buf as i64, n as i64) as i64 {
