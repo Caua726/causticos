@@ -246,15 +246,24 @@ fn harvest_all(p as *BlockIOProvider) as i64 {
 // to SLEEPING — in which case wakeup now observes SLEEPING and
 // re-queues us correctly. sched.sleep_locked_and_yield drops the
 // lock atomically with the hand-off to schedule().
-fn wait_complete(r as *BlockRequest) as void {
-    let is i64 as flags with mut = sched.take_lock();
+fn wait_complete(p as *BlockIOProvider, r as *BlockRequest) as void {
+    // Timed-poll wait that ALSO actively harvests the hardware, NOT the
+    // indefinite sleep_locked_and_yield primitive. The root SMP failure was a
+    // LOST AHCI completion IRQ: the hardware finished the command (PX_CI bit
+    // cleared) but the IRQ on another cpu was missed, so the IRQ-only harvest
+    // never ran, r.state never reached COMPLETE, and the waiter slept forever —
+    // the 5 s timeout never fired because the thread never woke to check it (the
+    // silent residual smp>1 boot stall). Here each poll we drive harvest_all
+    // ourselves: ahci_harvest reads PX_CI under the port lock, so a completion
+    // the IRQ missed is picked up within one poll. A genuinely stuck request
+    // still surfaces loudly at 5 s. The submit path's wakeup_thread stays as an
+    // early-wake optimisation.
     let is i64 as wait_start = timer.current_time_ns();
     let is i64 as bail_at    = wait_start + 5000000000;   // 5 s hard timeout
     while (r.state != REQ_COMPLETE) {
-        sched.sleep_locked_and_yield(flags);
-        flags = sched.take_lock();
+        harvest_all(p);                              // active poll — covers a lost completion IRQ
+        if (r.state == REQ_COMPLETE) { return; }
         if (timer.current_time_ns() > bail_at) {
-            sched.drop_lock(flags);
             serial.println("", 0);
             serial.println("=== wait_complete STALLED ===", 29);
             serial.print("waiter_tid=", 11);
@@ -275,8 +284,8 @@ fn wait_complete(r as *BlockRequest) as void {
             asm("cli\n");
             while (1 == 1) { asm(".byte 0xF4\n"); }
         }
+        sched.sleep_for_ns(500000);   // 0.5 ms poll — robust to a missed completion wakeup
     }
-    sched.drop_lock(flags);
 }
 
 // Blocking read. Creates a request, submits, and sleeps the caller
@@ -295,7 +304,7 @@ fn read_sync(dev as *driver.Hardware, port as i64, lba as i64,
     let is i32 as rc = submit(p, r);
     if (rc != 0) { free_request(r); return rc; }
 
-    wait_complete(r);
+    wait_complete(p, r);
     let is i32 as status = cast(i32, r.status);
     free_request(r);
     return status;
@@ -313,7 +322,7 @@ fn write_sync(dev as *driver.Hardware, port as i64, lba as i64,
     let is i32 as rc = submit(p, r);
     if (rc != 0) { free_request(r); return rc; }
 
-    wait_complete(r);
+    wait_complete(p, r);
     let is i32 as status = cast(i32, r.status);
     free_request(r);
     return status;
@@ -330,7 +339,7 @@ fn flush_sync(dev as *driver.Hardware, port as i64) as i32 {
     let is i32 as rc = submit(p, r);
     if (rc != 0) { free_request(r); return rc; }
 
-    wait_complete(r);
+    wait_complete(p, r);
     let is i32 as status = cast(i32, r.status);
     free_request(r);
     return status;
