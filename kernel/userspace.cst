@@ -20,6 +20,7 @@
 use "serial.cst" as serial;
 use "util.cst" as util;
 use "pmm.cst" as pmm;
+use "heap.cst" as heap;
 use "vmm.cst" as vmm;
 use "vma.cst" as vma;
 use "sched.cst" as sched;
@@ -2813,8 +2814,6 @@ fn spawn_argv_smoke() as void {
 // succeeded. Every failure below is LOUD (serial + return), never a silent
 // hang: a missing / short / unspawnable /init.cse is a real boot fault.
 // ============================================================
-let is [262144]u8 as init_image with mut;  // a real /init (shell, with an embedded 8x16 font) is larger than the SYS_SPAWN bound; give it 256 KiB
-
 fn spawn_init_from_disk() as void {
     serial.println("boot: open /init.cse", 20);
     let is *vfs.VfsFile as f = vfs.open(cast(*u8, "/init.cse"), 9, cast(i32, abi.O_RDONLY));
@@ -2823,19 +2822,31 @@ fn spawn_init_from_disk() as void {
         return;
     }
     let is i64 as sz = f.size;
-    if (sz <= 0 || sz > 262144) {
+    // Same structural bound as SYS_SPAWN: the image is staged in one contiguous
+    // kernel buffer (buddy max 4 MiB). No static cap any more — the buffer is
+    // kmalloc'd to the file's exact size and freed after proc_spawn copies it
+    // into the child aspace, so /init can be any real program up to the ceiling.
+    if (sz <= 0 || sz > abi.SPAWN_IMG_MAX) {
         serial.print("boot: /init.cse bad size", 24);
         serial.println("", 0);
         vfs.close(f);
         return;
     }
-    let is i64 as got = vfs.read(f, cast(*u8, &init_image[0]), sz);
+    let is i64 as buf = heap.kmalloc(sz, cast(i32, 0));
+    if (buf == 0) {
+        serial.println("boot: /init.cse no mem", 22);
+        vfs.close(f);
+        return;
+    }
+    let is i64 as got = vfs.read(f, cast(*u8, buf), sz);
     vfs.close(f);
     if (got != sz) {
         serial.println("boot: /init.cse short read", 26);
+        heap.kfree(buf);
         return;
     }
-    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &init_image[0]), got);
+    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, buf), got);
+    heap.kfree(buf);   // proc_spawn copied the image into the child aspace; buffer is transient
     if (child == 0) {
         serial.println("boot: /init.cse spawn FAIL", 26);
         return;
@@ -2846,12 +2857,9 @@ fn spawn_init_from_disk() as void {
     serial.println("", 0);
 }
 
-fn smoke_thread() as void {
-    // Wait for the boot self-tests (FAT32 phase-6 + VFS test) to finish
-    // before running the userspace smokes — otherwise they spawn processes
-    // that compete with the AHCI bind for cpus and stretch boot past the
-    // verify window under smp 4. Cap the wait so a no-disk boot still runs
-    // them. (Tooling only; production has no smoke thread.)
+// Wait for the FS to mount (bounded), then settle. Shared by init_thread and
+// smoke_init — both need a mounted disk before they touch files / spawn.
+fn wait_boot_ready() as void {
     let is i64 as deadline = timer.current_time_ns() + 12000000000;
     let is i64 as waiting with mut = 1;
     while (waiting == 1) {
@@ -2860,6 +2868,21 @@ fn smoke_thread() as void {
         else { sched.sleep_for_ns(20000000); }
     }
     sched.sleep_for_ns(100000000);     // let the bind/mount settle
+}
+
+// The real boot→userspace handoff: wait for mount, launch /init.cse. NO smokes
+// — this is the clean production path (run.sh, the bootstrap). The smokes live
+// in smoke_init() and never share or block this path.
+fn init_thread() as void {
+    wait_boot_ready();
+    spawn_init_from_disk();
+}
+
+// The "smoke-init": runs the kernel/userspace smokes for regression (verify.sh,
+// gated by main.RUN_SMOKE_INIT). Tooling only — separate thread, does NOT launch
+// /init, so a smoke boot and a real boot never interleave.
+fn smoke_init() as void {
+    wait_boot_ready();
     spawn_user_smoke();
     spawn_user_fault_smoke();
     vma_strict_smoke();
@@ -2880,9 +2903,5 @@ fn smoke_thread() as void {
     spawn_budget_smoke();
     spawn_budget_ring3_smoke();
     spawn_seg_share_smoke();
-    // The boot→userspace handoff: load and launch the first real program from
-    // disk. Last, so the smokes above (which validate the mechanisms init uses)
-    // run first; in production this is where the terminal takes over.
-    spawn_init_from_disk();
 }
 
