@@ -892,8 +892,77 @@ fn record_fail(order as i32, flags as i32) as void {
 
 // owner is kept for API stability; A1 dropped per-page owner tracking
 // (it returns with refcount/CoW later), so it is not threaded down here.
+// ============================================================
+// Pre-zeroed frame pool. A small cache of order-0 frames already wiped during
+// idle time, so a commit's ALLOC_ZERO doesn't pay the per-page zeroing burst
+// inline. Pooled frames are buddy-ALLOCATED (off the free list) but counted as
+// available in free_total — the buddy-alloc decrement is cancelled by a +1 when
+// pooled, so free_total = (buddy free) + (pool), and the budget pre-check stays
+// honest. The idle loop calls pzero_refill_one; alloc_pages serves from here
+// first for normal-zone order-0 zero allocs.
+// ============================================================
+let is i32 as PZERO_CAP = 64;            // 256 KiB cap
+let is [64]i32 as pzero_pool;
+let is i32 as pzero_count with mut = cast(i32, 0);
+
+// Pop a pre-zeroed frame, re-tagged with the caller's usage, or PFN_NONE.
+fn pzero_get(usage as i32) as i32 {
+    let is i64 as pflags = lock.acquire_irq(&pmm_lock);
+    if (pzero_count <= cast(i32, 0)) {
+        lock.release_irq(&pmm_lock, pflags);
+        return PFN_NONE;
+    }
+    pzero_count = pzero_count - cast(i32, 1);
+    let is i32 as pfn = pzero_pool[pzero_count];
+    free_total = free_total - cast(i32, 1);          // now truly used
+    mark_alloc(pfn, cast(i32, 0), usage);            // re-tag usage (already alloc'd + zeroed)
+    lock.release_irq(&pmm_lock, pflags);
+    return pfn;
+}
+
+// Add one freshly-zeroed frame to the pool (called from the idle loop). Returns
+// 1 if it added one, 0 if the pool is full or out of memory.
+fn pzero_refill_one() as i32 {
+    let is i64 as pf0 = lock.acquire_irq(&pmm_lock);
+    let is i32 as full0 with mut = cast(i32, 0);
+    if (pzero_count >= PZERO_CAP) { full0 = cast(i32, 1); }
+    lock.release_irq(&pmm_lock, pf0);
+    if (full0 != cast(i32, 0)) { return cast(i32, 0); }
+
+    // Allocate a frame WITHOUT zeroing (buddy path decrements free_total).
+    let is i32 as pfn = alloc_pages(cast(i32, 0), cast(i32, 0), USAGE_KERNEL, cast(i32, 0));
+    if (pfn == PFN_NONE) { return cast(i32, 0); }
+    let is i64 as ptr = phys_to_virt(pfn_to_phys(pfn));
+    let is *u8 as zp = cast(*u8, ptr);
+    let is i64 as zz with mut = 0;
+    while (zz < PAGE_SIZE) { zp[zz] = cast(u8, 0); zz = zz + 1; }
+
+    let is i64 as pflags = lock.acquire_irq(&pmm_lock);
+    let is i32 as full1 with mut = cast(i32, 0);
+    if (pzero_count >= PZERO_CAP) { full1 = cast(i32, 1); }
+    else {
+        pzero_pool[pzero_count] = pfn;
+        pzero_count = pzero_count + cast(i32, 1);
+        free_total = free_total + cast(i32, 1);      // count as available again
+    }
+    lock.release_irq(&pmm_lock, pflags);
+    if (full1 != cast(i32, 0)) { free_pages(pfn, cast(i32, 0)); return cast(i32, 0); }  // race: pool filled
+    return cast(i32, 1);
+}
+
 fn alloc_pages(flags as i32, order as i32, usage as i32, owner as i32) as i32 {
     if (order > MAX_BLOCK_ORDER) { return PFN_NONE; }
+
+    // Fast path: a pre-zeroed order-0 frame for a normal-zone ALLOC_ZERO (the
+    // common commit/back-page case). Skips the inline per-page wipe.
+    if (order == cast(i32, 0)) {
+        if ((flags & ALLOC_ZERO) != cast(i32, 0)) {
+            if ((flags & ALLOC_BELOW_4G) == cast(i32, 0)) {
+                let is i32 as pooled = pzero_get(usage);
+                if (pooled != PFN_NONE) { return pooled; }
+            }
+        }
+    }
 
     // ALLOC_EMERGENCY enforcement: panic if used outside permitted context
     if ((flags & ALLOC_EMERGENCY) != cast(i32, 0)) {
@@ -1124,6 +1193,38 @@ fn buddy_selftest() as void {
     util.print_num(pi_bytes);
     serial.println(" B)", 3);
     serial.println("pmm.selftest: buddy PASS", 24);
+}
+
+// Pre-zeroed pool: refill a few frames, confirm an ALLOC_ZERO order-0 alloc is
+// served from the pool (count drops) and is zeroed, then drain and confirm
+// free_total round-tripped (pooled frames count as available throughout).
+fn pzero_smoke() as void {
+    serial.println("pmm.pzero_smoke: start", 22);
+    let is i32 as ok with mut = cast(i32, 1);
+    let is i32 as base = free_total;
+
+    let is i32 as i with mut = cast(i32, 0);
+    while (i < cast(i32, 4)) { pzero_refill_one(); i = i + cast(i32, 1); }
+    if (pzero_count < cast(i32, 1)) { ok = cast(i32, 0); }
+    let is i32 as cnt_before = pzero_count;
+
+    let is i32 as got = alloc_pages(ALLOC_ZERO, cast(i32, 0), USAGE_KERNEL, cast(i32, 0));
+    if (got == PFN_NONE) { ok = cast(i32, 0); }
+    if (pzero_count != cnt_before - cast(i32, 1)) { ok = cast(i32, 0); }   // served from the pool
+    let is *i64 as zp = cast(*i64, phys_to_virt(pfn_to_phys(got)));
+    if (zp[0] != 0) { ok = cast(i32, 0); }
+    if (zp[511] != 0) { ok = cast(i32, 0); }                                // last qword of the page
+    free_pages(got, cast(i32, 0));
+
+    while (pzero_count > cast(i32, 0)) {
+        let is i32 as p = pzero_get(USAGE_KERNEL);
+        if (p == PFN_NONE) { pzero_count = cast(i32, 0); }
+        else { free_pages(p, cast(i32, 0)); }
+    }
+    if (free_total != base) { ok = cast(i32, 0); }
+
+    if (ok != cast(i32, 0)) { serial.println("pmm.pzero_smoke: PASS", 21); }
+    else { panic("pmm.pzero_smoke FAIL", 20); }
 }
 
 // ============================================================
