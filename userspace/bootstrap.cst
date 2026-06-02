@@ -1,0 +1,114 @@
+// bootstrap.cst — the CausticOS self-host bootstrap driver (runs as /init).
+//
+// Proves the compiler can compile + SAVE on CausticOS: it reads /caustic.cse
+// from disk, spawns it to compile /tiny.cst into /tiny.cse, waits, and reports
+// the result over serial. The host then lifts /tiny.cse off the disk image
+// (scripts/fat32_get.py) and checks the CST_ magic. This is round 0 of the
+// bootstrap; once it works, the same driver chains rounds (rN compiles rN+1).
+use "../../Caustic/std/os/causticos.cst" as sys;
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn log(s as *u8) as void { sys.write_serial(s, slen(s)); }
+
+fn lognum(n as i64) as void {
+    if (n == 0) { sys.write_serial("0", 1); return; }
+    let is [24]u8 as b;
+    let is i64 as v with mut = n;
+    let is i64 as neg with mut = 0;
+    if (v < 0) { neg = 1; v = 0 - v; }
+    let is i64 as p with mut = 23;
+    while (v > 0) { b[p] = cast(u8, (v % 10) + 48); v = v / 10; p = p - 1; }
+    if (neg == 1) { b[p] = 45; p = p - 1; }
+    sys.write_serial(cast(*u8, cast(i64, &b[0]) + p + 1), 23 - p);
+}
+
+// Read a whole file into a fresh anonymous mapping. Returns the buffer (len in
+// *out_len) or 0. The mapping is sized to the file (eager commit).
+fn read_whole(path as *u8, out_len as *i64) as *u8 {
+    *out_len = 0;
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0) { sys.close(fd); return cast(*u8, 0); }
+    let is i64 as va = sys.mmap(cast(i64, 0), sz, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
+    let is *u8 as buf = cast(*u8, va);
+    let is i64 as got = sys.read(fd, buf, sz);
+    sys.close(fd);
+    *out_len = got;
+    return buf;
+}
+
+fn probe(path as *u8) as void {
+    log("probe "); log(path); log(" -> fd=");
+    let is i64 as fd = sys.open_read(path);
+    lognum(fd);
+    if (fd >= 0) {
+        let is [16]u8 as b;
+        let is i64 as n = sys.read(fd, &b, 16);
+        log(" read="); lognum(n);
+        sys.close(fd);
+    }
+    log("\n");
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    log("bootstrap: self-host round — compiling /src/main.cst on CausticOS\n");
+
+    // VFS probe: isolate kernel path-resolution from compiler logic.
+    probe("/src/main.cst");
+    probe("/std/mem.cst");
+    probe("/std/io.cst");
+    probe("/src/lexer/tokens.cst");
+
+    let is i64 as clen with mut = 0;
+    let is *u8 as cimg = read_whole("/caustic.cse", &clen);
+    if (cast(i64, cimg) == 0) { log("bootstrap: read /caustic.cse FAIL\n"); return 1; }
+    log("bootstrap: /caustic.cse len="); lognum(clen); log("\n");
+
+    // argv for the compiler: compile the whole compiler for the caustic target.
+    // The compiler is recursive (recursive-descent parser, DFS passes) so it
+    // declares its stack with --stack-size; everything else resolves via the
+    // source tree mirrored at /src, /std, /caustic-linker, /caustic-assembler.
+    let is [12]i64 as av;
+    av[0]  = cast(i64, "caustic");                 av[1]  = 7;
+    av[2]  = cast(i64, "/src/main.cst");           av[3]  = 13;
+    av[4]  = cast(i64, "-o");                       av[5]  = 2;
+    av[6]  = cast(i64, "/out.cse");                 av[7]  = 8;
+    av[8]  = cast(i64, "--target=caustic-x86_64");  av[9]  = 23;
+    av[10] = cast(i64, "--stack-size=8388608");     av[11] = 21;
+
+    log("bootstrap: spawning compiler (this is slow)...\n");
+    let is i64 as pid = sys.spawn(cimg, clen, cast(*u8, 0), 0, cast(*u8, &av[0]), 6);
+    if (pid < 0) { log("bootstrap: spawn FAIL rc="); lognum(pid); log("\n"); return 1; }
+    log("bootstrap: compiler pid="); lognum(pid); log("\n");
+
+    // SYS_WAIT blocks for a bounded window (~1s) then returns E_AGAIN (-8) if the
+    // child is still running. A full self-compile takes far longer, so loop until
+    // the child is actually a zombie. r then holds its real exit code.
+    let is i64 as status with mut = 0;
+    let is i64 as r with mut = 0 - 8;
+    let is i64 as ticks with mut = 0;
+    while (r == (0 - 8)) {
+        r = sys.wait(pid, &status);
+        ticks = ticks + 1;
+        if ((ticks % 10) == 0) { log("bootstrap: still compiling... t="); lognum(ticks); log("s\n"); }
+    }
+    log("bootstrap: compiler exited code="); lognum(r); log("\n");
+
+    let is i64 as olen with mut = 0;
+    let is *u8 as oimg = read_whole("/out.cse", &olen);
+    if (cast(i64, oimg) == 0) { log("bootstrap: /out.cse NOT written\n"); return 1; }
+    log("bootstrap: /out.cse written len="); lognum(olen); log(" magic=");
+    sys.write_serial(oimg, 4);
+    log("\n");
+
+    log("bootstrap: ROUND DONE\n");
+    return 0;
+}
