@@ -199,43 +199,66 @@ def collect_existing_shorts(f, bpb, dir_cluster):
 
 
 def write_entries_to_dir(f, bpb, dir_cluster, entries):
-    """Append a consecutive run of entries (LFNs + SFN) to the
-    directory chain, extending clusters if needed."""
+    """Append an LFN+SFN run at the directory's true end, writing entries
+    SEQUENTIALLY and spanning into a freshly-extended cluster when the current
+    one fills. Critically, it never leaves a 0x00 slot BEFORE the new entries:
+    a 0x00 marks end-of-directory, so a gap in an earlier cluster would make
+    readers (dir_find / walk_dir) stop and never see entries written into a
+    later cluster — the bug that silently dropped every file added after a
+    directory grew past one cluster."""
     cluster_bytes = bpb["bps"] * bpb["spc"]
-    slots_needed = len(entries)
+    n_slots = cluster_bytes // 32
+
+    # 1. Walk the chain to the append point = first 0x00 (true end of dir).
     cluster = dir_cluster
+    data = None
+    slot = -1
     while True:
         off = cluster_to_offset(bpb, cluster)
         f.seek(off)
         data = bytearray(f.read(cluster_bytes))
-        # Find a run of slots_needed consecutive free/end slots.
-        n_slots = cluster_bytes // 32
-        run_start = -1
+        found = -1
         for i in range(n_slots):
-            marker = data[i * 32]
-            if marker == 0x00 or marker == 0xE5:
-                if run_start == -1:
-                    run_start = i
-                if i - run_start + 1 == slots_needed:
-                    for k, e in enumerate(entries):
-                        byte_off = (run_start + k) * 32
-                        data[byte_off:byte_off + 32] = e
-                    f.seek(off)
-                    f.write(data)
-                    return
-            else:
-                run_start = -1
-        # No fit in this cluster — advance or extend.
+            if data[i * 32] == 0x00:
+                found = i
+                break
+        if found != -1:
+            slot = found
+            break
         nxt = read_fat_entry(f, bpb, cluster)
         if nxt >= 0x0FFFFFF8:
+            # Full cluster with no terminator — extend; end is slot 0 of the new.
             new_c = find_free_cluster(f, bpb)
             write_fat_entry(f, bpb, cluster, new_c)
             write_fat_entry(f, bpb, new_c, 0x0FFFFFFF)
-            f.seek(cluster_to_offset(bpb, new_c))
-            f.write(b"\x00" * cluster_bytes)
             cluster = new_c
-        else:
-            cluster = nxt
+            data = bytearray(b"\x00" * cluster_bytes)
+            slot = 0
+            break
+        cluster = nxt
+
+    # 2. Write entries one slot at a time from (cluster, slot), extending the
+    #    chain when a cluster fills. The trailing slots stay 0x00 = terminator.
+    for e in entries:
+        if slot >= n_slots:
+            f.seek(cluster_to_offset(bpb, cluster))
+            f.write(data)
+            nxt = read_fat_entry(f, bpb, cluster)
+            if nxt >= 0x0FFFFFF8:
+                new_c = find_free_cluster(f, bpb)
+                write_fat_entry(f, bpb, cluster, new_c)
+                write_fat_entry(f, bpb, new_c, 0x0FFFFFFF)
+                cluster = new_c
+                data = bytearray(b"\x00" * cluster_bytes)
+            else:
+                cluster = nxt
+                f.seek(cluster_to_offset(bpb, cluster))
+                data = bytearray(f.read(cluster_bytes))
+            slot = 0
+        data[slot * 32:slot * 32 + 32] = e
+        slot += 1
+    f.seek(cluster_to_offset(bpb, cluster))
+    f.write(data)
 
 
 def add_entry(f, bpb, parent_cluster, name, attr, first_clus, size):
