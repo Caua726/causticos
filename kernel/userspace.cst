@@ -2236,7 +2236,7 @@ fn build_min_cse(code as i64) as void {
 // ----------------------------------------------------------------
 let is i64 as BUD_ENTRY = 0x401000;
 let is i64 as BUD_FOFF  = 0x38;
-let is i64 as BUD_RV    = 0x500000;      // reserve window, clear of text/stack
+let is i64 as BUD_RV    = 0x0000000010000000;   // reserve window, high + clear of text/stack
 let is [256]u8 as budget_cse;
 let is i64 as budget_cse_len with mut = 0;
 
@@ -2255,17 +2255,17 @@ fn build_budget_child_cse() as void {
     write_le_u32(e, 0x34, 5);                          // R-X
 
     let is i64 as c with mut = BUD_FOFF;
-    // SYS_MMAP(BUD_RV, 0x10000, WRITE|MMAP_RESERVE)  (16 pages reserved)
-    e[c+0]=cast(u8,0xB8); write_le_u32(e, c+1, 7); c = c + 5;        // mov eax,7
-    e[c+0]=cast(u8,0xBF); write_le_u32(e, c+1, BUD_RV); c = c + 5;   // mov edi, BUD_RV
-    e[c+0]=cast(u8,0xBE); write_le_u32(e, c+1, 0x10000); c = c + 5;  // mov esi, 0x10000
-    e[c+0]=cast(u8,0xBA); write_le_u32(e, c+1, 0x22); c = c + 5;     // mov edx, WRITE|MMAP_RESERVE
-    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;           // syscall
-    // SYS_COMMIT(BUD_RV, 0x8000, WRITE)  (8 pages -> rax = 0 or E_NOMEM)
-    e[c+0]=cast(u8,0xB8); write_le_u32(e, c+1, 27); c = c + 5;       // mov eax,27
-    e[c+0]=cast(u8,0xBF); write_le_u32(e, c+1, BUD_RV); c = c + 5;   // mov edi, BUD_RV
-    e[c+0]=cast(u8,0xBE); write_le_u32(e, c+1, 0x8000); c = c + 5;   // mov esi, 0x8000
-    e[c+0]=cast(u8,0xBA); write_le_u32(e, c+1, 2); c = c + 5;        // mov edx, WRITE
+    // SYS_MMAP(BUD_RV, 0x100000, WRITE|MMAP_RESERVE)  (1 MiB reserved)
+    e[c+0]=cast(u8,0xB8); write_le_u32(e, c+1, 7); c = c + 5;         // mov eax,7
+    e[c+0]=cast(u8,0xBF); write_le_u32(e, c+1, BUD_RV); c = c + 5;    // mov edi, BUD_RV
+    e[c+0]=cast(u8,0xBE); write_le_u32(e, c+1, 0x100000); c = c + 5;  // mov esi, 1 MiB
+    e[c+0]=cast(u8,0xBA); write_le_u32(e, c+1, 0x22); c = c + 5;      // mov edx, WRITE|MMAP_RESERVE
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;            // syscall
+    // SYS_COMMIT(BUD_RV, 0x100000, WRITE)  (1 MiB -> rax = 0 or E_NOMEM)
+    e[c+0]=cast(u8,0xB8); write_le_u32(e, c+1, 27); c = c + 5;        // mov eax,27
+    e[c+0]=cast(u8,0xBF); write_le_u32(e, c+1, BUD_RV); c = c + 5;    // mov edi, BUD_RV
+    e[c+0]=cast(u8,0xBE); write_le_u32(e, c+1, 0x100000); c = c + 5;  // mov esi, 1 MiB
+    e[c+0]=cast(u8,0xBA); write_le_u32(e, c+1, 2); c = c + 5;         // mov edx, WRITE
     e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;           // syscall
     // mov edi,1 ; cmp rax,-5 ; jne +2 ; xor edi,edi   (rdi=0 iff E_NOMEM)
     e[c+0]=cast(u8,0xBF); write_le_u32(e, c+1, 1); c = c + 5;        // mov edi,1
@@ -2372,6 +2372,72 @@ fn build_spawn_parent_cse() as void {
 
     write_le_u32(e, 0x2C, c - SPAWN_FOFF);             // file_size
     spawn_cse_len = c;
+}
+
+// A parent CSE that grants a memory BUDGET to its child through the real
+// SYS_SPAWN path: it embeds the budget child (reserves 1 MiB, commits 1 MiB,
+// exits 0 iff that commit got E_NOMEM), spawns it via SpawnParams with budget =
+// 64 KiB, waits, and exits with the child's code. The 64 KiB budget is far above
+// the child's loaded image but far below its 1 MiB commit, so the commit must be
+// refused → child exits 0 → parent exits 0. Proves the grant end to end through
+// the ring-3 syscall, not a kernel-side budget write.
+let is i64 as BUDP_ENTRY = 0x401000;
+let is i64 as BUDP_FOFF  = 0x38;
+let is [1024]u8 as budget_parent_cse;
+let is i64 as budget_parent_cse_len with mut = 0;
+
+fn build_budget_parent_cse() as void {
+    build_budget_child_cse();
+    let is *u8 as m = cast(*u8, &budget_cse[0]);
+    let is i64 as clen = budget_cse_len;
+
+    let is *u8 as e = cast(*u8, &budget_parent_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < 1024) { e[z] = cast(u8, 0); z = z + 1; }
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F);   // "CST_"
+    e[4]=cast(u8,2); e[6]=cast(u8,1);
+    write_le_u64(e, 0x08, BUDP_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 1);
+    write_le_u64(e, 0x20, BUDP_ENTRY);
+    write_le_u32(e, 0x28, BUDP_FOFF);
+    write_le_u32(e, 0x30, 0x2000);                     // mem_size (2 pages)
+    write_le_u32(e, 0x34, 5);                          // R-X
+
+    let is i64 as c with mut = BUDP_FOFF;
+    e[c+0]=cast(u8,0xEB); e[c+1]=cast(u8, clen); c = c + 2;            // jmp +clen (over the child)
+    let is i64 as child_foff = c;
+    let is i64 as ci with mut = 0;
+    while (ci < clen) { e[c+ci] = m[ci]; ci = ci + 1; }
+    c = c + clen;
+    let is i64 as child_va = BUDP_ENTRY + (child_foff - BUDP_FOFF);
+
+    // SYS_SPAWN(*SpawnParams): img=child, budget=0x10000 (64 KiB grant).
+    c = emit_spawn_params(e, c, child_va, clen, 0, 0, 0, 0, 0x10000);
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xC7); c = c + 3;   // mov rdi, rax (pid)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;                          // xor esi, esi (status=0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,15); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rax,15 (WAIT)
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                          // syscall -> child code
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xC7); c = c + 3;   // mov rdi, rax
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;    // mov rax,3 (EXIT)
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                          // syscall
+
+    write_le_u32(e, 0x2C, c - BUDP_FOFF);
+    budget_parent_cse_len = c;
+}
+
+fn spawn_budget_ring3_smoke() as void {
+    serial.println("userspace.budget_ring3_smoke: start", 35);
+    build_budget_parent_cse();
+    let is i64 as p = proc_spawn(proc.init_proc, cast(*u8, &budget_parent_cse[0]), budget_parent_cse_len);
+    if (p == 0) { serial.println("userspace.budget_ring3_smoke: spawn FAIL", 40); return; }
+    proc_start(p);
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(p));
+    // child commits 1 MiB under a 64 KiB grant -> E_NOMEM -> exit 0 -> parent exit 0.
+    if (code == 0) { serial.println("userspace.budget_ring3_smoke: PASS", 34); }
+    else { serial.println("userspace.budget_ring3_smoke: FAIL", 34); }
 }
 
 // ----------------------------------------------------------------
@@ -2812,6 +2878,7 @@ fn smoke_thread() as void {
     spawn_user_syscall_smoke();
     spawn_argv_smoke();
     spawn_budget_smoke();
+    spawn_budget_ring3_smoke();
     spawn_seg_share_smoke();
     // The boot→userspace handoff: load and launch the first real program from
     // disk. Last, so the smokes above (which validate the mechanisms init uses)
