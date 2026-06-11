@@ -21,6 +21,7 @@ use "channel.cst" as channel;
 use "driver.cst" as driver;
 use "process.cst" as proc;
 use "heap.cst" as heap;
+use "vmm.cst" as vmm;
 use "segment.cst" as segment;
 
 // ============================================================
@@ -664,7 +665,7 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     let is i64 as fdacts_uptr = sp.fdacts_uptr;
     let is i64 as n_acts with mut = sp.n_acts;
     if (img_len <= 0) { return abi.E_INVAL; }
-    if (img_len > abi.SPAWN_IMG_MAX) { return abi.E_INVAL; }   // structural: contiguous kmalloc staging (buddy max 4 MiB)
+    if (img_len > abi.SPAWN_IMG_MAX) { return abi.E_INVAL; }   // sanity bound on a spawned image (kvmap-staged, see below)
     if (n_acts < 0) { n_acts = 0; }
     if (n_acts > 16) { return abi.E_INVAL; }           // bound the fd-action list
     if (sp.budget < 0) { return abi.E_INVAL; }         // budget is a ceiling, not negative
@@ -723,12 +724,16 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
         }
     }
 
-    // Snapshot the image into a kernel buffer; proc_spawn copies it into
-    // the child's fresh aspace, so the buffer is transient.
-    let is i64 as kbuf = heap.kmalloc(img_len, cast(i32, 0));
+    // Snapshot the image into a transient kernel buffer; proc_spawn copies it
+    // into the child's fresh aspace. Staged via kvmap(KV_DATA) — scattered
+    // frames behind a contiguous VA — NOT a contiguous kmalloc: a multi-MiB
+    // image (the self-host compiler is >1 MiB) needs a 2 MiB+ buddy block that
+    // a fragmented heap can lack even with ~1 GiB free, which spuriously
+    // E_NOMEM'd the spawn. kvmap only needs free pages, not a contiguous run.
+    let is i64 as kbuf = vmm.kvmap(img_len, vmm.KV_DATA, 0, 0);
     if (kbuf == 0) { return abi.E_NOMEM; }
     let is i32 as crc = userspace.copy_from_user(pml4, cast(*u8, kbuf), img_uptr, img_len);
-    if (crc != 0) { heap.kfree(kbuf); return abi.E_FAULT; }
+    if (crc != 0) { vmm.kvunmap(kbuf); return abi.E_FAULT; }
 
     let is i64 as child with mut = 0;
     if (argc > 0) {
@@ -737,7 +742,7 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     } else {
         child = userspace.proc_spawn(parent, cast(*u8, kbuf), img_len);
     }
-    heap.kfree(kbuf);
+    vmm.kvunmap(kbuf);
     if (child == 0) { return abi.E_NOMEM; }
 
     // Hand off the requested fds into the still-suspended child. ko_ref
