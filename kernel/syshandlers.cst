@@ -333,6 +333,78 @@ fn sys_fd_recv(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i6
     return fd;
 }
 
+// ============================================================
+// SYS_POLL(entries_uptr, n, timeout_ns) — wait-many readiness. The
+// single-threaded event loop's only blocking point: sweep every watched fd
+// through ko_poll (each object reports under its own lock, briefly), return
+// as soon as anything is ready, else nap 1ms (the channel/kbd house style)
+// and re-sweep until the HPET deadline. Entries are copied in once and the
+// results copied out once; fds are re-resolved on every sweep so a peer's
+// close shows up as CLOSED, not a stale pointer. No lock is ever held
+// across the nap.
+// ============================================================
+
+fn sys_poll(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as uptr = a;
+    let is i64 as n = b;
+    let is i64 as timeout_ns = c;
+    if (n <= 0) { return abi.E_INVAL; }            // a pure sleep is SYS_TIME_SLEEP_NS
+    if (n > abi.POLL_MAX_ENTRIES) { return abi.E_INVAL; }
+    if (uptr == 0) { return abi.E_FAULT; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+
+    // 64 entries × 3 i64 = 1536 B on the kstack (32 KiB; sys_spawn stages
+    // more). Layout per entry: [i*3+0]=fd, [i*3+1]=want, [i*3+2]=got.
+    let is [192]i64 as ents;
+    let is i64 as nbytes = n * 24;
+    if (userspace.copy_from_user(pml4, cast(*u8, &ents[0]), uptr, nbytes) != 0) {
+        return abi.E_FAULT;
+    }
+
+    let is i64 as infinite with mut = 0;
+    let is i64 as deadline with mut = 0;
+    if (timeout_ns < 0) { infinite = 1; }
+    else if (timeout_ns > 0) {
+        let is i64 as now = timer.current_time_ns();
+        deadline = now + timeout_ns;
+        if (deadline < now) { infinite = 1; }      // overflow saturates to forever
+    }
+
+    let is i64 as ready with mut = 0;
+    let is i64 as sweeping with mut = 1;
+    while (sweeping == 1) {
+        ready = 0;
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            let is i64 as fd = ents[i*3+0];
+            let is i64 as want = ents[i*3+1];
+            let is i64 as got with mut = 0;
+            let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), fd);
+            if (ko == 0) { got = abi.POLL_ERROR; }
+            else {
+                let is i64 as st = kobject.ko_poll(ko);
+                if (st < 0) { got = abi.POLL_ERROR; }
+                else { got = st & (want | abi.POLL_CLOSED | abi.POLL_ERROR); }
+            }
+            ents[i*3+2] = got;
+            if (got != 0) { ready = ready + 1; }
+            i = i + 1;
+        }
+        if (ready > 0) { sweeping = 0; }
+        else if (timeout_ns == 0) { sweeping = 0; }
+        else if (infinite == 0 && timer.current_time_ns() >= deadline) { sweeping = 0; }
+        else { sched.sleep_for_ns(1000000); }
+    }
+
+    if (userspace.copy_to_user(pml4, uptr, cast(*u8, &ents[0]), nbytes) != 0) {
+        return abi.E_FAULT;
+    }
+    return ready;
+}
+
 // SYS_SEG_COPY(fd, off, ubuf, len, dir) — random-access copy between a segment's
 // bytes at [off,off+len) and the user buffer ubuf. dir 0 = read (seg→ubuf), 1 =
 // write (ubuf→seg). NOT read/write (no cursor) — a pointed access without
@@ -976,4 +1048,5 @@ fn install_all() as void {
     install(abi.SYS_SEG_COPY,        cast(i64, fn_ptr(sys_seg_copy)));
     install(abi.SYS_FD_SEND,         cast(i64, fn_ptr(sys_fd_send)));
     install(abi.SYS_FD_RECV,         cast(i64, fn_ptr(sys_fd_recv)));
+    install(abi.SYS_POLL,            cast(i64, fn_ptr(sys_poll)));
 }

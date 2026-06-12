@@ -55,6 +55,7 @@ fn init() as void {
     CHANNEL_OPS.read  = fn_ptr(chan_read);
     CHANNEL_OPS.write = fn_ptr(chan_write);
     CHANNEL_OPS.close = fn_ptr(chan_close);
+    CHANNEL_OPS.poll  = fn_ptr(chan_poll);
     // mmap/present/lseek/readdir stay null — a channel is a byte stream.
 }
 
@@ -159,6 +160,41 @@ fn chan_write(priv as i64, buf as i64, n as i64) as i64 {
         else                   { sched.sleep_for_ns(POLL_NS); }   // full
     }
     return result;
+}
+
+// Readiness for SYS_POLL. READABLE: my input ring has bytes, or the peer
+// closed (a read returns EOF without blocking — buffered bytes still drain
+// first since the count also reports READABLE). WRITABLE: the output ring
+// has at least POLL_WRITE_UNIT bytes free — so a write of one protocol-sized
+// message completes whole, never splits, never blocks on a stuck peer — or
+// the peer closed (a write returns E_PIPE without blocking; "progress" too).
+// CLOSED rides along so the holder can tell hangup from data.
+fn chan_poll(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as fl = lock.acquire_irq(&ch.lk);
+    let is i64 as in_count with mut = 0;
+    let is i64 as out_count with mut = 0;
+    let is i64 as other_closed with mut = 0;
+    if (ep.side == 0) {
+        in_count = ch.b2a_count;
+        out_count = ch.a2b_count;
+        other_closed = ch.b_closed;
+    } else {
+        in_count = ch.a2b_count;
+        out_count = ch.b2a_count;
+        other_closed = ch.a_closed;
+    }
+    lock.release_irq(&ch.lk, fl);
+    let is i64 as st with mut = 0;
+    if (in_count > 0) { st = st | abi.POLL_READABLE; }
+    if (other_closed != 0) {
+        st = st | abi.POLL_READABLE | abi.POLL_WRITABLE | abi.POLL_CLOSED;
+    } else if (BUF_CAP - out_count >= abi.POLL_WRITE_UNIT) {
+        st = st | abi.POLL_WRITABLE;
+    }
+    return st;
 }
 
 // Close one endpoint. Marks its side closed (so the peer sees EOF/E_PIPE),

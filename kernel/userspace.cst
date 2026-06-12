@@ -3016,6 +3016,290 @@ fn init_thread() as void {
     spawn_init_from_disk();
 }
 
+// ============================================================
+// poll_unit_smoke — kernel-side readiness checks across kinds, straight
+// through ko_poll (the exact dispatch SYS_POLL uses). Pins the contract:
+// channel empty/with-data/full/threshold/peer-closed, keyboard and mouse
+// inject→readable→drain→idle, and a no-poll-op kind (vfs file) reporting
+// always-ready. Failures panic — verify.sh greps panics, not FAIL lines.
+// ============================================================
+
+fn poll_drain_device(ko as i64, recsz as i64, who as *u8, who_len as i64) as void {
+    let is [8]u8 as scratch;
+    let is i64 as guard with mut = 0;
+    while ((kobject.ko_poll(ko) & abi.POLL_READABLE) != 0) {
+        kobject.ko_read(ko, cast(i64, &scratch[0]), recsz);
+        guard = guard + 1;
+        if (guard > 256) { pmm.panic(who, who_len); }
+    }
+}
+
+fn poll_unit_smoke() as void {
+    serial.println("poll_unit_smoke: start", 22);
+
+    // -- channel readiness --
+    let is i64 as ko_a with mut = 0;
+    let is i64 as ko_b with mut = 0;
+    if (channel.channel_create(&ko_a, &ko_b) != cast(i32, 0)) {
+        pmm.panic("poll_smoke: chan create FAIL", 28);
+    }
+    if (kobject.ko_poll(ko_a) != abi.POLL_WRITABLE) {
+        pmm.panic("poll_smoke: empty chan FAIL", 27);
+    }
+    let is [1]u8 as one;
+    one[0] = cast(u8, 7);
+    channel.chan_write(kobject.ko_priv(ko_a), cast(i64, &one[0]), 1);
+    if (kobject.ko_poll(ko_b) != (abi.POLL_READABLE | abi.POLL_WRITABLE)) {
+        pmm.panic("poll_smoke: data chan FAIL", 26);
+    }
+    let is [32]u8 as sink;
+    channel.chan_read(kobject.ko_priv(ko_b), cast(i64, &sink[0]), 1);
+    if (kobject.ko_poll(ko_b) != abi.POLL_WRITABLE) {
+        pmm.panic("poll_smoke: drained chan FAIL", 29);
+    }
+    // Fill a→b completely: A loses WRITABLE; drain past the threshold and it
+    // returns exactly at POLL_WRITE_UNIT free — the no-partial-write contract.
+    let is [256]u8 as blk;
+    let is i64 as zz with mut = 0;
+    while (zz < 256) { blk[zz] = cast(u8, 0x55); zz = zz + 1; }
+    let is i64 as pushed with mut = 0;
+    while (pushed < 1024) {
+        let is i64 as w = channel.chan_write(kobject.ko_priv(ko_a), cast(i64, &blk[0]), 256);
+        if (w <= 0) { pmm.panic("poll_smoke: fill FAIL", 21); }
+        pushed = pushed + w;
+    }
+    if ((kobject.ko_poll(ko_a) & abi.POLL_WRITABLE) != 0) {
+        pmm.panic("poll_smoke: full chan FAIL", 26);
+    }
+    channel.chan_read(kobject.ko_priv(ko_b), cast(i64, &sink[0]), 32);
+    if ((kobject.ko_poll(ko_a) & abi.POLL_WRITABLE) != 0) {
+        pmm.panic("poll_smoke: threshold-32 FAIL", 29);
+    }
+    channel.chan_read(kobject.ko_priv(ko_b), cast(i64, &sink[0]), 32);
+    if ((kobject.ko_poll(ko_a) & abi.POLL_WRITABLE) == 0) {
+        pmm.panic("poll_smoke: threshold-64 FAIL", 29);
+    }
+    // Peer hangup: closing B makes A fully "ready" (EOF/E_PIPE pending) + CLOSED.
+    kobject.ko_unref(ko_b);
+    if (kobject.ko_poll(ko_a) != (abi.POLL_READABLE | abi.POLL_WRITABLE | abi.POLL_CLOSED)) {
+        pmm.panic("poll_smoke: closed chan FAIL", 28);
+    }
+    kobject.ko_unref(ko_a);
+
+    // -- keyboard: inject → readable → drain → idle --
+    let is i64 as kko = driver.device_open(abi.DEV_KEYBOARD, 0);
+    if (kko == 0) { pmm.panic("poll_smoke: kbd open FAIL", 25); }
+    poll_drain_device(kko, 2, "poll_smoke: kbd drain FAIL", 26);
+    if (kobject.ko_poll(kko) != 0) { pmm.panic("poll_smoke: kbd idle FAIL", 25); }
+    kbd.inject_event(3, 1);
+    if (kobject.ko_poll(kko) != abi.POLL_READABLE) {
+        pmm.panic("poll_smoke: kbd ready FAIL", 26);
+    }
+    poll_drain_device(kko, 2, "poll_smoke: kbd redrain FAIL", 28);
+    kobject.ko_unref(kko);
+
+    // -- mouse: same shape over 4-byte records --
+    let is i64 as mko = driver.device_open(abi.DEV_MOUSE, 0);
+    if (mko == 0) { pmm.panic("poll_smoke: mouse open FAIL", 27); }
+    poll_drain_device(mko, 4, "poll_smoke: mouse drain FAIL", 28);
+    if (kobject.ko_poll(mko) != 0) { pmm.panic("poll_smoke: mouse idle FAIL", 27); }
+    mouse.inject_event(5, 0, 0, 0);
+    if (kobject.ko_poll(mko) != abi.POLL_READABLE) {
+        pmm.panic("poll_smoke: mouse ready FAIL", 28);
+    }
+    poll_drain_device(mko, 4, "poll_smoke: mouse redrain FAIL", 30);
+    kobject.ko_unref(mko);
+
+    // -- a kind with no poll op (vfs file): always ready, honestly --
+    let is *vfs.VfsFile as vf = vfs.open(cast(*u8, "/hello.txt"), 10, cast(i32, 0));
+    if (cast(i64, vf) == 0) { pmm.panic("poll_smoke: vfs open FAIL", 25); }
+    let is i64 as fko = vfs.make_file_kobject(vf);
+    if (fko == 0) { pmm.panic("poll_smoke: vfs ko FAIL", 23); }
+    if (kobject.ko_poll(fko) != (abi.POLL_READABLE | abi.POLL_WRITABLE)) {
+        pmm.panic("poll_smoke: vfs ready FAIL", 26);
+    }
+    kobject.ko_unref(fko);
+
+    serial.println("poll_unit_smoke: PASS", 21);
+}
+
+// ============================================================
+// Ring-3 SYS_POLL smokes — the syscall path end to end, three children:
+//   mode 0: poll fd 0 (a channel) with INFINITE timeout → read 1 → exit(byte).
+//           The kernel starts it, sleeps 100ms (the child is parked inside
+//           sys_poll, not racing), then writes 7 — exit must be 7.
+//   mode 1: poll an empty channel with a 100ms timeout → exit(5 + ret + got).
+//           Nothing ever arrives — poll must return 0 with got 0: exit 5.
+//   mode 2: dev_open(DEV_KEYBOARD) → poll it (infinite) → read 2 → exit(sc).
+//           Kernel injects scancode 9 after 100ms — exit must be 9.
+// ============================================================
+
+let is i64 as CSE_PL_ENTRY  = 0x401000;
+let is i64 as CSE_PL_BSS_VA = 0x402000;
+let is i64 as CSE_PL_FOFF   = 0x50;
+let is i64 as child_pl_len with mut = 0;
+let is [256]u8 as child_pl;
+
+// One builder, three bodies. The PollEntry lives at BSS+0 ({fd, want, got},
+// fd/got pre-zeroed by the loader's BSS fill); the read buffer at BSS+24.
+fn build_poll_child_cse(mode as i64) as void {
+    let is *u8 as e = cast(*u8, &child_pl[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, CSE_PL_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, CSE_PL_ENTRY);
+    write_le_u32(e, 0x28, CSE_PL_FOFF);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, CSE_PL_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_PL_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, CSE_PL_BSS_VA); c = c + 10;
+
+    if (mode == 2) {
+        // dev_open(DEV_KEYBOARD=1, 0, 0); PollEntry.fd = returned fd
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+        e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,22
+        e[c+0]=cast(u8,0xBF); e[c+1]=cast(u8,1); e[c+2]=cast(u8,0); e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); c = c + 5;  // mov edi,1
+        e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;                        // xor esi,esi
+        e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;                        // xor edx,edx
+        e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+        e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;  // mov [r15+0],rax
+    }
+    // PollEntry.want = POLL_READABLE
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x08);
+    e[c+4]=cast(u8,1); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); e[c+7]=cast(u8,0); c = c + 8;       // mov qword [r15+8],1
+    // poll(r15, 1, timeout)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,34); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;      // mov rax,34
+    e[c+0]=cast(u8,0x4C); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xFF); c = c + 3;                 // mov rdi,r15
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);
+    e[c+3]=cast(u8,1); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;       // mov rsi,1
+    if (mode == 1) {
+        // mov rdx, 100000000 (0x05F5E100) — finite 100ms deadline
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+        e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0xE1); e[c+5]=cast(u8,0xF5); e[c+6]=cast(u8,0x05); c = c + 7;
+    } else {
+        // mov rdx, -1 — infinite
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+        e[c+3]=cast(u8,0xFF); e[c+4]=cast(u8,0xFF); e[c+5]=cast(u8,0xFF); e[c+6]=cast(u8,0xFF); c = c + 7;
+    }
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                        // syscall
+
+    if (mode == 1) {
+        // exit(5 + ret + got): clean timeout ⇒ ret 0, got 0 ⇒ 5
+        e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x10); c = c + 4;  // mov rdi,[r15+16]
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x01); e[c+2]=cast(u8,0xC7); c = c + 3;                        // add rdi,rax
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x83); e[c+2]=cast(u8,0xC7); e[c+3]=cast(u8,5); c = c + 4;     // add rdi,5
+    } else {
+        // read(PollEntry.fd, r15+24, mode==2 ? 2 : 1)
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+        e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,10
+        e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+        e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x18); c = c + 4;  // lea rsi,[r15+24]
+        let is i64 as rdlen with mut = 1;
+        if (mode == 2) { rdlen = 2; }
+        e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+        e[c+3]=cast(u8, rdlen); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+        e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                    // syscall
+        // exit(byte [r15+24])
+        e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x7F); e[c+4]=cast(u8,0x18); c = c + 5;
+    }
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;        // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                        // syscall
+
+    let is i64 as text_size = c - CSE_PL_FOFF;
+    write_le_u32(e, 0x2C, text_size);
+    write_le_u32(e, 0x30, text_size);
+    child_pl_len = c;
+}
+
+fn spawn_poll_smoke() as void {
+    serial.println("userspace.poll_smoke: start", 27);
+
+    // -- mode 0: park in poll (infinite), wake by a channel write --
+    build_poll_child_cse(0);
+    let is i64 as ko_a with mut = 0;
+    let is i64 as ko_b with mut = 0;
+    if (channel.channel_create(&ko_a, &ko_b) != cast(i32, 0)) {
+        pmm.panic("poll_smoke: chan FAIL", 21);
+    }
+    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &child_pl[0]), child_pl_len);
+    if (child == 0) { pmm.panic("poll_smoke: spawn A FAIL", 24); }
+    let is i64 as child_asp = proc.proc_aspace(child);
+    kobject.ko_ref(ko_b);
+    vma.fd_install(cast(*vma.Aspace, child_asp), 0, ko_b);
+    proc_start(child);
+    // Let the child reach and park inside sys_poll — the wakeup is then a
+    // real unblock, not a lucky race.
+    sched.sleep_for_ns(100000000);
+    let is *kobject.KObject as ka = cast(*kobject.KObject, ko_a);
+    let is [1]u8 as msg;
+    msg[0] = cast(u8, 7);
+    channel.chan_write(ka.priv, cast(i64, &msg[0]), 1);
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(child));
+    kobject.ko_unref(ko_a);
+    kobject.ko_unref(ko_b);
+    if (code != 7) {
+        serial.print("userspace.poll_smoke: wakeup exit=", 34);
+        util.print_num(code);
+        serial.println("", 0);
+        pmm.panic("poll_smoke wakeup FAIL", 22);
+    }
+    serial.println("userspace.poll_smoke: wakeup PASS", 33);
+
+    // -- mode 1: timeout expiry on a silent channel --
+    build_poll_child_cse(1);
+    let is i64 as ko_a2 with mut = 0;
+    let is i64 as ko_b2 with mut = 0;
+    if (channel.channel_create(&ko_a2, &ko_b2) != cast(i32, 0)) {
+        pmm.panic("poll_smoke: chan2 FAIL", 22);
+    }
+    let is i64 as child2 = proc_spawn(proc.init_proc, cast(*u8, &child_pl[0]), child_pl_len);
+    if (child2 == 0) { pmm.panic("poll_smoke: spawn B FAIL", 24); }
+    let is i64 as child2_asp = proc.proc_aspace(child2);
+    kobject.ko_ref(ko_b2);
+    vma.fd_install(cast(*vma.Aspace, child2_asp), 0, ko_b2);
+    proc_start(child2);
+    let is i64 as code2 = proc_wait(proc.init_proc, proc.proc_pid(child2));
+    kobject.ko_unref(ko_a2);
+    kobject.ko_unref(ko_b2);
+    if (code2 != 5) {
+        serial.print("userspace.poll_smoke: timeout exit=", 35);
+        util.print_num(code2);
+        serial.println("", 0);
+        pmm.panic("poll_smoke timeout FAIL", 23);
+    }
+    serial.println("userspace.poll_smoke: timeout PASS", 34);
+
+    // -- mode 2: poll the keyboard device, wake by injection --
+    build_poll_child_cse(2);
+    let is i64 as child3 = proc_spawn(proc.init_proc, cast(*u8, &child_pl[0]), child_pl_len);
+    if (child3 == 0) { pmm.panic("poll_smoke: spawn C FAIL", 24); }
+    proc_start(child3);
+    sched.sleep_for_ns(100000000);
+    kbd.inject_event(9, 1);
+    let is i64 as code3 = proc_wait(proc.init_proc, proc.proc_pid(child3));
+    if (code3 != 9) {
+        serial.print("userspace.poll_smoke: kbd exit=", 31);
+        util.print_num(code3);
+        serial.println("", 0);
+        pmm.panic("poll_smoke kbd FAIL", 19);
+    }
+    serial.println("userspace.poll_smoke: kbd PASS", 30);
+}
+
 // The "smoke-init": runs the kernel/userspace smokes for regression (verify.sh,
 // gated by main.RUN_SMOKE_INIT). Tooling only — separate thread, does NOT launch
 // /init, so a smoke boot and a real boot never interleave.
@@ -3042,5 +3326,7 @@ fn smoke_init() as void {
     spawn_budget_smoke();
     spawn_budget_ring3_smoke();
     spawn_seg_share_smoke();
+    poll_unit_smoke();
+    spawn_poll_smoke();
 }
 
