@@ -1,0 +1,289 @@
+// virtio.cst — the virtio-over-PCI MODERN transport (virtio spec 1.1 §4.1).
+//
+// This is the device-independent half of any virtio driver: walk the PCI
+// vendor capabilities to find the four register windows (common / notify /
+// ISR / device-specific), drive the status handshake and feature
+// negotiation, lay out and program split virtqueues, kick the notify
+// doorbell. A concrete device driver (vtablet.cst is the first) owns WHAT
+// flows through the queues; this module owns HOW a queue exists at all.
+//
+// Modern-only on purpose: we negotiate VIRTIO_F_VERSION_1 and nothing else
+// (no EVENT_IDX, no INDIRECT — plain split rings). x86 is little-endian and
+// store-ordered (TSO), so the spec's "suitable memory barrier" before
+// publishing avail->idx is program order here; the 64-bit queue address
+// registers are written as two le32 halves, which the spec allows.
+
+use "pci.cst" as pci;
+use "driver.cst" as driver;
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "timer.cst" as timer;
+use "sched.cst" as sched;
+
+// PCI capability ids / virtio cfg_type values (§4.1.4)
+let is i64 as PCI_CAP_VENDOR  = 0x09;
+let is i64 as CFG_COMMON      = 1;
+let is i64 as CFG_NOTIFY      = 2;
+let is i64 as CFG_ISR         = 3;
+let is i64 as CFG_DEVICE      = 4;
+
+// Device status bits (§2.1)
+let is i64 as ST_ACKNOWLEDGE  = 1;
+let is i64 as ST_DRIVER       = 2;
+let is i64 as ST_DRIVER_OK    = 4;
+let is i64 as ST_FEATURES_OK  = 8;
+let is i64 as ST_FAILED       = 128;
+
+// common cfg register offsets (§4.1.4.3)
+let is i64 as C_DFSEL  = 0;    // device_feature_select (le32)
+let is i64 as C_DF     = 4;    // device_feature (le32)
+let is i64 as C_GFSEL  = 8;    // driver_feature_select (le32)
+let is i64 as C_GF     = 12;   // driver_feature (le32)
+let is i64 as C_NUMQ   = 18;   // num_queues (le16)
+let is i64 as C_STATUS = 20;   // device_status (u8)
+let is i64 as C_QSEL   = 22;   // queue_select (le16)
+let is i64 as C_QSIZE  = 24;   // queue_size (le16)
+let is i64 as C_QEN    = 28;   // queue_enable (le16)
+let is i64 as C_QNOFF  = 30;   // queue_notify_off (le16)
+let is i64 as C_QDESC  = 32;   // queue_desc (le64)
+let is i64 as C_QDRV   = 40;   // queue_driver / avail (le64)
+let is i64 as C_QDEV   = 48;   // queue_device / used (le64)
+
+// split-ring descriptor flags (§2.6.5)
+let is i64 as DESC_F_WRITE = 2;
+
+// One discovered+mapped virtio PCI device. All scalars i64 (struct rule);
+// the four windows are kernel VAs from driver.mmio_map.
+struct VirtioDev {
+    hw as i64;            // *driver.Hardware
+    common as i64;        // VA of common cfg
+    notify_base as i64;   // VA of notify region base
+    notify_mult as i64;   // notify_off_multiplier
+    isr as i64;           // VA of the 1-byte ISR (read clears)
+    devcfg as i64;        // VA of device-specific config (0 if absent)
+    devcfg_len as i64;
+}
+
+// One configured split virtqueue. The three rings plus the event buffers
+// live in one DMA page; addresses here are VAs into it.
+struct VirtQueue {
+    qsize as i64;
+    desc as i64;          // VA of descriptor table (16 B per entry)
+    avail as i64;         // VA of avail ring  {flags, idx, ring[]}
+    used as i64;          // VA of used ring   {flags, idx, {id,len}[]}
+    notify_addr as i64;   // VA to write the queue index into (the doorbell)
+    avail_shadow as i64;  // driver's running avail idx (mod 2^16 on publish)
+    last_used as i64;     // last harvested used idx
+    buf_va as i64;        // VA of the buffer pool inside the same page
+    buf_phys as i64;
+}
+
+// ---- MMIO accessors (plain loads/stores; UC mapping from kvmap MMIO) ----
+fn rd8(addr as i64) as i64 { let is *u8 as p = cast(*u8, addr); return cast(i64, p[0]); }
+fn wr8(addr as i64, v as i64) as void { let is *u8 as p = cast(*u8, addr); p[0] = cast(u8, v & 0xFF); }
+fn rd16(addr as i64) as i64 { let is *u16 as p = cast(*u16, addr); return cast(i64, p[0]); }
+fn wr16(addr as i64, v as i64) as void { let is *u16 as p = cast(*u16, addr); p[0] = cast(u16, v & 0xFFFF); }
+fn rd32(addr as i64) as i64 { let is *u32 as p = cast(*u32, addr); return cast(i64, p[0]) & 0xFFFFFFFF; }
+fn wr32(addr as i64, v as i64) as void { let is *u32 as p = cast(*u32, addr); p[0] = cast(u32, v & 0xFFFFFFFF); }
+fn wr64(addr as i64, v as i64) as void {
+    wr32(addr, v & 0xFFFFFFFF);
+    wr32(addr + 4, (v >> 32) & 0xFFFFFFFF);
+}
+
+// Map a window that may sit at any offset inside a BAR: kvmap wants a
+// page-aligned physical base, so map from the containing page and return
+// the VA at the right delta.
+fn map_window(hw as i64, bar_phys as i64, off as i64, len as i64) as i64 {
+    let is i64 as phys = bar_phys + off;
+    let is i64 as page = phys & (0 - 4096);          // align down
+    let is i64 as delta = phys - page;
+    let is *u8 as va with mut = cast(*u8, 0);
+    let is i32 as rc = driver.mmio_map(cast(*driver.Hardware, hw),
+                                       cast(u64, page), cast(u64, delta + len),
+                                       cast(u32, 0), &va);
+    if (rc != 0) { return 0; }
+    return cast(i64, va) + delta;
+}
+
+// Walk the PCI vendor capabilities and map the transport windows.
+// Returns 0 on success; negative = this is not a usable modern device.
+fn vio_setup(hw as i64, vd as *VirtioDev) as i64 {
+    let is *pci.PciHardware as pd = cast(*pci.PciHardware, hw);
+    let is i32 as bus = cast(i32, pd.bus);
+    let is i32 as dev = cast(i32, pd.dev);
+    let is i32 as fnc = cast(i32, pd.func);
+    vd.hw = hw;
+    vd.common = 0; vd.notify_base = 0; vd.notify_mult = 0;
+    vd.isr = 0; vd.devcfg = 0; vd.devcfg_len = 0;
+
+    // capabilities present? (PCI status register bit 4)
+    let is i64 as status = pci.pci_config_read16(bus, dev, fnc, cast(i32, 0x06));
+    if ((status & 0x10) == 0) { return 0 - 1; }
+
+    let is i64 as cap with mut = pci.pci_config_read8(bus, dev, fnc, cast(i32, 0x34)) & 0xFC;
+    let is i64 as guard with mut = 0;
+    while (cap != 0 && guard < 48) {
+        let is i64 as id = pci.pci_config_read8(bus, dev, fnc, cast(i32, cap));
+        let is i64 as nxt = pci.pci_config_read8(bus, dev, fnc, cast(i32, cap + 1)) & 0xFC;
+        if (id == PCI_CAP_VENDOR) {
+            let is i64 as cfg_type = pci.pci_config_read8(bus, dev, fnc, cast(i32, cap + 3));
+            let is i64 as bar = pci.pci_config_read8(bus, dev, fnc, cast(i32, cap + 4));
+            let is i64 as off = pci.pci_config_read32(bus, dev, fnc, cast(i32, cap + 8));
+            let is i64 as len = pci.pci_config_read32(bus, dev, fnc, cast(i32, cap + 12));
+            let is i64 as bar_phys with mut = 0;
+            if (bar <= 5 && len > 0
+                && pci.pci_get_bar_info(cast(*driver.Hardware, hw), bar, &bar_phys) == 0) {
+                if (cfg_type == CFG_COMMON && vd.common == 0) {
+                    vd.common = map_window(hw, bar_phys, off, len);
+                } else if (cfg_type == CFG_NOTIFY && vd.notify_base == 0) {
+                    vd.notify_base = map_window(hw, bar_phys, off, len);
+                    vd.notify_mult = pci.pci_config_read32(bus, dev, fnc, cast(i32, cap + 16));
+                } else if (cfg_type == CFG_ISR && vd.isr == 0) {
+                    vd.isr = map_window(hw, bar_phys, off, len);
+                } else if (cfg_type == CFG_DEVICE && vd.devcfg == 0) {
+                    vd.devcfg = map_window(hw, bar_phys, off, len);
+                    vd.devcfg_len = len;
+                }
+            }
+        }
+        cap = nxt;
+        guard = guard + 1;
+    }
+    if (vd.common == 0 || vd.notify_base == 0 || vd.isr == 0) { return 0 - 2; }
+    return 0;
+}
+
+// Status handshake through feature negotiation. Accepts ONLY
+// VIRTIO_F_VERSION_1 (feature word 1, bit 0); the device offering it is
+// what makes this a modern device at all. Returns 0, or negative with the
+// device marked FAILED.
+fn vio_negotiate(vd as *VirtioDev) as i64 {
+    // reset, then wait for the device to report 0 (spec 4.1.4.3.2)
+    wr8(vd.common + C_STATUS, 0);
+    let is i64 as deadline = timer.current_time_ns() + 100000000;   // 100 ms
+    while (rd8(vd.common + C_STATUS) != 0) {
+        if (timer.current_time_ns() >= deadline) { return 0 - 1; }
+        sched.sleep_for_ns(1000000);
+    }
+    wr8(vd.common + C_STATUS, ST_ACKNOWLEDGE);
+    wr8(vd.common + C_STATUS, ST_ACKNOWLEDGE | ST_DRIVER);
+
+    wr32(vd.common + C_DFSEL, 1);
+    let is i64 as f1 = rd32(vd.common + C_DF);
+    if ((f1 & 1) == 0) {                      // no VERSION_1: legacy-only device
+        wr8(vd.common + C_STATUS, ST_FAILED);
+        return 0 - 2;
+    }
+    wr32(vd.common + C_GFSEL, 0);
+    wr32(vd.common + C_GF, 0);                // no device-specific features
+    wr32(vd.common + C_GFSEL, 1);
+    wr32(vd.common + C_GF, 1);                // VERSION_1 only
+
+    wr8(vd.common + C_STATUS, ST_ACKNOWLEDGE | ST_DRIVER | ST_FEATURES_OK);
+    if ((rd8(vd.common + C_STATUS) & ST_FEATURES_OK) == 0) {
+        wr8(vd.common + C_STATUS, ST_FAILED);
+        return 0 - 3;
+    }
+    return 0;
+}
+
+// Lay out and program split virtqueue `idx` inside one zeroed DMA page:
+//   desc[qsize]                  @ 0       (16-byte aligned by the page)
+//   avail {flags,idx,ring[q]}    @ 16*q    (2-byte aligned)
+//   used  {flags,idx,elem[q]}    @ align4  (4-byte aligned)
+//   event buffers (buf_sz each)  @ align8
+// The queue size is clamped to what fits; writing a smaller power of two
+// to queue_size is allowed by the spec. Returns 0 or negative.
+fn vio_queue_setup(vd as *VirtioDev, idx as i64, want_qsize as i64, buf_sz as i64,
+                   vq as *VirtQueue) as i64 {
+    wr16(vd.common + C_QSEL, idx);
+    let is i64 as dev_qs = rd16(vd.common + C_QSIZE);
+    if (dev_qs == 0) { return 0 - 1; }
+    let is i64 as qs with mut = dev_qs;
+    if (qs > want_qsize) { qs = want_qsize; }
+
+    let is *driver.DmaBuffer as dma with mut = cast(*driver.DmaBuffer, 0);
+    let is i32 as rc = driver.dma_alloc(cast(*driver.Hardware, vd.hw),
+                                        cast(u64, 4096), cast(u64, 4096),
+                                        cast(u32, 1), &dma);     // DMA32 + zeroed
+    if (rc != 0) { return 0 - 2; }
+    let is i64 as base_va = cast(i64, dma.virt);
+    let is i64 as base_phys = dma.phys;
+
+    let is i64 as desc_off = 0;
+    let is i64 as avail_off = 16 * qs;
+    let is i64 as avail_end = avail_off + 6 + 2 * qs;
+    let is i64 as used_off = (avail_end + 3) & (0 - 4);
+    let is i64 as used_end = used_off + 6 + 8 * qs;
+    let is i64 as buf_off = (used_end + 7) & (0 - 8);
+    if (buf_off + buf_sz * qs > 4096) { return 0 - 3; }   // doesn't fit one page
+
+    if (rd16(vd.common + C_QSIZE) != qs) { wr16(vd.common + C_QSIZE, qs); }
+    wr64(vd.common + C_QDESC, base_phys + desc_off);
+    wr64(vd.common + C_QDRV,  base_phys + avail_off);
+    wr64(vd.common + C_QDEV,  base_phys + used_off);
+    let is i64 as noff = rd16(vd.common + C_QNOFF);
+    wr16(vd.common + C_QEN, 1);
+
+    vq.qsize = qs;
+    vq.desc = base_va + desc_off;
+    vq.avail = base_va + avail_off;
+    vq.used = base_va + used_off;
+    vq.notify_addr = vd.notify_base + noff * vd.notify_mult;
+    vq.avail_shadow = 0;
+    vq.last_used = 0;
+    vq.buf_va = base_va + buf_off;
+    vq.buf_phys = base_phys + buf_off;
+    return 0;
+}
+
+// Post buffer slot `i` (device-writable, buf_sz bytes) into the avail ring.
+// Publish with vio_publish after a batch.
+fn vio_post(vq as *VirtQueue, i as i64, buf_sz as i64) as void {
+    let is i64 as d = vq.desc + i * 16;
+    wr64(d, vq.buf_phys + i * buf_sz);          // addr
+    wr32(d + 8, buf_sz);                        // len
+    wr16(d + 12, DESC_F_WRITE);                 // flags: device writes
+    wr16(d + 14, 0);                            // next
+    let is i64 as slot = vq.avail_shadow - (vq.avail_shadow / vq.qsize) * vq.qsize;
+    wr16(vq.avail + 4 + slot * 2, i);           // ring[slot] = desc head
+    vq.avail_shadow = vq.avail_shadow + 1;
+    return;
+}
+
+// Re-post an already-described buffer (descriptor untouched, just ring it).
+fn vio_repost(vq as *VirtQueue, head as i64) as void {
+    let is i64 as slot = vq.avail_shadow - (vq.avail_shadow / vq.qsize) * vq.qsize;
+    wr16(vq.avail + 4 + slot * 2, head);
+    vq.avail_shadow = vq.avail_shadow + 1;
+    return;
+}
+
+// Publish everything posted so far (sets avail->idx) and ring the doorbell.
+// x86 TSO keeps the ring writes ordered before the idx store; the doorbell
+// is an UC store, ordered after both.
+fn vio_publish(vd as *VirtioDev, vq as *VirtQueue, queue_idx as i64) as void {
+    wr16(vq.avail + 2, vq.avail_shadow & 0xFFFF);
+    wr16(vq.notify_addr, queue_idx);
+    return;
+}
+
+// Used-ring harvest: returns the next used descriptor head, or -1 if none.
+fn vio_next_used(vq as *VirtQueue) as i64 {
+    let is i64 as dev_idx = rd16(vq.used + 2);
+    if ((vq.last_used & 0xFFFF) == dev_idx) { return 0 - 1; }
+    let is i64 as slot = vq.last_used - (vq.last_used / vq.qsize) * vq.qsize;
+    let is i64 as id = rd32(vq.used + 4 + slot * 8);
+    vq.last_used = vq.last_used + 1;
+    return id;
+}
+
+fn vio_isr_read(vd as *VirtioDev) as i64 {
+    return rd8(vd.isr);                          // read clears
+}
+
+fn vio_driver_ok(vd as *VirtioDev) as void {
+    wr8(vd.common + C_STATUS,
+        ST_ACKNOWLEDGE | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
+    return;
+}

@@ -83,6 +83,7 @@ qemu-system-x86_64 \
     -device ide-hd,drive=disk,bus=ahci.0 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
+    -device virtio-tablet-pci \
     -boot d \
     -serial stdio \
     -display none \

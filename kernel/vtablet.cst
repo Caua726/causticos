@@ -1,0 +1,333 @@
+// vtablet.cst — virtio-input tablet driver (virtio spec §5.8): the
+// ABSOLUTE pointing device. This is what kills the pointer grab: the host
+// reports WHERE the pointer is over the VM window (0..32767 on each axis),
+// not how it moved, so the guest cursor matches the host cursor 1:1 and
+// QEMU never needs to capture the mouse. virt-manager guests feel seamless
+// because of exactly this device class; now CausticOS speaks it too.
+//
+// Device: PCI 0x1AF4:0x1052 (modern virtio, type 18 = input). Transport in
+// virtio.cst. The eventq carries 8-byte evdev events {le16 type, le16 code,
+// le32 value}; QEMU batches ABS_X/ABS_Y/BTN_*/REL_WHEEL and closes each
+// batch with EV_SYN/SYN_REPORT — we accumulate and emit ONE record per SYN:
+//
+//   8-byte record, read granularity = whole records:
+//     [0..1] x  u16 LE — absolute, normalized to 0..32767
+//     [2..3] y  u16 LE — absolute, normalized to 0..32767 (0 = top)
+//     [4]    buttons u8 — bit0 left, bit1 right, bit2 middle (state mask)
+//     [5]    wheel  i8 — signed detents since last record
+//     [6..7] reserved (0)
+//
+// Raw events, no screen coords, no acceleration: scaling 0..32767 onto the
+// framebuffer is the holder's policy (the WM multiplies by its width).
+
+use "driver.cst" as driver;
+use "spec.cst" as spec;
+use "ksym.cst" as ksym;
+use "serial.cst" as serial;
+use "kobject.cst" as kobject;
+use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "abi.cst" as abi;
+use "virtio.cst" as virtio;
+use "util.cst" as util;
+
+// evdev event types / codes (Linux input-event-codes.h, part of the wire ABI)
+let is i64 as EV_SYN = 0;
+let is i64 as EV_KEY = 1;
+let is i64 as EV_REL = 2;
+let is i64 as EV_ABS = 3;
+let is i64 as SYN_REPORT = 0;
+let is i64 as ABS_X = 0;
+let is i64 as ABS_Y = 1;
+let is i64 as REL_WHEEL = 8;
+let is i64 as BTN_LEFT   = 0x110;
+let is i64 as BTN_RIGHT  = 0x111;
+let is i64 as BTN_MIDDLE = 0x112;
+
+// virtio-input config space (§5.8.4): select/subsel/size + union at +8
+let is i64 as CFG_ABS_INFO = 0x09;
+
+let is i64 as TAB_REC  = 8;
+let is i64 as TAB_CAP  = 1024;      // 128 records
+let is i64 as TAB_MASK = 1023;
+let is i64 as EVQ_SIZE = 64;        // QEMU's eventq size; we accept up to this
+let is i64 as EV_SZ    = 8;         // sizeof(virtio_input_event)
+
+let is [1024]u8 as tab_buf with mut;
+let is i64 as tab_head with mut = 0;
+let is i64 as tab_tail with mut = 0;
+let is i64 as tab_count with mut = 0;
+let is lock.TicketLock as tab_lk;
+
+// accumulator between SYN_REPORTs (IRQ context, guarded by tab_lk)
+let is i64 as cur_x with mut = 0;       // raw device units
+let is i64 as cur_y with mut = 0;
+let is i64 as cur_buttons with mut = 0;
+let is i64 as cur_wheel with mut = 0;
+let is i64 as x_max with mut = 32767;   // from ABS_INFO; QEMU reports 32767
+let is i64 as y_max with mut = 32767;
+
+let is i64 as tab_present with mut = 0;
+let is virtio.VirtioDev as vdev;
+let is virtio.VirtQueue as evq;
+
+let is ksym.KSym as ksym_handler;
+let is ksym.KSym as ksym_acquire;
+let is ksym.KSym as ksym_bind;
+let is kobject.KObjectOps as TAB_OPS with mut;
+
+fn vtablet_init() as void {
+    TAB_OPS.read  = fn_ptr(tab_read);
+    TAB_OPS.close = fn_ptr(tab_close);
+    TAB_OPS.poll  = fn_ptr(tab_poll);
+    // write/mmap/present/lseek/readdir stay null — a tablet is a read-only
+    // raw-event stream.
+}
+
+// Read one axis' max from the device config: write select/subsel, read the
+// size byte back, then u.abs.max (le32 at +12). Falls back to 32767 (the
+// QEMU range) when the device doesn't answer — never 0, never a divide.
+fn cfg_abs_max(axis as i64) as i64 {
+    if (vdev.devcfg == 0) { return 32767; }
+    virtio.wr8(vdev.devcfg + 0, CFG_ABS_INFO);
+    virtio.wr8(vdev.devcfg + 1, axis);
+    let is i64 as size = virtio.rd8(vdev.devcfg + 2);
+    if (size < 8) { return 32767; }
+    let is i64 as mx = virtio.rd32(vdev.devcfg + 12);
+    if (mx <= 0) { return 32767; }
+    return mx;
+}
+
+// Push one 8-byte record. Full ring drops it (bounded). Caller holds tab_lk.
+fn push_record_locked(x as i64, y as i64, buttons as i64, wheel as i64) as void {
+    if (tab_count + TAB_REC > TAB_CAP) { return; }
+    tab_buf[tab_tail] = cast(u8, x & 0xFF);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, (x >> 8) & 0xFF);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, y & 0xFF);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, (y >> 8) & 0xFF);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, buttons & 0xFF);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, wheel & 0xFF);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, 0);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_buf[tab_tail] = cast(u8, 0);
+    tab_tail = (tab_tail + 1) & TAB_MASK;
+    tab_count = tab_count + TAB_REC;
+}
+
+// Fold one evdev event into the accumulator; SYN_REPORT closes the batch
+// and emits a record with x/y normalized to 0..32767. Caller holds tab_lk.
+fn fold_event_locked(etype as i64, code as i64, value as i64) as void {
+    if (etype == EV_ABS) {
+        if (code == ABS_X) { cur_x = value; }
+        else if (code == ABS_Y) { cur_y = value; }
+    } else if (etype == EV_KEY) {
+        let is i64 as bit with mut = 0;
+        if (code == BTN_LEFT) { bit = 1; }
+        else if (code == BTN_RIGHT) { bit = 2; }
+        else if (code == BTN_MIDDLE) { bit = 4; }
+        if (bit != 0) {
+            if (value != 0) { cur_buttons = cur_buttons | bit; }
+            else { cur_buttons = cur_buttons & (7 - bit); }
+        }
+    } else if (etype == EV_REL) {
+        if (code == REL_WHEEL) {
+            let is i64 as v with mut = value;
+            if (v >= 0x80000000) { v = v - 0x100000000; }   // le32 → signed
+            cur_wheel = cur_wheel + v;
+        }
+    } else if (etype == EV_SYN && code == SYN_REPORT) {
+        let is i64 as nx with mut = cur_x;
+        let is i64 as ny with mut = cur_y;
+        if (x_max != 32767) { nx = nx * 32767 / x_max; }
+        if (y_max != 32767) { ny = ny * 32767 / y_max; }
+        if (nx < 0) { nx = 0; }
+        if (nx > 32767) { nx = 32767; }
+        if (ny < 0) { ny = 0; }
+        if (ny > 32767) { ny = 32767; }
+        let is i64 as wh with mut = cur_wheel;
+        if (wh > 127) { wh = 127; }
+        if (wh < 0 - 127) { wh = 0 - 127; }
+        push_record_locked(nx, ny, cur_buttons, wh);
+        cur_wheel = 0;
+    }
+}
+
+// IRQ handler: drain the ISR (read clears the INTx level), then harvest
+// every used event buffer — parse, fold, immediately repost — and publish
+// the refilled ring with one doorbell.
+fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
+    if (tab_present == 0) { return 0; }
+    let is i64 as isr = virtio.vio_isr_read(&vdev);
+    if ((isr & 1) == 0) { return 0; }
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    let is i64 as harvested with mut = 0;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as id = virtio.vio_next_used(&evq);
+        if (id < 0) { more = 0; }
+        else {
+            let is i64 as ev = evq.buf_va + id * EV_SZ;
+            let is i64 as etype = virtio.rd16(ev);
+            let is i64 as code = virtio.rd16(ev + 2);
+            let is i64 as value = virtio.rd32(ev + 4);
+            fold_event_locked(etype, code, value);
+            virtio.vio_repost(&evq, id);
+            harvested = harvested + 1;
+        }
+    }
+    lock.release_irq(&tab_lk, fl);
+    if (harvested > 0) { virtio.vio_publish(&vdev, &evq, 0); }
+    return 0;
+}
+
+// on_bind: full modern-transport bring-up. Loud, bounded, and restores a
+// FAILED status on any error so the device isn't half-alive.
+fn vtablet_bind(b as *spec.Binding) as i32 {
+    let is i64 as hw = cast(i64, b.hardware);
+    if (virtio.vio_setup(hw, &vdev) != 0) {
+        serial.println("vtablet: no modern virtio caps", 30);
+        return 1;
+    }
+    if (virtio.vio_negotiate(&vdev) != 0) {
+        serial.println("vtablet: feature negotiation FAIL", 33);
+        return 1;
+    }
+    if (virtio.vio_queue_setup(&vdev, 0, EVQ_SIZE, EV_SZ, &evq) != 0) {
+        serial.println("vtablet: eventq setup FAIL", 26);
+        return 1;
+    }
+    // hand the device every event buffer, then go live
+    let is i64 as i with mut = 0;
+    while (i < evq.qsize) {
+        virtio.vio_post(&evq, i, EV_SZ);
+        i = i + 1;
+    }
+    virtio.vio_driver_ok(&vdev);
+    virtio.vio_publish(&vdev, &evq, 0);
+    x_max = cfg_abs_max(ABS_X);
+    y_max = cfg_abs_max(ABS_Y);
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    tab_head = 0; tab_tail = 0; tab_count = 0;
+    cur_x = 0; cur_y = 0; cur_buttons = 0; cur_wheel = 0;
+    lock.release_irq(&tab_lk, fl);
+    tab_present = 1;
+    serial.print("vtablet: virtio-input up (eventq=", 33);
+    util.print_num(evq.qsize);
+    serial.print(" absmax=", 8);
+    util.print_num(x_max);
+    serial.println(")", 1);
+    return 0;
+}
+
+// Test hooks. inject_event pushes a finished record (values already in the
+// normalized 0..32767 space); inject_evdev feeds the SAME fold path the IRQ
+// uses — exercises accumulation, SYN batching and normalization.
+fn inject_event(x as i64, y as i64, buttons as i64, wheel as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    push_record_locked(x, y, buttons, wheel);
+    lock.release_irq(&tab_lk, fl);
+}
+
+fn inject_evdev(etype as i64, code as i64, value as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    fold_event_locked(etype, code, value);
+    lock.release_irq(&tab_lk, fl);
+}
+
+// Test-only: deterministic decode check through the exact IRQ fold path.
+// Empties the ring before and after (call on an idle/unbound tablet).
+// Returns 1 on PASS.
+fn decode_self_test() as i64 {
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    tab_head = 0; tab_tail = 0; tab_count = 0;
+    cur_x = 0; cur_y = 0; cur_buttons = 0; cur_wheel = 0;
+    lock.release_irq(&tab_lk, fl);
+
+    inject_evdev(EV_ABS, ABS_X, 16384);
+    inject_evdev(EV_ABS, ABS_Y, 8192);
+    inject_evdev(EV_KEY, BTN_LEFT, 1);
+    inject_evdev(EV_SYN, SYN_REPORT, 0);
+
+    let is i64 as fl2 = lock.acquire_irq(&tab_lk);
+    let is i64 as ok with mut = 1;
+    if (tab_count != TAB_REC) { ok = 0; }
+    if (ok == 1) {
+        let is i64 as x = cast(i64, tab_buf[0]) | (cast(i64, tab_buf[1]) << 8);
+        let is i64 as y = cast(i64, tab_buf[2]) | (cast(i64, tab_buf[3]) << 8);
+        if (x != 16384) { ok = 0; }
+        if (y != 8192) { ok = 0; }
+        if (cast(i64, tab_buf[4]) != 1) { ok = 0; }
+        if (cast(i64, tab_buf[5]) != 0) { ok = 0; }
+    }
+    tab_head = 0; tab_tail = 0; tab_count = 0;
+    cur_x = 0; cur_y = 0; cur_buttons = 0; cur_wheel = 0;
+    lock.release_irq(&tab_lk, fl2);
+    return ok;
+}
+
+// Device read op: drain whole 8-byte records; blocks (polling) when empty.
+fn tab_read(priv as i64, buf as i64, n as i64) as i64 {
+    if (n < TAB_REC) { return abi.E_INVAL; }
+    let is i64 as want = n - (n & 7);
+    let is i64 as done with mut = 0;
+    let is i64 as result with mut = 0;
+    while (done == 0) {
+        let is i64 as fl = lock.acquire_irq(&tab_lk);
+        let is i64 as avail = tab_count;
+        let is i64 as take with mut = want;
+        if (take > avail) { take = avail; }
+        let is i64 as i with mut = 0;
+        while (i < take) {
+            let is *u8 as d = cast(*u8, buf + i);
+            d[0] = tab_buf[tab_head];
+            tab_head = (tab_head + 1) & TAB_MASK;
+            i = i + 1;
+        }
+        tab_count = tab_count - take;
+        lock.release_irq(&tab_lk, fl);
+        if (take > 0) { result = take; done = 1; }
+        else { sched.sleep_for_ns(2000000); }
+    }
+    return result;
+}
+
+fn tab_poll(priv as i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    let is i64 as c = tab_count;
+    lock.release_irq(&tab_lk, fl);
+    if (c >= TAB_REC) { return abi.POLL_READABLE; }
+    return 0;
+}
+
+fn tab_close(priv as i64) as i64 {
+    return abi.E_OK;
+}
+
+fn tab_acquire(ctx as i64) as i64 {
+    return kobject.ko_alloc(kobject.KOBJ_DEVICE, &TAB_OPS, 1);
+}
+
+fn register() as void {
+    ksym_handler.name_ptr = cast(*u8, "vtablet.handler");
+    ksym_handler.name_len = 15;
+    ksym_handler.addr     = cast(i64, fn_ptr(handler));
+    ksym_handler.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_handler);
+    ksym_acquire.name_ptr = cast(*u8, "vtablet.tab_acquire");
+    ksym_acquire.name_len = 19;
+    ksym_acquire.addr     = cast(i64, fn_ptr(tab_acquire));
+    ksym_acquire.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_acquire);
+    ksym_bind.name_ptr = cast(*u8, "vtablet.vtablet_bind");
+    ksym_bind.name_len = 20;
+    ksym_bind.addr     = cast(i64, fn_ptr(vtablet_bind));
+    ksym_bind.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_bind);
+    serial.println("vtablet: registered", 19);
+}
