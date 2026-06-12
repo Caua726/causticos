@@ -37,7 +37,16 @@ if [ "${HEADLESS:-0}" = "1" ]; then
     DISPLAY_ARGS=(-display none -monitor unix:/tmp/cwm-mon,server,nowait)
     echo "headless: monitor at /tmp/cwm-mon (screendump / sendkey)"
 else
-    echo "booting with a display — Alt+Tab / Super+Enter / Super+Q..."
+    # The guest mouse is a relative PS/2 device, so the host pointer must be
+    # GRABBED for it to track. Native Wayland refuses QEMU's classic pointer
+    # grab — route GTK through XWayland, where click-to-grab works.
+    # (The real fix is an absolute-pointing virtio-tablet driver in the
+    # guest; until then: click inside to capture, Ctrl+Alt+G to release.)
+    if [ -n "$WAYLAND_DISPLAY" ]; then
+        export GDK_BACKEND=x11
+    fi
+    echo "booting with a display — CLICK INSIDE to capture the mouse,"
+    echo "Ctrl+Alt+G releases it. Alt+Tab / Super+Enter / Super+Q / drag..."
 fi
 
 exec qemu-system-x86_64 \
