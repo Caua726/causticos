@@ -3410,6 +3410,143 @@ fn spawn_poll_smoke() as void {
 }
 
 // ============================================================
+// Ring-3 SYS_PROC_KILL smoke — a parent spawns an unkillable-by-politeness
+// child and kills it: mode 0 = `jmp $` (a pure user spin that never enters
+// the kernel voluntarily — only the preemption tick can stop it), mode 1 =
+// a 1-hour sleep (parked deep in a kernel wait). Parent: spawn → 200ms →
+// SYS_PROC_KILL → SYS_WAIT → exit(status). The kernel expects 137.
+// ============================================================
+
+let is i64 as CSE_KL_ENTRY      = 0x401000;
+let is i64 as CSE_KL_BSS_VA     = 0x402000;
+let is i64 as CSE_KL_FOFF       = 0x50;
+let is i64 as CSE_KL_CHILD_FOFF = 0x200;
+let is i64 as kill_parent_len with mut = 0;
+let is [1024]u8 as kill_parent;
+
+fn build_kill_parent_cse(mode as i64) as void {
+    let is *u8 as e = cast(*u8, &kill_parent[0]);
+    let is i64 as z with mut = 0;
+    while (z < 1024) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F);
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, CSE_KL_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, CSE_KL_ENTRY);
+    write_le_u32(e, 0x28, CSE_KL_FOFF);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, CSE_KL_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    // -- the child: a FULL CSE embedded at CSE_KL_CHILD_FOFF (SYS_SPAWN wants
+    //    a real CSE image — header + segment — not raw code). Header 0x50, code
+    //    at +0x50, child entry VA = CHILD_FOFF maps to 0x401000 in the child. --
+    let is i64 as CH_ENTRY = 0x401000;
+    let is *u8 as ce = cast(*u8, &kill_parent[CSE_KL_CHILD_FOFF]);
+    let is i64 as zc with mut = 0;
+    while (zc < 0x80) { ce[zc] = cast(u8, 0); zc = zc + 1; }
+    ce[0]=cast(u8,0x43); ce[1]=cast(u8,0x53); ce[2]=cast(u8,0x54); ce[3]=cast(u8,0x5F);  // "CST_"
+    ce[4]=cast(u8,2); ce[5]=cast(u8,0); ce[6]=cast(u8,1); ce[7]=cast(u8,0);
+    write_le_u64(ce, 0x08, CH_ENTRY);
+    write_le_u64(ce, 0x10, 0x400000);
+    write_le_u32(ce, 0x18, 2);
+    write_le_u32(ce, 0x1C, 0);
+    write_le_u64(ce, 0x20, CH_ENTRY);
+    write_le_u32(ce, 0x28, 0x50);              // file offset of seg0
+    write_le_u32(ce, 0x34, 5);
+    write_le_u64(ce, 0x38, 0x402000);
+    write_le_u32(ce, 0x40, 0);
+    write_le_u32(ce, 0x44, 0);
+    write_le_u32(ce, 0x48, 0x1000);
+    write_le_u32(ce, 0x4C, 3);
+    let is i64 as cc with mut = 0x50;
+    if (mode == 0) {
+        ce[cc+0] = cast(u8, 0xEB); ce[cc+1] = cast(u8, 0xFE); cc = cc + 2;           // jmp $
+    } else {
+        ce[cc+0]=cast(u8,0x48); ce[cc+1]=cast(u8,0xC7); ce[cc+2]=cast(u8,0xC0);
+        ce[cc+3]=cast(u8,2); ce[cc+4]=cast(u8,0); ce[cc+5]=cast(u8,0); ce[cc+6]=cast(u8,0); cc = cc + 7;  // mov rax,2
+        ce[cc+0]=cast(u8,0x48); ce[cc+1]=cast(u8,0xBF);
+        write_le_u64(ce, cc+2, 3600000000000); cc = cc + 10;                         // movabs rdi,1h
+        ce[cc+0]=cast(u8,0x0F); ce[cc+1]=cast(u8,0x05); cc = cc + 2;                  // syscall
+        ce[cc+0]=cast(u8,0xEB); ce[cc+1]=cast(u8,0xFE); cc = cc + 2;                  // jmp $
+    }
+    write_le_u32(ce, 0x2C, cc - 0x50);         // seg0 file_size
+    write_le_u32(ce, 0x30, cc - 0x50);         // seg0 mem_size
+    let is i64 as chlen = cc;                   // total child CSE size
+
+    let is i64 as child_va = CSE_KL_ENTRY + (CSE_KL_CHILD_FOFF - CSE_KL_FOFF);
+    let is i64 as c with mut = CSE_KL_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, CSE_KL_BSS_VA); c = c + 10;
+    // spawn(child) — no fdacts, no argv
+    c = emit_spawn_params(e, c, child_va, chlen, 0, 0, 0, 0, 0);
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;  // mov [r15+0],rax (pid)
+    // sleep 200ms — let the child reach its spin/sleep
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,2); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;     // mov rax,2
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC7);
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0xC2); e[c+5]=cast(u8,0xEB); e[c+6]=cast(u8,0x0B); c = c + 7;  // mov rdi,200000000
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+    // SYS_PROC_KILL(pid)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,35); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;    // mov rax,35
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+    // wait(pid, r15+8)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,15); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;    // mov rax,15
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x08); c = c + 4;  // lea rsi,[r15+8]
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+    // exit(rax)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0xC7); c = c + 3;               // mov rdi,rax
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;     // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                                     // syscall
+
+    // (the child CSE is already written in place at CSE_KL_CHILD_FOFF above)
+    let is i64 as text_size = (CSE_KL_CHILD_FOFF + chlen) - CSE_KL_FOFF;
+    write_le_u32(e, 0x2C, text_size);
+    write_le_u32(e, 0x30, text_size);
+    kill_parent_len = CSE_KL_CHILD_FOFF + chlen;
+}
+
+fn spawn_kill_smoke() as void {
+    serial.println("userspace.kill_smoke: start", 27);
+    build_kill_parent_cse(0);
+    let is i64 as p0 = proc_spawn(proc.init_proc, cast(*u8, &kill_parent[0]), kill_parent_len);
+    if (p0 == 0) { pmm.panic("kill_smoke: spawn0 FAIL", 23); }
+    proc_start(p0);
+    let is i64 as code0 = proc_wait(proc.init_proc, proc.proc_pid(p0));
+    if (code0 != 137) {
+        serial.print("userspace.kill_smoke: spin exit=", 32);
+        util.print_num(code0);
+        serial.println("", 0);
+        pmm.panic("kill_smoke spin FAIL", 20);
+    }
+    serial.println("userspace.kill_smoke: spin PASS", 31);
+
+    build_kill_parent_cse(1);
+    let is i64 as p1 = proc_spawn(proc.init_proc, cast(*u8, &kill_parent[0]), kill_parent_len);
+    if (p1 == 0) { pmm.panic("kill_smoke: spawn1 FAIL", 23); }
+    proc_start(p1);
+    let is i64 as code1 = proc_wait(proc.init_proc, proc.proc_pid(p1));
+    if (code1 != 137) {
+        serial.print("userspace.kill_smoke: sleep exit=", 33);
+        util.print_num(code1);
+        serial.println("", 0);
+        pmm.panic("kill_smoke sleep FAIL", 21);
+    }
+    serial.println("userspace.kill_smoke: sleep PASS", 32);
+}
+
+// ============================================================
 // grab_smoke — the preemptible exclusivity contract, both flavors:
 // input (second open mutes the first; close hands back a CLEAN ring) and
 // surface (non-top presents paint nothing; close snaps the restored
@@ -3495,5 +3632,6 @@ fn smoke_init() as void {
     poll_unit_smoke();
     spawn_poll_smoke();
     grab_smoke();
+    spawn_kill_smoke();
 }
 

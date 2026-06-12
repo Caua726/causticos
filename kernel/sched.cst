@@ -135,7 +135,9 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 304  aspace_ptr       i64   (*vma.Aspace; 0 for kernel threads)
 // 312  kstack_va        i64   (guarded kvmap VA — kvunmap'd by the reaper)
 // 320  io_buf           i64   (lazy 4 KiB syscall-I/O staging — kfree'd by the reaper)
-// 328  reserved         56 bytes
+// 328  kill_pending     i64   (SYS_PROC_KILL marked this thread; the scheduler
+//                              never resumes it again — see kill_finalize)
+// 336  reserved         48 bytes
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
@@ -372,6 +374,56 @@ fn thr_user_rsp(tid as i64) as i64      { return thr_get(tid, 296); }
 // Aspace pointer — not just pml4 — to call mmap/fd_* against it. Stored
 // at create time, before the thread becomes runnable. 0 for kernel threads.
 fn thr_aspace_ptr(tid as i64) as i64    { return thr_get(tid, 304); }
+
+// ---- SYS_PROC_KILL support (the sched-side half) ----
+// Marking is one store; the scheduler reacts in two places: a preempted
+// RUNNING thread is parked SUSPENDED instead of re-queued, and a marked
+// thread surfacing from pick_next is unqueued+parked instead of resumed.
+// Either way it never executes again; kill_finalize then moves the parked
+// corpse to the reaper. The killer (syshandlers.sys_proc_kill) owns the
+// process-side teardown (zombify + fd drain) — done BEFORE finalize, while
+// the thread is provably off-cpu and barred from returning.
+fn thr_mark_kill(tid as i64) as void    { thr_set(tid, 328, 1); }
+fn thr_is_running(tid as i64) as i64 {
+    if (thr_state(tid) == THREAD_RUNNING) { return 1; }
+    return 0;
+}
+
+// Finalize a marked thread once it is off-cpu: detach it from whatever
+// scheduler structure still references it and queue it for the deferred
+// reaper. Returns 0 = finalized now, 1 = it had already died on its own
+// (THREAD_DEAD), -1 = still RUNNING (caller retries).
+fn kill_finalize(tid as i64) as i64 {
+    let is i64 as cpu = thr_home_cpu(tid);
+    let is i64 as fl = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as st = thr_state(tid);
+    if (st == THREAD_RUNNING) {
+        lock.release_irq(sched_lock_ptr(cpu), fl);
+        return 0 - 1;
+    }
+    if (st == THREAD_DEAD) {
+        lock.release_irq(sched_lock_ptr(cpu), fl);
+        return 1;
+    }
+    if (st == THREAD_SLEEPING) {
+        if (thr_get(tid, 272) > 0) {
+            thr_set(tid, 272, 0);
+            timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
+        }
+    }
+    if (st == THREAD_RUNNABLE) {
+        // runnable ⇔ sitting in a run structure: pull it out
+        if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dl_remove(cpu, tid); }
+        if (thr_class(tid) == SCHED_CLASS_QOS) { runlist_remove(cpu, thr_band(tid), tid); }
+        set_nr_running(cpu, nr_running(cpu) - 1);
+    }
+    // SUSPENDED: schedule() already detached + uncounted it
+    thr_set(tid, 8, THREAD_DEAD);
+    thr_set(tid, 96, cpu_reap_head(cpu));
+    set_cpu_reap_head(cpu, tid);
+    lock.release_irq(sched_lock_ptr(cpu), fl);
+    return 0;
+}
 // *process.Process owning this thread (as i64; 0 for kernel threads).
 // The thread is execution; the Process is isolation/identity/lineage.
 fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
@@ -1556,12 +1608,19 @@ fn schedule() as void {
                 account_runtime(cpu, prev, elapsed);
             }
             if (thr_state(prev) == THREAD_RUNNING) {
-                thr_set(prev, 8, THREAD_RUNNABLE);
-                if (thr_class(prev) == SCHED_CLASS_DEADLINE) {
-                    dl_insert(cpu, prev);
-                }
-                if (thr_class(prev) == SCHED_CLASS_QOS) {
-                    runlist_insert(cpu, thr_band(prev), prev);
+                if (thr_get(prev, 328) != 0) {
+                    // marked by SYS_PROC_KILL: park it instead of re-queuing —
+                    // this preemption was its last instruction ever
+                    thr_set(prev, 8, THREAD_SUSPENDED);
+                    set_nr_running(cpu, nr_running(cpu) - 1);
+                } else {
+                    thr_set(prev, 8, THREAD_RUNNABLE);
+                    if (thr_class(prev) == SCHED_CLASS_DEADLINE) {
+                        dl_insert(cpu, prev);
+                    }
+                    if (thr_class(prev) == SCHED_CLASS_QOS) {
+                        runlist_insert(cpu, thr_band(prev), prev);
+                    }
                 }
             }
         }

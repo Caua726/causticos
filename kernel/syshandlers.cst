@@ -334,6 +334,49 @@ fn sys_fd_recv(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i6
 }
 
 // ============================================================
+// SYS_PROC_KILL(pid) — forced termination of a CHILD. The spawn key is the
+// kill authority: only the parent that holds the relationship may use it
+// (no ambient pid namespace to attack). The scheduler half (thr_mark_kill /
+// kill_finalize) guarantees the target never executes again before we touch
+// its process state; teardown then runs FROM THIS CONTEXT — zombify(137),
+// fd-table drain (peers see EOF/CLOSED immediately, exactly like a
+// voluntary exit) — and the corpse goes to the deferred reaper. wait()
+// collects the zombie as usual.
+// ============================================================
+
+fn sys_proc_kill(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as me = sched.thr_process_ptr(sched.current_tid());
+    if (me == 0) { return abi.E_PERM; }
+    let is i64 as child = proc.find_child(me, a);
+    if (child == 0) { return abi.E_NOENT; }
+    if (proc.proc_state(child) != proc.PROC_ALIVE) { return abi.E_OK; }   // already dying/dead
+    let is i64 as tid = proc.proc_first_tid(child);
+    if (tid < 0) { return abi.E_NOENT; }
+
+    sched.thr_mark_kill(tid);
+    // Wait for it to leave any cpu: the 1ms tick preempts even a pure user
+    // spin, and the scheduler parks marked threads instead of resuming them.
+    let is i64 as deadline = timer.current_time_ns() + 2000000000;
+    while (sched.thr_is_running(tid) == 1) {
+        if (timer.current_time_ns() >= deadline) { return abi.E_AGAIN; }
+        sched.sleep_for_ns(1000000);
+    }
+    // Off-cpu and barred from ever returning: process teardown is safe here.
+    proc.zombify(child, 137);
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
+    // Scheduler-side finalize (detach from queues/sleepers, queue the reaper).
+    let is i64 as tries with mut = 0;
+    while (tries < 2000) {
+        let is i64 as rc = sched.kill_finalize(tid);
+        if (rc >= 0) { return abi.E_OK; }
+        sched.sleep_for_ns(1000000);
+        tries = tries + 1;
+    }
+    return abi.E_AGAIN;
+}
+
+// ============================================================
 // SYS_POLL(entries_uptr, n, timeout_ns) — wait-many readiness. The
 // single-threaded event loop's only blocking point: sweep every watched fd
 // through ko_poll (each object reports under its own lock, briefly), return
@@ -1049,4 +1092,5 @@ fn install_all() as void {
     install(abi.SYS_FD_SEND,         cast(i64, fn_ptr(sys_fd_send)));
     install(abi.SYS_FD_RECV,         cast(i64, fn_ptr(sys_fd_recv)));
     install(abi.SYS_POLL,            cast(i64, fn_ptr(sys_poll)));
+    install(abi.SYS_PROC_KILL,       cast(i64, fn_ptr(sys_proc_kill)));
 }
