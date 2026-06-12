@@ -33,9 +33,11 @@ echo "disk seeded: /init.cse(wm) + wmpat + tools + hello.txt"
 
 DISPLAY_ARGS=()
 if [ "${HEADLESS:-0}" = "1" ]; then
-    rm -f /tmp/cwm-mon
-    DISPLAY_ARGS=(-display none -monitor unix:/tmp/cwm-mon,server,nowait)
-    echo "headless: monitor at /tmp/cwm-mon (screendump / sendkey)"
+    rm -f /tmp/cwm-mon /tmp/cwm-qmp
+    DISPLAY_ARGS=(-display none -monitor unix:/tmp/cwm-mon,server,nowait
+                  -qmp unix:/tmp/cwm-qmp,server,nowait)
+    echo "headless: monitor at /tmp/cwm-mon (screendump/sendkey),"
+    echo "          QMP at /tmp/cwm-qmp (input-send-event abs for the tablet)"
 else
     # The guest mouse is a relative PS/2 device, so the host pointer must be
     # GRABBED for it to track. Native Wayland refuses QEMU's classic pointer
@@ -53,5 +55,5 @@ exec qemu-system-x86_64 \
     -cdrom build/causticos.iso -m 128M -machine q35 \
     -drive id=disk,file=build/disk.img,if=none,format=raw \
     -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
-    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
+    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -device virtio-tablet-pci \
     -boot d -serial stdio -no-reboot "${DISPLAY_ARGS[@]}"
