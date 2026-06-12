@@ -74,6 +74,7 @@ struct VirtQueue {
     notify_addr as i64;   // VA to write the queue index into (the doorbell)
     avail_shadow as i64;  // driver's running avail idx (mod 2^16 on publish)
     last_used as i64;     // last harvested used idx
+    last_used_len as i64; // bytes the device wrote into the last harvested buffer
     buf_va as i64;        // VA of the buffer pool inside the same page
     buf_phys as i64;
 }
@@ -202,21 +203,25 @@ fn vio_queue_setup(vd as *VirtioDev, idx as i64, want_qsize as i64, buf_sz as i6
     let is i64 as qs with mut = dev_qs;
     if (qs > want_qsize) { qs = want_qsize; }
 
-    let is *driver.DmaBuffer as dma with mut = cast(*driver.DmaBuffer, 0);
-    let is i32 as rc = driver.dma_alloc(cast(*driver.Hardware, vd.hw),
-                                        cast(u64, 4096), cast(u64, 4096),
-                                        cast(u32, 1), &dma);     // DMA32 + zeroed
-    if (rc != 0) { return 0 - 2; }
-    let is i64 as base_va = cast(i64, dma.virt);
-    let is i64 as base_phys = dma.phys;
-
+    // One DMA32 region holds the three rings AND the buffer pool; size it to
+    // fit and round up to whole pages (the buffers can far exceed a page —
+    // virtio-net's 16x2KB is 32 KiB; the input device's 64x8B is under one).
     let is i64 as desc_off = 0;
     let is i64 as avail_off = 16 * qs;
     let is i64 as avail_end = avail_off + 6 + 2 * qs;
     let is i64 as used_off = (avail_end + 3) & (0 - 4);
     let is i64 as used_end = used_off + 6 + 8 * qs;
     let is i64 as buf_off = (used_end + 7) & (0 - 8);
-    if (buf_off + buf_sz * qs > 4096) { return 0 - 3; }   // doesn't fit one page
+    let is i64 as total = buf_off + buf_sz * qs;
+    let is i64 as alloc_sz = (total + 4095) & (0 - 4096);
+
+    let is *driver.DmaBuffer as dma with mut = cast(*driver.DmaBuffer, 0);
+    let is i32 as rc = driver.dma_alloc(cast(*driver.Hardware, vd.hw),
+                                        cast(u64, alloc_sz), cast(u64, 4096),
+                                        cast(u32, 1), &dma);     // DMA32 + zeroed
+    if (rc != 0) { return 0 - 2; }
+    let is i64 as base_va = cast(i64, dma.virt);
+    let is i64 as base_phys = dma.phys;
 
     if (rd16(vd.common + C_QSIZE) != qs) { wr16(vd.common + C_QSIZE, qs); }
     wr64(vd.common + C_QDESC, base_phys + desc_off);
@@ -269,11 +274,14 @@ fn vio_publish(vd as *VirtioDev, vq as *VirtQueue, queue_idx as i64) as void {
 }
 
 // Used-ring harvest: returns the next used descriptor head, or -1 if none.
+// Stashes the matching "bytes the device wrote" into vq.last_used_len so a
+// receive path can size its copy.
 fn vio_next_used(vq as *VirtQueue) as i64 {
     let is i64 as dev_idx = rd16(vq.used + 2);
     if ((vq.last_used & 0xFFFF) == dev_idx) { return 0 - 1; }
     let is i64 as slot = vq.last_used - (vq.last_used / vq.qsize) * vq.qsize;
     let is i64 as id = rd32(vq.used + 4 + slot * 8);
+    vq.last_used_len = rd32(vq.used + 4 + slot * 8 + 4);
     vq.last_used = vq.last_used + 1;
     return id;
 }

@@ -55,5 +55,5 @@ exec qemu-system-x86_64 \
     -cdrom build/causticos.iso -m 128M -machine q35 -smp 2 \
     -drive id=disk,file=build/disk.img,if=none,format=raw \
     -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
-    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -device virtio-tablet-pci \
+    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -device virtio-tablet-pci -netdev user,id=net1 -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off \
     -boot d -serial stdio -no-reboot "${DISPLAY_ARGS[@]}"

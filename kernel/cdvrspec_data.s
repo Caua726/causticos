@@ -20,6 +20,8 @@
 .global _cdvrspec_ahci_end
 .global _cdvrspec_vtablet_start
 .global _cdvrspec_vtablet_end
+.global _cdvrspec_vnet_start
+.global _cdvrspec_vnet_end
 _cdvrspec_dummy_start:
 .incbin "kernel/dummy.cdvrspec"
 _cdvrspec_dummy_end:
@@ -38,6 +40,9 @@ _cdvrspec_ahci_end:
 _cdvrspec_vtablet_start:
 .incbin "kernel/vtablet.cdvrspec"
 _cdvrspec_vtablet_end:
+_cdvrspec_vnet_start:
+.incbin "kernel/vnet.cdvrspec"
+_cdvrspec_vnet_end:
 
 .section .cdvrspec_index
 .quad _cdvrspec_dummy_start
@@ -52,3 +57,5 @@ _cdvrspec_vtablet_end:
 .quad _cdvrspec_ahci_end
 .quad _cdvrspec_vtablet_start
 .quad _cdvrspec_vtablet_end
+.quad _cdvrspec_vnet_start
+.quad _cdvrspec_vnet_end

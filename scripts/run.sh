@@ -84,6 +84,7 @@ qemu-system-x86_64 \
     -netdev user,id=net0 \
     -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
     -device virtio-tablet-pci \
+    -netdev user,id=net1 -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off \
     -boot d \
     -serial stdio \
     -display none \
