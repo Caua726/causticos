@@ -72,10 +72,56 @@ let is i64 as kbd_fd with mut = 0;
 let is i64 as mouse_fd with mut = 0;
 let is i64 as mod_alt with mut = 0;
 let is i64 as mod_super with mut = 0;
-// cursor state (drained now, drawn/used by the drag machinery — M2)
 let is i64 as mx with mut = 0;
 let is i64 as my with mut = 0;
 let is i64 as mbuttons with mut = 0;
+
+// ---- software cursor: a 10x16 arrow, black outline + white fill, drawn
+// last in every composed rect. Bit c of row r = pixel at column c. ----
+let is i64 as CUR_W with imut = 10;
+let is i64 as CUR_H with imut = 16;
+let is [16]i64 as cur_o with mut;    // outline mask per row
+let is [16]i64 as cur_f with mut;    // fill mask per row
+let is i64 as cur_last_x with mut = 0;
+let is i64 as cur_last_y with mut = 0;
+
+fn cursor_init() as void {
+    cur_o[0]  = 0x001; cur_f[0]  = 0x000;
+    cur_o[1]  = 0x003; cur_f[1]  = 0x000;
+    cur_o[2]  = 0x005; cur_f[2]  = 0x002;
+    cur_o[3]  = 0x009; cur_f[3]  = 0x006;
+    cur_o[4]  = 0x011; cur_f[4]  = 0x00E;
+    cur_o[5]  = 0x021; cur_f[5]  = 0x01E;
+    cur_o[6]  = 0x041; cur_f[6]  = 0x03E;
+    cur_o[7]  = 0x081; cur_f[7]  = 0x07E;
+    cur_o[8]  = 0x101; cur_f[8]  = 0x0FE;
+    cur_o[9]  = 0x201; cur_f[9]  = 0x1FE;
+    cur_o[10] = 0x3E1; cur_f[10] = 0x01E;
+    cur_o[11] = 0x011; cur_f[11] = 0x00E;
+    cur_o[12] = 0x009; cur_f[12] = 0x006;
+    cur_o[13] = 0x005; cur_f[13] = 0x002;
+    cur_o[14] = 0x003; cur_f[14] = 0x000;
+    cur_o[15] = 0x001; cur_f[15] = 0x000;
+    return;
+}
+
+// ---- drag state machine (move = pure WM bookkeeping; resize also streams
+// RESIZE to the client so it can re-lay its grid out) ----
+let is i64 as DIR_N with imut = 1;
+let is i64 as DIR_S with imut = 2;
+let is i64 as DIR_W with imut = 4;
+let is i64 as DIR_E with imut = 8;
+let is i64 as EDGE  with imut = 6;     // resize band, px from the frame edge
+
+let is i64 as drag_mode with mut = 0;  // 0 none, 1 move, 2 resize
+let is i64 as drag_win with mut = 0;
+let is i64 as drag_dirs with mut = 0;
+let is i64 as drag_ax with mut = 0;    // mouse at press
+let is i64 as drag_ay with mut = 0;
+let is i64 as drag_ox with mut = 0;    // window geometry at press
+let is i64 as drag_oy with mut = 0;
+let is i64 as drag_ow with mut = 0;
+let is i64 as drag_oh with mut = 0;
 
 // ---- the client image (/wmpat.cse for now; the terminal later) ----
 let is i64 as img_base with mut = 0;
@@ -230,6 +276,31 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
             cblit_content(i);
         }
         zi = zi - 1;
+    }
+    // the cursor rides on top of everything
+    if (mouse_fd >= 0) {
+        let is i64 as r with mut = 0;
+        while (r < CUR_H) {
+            let is i64 as yy = my + r;
+            if (yy >= clip_y0 && yy < clip_y1) {
+                let is i64 as c with mut = 0;
+                while (c < CUR_W) {
+                    let is i64 as xx = mx + c;
+                    if (xx >= clip_x0 && xx < clip_x1) {
+                        let is i64 as bit = 1 << c;
+                        if ((cur_f[r] & bit) != 0) {
+                            let is *u32 as p = cast(*u32, fb_base + yy * scr_pitch + xx * 4);
+                            p[0] = cast(u32, 0x00FFFFFF);
+                        } else if ((cur_o[r] & bit) != 0) {
+                            let is *u32 as p2 = cast(*u32, fb_base + yy * scr_pitch + xx * 4);
+                            p2[0] = cast(u32, 0x00101010);
+                        }
+                    }
+                    c = c + 1;
+                }
+            }
+            r = r + 1;
+        }
     }
     return;
 }
@@ -550,7 +621,143 @@ fn drain_kbd() as void {
     return;
 }
 
-// M0: drain and track only — the cursor/drag machinery is the next slice.
+fn start_move(i as i64) as void {
+    drag_mode = 1;
+    drag_win = i;
+    drag_ax = mx; drag_ay = my;
+    drag_ox = wins[i].x; drag_oy = wins[i].y;
+    drag_ow = wins[i].w; drag_oh = wins[i].h;
+    return;
+}
+
+fn start_resize(i as i64, dirs as i64) as void {
+    drag_mode = 2;
+    drag_win = i;
+    drag_dirs = dirs;
+    drag_ax = mx; drag_ay = my;
+    drag_ox = wins[i].x; drag_oy = wins[i].y;
+    drag_ow = wins[i].w; drag_oh = wins[i].h;
+    return;
+}
+
+// Send a button/wheel event to window i with content-relative coordinates,
+// under the same writable+quota gate as keys.
+fn forward_mouse(i as i64, mtype as i64, a as i64) as void {
+    if (wins[i].state != 2) { return; }
+    let is i64 as rx = mx - (wins[i].x + BORDER);
+    let is i64 as ry = my - (wins[i].y + BORDER + TITLE_H);
+    if (rx < 0 || ry < 0 || rx >= wins[i].w || ry >= wins[i].h) { return; }
+    if (writable[i] == 1 && quota[i] < 2) {
+        wmp.msg_send(wins[i].chan, mtype, a, rx, ry);
+        quota[i] = quota[i] + 1;
+    } else {
+        wins[i].drops = wins[i].drops + 1;
+        if (wins[i].drops > MAX_DROPS) { reap_window(i, 0); }
+    }
+    return;
+}
+
+// Left press: hit-test top→bottom. Resize band beats titlebar beats content;
+// Super+press moves from anywhere in the frame. Every hit focuses + raises.
+fn press_at() as void {
+    let is i64 as zi with mut = 0;
+    while (zi < nz) {
+        let is i64 as i = zord[zi];
+        if (wins[i].used == 1 && wins[i].state == 2) {
+            let is i64 as fx = wins[i].x;
+            let is i64 as fy = wins[i].y;
+            let is i64 as fw = wins[i].w + 2 * BORDER;
+            let is i64 as fh = wins[i].h + TITLE_H + 2 * BORDER;
+            if (mx >= fx && mx < fx + fw && my >= fy && my < fy + fh) {
+                set_focus(i);
+                if (mod_super == 1) { start_move(i); return; }
+                let is i64 as dirs with mut = 0;
+                if (mx < fx + EDGE) { dirs = dirs | DIR_W; }
+                if (mx >= fx + fw - EDGE) { dirs = dirs | DIR_E; }
+                if (my < fy + EDGE) { dirs = dirs | DIR_N; }
+                if (my >= fy + fh - EDGE) { dirs = dirs | DIR_S; }
+                if (dirs != 0) { start_resize(i, dirs); return; }
+                if (my < fy + BORDER + TITLE_H) { start_move(i); return; }
+                forward_mouse(i, wmp.MSG_MOUSE_BTN, mbuttons);
+                return;
+            }
+        }
+        zi = zi + 1;
+    }
+    return;                                          // desktop: nothing
+}
+
+fn handle_buttons(oldb as i64, newb as i64) as void {
+    let is i64 as lp_old = oldb & 1;
+    let is i64 as lp_new = newb & 1;
+    mbuttons = newb;
+    if (lp_old == 0 && lp_new == 1) { press_at(); return; }
+    if (lp_old == 1 && lp_new == 0) {
+        if (drag_mode != 0) { drag_mode = 0; return; }
+        if (nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_BTN, newb); }
+        return;
+    }
+    // right/middle edges go to the focused window when inside its content
+    if (nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_BTN, newb); }
+    return;
+}
+
+// Apply accumulated motion once per sweep: drag geometry + cursor damage.
+fn apply_motion() as void {
+    if (drag_mode == 1) {
+        let is i64 as i = drag_win;
+        let is i64 as fw = wins[i].w + 2 * BORDER;
+        let is i64 as fh = wins[i].h + TITLE_H + 2 * BORDER;
+        let is i64 as nx2 with mut = drag_ox + (mx - drag_ax);
+        let is i64 as ny2 with mut = drag_oy + (my - drag_ay);
+        if (nx2 < 0) { nx2 = 0; }
+        if (ny2 < 0) { ny2 = 0; }
+        if (nx2 + fw > scr_w) { nx2 = scr_w - fw; }
+        if (ny2 + fh > scr_h) { ny2 = scr_h - fh; }
+        if (nx2 != wins[i].x || ny2 != wins[i].y) {
+            damage_frame(i);
+            wins[i].x = nx2;
+            wins[i].y = ny2;
+            damage_frame(i);
+        }
+    } else if (drag_mode == 2) {
+        let is i64 as i = drag_win;
+        let is i64 as nw with mut = drag_ow;
+        let is i64 as nh with mut = drag_oh;
+        let is i64 as nx with mut = drag_ox;
+        let is i64 as ny with mut = drag_oy;
+        if ((drag_dirs & DIR_E) != 0) { nw = drag_ow + (mx - drag_ax); }
+        if ((drag_dirs & DIR_S) != 0) { nh = drag_oh + (my - drag_ay); }
+        if ((drag_dirs & DIR_W) != 0) { nw = drag_ow - (mx - drag_ax); }
+        if ((drag_dirs & DIR_N) != 0) { nh = drag_oh - (my - drag_ay); }
+        if (nw < MIN_W) { nw = MIN_W; }
+        if (nh < MIN_H) { nh = MIN_H; }
+        if (nw > scr_w - 2 * BORDER) { nw = scr_w - 2 * BORDER; }
+        if (nh > scr_h - TITLE_H - 2 * BORDER) { nh = scr_h - TITLE_H - 2 * BORDER; }
+        if ((drag_dirs & DIR_W) != 0) { nx = drag_ox + (drag_ow - nw); }
+        if ((drag_dirs & DIR_N) != 0) { ny = drag_oy + (drag_oh - nh); }
+        if (nx < 0) { nw = nw + nx; nx = 0; }
+        if (ny < 0) { nh = nh + ny; ny = 0; }
+        if (nx + nw + 2 * BORDER > scr_w) { nw = scr_w - 2 * BORDER - nx; }
+        if (ny + nh + TITLE_H + 2 * BORDER > scr_h) { nh = scr_h - TITLE_H - 2 * BORDER - ny; }
+        if (nw != wins[i].w || nh != wins[i].h || nx != wins[i].x || ny != wins[i].y) {
+            damage_frame(i);
+            wins[i].x = nx; wins[i].y = ny;
+            wins[i].w = nw; wins[i].h = nh;
+            damage_frame(i);
+            wins[i].pend_resize_w = nw;              // slot: the latest wins
+            wins[i].pend_resize_h = nh;
+        }
+    }
+    if (mx != cur_last_x || my != cur_last_y) {
+        damage(cur_last_x, cur_last_y, CUR_W, CUR_H);
+        damage(mx, my, CUR_W, CUR_H);
+        cur_last_x = mx;
+        cur_last_y = my;
+    }
+    return;
+}
+
 fn drain_mouse() as void {
     let is [64]u8 as recs;
     let is i64 as n = syscall(10, mouse_fd, cast(i64, &recs[0]), 64);
@@ -567,9 +774,14 @@ fn drain_mouse() as void {
         if (my < 0) { my = 0; }
         if (mx >= scr_w) { mx = scr_w - 1; }
         if (my >= scr_h) { my = scr_h - 1; }
-        mbuttons = cast(i64, recs[k + 2]);
+        let is i64 as nb = cast(i64, recs[k + 2]);
+        if (nb != mbuttons) { handle_buttons(mbuttons, nb); }
+        let is i64 as wh with mut = cast(i64, recs[k + 3]);
+        if (wh >= 128) { wh = wh - 256; }
+        if (wh != 0 && nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_WHEEL, wh); }
         k = k + 4;
     }
+    apply_motion();
     return;
 }
 
@@ -632,8 +844,11 @@ fn main() as i32 {
 
     let is i64 as zi with mut = 0;
     while (zi < MAX_WIN) { wins[zi].used = 0; wins[zi].state = 0; zi = zi + 1; }
+    cursor_init();
     mx = scr_w / 2;
     my = scr_h / 2;
+    cur_last_x = mx;
+    cur_last_y = my;
 
     damage_all();
     flush_damage();
