@@ -52,6 +52,11 @@ let is i64 as pend_y1 with mut = 0;
 // Running child (one at a time, like the shell).
 let is i64 as child_pid with mut = 0;
 let is i64 as child_out with mut = 0 - 1;
+// The child's control channel (its fd wmp.TERM_CTL): 32-byte requests the
+// terminal relays — today, MSG_SPAWN_REQ ("open another terminal").
+let is i64 as child_ctl with mut = 0 - 1;
+let is i64 as ctl_fill with mut = 0;
+let is [32]u8 as ctl_acc with mut;
 
 // --- helpers (transplanted from shell.cst) ---
 fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
@@ -134,36 +139,79 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
         sys.munmap(cast(i64, img), IMG_CAP);
         return;
     }
-    let is [2]i64 as fdacts;
+    // control channel: the child's window onto terminal services (fd 4)
+    let is [2]i64 as cfds;
+    if (sys.channel_create(cast(*i64, &cfds[0])) != 0) {
+        err(t, "channel fail\n");
+        sys.close(fds[0]); sys.close(fds[1]);
+        sys.munmap(cast(i64, img), IMG_CAP);
+        return;
+    }
+    let is [4]i64 as fdacts;
     fdacts[0] = 1;
     fdacts[1] = fds[1];
+    fdacts[2] = wmp.TERM_CTL;
+    fdacts[3] = cfds[1];
 
     let is [32]i64 as av;
     let is i64 as k with mut = 0;
     while (k < argc) { av[2 * k] = argv_ptr[k]; av[2 * k + 1] = argv_len[k]; k = k + 1; }
 
-    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 1, cast(*u8, &av[0]), argc);
+    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 2, cast(*u8, &av[0]), argc);
     sys.close(fds[1]);
+    sys.close(cfds[1]);
     if (pid < 0) {
         err(t, "spawn failed\n");
         sys.close(fds[0]);
+        sys.close(cfds[0]);
         sys.munmap(cast(i64, img), IMG_CAP);
         return;
     }
     _col(t, C_TEXT);
     child_pid = pid;
     child_out = fds[0];
+    child_ctl = cfds[0];
+    ctl_fill = 0;
     child_img = cast(i64, img);
     return;
 }
 
-// Child stdout drained to EOF → reap, free the image, fresh prompt.
+// Drain every complete control request still buffered and relay it. The
+// child's exit closes its end together with its last write — the request
+// must be honored even when its EOF arrives in the same sweep.
+fn drain_ctl() as void {
+    if (child_ctl < 0) { return; }
+    let is [3]i64 as ce;
+    let is [4]i64 as cm;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        ce[0] = child_ctl;
+        ce[1] = sys.POLL_READABLE;
+        ce[2] = 0;
+        sys.poll(&ce[0], 1, 0);
+        if ((ce[2] & sys.POLL_READABLE) == 0) { more = 0; }
+        else {
+            let is i64 as cr = wmp.msg_read(child_ctl, &ctl_fill, cast(*u8, &ctl_acc[0]), &cm[0]);
+            if (cr < 0) { more = 0; }
+            else if (cr == 1 && cm[0] == wmp.MSG_SPAWN_REQ) {
+                wmp.msg_send(wmp.WM_FD, wmp.MSG_SPAWN_REQ, 0, 0, 0);
+            }
+        }
+    }
+    return;
+}
+
+// Child stdout drained to EOF → flush its control channel, reap, free the
+// image, fresh prompt.
 fn child_eof(t as *term.Term) as void {
+    drain_ctl();
     sys.close(child_out);
+    sys.close(child_ctl);
     let is i64 as st with mut = 0;
     sys.wait(child_pid, &st);
     sys.munmap(child_img, IMG_CAP);
     child_out = 0 - 1;
+    child_ctl = 0 - 1;
     child_pid = 0;
     child_img = 0;
     prompt(t);
@@ -215,6 +263,7 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as i64 {
         puts(t, "  ls   [path]       list a directory\n");
         puts(t, "  uptime            time since boot\n");
         puts(t, "  sysinfo           kernel version + limits\n");
+        puts(t, "  newterm           open another terminal window\n");
         return 0;
     }
     run_program(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc);
@@ -343,11 +392,12 @@ fn main() as i32 {
     let is [256]u8 as line;
     let is i64 as llen with mut = 0;
     let is i64 as shift with mut = 0;
-    let is [6]i64 as pe;
+    let is [9]i64 as pe;
     let is [256]u8 as pbuf;
 
     while (1 == 1) {
-        // entry 0: the WM channel; entry 1 (optional): the child's stdout
+        // entry 0: the WM channel; entries 1/2 (optional): the running
+        // child's stdout and control channel
         let is i64 as n with mut = 1;
         pe[0] = wmp.WM_FD;
         pe[1] = sys.POLL_READABLE;
@@ -357,7 +407,10 @@ fn main() as i32 {
             pe[3] = child_out;
             pe[4] = sys.POLL_READABLE;
             pe[5] = 0;
-            n = 2;
+            pe[6] = child_ctl;
+            pe[7] = sys.POLL_READABLE;
+            pe[8] = 0;
+            n = 3;
         }
         sys.poll(&pe[0], n, 0 - 1);
 
@@ -368,6 +421,12 @@ fn main() as i32 {
                                             wmp.pack_wh(pend_x1 - pend_x0, pend_y1 - pend_y0));
             if (rc < 0) { return 0; }                  // WM gone
             pend_on = 0;
+        }
+
+        // -- child control requests first: a child's last request and its
+        //    stdout EOF can land in the same sweep --
+        if (child_ctl >= 0 && (pe[8] & sys.POLL_READABLE) != 0) {
+            drain_ctl();
         }
 
         // -- child output --
@@ -384,6 +443,7 @@ fn main() as i32 {
         if (child_out >= 0 && (pe[5] & sys.POLL_CLOSED) != 0 && (pe[5] & sys.POLL_READABLE) == 0) {
             child_eof(&t);
         }
+
 
         // -- WM messages --
         if ((pe[2] & sys.POLL_READABLE) != 0) {
