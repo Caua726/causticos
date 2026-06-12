@@ -18,7 +18,7 @@ cd "$OUT"; rm -rf .caustic            # the module cache lands in cwd
 # --stack-size: term.cst's putc is recursive (tab → spaces), so the compiler
 # can't bound the worst-case stack on its own; 64 KiB is generous for all of
 # these and harmless where no recursion exists.
-PROGS="shell echo cat ls uptime sysinfo vic wm wmpat"
+PROGS="shell echo cat ls uptime sysinfo vic wm wmpat wterm"
 for p in $PROGS; do
     if ! "$CAUSTIC" --target=caustic-x86_64 --stack-size=65536 "$HERE/$p.cst" -o "$OUT/$p.cse" >/dev/null 2>&1; then
         echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 --stack-size=65536 "$HERE/$p.cst" -o "$OUT/$p.cse"; exit 1
