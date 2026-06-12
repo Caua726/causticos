@@ -147,6 +147,32 @@ fn damage(x as i64, y as i64, w as i64, h as i64) as void {
     if (x1 > scr_w) { x1 = scr_w; }
     if (y1 > scr_h) { y1 = scr_h; }
     if (x1 <= x0 || y1 <= y0) { return; }
+    // Merge into an overlapping rect instead of stacking near-duplicates:
+    // a drag damages old+new frames that mostly coincide — composing the
+    // overlap twice per frame was pure waste.
+    let is i64 as k with mut = 0;
+    while (k < dmg_n) {
+        let is i64 as ex0 = dmg[k*4+0];
+        let is i64 as ey0 = dmg[k*4+1];
+        let is i64 as ex1 = ex0 + dmg[k*4+2];
+        let is i64 as ey1 = ey0 + dmg[k*4+3];
+        if (x0 < ex1 && x1 > ex0 && y0 < ey1 && y1 > ey0) {
+            let is i64 as nx0 with mut = x0;
+            let is i64 as ny0 with mut = y0;
+            let is i64 as nx1 with mut = x1;
+            let is i64 as ny1 with mut = y1;
+            if (ex0 < nx0) { nx0 = ex0; }
+            if (ey0 < ny0) { ny0 = ey0; }
+            if (ex1 > nx1) { nx1 = ex1; }
+            if (ey1 > ny1) { ny1 = ey1; }
+            dmg[k*4+0] = nx0;
+            dmg[k*4+1] = ny0;
+            dmg[k*4+2] = nx1 - nx0;
+            dmg[k*4+3] = ny1 - ny0;
+            return;
+        }
+        k = k + 1;
+    }
     if (dmg_n >= 8) { dmg_full = 1; return; }
     dmg[dmg_n * 4 + 0] = x0;
     dmg[dmg_n * 4 + 1] = y0;
@@ -580,11 +606,25 @@ fn drain_pending(i as i64) as void {
 // Input
 // ============================================================
 
+// Point check: can window i's channel take one whole message right now?
+// Input events are reactive and rare (human-rate), so a one-entry
+// non-blocking poll at forward time replaces standing WRITABLE interest in
+// the main poll set — which would otherwise make the idle loop spin.
+fn chan_writable_now(i as i64) as i64 {
+    let is [3]i64 as ce;
+    ce[0] = wins[i].chan;
+    ce[1] = sys.POLL_WRITABLE;
+    ce[2] = 0;
+    sys.poll(&ce[0], 1, 0);
+    if ((ce[2] & sys.POLL_WRITABLE) != 0) { return 1; }
+    return 0;
+}
+
 fn forward_key(sc as i64, flags as i64) as void {
     if (nz == 0) { return; }
     let is i64 as i = zord[0];
     if (wins[i].state != 2) { return; }
-    if (writable[i] == 1 && quota[i] < 2) {
+    if (quota[i] < 2 && chan_writable_now(i) == 1) {
         wmp.msg_send(wins[i].chan, wmp.MSG_KEY, sc, flags, 0);
         quota[i] = quota[i] + 1;
     } else {
@@ -650,7 +690,7 @@ fn forward_mouse(i as i64, mtype as i64, a as i64) as void {
     let is i64 as rx = mx - (wins[i].x + BORDER);
     let is i64 as ry = my - (wins[i].y + BORDER + TITLE_H);
     if (rx < 0 || ry < 0 || rx >= wins[i].w || ry >= wins[i].h) { return; }
-    if (writable[i] == 1 && quota[i] < 2) {
+    if (quota[i] < 2 && chan_writable_now(i) == 1) {
         wmp.msg_send(wins[i].chan, mtype, a, rx, ry);
         quota[i] = quota[i] + 1;
     } else {
@@ -906,11 +946,20 @@ fn main() as i32 {
             pe[n*3+0] = tab_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
             pmap[n] = 0 - 1; tab_e = n; n = n + 1;
         }
+        // READABLE always; WRITABLE only while a control message is queued
+        // for that window. An empty channel is permanently writable, so
+        // asking for WRITABLE unconditionally turns the poll into a busy
+        // spin that starves every client of CPU — the idle WM must SLEEP.
         let is i64 as wi with mut = 0;
         while (wi < MAX_WIN) {
             if (wins[wi].used == 1) {
+                let is i64 as want with mut = sys.POLL_READABLE;
+                if (wins[wi].pend_close == 1 || wins[wi].pend_resize_w > 0
+                    || wins[wi].pend_focus >= 0) {
+                    want = want | sys.POLL_WRITABLE;
+                }
                 pe[n*3+0] = wins[wi].chan;
-                pe[n*3+1] = sys.POLL_READABLE | sys.POLL_WRITABLE;
+                pe[n*3+1] = want;
                 pe[n*3+2] = 0;
                 pmap[n] = wi;
                 n = n + 1;
