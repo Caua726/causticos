@@ -35,6 +35,7 @@ use "channel.cst" as channel;
 use "segment.cst" as segment;
 use "kobject.cst" as kobject;
 use "kbd.cst" as kbd;
+use "mouse.cst" as mouse;
 use "driver.cst" as driver;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
@@ -2055,6 +2056,117 @@ fn spawn_kbd_smoke() as void {
     }
 }
 
+// ============================================================
+// Embedded "mouse child" CSE — proves the raw-input path from ring 3:
+// dev_open(DEV_MOUSE) → read(fd, &rec, 4) → exit(rec[0] = dx). The kernel
+// injects a synthetic record (QEMU sends no motion with -display none) and
+// checks the child exits with that dx — read off the device by syscall.
+// ============================================================
+
+let is i64 as CSE_MS_ENTRY  = 0x401000;
+let is i64 as CSE_MS_BSS_VA = 0x402000;
+let is i64 as CSE_MS_FOFF   = 0x50;
+let is i64 as child_ms_len with mut = 0;
+let is [256]u8 as child_ms;
+
+fn build_mouse_child_cse() as void {
+    let is *u8 as e = cast(*u8, &child_ms[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    write_le_u64(e, 0x08, CSE_MS_ENTRY);
+    write_le_u64(e, 0x10, 0x400000);
+    write_le_u32(e, 0x18, 2);
+    write_le_u32(e, 0x1C, 0);
+    write_le_u64(e, 0x20, CSE_MS_ENTRY);
+    write_le_u32(e, 0x28, CSE_MS_FOFF);
+    write_le_u32(e, 0x34, 5);
+    write_le_u64(e, 0x38, CSE_MS_BSS_VA);
+    write_le_u32(e, 0x40, 0);
+    write_le_u32(e, 0x44, 0);
+    write_le_u32(e, 0x48, 0x1000);
+    write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_MS_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); write_le_u64(e, c+2, CSE_MS_BSS_VA); c = c + 10;
+    // dev_open(DEV_MOUSE=2, 0, 0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,22
+    e[c+0]=cast(u8,0xBF); e[c+1]=cast(u8,2); e[c+2]=cast(u8,0); e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); c = c + 5;  // mov edi,2
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;                        // xor esi,esi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;                        // xor edx,edx
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;  // mov [r15+0],rax (fd)
+    // read(fd, r15+8, 4) — one whole 4-byte record
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,10
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x08); c = c + 4;  // lea rsi,[r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,4); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rdx,4
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    // exit(byte [r15+8]) — dx of the first record
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x7F); e[c+4]=cast(u8,0x08); c = c + 5;  // movzx edi, byte [r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+
+    let is i64 as text_size = c - CSE_MS_FOFF;
+    write_le_u32(e, 0x2C, text_size);
+    write_le_u32(e, 0x30, text_size);
+    child_ms_len = c;
+}
+
+// Mouse smoke: wait for the driver to bind, check registry honesty, run the
+// byte-decoder self-test, then spawn the child, inject a record (dx=9) and
+// confirm it exits with 9 — ring-3 dev_open + record read. Failures panic:
+// verify.sh greps panics, not FAIL lines.
+fn spawn_mouse_smoke() as void {
+    serial.println("userspace.mouse_smoke: start", 28);
+    let is i64 as mdeadline = timer.current_time_ns() + 4000000000;
+    let is i64 as mwaiting with mut = 1;
+    while (mwaiting == 1) {
+        if (driver.device_count(abi.DEV_MOUSE) > 0) { mwaiting = 0; }
+        else if (timer.current_time_ns() >= mdeadline) { mwaiting = 0; }
+        else { sched.sleep_for_ns(20000000); }
+    }
+
+    let is i64 as nms = driver.device_count(abi.DEV_MOUSE);
+    let is i64 as mo0 = driver.device_open(abi.DEV_MOUSE, 0);
+    let is i64 as mo1 = driver.device_open(abi.DEV_MOUSE, 1);
+    if (mo0 != 0) { kobject.ko_unref(mo0); }
+    if (mo1 != 0) { kobject.ko_unref(mo1); }
+    if (nms != 1) { pmm.panic("mouse_smoke: registry count FAIL", 32); }
+    if (mo0 == 0) { pmm.panic("mouse_smoke: instance 0 FAIL", 28); }
+    if (mo1 != 0) { pmm.panic("mouse_smoke: phantom instance FAIL", 34); }
+
+    if (mouse.decode_self_test() != 1) {
+        pmm.panic("mouse_smoke: decoder FAIL", 25);
+    }
+
+    build_mouse_child_cse();
+    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &child_ms[0]), child_ms_len);
+    if (child == 0) {
+        pmm.panic("mouse_smoke: spawn FAIL", 23);
+    }
+    proc_start(child);
+    // Inject dx=9 (the child's blocking record-read wakes).
+    mouse.inject_event(9, 0, 0, 0);
+
+    let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(child));
+    if (code == 9) {
+        serial.println("userspace.mouse_smoke: PASS", 27);
+    } else {
+        serial.print("userspace.mouse_smoke: exit=", 28);
+        util.print_num(code);
+        serial.println("", 0);
+        pmm.panic("mouse_smoke FAIL", 16);
+    }
+}
+
 fn spawn_user_cse_smoke() as void {
     serial.println("userspace.cse_smoke: start", 26);
 
@@ -2923,6 +3035,7 @@ fn smoke_init() as void {
     spawn_channel_smoke();
     spawn_fdacts_smoke();
     spawn_kbd_smoke();
+    spawn_mouse_smoke();
     spawn_user_proc_smoke();
     spawn_user_syscall_smoke();
     spawn_argv_smoke();

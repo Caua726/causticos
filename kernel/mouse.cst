@@ -1,0 +1,356 @@
+// mouse.cst — PS/2 (aux port) mouse driver, spec-framework style.
+// Declares match + CAP_IRQ in kernel/mouse.cdvrspec; the framework allocates
+// the vector, programs the IOAPIC redirection (line 12), and registers the
+// handler. The shared i8042 module owns the controller (kernel/i8042.cst).
+//
+// The mouse is a DEVICE that yields RAW events (docs/architecture.md §8):
+// the IRQ handler decodes the PS/2 packet protocol only as far as the device
+// defines it — deltas, buttons, wheel — and enqueues fixed 4-byte records:
+//
+//   [0] dx      i8 — signed; positive = right
+//   [1] dy      i8 — signed; RAW PS/2: positive = UP (screen-space inversion
+//                    is userspace policy, like the keymap)
+//   [2] buttons u8 — bit0 = left, bit1 = right, bit2 = middle (state mask)
+//   [3] wheel   i8 — signed detents; always 0 on non-wheel mice
+//
+// Reads drain whole records (granularity 4). No acceleration, no cursor, no
+// screen coords — all userspace policy. 9-bit deltas beyond ±127 are split
+// losslessly across consecutive records (buttons repeated, wheel only on the
+// first); the hardware overflow bits saturate the delta to ±255 first.
+
+use "driver.cst" as driver;
+use "spec.cst" as spec;
+use "ksym.cst" as ksym;
+use "port.cst" as port;
+use "serial.cst" as serial;
+use "kobject.cst" as kobject;
+use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "abi.cst" as abi;
+use "i8042.cst" as i8042;
+use "util.cst" as util;
+
+// 4-byte records; 1024-byte ring = 256 records.
+let is i64 as MOUSE_CAP  = 1024;
+let is i64 as MOUSE_MASK = 1023;
+let is i64 as MOUSE_REC  = 4;
+
+let is [1024]u8 as mouse_buf with mut;
+let is i64 as mouse_head with mut = 0;
+let is i64 as mouse_tail with mut = 0;
+let is i64 as mouse_count with mut = 0;
+let is lock.TicketLock as mouse_lk;
+
+// Packet accumulator — IRQ context, guarded by mouse_lk.
+let is [4]u8 as pkt with mut;
+let is i64 as pkt_idx with mut = 0;
+let is i64 as pkt_size with mut = 3;      // 4 after IntelliMouse detection
+let is i64 as wheel_mode with mut = 0;
+let is i64 as mouse_present with mut = 0;
+
+let is ksym.KSym as ksym_handler;
+let is ksym.KSym as ksym_acquire;
+let is ksym.KSym as ksym_bind;
+let is kobject.KObjectOps as MOUSE_OPS with mut;
+
+fn mouse_init() as void {
+    MOUSE_OPS.read  = fn_ptr(mouse_read);
+    MOUSE_OPS.close = fn_ptr(mouse_close);
+    // write/mmap/present/lseek/readdir stay null — a mouse is a read-only
+    // raw-event stream.
+}
+
+// Failure exit for mouse_bind: report with register-level evidence, then
+// put the controller back in a safe pre-mouse state (aux clock off, aux IRQ
+// off, aux port disabled, keyboard port re-enabled) so a dead/absent mouse
+// on real hardware cannot wedge the keyboard. Called with ctl_lk held;
+// unlocks it.
+fn bind_fail(step as i64) as i32 {
+    i8042.report_fail("mouse", 5, step);
+    i8042.config_update(i8042.CFG_AUX_CLK_OFF, i8042.CFG_AUX_IRQ);
+    i8042.cmd(i8042.CMD_AUX_DISABLE);
+    i8042.cmd(i8042.CMD_KBD_ENABLE);
+    i8042.flush();
+    i8042.unlock_ctl();
+    return 1;
+}
+
+// on_bind: bring up the aux port and the mouse behind it.
+//
+// Load-bearing ordering: the IOAPIC route for IRQ12 is already programmed
+// (populate_caps runs before on_bind), so the config byte's aux-IRQ bit
+// stays OFF for the whole command dance — otherwise every ACK byte would
+// fire IRQ12, the handler would consume it, and the polled waits here would
+// starve. The bit is set only at the very end, after a flush; a byte parked
+// in the output buffer before the IRQ enable would never re-edge (ISA IOAPIC
+// entries are edge-triggered), which is also why the flush comes first and
+// the bit3 sync check makes any residual misalignment self-heal.
+//
+// The keyboard port is quiesced (0xAD) for the duration so polled aux reads
+// can't interleave with keystroke bytes; it is re-enabled at the end. Boot-
+// time only, ms scale.
+fn mouse_bind(b as *spec.Binding) as i32 {
+    i8042.lock_ctl();
+    if (i8042.cmd(i8042.CMD_KBD_DISABLE) != 0) { return bind_fail(1); }
+    if (i8042.cmd(i8042.CMD_AUX_ENABLE) != 0) { return bind_fail(2); }
+    i8042.flush();
+    // Aux clock ON, aux IRQ OFF (see ordering note above).
+    if (i8042.config_update(0, i8042.CFG_AUX_IRQ | i8042.CFG_AUX_CLK_OFF) != 0) {
+        return bind_fail(3);
+    }
+    // Reset (0xFF): ACK, then BAT result 0xAA (up to ~500ms on real silicon),
+    // then a device-id byte. A missing mouse times out on the ACK — that is
+    // the "no mouse on this machine" path, loud and safe.
+    if (i8042.aux_send(0xFF, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(4); }
+    let is i64 as bat = i8042.read_aux_data(i8042.RESET_TIMEOUT_NS);
+    if (bat != 0xAA) { i8042.last_byte = bat; return bind_fail(5); }
+    let is i64 as rid = i8042.read_aux_data(i8042.CMD_TIMEOUT_NS);
+    if (rid < 0) { return bind_fail(6); }
+    // Set defaults (sample rate 100, resolution 4, stream mode, reporting off).
+    if (i8042.aux_send(0xF6, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(7); }
+    // IntelliMouse detection: the magic sample-rate knock 200,100,80 then read
+    // the device id. Id 3 (or 4) = wheel present, 4-byte packets. Anything
+    // else — including a timeout from a quirky USB-legacy emulation — falls
+    // back to plain 3-byte packets; only the knock itself failing is fatal.
+    if (i8042.aux_send(0xF3, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(8); }
+    if (i8042.aux_send(200, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(8); }
+    if (i8042.aux_send(0xF3, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(8); }
+    if (i8042.aux_send(100, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(8); }
+    if (i8042.aux_send(0xF3, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(8); }
+    if (i8042.aux_send(80, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(8); }
+    let is i64 as id with mut = 0;
+    if (i8042.aux_send(0xF2, i8042.CMD_TIMEOUT_NS) == 0) {
+        id = i8042.read_aux_data(i8042.CMD_TIMEOUT_NS);
+    }
+    if (id == 3) { wheel_mode = 1; pkt_size = 4; }
+    else if (id == 4) { wheel_mode = 1; pkt_size = 4; }
+    else { wheel_mode = 0; pkt_size = 3; }
+    // Settle on 100 Hz after the detection knock.
+    if (i8042.aux_send(0xF3, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(9); }
+    if (i8042.aux_send(100, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(9); }
+    // Enable data reporting.
+    if (i8042.aux_send(0xF4, i8042.CMD_TIMEOUT_NS) != 0) { return bind_fail(10); }
+    // Clean slate before arming the IRQ (see ordering note).
+    let is i64 as fl = lock.acquire_irq(&mouse_lk);
+    mouse_head = 0; mouse_tail = 0; mouse_count = 0; pkt_idx = 0;
+    lock.release_irq(&mouse_lk, fl);
+    i8042.flush();
+    if (i8042.config_update(i8042.CFG_AUX_IRQ, i8042.CFG_AUX_CLK_OFF) != 0) {
+        return bind_fail(11);
+    }
+    if (i8042.cmd(i8042.CMD_KBD_ENABLE) != 0) { return bind_fail(12); }
+    mouse_present = 1;
+    i8042.unlock_ctl();
+    serial.print("mouse: i8042 aux init (IRQ12 on, id=", 37);
+    util.print_num(id);
+    serial.println(")", 1);
+    return 0;
+}
+
+// Push one 4-byte record. Full ring drops the record (bounded; a reader that
+// vanishes can't make us grow without limit). Caller holds mouse_lk.
+fn push_record_locked(dx as i64, dy as i64, buttons as i64, wheel as i64) as void {
+    if (mouse_count + MOUSE_REC > MOUSE_CAP) { return; }
+    mouse_buf[mouse_tail] = cast(u8, dx & 0xFF);
+    mouse_tail = (mouse_tail + 1) & MOUSE_MASK;
+    mouse_buf[mouse_tail] = cast(u8, dy & 0xFF);
+    mouse_tail = (mouse_tail + 1) & MOUSE_MASK;
+    mouse_buf[mouse_tail] = cast(u8, buttons & 0xFF);
+    mouse_tail = (mouse_tail + 1) & MOUSE_MASK;
+    mouse_buf[mouse_tail] = cast(u8, wheel & 0xFF);
+    mouse_tail = (mouse_tail + 1) & MOUSE_MASK;
+    mouse_count = mouse_count + MOUSE_REC;
+}
+
+// Emit one decoded movement as records: deltas beyond ±127 split losslessly
+// across consecutive records (buttons repeated, wheel only on the first).
+// A zero-delta event (button change) still emits exactly one record.
+// Caller holds mouse_lk.
+fn emit_locked(dx as i64, dy as i64, buttons as i64, wheel as i64) as void {
+    let is i64 as rx with mut = dx;
+    let is i64 as ry with mut = dy;
+    let is i64 as rw with mut = wheel;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as cx with mut = rx;
+        if (cx > 127) { cx = 127; }
+        if (cx < 0 - 127) { cx = 0 - 127; }
+        let is i64 as cy with mut = ry;
+        if (cy > 127) { cy = 127; }
+        if (cy < 0 - 127) { cy = 0 - 127; }
+        push_record_locked(cx, cy, buttons, rw);
+        rx = rx - cx;
+        ry = ry - cy;
+        rw = 0;
+        more = 0;
+        if (rx != 0) { more = 1; }
+        if (ry != 0) { more = 1; }
+    }
+}
+
+// Decode the accumulated packet into records. Caller holds mouse_lk.
+fn decode_locked() as void {
+    let is i64 as b0 = cast(i64, pkt[0]);
+    let is i64 as buttons = b0 & 0x07;
+    let is i64 as dx with mut = cast(i64, pkt[1]);
+    if ((b0 & 0x10) != 0) { dx = dx - 256; }
+    let is i64 as dy with mut = cast(i64, pkt[2]);
+    if ((b0 & 0x20) != 0) { dy = dy - 256; }
+    // Hardware overflow bits: the 9-bit delta clipped — saturate to ±255
+    // (sign from the sign bit) rather than trusting the wrapped byte.
+    if ((b0 & 0x40) != 0) {
+        if ((b0 & 0x10) != 0) { dx = 0 - 255; } else { dx = 255; }
+    }
+    if ((b0 & 0x80) != 0) {
+        if ((b0 & 0x20) != 0) { dy = 0 - 255; } else { dy = 255; }
+    }
+    let is i64 as wheel with mut = 0;
+    if (wheel_mode == 1) {
+        wheel = cast(i64, pkt[3]);
+        if (wheel >= 128) { wheel = wheel - 256; }
+    }
+    emit_locked(dx, dy, buttons, wheel);
+}
+
+// Accumulate one aux byte into the packet. Sync check: bit3 of a packet's
+// first byte is always 1 — a clear bit3 at index 0 means we lost alignment
+// (dropped IRQ, firmware leftovers); drop bytes until a plausible header
+// re-aligns the stream. Self-healing within one packet.
+fn accumulate(byte as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&mouse_lk);
+    if (pkt_idx == 0 && (byte & 0x08) == 0) {
+        lock.release_irq(&mouse_lk, fl);
+        return;
+    }
+    pkt[pkt_idx] = cast(u8, byte & 0xFF);
+    pkt_idx = pkt_idx + 1;
+    if (pkt_idx >= pkt_size) {
+        decode_locked();
+        pkt_idx = 0;
+    }
+    lock.release_irq(&mouse_lk, fl);
+}
+
+// IRQ handler: drain aux bytes. Status is sampled BEFORE 0x60: stop when the
+// buffer is empty, and never consume a byte that is NOT flagged ST_AUX — the
+// controller FIFO is shared and that byte belongs to the keyboard's IRQ1
+// handler (the classic i8042 cross-steal).
+fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
+    while (1 == 1) {
+        let is i64 as st = port.inb(0x64);
+        if ((st & i8042.ST_OBF) == 0) { return 0; }
+        if ((st & i8042.ST_AUX) == 0) { return 0; }
+        let is i64 as byte = port.inb(0x60);
+        accumulate(byte);
+    }
+    return 0;
+}
+
+// Test hooks. inject_event pushes a decoded record (deterministic regardless
+// of detected packet size); inject_byte feeds the accumulator exactly as the
+// IRQ does — exercises the sync check and the decoder.
+fn inject_event(dx as i64, dy as i64, buttons as i64, wheel as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&mouse_lk);
+    emit_locked(dx, dy, buttons, wheel);
+    lock.release_irq(&mouse_lk, fl);
+}
+
+fn inject_byte(byte as i64) as void {
+    accumulate(byte);
+}
+
+// Test-only: run the byte path deterministically — force 3-byte mode, feed a
+// desync byte (must be dropped) plus one packet {0x28, 5, 0xF6} (bit3 set,
+// Y-sign set → dx=+5, dy=-10, no buttons), and check the ring holds exactly
+// the record [5, 0xF6, 0, 0]. Driver state is saved/restored and the ring
+// left clean. Call only after the driver bound (no concurrent state writer);
+// an idle mouse produces no interleaving IRQ traffic. Returns 1 on PASS.
+fn decode_self_test() as i64 {
+    let is i64 as fl = lock.acquire_irq(&mouse_lk);
+    let is i64 as save_size = pkt_size;
+    let is i64 as save_wheel = wheel_mode;
+    let is i64 as save_idx = pkt_idx;
+    pkt_size = 3; wheel_mode = 0; pkt_idx = 0;
+    mouse_head = 0; mouse_tail = 0; mouse_count = 0;
+    lock.release_irq(&mouse_lk, fl);
+
+    inject_byte(0x12);          // bit3 clear at index 0 → sync check drops it
+    inject_byte(0x28);          // header: bit3 set, Y sign set
+    inject_byte(5);             // dx = +5
+    inject_byte(0xF6);          // dy = -10 (0xF6 - 256)
+
+    let is i64 as fl2 = lock.acquire_irq(&mouse_lk);
+    let is i64 as ok with mut = 1;
+    if (mouse_count != 4) { ok = 0; }
+    if (ok == 1) {
+        if (cast(i64, mouse_buf[0]) != 5) { ok = 0; }
+        if (cast(i64, mouse_buf[1]) != 0xF6) { ok = 0; }
+        if (cast(i64, mouse_buf[2]) != 0) { ok = 0; }
+        if (cast(i64, mouse_buf[3]) != 0) { ok = 0; }
+    }
+    mouse_head = 0; mouse_tail = 0; mouse_count = 0;
+    pkt_size = save_size; wheel_mode = save_wheel; pkt_idx = save_idx;
+    lock.release_irq(&mouse_lk, fl2);
+    return ok;
+}
+
+// Device read op: drain whole 4-byte records from the ring. Blocks (polling,
+// like the keyboard) until at least one record is available — there is no
+// EOF for a mouse. A buffer smaller than one record is a caller bug.
+fn mouse_read(priv as i64, buf as i64, n as i64) as i64 {
+    if (n < MOUSE_REC) { return abi.E_INVAL; }
+    let is i64 as want = n - (n & 3);              // whole records only
+    let is i64 as done with mut = 0;
+    let is i64 as result with mut = 0;
+    while (done == 0) {
+        let is i64 as fl = lock.acquire_irq(&mouse_lk);
+        let is i64 as avail = mouse_count;          // always a multiple of 4
+        let is i64 as take with mut = want;
+        if (take > avail) { take = avail; }
+        let is i64 as i with mut = 0;
+        while (i < take) {
+            let is *u8 as d = cast(*u8, buf + i);
+            d[0] = mouse_buf[mouse_head];
+            mouse_head = (mouse_head + 1) & MOUSE_MASK;
+            i = i + 1;
+        }
+        mouse_count = mouse_count - take;
+        lock.release_irq(&mouse_lk, fl);
+        if (take > 0) { result = take; done = 1; }
+        else { sched.sleep_for_ns(2000000); }       // 2 ms, no events yet
+    }
+    return result;
+}
+
+fn mouse_close(priv as i64) as i64 {
+    return abi.E_OK;                                // shared global ring — nothing to free
+}
+
+// dev_open(DEV_MOUSE) → a KOBJ_DEVICE over the raw-event ring. Same v0
+// exclusivity story as the keyboard: no enforcement, one shared ring.
+fn mouse_acquire(ctx as i64) as i64 {
+    return kobject.ko_alloc(kobject.KOBJ_DEVICE, &MOUSE_OPS, 1);
+}
+
+// The DEV_MOUSE class is declared in mouse.cdvrspec (`device { class: mouse;
+// acquire: mouse.mouse_acquire }`) — the framework registers it after a
+// successful bind. The spec text is the single source of truth.
+
+fn register() as void {
+    ksym_handler.name_ptr = cast(*u8, "mouse.handler");
+    ksym_handler.name_len = 13;
+    ksym_handler.addr     = cast(i64, fn_ptr(handler));
+    ksym_handler.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_handler);
+    ksym_acquire.name_ptr = cast(*u8, "mouse.mouse_acquire");
+    ksym_acquire.name_len = 19;
+    ksym_acquire.addr     = cast(i64, fn_ptr(mouse_acquire));
+    ksym_acquire.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_acquire);
+    ksym_bind.name_ptr = cast(*u8, "mouse.mouse_bind");
+    ksym_bind.name_len = 16;
+    ksym_bind.addr     = cast(i64, fn_ptr(mouse_bind));
+    ksym_bind.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_bind);
+    serial.println("mouse: registered", 17);
+}
