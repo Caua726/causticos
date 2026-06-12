@@ -19,6 +19,7 @@ use "kobject.cst" as kobject;
 use "lock.cst" as lock;
 use "sched.cst" as sched;
 use "abi.cst" as abi;
+use "i8042.cst" as i8042;
 
 // 2-byte events: [scancode, flags]. flags bit0 = pressed (1) / released (0),
 // bit1 = extended (0xE0-prefixed). 256-byte ring = 128 events.
@@ -37,39 +38,41 @@ let is ksym.KSym as ksym_acquire;
 let is ksym.KSym as ksym_bind;
 let is kobject.KObjectOps as KBD_OPS with mut;
 
-// --- i8042 PS/2 controller bring-up (ports 0x60 data, 0x64 cmd/status) ---
+// --- i8042 bring-up (shared controller module: kernel/i8042.cst) ---
 // Limine hands us a minimal machine; the firmware does not leave IRQ1 armed.
 // Without enabling it in the controller config byte the keyboard never raises
 // an interrupt, so the IOAPIC redirection the framework programs has nothing to
 // deliver — keypresses vanish. (The kbd_smoke only ever used inject_event, so
 // the real IRQ path was never exercised: hence the old "QEMU has no input".)
-fn i8042_wait_write() as void {
-    let is i64 as i with mut = 0;
-    while (i < 100000) { if ((port.inb(0x64) & 0x02) == 0) { return; } i = i + 1; }
-}
-fn i8042_wait_read() as i64 {
-    let is i64 as i with mut = 0;
-    while (i < 100000) { if ((port.inb(0x64) & 0x01) != 0) { return 1; } i = i + 1; }
-    return 0;
-}
-fn i8042_cmd(c as i64) as void { i8042_wait_write(); port.outb(0x64, c); }
-fn i8042_write_data(d as i64) as void { i8042_wait_write(); port.outb(0x60, d); }
-fn i8042_flush() as void {
-    let is i64 as i with mut = 0;
-    while (i < 64) { if ((port.inb(0x64) & 0x01) == 0) { return; } port.inb(0x60); i = i + 1; }
-}
-
-// on_bind: arm the controller so real keypresses raise IRQ1.
+//
+// on_bind: arm the controller's KEYBOARD port so keypresses raise IRQ1.
+// Touches only kbd-side state — the aux (mouse) port belongs to the mouse
+// driver; disabling or reconfiguring it here would clobber a mouse that
+// bound first. config_update preserves the aux/translation bits, so kbd and
+// mouse can bind in either order.
 fn kbd_bind(b as *spec.Binding) as i32 {
-    i8042_flush();                                   // drain any stale output byte
-    i8042_cmd(0xAD); i8042_cmd(0xA7); i8042_flush(); // disable both ports during config
-    i8042_cmd(0x20);                                 // read config byte -> data port
-    let is i64 as cfg with mut = 0;
-    if (i8042_wait_read() != 0) { cfg = port.inb(0x60); }
-    cfg = (cfg | 0x01) & 0xEF;                        // bit0=1 enable IRQ1; bit4=0 enable kbd clock
-    i8042_cmd(0x60); i8042_write_data(cfg);           // write config byte
-    i8042_cmd(0xAE);                                  // enable first PS/2 (keyboard) port
-    i8042_flush();
+    i8042.lock_ctl();
+    i8042.flush();                                   // drain any stale output byte
+    if (i8042.cmd(i8042.CMD_KBD_DISABLE) != 0) {
+        i8042.report_fail("kbd", 3, 1);
+        i8042.unlock_ctl();
+        return 1;
+    }
+    i8042.flush();
+    // bit0=1: IRQ1 on; bit4=0: kbd clock on. Aux bits (1/5) and translation
+    // (bit6) pass through untouched.
+    if (i8042.config_update(i8042.CFG_KBD_IRQ, i8042.CFG_KBD_CLK_OFF) != 0) {
+        i8042.report_fail("kbd", 3, 2);
+        i8042.unlock_ctl();
+        return 1;
+    }
+    if (i8042.cmd(i8042.CMD_KBD_ENABLE) != 0) {
+        i8042.report_fail("kbd", 3, 3);
+        i8042.unlock_ctl();
+        return 1;
+    }
+    i8042.flush();
+    i8042.unlock_ctl();
     // Drop anything the bring-up enqueued (an ACK/spurious byte that fired the
     // now-armed IRQ) so the first real keypress — and the kbd_smoke — start on a
     // clean ring, with no phantom event.
@@ -102,26 +105,35 @@ fn kbd_enqueue(sc as i64, flags as i64) as void {
     lock.release_irq(&kbd_lk, fl);
 }
 
-// IRQ handler: read the scancode, decode the set-1 protocol (down/up +
-// the 0xE0 extended prefix), enqueue the raw event. No keymap, no logging.
+// IRQ handler: drain keyboard bytes, decode the set-1 protocol (down/up +
+// the 0xE0 extended prefix), enqueue raw events. No keymap, no logging.
+// The status byte is sampled BEFORE 0x60: stop when the buffer is empty
+// (spurious IRQ → no blind read), and never consume a byte flagged ST_AUX —
+// the controller FIFO is shared and that byte belongs to the mouse driver's
+// IRQ12 handler (the classic i8042 cross-steal).
 fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
-    let is i64 as byte = port.inb(0x60);
-    if (byte == 0xE0) {
-        let is i64 as fl = lock.acquire_irq(&kbd_lk);
-        kbd_e0 = 1;
-        lock.release_irq(&kbd_lk, fl);
-        return 0;
+    while (1 == 1) {
+        let is i64 as st = port.inb(0x64);
+        if ((st & i8042.ST_OBF) == 0) { return 0; }
+        if ((st & i8042.ST_AUX) != 0) { return 0; }
+        let is i64 as byte = port.inb(0x60);
+        if (byte == 0xE0) {
+            let is i64 as fl = lock.acquire_irq(&kbd_lk);
+            kbd_e0 = 1;
+            lock.release_irq(&kbd_lk, fl);
+        } else {
+            let is i64 as pressed with mut = 1;
+            if ((byte & 0x80) != 0) { pressed = 0; }
+            let is i64 as sc = byte & 0x7F;
+            let is i64 as fl2 = lock.acquire_irq(&kbd_lk);
+            let is i64 as e0 = kbd_e0;
+            kbd_e0 = 0;
+            lock.release_irq(&kbd_lk, fl2);
+            let is i64 as flags with mut = pressed;
+            if (e0 != 0) { flags = flags | 2; }
+            kbd_enqueue(sc, flags);
+        }
     }
-    let is i64 as pressed with mut = 1;
-    if ((byte & 0x80) != 0) { pressed = 0; }
-    let is i64 as sc = byte & 0x7F;
-    let is i64 as fl2 = lock.acquire_irq(&kbd_lk);
-    let is i64 as e0 = kbd_e0;
-    kbd_e0 = 0;
-    lock.release_irq(&kbd_lk, fl2);
-    let is i64 as flags with mut = pressed;
-    if (e0 != 0) { flags = flags | 2; }
-    kbd_enqueue(sc, flags);
     return 0;
 }
 

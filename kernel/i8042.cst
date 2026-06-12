@@ -1,0 +1,183 @@
+// i8042.cst — shared PS/2 controller management. One controller, two ports
+// (port 1 = keyboard, port 2 = aux/mouse), one config byte: both drivers
+// funnel every controller access through this module so the config byte is
+// read-modify-written under one lock and bind order never matters — each
+// driver ORs in only its own enable bits and can't clobber the other's.
+//
+// Waits are HPET-deadline based (timer.current_time_ns), not iteration
+// counts: tight-poll the first 200µs (commands normally complete in µs),
+// then 1ms naps until the deadline — the bind thread is preemptible, and a
+// real-hardware mouse reset (BAT) can take ~500ms.
+
+use "port.cst" as port;
+use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "timer.cst" as timer;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+// Status register bits (read port 0x64)
+let is i64 as ST_OBF = 0x01;   // output buffer full: a byte waits at 0x60
+let is i64 as ST_IBF = 0x02;   // input buffer full: controller busy, don't write
+let is i64 as ST_AUX = 0x20;   // the byte at 0x60 came from the AUX (mouse) port
+
+// Controller config byte bits (command 0x20 reads it, 0x60 writes it)
+let is i64 as CFG_KBD_IRQ     = 0x01;  // bit0: raise IRQ1 on kbd output
+let is i64 as CFG_AUX_IRQ     = 0x02;  // bit1: raise IRQ12 on aux output
+let is i64 as CFG_KBD_CLK_OFF = 0x10;  // bit4: kbd clock disable (0 = enabled)
+let is i64 as CFG_AUX_CLK_OFF = 0x20;  // bit5: aux clock disable (0 = enabled)
+// bit6 (scancode translation) is deliberately never touched: the kbd driver
+// decodes set 1 via the controller's translation; flipping it breaks kbd.
+
+// Controller commands (write port 0x64)
+let is i64 as CMD_READ_CFG    = 0x20;
+let is i64 as CMD_WRITE_CFG   = 0x60;
+let is i64 as CMD_AUX_DISABLE = 0xA7;
+let is i64 as CMD_AUX_ENABLE  = 0xA8;
+let is i64 as CMD_KBD_DISABLE = 0xAD;
+let is i64 as CMD_KBD_ENABLE  = 0xAE;
+let is i64 as CMD_AUX_PREFIX  = 0xD4;  // next data byte is routed to the mouse
+
+// Deadlines. CMD covers IBF-drain/ordinary replies; RESET covers the mouse
+// self-test (BAT), which takes hundreds of ms on real silicon.
+let is i64 as CMD_TIMEOUT_NS   = 10000000;     // 10 ms
+let is i64 as RESET_TIMEOUT_NS = 1000000000;   // 1 s
+let is i64 as TIGHT_POLL_NS    = 200000;       // 200 µs before yielding 1ms naps
+
+// One lock serializes every multi-step controller sequence (config RMW,
+// command+reply pairs, whole bind dances). Thread context only — the IRQ
+// handlers just read ports 0x60/0x64 and never take this lock.
+let is lock.TicketLock as ctl_lk;
+
+// Failure forensics for the caller's error report: last status byte observed
+// at a timeout, last reply byte consumed by aux_send.
+let is i64 as last_status with mut = 0;
+let is i64 as last_byte with mut = 0;
+
+fn lock_ctl() as void { lock.acquire(&ctl_lk); }
+fn unlock_ctl() as void { lock.release(&ctl_lk); }
+
+// Wait until the controller accepts a write (IBF clear). 1 = ok, 0 = timeout.
+fn wait_ibf_clear(timeout_ns as i64) as i64 {
+    let is i64 as start = timer.current_time_ns();
+    let is i64 as deadline = start + timeout_ns;
+    while (1 == 1) {
+        let is i64 as st = port.inb(0x64);
+        if ((st & ST_IBF) == 0) { return 1; }
+        let is i64 as now = timer.current_time_ns();
+        if (now >= deadline) { last_status = st; return 0; }
+        if (now - start >= TIGHT_POLL_NS) { sched.sleep_for_ns(1000000); }
+    }
+    return 0;
+}
+
+// Wait until a byte is available (OBF set). 1 = ok, 0 = timeout.
+fn wait_obf_set(timeout_ns as i64) as i64 {
+    let is i64 as start = timer.current_time_ns();
+    let is i64 as deadline = start + timeout_ns;
+    while (1 == 1) {
+        let is i64 as st = port.inb(0x64);
+        if ((st & ST_OBF) != 0) { return 1; }
+        let is i64 as now = timer.current_time_ns();
+        if (now >= deadline) { last_status = st; return 0; }
+        if (now - start >= TIGHT_POLL_NS) { sched.sleep_for_ns(1000000); }
+    }
+    return 0;
+}
+
+// Controller command (port 0x64). 0 = ok, negative = timeout.
+fn cmd(c as i64) as i64 {
+    if (wait_ibf_clear(CMD_TIMEOUT_NS) == 0) { return cast(i64, 0 - 1); }
+    port.outb(0x64, c);
+    return 0;
+}
+
+// Data byte (port 0x60 — config byte value, or a 0xD4-prefixed mouse byte).
+fn write_data(d as i64) as i64 {
+    if (wait_ibf_clear(CMD_TIMEOUT_NS) == 0) { return cast(i64, 0 - 1); }
+    port.outb(0x60, d);
+    return 0;
+}
+
+// Read one reply byte regardless of source. Byte (>= 0), or -1 on timeout.
+fn read_data(timeout_ns as i64) as i64 {
+    if (wait_obf_set(timeout_ns) == 0) { return cast(i64, 0 - 1); }
+    return port.inb(0x60);
+}
+
+// Read a byte that must come FROM THE AUX device (status ST_AUX set with the
+// byte). Non-aux bytes are drained and dropped — callers quiesce the kbd
+// port first, so anything non-aux here is firmware leftovers, not input.
+// The status is sampled BEFORE 0x60: ST_AUX describes the byte currently in
+// the output buffer. Byte (>= 0), or -1 on timeout.
+fn read_aux_data(timeout_ns as i64) as i64 {
+    let is i64 as start = timer.current_time_ns();
+    let is i64 as deadline = start + timeout_ns;
+    while (1 == 1) {
+        let is i64 as st = port.inb(0x64);
+        if ((st & ST_OBF) != 0) {
+            let is i64 as byte = port.inb(0x60);
+            if ((st & ST_AUX) != 0) { return byte; }
+        }
+        let is i64 as now = timer.current_time_ns();
+        if (now >= deadline) { last_status = st; return cast(i64, 0 - 1); }
+        if (now - start >= TIGHT_POLL_NS) { sched.sleep_for_ns(1000000); }
+    }
+    return cast(i64, 0 - 1);
+}
+
+// Drain pending output bytes. Bounded by count, not time — it empties a FIFO
+// at most a few bytes deep; an empty OBF exits immediately.
+fn flush() as void {
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        if ((port.inb(0x64) & ST_OBF) == 0) { return; }
+        port.inb(0x60);
+        i = i + 1;
+    }
+}
+
+// Read the controller config byte. Byte (>= 0), or -1.
+fn config_read() as i64 {
+    if (cmd(CMD_READ_CFG) != 0) { return cast(i64, 0 - 1); }
+    return read_data(CMD_TIMEOUT_NS);
+}
+
+// Read-modify-write the config byte. Call with ctl_lk held — binds take the
+// lock around their whole sequence, so the RMW composes with the commands
+// around it. 255 - mask is the 8-bit complement (255 has all bits set, the
+// subtraction never borrows).
+fn config_update(set_mask as i64, clear_mask as i64) as i64 {
+    let is i64 as cfg = config_read();
+    if (cfg < 0) { return cast(i64, 0 - 1); }
+    let is i64 as ncfg = (cfg | set_mask) & (255 - clear_mask);
+    if (cmd(CMD_WRITE_CFG) != 0) { return cast(i64, 0 - 1); }
+    if (write_data(ncfg) != 0) { return cast(i64, 0 - 1); }
+    return 0;
+}
+
+// Send one byte to the mouse (0xD4 prefix) and consume its ACK (0xFA).
+// 0 = acked; negative = failed, with last_byte/last_status as evidence.
+fn aux_send(byte as i64, ack_timeout_ns as i64) as i64 {
+    if (cmd(CMD_AUX_PREFIX) != 0) { return cast(i64, 0 - 1); }
+    if (write_data(byte) != 0) { return cast(i64, 0 - 2); }
+    let is i64 as ack = read_aux_data(ack_timeout_ns);
+    last_byte = ack;
+    if (ack == 0xFA) { return 0; }
+    return cast(i64, 0 - 3);
+}
+
+// Loud failure line: "i8042: <who> fail step=N byte=0x.. status=0x..".
+// Register-level evidence so a dead controller/mouse on real hardware is
+// diagnosable from the serial log alone.
+fn report_fail(who as *u8, who_len as i64, step as i64) as void {
+    serial.print("i8042: ", 7);
+    serial.print(who, who_len);
+    serial.print(" fail step=", 11);
+    util.print_num(step);
+    serial.print(" byte=", 6);
+    util.print_hex(last_byte);
+    serial.print(" status=", 8);
+    util.print_hex(port.inb(0x64));
+    serial.println("", 0);
+}
