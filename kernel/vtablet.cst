@@ -30,6 +30,7 @@ use "sched.cst" as sched;
 use "abi.cst" as abi;
 use "virtio.cst" as virtio;
 use "util.cst" as util;
+use "grab.cst" as grab;
 
 // evdev event types / codes (Linux input-event-codes.h, part of the wire ABI)
 let is i64 as EV_SYN = 0;
@@ -75,6 +76,17 @@ let is ksym.KSym as ksym_handler;
 let is ksym.KSym as ksym_acquire;
 let is ksym.KSym as ksym_bind;
 let is kobject.KObjectOps as TAB_OPS with mut;
+
+// Preemptible exclusivity (architecture.md §6): priv IS the holder token.
+let is grab.GrabStack as tab_gs;
+let is i64 as tab_next_token with mut = 1;
+
+fn tab_ring_clear() as void {
+    let is i64 as fl = lock.acquire_irq(&tab_lk);
+    tab_head = 0; tab_tail = 0; tab_count = 0;
+    lock.release_irq(&tab_lk, fl);
+    return;
+}
 
 fn vtablet_init() as void {
     TAB_OPS.read  = fn_ptr(tab_read);
@@ -272,32 +284,38 @@ fn decode_self_test() as i64 {
 }
 
 // Device read op: drain whole 8-byte records; blocks (polling) when empty.
+// A holder that is not the grab-stack top is quiet until ownership returns.
 fn tab_read(priv as i64, buf as i64, n as i64) as i64 {
     if (n < TAB_REC) { return abi.E_INVAL; }
     let is i64 as want = n - (n & 7);
     let is i64 as done with mut = 0;
     let is i64 as result with mut = 0;
     while (done == 0) {
-        let is i64 as fl = lock.acquire_irq(&tab_lk);
-        let is i64 as avail = tab_count;
-        let is i64 as take with mut = want;
-        if (take > avail) { take = avail; }
-        let is i64 as i with mut = 0;
-        while (i < take) {
-            let is *u8 as d = cast(*u8, buf + i);
-            d[0] = tab_buf[tab_head];
-            tab_head = (tab_head + 1) & TAB_MASK;
-            i = i + 1;
+        if (grab.top(&tab_gs) != priv) {            // preempted: quiet
+            sched.sleep_for_ns(2000000);
+        } else {
+            let is i64 as fl = lock.acquire_irq(&tab_lk);
+            let is i64 as avail = tab_count;
+            let is i64 as take with mut = want;
+            if (take > avail) { take = avail; }
+            let is i64 as i with mut = 0;
+            while (i < take) {
+                let is *u8 as d = cast(*u8, buf + i);
+                d[0] = tab_buf[tab_head];
+                tab_head = (tab_head + 1) & TAB_MASK;
+                i = i + 1;
+            }
+            tab_count = tab_count - take;
+            lock.release_irq(&tab_lk, fl);
+            if (take > 0) { result = take; done = 1; }
+            else { sched.sleep_for_ns(2000000); }
         }
-        tab_count = tab_count - take;
-        lock.release_irq(&tab_lk, fl);
-        if (take > 0) { result = take; done = 1; }
-        else { sched.sleep_for_ns(2000000); }
     }
     return result;
 }
 
 fn tab_poll(priv as i64) as i64 {
+    if (grab.top(&tab_gs) != priv) { return 0; }    // preempted: quiet
     let is i64 as fl = lock.acquire_irq(&tab_lk);
     let is i64 as c = tab_count;
     lock.release_irq(&tab_lk, fl);
@@ -306,11 +324,19 @@ fn tab_poll(priv as i64) as i64 {
 }
 
 fn tab_close(priv as i64) as i64 {
+    let is i64 as newtop = grab.remove(&tab_gs, priv);
+    if (newtop != 0) { tab_ring_clear(); }          // restored holder starts clean
     return abi.E_OK;
 }
 
 fn tab_acquire(ctx as i64) as i64 {
-    return kobject.ko_alloc(kobject.KOBJ_DEVICE, &TAB_OPS, 1);
+    tab_next_token = tab_next_token + 1;
+    let is i64 as token = tab_next_token;
+    if (grab.push(&tab_gs, token) != 0) { return 0; }
+    tab_ring_clear();
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &TAB_OPS, token);
+    if (ko == 0) { grab.remove(&tab_gs, token); return 0; }
+    return ko;
 }
 
 fn register() as void {

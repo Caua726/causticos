@@ -28,6 +28,7 @@ use "abi.cst" as abi;
 use "driver.cst" as driver;
 use "serial.cst" as serial;
 use "util.cst" as util;
+use "grab.cst" as grab;
 
 // All scalars i64 (Caustic mixed-width rule).
 struct Surface {
@@ -48,6 +49,14 @@ struct Surface {
 let is i64 as BB_MAX_PAGES = 1024;     // 2^MAX_BLOCK_ORDER pages = 4 MiB
 
 let is kobject.KObjectOps as SURFACE_OPS with mut;
+
+// Preemptible exclusivity (architecture.md §6). Each open mints its own
+// Surface (own backbuffer), so the *Surface pointer is the holder token. A
+// non-top holder's present paints nothing (quiet, not an error: being
+// preempted mutes you, it never breaks you); when the top closes, the
+// restored holder's whole backbuffer is re-blitted so the screen snaps back
+// without the holder even noticing it was gone.
+let is grab.GrabStack as surf_gs;
 
 fn init() as void {
     SURFACE_OPS.present = fn_ptr(surf_present);
@@ -106,15 +115,54 @@ fn acquire_fb(ctx as i64) as i64 {
 
     let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_SURFACE, &SURFACE_OPS, addr);
     if (ko == 0) { pmm.free_pages(pfn, order); heap.kfree(addr); return 0; }
+    if (grab.push(&surf_gs, addr) != 0) {
+        // stack full: refuse the open entirely (ko_unref runs surf_close,
+        // which frees the backbuffer + struct — remove() there is a no-op
+        // since this token never made it onto the stack)
+        kobject.ko_unref(ko);
+        return 0;
+    }
     return ko;
 }
 
-// close op: free the backbuffer pages + the Surface struct. The fd-table
+// Row-wise word blit of one clamped rect, backbuffer→scanout (shared
+// pitch). The core of present, also used to restore a holder whose grab
+// just returned.
+fn blit_rect(s as *Surface, x0 as i64, y0 as i64, x1 as i64, y1 as i64) as void {
+    let is i64 as row with mut = y0;
+    while (row < y1) {
+        let is i64 as off = row * s.pitch + x0 * s.bpp_bytes;
+        let is i64 as nbytes = (x1 - x0) * s.bpp_bytes;
+        let is *i64 as sp = cast(*i64, s.backbuffer + off);
+        let is *i64 as dp = cast(*i64, s.scanout + off);
+        let is i64 as words = nbytes / 8;
+        let is i64 as i with mut = 0;
+        while (i < words) { dp[i] = sp[i]; i = i + 1; }
+        if (words * 8 < nbytes) {
+            let is *i32 as st = cast(*i32, s.backbuffer + off + words * 8);
+            let is *i32 as dt = cast(*i32, s.scanout + off + words * 8);
+            dt[0] = st[0];
+        }
+        row = row + 1;
+    }
+    return;
+}
+
+// close op: hand the grab back (restoring the new top's frame if there is
+// one), then free the backbuffer pages + the Surface struct. The fd-table
 // drain (aspace_destroy) runs this on the last reference, so a process
 // exiting with the surface open never leaks framebuffer-sized memory.
 fn surf_close(priv as i64) as i64 {
     if (priv == 0) { return abi.E_BADF; }
     let is *Surface as s = cast(*Surface, priv);
+    let is i64 as newtop = grab.remove(&surf_gs, priv);
+    if (newtop != 0 && newtop != priv) {
+        // the screen snaps back to the restored holder's last frame
+        let is *Surface as ns = cast(*Surface, newtop);
+        if (ns.backbuffer != 0) {
+            blit_rect(ns, 0, 0, ns.width, ns.height);
+        }
+    }
     if (s.backbuffer != 0) {
         pmm.free_pages(cast(i32, s.bb_pfn), cast(i32, s.bb_order));
         s.backbuffer = 0;
@@ -138,14 +186,12 @@ fn surf_mmap(priv as i64, aspace as i64, hint as i64, prot as i64) as i64 {
 }
 
 // present op: blit the dirty rectangle backbuffer→scanout. Clamps to the
-// surface bounds. Row-wise 8-byte word copy — backbuffer and scanout share
-// the pitch, so one offset addresses both. A compositor presents
-// half-screen rects on every drag frame, which made the old per-pixel loop
-// the hottest code in the system; words cut it ~8x (and the WC scanout
-// write-combines them on real hardware). bpp is 4, so the tail is at most
-// one dword; x86 tolerates the unaligned cases.
+// surface bounds; word-wise rows via blit_rect. A holder that is not the
+// grab-stack top paints NOTHING and gets E_OK — quiet, per the preemption
+// contract; its frame reappears when ownership returns.
 fn surf_present(priv as i64, x as i64, y as i64, w as i64, h as i64) as i64 {
     if (priv == 0) { return abi.E_BADF; }
+    if (grab.top(&surf_gs) != priv) { return abi.E_OK; }
     let is *Surface as s = cast(*Surface, priv);
     let is i64 as x0 with mut = x;
     let is i64 as y0 with mut = y;
@@ -159,23 +205,7 @@ fn surf_present(priv as i64, x as i64, y as i64, w as i64, h as i64) as i64 {
     if (y1 > s.height) { y1 = s.height; }
     if (x1 <= x0) { return abi.E_OK; }
     if (y1 <= y0) { return abi.E_OK; }
-
-    let is i64 as row with mut = y0;
-    while (row < y1) {
-        let is i64 as off = row * s.pitch + x0 * s.bpp_bytes;
-        let is i64 as nbytes = (x1 - x0) * s.bpp_bytes;
-        let is *i64 as sp = cast(*i64, s.backbuffer + off);
-        let is *i64 as dp = cast(*i64, s.scanout + off);
-        let is i64 as words = nbytes / 8;
-        let is i64 as i with mut = 0;
-        while (i < words) { dp[i] = sp[i]; i = i + 1; }
-        if (words * 8 < nbytes) {
-            let is *i32 as st = cast(*i32, s.backbuffer + off + words * 8);
-            let is *i32 as dt = cast(*i32, s.scanout + off + words * 8);
-            dt[0] = st[0];
-        }
-        row = row + 1;
-    }
+    blit_rect(s, x0, y0, x1, y1);
     return abi.E_OK;
 }
 

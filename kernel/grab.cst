@@ -1,0 +1,97 @@
+// grab.cst — the preemptible grab stack (docs/architecture.md §6): the
+// MECHANISM of device exclusivity. Every open of an exclusive device class
+// pushes a holder token; the TOP of the stack is the active owner; a close
+// pops the token wherever it sits, and whoever surfaces as the new top
+// regains the device. Everyone below the top is QUIET — their fd stays
+// valid, their reads block and their polls report nothing, their presents
+// paint nothing — until ownership returns. That is the whole contract:
+// being preempted never breaks a holder, it just mutes it.
+//
+// WHO may grab from whom is policy and lives in userspace (a launcher, a
+// session manager); the kernel only keeps the stack honest. v0 policy is
+// therefore "anyone may push" — which makes a fullscreen app over the WM a
+// clean VT-switch-like takeover that undoes itself on exit, instead of two
+// owners scribbling over each other.
+
+use "lock.cst" as lock;
+
+let is i64 as GRAB_CAP = 8;
+
+// All scalars i64; one stack per exclusive device instance.
+struct GrabStack {
+    lk as lock.TicketLock;
+    n as i64;
+    o0 as i64;  o1 as i64;  o2 as i64;  o3 as i64;
+    o4 as i64;  o5 as i64;  o6 as i64;  o7 as i64;
+}
+
+fn _get(gs as *GrabStack, i as i64) as i64 {
+    if (i == 0) { return gs.o0; }
+    if (i == 1) { return gs.o1; }
+    if (i == 2) { return gs.o2; }
+    if (i == 3) { return gs.o3; }
+    if (i == 4) { return gs.o4; }
+    if (i == 5) { return gs.o5; }
+    if (i == 6) { return gs.o6; }
+    return gs.o7;
+}
+
+fn _set(gs as *GrabStack, i as i64, v as i64) as void {
+    if (i == 0) { gs.o0 = v; return; }
+    if (i == 1) { gs.o1 = v; return; }
+    if (i == 2) { gs.o2 = v; return; }
+    if (i == 3) { gs.o3 = v; return; }
+    if (i == 4) { gs.o4 = v; return; }
+    if (i == 5) { gs.o5 = v; return; }
+    if (i == 6) { gs.o6 = v; return; }
+    gs.o7 = v;
+    return;
+}
+
+// Push a holder token; it becomes the active owner. 0 on success, -1 when
+// the stack is full (the open fails — bounded, never silently dropped).
+fn push(gs as *GrabStack, token as i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&gs.lk);
+    if (gs.n >= GRAB_CAP) {
+        lock.release_irq(&gs.lk, fl);
+        return 0 - 1;
+    }
+    _set(gs, gs.n, token);
+    gs.n = gs.n + 1;
+    lock.release_irq(&gs.lk, fl);
+    return 0;
+}
+
+// Remove a token wherever it sits (a non-top holder can close too).
+// Returns the NEW top token (0 = stack empty), so the caller can hand the
+// device back — restore the screen, reset the event ring.
+fn remove(gs as *GrabStack, token as i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&gs.lk);
+    let is i64 as i with mut = 0;
+    let is i64 as found with mut = 0 - 1;
+    while (i < gs.n) {
+        if (_get(gs, i) == token) { found = i; }
+        i = i + 1;
+    }
+    if (found >= 0) {
+        let is i64 as j with mut = found;
+        while (j < gs.n - 1) {
+            _set(gs, j, _get(gs, j + 1));
+            j = j + 1;
+        }
+        gs.n = gs.n - 1;
+    }
+    let is i64 as newtop with mut = 0;
+    if (gs.n > 0) { newtop = _get(gs, gs.n - 1); }
+    lock.release_irq(&gs.lk, fl);
+    return newtop;
+}
+
+// The active owner's token (0 = nobody holds the device).
+fn top(gs as *GrabStack) as i64 {
+    let is i64 as fl = lock.acquire_irq(&gs.lk);
+    let is i64 as t with mut = 0;
+    if (gs.n > 0) { t = _get(gs, gs.n - 1); }
+    lock.release_irq(&gs.lk, fl);
+    return t;
+}

@@ -37,6 +37,7 @@ use "kobject.cst" as kobject;
 use "kbd.cst" as kbd;
 use "mouse.cst" as mouse;
 use "vtablet.cst" as vtablet;
+use "surface.cst" as surface;
 use "driver.cst" as driver;
 
 // User VAs the smoke uses. Anywhere in the lower half is fine; we
@@ -2044,6 +2045,9 @@ fn spawn_kbd_smoke() as void {
         return;
     }
     proc_start(child);
+    // Let the child reach dev_open first: acquiring the grab clears the
+    // ring, so an event injected before the open would be wiped.
+    sched.sleep_for_ns(150000000);
     // Inject scancode 7, pressed (the child's blocking device-read wakes).
     kbd.inject_event(7, 1);
 
@@ -2154,6 +2158,8 @@ fn spawn_mouse_smoke() as void {
         pmm.panic("mouse_smoke: spawn FAIL", 23);
     }
     proc_start(child);
+    // Let the child's dev_open (which clears the ring on grab) land first.
+    sched.sleep_for_ns(150000000);
     // Inject dx=9 (the child's blocking record-read wakes).
     mouse.inject_event(9, 0, 0, 0);
 
@@ -2256,6 +2262,8 @@ fn spawn_tablet_smoke() as void {
     let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, &child_tb[0]), child_tb_len);
     if (child == 0) { pmm.panic("tablet_smoke: spawn FAIL", 24); }
     proc_start(child);
+    // Let the child's dev_open (which clears the ring on grab) land first.
+    sched.sleep_for_ns(150000000);
     vtablet.inject_event(9, 5, 1, 0);
     let is i64 as code = proc_wait(proc.init_proc, proc.proc_pid(child));
     if (code == 9) {
@@ -3401,6 +3409,62 @@ fn spawn_poll_smoke() as void {
     serial.println("userspace.poll_smoke: kbd PASS", 30);
 }
 
+// ============================================================
+// grab_smoke — the preemptible exclusivity contract, both flavors:
+// input (second open mutes the first; close hands back a CLEAN ring) and
+// surface (non-top presents paint nothing; close snaps the restored
+// holder's frame back onto the scanout). Panics on failure.
+// ============================================================
+
+fn grab_smoke() as void {
+    serial.println("grab_smoke: start", 17);
+
+    // -- input: keyboard --
+    let is i64 as ko1 = driver.device_open(abi.DEV_KEYBOARD, 0);
+    if (ko1 == 0) { pmm.panic("grab_smoke: open1 FAIL", 22); }
+    kbd.inject_event(5, 1);
+    if (kobject.ko_poll(ko1) != abi.POLL_READABLE) { pmm.panic("grab_smoke: top1 FAIL", 21); }
+    let is i64 as ko2 = driver.device_open(abi.DEV_KEYBOARD, 0);
+    if (ko2 == 0) { pmm.panic("grab_smoke: open2 FAIL", 22); }
+    if (kobject.ko_poll(ko1) != 0) { pmm.panic("grab_smoke: quiet FAIL", 22); }
+    kbd.inject_event(6, 1);
+    if (kobject.ko_poll(ko2) != abi.POLL_READABLE) { pmm.panic("grab_smoke: top2 FAIL", 21); }
+    if (kobject.ko_poll(ko1) != 0) { pmm.panic("grab_smoke: quiet2 FAIL", 23); }
+    kobject.ko_unref(ko2);
+    // ownership returned — and returned CLEAN (ko2's leftover event wiped)
+    if (kobject.ko_poll(ko1) != 0) { pmm.panic("grab_smoke: cleanret FAIL", 25); }
+    kbd.inject_event(7, 1);
+    if (kobject.ko_poll(ko1) != abi.POLL_READABLE) { pmm.panic("grab_smoke: restore FAIL", 24); }
+    kobject.ko_unref(ko1);
+
+    // -- surface: quiet present + snap-back --
+    let is i64 as s1 = driver.device_open(abi.DEV_FB, 0);
+    if (s1 == 0) { pmm.panic("grab_smoke: fb1 FAIL", 20); }
+    let is i64 as s2 = driver.device_open(abi.DEV_FB, 0);
+    if (s2 == 0) { pmm.panic("grab_smoke: fb2 FAIL", 20); }
+    let is *surface.Surface as sp1 = cast(*surface.Surface, kobject.ko_priv(s1));
+    let is *surface.Surface as sp2 = cast(*surface.Surface, kobject.ko_priv(s2));
+    let is *u32 as b1 = cast(*u32, sp1.backbuffer);
+    let is *u32 as b2 = cast(*u32, sp2.backbuffer);
+    b1[0] = cast(u32, 0x00AA1111);
+    b2[0] = cast(u32, 0x00BB2222);
+    let is *u32 as sc = cast(*u32, sp1.scanout);
+    kobject.ko_present(s1, 0, 0, 4, 1);            // s1 is NOT top: must be quiet
+    if ((cast(i64, sc[0]) & 0xFFFFFF) == 0xAA1111) {
+        pmm.panic("grab_smoke: quiet-present FAIL", 30);
+    }
+    kobject.ko_present(s2, 0, 0, 4, 1);            // s2 IS top: must land
+    if ((cast(i64, sc[0]) & 0xFFFFFF) != 0xBB2222) {
+        pmm.panic("grab_smoke: top-present FAIL", 28);
+    }
+    kobject.ko_unref(s2);                          // close → s1's frame snaps back
+    if ((cast(i64, sc[0]) & 0xFFFFFF) != 0xAA1111) {
+        pmm.panic("grab_smoke: snapback FAIL", 25);
+    }
+    kobject.ko_unref(s1);
+    serial.println("grab_smoke: PASS", 16);
+}
+
 // The "smoke-init": runs the kernel/userspace smokes for regression (verify.sh,
 // gated by main.RUN_SMOKE_INIT). Tooling only — separate thread, does NOT launch
 // /init, so a smoke boot and a real boot never interleave.
@@ -3430,5 +3494,6 @@ fn smoke_init() as void {
     spawn_seg_share_smoke();
     poll_unit_smoke();
     spawn_poll_smoke();
+    grab_smoke();
 }
 

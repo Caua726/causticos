@@ -29,6 +29,7 @@ use "sched.cst" as sched;
 use "abi.cst" as abi;
 use "i8042.cst" as i8042;
 use "util.cst" as util;
+use "grab.cst" as grab;
 
 // 4-byte records; 1024-byte ring = 256 records.
 let is i64 as MOUSE_CAP  = 1024;
@@ -53,6 +54,17 @@ let is ksym.KSym as ksym_acquire;
 let is ksym.KSym as ksym_bind;
 let is kobject.KObjectOps as MOUSE_OPS with mut;
 
+// Preemptible exclusivity (architecture.md §6): priv IS the holder token.
+let is grab.GrabStack as mouse_gs;
+let is i64 as mouse_next_token with mut = 1;
+
+fn mouse_ring_clear() as void {
+    let is i64 as fl = lock.acquire_irq(&mouse_lk);
+    mouse_head = 0; mouse_tail = 0; mouse_count = 0; pkt_idx = 0;
+    lock.release_irq(&mouse_lk, fl);
+    return;
+}
+
 fn mouse_init() as void {
     MOUSE_OPS.read  = fn_ptr(mouse_read);
     MOUSE_OPS.close = fn_ptr(mouse_close);
@@ -62,8 +74,9 @@ fn mouse_init() as void {
 }
 
 // Readiness for SYS_POLL: READABLE when at least one whole 4-byte record is
-// queued. Never WRITABLE — write is a null op here.
+// queued AND this holder owns the grab. Never WRITABLE — write is a null op.
 fn mouse_poll(priv as i64) as i64 {
+    if (grab.top(&mouse_gs) != priv) { return 0; }  // preempted: quiet
     let is i64 as fl = lock.acquire_irq(&mouse_lk);
     let is i64 as c = mouse_count;
     lock.release_irq(&mouse_lk, fl);
@@ -314,33 +327,45 @@ fn mouse_read(priv as i64, buf as i64, n as i64) as i64 {
     let is i64 as done with mut = 0;
     let is i64 as result with mut = 0;
     while (done == 0) {
-        let is i64 as fl = lock.acquire_irq(&mouse_lk);
-        let is i64 as avail = mouse_count;          // always a multiple of 4
-        let is i64 as take with mut = want;
-        if (take > avail) { take = avail; }
-        let is i64 as i with mut = 0;
-        while (i < take) {
-            let is *u8 as d = cast(*u8, buf + i);
-            d[0] = mouse_buf[mouse_head];
-            mouse_head = (mouse_head + 1) & MOUSE_MASK;
-            i = i + 1;
+        if (grab.top(&mouse_gs) != priv) {          // preempted: quiet
+            sched.sleep_for_ns(2000000);
+        } else {
+            let is i64 as fl = lock.acquire_irq(&mouse_lk);
+            let is i64 as avail = mouse_count;          // always a multiple of 4
+            let is i64 as take with mut = want;
+            if (take > avail) { take = avail; }
+            let is i64 as i with mut = 0;
+            while (i < take) {
+                let is *u8 as d = cast(*u8, buf + i);
+                d[0] = mouse_buf[mouse_head];
+                mouse_head = (mouse_head + 1) & MOUSE_MASK;
+                i = i + 1;
+            }
+            mouse_count = mouse_count - take;
+            lock.release_irq(&mouse_lk, fl);
+            if (take > 0) { result = take; done = 1; }
+            else { sched.sleep_for_ns(2000000); }       // 2 ms, no events yet
         }
-        mouse_count = mouse_count - take;
-        lock.release_irq(&mouse_lk, fl);
-        if (take > 0) { result = take; done = 1; }
-        else { sched.sleep_for_ns(2000000); }       // 2 ms, no events yet
     }
     return result;
 }
 
 fn mouse_close(priv as i64) as i64 {
-    return abi.E_OK;                                // shared global ring — nothing to free
+    let is i64 as newtop = grab.remove(&mouse_gs, priv);
+    if (newtop != 0) { mouse_ring_clear(); }        // restored holder starts clean
+    return abi.E_OK;
 }
 
-// dev_open(DEV_MOUSE) → a KOBJ_DEVICE over the raw-event ring. Same v0
-// exclusivity story as the keyboard: no enforcement, one shared ring.
+// dev_open(DEV_MOUSE) → a KOBJ_DEVICE over the raw-event ring. Same grab
+// semantics as the keyboard: each open preempts; close restores.
 fn mouse_acquire(ctx as i64) as i64 {
-    return kobject.ko_alloc(kobject.KOBJ_DEVICE, &MOUSE_OPS, 1);
+    mouse_next_token = mouse_next_token + 1;
+    let is i64 as token = mouse_next_token;
+    if (grab.push(&mouse_gs, token) != 0) { return 0; }
+    mouse_ring_clear();
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &MOUSE_OPS, token);
+    if (ko == 0) { grab.remove(&mouse_gs, token); return 0; }
+    return ko;
 }
 
 // The DEV_MOUSE class is declared in mouse.cdvrspec (`device { class: mouse;

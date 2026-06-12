@@ -20,6 +20,7 @@ use "lock.cst" as lock;
 use "sched.cst" as sched;
 use "abi.cst" as abi;
 use "i8042.cst" as i8042;
+use "grab.cst" as grab;
 
 // 2-byte events: [scancode, flags]. flags bit0 = pressed (1) / released (0),
 // bit1 = extended (0xE0-prefixed). 256-byte ring = 128 events.
@@ -37,6 +38,12 @@ let is ksym.KSym as ksym_handler;
 let is ksym.KSym as ksym_acquire;
 let is ksym.KSym as ksym_bind;
 let is kobject.KObjectOps as KBD_OPS with mut;
+
+// Preemptible exclusivity (architecture.md §6): each open holds a token on
+// the grab stack; only the TOP holder's reads/polls see events. priv IS the
+// token (a monotonic id — 0 is reserved for "nobody").
+let is grab.GrabStack as kbd_gs;
+let is i64 as kbd_next_token with mut = 1;
 
 // --- i8042 bring-up (shared controller module: kernel/i8042.cst) ---
 // Limine hands us a minimal machine; the firmware does not leave IRQ1 armed.
@@ -92,9 +99,10 @@ fn kbd_init() as void {
 }
 
 // Readiness for SYS_POLL: READABLE when at least one whole 2-byte event is
-// queued. Never WRITABLE — write is a null op here, and "writable" must mean
-// "a write would make progress", which it never would.
+// queued AND this holder owns the grab. Never WRITABLE — write is a null op
+// here, and "writable" must mean "a write would make progress".
 fn kbd_poll(priv as i64) as i64 {
+    if (grab.top(&kbd_gs) != priv) { return 0; }    // preempted: quiet
     let is i64 as fl = lock.acquire_irq(&kbd_lk);
     let is i64 as c = kbd_count;
     lock.release_irq(&kbd_lk, fl);
@@ -155,45 +163,67 @@ fn inject_event(sc as i64, flags as i64) as void {
     kbd_enqueue(sc, flags);
 }
 
+// Wipe the event ring — events buffered for one holder must never leak to
+// the next when the grab changes hands.
+fn kbd_ring_clear() as void {
+    let is i64 as fl = lock.acquire_irq(&kbd_lk);
+    kbd_head = 0; kbd_tail = 0; kbd_count = 0; kbd_e0 = 0;
+    lock.release_irq(&kbd_lk, fl);
+    return;
+}
+
 // Device read op: drain raw-event bytes from the ring. Blocks (polling, like
 // the channel) until at least one byte is available — there is no EOF for a
-// keyboard. priv is unused (single keyboard, one shared ring).
+// keyboard. A holder that is not the grab-stack TOP is quiet: its read
+// keeps blocking until ownership returns (architecture.md §6).
 fn kbd_read(priv as i64, buf as i64, n as i64) as i64 {
     if (n <= 0) { return 0; }
     let is i64 as done with mut = 0;
     let is i64 as result with mut = 0;
     while (done == 0) {
-        let is i64 as fl = lock.acquire_irq(&kbd_lk);
-        let is i64 as avail = kbd_count;
-        let is i64 as take with mut = n;
-        if (take > avail) { take = avail; }
-        let is i64 as i with mut = 0;
-        while (i < take) {
-            let is *u8 as d = cast(*u8, buf + i);
-            d[0] = kbd_buf[kbd_head];
-            kbd_head = (kbd_head + 1) & KBD_MASK;
-            i = i + 1;
+        if (grab.top(&kbd_gs) != priv) {
+            sched.sleep_for_ns(2000000);
+        } else {
+            let is i64 as fl = lock.acquire_irq(&kbd_lk);
+            let is i64 as avail = kbd_count;
+            let is i64 as take with mut = n;
+            if (take > avail) { take = avail; }
+            let is i64 as i with mut = 0;
+            while (i < take) {
+                let is *u8 as d = cast(*u8, buf + i);
+                d[0] = kbd_buf[kbd_head];
+                kbd_head = (kbd_head + 1) & KBD_MASK;
+                i = i + 1;
+            }
+            kbd_count = kbd_count - take;
+            lock.release_irq(&kbd_lk, fl);
+            if (take > 0) { result = take; done = 1; }
+            else { sched.sleep_for_ns(2000000); }      // 2 ms, no events yet
         }
-        kbd_count = kbd_count - take;
-        lock.release_irq(&kbd_lk, fl);
-        if (take > 0) { result = take; done = 1; }
-        else { sched.sleep_for_ns(2000000); }      // 2 ms, no events yet
     }
     return result;
 }
 
 fn kbd_close(priv as i64) as i64 {
-    return abi.E_OK;                                // shared global ring — nothing to free
+    let is i64 as newtop = grab.remove(&kbd_gs, priv);
+    // hand the device back clean: the restored holder starts from silence
+    if (newtop != 0) { kbd_ring_clear(); }
+    return abi.E_OK;
 }
 
-// dev_open(DEV_KEYBOARD) → a KOBJ_DEVICE over the raw-event ring. v0 has no
-// exclusivity enforcement (the preemptible grab stack is a refinement); the
-// single ring is shared by any holder. ctx is the keyboard's Hardware node
-// (the instance discriminator) — unused today since the PS/2 controller has
-// one keyboard port and one global ring; a second keyboard would be a separate
-// driver with its own acquire/ring, not a second ctx here.
+// dev_open(DEV_KEYBOARD) → a KOBJ_DEVICE over the raw-event ring. Each open
+// pushes a holder token on the grab stack and becomes the active owner —
+// preempting (muting) whoever held it before; closing restores them. ctx is
+// the keyboard's Hardware node (the instance discriminator) — unused since
+// the PS/2 controller has one keyboard port and one global ring.
 fn kbd_acquire(ctx as i64) as i64 {
-    return kobject.ko_alloc(kobject.KOBJ_DEVICE, &KBD_OPS, 1);
+    kbd_next_token = kbd_next_token + 1;
+    let is i64 as token = kbd_next_token;
+    if (grab.push(&kbd_gs, token) != 0) { return 0; }   // stack full → open fails
+    kbd_ring_clear();                                   // new owner starts clean
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &KBD_OPS, token);
+    if (ko == 0) { grab.remove(&kbd_gs, token); return 0; }
+    return ko;
 }
 
 // The DEV_KEYBOARD class is declared in kbd.cdvrspec (`device { class: keyboard;
