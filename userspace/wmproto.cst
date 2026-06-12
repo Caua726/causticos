@@ -1,0 +1,178 @@
+// wmproto.cst — the wire protocol between the window manager and its clients.
+//
+// One channel pair per client (the WM keeps side A, the client gets side B
+// installed at fd WM_FD by spawn fdacts). Pixels never cross the channel:
+// the client allocates a full-screen-sized SEGMENT, hands its fd over with
+// SYS_FD_SEND, and both sides mmap the same frames — zero copy. The channel
+// carries only fixed 32-byte messages (4 x i64: {mtype, a, b, c}), so the
+// kernel's POLL_WRITE_UNIT (64B) guarantees a poll-then-write of one message
+// never blocks or splits. 1024B channel buffer = 32 messages in flight.
+//
+// Handshake (order is load-bearing — the FD_SEND slot holds ONE object):
+//   WM:     channel_create → write WELCOME on side A → spawn(client,
+//           fdacts={WM_FD: side B}) → close own copy of side B
+//   client: read WELCOME → seg_create(full-screen pages) → mmap →
+//           FD_SEND(WM_FD, seg_fd) FIRST → write HELLO
+//   WM:     sees HELLO → FD_RECV (guaranteed: the send parked the object
+//           before the HELLO bytes entered the stream) → mmap read-only
+// The client keeps its seg fd open forever — the fd is what keeps the
+// frames alive while both sides have them mapped.
+//
+// Conventions: the window buffer is allocated ONCE at full-screen size with
+// a FIXED stride of screen_width*4; a resize only changes the w x h sub-rect
+// in use (top-left anchored) — never the buffer. KEY events are raw
+// scancode+flags: the keymap is client policy (architecture.md §8).
+
+use "../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as WM_FD     with imut = 3;    // the client's end of the WM channel
+let is i64 as PROTO_VER with imut = 1;
+let is i64 as MSG_BYTES with imut = 32;
+
+// client → WM
+let is i64 as MSG_HELLO     with imut = 1;   // a=seg npages, b=stride bytes, c=PROTO_VER
+let is i64 as MSG_COMMIT    with imut = 2;   // a=x, b=y, c=(w<<32)|h   (content coords)
+let is i64 as MSG_SET_TITLE with imut = 3;   // a=len(<=16), b=bytes 0-7 LE, c=bytes 8-15 LE
+let is i64 as MSG_CLOSE     with imut = 4;   // client is exiting
+
+// WM → client
+let is i64 as MSG_WELCOME     with imut = 16; // a=screen_w, b=screen_h, c=(win_w<<32)|win_h
+let is i64 as MSG_KEY         with imut = 17; // a=scancode, b=flags (bit0 pressed, bit1 extended)
+let is i64 as MSG_RESIZE      with imut = 18; // a=new_w, b=new_h
+let is i64 as MSG_FOCUS       with imut = 19; // a=0|1
+let is i64 as MSG_CLOSE_REQ   with imut = 20; // please exit
+let is i64 as MSG_MOUSE_BTN   with imut = 21; // a=buttons mask, b=x, c=y (content-relative)
+let is i64 as MSG_MOUSE_WHEEL with imut = 22; // a=delta, b=x, c=y
+
+fn pack_wh(w as i64, h as i64) as i64 { return (w << 32) | (h & 0xFFFFFFFF); }
+fn unpack_w(v as i64) as i64 { return (v >> 32) & 0xFFFFFFFF; }
+fn unpack_h(v as i64) as i64 { return v & 0xFFFFFFFF; }
+
+// Raw channel I/O — deliberately NOT sys.write(): that helper falls back to
+// the serial console on E_BADF, which would silently eat protocol bytes.
+fn _wr(fd as i64, buf as i64, n as i64) as i64 { return syscall(11, fd, buf, n); }
+fn _rd(fd as i64, buf as i64, n as i64) as i64 { return syscall(10, fd, buf, n); }
+
+// msg_write — send one 32-byte message, riding out partial writes (with the
+// poll WRITABLE>=64B contract a split can't happen, but the loop keeps this
+// correct even when called without a poll). Returns 0, or a negative errno
+// (E_PIPE once the peer is gone).
+fn msg_write(fd as i64, m as *i64) as i64 {
+    let is i64 as sent with mut = 0;
+    while (sent < MSG_BYTES) {
+        let is i64 as w = _wr(fd, cast(i64, m) + sent, MSG_BYTES - sent);
+        if (w < 0) { return w; }
+        if (w == 0) { return sys.E_PIPE; }
+        sent = sent + w;
+    }
+    return 0;
+}
+
+fn msg_send(fd as i64, mtype as i64, a as i64, b as i64, c as i64) as i64 {
+    let is [4]i64 as m;
+    m[0] = mtype; m[1] = a; m[2] = b; m[3] = c;
+    return msg_write(fd, &m[0]);
+}
+
+// msg_read — assemble one message from a byte stream that may deliver it in
+// pieces. `fill` and `acc` (32 bytes) persist across calls per channel.
+// Returns 1 = a whole message is in out[0..3]; 0 = partial, call again when
+// the fd polls READABLE; -1 = EOF/error (peer closed). Call only when the
+// fd is readable — the underlying read blocks on an empty channel.
+fn msg_read(fd as i64, fill as *i64, acc as *u8, out as *i64) as i64 {
+    let is i64 as have with mut = *fill;
+    let is i64 as r = _rd(fd, cast(i64, acc) + have, MSG_BYTES - have);
+    if (r <= 0) { return 0 - 1; }
+    have = have + r;
+    if (have < MSG_BYTES) { *fill = have; return 0; }
+    *fill = 0;
+    let is *i64 as p = cast(*i64, cast(i64, acc));
+    out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; out[3] = p[3];
+    return 1;
+}
+
+// title_pack — squeeze up to 16 title bytes into two i64 (LE), for
+// MSG_SET_TITLE's b/c words.
+fn title_pack(s as *u8, len as i64, out_b as *i64, out_c as *i64) as void {
+    let is i64 as n with mut = len;
+    if (n > 16) { n = 16; }
+    let is i64 as b with mut = 0;
+    let is i64 as c with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as by = cast(i64, s[i]);
+        if (i < 8) { b = b | (by << (i * 8)); }
+        else { c = c | (by << ((i - 8) * 8)); }
+        i = i + 1;
+    }
+    *out_b = b; *out_c = c;
+    return;
+}
+
+fn title_unpack(b as i64, c as i64, len as i64, out as *u8) as void {
+    let is i64 as n with mut = len;
+    if (n > 16) { n = 16; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (i < 8) { out[i] = cast(u8, (b >> (i * 8)) & 0xFF); }
+        else { out[i] = cast(u8, (c >> ((i - 8) * 8)) & 0xFF); }
+        i = i + 1;
+    }
+    return;
+}
+
+// copy_row — word-wise memcpy for pixel rows (the compositor's inner loop
+// and the clients' blits). Freestanding on purpose: no std/mem import.
+fn copy_row(dst as i64, src as i64, n as i64) as void {
+    let is i64 as words = n / 8;
+    let is *i64 as d = cast(*i64, dst);
+    let is *i64 as s = cast(*i64, src);
+    let is i64 as i with mut = 0;
+    while (i < words) { d[i] = s[i]; i = i + 1; }
+    let is i64 as j with mut = words * 8;
+    while (j < n) {
+        let is *u8 as db = cast(*u8, dst + j);
+        let is *u8 as sb = cast(*u8, src + j);
+        db[0] = sb[0];
+        j = j + 1;
+    }
+    return;
+}
+
+// dec_str — minimal int→decimal for serial markers. Returns the length.
+fn dec_str(v as i64, out as *u8) as i64 {
+    if (v == 0) { out[0] = cast(u8, 48); return 1; }
+    let is i64 as n with mut = v;
+    let is i64 as neg with mut = 0;
+    if (n < 0) { neg = 1; n = 0 - n; }
+    let is [24]u8 as tmp;
+    let is i64 as t with mut = 0;
+    while (n > 0) {
+        tmp[t] = cast(u8, 48 + (n - (n / 10) * 10));
+        n = n / 10;
+        t = t + 1;
+    }
+    let is i64 as o with mut = 0;
+    if (neg == 1) { out[0] = cast(u8, 45); o = 1; }
+    let is i64 as k with mut = t - 1;
+    while (k >= 0) {
+        out[o] = tmp[k];
+        o = o + 1;
+        k = k - 1;
+    }
+    return o;
+}
+
+// log_kv — "wm: <tag><value>\n" on the serial console: the verification
+// markers scripts grep for.
+fn log_kv(tag as *u8, tag_len as i64, v as i64) as void {
+    let is [64]u8 as line;
+    let is i64 as o with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < tag_len) { line[o] = tag[i]; o = o + 1; i = i + 1; }
+    o = o + dec_str(v, cast(*u8, cast(i64, &line[0]) + o));
+    line[o] = cast(u8, 10);
+    o = o + 1;
+    sys.write_serial(cast(*u8, &line[0]), o);
+    return;
+}
