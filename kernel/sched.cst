@@ -81,7 +81,6 @@ let is i64 as CAP_SCHED_AFFINITY = 8;
 // register-only smokes never went deep enough. 32 KiB (order 3) gives the 4 KiB
 // staging buffer + the deepest chain + a nested IRQ ample headroom.
 let is i64 as KSTACK_SIZE      = 32768;
-let is i64 as KSTACK_ORDER     = 3;       // 2^3 = 8 pages = KSTACK_SIZE
 let is i64 as MAX_THREADS      = 64;
 
 // FPU state size (fxsave = 512 bytes)
@@ -134,7 +133,9 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 288  user_entry       i64   (ring-3 RIP)
 // 296  user_rsp         i64   (ring-3 RSP)
 // 304  aspace_ptr       i64   (*vma.Aspace; 0 for kernel threads)
-// 312  reserved         72 bytes
+// 312  kstack_va        i64   (guarded kvmap VA — kvunmap'd by the reaper)
+// 320  io_buf           i64   (lazy 4 KiB syscall-I/O staging — kfree'd by the reaper)
+// 328  reserved         56 bytes
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
@@ -332,6 +333,21 @@ fn thr_vruntime(tid as i64) as i64      { return thr_get(tid, 48); }
 fn thr_vdeadline(tid as i64) as i64     { return thr_get(tid, 56); }
 fn thr_kstack_top(tid as i64) as i64    { return thr_get(tid, 64); }
 fn thr_kstack_base(tid as i64) as i64   { return thr_get(tid, 72); }
+
+// Per-thread 4 KiB staging buffer for syscall I/O (read/write/write_serial),
+// allocated off the heap the first time the thread needs it. This 4 KiB used to
+// ride the kernel stack — the single biggest kstack consumer, and why 8 KiB
+// overflowed under deep I/O. Per-thread, so concurrent syscalls on different
+// threads never share it (a thread runs on at most one cpu); freed in reap_one.
+fn thr_io_buf(tid as i64) as i64 {
+    let is i64 as buf with mut = thr_get(tid, 320);
+    if (buf != 0) { return buf; }
+    buf = heap.kmalloc(4096, cast(i32, 0));
+    if (buf == 0) { return 0; }
+    thr_set(tid, 320, buf);
+    return buf;
+}
+
 fn thr_entry(tid as i64) as i64         { return thr_get(tid, 80); }
 fn thr_runtime(tid as i64) as i64       { return thr_get(tid, 88); }
 fn thr_next(tid as i64) as i64          { return thr_get(tid, 96); }
@@ -1025,13 +1041,13 @@ fn create_thread(entry as i64, band as i64) as i64 {
     while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
 
     // Kernel stack
-    let is i32 as stack_pfn = pmm.alloc_pages(
-        pmm.ALLOC_ZERO,
-        cast(i32, KSTACK_ORDER), pmm.USAGE_KERNEL, cast(i32, 0)
-    );
-    if (stack_pfn == pmm.PFN_NONE) { pmm.panic("stack alloc fail", 16); }
-
-    let is i64 as stack_base = pmm.phys_to_virt(pmm.pfn_to_phys(stack_pfn));
+    // Guarded kernel stack: kvmap(KV_DATA | KV_GUARD) is a contiguous kernel VA
+    // backed by scattered frames with an UNMAPPED page on each side, so an
+    // overflow past the stack faults at once (#PF on the lower guard) instead of
+    // silently corrupting the neighbour below it. It lives in the shared kernel
+    // half (as_create copies PML4[256..511]), so it is mapped in every aspace.
+    let is i64 as stack_base = vmm.kvmap(KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
+    if (stack_base == 0) { pmm.panic("stack alloc fail", 16); }
     let is i64 as stack_top = stack_base + KSTACK_SIZE;
 
     let is *i64 as sf = cast(*i64, stack_top - 56);
@@ -1066,7 +1082,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     thr_set(tid, 64, stack_top - 56);
     thr_set(tid, 72, stack_base);
     thr_set(tid, 80, entry);
-    thr_set(tid, 312, cast(i64, stack_pfn));   // kstack pfn — for the reaper to free
+    thr_set(tid, 312, stack_base);   // kstack VA — kvunmap'd by the reaper
     thr_set(tid, 96, 0 - 1);
     thr_set(tid, 104, 0 - 1);
     thr_set(tid, 112, 0);             // lag
@@ -1125,13 +1141,9 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
     let is i64 as z with mut = 0;
     while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
 
-    let is i32 as stack_pfn = pmm.alloc_pages(
-        pmm.ALLOC_ZERO,
-        cast(i32, KSTACK_ORDER), pmm.USAGE_KERNEL, cast(i32, 0)
-    );
-    if (stack_pfn == pmm.PFN_NONE) { pmm.panic("ustack alloc fail", 17); }
-
-    let is i64 as stack_base = pmm.phys_to_virt(pmm.pfn_to_phys(stack_pfn));
+    // Guarded kernel stack (see the matching comment in the other thread ctor).
+    let is i64 as stack_base = vmm.kvmap(KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
+    if (stack_base == 0) { pmm.panic("ustack alloc fail", 17); }
     let is i64 as stack_top = stack_base + KSTACK_SIZE;
 
     let is *i64 as sf = cast(*i64, stack_top - 56);
@@ -1177,7 +1189,7 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
     thr_set(tid, 296, user_rsp);      // ring-3 RSP
     thr_set(tid, 304, aspace_ptr);    // *vma.Aspace (for syscall handlers)
     thr_set(tid, 248, process_ptr);   // owning Process (0 for none)
-    thr_set(tid, 312, cast(i64, stack_pfn));  // kstack pfn — for the reaper to free
+    thr_set(tid, 312, stack_base);  // kstack VA — kvunmap'd by the reaper
     // Suspended: created but parked. The state line above set RUNNABLE;
     // override to SUSPENDED and skip the runqueue insert. proc_start /
     // make_runnable enqueues it once the child's fd table is set up.
@@ -2020,13 +2032,15 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
 fn reap_one(tid as i64) as void {
     let is i64 as tptr = thread_ptr(tid);
     if (tptr == 0) { return; }
-    let is i64 as pfn = thr_get(tid, 312);    // kstack pfn (0 if none)
+    let is i64 as kstack_va = thr_get(tid, 312);    // guarded kstack VA (0 if none)
+    let is i64 as io_buf = thr_get(tid, 320);       // per-thread I/O staging (0 if never used)
     let is i64 as fpu = thr_get(tid, 240);    // fpu_state_addr
     tid_ht_remove(tid);
     thread_count = thread_count - 1;
     if (fpu != 0) { heap.kpool_free(fpu_pool, fpu); }
+    if (io_buf != 0) { heap.kfree(io_buf); }
     heap.kpool_free(thread_pool, tptr);
-    if (pfn != 0) { pmm.free_pages(cast(i32, pfn), cast(i32, 1)); }   // kstack is order 1
+    if (kstack_va != 0) { vmm.kvunmap(kstack_va); }   // guarded kstack via kvmap
 }
 
 // Drain this cpu's reap list. Pops each tid under the cpu's sched_lock
