@@ -28,13 +28,13 @@ fi
 
 if [ ! -f "$WORK/r0.cse" ] || [ "${RESEED:-0}" = "1" ]; then
     echo "==> building the seed compiler (cross-compiled on the host, slow)"
-    "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --mode=pure --stack-size=8388608 \
+    "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --mode=pure \
         "$SNAP/src/main.cst" -o "$WORK/r0.cse" >/dev/null 2>&1 \
-        || { echo "seed build FAILED"; "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --mode=pure --stack-size=8388608 "$SNAP/src/main.cst" -o "$WORK/r0.cse"; exit 1; }
+        || { echo "seed build FAILED"; "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --mode=pure "$SNAP/src/main.cst" -o "$WORK/r0.cse"; exit 1; }
 else
     echo "==> reusing existing seed $WORK/r0.cse"
 fi
-"$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --stack-size=65536 \
+"$CAUSTIC_DIR/caustic" --target=caustic-x86_64 \
     "$(pwd)/userspace/bootstrap.cst" -o "$WORK/bootstrap.cse" >/dev/null 2>&1 \
     || { echo "bootstrap driver build FAILED"; exit 1; }
 echo "    seed r0.cse md5 = $(md5sum "$WORK/r0.cse" | cut -d' ' -f1)  ($(stat -c%s "$WORK/r0.cse") bytes)"
