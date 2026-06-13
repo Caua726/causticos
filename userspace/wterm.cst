@@ -54,6 +54,10 @@ let is i64 as pend_y1 with mut = 0;
 // Running child (one at a time, like the shell).
 let is i64 as child_pid with mut = 0;
 let is i64 as child_out with mut = 0 - 1;
+// The child's stdin (its fd 0): a channel the terminal writes keystrokes into
+// while the child runs, so interactive programs can read input. Raw bytes,
+// byte-at-a-time, no echo — the program echoes if it wants (terminal raw mode).
+let is i64 as child_in with mut = 0 - 1;
 // The child's control channel (its fd wmp.TERM_CTL): 32-byte requests the
 // terminal relays — today, MSG_SPAWN_REQ ("open another terminal").
 let is i64 as child_ctl with mut = 0 - 1;
@@ -149,23 +153,37 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
         sys.munmap(cast(i64, img), IMG_CAP);
         return;
     }
-    let is [4]i64 as fdacts;
-    fdacts[0] = 1;
-    fdacts[1] = fds[1];
-    fdacts[2] = wmp.TERM_CTL;
-    fdacts[3] = cfds[1];
+    // stdin channel: the terminal keeps [0] (writes keystrokes), the child gets
+    // [1] as fd 0 (reads them). Same keep-[0]/give-[1] convention as stdout.
+    let is [2]i64 as ifds;
+    if (sys.channel_create(cast(*i64, &ifds[0])) != 0) {
+        err(t, "channel fail\n");
+        sys.close(fds[0]); sys.close(fds[1]);
+        sys.close(cfds[0]); sys.close(cfds[1]);
+        sys.munmap(cast(i64, img), IMG_CAP);
+        return;
+    }
+    let is [6]i64 as fdacts;
+    fdacts[0] = 0;
+    fdacts[1] = ifds[1];
+    fdacts[2] = 1;
+    fdacts[3] = fds[1];
+    fdacts[4] = wmp.TERM_CTL;
+    fdacts[5] = cfds[1];
 
     let is [32]i64 as av;
     let is i64 as k with mut = 0;
     while (k < argc) { av[2 * k] = argv_ptr[k]; av[2 * k + 1] = argv_len[k]; k = k + 1; }
 
-    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 2, cast(*u8, &av[0]), argc);
+    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 3, cast(*u8, &av[0]), argc);
     sys.close(fds[1]);
     sys.close(cfds[1]);
+    sys.close(ifds[1]);
     if (pid < 0) {
         err(t, "spawn failed\n");
         sys.close(fds[0]);
         sys.close(cfds[0]);
+        sys.close(ifds[0]);
         sys.munmap(cast(i64, img), IMG_CAP);
         return;
     }
@@ -173,6 +191,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     child_pid = pid;
     child_out = fds[0];
     child_ctl = cfds[0];
+    child_in = ifds[0];
     ctl_fill = 0;
     child_img = cast(i64, img);
     return;
@@ -209,11 +228,13 @@ fn child_eof(t as *term.Term) as void {
     drain_ctl();
     sys.close(child_out);
     sys.close(child_ctl);
+    if (child_in >= 0) { sys.close(child_in); }
     let is i64 as st with mut = 0;
     sys.wait(child_pid, &st);
     sys.munmap(child_img, IMG_CAP);
     child_out = 0 - 1;
     child_ctl = 0 - 1;
+    child_in = 0 - 1;
     child_pid = 0;
     child_img = 0;
     prompt(t);
@@ -465,7 +486,21 @@ fn main() as i32 {
                         term.scroll_view(&t, 0 - (t.rows - 1));
                         show(&t);
                     }
-                    else if (child_out >= 0) { }       // line input parked while a child runs
+                    else if (child_out >= 0) {
+                        // A child is running: forward keystrokes to its stdin
+                        // (raw byte, no echo — the program echoes if it wants).
+                        // Ctrl+C (the WM sends sc 0x2E for 'c'; we don't have a
+                        // modifier for ctrl here yet) is a TODO; for now a plain
+                        // byte stream. The line editor below is for the prompt.
+                        if (child_in >= 0 && pressed == 1) {
+                            let is i64 as ic = input.scancode_to_ascii(sc, shift);
+                            if (ic != 0) {
+                                let is [1]u8 as kb;
+                                kb[0] = cast(u8, ic);
+                                syscall(11, child_in, cast(i64, &kb[0]), 1);
+                            }
+                        }
+                    }
                     else if (pressed == 1 && ext == 1 && sc == 0x48) {       // Up
                         if (hnav < hsize) {
                             hnav = hnav + 1;

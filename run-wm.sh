@@ -22,7 +22,7 @@ B=userspace/build
 qemu-img create -f raw build/disk.img 64M >/dev/null
 mkfs.fat -F 32 -n CAUSTICOS build/disk.img >/dev/null
 python3 scripts/fat32_add_file.py build/disk.img addfilebin init.cse "$B/wm.cse" >/dev/null
-for p in wmpat wterm newterm echo cat ls uptime sysinfo vic; do
+for p in wmpat wterm newterm echo cat ls uptime sysinfo vic guess; do
     if [ -f "$B/$p.cse" ]; then
         python3 scripts/fat32_add_file.py build/disk.img addfilebin "$p.cse" "$B/$p.cse" >/dev/null
     fi

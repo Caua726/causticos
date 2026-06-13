@@ -15,13 +15,13 @@ CAUSTIC="$CAUSTIC_DIR/caustic"
 OUT="$HERE/build"; mkdir -p "$OUT"
 cd "$OUT"; rm -rf .caustic            # the module cache lands in cwd
 
-# --stack-size: term.cst's putc is recursive (tab → spaces), so the compiler
-# can't bound the worst-case stack on its own; 64 KiB is generous for all of
-# these and harmless where no recursion exists.
-PROGS="shell echo cat ls uptime sysinfo vic wm wmpat wterm newterm"
+# No --stack-size: term.cst's putc is recursive (tab → spaces), but the compiler
+# now grows recursive programs' stacks on demand (dynamic-stack), so no program
+# declares one — non-recursive ones still get an exact computed stack.
+PROGS="shell echo cat ls uptime sysinfo vic wm wmpat wterm newterm guess"
 for p in $PROGS; do
-    if ! "$CAUSTIC" --target=caustic-x86_64 --stack-size=65536 "$HERE/$p.cst" -o "$OUT/$p.cse" >/dev/null 2>&1; then
-        echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 --stack-size=65536 "$HERE/$p.cst" -o "$OUT/$p.cse"; exit 1
+    if ! "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse" >/dev/null 2>&1; then
+        echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse"; exit 1
     fi
     printf "  %-10s %s\n" "$p.cse" "$(stat -c%s "$OUT/$p.cse")b"
 done
