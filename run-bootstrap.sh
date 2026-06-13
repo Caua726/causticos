@@ -19,20 +19,20 @@ mkdir -p "$WORK"
 
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing — build the kernel first"; exit 1; }
 
-if [ ! -d "$SNAP/src" ] || [ "${RESNAP:-0}" = "1" ]; then
-    echo "==> snapshotting the compiler source (stable vs live edits)"
+# Always re-snapshot + re-seed by default, so a toolchain edit is never run
+# against a stale snapshot (that trap silently builds the seed from old source).
+# REUSE=1 skips both when you KNOW the source is unchanged (fast iteration).
+if [ "${REUSE:-0}" = "1" ] && [ -f "$WORK/r0.cse" ] && [ -d "$SNAP/src" ]; then
+    echo "==> REUSE=1: reusing existing snapshot + seed $WORK/r0.cse"
+else
+    echo "==> snapshotting the compiler source (fresh — captures toolchain edits)"
     rm -rf "$SNAP"; mkdir -p "$SNAP"
     cp -r "$CAUSTIC_DIR/src" "$CAUSTIC_DIR/std" \
           "$CAUSTIC_DIR/caustic-assembler" "$CAUSTIC_DIR/caustic-linker" "$SNAP/"
-fi
-
-if [ ! -f "$WORK/r0.cse" ] || [ "${RESEED:-0}" = "1" ]; then
     echo "==> building the seed compiler (cross-compiled on the host, slow)"
     "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --mode=pure \
         "$SNAP/src/main.cst" -o "$WORK/r0.cse" >/dev/null 2>&1 \
         || { echo "seed build FAILED"; "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 --mode=pure "$SNAP/src/main.cst" -o "$WORK/r0.cse"; exit 1; }
-else
-    echo "==> reusing existing seed $WORK/r0.cse"
 fi
 "$CAUSTIC_DIR/caustic" --target=caustic-x86_64 \
     "$(pwd)/userspace/bootstrap.cst" -o "$WORK/bootstrap.cse" >/dev/null 2>&1 \
