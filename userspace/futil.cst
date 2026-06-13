@@ -166,3 +166,124 @@ fn is_dot(name as *u8, nlen as i64) as i64 {
 fn de_name_len(de as *u8) as i64 { let is *i64 as p = cast(*i64, cast(i64, de) + 256); return p[0]; }
 fn de_size(de as *u8) as i64     { let is *i64 as p = cast(*i64, cast(i64, de) + 272); return p[0]; }
 fn de_is_dir(de as *u8) as i64   { let is *i64 as p = cast(*i64, cast(i64, de) + 288); return p[0]; }
+
+// read_dir: collect a directory's entries (skipping . and ..) into caller-owned
+// arrays in ONE pass, then close — so a caller can recurse or delete without a
+// second readdir on the same fd interfering. `names` holds the concatenated
+// NUL-terminated names; per entry i: off[i] (offset into names), nlen[i], and
+// isdir[i]. Returns the count, capped at maxn / names_cap (a huge directory is
+// handled by the caller re-reading after it shrinks).
+fn read_dir(path as *u8, names as *u8, names_cap as i64, off as *i64, nlen as *i64, isdir as *i64, maxn as i64) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as count with mut = 0;
+    let is i64 as used with mut = 0;
+    let is [320]u8 as de;
+    while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+        let is i64 as nl = de_name_len(cast(*u8, &de[0]));
+        if (is_dot(cast(*u8, &de[0]), nl) == 0 && count < maxn && used + nl + 1 <= names_cap) {
+            off[count] = used;
+            let is i64 as k with mut = 0;
+            while (k < nl) { names[used] = de[k]; used = used + 1; k = k + 1; }
+            names[used] = cast(u8, 0); used = used + 1;
+            nlen[count] = nl;
+            isdir[count] = de_is_dir(cast(*u8, &de[0]));
+            count = count + 1;
+        }
+    }
+    sys.close(fd);
+    return count;
+}
+
+// ---- stdin / whole-fd ----
+// rd_open_fd: a Reader over an already-open fd (e.g. 0 = stdin), no path.
+fn rd_open_fd(r as *Reader, fd as i64, buf as *u8, cap as i64) as void {
+    r.fd = fd; r.buf = cast(i64, buf); r.cap = cap; r.fill = 0; r.pos = 0; r.eofd = 0;
+}
+
+// slurp_fd: read an entire fd (stdin) into a fresh mapping that grows as needed
+// (the size isn't known up front). Returns the base, sets *out_len; the mapping
+// is freed when the process exits (no exact unslurp — the length and the mapped
+// capacity differ). On error out_len = -1, returns 0.
+fn slurp_fd(fd as i64, out_len as *i64) as i64 {
+    let is i64 as cap with mut = 65536;
+    let is i64 as va with mut = sys.mmap(0, cap, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { out_len[0] = 0 - 1; return 0; }
+    let is i64 as got with mut = 0;
+    while (1 == 1) {
+        if (got >= cap) {
+            let is i64 as ncap = cap * 2;
+            let is i64 as nva = sys.mmap(0, ncap, sys.PROT_READ | sys.PROT_WRITE);
+            if (nva < 0) { out_len[0] = 0 - 1; return 0; }
+            let is *u8 as src = cast(*u8, va);
+            let is *u8 as dst = cast(*u8, nva);
+            let is i64 as k with mut = 0;
+            while (k < got) { dst[k] = src[k]; k = k + 1; }
+            sys.munmap(va, cap); va = nva; cap = ncap;
+        }
+        let is i64 as n = sys.read(fd, cast(*u8, va + got), cap - got);
+        if (n <= 0) { break; }
+        got = got + n;
+    }
+    out_len[0] = got;
+    return va;
+}
+
+// ---- a small getopt ----
+// Opt walks argv[1..] like POSIX getopt: bundled short flags (-lwc), flags that
+// take a value (-n5 or -n 5), "--" terminator, and "-" treated as an operand
+// (stdin). opt_next returns the flag char, 63 ('?') for an unknown flag, or -1
+// when the flags end (o.ind then indexes the first operand). For a value flag,
+// o.optarg holds the value pointer.
+struct Opt {
+    argc   as i64;
+    argv   as i64;     // *u8 (char**), held as an address
+    ind    as i64;     // index into argv
+    cpos   as i64;     // position within a bundled flag arg (0 = not mid-bundle)
+    optarg as i64;     // *u8 value when the returned flag takes one
+}
+
+fn opt_init(o as *Opt, argc as i64, argv as *u8) as void {
+    o.argc = argc; o.argv = cast(i64, argv); o.ind = 1; o.cpos = 0; o.optarg = 0;
+}
+
+fn _opt_arg(o as *Opt, i as i64) as *u8 {
+    let is *i64 as p = cast(*i64, o.argv);
+    return cast(*u8, p[i]);
+}
+
+fn _spec_find(spec as *u8, c as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (spec[i] != 0) { if (cast(i64, spec[i]) == c) { return i; } i = i + 1; }
+    return 0 - 1;
+}
+
+fn opt_next(o as *Opt, spec as *u8) as i64 {
+    if (o.cpos == 0) {
+        if (o.ind >= o.argc) { return 0 - 1; }
+        let is *u8 as a = _opt_arg(o, o.ind);
+        if (cast(i64, a[0]) != 45) { return 0 - 1; }                                   // not '-' → operand
+        if (cast(i64, a[1]) == 0) { return 0 - 1; }                                    // "-" → operand (stdin)
+        if (cast(i64, a[1]) == 45 && cast(i64, a[2]) == 0) { o.ind = o.ind + 1; return 0 - 1; }  // "--"
+        o.cpos = 1;
+    }
+    let is *u8 as a = _opt_arg(o, o.ind);
+    let is i64 as c = cast(i64, a[o.cpos]);
+    o.cpos = o.cpos + 1;
+    let is i64 as si = _spec_find(spec, c);
+    if (si < 0) {
+        if (cast(i64, a[o.cpos]) == 0) { o.ind = o.ind + 1; o.cpos = 0; }
+        return 63;                                                                     // '?'
+    }
+    if (cast(i64, spec[si + 1]) == 58) {                                               // ':' → takes a value
+        if (cast(i64, a[o.cpos]) != 0) { o.optarg = cast(i64, &a[o.cpos]); o.ind = o.ind + 1; o.cpos = 0; }
+        else {
+            o.ind = o.ind + 1; o.cpos = 0;
+            if (o.ind < o.argc) { o.optarg = cast(i64, _opt_arg(o, o.ind)); o.ind = o.ind + 1; }
+            else { o.optarg = 0; }
+        }
+        return c;
+    }
+    if (cast(i64, a[o.cpos]) == 0) { o.ind = o.ind + 1; o.cpos = 0; }                  // end of bundle
+    return c;
+}
