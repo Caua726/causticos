@@ -1,20 +1,174 @@
-// ls — list a directory (default "/"). `ls [path]`. Reads VFS dir entries via
-// SYS_READDIR on an open dir fd; each VfsDirEntry is name[256] + name_len@256.
+// ls — list directory contents. ls [-l] [-a] [-1] [-R] [path ...].
+// -l long (type + size), -a include . and .., -1 one per line, -R recurse into
+// subdirectories. Entries are sorted; the default lays them out in columns.
+// (FAT32 has no owner/permissions/mtime, so -l shows type and size only.)
 use "../../Caustic/std/causticos/prog.cst" as prog;
 use "../../Caustic/std/os/causticos.cst" as sys;
+use "futil.cst" as fu;
 
-fn main(argc as i64, argv as *u8) as i32 {
-    let is [256]u8 as pb;
-    let is *u8 as path with mut = "/";
-    if (argc >= 2) { path = prog.abspath(prog.arg(argv, 1), cast(*u8, &pb[0])); }
+let is i64 as g_fl with mut = 0;        // bit0 l, bit1 a, bit2 1, bit3 R
+
+// collected entries for the directory currently being printed.
+let is [65536]u8 as g_names;
+let is [4096]i64 as g_off;
+let is [4096]i64 as g_dir;
+let is [4096]i64 as g_size;
+let is i64 as g_count with mut = 0;
+let is i64 as g_nbytes with mut = 0;
+
+fn ename(i as i64) as *u8 { return cast(*u8, cast(i64, &g_names[0]) + g_off[i]); }
+
+fn add_entry(name as *u8, nlen as i64, isdir as i64, size as i64) as void {
+    if (g_count >= 4096) { return; }
+    if (g_nbytes + nlen + 1 >= 65536) { return; }
+    g_off[g_count] = g_nbytes;
+    let is i64 as k with mut = 0;
+    while (k < nlen) { g_names[g_nbytes] = name[k]; g_nbytes = g_nbytes + 1; k = k + 1; }
+    g_names[g_nbytes] = cast(u8, 0); g_nbytes = g_nbytes + 1;
+    g_dir[g_count] = isdir; g_size[g_count] = size;
+    g_count = g_count + 1;
+}
+
+fn ncmp(a as *u8, b as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (cast(i64, a[k]) != 0 && cast(i64, b[k]) != 0) {
+        if (a[k] != b[k]) { if (a[k] < b[k]) { return 0 - 1; } return 1; }
+        k = k + 1;
+    }
+    if (cast(i64, a[k]) == 0 && cast(i64, b[k]) != 0) { return 0 - 1; }
+    if (cast(i64, a[k]) != 0 && cast(i64, b[k]) == 0) { return 1; }
+    return 0;
+}
+
+fn sort_entries() as void {
+    let is i64 as i with mut = 1;
+    while (i < g_count) {
+        let is i64 as oo = g_off[i]; let is i64 as od = g_dir[i]; let is i64 as os = g_size[i];
+        let is i64 as j with mut = i - 1;
+        while (j >= 0 && ncmp(cast(*u8, cast(i64, &g_names[0]) + g_off[j]), cast(*u8, cast(i64, &g_names[0]) + oo)) > 0) {
+            g_off[j + 1] = g_off[j]; g_dir[j + 1] = g_dir[j]; g_size[j + 1] = g_size[j]; j = j - 1;
+        }
+        g_off[j + 1] = oo; g_dir[j + 1] = od; g_size[j + 1] = os;
+        i = i + 1;
+    }
+}
+
+fn print_entries() as void {
+    if ((g_fl & 1) == 1) {                                  // -l
+        let is i64 as i with mut = 0;
+        while (i < g_count) {
+            if (g_dir[i] != 0) { prog.outs("d "); } else { prog.outs("- "); }
+            prog.pad_num(g_size[i], 9); prog.outs("  ");
+            prog.outs(ename(i));
+            if (g_dir[i] != 0) { prog.outs("/"); }
+            prog.out("\n", 1);
+            i = i + 1;
+        }
+        return;
+    }
+    if (((g_fl >> 2) & 1) == 1 || g_count == 0) {           // -1
+        let is i64 as i with mut = 0;
+        while (i < g_count) { prog.outs(ename(i)); if (g_dir[i] != 0) { prog.outs("/"); } prog.out("\n", 1); i = i + 1; }
+        return;
+    }
+    // columns: width = longest name (+ '/' for dirs) + 2 spaces, fit into 80.
+    let is i64 as maxw with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < g_count) {
+        let is i64 as w with mut = prog.slen(ename(i));
+        if (g_dir[i] != 0) { w = w + 1; }
+        if (w > maxw) { maxw = w; }
+        i = i + 1;
+    }
+    let is i64 as colw = maxw + 2;
+    let is i64 as ncols with mut = 80 / colw;
+    if (ncols < 1) { ncols = 1; }
+    let is i64 as col with mut = 0;
+    i = 0;
+    while (i < g_count) {
+        let is i64 as w with mut = prog.slen(ename(i));
+        prog.outs(ename(i));
+        if (g_dir[i] != 0) { prog.outs("/"); w = w + 1; }
+        col = col + 1;
+        if (col >= ncols || i == g_count - 1) { prog.out("\n", 1); col = 0; }
+        else { let is i64 as pad with mut = colw - w; while (pad > 0) { prog.outs(" "); pad = pad - 1; } }
+        i = i + 1;
+    }
+}
+
+fn list_dir(path as *u8, plen as i64, header as i64) as i32 {
     let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { prog.outs("ls: cannot open "); prog.outs(path); prog.out("\n", 1); return cast(i32, 1); }
-    let is [320]u8 as de;                                    // VfsDirEntry is 296 B (name[256] + 5*i64); kernel copies sizeof -> need >=296
+    if (fd < 0) { prog.outs("ls: "); prog.outs(path); prog.outs(": cannot open\n"); return cast(i32, 1); }
+    if (header == 1) { prog.outs(path); prog.outs(":\n"); }
+    g_count = 0; g_nbytes = 0;
+    let is i64 as aflag = (g_fl >> 1) & 1;
+    let is [320]u8 as de;
     while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
-        let is *i64 as nl = cast(*i64, cast(i64, &de[0]) + 256);
-        prog.out(cast(*u8, &de[0]), nl[0]);
-        prog.out("\n", 1);
+        let is i64 as nl = fu.de_name_len(cast(*u8, &de[0]));
+        if (aflag == 0 && fu.is_dot(cast(*u8, &de[0]), nl) == 1) { }
+        else { add_entry(cast(*u8, &de[0]), nl, fu.de_is_dir(cast(*u8, &de[0])), fu.de_size(cast(*u8, &de[0]))); }
     }
     sys.close(fd);
+    sort_entries();
+    print_entries();
+    // -R: recurse into subdirectories. The recursion clobbers g_*, so copy the
+    // subdir names into a local buffer first (this level is already printed).
+    if (((g_fl >> 3) & 1) == 1) {
+        let is [8192]u8 as subn;
+        let is [256]i64 as suboff; let is [256]i64 as subnl;
+        let is i64 as subc with mut = 0;
+        let is i64 as subu with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < g_count) {
+            if (g_dir[i] != 0 && subc < 256) {
+                let is *u8 as nm = ename(i);
+                let is i64 as ln = prog.slen(nm);
+                if (subu + ln + 1 <= 8192) {
+                    suboff[subc] = subu;
+                    let is i64 as k with mut = 0; while (k < ln) { subn[subu] = nm[k]; subu = subu + 1; k = k + 1; }
+                    subn[subu] = cast(u8, 0); subu = subu + 1;
+                    subnl[subc] = ln; subc = subc + 1;
+                }
+            }
+            i = i + 1;
+        }
+        let is i64 as k with mut = 0;
+        while (k < subc) {
+            let is [512]u8 as child;
+            let is i64 as clen = fu.path_join(cast(*u8, &child[0]), path, plen, cast(*u8, cast(i64, &subn[0]) + suboff[k]), subnl[k]);
+            prog.out("\n", 1);
+            list_dir(cast(*u8, &child[0]), clen, 1);
+            k = k + 1;
+        }
+    }
     return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is fu.Opt as o;
+    fu.opt_init(&o, argc, argv);
+    while (1 == 1) {
+        let is i64 as f = fu.opt_next(&o, "la1R");
+        if (f < 0) { break; }
+        if (f == 108) { g_fl = g_fl | 1; }
+        else if (f == 97) { g_fl = g_fl | 2; }
+        else if (f == 49) { g_fl = g_fl | 4; }
+        else if (f == 82) { g_fl = g_fl | 8; }
+        else { prog.outs("usage: ls [-la1R] [path ...]\n"); return cast(i32, 1); }
+    }
+    let is i64 as npaths = argc - o.ind;
+    let is i32 as rc with mut = 0;
+    if (npaths <= 0) { return list_dir("/", 1, 0); }
+    let is i64 as multi with mut = 0;
+    if (npaths > 1) { multi = 1; }
+    let is i64 as i with mut = o.ind;
+    while (i < argc) {
+        let is *u8 as name = prog.arg(argv, i);
+        let is [256]u8 as pb;
+        let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
+        let is i32 as r = list_dir(path, prog.slen(path), multi);
+        if (r != 0) { rc = r; }
+        i = i + 1;
+    }
+    return rc;
 }
