@@ -22,11 +22,17 @@ B=userspace/build
 qemu-img create -f raw build/disk.img 64M >/dev/null
 mkfs.fat -F 32 -n CAUSTICOS build/disk.img >/dev/null
 python3 scripts/fat32_add_file.py build/disk.img addfilebin init.cse "$B/wm.cse" >/dev/null
-for p in wmpat wterm newterm echo cat ls uptime sysinfo vic guess; do
+for p in wmpat wterm newterm echo cat ls uptime sysinfo vic guess \
+         wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
+         touch mkdir rmdir rm mv cp stat du tree find clear \
+         ps free df top run cc make objdump pager hexedit; do
     if [ -f "$B/$p.cse" ]; then
         python3 scripts/fat32_add_file.py build/disk.img addfilebin "$p.cse" "$B/$p.cse" >/dev/null
     fi
 done
+# a sample source so `run greet.cst` / `cc greet.cst` work out of the box (needs
+# /caustic.cse + the /std tree, seeded below).
+[ -f userspace/greet.cst ] && python3 scripts/fat32_add_file.py build/disk.img addfilebin greet.cst userspace/greet.cst >/dev/null
 python3 scripts/fat32_add_file.py build/disk.img addfile hello.txt \
     "ola do CausticOS! este arquivo veio do disco FAT32 via cat." >/dev/null
 
@@ -37,6 +43,13 @@ python3 scripts/fat32_add_file.py build/disk.img addfile hello.txt \
 #   caustic /src/main.cst -o /out.cse --target=caustic-x86_64 --stack-size=8388608 -q
 if [ -f build/caustic.cse ]; then
     python3 scripts/fat32_add_file.py build/disk.img addfilebin caustic.cse build/caustic.cse >/dev/null
+    # the standalone assembler + linker (scripts/build-tools.sh), so the OS has
+    # the whole toolchain: `caustic` one-shot, or caustic-as | caustic-ld staged.
+    for tool in caustic-as caustic-ld; do
+        if [ -f "build/$tool.cse" ]; then
+            python3 scripts/fat32_add_file.py build/disk.img addfilebin "$tool.cse" "build/$tool.cse" >/dev/null
+        fi
+    done
     if [ -d /tmp/srcsnap/src ]; then
         python3 scripts/fat32_mirror.py build/disk.img \
             /tmp/srcsnap/src /tmp/srcsnap/std \

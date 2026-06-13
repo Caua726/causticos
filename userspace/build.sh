@@ -18,7 +18,23 @@ cd "$OUT"; rm -rf .caustic            # the module cache lands in cwd
 # No --stack-size: term.cst's putc is recursive (tab → spaces), but the compiler
 # now grows recursive programs' stacks on demand (dynamic-stack), so no program
 # declares one — non-recursive ones still get an exact computed stack.
+#   core: the shell, the window manager + clients, and the original demos.
+#   file/text tools (category C): share userspace/futil.cst.
 PROGS="shell echo cat ls uptime sysinfo vic wm wmpat wterm newterm guess"
+PROGS="$PROGS wc head tail grep rev tac uniq fold cmp seq cut sort hexdump"
+PROGS="$PROGS touch mkdir rmdir rm mv cp stat du tree find clear"
+#   monitors (category D): read SYS_PROC_LIST / SYS_MEM_INFO / SYS_STATFS.
+#   ("kill" is Ctrl+C in the terminal — the wterm is the job's parent and holds
+#   the kill authority; CausticOS has no ambient pid namespace for a standalone
+#   kill tool to use.)
+PROGS="$PROGS ps free df top"
+#   compiler front-ends (category F): spawn the embedded /caustic.cse. run +
+#   cc + make compile; objdump inspects a .cse. (caustic-as / caustic-ld are
+#   built separately by scripts/build-tools.sh.)
+PROGS="$PROGS run cc make objdump"
+#   viewers/editors (category E): full-screen, drawing through the framebuffer
+#   grab stack (the WM yields while they run), like vic.
+PROGS="$PROGS pager hexedit"
 for p in $PROGS; do
     if ! "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse" >/dev/null 2>&1; then
         echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse"; exit 1
