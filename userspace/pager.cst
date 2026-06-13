@@ -1,8 +1,9 @@
-// pager — a full-screen file viewer, like `less`. `pager <file>`. Takes over the
-// screen through the framebuffer (the WM yields via the grab stack — opening
-// DEV_FB makes this program the top owner; closing it hands the screen back),
-// shows one page, and scrolls with the arrows / PgUp / PgDn / Space / Home /
-// End. `q` quits. Keys come raw from the keyboard device (same model as vic).
+// pager — a full-screen file viewer, like `less`. `pager <file>`.
+//   arrows / PgUp / PgDn / Space  scroll      g / G   top / bottom
+//   /text <Enter>  search forward   n / N      next / previous match
+//   q  quit
+// Long lines wrap. Takes the screen via the framebuffer grab stack (the WM
+// yields while it runs); keys come raw from the keyboard.
 use "../../Caustic/std/causticos/gfx.cst" as gfx;
 use "../../Caustic/std/causticos/font.cst" as font;
 use "../../Caustic/std/causticos/input.cst" as input;
@@ -12,33 +13,33 @@ use "futil.cst" as fu;
 
 let is i64 as GW = 8;
 let is i64 as GH = 16;
-let is u32 as FG  = 0x00d3d7cf;        // body text
-let is u32 as BG  = 0x00121417;        // background
-let is u32 as HFG = 0x00121417;        // header text (dark on the bar)
-let is u32 as HBG = 0x0073d0ff;        // header bar (cyan)
+let is u32 as FG  = 0x00d3d7cf;
+let is u32 as BG  = 0x00121417;
+let is u32 as HFG = 0x00121417;
+let is u32 as HBG = 0x0073d0ff;
 
 let is i64 as fbbase with mut = 0;
 let is i64 as fbw with mut = 0;
 let is i64 as fbh with mut = 0;
 let is i64 as fbpitch with mut = 0;
+let is i64 as g_kfd with mut = 0;
+
+let is i64 as g_base with mut = 0;     // file bytes
+let is i64 as g_len with mut = 0;
+let is i64 as g_idx with mut = 0;      // *i64 line-start offsets
+let is i64 as g_nlines with mut = 0;
+let is [128]u8 as g_term;              // current search term
+let is i64 as g_tlen with mut = 0;
 
 fn putpix(x as i64, y as i64, color as u32) as void {
     if (x < 0 || y < 0 || x >= fbw || y >= fbh) { return; }
     let is *u32 as p = cast(*u32, fbbase + y * fbpitch + x * 4);
     p[0] = color;
 }
-
 fn fill_rect(x0 as i64, y0 as i64, w as i64, h as i64, color as u32) as void {
     let is i64 as y with mut = y0;
-    let is i64 as y1 = y0 + h;
-    while (y < y1) {
-        let is i64 as x with mut = x0;
-        let is i64 as x1 = x0 + w;
-        while (x < x1) { putpix(x, y, color); x = x + 1; }
-        y = y + 1;
-    }
+    while (y < y0 + h) { let is i64 as x with mut = x0; while (x < x0 + w) { putpix(x, y, color); x = x + 1; } y = y + 1; }
 }
-
 fn draw_glyph(px as i64, py as i64, ch as i64, fg as u32, bg as u32) as void {
     let is *u8 as g = font.get_glyph(cast(i32, ch));
     let is i64 as row with mut = 0;
@@ -46,32 +47,120 @@ fn draw_glyph(px as i64, py as i64, ch as i64, fg as u32, bg as u32) as void {
         let is i64 as bits = cast(i64, g[row]);
         let is i64 as col with mut = 0;
         while (col < GW) {
-            if ((bits & (128 >> col)) != 0) { putpix(px + col, py + row, fg); }
-            else { putpix(px + col, py + row, bg); }
+            if ((bits & (128 >> col)) != 0) { putpix(px + col, py + row, fg); } else { putpix(px + col, py + row, bg); }
             col = col + 1;
         }
         row = row + 1;
     }
 }
-
 fn draw_text(px as i64, py as i64, s as *u8, n as i64, fg as u32, bg as u32) as i64 {
     let is i64 as i with mut = 0;
     while (i < n) { draw_glyph(px + i * GW, py, cast(i64, s[i]), fg, bg); i = i + 1; }
     return px + n * GW;
 }
-
 fn draw_num(px as i64, py as i64, v as i64, fg as u32, bg as u32) as i64 {
-    let is [24]u8 as b;
-    let is i64 as n with mut = 0;
+    let is [24]u8 as b; let is i64 as n with mut = 0;
     if (v == 0) { b[0] = cast(u8, 48); n = 1; }
     else {
-        let is i64 as x with mut = v;
-        let is i64 as q with mut = 24;
+        let is i64 as x with mut = v; let is i64 as q with mut = 24;
         while (x > 0) { q = q - 1; b[q] = cast(u8, 48 + (x % 10)); x = x / 10; }
         let is i64 as k with mut = q;
         while (k < 24) { b[n] = b[k]; n = n + 1; k = k + 1; }
     }
     return draw_text(px, py, cast(*u8, &b[0]), n, fg, bg);
+}
+
+fn line_at(ln as i64, out_len as *i64) as i64 {
+    let is *i64 as idx = cast(*i64, g_idx);
+    let is i64 as s = idx[ln];
+    let is i64 as e with mut = g_len;
+    if (ln + 1 < g_nlines) { e = idx[ln + 1] - 1; }      // drop the trailing newline
+    if (e < s) { e = s; }
+    out_len[0] = e - s;
+    return g_base + s;
+}
+
+// search forward from line `from` (inclusive) for g_term; -1 if none.
+fn search_fwd(from as i64) as i64 {
+    if (g_tlen == 0) { return 0 - 1; }
+    let is i64 as ln with mut = from;
+    while (ln < g_nlines) {
+        let is i64 as ll with mut = 0;
+        let is i64 as lp = line_at(ln, &ll);
+        if (fu.mem_find(cast(*u8, lp), ll, cast(*u8, &g_term[0]), g_tlen) >= 0) { return ln; }
+        ln = ln + 1;
+    }
+    return 0 - 1;
+}
+fn search_bwd(from as i64) as i64 {
+    if (g_tlen == 0) { return 0 - 1; }
+    let is i64 as ln with mut = from;
+    while (ln >= 0) {
+        let is i64 as ll with mut = 0;
+        let is i64 as lp = line_at(ln, &ll);
+        if (fu.mem_find(cast(*u8, lp), ll, cast(*u8, &g_term[0]), g_tlen) >= 0) { return ln; }
+        ln = ln - 1;
+    }
+    return 0 - 1;
+}
+
+let is i64 as g_rows with mut = 1;
+let is i64 as g_cols with mut = 1;
+
+fn render(view as i64) as void {
+    // header
+    fill_rect(0, 0, fbw, GH, HBG);
+    let is i64 as hx with mut = draw_num(4, 0, view + 1, HFG, HBG);
+    hx = draw_text(hx, 0, "/", 1, HFG, HBG);
+    hx = draw_num(hx, 0, g_nlines, HFG, HBG);
+    hx = draw_text(hx + GW, 0, "(", 1, HFG, HBG);
+    let is i64 as pct with mut = 100;
+    if (g_nlines > 1) { pct = view * 100 / (g_nlines - 1); }
+    hx = draw_num(hx, 0, pct, HFG, HBG);
+    hx = draw_text(hx, 0, "%)  /search n/N  q quit", 23, HFG, HBG);
+    // body (wrap long lines)
+    fill_rect(0, GH, fbw, fbh - GH, BG);
+    let is i64 as vy with mut = 1;
+    let is i64 as ln with mut = view;
+    while (vy <= g_rows && ln < g_nlines) {
+        let is i64 as ll with mut = 0;
+        let is i64 as lp = line_at(ln, &ll);
+        let is *u8 as p = cast(*u8, lp);
+        let is i64 as col with mut = 0;
+        let is i64 as c with mut = 0;
+        while (c < ll) {
+            let is i64 as ch = cast(i64, p[c]);
+            if (ch == 0x09) { col = col + 4; }
+            else { draw_glyph(col * GW, vy * GH, ch, FG, BG); col = col + 1; }
+            if (col >= g_cols) { col = 0; vy = vy + 1; if (vy > g_rows) { c = ll; } }
+            c = c + 1;
+        }
+        vy = vy + 1;
+        ln = ln + 1;
+    }
+}
+
+// read a search term into g_term at the bottom row; returns 1 on Enter, 0 on Esc.
+fn read_term(fb as *gfx.Framebuffer) as i64 {
+    g_tlen = 0;
+    let is input.KeyEvent as ev;
+    while (1 == 1) {
+        fill_rect(0, fbh - GH, fbw, GH, BG);
+        let is i64 as x = draw_text(0, fbh - GH, "/", 1, HBG, BG);
+        draw_text(x, fbh - GH, cast(*u8, &g_term[0]), g_tlen, FG, BG);
+        sys.present(fb.fd, 0, 0, fbw, fbh);
+        if (input.read_event(g_kfd, &ev) == 1 && ev.pressed == 1) {
+            let is i64 as sc = ev.scancode;
+            if (sc == 0x1C) { return 1; }                        // Enter
+            if (sc == 0x01) { return 0; }                        // Esc
+            if (sc == 0x0E) { if (g_tlen > 0) { g_tlen = g_tlen - 1; } }   // Backspace
+            else if (input.is_shift(sc) == 0) {
+                let is i64 as a = input.scancode_to_ascii(sc, 0);
+                if (a >= 32 && a < 127 && g_tlen < 127) { g_term[g_tlen] = cast(u8, a); g_tlen = g_tlen + 1; }
+            }
+        }
+    }
+    return 0;
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
@@ -81,86 +170,61 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as len with mut = 0;
     let is i64 as base = fu.slurp(path, &len);
     if (len < 0) { prog.outs("pager: cannot open "); prog.outs(path); prog.out("\n", 1); return cast(i32, 1); }
+    g_base = base; g_len = len;
     let is *u8 as p = cast(*u8, base);
-
-    // index every line start. A trailing newline does NOT begin a new (empty)
-    // line — only record a start when content follows the newline.
     let is i64 as nlcap with mut = 1;
     let is i64 as i with mut = 0;
     while (i < len) { if (cast(i64, p[i]) == 0x0A) { nlcap = nlcap + 1; } i = i + 1; }
     let is i64 as isz = fu.page_round(nlcap * 8);
     let is i64 as iva = sys.mmap(0, isz, sys.PROT_READ | sys.PROT_WRITE);
-    if (iva < 0) { prog.outs("pager: out of memory\n"); fu.unslurp(base, len); return cast(i32, 1); }
+    if (iva < 0) { prog.outs("pager: out of memory\n"); return cast(i32, 1); }
     let is *i64 as idx = cast(*i64, iva);
     idx[0] = 0;
     let is i64 as li with mut = 1;
     i = 0;
     while (i < len) { if (cast(i64, p[i]) == 0x0A && i + 1 < len) { idx[li] = i + 1; li = li + 1; } i = i + 1; }
-    let is i64 as nlines = li;
+    g_idx = iva; g_nlines = li;
 
     font.init();
     let is gfx.Framebuffer as fb = gfx.open();
-    if (fb.ok != 1) { prog.outs("pager: no framebuffer\n"); sys.munmap(iva, isz); fu.unslurp(base, len); return cast(i32, 1); }
+    if (fb.ok != 1) { prog.outs("pager: no framebuffer\n"); return cast(i32, 1); }
     fbbase = cast(i64, fb.base); fbw = fb.width; fbh = fb.height; fbpitch = fb.pitch;
-    let is i64 as kfd = input.open_keyboard();
+    g_kfd = input.open_keyboard();
+    g_rows = (fbh / GH) - 2;            // header + footer
+    g_cols = fbw / GW;
 
-    let is i64 as rows = (fbh / GH) - 1;
-    let is i64 as cols = fbw / GW;
     let is i64 as view with mut = 0;
+    let is i64 as shift with mut = 0;
     let is i64 as dirty with mut = 1;
     let is input.KeyEvent as ev;
     while (1 == 1) {
-        if (dirty == 1) {
-            fill_rect(0, 0, fbw, GH, HBG);
-            let is i64 as hx with mut = draw_text(4, 0, path, prog.slen(path), HFG, HBG);
-            hx = draw_text(hx + GW, 0, "line ", 5, HFG, HBG);
-            hx = draw_num(hx, 0, view + 1, HFG, HBG);
-            hx = draw_text(hx, 0, "/", 1, HFG, HBG);
-            hx = draw_num(hx, 0, nlines, HFG, HBG);
-            draw_text(hx + GW, 0, "(q quit)", 8, HFG, HBG);
-            fill_rect(0, GH, fbw, fbh - GH, BG);
-            let is i64 as r with mut = 0;
-            while (r < rows) {
-                let is i64 as ln = view + r;
-                if (ln < nlines) {
-                    let is i64 as lstart = idx[ln];
-                    let is i64 as lend with mut = len;
-                    if (ln + 1 < nlines) { lend = idx[ln + 1]; }
-                    let is i64 as py = (r + 1) * GH;
-                    let is i64 as c with mut = lstart;
-                    let is i64 as col with mut = 0;
-                    while (c < lend && col < cols) {
-                        let is i64 as ch = cast(i64, p[c]);
-                        if (ch == 0x0A) { c = lend; }
-                        else if (ch == 0x09) { col = col + 4; c = c + 1; }
-                        else { draw_glyph(col * GW, py, ch, FG, BG); col = col + 1; c = c + 1; }
-                    }
+        if (dirty == 1) { render(view); sys.present(fb.fd, 0, 0, fbw, fbh); dirty = 0; }
+        if (input.read_event(g_kfd, &ev) == 1) {
+            let is i64 as sc = ev.scancode;
+            let is i64 as ext = ev.extended;
+            if (input.is_shift(sc) == 1) { shift = ev.pressed; }
+            else if (ev.pressed == 1) {
+                if (ext == 1 && sc == 0x48) { if (view > 0) { view = view - 1; dirty = 1; } }                      // Up
+                else if (ext == 1 && sc == 0x50) { if (view < g_nlines - 1) { view = view + 1; dirty = 1; } }      // Down
+                else if (ext == 1 && sc == 0x49) { view = view - g_rows; if (view < 0) { view = 0; } dirty = 1; }  // PgUp
+                else if (ext == 1 && sc == 0x51) { view = view + g_rows; if (view > g_nlines - 1) { view = g_nlines - 1; } dirty = 1; }  // PgDn
+                else if (ext == 1 && sc == 0x47) { view = 0; dirty = 1; }                                          // Home
+                else if (ext == 1 && sc == 0x4F) { view = g_nlines - 1; if (view < 0) { view = 0; } dirty = 1; }   // End
+                else {
+                    let is i64 as a = input.scancode_to_ascii(sc, shift);
+                    if (a == 113) { break; }                                                                      // q
+                    else if (a == 32) { view = view + g_rows; if (view > g_nlines - 1) { view = g_nlines - 1; } dirty = 1; }   // Space
+                    else if (a == 103) { view = 0; dirty = 1; }                                                   // g
+                    else if (a == 71) { view = g_nlines - 1; if (view < 0) { view = 0; } dirty = 1; }             // G
+                    else if (a == 47) { if (read_term(&fb) == 1) { let is i64 as r = search_fwd(view); if (r >= 0) { view = r; } } dirty = 1; }   // /
+                    else if (a == 110) { let is i64 as r = search_fwd(view + 1); if (r >= 0) { view = r; } dirty = 1; }   // n
+                    else if (a == 78) { let is i64 as r = search_bwd(view - 1); if (r >= 0) { view = r; } dirty = 1; }    // N
                 }
-                r = r + 1;
-            }
-            sys.present(fb.fd, 0, 0, fbw, fbh);
-            dirty = 0;
-        }
-        if (input.read_event(kfd, &ev) == 1) {
-            if (ev.pressed == 1) {
-                let is i64 as sc = ev.scancode;
-                let is i64 as ext = ev.extended;
-                if (sc == 0x10) { break; }                                                            // q
-                else if (ext == 1 && sc == 0x48) { if (view > 0) { view = view - 1; dirty = 1; } }     // Up
-                else if (ext == 1 && sc == 0x50) { if (view < nlines - 1) { view = view + 1; dirty = 1; } }  // Down
-                else if (ext == 1 && sc == 0x49) { view = view - rows; if (view < 0) { view = 0; } dirty = 1; }       // PgUp
-                else if (ext == 1 && sc == 0x51) { view = view + rows; if (view > nlines - 1) { view = nlines - 1; } dirty = 1; }  // PgDn
-                else if (sc == 0x39) { view = view + rows; if (view > nlines - 1) { view = nlines - 1; } dirty = 1; } // Space
-                else if (ext == 1 && sc == 0x47) { view = 0; dirty = 1; }                              // Home
-                else if (ext == 1 && sc == 0x4F) { view = nlines - 1; if (view < 0) { view = 0; } dirty = 1; }        // End
             }
         }
     }
-
     fill_rect(0, 0, fbw, fbh, BG);
     sys.present(fb.fd, 0, 0, fbw, fbh);
     gfx.close(&fb);
-    sys.munmap(iva, isz);
-    fu.unslurp(base, len);
     return 0;
 }

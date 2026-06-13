@@ -1,8 +1,10 @@
-// hexedit — a full-screen hex editor. `hexedit <file>`. Shows the file as
-// offset | 16 hex bytes | ascii, with a cursor (arrows move it). Type hex digits
-// (0-9 a-f) to overwrite the byte under the cursor, 's' saves to disk, 'q'
-// quits. Edits happen in a private copy (slurp's R/W mapping) and only reach the
-// file on save. Screen via the framebuffer grab stack, keys raw from the kbd.
+// hexedit — a full-screen hex editor. `hexedit <file>`.
+//   arrows move    PgUp/PgDn page    hex digits overwrite the nibble
+//   i insert a 00 byte    x delete the byte    g goto offset (hex)
+//   / search ascii    n next match    s save    q quit
+// The file is loaded into a buffer with room to grow, so insert/delete change
+// its length; save writes the current length. Screen via the framebuffer grab
+// stack, keys raw from the keyboard.
 use "../../Caustic/std/causticos/gfx.cst" as gfx;
 use "../../Caustic/std/causticos/font.cst" as font;
 use "../../Caustic/std/causticos/input.cst" as input;
@@ -15,7 +17,7 @@ let is i64 as GH = 16;
 let is u32 as FG  = 0x00d3d7cf;
 let is u32 as BG  = 0x00121417;
 let is u32 as DIM = 0x00888a8c;
-let is u32 as CUR = 0x00ffd166;        // cursor highlight (amber)
+let is u32 as CUR = 0x00ffd166;
 let is u32 as CURTXT = 0x00121417;
 let is u32 as HFG = 0x00121417;
 let is u32 as HBG = 0x0073d0ff;
@@ -24,6 +26,13 @@ let is i64 as fbbase with mut = 0;
 let is i64 as fbw with mut = 0;
 let is i64 as fbh with mut = 0;
 let is i64 as fbpitch with mut = 0;
+let is i64 as g_kfd with mut = 0;
+
+let is i64 as g_buf with mut = 0;      // *u8
+let is i64 as g_len with mut = 0;
+let is i64 as g_cap with mut = 0;
+let is [128]u8 as g_find;
+let is i64 as g_findlen with mut = 0;
 
 fn putpix(x as i64, y as i64, color as u32) as void {
     if (x < 0 || y < 0 || x >= fbw || y >= fbh) { return; }
@@ -52,126 +61,181 @@ fn draw_text(px as i64, py as i64, s as *u8, n as i64, fg as u32, bg as u32) as 
     while (i < n) { draw_glyph(px + i * GW, py, cast(i64, s[i]), fg, bg); i = i + 1; }
     return px + n * GW;
 }
-fn hexd(v as i64) as i64 { if (v < 10) { return 48 + v; } return 87 + v; }   // 0-15 -> '0'..'f'
-
-// draw v as `w` hex digits at column `col`, row pixel `py`.
+fn hexd(v as i64) as i64 { if (v < 10) { return 48 + v; } return 87 + v; }
 fn draw_hex(col as i64, py as i64, v as i64, w as i64, fg as u32, bg as u32) as void {
     let is i64 as i with mut = 0;
-    while (i < w) {
-        let is i64 as sh = (w - 1 - i) * 4;
-        draw_glyph((col + i) * GW, py, hexd((v >> sh) & 15), fg, bg);
-        i = i + 1;
+    while (i < w) { let is i64 as sh = (w - 1 - i) * 4; draw_glyph((col + i) * GW, py, hexd((v >> sh) & 15), fg, bg); i = i + 1; }
+}
+
+// read a prompt string at the bottom row; returns 1 on Enter, 0 on Esc.
+fn read_prompt(fb as *gfx.Framebuffer, label as *u8, buf as *u8, cap as *i64) as i64 {
+    cap[0] = 0;
+    let is input.KeyEvent as ev;
+    while (1 == 1) {
+        fill_rect(0, fbh - GH, fbw, GH, BG);
+        let is i64 as x = draw_text(0, fbh - GH, label, prog.slen(label), HBG, BG);
+        draw_text(x, fbh - GH, buf, cap[0], FG, BG);
+        sys.present(fb.fd, 0, 0, fbw, fbh);
+        if (input.read_event(g_kfd, &ev) == 1 && ev.pressed == 1) {
+            let is i64 as sc = ev.scancode;
+            if (sc == 0x1C) { return 1; }
+            if (sc == 0x01) { return 0; }
+            if (sc == 0x0E) { if (cap[0] > 0) { cap[0] = cap[0] - 1; } }
+            else if (input.is_shift(sc) == 0) {
+                let is i64 as a = input.scancode_to_ascii(sc, 0);
+                if (a >= 32 && a < 127 && cap[0] < 127) { buf[cap[0]] = cast(u8, a); cap[0] = cap[0] + 1; }
+            }
+        }
     }
+    return 0;
+}
+
+fn do_insert(cur as i64) as void {
+    if (g_len >= g_cap) { return; }
+    let is *u8 as b = cast(*u8, g_buf);
+    let is i64 as j with mut = g_len;
+    while (j > cur) { b[j] = b[j - 1]; j = j - 1; }
+    b[cur] = cast(u8, 0);
+    g_len = g_len + 1;
+}
+fn do_delete(cur as i64) as void {
+    if (g_len == 0 || cur >= g_len) { return; }
+    let is *u8 as b = cast(*u8, g_buf);
+    let is i64 as j with mut = cur;
+    while (j < g_len - 1) { b[j] = b[j + 1]; j = j + 1; }
+    g_len = g_len - 1;
+}
+// search g_find as raw bytes from offset `from`; -1 if none.
+fn search(from as i64) as i64 {
+    if (g_findlen == 0) { return 0 - 1; }
+    let is i64 as r = fu.mem_find(cast(*u8, g_buf + from), g_len - from, cast(*u8, &g_find[0]), g_findlen);
+    if (r < 0) { return 0 - 1; }
+    return from + r;
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
     if (argc < 2) { prog.outs("usage: hexedit <file>\n"); return cast(i32, 1); }
     let is [256]u8 as pbb;
     let is *u8 as path = prog.abspath(prog.arg(argv, 1), cast(*u8, &pbb[0]));
-    let is i64 as len with mut = 0;
-    let is i64 as base = fu.slurp(path, &len);
-    if (len < 0) { prog.outs("hexedit: cannot open "); prog.outs(path); prog.out("\n", 1); return cast(i32, 1); }
-    if (len == 0) { prog.outs("hexedit: empty file\n"); return cast(i32, 1); }
-    let is *u8 as p = cast(*u8, base);
+    // load into a buffer with room to grow.
+    let is [4]i64 as st;
+    let is i64 as size with mut = 0;
+    if (sys.stat(path, cast(*u8, &st[0])) == 0) { size = st[0]; }
+    let is i64 as cap = fu.page_round(size + 1048576);
+    let is i64 as va = sys.mmap(0, cap, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { prog.outs("hexedit: out of memory\n"); return cast(i32, 1); }
+    let is i64 as fd = sys.open_read(path);
+    let is i64 as got with mut = 0;
+    if (fd >= 0) { while (got < size) { let is i64 as r = sys.read(fd, cast(*u8, va + got), size - got); if (r <= 0) { break; } got = got + r; } sys.close(fd); }
+    g_buf = va; g_len = got; g_cap = cap;
 
     font.init();
     let is gfx.Framebuffer as fb = gfx.open();
-    if (fb.ok != 1) { prog.outs("hexedit: no framebuffer\n"); fu.unslurp(base, len); return cast(i32, 1); }
+    if (fb.ok != 1) { prog.outs("hexedit: no framebuffer\n"); return cast(i32, 1); }
     fbbase = cast(i64, fb.base); fbw = fb.width; fbh = fb.height; fbpitch = fb.pitch;
-    let is i64 as kfd = input.open_keyboard();
-
-    let is i64 as rows = (fbh / GH) - 1;
-    let is i64 as cur with mut = 0;        // byte offset of the cursor
-    let is i64 as nib with mut = 0;        // 0 = high nibble, 1 = low
-    let is i64 as view with mut = 0;       // first byte shown (multiple of 16)
+    g_kfd = input.open_keyboard();
+    let is i64 as rows = (fbh / GH) - 2;     // header + footer
+    let is i64 as cur with mut = 0;
+    let is i64 as nib with mut = 0;
+    let is i64 as view with mut = 0;
     let is i64 as modified with mut = 0;
+    let is i64 as shift with mut = 0;
     let is i64 as dirty with mut = 1;
+    let is *u8 as b = cast(*u8, g_buf);
     let is input.KeyEvent as ev;
 
     while (1 == 1) {
-        // keep the cursor on screen
         if (cur < view) { view = (cur / 16) * 16; }
         if (cur >= view + rows * 16) { view = ((cur / 16) - rows + 1) * 16; }
         if (view < 0) { view = 0; }
-
         if (dirty == 1) {
             fill_rect(0, 0, fbw, GH, HBG);
             let is i64 as hx with mut = draw_text(4, 0, path, prog.slen(path), HFG, HBG);
-            hx = draw_text(hx + GW, 0, "off ", 4, HFG, HBG);
-            draw_hex((hx / GW), 0, cur, 8, HFG, HBG);
-            hx = hx + 8 * GW;
-            if (modified == 1) { draw_text(hx + GW, 0, "*modified", 9, HFG, HBG); }
-            draw_text(fbw - 30 * GW, 0, "(s save  q quit)", 16, HFG, HBG);
+            hx = draw_text(hx + GW, 0, "off ", 4, HFG, HBG); draw_hex(hx / GW, 0, cur, 8, HFG, HBG); hx = hx + 8 * GW;
+            hx = draw_text(hx + GW, 0, "len ", 4, HFG, HBG); draw_hex(hx / GW, 0, g_len, 6, HFG, HBG); hx = hx + 6 * GW;
+            if (modified == 1) { draw_text(hx + GW, 0, "*mod", 4, HFG, HBG); }
             fill_rect(0, GH, fbw, fbh - GH, BG);
             let is i64 as r with mut = 0;
             while (r < rows) {
                 let is i64 as row_off = view + r * 16;
-                if (row_off < len) {
+                if (row_off <= g_len) {
                     let is i64 as py = (r + 1) * GH;
-                    draw_hex(0, py, row_off, 8, DIM, BG);                  // offset
+                    draw_hex(0, py, row_off, 8, DIM, BG);
                     let is i64 as k with mut = 0;
                     while (k < 16) {
                         let is i64 as off = row_off + k;
                         let is i64 as bcol = 10 + k * 3;
-                        if (off < len) {
-                            let is i64 as bv = cast(i64, p[off]);
-                            if (off == cur) {
-                                fill_rect(bcol * GW, py, 2 * GW, GH, CUR);
-                                draw_hex(bcol, py, bv, 2, CURTXT, CUR);
-                            } else {
-                                draw_hex(bcol, py, bv, 2, FG, BG);
-                            }
-                            // ascii column
+                        if (off < g_len) {
+                            let is i64 as bv = cast(i64, b[off]);
+                            if (off == cur) { fill_rect(bcol * GW, py, 2 * GW, GH, CUR); draw_hex(bcol, py, bv, 2, CURTXT, CUR); }
+                            else { draw_hex(bcol, py, bv, 2, FG, BG); }
                             let is i64 as ac = 60 + k;
-                            let is i64 as ch with mut = bv;
-                            if (bv < 32 || bv >= 127) { ch = 46; }
+                            let is i64 as ch with mut = bv; if (bv < 32 || bv >= 127) { ch = 46; }
                             if (off == cur) { fill_rect(ac * GW, py, GW, GH, CUR); draw_glyph(ac * GW, py, ch, CURTXT, CUR); }
                             else { draw_glyph(ac * GW, py, ch, DIM, BG); }
+                        } else if (off == cur && cur == g_len) {
+                            fill_rect(bcol * GW, py, GW, GH, CUR);          // cursor at the end (append point)
                         }
                         k = k + 1;
                     }
                 }
                 r = r + 1;
             }
+            fill_rect(0, fbh - GH, fbw, GH, BG);
+            draw_text(0, fbh - GH, "i ins  x del  g goto  / search  s save  q quit", 46, DIM, BG);
             sys.present(fb.fd, 0, 0, fbw, fbh);
             dirty = 0;
         }
 
-        if (input.read_event(kfd, &ev) == 1) {
-            if (ev.pressed == 1) {
-                let is i64 as sc = ev.scancode;
-                let is i64 as ext = ev.extended;
-                if (sc == 0x10) { break; }                                                   // q
-                else if (sc == 0x1F) {                                                       // s = save
-                    let is i64 as wfd = sys.open_write(path);
-                    if (wfd >= 0) { sys.write(wfd, p, len); sys.close(wfd); modified = 0; dirty = 1; }
-                }
-                else if (ext == 1 && sc == 0x4B) { if (cur > 0) { cur = cur - 1; nib = 0; dirty = 1; } }       // Left
-                else if (ext == 1 && sc == 0x4D) { if (cur < len - 1) { cur = cur + 1; nib = 0; dirty = 1; } } // Right
-                else if (ext == 1 && sc == 0x48) { if (cur >= 16) { cur = cur - 16; dirty = 1; } }             // Up
-                else if (ext == 1 && sc == 0x50) { if (cur + 16 < len) { cur = cur + 16; dirty = 1; } }        // Down
-                else if (ext == 1 && sc == 0x49) { cur = cur - rows * 16; if (cur < 0) { cur = 0; } dirty = 1; }    // PgUp
-                else if (ext == 1 && sc == 0x51) { cur = cur + rows * 16; if (cur > len - 1) { cur = len - 1; } dirty = 1; } // PgDn
+        if (input.read_event(g_kfd, &ev) == 1) {
+            let is i64 as sc = ev.scancode;
+            let is i64 as ext = ev.extended;
+            if (input.is_shift(sc) == 1) { shift = ev.pressed; }
+            else if (ev.pressed == 1) {
+                if (ext == 1 && sc == 0x4B) { if (cur > 0) { cur = cur - 1; nib = 0; dirty = 1; } }              // Left
+                else if (ext == 1 && sc == 0x4D) { if (cur < g_len) { cur = cur + 1; nib = 0; dirty = 1; } }     // Right
+                else if (ext == 1 && sc == 0x48) { if (cur >= 16) { cur = cur - 16; dirty = 1; } }               // Up
+                else if (ext == 1 && sc == 0x50) { if (cur + 16 <= g_len) { cur = cur + 16; dirty = 1; } }       // Down
+                else if (ext == 1 && sc == 0x49) { cur = cur - rows * 16; if (cur < 0) { cur = 0; } dirty = 1; } // PgUp
+                else if (ext == 1 && sc == 0x51) { cur = cur + rows * 16; if (cur > g_len) { cur = g_len; } dirty = 1; }  // PgDn
                 else {
-                    // hex digit edits the nibble under the cursor
-                    let is i64 as a = input.scancode_to_ascii(sc, 0);
-                    let is i64 as d with mut = 0 - 1;
-                    if (a >= 48 && a <= 57) { d = a - 48; }
-                    else if (a >= 97 && a <= 102) { d = a - 97 + 10; }
-                    if (d >= 0) {
-                        let is i64 as old = cast(i64, p[cur]);
-                        if (nib == 0) { p[cur] = cast(u8, (old & 15) | (d << 4)); nib = 1; }
-                        else { p[cur] = cast(u8, (old & 0xF0) | d); nib = 0; if (cur < len - 1) { cur = cur + 1; } }
-                        modified = 1; dirty = 1;
+                    let is i64 as a = input.scancode_to_ascii(sc, shift);
+                    if (a == 113) { break; }                                                                    // q
+                    else if (a == 115) { let is i64 as wfd = sys.open_write(path); if (wfd >= 0) { sys.write(wfd, cast(*u8, g_buf), g_len); sys.close(wfd); modified = 0; dirty = 1; } }  // s
+                    else if (a == 105) { do_insert(cur); modified = 1; dirty = 1; }                              // i
+                    else if (a == 120) { do_delete(cur); if (cur >= g_len && cur > 0) { cur = cur - 1; } modified = 1; dirty = 1; }   // x
+                    else if (a == 103) {                                                                        // g goto
+                        let is [128]u8 as gb; let is [1]i64 as gl;
+                        if (read_prompt(&fb, "goto 0x", cast(*u8, &gb[0]), cast(*i64, &gl[0])) == 1) {
+                            let is i64 as off with mut = 0; let is i64 as j with mut = 0;
+                            while (j < gl[0]) { let is i64 as c = cast(i64, gb[j]); let is i64 as d with mut = 0 - 1;
+                                if (c >= 48 && c <= 57) { d = c - 48; } else if (c >= 97 && c <= 102) { d = c - 87; } else if (c >= 65 && c <= 70) { d = c - 55; }
+                                if (d >= 0) { off = off * 16 + d; } j = j + 1; }
+                            if (off > g_len) { off = g_len; } cur = off;
+                        }
+                        dirty = 1;
+                    }
+                    else if (a == 47) {                                                                        // / search ascii
+                        if (read_prompt(&fb, "/", cast(*u8, &g_find[0]), cast(*i64, &g_findlen)) == 1) { let is i64 as r2 = search(cur + 1); if (r2 >= 0) { cur = r2; } }
+                        dirty = 1;
+                    }
+                    else if (a == 110) { let is i64 as r2 = search(cur + 1); if (r2 >= 0) { cur = r2; } dirty = 1; }   // n
+                    else {                                                                                      // hex digit overwrite
+                        let is i64 as d with mut = 0 - 1;
+                        if (a >= 48 && a <= 57) { d = a - 48; } else if (a >= 97 && a <= 102) { d = a - 87; }
+                        if (d >= 0 && cur < g_len) {
+                            let is i64 as old = cast(i64, b[cur]);
+                            if (nib == 0) { b[cur] = cast(u8, (old & 15) | (d << 4)); nib = 1; }
+                            else { b[cur] = cast(u8, (old & 0xF0) | d); nib = 0; if (cur < g_len - 1) { cur = cur + 1; } }
+                            modified = 1; dirty = 1;
+                        }
                     }
                 }
             }
         }
     }
-
     fill_rect(0, 0, fbw, fbh, BG);
     sys.present(fb.fd, 0, 0, fbw, fbh);
     gfx.close(&fb);
-    fu.unslurp(base, len);
     return 0;
 }
