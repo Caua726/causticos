@@ -21,7 +21,7 @@ cd "$OUT"; rm -rf .caustic            # the module cache lands in cwd
 #   core: the shell, the window manager + clients, and the original demos.
 #   file/text tools (category C): share userspace/futil.cst.
 PROGS="shell echo cat ls uptime sysinfo vic wm wmpat wterm newterm guess"
-PROGS="$PROGS wc head tail grep rev tac uniq fold cmp seq cut sort hexdump"
+PROGS="$PROGS tr wc head tail grep rev tac uniq fold cmp seq cut sort hexdump"
 PROGS="$PROGS touch mkdir rmdir rm mv cp stat du tree find clear"
 #   monitors (category D): read SYS_PROC_LIST / SYS_MEM_INFO / SYS_STATFS.
 #   ("kill" is Ctrl+C in the terminal — the wterm is the job's parent and holds
