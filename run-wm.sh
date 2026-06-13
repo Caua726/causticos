@@ -29,7 +29,25 @@ for p in wmpat wterm newterm echo cat ls uptime sysinfo vic; do
 done
 python3 scripts/fat32_add_file.py build/disk.img addfile hello.txt \
     "ola do CausticOS! este arquivo veio do disco FAT32 via cat." >/dev/null
-echo "disk seeded: /init.cse(wm) + wmpat + tools + hello.txt"
+
+# Ship the self-hosted compiler: the converged caustic.cse (byte-identical
+# across 4 on-device bootstrap rounds — see run-bootstrap.sh) + its whole
+# source tree, so the OS comes WITH a working compiler you can run from a
+# terminal, Unix-tradition style:
+#   caustic /src/main.cst -o /out.cse --target=caustic-x86_64 --stack-size=8388608 -q
+if [ -f build/caustic.cse ]; then
+    python3 scripts/fat32_add_file.py build/disk.img addfilebin caustic.cse build/caustic.cse >/dev/null
+    if [ -d /tmp/srcsnap/src ]; then
+        python3 scripts/fat32_mirror.py build/disk.img \
+            /tmp/srcsnap/src /tmp/srcsnap/std \
+            /tmp/srcsnap/caustic-assembler /tmp/srcsnap/caustic-linker >/dev/null
+        echo "disk seeded: /init.cse(wm) + tools + /caustic.cse (self-hosted) + source tree"
+    else
+        echo "disk seeded: /init.cse(wm) + tools + /caustic.cse (no source tree — run run-bootstrap.sh to snapshot it)"
+    fi
+else
+    echo "disk seeded: /init.cse(wm) + wmpat + tools + hello.txt"
+fi
 
 DISPLAY_ARGS=()
 if [ "${HEADLESS:-0}" = "1" ]; then
