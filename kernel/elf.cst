@@ -71,9 +71,20 @@ let is i64 as AT_EGID       = 14;
 let is i64 as AT_RANDOM     = 25;
 let is i64 as AT_EXECFN     = 31;
 
-// Default user stack size (System V AMD64 RLIMIT_STACK on Linux is
-// 8 MiB; we use 16 KiB while we don't have growing-stack support).
+// Default user stack size for STRICT (non-dynamic) programs: eager-committed
+// in full, the legacy wall. Non-recursive caustic programs declare their exact
+// computed need here; hand-built smokes fall back to this.
 let is i64 as USER_STACK_SIZE = 0x4000;
+
+// Dynamic-stack programs (Aspace.stack_dynamic == 1): the loader RESERVES the
+// ceiling (declared stack_size, or this default) and COMMITS only the initial
+// window at the top; the program's prologue probes commit the rest on demand
+// via SYS_COMMIT (explicit growth, not demand paging). INITIAL_STACK_COMMIT
+// must cover the entry argv/auxv page + the first frame + the grow helper's own
+// frame, with margin. The runtime tracks the committed bottom from the SAME two
+// constants (USER_STACK_TOP_VA and INITIAL_STACK_COMMIT).
+let is i64 as INITIAL_STACK_COMMIT = 0x20000;    // 128 KiB committed up-front
+let is i64 as STACK_DYN_CEILING    = 0x800000;   // 8 MiB default reserve ceiling
 
 // Where the stack sits in the user aspace: just below the upper
 // canonical-half boundary so it doesn't collide with anything the
@@ -260,20 +271,40 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
         return cast(i32, 0 - 4);
     }
     let is i64 as stack_top = USER_STACK_TOP_VA;
-    // Stack size = the spawner's grant (a.stack_size, Phase G pattern), or the
-    // default. Eager-committed below — strict reserve/commit, no growing stack.
-    let is i64 as stack_size with mut = a.stack_size;
-    if (stack_size <= 0) { stack_size = USER_STACK_SIZE; }
-    // The declared/computed size is arbitrary bytes; round up to a page so the
-    // FIXED mapping's base (stack_top - stack_size) stays page-aligned.
-    stack_size = pmm.align_up(stack_size, pmm.PAGE_SIZE);
-    let is i64 as got = vma.mmap_anon(a, stack_top - stack_size,
-                                       stack_size,
-                                       vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+    let is i64 as sprot = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+    if (a.stack_dynamic == 1) {
+        // Explicit-growth stack: reserve the ceiling, commit only the initial
+        // window at the top. The program's prologue probes commit more on
+        // demand (SYS_COMMIT). stack_size is reinterpreted as the ceiling.
+        let is i64 as ceiling with mut = a.stack_size;
+        if (ceiling <= 0) { ceiling = STACK_DYN_CEILING; }
+        ceiling = pmm.align_up(ceiling, pmm.PAGE_SIZE);
+        let is i64 as ic with mut = INITIAL_STACK_COMMIT;
+        if (ic > ceiling) { ic = ceiling; }
+        let is i64 as base = stack_top - ceiling;
+        let is i64 as rv = vma.reserve(a, base, ceiling, sprot,
                                        vma.VMA_FIXED | vma.VMA_GROWSDOWN);
-    if (got != stack_top - stack_size) {
-        serial.println("elf: stack mmap fail", 20);
-        return cast(i32, 0 - 1);
+        if (rv != base) {
+            serial.println("elf: stack reserve fail", 23);
+            return cast(i32, 0 - 1);
+        }
+        let is i32 as crc = vma.commit(a, stack_top - ic, ic, sprot);
+        if (crc != 0) {
+            serial.println("elf: stack initial-commit fail", 30);
+            return cast(i32, 0 - 1);
+        }
+    } else {
+        // Strict: eager-commit the whole declared/default size — the wall.
+        let is i64 as stack_size with mut = a.stack_size;
+        if (stack_size <= 0) { stack_size = USER_STACK_SIZE; }
+        stack_size = pmm.align_up(stack_size, pmm.PAGE_SIZE);
+        let is i64 as got = vma.mmap_anon(a, stack_top - stack_size,
+                                           stack_size, sprot,
+                                           vma.VMA_FIXED | vma.VMA_GROWSDOWN);
+        if (got != stack_top - stack_size) {
+            serial.println("elf: stack mmap fail", 20);
+            return cast(i32, 0 - 1);
+        }
     }
 
     // Layout inside our kernel-mapped view of the top page, working backwards
