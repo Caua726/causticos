@@ -23,6 +23,8 @@ use "process.cst" as proc;
 use "heap.cst" as heap;
 use "vmm.cst" as vmm;
 use "segment.cst" as segment;
+use "pmm.cst" as pmm;
+use "fat32.cst" as fat32;
 
 // ============================================================
 // SYS_KERN_INFO(buf, buf_size) — fill `buf` with the static KernInfo
@@ -374,6 +376,119 @@ fn sys_proc_kill(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
         tries = tries + 1;
     }
     return abi.E_AGAIN;
+}
+
+// ============================================================
+// SYS_PROC_LIST(entries_uptr, max) — snapshot the process tree into a
+// caller array of ProcInfo (6 i64 each), up to `max`. Returns the TOTAL
+// live count so a truncated snapshot is detectable. DFS from init over an
+// explicit worklist (no kernel-stack recursion). Read-only and quick; like
+// the other process paths it runs without a global proc lock (none exists
+// yet) — a concurrent spawn/reap can make the snapshot momentarily
+// inconsistent, acceptable for a monitor.
+// ============================================================
+
+fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as uptr = a;
+    let is i64 as maxn with mut = b;
+    if (uptr == 0) { return abi.E_FAULT; }
+    if (maxn < 0) { return abi.E_INVAL; }
+    if (maxn > abi.PROC_LIST_MAX) { maxn = abi.PROC_LIST_MAX; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
+    let is [384]i64 as kbuf;            // PROC_LIST_MAX(64) * PROC_INFO_WORDS(6)
+    let is [256]i64 as stk;             // DFS worklist of *Process
+    let is i64 as sp with mut = 0;
+    if (proc.init_proc != 0) { stk[0] = proc.init_proc; sp = 1; }
+    let is i64 as total with mut = 0;
+    let is i64 as n with mut = 0;
+    while (sp > 0) {
+        sp = sp - 1;
+        let is i64 as p = stk[sp];
+        if (p != 0) {
+            total = total + 1;
+            if (n < maxn) {
+                let is i64 as base = n * 6;
+                kbuf[base + 0] = proc.proc_pid(p);
+                let is i64 as par = proc.proc_parent(p);
+                if (par != 0) { kbuf[base + 1] = proc.proc_pid(par); } else { kbuf[base + 1] = 0; }
+                kbuf[base + 2] = proc.proc_state(p);
+                kbuf[base + 3] = proc.proc_exit_code(p);
+                kbuf[base + 4] = proc.proc_thread_count(p);
+                let is i64 as asp = proc.proc_aspace(p);
+                if (asp != 0) {
+                    let is *vma.Aspace as ap = cast(*vma.Aspace, asp);
+                    kbuf[base + 5] = ap.committed_bytes;
+                } else { kbuf[base + 5] = 0; }
+                n = n + 1;
+            }
+            let is i64 as sib = proc.proc_next_sib(p);
+            if (sib != 0 && sp < 256) { stk[sp] = sib; sp = sp + 1; }
+            let is i64 as ch = proc.proc_first_child(p);
+            if (ch != 0 && sp < 256) { stk[sp] = ch; sp = sp + 1; }
+        }
+    }
+    if (n > 0) {
+        if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), n * 48) != 0) { return abi.E_FAULT; }
+    }
+    return total;
+}
+
+// ============================================================
+// SYS_MEM_INFO(out_uptr) — [total_pages, free_pages, page_size,
+// committed_bytes_total]. Physical truth from the PMM; committed summed
+// over the aspace tree (same walk as PROC_LIST).
+// ============================================================
+
+fn sys_mem_info(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as uptr = a;
+    if (uptr == 0) { return abi.E_FAULT; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
+    let is [4]i64 as kbuf;
+    let is i64 as total_bytes with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as rc = pmm.region_count();
+    while (i < rc) { total_bytes = total_bytes + pmm.region_len(i); i = i + 1; }
+    kbuf[0] = total_bytes / pmm.PAGE_SIZE;
+    kbuf[1] = cast(i64, pmm.free_total);
+    kbuf[2] = pmm.PAGE_SIZE;
+    let is [256]i64 as stk;
+    let is i64 as sp with mut = 0;
+    if (proc.init_proc != 0) { stk[0] = proc.init_proc; sp = 1; }
+    let is i64 as committed with mut = 0;
+    while (sp > 0) {
+        sp = sp - 1;
+        let is i64 as p = stk[sp];
+        if (p != 0) {
+            let is i64 as asp = proc.proc_aspace(p);
+            if (asp != 0) {
+                let is *vma.Aspace as ap = cast(*vma.Aspace, asp);
+                committed = committed + ap.committed_bytes;
+            }
+            let is i64 as sib = proc.proc_next_sib(p);
+            if (sib != 0 && sp < 256) { stk[sp] = sib; sp = sp + 1; }
+            let is i64 as ch = proc.proc_first_child(p);
+            if (ch != 0 && sp < 256) { stk[sp] = ch; sp = sp + 1; }
+        }
+    }
+    kbuf[3] = committed;
+    if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), 32) != 0) { return abi.E_FAULT; }
+    return abi.E_OK;
+}
+
+// ============================================================
+// SYS_STATFS(out_uptr) — [total_bytes, free_bytes, block_size] for the
+// mounted filesystem. fat32.statfs_fill counts free clusters via the
+// FAT (cached), so the scan is cheap.
+// ============================================================
+
+fn sys_statfs(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as uptr = a;
+    if (uptr == 0) { return abi.E_FAULT; }
+    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
+    let is [3]i64 as kbuf;
+    if (fat32.statfs_fill(cast(*i64, &kbuf[0])) != 0) { return abi.E_IO; }
+    if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), 24) != 0) { return abi.E_FAULT; }
+    return abi.E_OK;
 }
 
 // ============================================================
@@ -1093,4 +1208,7 @@ fn install_all() as void {
     install(abi.SYS_FD_RECV,         cast(i64, fn_ptr(sys_fd_recv)));
     install(abi.SYS_POLL,            cast(i64, fn_ptr(sys_poll)));
     install(abi.SYS_PROC_KILL,       cast(i64, fn_ptr(sys_proc_kill)));
+    install(abi.SYS_PROC_LIST,       cast(i64, fn_ptr(sys_proc_list)));
+    install(abi.SYS_MEM_INFO,        cast(i64, fn_ptr(sys_mem_info)));
+    install(abi.SYS_STATFS,          cast(i64, fn_ptr(sys_statfs)));
 }
