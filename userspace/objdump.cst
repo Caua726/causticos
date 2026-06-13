@@ -1,50 +1,432 @@
-// objdump — inspect a CSE executable's structure. `objdump <file.cse>`.
-// Reads the CSE header + segment table (see docs/CSE_FORMAT.md) and prints
-// them. NOT an x86 disassembler — it shows the container, the header fields,
-// and each segment's layout (vaddr, file/mem size, R/W/X), the honest "what is
-// in this file".
+// objdump — inspect a CSE executable. `objdump [-h] [-s] [-d] <file.cse>`.
+//   -h  header + segment table (the default)
+//   -s  full contents of every segment, hex + ascii
+//   -d  disassemble the executable (X) segments — a real x86-64 decoder for the
+//       instruction subset the Caustic backend emits (REX, ModRM/SIB, the ALU/
+//       mov/shift groups, call/jmp/jcc with resolved targets, syscall, movzx/sx,
+//       setcc/cmovcc). Unknown bytes print as "(bad)" and advance one byte.
+// See docs/CSE_FORMAT.md for the container layout.
 use "../../Caustic/std/causticos/prog.cst" as prog;
 use "../../Caustic/std/os/causticos.cst" as sys;
 use "futil.cst" as fu;
 
+// ---- register / condition / group name tables (filled by fill_names) --------
+let is [16]i64 as G_R64;
+let is [16]i64 as G_R32;
+let is [16]i64 as G_R16;
+let is [16]i64 as G_R8;
+let is [16]i64 as G_CC;
+let is [8]i64 as G_ALU;
+let is [8]i64 as G_SH;
+let is [8]i64 as G_G3;
+
+fn fill_names() as void {
+    G_R64[0] = cast(i64, "rax"); G_R64[1] = cast(i64, "rcx"); G_R64[2] = cast(i64, "rdx"); G_R64[3] = cast(i64, "rbx");
+    G_R64[4] = cast(i64, "rsp"); G_R64[5] = cast(i64, "rbp"); G_R64[6] = cast(i64, "rsi"); G_R64[7] = cast(i64, "rdi");
+    G_R64[8] = cast(i64, "r8");  G_R64[9] = cast(i64, "r9");  G_R64[10] = cast(i64, "r10"); G_R64[11] = cast(i64, "r11");
+    G_R64[12] = cast(i64, "r12"); G_R64[13] = cast(i64, "r13"); G_R64[14] = cast(i64, "r14"); G_R64[15] = cast(i64, "r15");
+    G_R32[0] = cast(i64, "eax"); G_R32[1] = cast(i64, "ecx"); G_R32[2] = cast(i64, "edx"); G_R32[3] = cast(i64, "ebx");
+    G_R32[4] = cast(i64, "esp"); G_R32[5] = cast(i64, "ebp"); G_R32[6] = cast(i64, "esi"); G_R32[7] = cast(i64, "edi");
+    G_R32[8] = cast(i64, "r8d"); G_R32[9] = cast(i64, "r9d"); G_R32[10] = cast(i64, "r10d"); G_R32[11] = cast(i64, "r11d");
+    G_R32[12] = cast(i64, "r12d"); G_R32[13] = cast(i64, "r13d"); G_R32[14] = cast(i64, "r14d"); G_R32[15] = cast(i64, "r15d");
+    G_R16[0] = cast(i64, "ax"); G_R16[1] = cast(i64, "cx"); G_R16[2] = cast(i64, "dx"); G_R16[3] = cast(i64, "bx");
+    G_R16[4] = cast(i64, "sp"); G_R16[5] = cast(i64, "bp"); G_R16[6] = cast(i64, "si"); G_R16[7] = cast(i64, "di");
+    G_R16[8] = cast(i64, "r8w"); G_R16[9] = cast(i64, "r9w"); G_R16[10] = cast(i64, "r10w"); G_R16[11] = cast(i64, "r11w");
+    G_R16[12] = cast(i64, "r12w"); G_R16[13] = cast(i64, "r13w"); G_R16[14] = cast(i64, "r14w"); G_R16[15] = cast(i64, "r15w");
+    G_R8[0] = cast(i64, "al"); G_R8[1] = cast(i64, "cl"); G_R8[2] = cast(i64, "dl"); G_R8[3] = cast(i64, "bl");
+    G_R8[4] = cast(i64, "spl"); G_R8[5] = cast(i64, "bpl"); G_R8[6] = cast(i64, "sil"); G_R8[7] = cast(i64, "dil");
+    G_R8[8] = cast(i64, "r8b"); G_R8[9] = cast(i64, "r9b"); G_R8[10] = cast(i64, "r10b"); G_R8[11] = cast(i64, "r11b");
+    G_R8[12] = cast(i64, "r12b"); G_R8[13] = cast(i64, "r13b"); G_R8[14] = cast(i64, "r14b"); G_R8[15] = cast(i64, "r15b");
+    G_CC[0] = cast(i64, "o"); G_CC[1] = cast(i64, "no"); G_CC[2] = cast(i64, "b"); G_CC[3] = cast(i64, "ae");
+    G_CC[4] = cast(i64, "e"); G_CC[5] = cast(i64, "ne"); G_CC[6] = cast(i64, "be"); G_CC[7] = cast(i64, "a");
+    G_CC[8] = cast(i64, "s"); G_CC[9] = cast(i64, "ns"); G_CC[10] = cast(i64, "p"); G_CC[11] = cast(i64, "np");
+    G_CC[12] = cast(i64, "l"); G_CC[13] = cast(i64, "ge"); G_CC[14] = cast(i64, "le"); G_CC[15] = cast(i64, "g");
+    G_ALU[0] = cast(i64, "add"); G_ALU[1] = cast(i64, "or"); G_ALU[2] = cast(i64, "adc"); G_ALU[3] = cast(i64, "sbb");
+    G_ALU[4] = cast(i64, "and"); G_ALU[5] = cast(i64, "sub"); G_ALU[6] = cast(i64, "xor"); G_ALU[7] = cast(i64, "cmp");
+    G_SH[0] = cast(i64, "rol"); G_SH[1] = cast(i64, "ror"); G_SH[2] = cast(i64, "rcl"); G_SH[3] = cast(i64, "rcr");
+    G_SH[4] = cast(i64, "shl"); G_SH[5] = cast(i64, "shr"); G_SH[6] = cast(i64, "sal"); G_SH[7] = cast(i64, "sar");
+    G_G3[0] = cast(i64, "test"); G_G3[1] = cast(i64, "test"); G_G3[2] = cast(i64, "not"); G_G3[3] = cast(i64, "neg");
+    G_G3[4] = cast(i64, "mul"); G_G3[5] = cast(i64, "imul"); G_G3[6] = cast(i64, "div"); G_G3[7] = cast(i64, "idiv");
+    return;
+}
+
+// ---- string builder (the decoder writes the mnemonic here) ------------------
+let is [256]u8 as G_SB;
+let is i64 as G_SBLEN with mut = 0;
+// context for resolving a RIP-relative operand to its absolute target: the
+// current instruction's vaddr+offset, and the count of immediate bytes that
+// follow the r/m operand (so target = next-insn-vaddr + disp32).
+let is i64 as G_INSN_VA with mut = 0;
+let is i64 as G_INSN_OFF with mut = 0;
+let is i64 as G_TAIL with mut = 0;
+
+fn sb_reset() as void { G_SBLEN = 0; return; }
+fn sb_putc(c as i64) as void { if (G_SBLEN < 250) { G_SB[G_SBLEN] = cast(u8, c & 0xFF); G_SBLEN = G_SBLEN + 1; } return; }
+fn sb_puts(s as *u8) as void { let is i64 as i with mut = 0; while (cast(i64, s[i]) != 0) { sb_putc(cast(i64, s[i])); i = i + 1; } return; }
+fn sb_hex(v as i64) as void {
+    // unsigned hex, minimal digits, with 0x prefix.
+    sb_puts("0x");
+    let is [18]u8 as t; let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    if (x == 0) { sb_putc(48); return; }
+    while (x != 0 && n < 18) { let is i64 as d = x & 15; if (d < 10) { t[n] = cast(u8, 48 + d); } else { t[n] = cast(u8, 87 + d); } x = cast(i64, cast(u64, x) >> 4); n = n + 1; }
+    while (n > 0) { n = n - 1; sb_putc(cast(i64, t[n])); }
+    return;
+}
+fn sb_simm(v as i64) as void { if (v < 0) { sb_puts("-"); sb_hex(0 - v); } else { sb_hex(v); } return; }
+
+fn emit_reg(idx as i64, w as i64) as void {
+    let is i64 as i = idx & 15;
+    if (w == 8) { sb_puts(cast(*u8, G_R64[i])); }
+    else if (w == 2) { sb_puts(cast(*u8, G_R16[i])); }
+    else if (w == 1) { sb_puts(cast(*u8, G_R8[i])); }
+    else { sb_puts(cast(*u8, G_R32[i])); }
+    return;
+}
+
+// ---- raw little-endian reads ------------------------------------------------
 fn rd_u16(p as *u8, off as i64) as i64 { return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8); }
 fn rd_u32(p as *u8, off as i64) as i64 { return rd_u16(p, off) | (rd_u16(p, off + 2) << 16); }
 fn rd_u64(p as *u8, off as i64) as i64 { return rd_u32(p, off) | (rd_u32(p, off + 4) << 32); }
+fn rd_s8(p as *u8, off as i64) as i64 { let is i64 as b = cast(i64, p[off]); if (b >= 128) { return b - 256; } return b; }
+fn rd_s32(p as *u8, off as i64) as i64 { let is i64 as u = rd_u32(p, off); if (u >= 2147483648) { return u - 4294967296; } return u; }
 
-fn hex(v as i64) as void {
-    prog.outs("0x");
-    let is [16]u8 as b;
-    let is i64 as nd with mut = 1;
-    let is i64 as t with mut = v;
-    while (t >= 16) { t = t / 16; nd = nd + 1; }
-    let is i64 as i with mut = nd;
-    let is i64 as x with mut = v;
-    while (i > 0) { i = i - 1; let is i64 as d = x & 15; if (d < 10) { b[i] = cast(u8, 48 + d); } else { b[i] = cast(u8, 87 + d); } x = x / 16; }
-    prog.out(cast(*u8, &b[0]), nd);
+// ---- disp helper inside [ ... ] ---------------------------------------------
+fn emit_disp(d as i64, wrote as i64) as void {
+    if (wrote != 0) { if (d < 0) { sb_puts("-"); sb_hex(0 - d); } else { sb_puts("+"); sb_hex(d); } }
+    else { sb_hex(d); }
+    return;
 }
 
-fn perms_str(p as i64) as void {
-    if ((p & 1) != 0) { prog.outs("R"); } else { prog.outs("-"); }
-    if ((p & 2) != 0) { prog.outs("W"); } else { prog.outs("-"); }
-    if ((p & 4) != 0) { prog.outs("X"); } else { prog.outs("-"); }
+// print the r/m operand (register if mod==3, else memory). returns the number
+// of SIB+displacement bytes consumed past the ModRM byte.
+fn oper_rm(p as *u8, o as i64, modb as i64, w as i64, rexX as i64, rexB as i64) as i64 {
+    let is i64 as md = (modb >> 6) & 3;
+    let is i64 as rm = modb & 7;
+    if (md == 3) { emit_reg(rm | (rexB << 3), w); return 0; }
+    let is i64 as extra with mut = 0;
+    sb_puts("[");
+    if (rm == 4) {                                   // SIB
+        let is i64 as sib = cast(i64, p[o]); extra = 1;
+        let is i64 as scale = (sib >> 6) & 3;
+        let is i64 as idx = ((sib >> 3) & 7) | (rexX << 3);
+        let is i64 as bas = (sib & 7) | (rexB << 3);
+        let is i64 as nobase with mut = 0;
+        if (md == 0 && (sib & 7) == 5) { nobase = 1; }
+        let is i64 as wrote with mut = 0;
+        if (nobase == 0) { emit_reg(bas, 8); wrote = 1; }
+        if (((sib >> 3) & 7) != 4) {                 // index rsp(4) means "none"
+            if (wrote != 0) { sb_puts("+"); }
+            emit_reg(idx, 8);
+            if (scale > 0) { sb_puts("*"); sb_hex(1 << scale); }
+            wrote = 1;
+        }
+        if (md == 1) { emit_disp(rd_s8(p, o + extra), wrote); extra = extra + 1; }
+        else if (md == 2) { emit_disp(rd_s32(p, o + extra), wrote); extra = extra + 4; }
+        else if (nobase != 0) { emit_disp(rd_s32(p, o + extra), wrote); extra = extra + 4; }
+    } else if (md == 0 && rm == 5) {                 // RIP-relative -> absolute target
+        let is i64 as disp = rd_s32(p, o);
+        let is i64 as tgt = G_INSN_VA + (o + 4 + G_TAIL - G_INSN_OFF) + disp;
+        sb_puts("rel "); sb_hex(tgt); extra = 4;
+    } else {
+        emit_reg(rm | (rexB << 3), 8);
+        if (md == 1) { emit_disp(rd_s8(p, o), 1); extra = 1; }
+        else if (md == 2) { emit_disp(rd_s32(p, o), 1); extra = 4; }
+    }
+    sb_puts("]");
+    return extra;
+}
+
+// decode one instruction at file offset `off` (its virtual address `vaddr`).
+// fills G_SB with the textual form; returns the instruction length in bytes.
+fn decode_insn(p as *u8, off as i64, vaddr as i64) as i64 {
+    let is i64 as o with mut = off;
+    G_INSN_VA = vaddr; G_INSN_OFF = off; G_TAIL = 0;
+    let is i64 as p66 with mut = 0;
+    // legacy prefixes
+    let is i64 as go with mut = 1;
+    while (go != 0) {
+        let is i64 as b = cast(i64, p[o]);
+        if (b == 0x66) { p66 = 1; o = o + 1; }
+        else if (b == 0x67 || b == 0xF0 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65) { o = o + 1; }
+        else if (b == 0xF2 || b == 0xF3) { o = o + 1; }
+        else { go = 0; }
+    }
+    let is i64 as rexW with mut = 0; let is i64 as rexR with mut = 0;
+    let is i64 as rexX with mut = 0; let is i64 as rexB with mut = 0;
+    let is i64 as rb = cast(i64, p[o]);
+    if (rb >= 0x40 && rb <= 0x4F) { rexW = (rb >> 3) & 1; rexR = (rb >> 2) & 1; rexX = (rb >> 1) & 1; rexB = rb & 1; o = o + 1; }
+    let is i64 as op = cast(i64, p[o]); o = o + 1;
+    let is i64 as w with mut = 4;
+    if (rexW == 1) { w = 8; } else if (p66 == 1) { w = 2; }
+
+    // ---- push/pop reg ----
+    if (op >= 0x50 && op <= 0x57) { sb_puts("push "); emit_reg((op - 0x50) | (rexB << 3), 8); return o - off; }
+    if (op >= 0x58 && op <= 0x5F) { sb_puts("pop "); emit_reg((op - 0x58) | (rexB << 3), 8); return o - off; }
+    if (op == 0x68) { sb_puts("push "); sb_simm(rd_s32(p, o)); o = o + 4; return o - off; }
+    if (op == 0x6A) { sb_puts("push "); sb_simm(rd_s8(p, o)); o = o + 1; return o - off; }
+
+    // ---- ALU reg/rm family (add..cmp, the 0x00..0x3D block) ----
+    if (op < 0x40 && (op & 7) < 6 && (op & 0xC0) == 0) {
+        let is i64 as alu = (op >> 3) & 7;
+        let is i64 as sub = op & 7;
+        sb_puts(cast(*u8, G_ALU[alu])); sb_puts(" ");
+        if (sub == 4) { emit_reg(0, 1); sb_puts(", "); sb_simm(rd_s8(p, o)); o = o + 1; return o - off; }
+        if (sub == 5) { emit_reg(0, w); sb_puts(", "); if (w == 2) { sb_hex(rd_u16(p, o)); o = o + 2; } else { sb_simm(rd_s32(p, o)); o = o + 4; } return o - off; }
+        let is i64 as ww with mut = w; if (sub == 0 || sub == 2) { ww = 1; }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3);
+        if (sub == 2 || sub == 3) { emit_reg(reg, ww); sb_puts(", "); o = o + oper_rm(p, o, modb, ww, rexX, rexB); }
+        else { let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e; sb_puts(", "); emit_reg(reg, ww); }
+        return o - off;
+    }
+
+    // ---- mov ----
+    if (op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B || op == 0x8D || op == 0x63) {
+        let is i64 as ww with mut = w; if (op == 0x88 || op == 0x8A) { ww = 1; }
+        let is i64 as wr with mut = ww;
+        if (op == 0x63) { sb_puts("movsxd "); ww = 4; wr = 8; } else if (op == 0x8D) { sb_puts("lea "); } else { sb_puts("mov "); }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3);
+        if (op == 0x88 || op == 0x89) { let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e; sb_puts(", "); emit_reg(reg, ww); }
+        else { emit_reg(reg, wr); sb_puts(", "); o = o + oper_rm(p, o, modb, ww, rexX, rexB); }
+        return o - off;
+    }
+    if (op == 0xC6 || op == 0xC7) {
+        let is i64 as ww with mut = w; if (op == 0xC6) { ww = 1; }
+        sb_puts("mov ");
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        if (op == 0xC6) { G_TAIL = 1; } else if (ww == 2) { G_TAIL = 2; } else { G_TAIL = 4; }
+        let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e;
+        sb_puts(", ");
+        if (op == 0xC6) { sb_hex(cast(i64, p[o])); o = o + 1; } else if (ww == 2) { sb_hex(rd_u16(p, o)); o = o + 2; } else if (rexW == 1) { sb_simm(rd_s32(p, o)); o = o + 4; } else { sb_hex(rd_u32(p, o)); o = o + 4; }
+        return o - off;
+    }
+    if (op >= 0xB8 && op <= 0xBF) {
+        sb_puts("mov "); emit_reg((op - 0xB8) | (rexB << 3), w); sb_puts(", ");
+        if (rexW == 1) { sb_hex(rd_u64(p, o)); o = o + 8; } else if (w == 2) { sb_hex(rd_u16(p, o)); o = o + 2; } else { sb_hex(rd_u32(p, o)); o = o + 4; }
+        return o - off;
+    }
+    if (op >= 0xB0 && op <= 0xB7) { sb_puts("mov "); emit_reg((op - 0xB0) | (rexB << 3), 1); sb_puts(", "); sb_hex(cast(i64, p[o])); o = o + 1; return o - off; }
+
+    // ---- grp1: rm, imm ----
+    if (op == 0x80 || op == 0x81 || op == 0x83) {
+        let is i64 as ww with mut = w; if (op == 0x80) { ww = 1; }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        let is i64 as alu = (modb >> 3) & 7;
+        sb_puts(cast(*u8, G_ALU[alu])); sb_puts(" ");
+        if (op == 0x83 || op == 0x80) { G_TAIL = 1; } else if (ww == 2) { G_TAIL = 2; } else { G_TAIL = 4; }
+        let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e; sb_puts(", ");
+        if (op == 0x83) { sb_simm(rd_s8(p, o)); o = o + 1; }
+        else if (op == 0x80) { sb_hex(cast(i64, p[o])); o = o + 1; }
+        else if (ww == 2) { sb_hex(rd_u16(p, o)); o = o + 2; }
+        else { sb_simm(rd_s32(p, o)); o = o + 4; }
+        return o - off;
+    }
+    // ---- test / xchg rm,reg ----
+    if (op == 0x84 || op == 0x85 || op == 0x86 || op == 0x87) {
+        let is i64 as ww with mut = w; if (op == 0x84 || op == 0x86) { ww = 1; }
+        if (op < 0x86) { sb_puts("test "); } else { sb_puts("xchg "); }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3);
+        let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e; sb_puts(", "); emit_reg(reg, ww);
+        return o - off;
+    }
+    if (op == 0xA8) { sb_puts("test al, "); sb_hex(cast(i64, p[o])); o = o + 1; return o - off; }
+    if (op == 0xA9) { sb_puts("test "); emit_reg(0, w); sb_puts(", "); sb_hex(rd_u32(p, o)); o = o + 4; return o - off; }
+
+    // ---- shift group ----
+    if (op == 0xC0 || op == 0xC1 || op == 0xD0 || op == 0xD1 || op == 0xD2 || op == 0xD3) {
+        let is i64 as ww with mut = w; if (op == 0xC0 || op == 0xD0 || op == 0xD2) { ww = 1; }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        sb_puts(cast(*u8, G_SH[(modb >> 3) & 7])); sb_puts(" ");
+        if (op == 0xC0 || op == 0xC1) { G_TAIL = 1; }
+        let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e;
+        if (op == 0xC0 || op == 0xC1) { sb_puts(", "); sb_hex(cast(i64, p[o])); o = o + 1; }
+        else if (op == 0xD0 || op == 0xD1) { sb_puts(", 1"); }
+        else { sb_puts(", cl"); }
+        return o - off;
+    }
+
+    // ---- grp3 (F6/F7): test/not/neg/mul/imul/div/idiv ----
+    if (op == 0xF6 || op == 0xF7) {
+        let is i64 as ww with mut = w; if (op == 0xF6) { ww = 1; }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        let is i64 as sub = (modb >> 3) & 7;
+        sb_puts(cast(*u8, G_G3[sub])); sb_puts(" ");
+        if (sub == 0 || sub == 1) { if (op == 0xF6) { G_TAIL = 1; } else if (ww == 2) { G_TAIL = 2; } else { G_TAIL = 4; } }
+        let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e;
+        if (sub == 0 || sub == 1) { sb_puts(", "); if (op == 0xF6) { sb_hex(cast(i64, p[o])); o = o + 1; } else if (ww == 2) { sb_hex(rd_u16(p, o)); o = o + 2; } else { sb_hex(rd_u32(p, o)); o = o + 4; } }
+        return o - off;
+    }
+    // ---- inc/dec/call/jmp/push group (FE/FF) ----
+    if (op == 0xFE || op == 0xFF) {
+        let is i64 as ww with mut = w; if (op == 0xFE) { ww = 1; }
+        let is i64 as modb = cast(i64, p[o]); o = o + 1;
+        let is i64 as sub = (modb >> 3) & 7;
+        if (sub == 0) { sb_puts("inc "); } else if (sub == 1) { sb_puts("dec "); }
+        else if (sub == 2) { sb_puts("call "); ww = 8; } else if (sub == 3) { sb_puts("callf "); }
+        else if (sub == 4) { sb_puts("jmp "); ww = 8; } else if (sub == 5) { sb_puts("jmpf "); }
+        else if (sub == 6) { sb_puts("push "); ww = 8; } else { sb_puts("(bad) "); }
+        let is i64 as e = oper_rm(p, o, modb, ww, rexX, rexB); o = o + e;
+        return o - off;
+    }
+
+    // ---- control flow ----
+    if (op == 0xE8 || op == 0xE9) {
+        let is i64 as rel = rd_s32(p, o); o = o + 4;
+        if (op == 0xE8) { sb_puts("call "); } else { sb_puts("jmp "); }
+        sb_hex(vaddr + (o - off) + rel); return o - off;
+    }
+    if (op == 0xEB) { let is i64 as rel = rd_s8(p, o); o = o + 1; sb_puts("jmp "); sb_hex(vaddr + (o - off) + rel); return o - off; }
+    if (op >= 0x70 && op <= 0x7F) {
+        let is i64 as rel = rd_s8(p, o); o = o + 1;
+        sb_puts("j"); sb_puts(cast(*u8, G_CC[op - 0x70])); sb_puts(" "); sb_hex(vaddr + (o - off) + rel);
+        return o - off;
+    }
+    if (op == 0xC3) { sb_puts("ret"); return o - off; }
+    if (op == 0xC2) { sb_puts("ret "); sb_hex(rd_u16(p, o)); o = o + 2; return o - off; }
+    if (op == 0xC9) { sb_puts("leave"); return o - off; }
+    if (op == 0x90) { sb_puts("nop"); return o - off; }
+    if (op == 0xCC) { sb_puts("int3"); return o - off; }
+    if (op == 0xCD) { sb_puts("int "); sb_hex(cast(i64, p[o])); o = o + 1; return o - off; }
+    if (op == 0x98) { if (rexW == 1) { sb_puts("cdqe"); } else { sb_puts("cwde"); } return o - off; }
+    if (op == 0x99) { if (rexW == 1) { sb_puts("cqo"); } else { sb_puts("cdq"); } return o - off; }
+
+    // ---- two-byte (0x0F) map ----
+    if (op == 0x0F) {
+        let is i64 as op2 = cast(i64, p[o]); o = o + 1;
+        if (op2 == 0x05) { sb_puts("syscall"); return o - off; }
+        if (op2 == 0x0B) { sb_puts("ud2"); return o - off; }
+        if (op2 == 0x31) { sb_puts("rdtsc"); return o - off; }
+        if (op2 == 0xA2) { sb_puts("cpuid"); return o - off; }
+        if (op2 >= 0x80 && op2 <= 0x8F) { let is i64 as rel = rd_s32(p, o); o = o + 4; sb_puts("j"); sb_puts(cast(*u8, G_CC[op2 - 0x80])); sb_puts(" "); sb_hex(vaddr + (o - off) + rel); return o - off; }
+        if (op2 >= 0x90 && op2 <= 0x9F) { let is i64 as modb = cast(i64, p[o]); o = o + 1; sb_puts("set"); sb_puts(cast(*u8, G_CC[op2 - 0x90])); sb_puts(" "); o = o + oper_rm(p, o, modb, 1, rexX, rexB); return o - off; }
+        if (op2 >= 0x40 && op2 <= 0x4F) { let is i64 as modb = cast(i64, p[o]); o = o + 1; let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3); sb_puts("cmov"); sb_puts(cast(*u8, G_CC[op2 - 0x40])); sb_puts(" "); emit_reg(reg, w); sb_puts(", "); o = o + oper_rm(p, o, modb, w, rexX, rexB); return o - off; }
+        if (op2 == 0xAF) { let is i64 as modb = cast(i64, p[o]); o = o + 1; let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3); sb_puts("imul "); emit_reg(reg, w); sb_puts(", "); o = o + oper_rm(p, o, modb, w, rexX, rexB); return o - off; }
+        if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF) {
+            let is i64 as modb = cast(i64, p[o]); o = o + 1;
+            let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3);
+            let is i64 as sw with mut = 1; if (op2 == 0xB7 || op2 == 0xBF) { sw = 2; }
+            if (op2 == 0xB6 || op2 == 0xB7) { sb_puts("movzx "); } else { sb_puts("movsx "); }
+            emit_reg(reg, w); sb_puts(", ");
+            if (((modb >> 6) & 3) != 3) { if (sw == 1) { sb_puts("byte "); } else { sb_puts("word "); } }
+            o = o + oper_rm(p, o, modb, sw, rexX, rexB); return o - off;
+        }
+        if (op2 == 0x1F) { let is i64 as modb = cast(i64, p[o]); o = o + 1; sb_puts("nop "); o = o + oper_rm(p, o, modb, w, rexX, rexB); return o - off; }
+        if (op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB) {
+            let is i64 as modb = cast(i64, p[o]); o = o + 1; let is i64 as reg = ((modb >> 3) & 7) | (rexR << 3);
+            if (op2 == 0xA3) { sb_puts("bt "); } else if (op2 == 0xAB) { sb_puts("bts "); } else if (op2 == 0xB3) { sb_puts("btr "); } else { sb_puts("btc "); }
+            let is i64 as e = oper_rm(p, o, modb, w, rexX, rexB); o = o + e; sb_puts(", "); emit_reg(reg, w); return o - off;
+        }
+        sb_puts("(bad 0f)"); return o - off;
+    }
+
+    sb_puts("(bad)");
+    return o - off;
+}
+
+// ---- output helpers (addresses / byte columns go straight to stdout) --------
+fn hex_raw(v as i64) as void {
+    let is [18]u8 as t; let is i64 as n with mut = 0; let is i64 as x with mut = v;
+    if (x == 0) { prog.out("0", 1); return; }
+    while (x != 0 && n < 18) { let is i64 as d = x & 15; if (d < 10) { t[n] = cast(u8, 48 + d); } else { t[n] = cast(u8, 87 + d); } x = cast(i64, cast(u64, x) >> 4); n = n + 1; }
+    let is [18]u8 as r; let is i64 as m with mut = 0;
+    while (n > 0) { n = n - 1; r[m] = t[n]; m = m + 1; }
+    prog.out(cast(*u8, &r[0]), m);
+    return;
+}
+fn byte_hex(v as i64) as void {
+    let is [2]u8 as t; let is i64 as h = (v >> 4) & 15; let is i64 as l = v & 15;
+    if (h < 10) { t[0] = cast(u8, 48 + h); } else { t[0] = cast(u8, 87 + h); }
+    if (l < 10) { t[1] = cast(u8, 48 + l); } else { t[1] = cast(u8, 87 + l); }
+    prog.out(cast(*u8, &t[0]), 2);
+    return;
+}
+
+fn disasm_seg(p as *u8, foff as i64, fsz as i64, vaddr as i64) as void {
+    let is i64 as o with mut = foff;
+    let is i64 as end = foff + fsz;
+    let is i64 as va with mut = vaddr;
+    while (o < end) {
+        sb_reset();
+        let is i64 as nb with mut = decode_insn(p, o, va);
+        if (nb <= 0) { nb = 1; }
+        if (o + nb > end) { nb = end - o; }
+        prog.outs("  "); hex_raw(va); prog.outs(":\t");
+        let is i64 as j with mut = 0;
+        while (j < nb) { byte_hex(cast(i64, p[o + j])); prog.out(" ", 1); j = j + 1; }
+        let is i64 as pad with mut = 28 - nb * 3; while (pad > 0) { prog.out(" ", 1); pad = pad - 1; }
+        prog.out(cast(*u8, &G_SB[0]), G_SBLEN);
+        prog.out("\n", 1);
+        o = o + nb; va = va + nb;
+    }
+    return;
+}
+
+fn dump_contents(p as *u8, foff as i64, fsz as i64, vaddr as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < fsz) {
+        prog.outs("  "); hex_raw(vaddr + i); prog.outs(" ");
+        let is i64 as j with mut = 0;
+        while (j < 16) {
+            if (i + j < fsz) { byte_hex(cast(i64, p[foff + i + j])); } else { prog.outs("  "); }
+            prog.out(" ", 1);
+            j = j + 1;
+        }
+        prog.outs(" ");
+        j = 0;
+        while (j < 16 && i + j < fsz) {
+            let is i64 as c = cast(i64, p[foff + i + j]);
+            if (c >= 32 && c < 127) { prog.out(cast(*u8, &p[foff + i + j]), 1); } else { prog.outs("."); }
+            j = j + 1;
+        }
+        prog.out("\n", 1);
+        i = i + 16;
+    }
+    return;
+}
+
+fn perms_str(pm as i64) as void {
+    if ((pm & 1) != 0) { prog.outs("R"); } else { prog.outs("-"); }
+    if ((pm & 2) != 0) { prog.outs("W"); } else { prog.outs("-"); }
+    if ((pm & 4) != 0) { prog.outs("X"); } else { prog.outs("-"); }
+    return;
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
-    if (argc < 2) { prog.outs("usage: objdump <file.cse>\n"); return cast(i32, 1); }
+    fill_names();
+    let is i64 as want_d with mut = 0;
+    let is i64 as want_s with mut = 0;
+    let is *u8 as arg1 with mut = cast(*u8, 0);
+    let is i64 as i with mut = 1;
+    while (i < argc) {
+        let is *u8 as a = prog.arg(argv, i);
+        if (cast(i64, a[0]) == 45 && cast(i64, a[1]) != 0) {
+            let is i64 as k with mut = 1;
+            while (cast(i64, a[k]) != 0) {
+                let is i64 as c = cast(i64, a[k]);
+                if (c == 100) { want_d = 1; } else if (c == 115) { want_s = 1; } else if (c == 104) { } // -d -s -h
+                k = k + 1;
+            }
+        } else { arg1 = a; }
+        i = i + 1;
+    }
+    if (cast(i64, arg1) == 0) { prog.outs("usage: objdump [-hsd] <file.cse>\n"); return cast(i32, 1); }
+
     let is [256]u8 as pb;
-    let is *u8 as path = prog.abspath(prog.arg(argv, 1), cast(*u8, &pb[0]));
+    let is *u8 as path = prog.abspath(arg1, cast(*u8, &pb[0]));
     let is i64 as len with mut = 0;
     let is i64 as base = fu.slurp(path, &len);
     if (len <= 0) { prog.outs("objdump: cannot read "); prog.outs(path); prog.out("\n", 1); return cast(i32, 1); }
     let is *u8 as p = cast(*u8, base);
 
-    // container: pure "CST_" at 0, or polyglot "MZ" with a "CST*" mini-header at 0x40.
     let is i64 as cst with mut = 0;
     if (cast(i64, p[0]) == 67 && cast(i64, p[1]) == 83 && cast(i64, p[2]) == 84 && cast(i64, p[3]) == 95) {
         cst = 0; prog.outs("container: pure CSE\n");
     } else if (cast(i64, p[0]) == 77 && cast(i64, p[1]) == 90) {
         cst = rd_u64(p, 0x48);
-        prog.outs("container: polyglot (MZ); CST body at "); hex(cst); prog.out("\n", 1);
+        prog.outs("container: polyglot (MZ); CST body at "); prog.outs("0x"); hex_raw(cst); prog.out("\n", 1);
     } else {
         prog.outs("objdump: not a CSE (bad magic)\n"); fu.unslurp(base, len); return cast(i32, 1);
     }
@@ -58,31 +440,58 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as entry = rd_u64(p, cst + 8);
     let is i64 as basev = rd_u64(p, cst + 0x10);
     let is i64 as nseg = rd_u32(p, cst + 0x18);
-    // Header is 0x20 in v2, 0x30 in v3 (v3 added stacksize@0x2C + import fields);
-    // the segment table starts right after it.
     let is i64 as hsize with mut = 0x20;
     if (ver == 3) { hsize = 0x30; }
-    prog.outs("version:  "); prog.out_num(ver); prog.out("\n", 1);
-    prog.outs("arch:     "); prog.out_num(arch); if (arch == 1) { prog.outs(" (x86_64)"); } prog.out("\n", 1);
-    prog.outs("flags:    "); hex(flags); if ((flags & 1) != 0) { prog.outs("  (dynamic-stack)"); } prog.out("\n", 1);
-    prog.outs("entry:    "); hex(entry); prog.out("\n", 1);
-    prog.outs("base:     "); hex(basev); prog.out("\n", 1);
+    prog.outs("version:   "); prog.out_num(ver); prog.out("\n", 1);
+    prog.outs("arch:      "); prog.out_num(arch); if (arch == 1) { prog.outs(" (x86_64)"); } prog.out("\n", 1);
+    prog.outs("flags:     0x"); hex_raw(flags); if ((flags & 1) != 0) { prog.outs("  (dynamic-stack)"); } prog.out("\n", 1);
+    prog.outs("entry:     0x"); hex_raw(entry); prog.out("\n", 1);
+    prog.outs("base:      0x"); hex_raw(basev); prog.out("\n", 1);
     if (ver == 3) { prog.outs("stacksize: "); prog.out_num(rd_u32(p, cst + 0x2C)); prog.outs(" bytes\n"); }
-    prog.outs("segments: "); prog.out_num(nseg); prog.out("\n", 1);
+    prog.outs("segments:  "); prog.out_num(nseg); prog.out("\n", 1);
     prog.outs("  #   vaddr            f_off    f_sz     m_sz     perms\n");
-    let is i64 as i with mut = 0;
-    while (i < nseg) {
-        let is i64 as s = cst + hsize + i * 24;
-        prog.outs("  "); prog.out_num(i); prog.outs("   ");
-        hex(rd_u64(p, s)); prog.outs("   ");
-        prog.pad_num(rd_u32(p, s + 8), 7); prog.outs("   ");
-        prog.pad_num(rd_u32(p, s + 0xC), 7); prog.outs("   ");
-        prog.pad_num(rd_u32(p, s + 0x10), 7); prog.outs("   ");
-        perms_str(rd_u32(p, s + 0x14));
+    let is i64 as s with mut = 0;
+    while (s < nseg) {
+        let is i64 as so = cst + hsize + s * 24;
+        prog.outs("  "); prog.out_num(s); prog.outs("   0x"); hex_raw(rd_u64(p, so));
+        prog.outs("   ");
+        prog.pad_num(rd_u32(p, so + 8), 7); prog.outs("  ");
+        prog.pad_num(rd_u32(p, so + 0xC), 7); prog.outs("  ");
+        prog.pad_num(rd_u32(p, so + 0x10), 7); prog.outs("  ");
+        perms_str(rd_u32(p, so + 0x14));
         prog.out("\n", 1);
-        i = i + 1;
+        s = s + 1;
     }
     prog.outs("file size: "); prog.out_num(len); prog.outs(" bytes\n");
+
+    if (want_s != 0) {
+        s = 0;
+        while (s < nseg) {
+            let is i64 as so = cst + hsize + s * 24;
+            let is i64 as va = rd_u64(p, so);
+            let is i64 as fo = rd_u32(p, so + 8);
+            let is i64 as fz = rd_u32(p, so + 0xC);
+            prog.outs("\nContents of segment "); prog.out_num(s); prog.outs(" (vaddr 0x"); hex_raw(va); prog.outs("):\n");
+            dump_contents(p, cst + fo, fz, va);
+            s = s + 1;
+        }
+    }
+    if (want_d != 0) {
+        s = 0;
+        while (s < nseg) {
+            let is i64 as so = cst + hsize + s * 24;
+            let is i64 as pm = rd_u32(p, so + 0x14);
+            if ((pm & 4) != 0) {
+                let is i64 as va = rd_u64(p, so);
+                let is i64 as fo = rd_u32(p, so + 8);
+                let is i64 as fz = rd_u32(p, so + 0xC);
+                prog.outs("\nDisassembly of segment "); prog.out_num(s); prog.outs(" (vaddr 0x"); hex_raw(va); prog.outs("):\n");
+                disasm_seg(p, cst + fo, fz, va);
+            }
+            s = s + 1;
+        }
+    }
+
     fu.unslurp(base, len);
     return 0;
 }
