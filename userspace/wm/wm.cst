@@ -39,6 +39,12 @@ let is i64 as COL_BORDER_U with imut = 0x003a4048;
 let is i64 as COL_TITLE_F  with imut = 0x002a3a4a;
 let is i64 as COL_TITLE_U  with imut = 0x001c2228;
 let is i64 as COL_TEXT     with imut = 0x00d3d7cf;
+// ---- taskbar ----
+let is i64 as BAR_H        with imut = 26;          // taskbar height (bottom)
+let is i64 as TASK_W       with imut = 150;         // per-window button width
+let is i64 as COL_BAR      with imut = 0x00161b21;  // taskbar background
+let is i64 as COL_BAR_ITEM with imut = 0x00262f38;  // window button (inactive)
+let is i64 as COL_BAR_DIM  with imut = 0x008a909a;  // minimized window text
 
 // ---- the window table ----
 // state: 0 = free, 1 = spawned/awaiting HELLO, 2 = live (segment mapped).
@@ -56,6 +62,7 @@ struct Win {
     mb_fill as i64;                                  // partial-message fill (buf in mbufs)
     maximized as i64;                                // 0 = floating, 1 = maximized/snapped
     sav_x as i64;  sav_y as i64;  sav_w as i64;  sav_h as i64;   // geometry to restore
+    minimized as i64;                                // 1 = hidden, lives only on the taskbar
 }
 let is [8]Win as wins with mut;
 let is [256]u8 as mbufs with mut;                    // 8 × 32B message accumulators
@@ -72,6 +79,12 @@ let is i64 as scr_h with mut = 0;
 let is i64 as scr_pitch with mut = 0;
 let is i64 as fb_base with mut = 0;
 let is i64 as fb_fd with mut = 0;
+let is i64 as work_h with mut = 0;                   // usable height = scr_h - BAR_H
+
+// ---- clock (HH:MM:SS) shown at the right of the taskbar ----
+let is [12]u8 as clock_str with mut;
+let is i64 as clock_len with mut = 0;
+let is i64 as clock_next with mut = 0;               // next wall read (monotonic ns)
 
 // ---- input ----
 let is i64 as kbd_fd with mut = 0;
@@ -191,6 +204,7 @@ fn damage(x as i64, y as i64, w as i64, h as i64) as void {
 }
 
 fn damage_all() as void { dmg_full = 1; return; }
+fn damage_taskbar() as void { damage(0, scr_h - BAR_H, scr_w, BAR_H); return; }
 
 fn damage_frame(i as i64) as void {
     damage(wins[i].x, wins[i].y,
@@ -299,6 +313,9 @@ fn draw_win_buttons(i as i64, tcol as i64) as void {
     } else {                                          // maximize: one square
         rect_outline(mxx, iy, icon, icon, COL_TEXT);
     }
+    // minimize button: a low horizontal bar
+    let is i64 as nbx = mbx - BTN_W;
+    cfill(nbx + (BTN_W - icon) / 2, iy + icon - 1, icon, 1, COL_TEXT);
     return;
 }
 
@@ -326,6 +343,67 @@ fn cblit_content(i as i64) as void {
     return;
 }
 
+// ---- clock + taskbar ----
+fn fmt2(off as i64, v as i64) as void {
+    clock_str[off] = cast(u8, 48 + v / 10);
+    clock_str[off + 1] = cast(u8, 48 + v - (v / 10) * 10);
+    return;
+}
+fn update_clock() as void {
+    let is [6]i64 as t;
+    if (sys.time_wall(cast(*i64, &t[0])) != 0) { return; }
+    fmt2(0, t[3]); clock_str[2] = cast(u8, 58);      // HH:MM:SS  (':' = 58)
+    fmt2(3, t[4]); clock_str[5] = cast(u8, 58);
+    fmt2(6, t[5]);
+    clock_len = 8;
+    return;
+}
+
+// The taskbar: one button per live window (left → right), the clock (right).
+fn draw_taskbar() as void {
+    let is i64 as by = scr_h - BAR_H;
+    if (clip_y1 <= by) { return; }                   // this rect doesn't touch the bar
+    cfill(0, by, scr_w, BAR_H, COL_BAR);
+    cfill(0, by, scr_w, 1, COL_BORDER_U);            // top hairline
+    let is i64 as gy = by + (BAR_H - 16) / 2;        // glyph baseline (font is 8x16)
+    let is i64 as bx with mut = 4;
+    let is i64 as i with mut = 0;
+    while (i < MAX_WIN) {
+        if (wins[i].used == 1 && wins[i].state == 2) {
+            let is i64 as active with mut = 0;
+            if (nz > 0 && zord[0] == i && wins[i].minimized == 0) { active = 1; }
+            let is i64 as bg with mut = COL_BAR_ITEM;
+            if (active == 1) { bg = COL_TITLE_F; }
+            cfill(bx, by + 3, TASK_W, BAR_H - 6, bg);
+            if (active == 1) { cfill(bx, by + BAR_H - 3, TASK_W, 2, COL_BORDER_F); }
+            let is i64 as tcol with mut = COL_TEXT;
+            if (wins[i].minimized == 1) { tcol = COL_BAR_DIM; }
+            if (wins[i].title_len > 0) {
+                let is [16]u8 as tb;
+                wmp.title_unpack(wins[i].t0, wins[i].t1, wins[i].title_len, cast(*u8, &tb[0]));
+                let is i64 as k with mut = 0;
+                while (k < wins[i].title_len) {
+                    let is i64 as gx = bx + 6 + k * 8;
+                    if (gx + 8 > bx + TASK_W - 4) { break; }
+                    cglyph(cast(i64, tb[k]), gx, gy, tcol);
+                    k = k + 1;
+                }
+            }
+            bx = bx + TASK_W + 4;
+        }
+        i = i + 1;
+    }
+    if (clock_len > 0) {                              // clock, right-aligned
+        let is i64 as cx0 = scr_w - clock_len * 8 - 10;
+        let is i64 as k2 with mut = 0;
+        while (k2 < clock_len) {
+            cglyph(cast(i64, clock_str[k2]), cx0 + k2 * 8, gy, COL_TEXT);
+            k2 = k2 + 1;
+        }
+    }
+    return;
+}
+
 // Re-composite one rect: desktop, then every window back-to-front.
 fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
     clip_x0 = rx; clip_y0 = ry; clip_x1 = rx + rw; clip_y1 = ry + rh;
@@ -338,7 +416,7 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
     let is i64 as zi with mut = nz - 1;
     while (zi >= 0) {
         let is i64 as i = zord[zi];
-        if (wins[i].used == 1 && wins[i].state == 2) {
+        if (wins[i].used == 1 && wins[i].state == 2 && wins[i].minimized == 0) {
             let is i64 as focused with mut = 0;
             if (zi == 0) { focused = 1; }
             let is i64 as bcol with mut = COL_BORDER_U;
@@ -348,7 +426,7 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
             cfill(wins[i].x, wins[i].y,
                   wins[i].w + 2 * BORDER, wins[i].h + TITLE_H + 2 * BORDER, bcol);
             cfill(wins[i].x + BORDER, wins[i].y + BORDER, wins[i].w, TITLE_H, tcol);
-            let is i64 as tx_max = wins[i].x + BORDER + wins[i].w - 2 * BTN_W;  // stop before buttons
+            let is i64 as tx_max = wins[i].x + BORDER + wins[i].w - 3 * BTN_W;  // stop before buttons
             if (wins[i].title_len > 0) {
                 let is [16]u8 as tbuf;
                 wmp.title_unpack(wins[i].t0, wins[i].t1, wins[i].title_len, cast(*u8, &tbuf[0]));
@@ -365,6 +443,7 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
         }
         zi = zi - 1;
     }
+    draw_taskbar();                                  // bar sits above windows, below cursor
     // the cursor rides on top of everything
     if (mouse_fd >= 0 || tab_fd >= 0) {
         let is i64 as r with mut = 0;
@@ -438,6 +517,7 @@ fn zraise(idx as i64) as void {
 }
 
 fn set_focus(idx as i64) as void {
+    damage_taskbar();                                // bar button highlight follows focus
     let is i64 as old with mut = 0 - 1;
     if (nz > 0) { old = zord[0]; }
     if (old == idx) { zraise(idx); return; }
@@ -522,6 +602,7 @@ fn spawn_client() as void {
     wins[i].hello_deadline = sys.time_ns() + HELLO_NS;
     wins[i].mb_fill = 0;
     wins[i].maximized = 0;
+    wins[i].minimized = 0;
     set_focus(i);
     wmp.log_kv(cast(*u8, "wm: spawn pid="), 14, pid);
     return;
@@ -541,6 +622,7 @@ fn reap_window(i as i64, do_wait as i64) as void {
     if (nz > 0 && zord[0] == i) { was_top = 1; }
     zremove(i);
     damage_frame(i);
+    damage_taskbar();                                // its bar button disappears
     wins[i].used = 0;
     wins[i].state = 0;
     if (do_wait == 1) {
@@ -589,6 +671,7 @@ fn handle_msg(i as i64, m as *i64) as void {
         wins[i].seg_stride = m[2];
         wins[i].state = 2;
         damage_frame(i);
+        damage_taskbar();                            // its bar button can now show
         wmp.log_kv(cast(*u8, "wm: hello win="), 14, i);
     } else if (m[0] == wmp.MSG_COMMIT) {
         if (wins[i].state != 2) { return; }
@@ -609,6 +692,7 @@ fn handle_msg(i as i64, m as *i64) as void {
         wins[i].t0 = m[2];
         wins[i].t1 = m[3];
         damage(wins[i].x, wins[i].y, wins[i].w + 2 * BORDER, TITLE_H + BORDER);
+        damage_taskbar();                            // title also shows on the bar button
     } else if (m[0] == wmp.MSG_CLOSE) {
         reap_window(i, 1);
     } else if (m[0] == wmp.MSG_SPAWN_REQ) {
@@ -748,7 +832,7 @@ fn save_geometry(i as i64) as void {
 }
 fn maximize_win(i as i64) as void {
     if (wins[i].maximized == 0) { save_geometry(i); }
-    set_geometry(i, 0, 0, scr_w - 2 * BORDER, scr_h - TITLE_H - 2 * BORDER);
+    set_geometry(i, 0, 0, scr_w - 2 * BORDER, work_h - TITLE_H - 2 * BORDER);
     wins[i].maximized = 1;
     return;
 }
@@ -757,7 +841,7 @@ fn snap_win(i as i64, rightside as i64) as void {
     let is i64 as halfw = scr_w / 2;
     let is i64 as nx with mut = 0;
     if (rightside == 1) { nx = halfw; }
-    set_geometry(i, nx, 0, halfw - 2 * BORDER, scr_h - TITLE_H - 2 * BORDER);
+    set_geometry(i, nx, 0, halfw - 2 * BORDER, work_h - TITLE_H - 2 * BORDER);
     wins[i].maximized = 1;
     return;
 }
@@ -770,13 +854,62 @@ fn toggle_maximize(i as i64) as void {
     if (wins[i].maximized == 1) { restore_win(i); } else { maximize_win(i); }
     return;
 }
-// Which titlebar control button is under the cursor: 0 none, 1 close, 2 max.
+fn minimize_win(i as i64) as void {
+    if (wins[i].minimized == 1) { return; }
+    wins[i].minimized = 1;
+    damage_frame(i);                                 // erase the window
+    damage_taskbar();                                // its bar button dims
+    if (nz > 0 && zord[0] == i) {                    // focus the next visible window
+        let is i64 as k with mut = 1;
+        let is i64 as done with mut = 0;
+        while (k < nz && done == 0) {
+            let is i64 as cand = zord[k];
+            if (wins[cand].used == 1 && wins[cand].state == 2 && wins[cand].minimized == 0) {
+                set_focus(cand); done = 1;
+            }
+            k = k + 1;
+        }
+    }
+    return;
+}
+fn unminimize_win(i as i64) as void {
+    wins[i].minimized = 0;
+    damage_frame(i);
+    damage_taskbar();
+    return;
+}
+// Which window's taskbar button is under the cursor (-1 = none).
+fn taskbar_window_at() as i64 {
+    if (my < scr_h - BAR_H) { return 0 - 1; }
+    let is i64 as bx with mut = 4;
+    let is i64 as i with mut = 0;
+    while (i < MAX_WIN) {
+        if (wins[i].used == 1 && wins[i].state == 2) {
+            if (mx >= bx && mx < bx + TASK_W) { return i; }
+            bx = bx + TASK_W + 4;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+// Click on a taskbar button: restore+focus if minimized, minimize if it's the
+// focused window, else just focus+raise.
+fn taskbar_click() as void {
+    let is i64 as i = taskbar_window_at();
+    if (i < 0) { return; }
+    if (wins[i].minimized == 1) { unminimize_win(i); set_focus(i); return; }
+    if (nz > 0 && zord[0] == i) { minimize_win(i); return; }
+    set_focus(i);
+    return;
+}
+// Which titlebar control button is under the cursor: 0 none, 1 close, 2 max, 3 min.
 fn titlebar_button_at(i as i64) as i64 {
     let is i64 as tb_y0 = wins[i].y + BORDER;
     if (my < tb_y0 || my >= tb_y0 + TITLE_H) { return 0; }
     let is i64 as right = wins[i].x + BORDER + wins[i].w;
     if (mx >= right - BTN_W && mx < right) { return 1; }
     if (mx >= right - 2 * BTN_W && mx < right - BTN_W) { return 2; }
+    if (mx >= right - 3 * BTN_W && mx < right - 2 * BTN_W) { return 3; }
     return 0;
 }
 
@@ -831,6 +964,7 @@ fn forward_mouse(i as i64, mtype as i64, a as i64) as void {
 // Left press: hit-test top→bottom. Resize band beats titlebar beats content;
 // Super+press moves from anywhere in the frame. Every hit focuses + raises.
 fn press_at() as void {
+    if (my >= scr_h - BAR_H) { taskbar_click(); return; }   // clicked the taskbar
     let is i64 as zi with mut = 0;
     while (zi < nz) {
         let is i64 as i = zord[zi];
@@ -846,6 +980,7 @@ fn press_at() as void {
                 let is i64 as btn = titlebar_button_at(i);
                 if (btn == 1) { wins[i].pend_close = 1; return; }
                 if (btn == 2) { toggle_maximize(i); return; }
+                if (btn == 3) { minimize_win(i); return; }
                 let is i64 as dirs with mut = 0;
                 if (mx < fx + EDGE) { dirs = dirs | DIR_W; }
                 if (mx >= fx + fw - EDGE) { dirs = dirs | DIR_E; }
@@ -946,7 +1081,7 @@ fn apply_motion() as void {
             let is i64 as f = zord[0];
             let is i64 as tby = wins[f].y + BORDER;
             if (my >= tby - CUR_H && my < tby + TITLE_H) {
-                damage(wins[f].x + BORDER + wins[f].w - 2 * BTN_W, tby, 2 * BTN_W, TITLE_H);
+                damage(wins[f].x + BORDER + wins[f].w - 3 * BTN_W, tby, 3 * BTN_W, TITLE_H);
             }
         }
         cur_last_x = mx;
@@ -1046,6 +1181,7 @@ fn main() as i32 {
     scr_pitch = fb.pitch;
     fb_base = cast(i64, fb.base);
     fb_fd = fb.fd;
+    work_h = scr_h - BAR_H;
 
     kbd_fd = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
     mouse_fd = sys.dev_open(sys.DEV_MOUSE, 0, 0);
@@ -1074,6 +1210,8 @@ fn main() as i32 {
     cur_last_x = mx;
     cur_last_y = my;
 
+    update_clock();
+    clock_next = sys.time_ns() + 1000000000;
     damage_all();
     flush_damage();
     spawn_client();
@@ -1163,8 +1301,14 @@ fn main() as i32 {
             wp = wp + 1;
         }
 
-        // -- frame tick --
+        // -- clock tick: read the wall ~1Hz, damage the clock cell --
         now = sys.time_ns();
+        if (now >= clock_next) {
+            update_clock();
+            damage(scr_w - 100, scr_h - BAR_H, 100, BAR_H);
+            clock_next = now + 1000000000;
+        }
+        // -- frame tick --
         if (now >= next_frame) {
             // handshake deadlines
             let is i64 as wd with mut = 0;
