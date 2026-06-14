@@ -1,0 +1,231 @@
+// btop — a full-screen live system monitor, like htop/btop. `btop`.
+//   a per-sample CPU area graph with a thermal gradient, per-core gradient
+//   meters, memory / committed / disk meters, uptime, and a process table with
+//   per-process memory bars and state colours. up/down select, k kills a child,
+//   q quits. Takes the screen via the framebuffer grab stack.
+use "../../Caustic/std/causticos/gfx.cst" as gfx;
+use "../../Caustic/std/causticos/font.cst" as font;
+use "../../Caustic/std/causticos/input.cst" as input;
+use "../../Caustic/std/causticos/prog.cst" as prog;
+use "../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as GW = 8; let is i64 as GH = 16;
+let is u32 as BG = 0x001e1e2e; let is u32 as FG = 0x00cdd6f4; let is u32 as DIM = 0x006c7086;
+let is u32 as BARBG = 0x00313244; let is u32 as GREEN = 0x00a6e3a1; let is u32 as RED = 0x00f38ba8;
+let is u32 as BLUE = 0x0089b4fa; let is u32 as MAUVE = 0x00cba6f7; let is u32 as TEAL = 0x0094e2d5;
+let is u32 as SELBG = 0x0045475a;
+
+let is i64 as fbbase with mut = 0; let is i64 as fbw with mut = 0; let is i64 as fbh with mut = 0; let is i64 as fbpitch with mut = 0;
+let is i64 as g_kfd with mut = 0;
+let is i64 as HSIZE = 24;
+let is [384]i64 as cpu_hist; let is i64 as cpu_hpos with mut = 0; let is i64 as cpu_filled with mut = 0; let is i64 as ncpu with mut = 1;
+let is [512]i64 as graph_hist; let is i64 as graph_pos with mut = 0; let is i64 as graph_n with mut = 0;
+let is [512]i64 as g_ents; let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
+
+fn putpix(x as i64, y as i64, color as u32) as void {
+    if (x < 0 || y < 0 || x >= fbw || y >= fbh) { return; }
+    let is *u32 as p = cast(*u32, fbbase + y * fbpitch + x * 4); p[0] = color;
+}
+fn fill_rect(x0 as i64, y0 as i64, w as i64, h as i64, color as u32) as void {
+    let is i64 as y with mut = y0;
+    while (y < y0 + h) { let is i64 as x with mut = x0; while (x < x0 + w) { putpix(x, y, color); x = x + 1; } y = y + 1; }
+}
+fn draw_glyph(px as i64, py as i64, ch as i64, fg as u32, bg as u32) as void {
+    let is *u8 as g = font.get_glyph(cast(i32, ch));
+    let is i64 as row with mut = 0;
+    while (row < GH) {
+        let is i64 as bits = cast(i64, g[row]); let is i64 as col with mut = 0;
+        while (col < GW) { if ((bits & (128 >> col)) != 0) { putpix(px + col, py + row, fg); } else { putpix(px + col, py + row, bg); } col = col + 1; }
+        row = row + 1;
+    }
+}
+fn draw_text(px as i64, py as i64, s as *u8, fg as u32, bg as u32) as i64 {
+    let is i64 as i with mut = 0;
+    while (cast(i64, s[i]) != 0) { draw_glyph(px + i * GW, py, cast(i64, s[i]), fg, bg); i = i + 1; }
+    return px + i * GW;
+}
+fn draw_num(px as i64, py as i64, v as i64, fg as u32, bg as u32) as i64 {
+    let is [24]u8 as b; let is i64 as n with mut = 0;
+    if (v == 0) { b[0] = cast(u8, 48); n = 1; } else { let is i64 as x with mut = v; let is i64 as q with mut = 24; while (x > 0) { q = q - 1; b[q] = cast(u8, 48 + x % 10); x = x / 10; } let is i64 as k with mut = q; while (k < 24) { b[n] = b[k]; n = n + 1; k = k + 1; } }
+    let is i64 as i with mut = 0; while (i < n) { draw_glyph(px + i * GW, py, cast(i64, b[i]), fg, bg); i = i + 1; }
+    return px + n * GW;
+}
+fn draw_bytes(px as i64, py as i64, v as i64, fg as u32, bg as u32) as i64 {
+    let is i64 as scale with mut = 1; let is i64 as suf with mut = 66;
+    if (v >= 1073741824) { scale = 1073741824; suf = 71; } else if (v >= 1048576) { scale = 1048576; suf = 77; } else if (v >= 1024) { scale = 1024; suf = 75; }
+    let is i64 as whole = v / scale; let is i64 as x with mut = draw_num(px, py, whole, fg, bg);
+    if (scale > 1 && whole < 100) { let is i64 as t = (v - whole * scale) * 10 / scale; x = draw_text(x, py, ".", fg, bg); x = draw_num(x, py, t, fg, bg); }
+    let is [2]u8 as sb; sb[0] = cast(u8, suf); sb[1] = cast(u8, 0); return draw_text(x, py, cast(*u8, &sb[0]), fg, bg);
+}
+// thermal gradient 0=green .. 50=yellow .. 100=red.
+fn grad_color(pct as i64) as u32 {
+    let is i64 as p with mut = pct; if (p < 0) { p = 0; } if (p > 100) { p = 100; }
+    let is i64 as r with mut = 0; let is i64 as g with mut = 0; let is i64 as bl with mut = 0;
+    if (p < 50) { r = 0xa6 + (0xf9 - 0xa6) * p / 50; g = 0xe3 + (0xe2 - 0xe3) * p / 50; bl = 0xa1 + (0xaf - 0xa1) * p / 50; }
+    else { let is i64 as t = p - 50; r = 0xf9 + (0xf3 - 0xf9) * t / 50; g = 0xe2 + (0x8b - 0xe2) * t / 50; bl = 0xaf + (0xa8 - 0xaf) * t / 50; }
+    return cast(u32, (r << 16) | (g << 8) | bl);
+}
+fn draw_meter(px as i64, py as i64, w as i64, h as i64, pct as i64) as void {
+    fill_rect(px, py, w, h, BARBG);
+    let is i64 as fw with mut = w * pct / 100; if (fw > w) { fw = w; } if (fw < 0) { fw = 0; }
+    let is i64 as i with mut = 0;
+    while (i < fw) { fill_rect(px + i, py, 1, h, grad_color(i * 100 / w)); i = i + 1; }
+}
+// area graph: one filled column per sample, coloured by the sample's value
+// (a single fill_rect/grad_color per column — pixel-by-pixel here expands too
+// far under inlining and segfaults the compiler).
+fn draw_cpu_graph(x as i64, y as i64, w as i64, h as i64) as void {
+    fill_rect(x, y, w, h, 0x00181825);
+    let is i64 as col with mut = 0;
+    while (col < w) {
+        let is i64 as back = w - 1 - col;
+        let is i64 as idx = (graph_pos - 1 - back + 2048) % 512;
+        let is i64 as pct with mut = 0; if (back < graph_n) { pct = graph_hist[idx]; }
+        let is i64 as bh = pct * h / 100;
+        if (bh > 0) { fill_rect(x + col, y + h - bh, 1, bh, grad_color(pct)); }
+        col = col + 1;
+    }
+}
+fn sample_cpu() as void {
+    let is [17]i64 as cs;
+    if (sys.cpu_stat(cast(*i64, &cs[0])) <= 0) { return; }
+    ncpu = cs[0]; if (ncpu > 16) { ncpu = 16; }
+    let is i64 as c with mut = 0; let is i64 as busy with mut = 0;
+    while (c < ncpu) { cpu_hist[c * 24 + cpu_hpos] = cs[1 + c]; busy = busy + cs[1 + c]; c = c + 1; }
+    cpu_hpos = (cpu_hpos + 1) % HSIZE; if (cpu_filled < HSIZE) { cpu_filled = cpu_filled + 1; }
+    let is i64 as agg with mut = 0; if (ncpu > 0) { agg = busy * 100 / ncpu; }
+    graph_hist[graph_pos] = agg; graph_pos = (graph_pos + 1) % 512; if (graph_n < 512) { graph_n = graph_n + 1; }
+}
+fn cpu_pct(core as i64) as i64 {
+    if (cpu_filled == 0) { return 0; }
+    let is i64 as sum with mut = 0; let is i64 as i with mut = 0;
+    while (i < cpu_filled) { sum = sum + cpu_hist[core * 24 + i]; i = i + 1; }
+    return sum * 100 / cpu_filled;
+}
+fn statename(s as i64) as *u8 { if (s == 1) { return "run"; } if (s == 3) { return "zombie"; } if (s == 2) { return "exit"; } return "?"; }
+fn state_color(s as i64) as u32 { if (s == 1) { return GREEN; } if (s == 3) { return RED; } return DIM; }
+fn num_w(v as i64) as i64 { let is i64 as n with mut = 1; let is i64 as x with mut = v; while (x >= 10) { x = x / 10; n = n + 1; } return n; }
+fn sort_procs() as void {
+    let is i64 as i with mut = 1;
+    while (i < g_nproc) {
+        let is [8]i64 as tmp; let is i64 as w with mut = 0; while (w < 8) { tmp[w] = g_ents[i * 8 + w]; w = w + 1; }
+        let is i64 as j with mut = i - 1;
+        while (j >= 0 && g_ents[j * 8] > tmp[0]) { w = 0; while (w < 8) { g_ents[(j + 1) * 8 + w] = g_ents[j * 8 + w]; w = w + 1; } j = j - 1; }
+        w = 0; while (w < 8) { g_ents[(j + 1) * 8 + w] = tmp[w]; w = w + 1; }
+        i = i + 1;
+    }
+}
+
+fn render() as void {
+    fill_rect(0, 0, fbw, fbh, BG);
+    let is i64 as y with mut = 6;
+    // header
+    let is i64 as up_s = sys.time_ns() / 1000000000;
+    let is i64 as hx with mut = draw_text(8, y, "btop", MAUVE, BG);
+    let is i64 as rx with mut = fbw - 22 * GW;
+    rx = draw_text(rx, y, "up ", DIM, BG); rx = draw_num(rx, y, up_s / 60, FG, BG); rx = draw_text(rx, y, "m  ", DIM, BG);
+    rx = draw_num(rx, y, ncpu, TEAL, BG); rx = draw_text(rx, y, " cpu  ", DIM, BG); rx = draw_num(rx, y, g_nproc, TEAL, BG); draw_text(rx, y, " proc", DIM, BG);
+    y = y + GH + 2;
+    // CPU area graph
+    draw_cpu_graph(8, y, fbw - 16, 90);
+    let is i64 as totp with mut = 0; let is i64 as cc with mut = 0;
+    while (cc < ncpu) { totp = totp + cpu_pct(cc); cc = cc + 1; }
+    if (ncpu > 0) { totp = totp / ncpu; }
+    let is i64 as lx with mut = draw_text(12, y + 2, "CPU ", DIM, BG); lx = draw_num(lx, y + 2, totp, grad_color(totp), BG); draw_text(lx, y + 2, "%", DIM, BG);
+    y = y + 92;
+    // per-core gradient meters
+    let is i64 as c with mut = 0;
+    while (c < ncpu) {
+        let is i64 as pct = cpu_pct(c);
+        draw_text(8, y, "C", BLUE, BG); draw_num(8 + GW, y, c, BLUE, BG);
+        draw_meter(8 + 3 * GW, y + 2, 420, GH - 4, pct);
+        let is i64 as tx with mut = draw_num(8 + 3 * GW + 428, y, pct, FG, BG); draw_text(tx, y, "%", DIM, BG);
+        y = y + GH + 2; c = c + 1;
+    }
+    y = y + 4;
+    // memory + disk meters
+    let is [4]i64 as mi; let is i64 as totalb with mut = 1;
+    if (sys.mem_info(cast(*i64, &mi[0])) == 0) {
+        let is i64 as totb = mi[0] * mi[2]; totalb = totb; let is i64 as usedb = totb - mi[1] * mi[2];
+        let is i64 as mp with mut = 0; if (totb > 0) { mp = usedb * 100 / totb; }
+        draw_text(8, y, "Mem", TEAL, BG); draw_meter(8 + 4 * GW, y + 2, 420, GH - 4, mp);
+        let is i64 as mtx with mut = draw_bytes(8 + 4 * GW + 428, y, usedb, FG, BG); mtx = draw_text(mtx, y, "/", DIM, BG); draw_bytes(mtx, y, totb, DIM, BG);
+        y = y + GH + 2;
+        let is i64 as cp with mut = 0; if (totb > 0) { cp = mi[3] * 100 / totb; }
+        draw_text(8, y, "Cmt", TEAL, BG); draw_meter(8 + 4 * GW, y + 2, 420, GH - 4, cp); draw_bytes(8 + 4 * GW + 428, y, mi[3], FG, BG);
+        y = y + GH + 2;
+    }
+    let is [3]i64 as stf;
+    if (sys.statfs(cast(*i64, &stf[0])) == 0) {
+        let is i64 as du = stf[0] - stf[1]; let is i64 as dp with mut = 0; if (stf[0] > 0) { dp = du * 100 / stf[0]; }
+        draw_text(8, y, "Dsk", TEAL, BG); draw_meter(8 + 4 * GW, y + 2, 420, GH - 4, dp);
+        let is i64 as dtx with mut = draw_bytes(8 + 4 * GW + 428, y, du, FG, BG); dtx = draw_text(dtx, y, "/", DIM, BG); draw_bytes(dtx, y, stf[0], DIM, BG);
+        y = y + GH + 2;
+    }
+    y = y + 4;
+    // process table
+    fill_rect(0, y, fbw, GH, 0x00181825);
+    draw_text(8, y, "  PID PPID STATE   PROGRAM           THR        MEM   MEM%", DIM, 0x00181825);
+    y = y + GH;
+    let is i64 as rows = (fbh - y - GH) / GH;
+    if (g_sel < g_scroll) { g_scroll = g_sel; }
+    if (g_sel >= g_scroll + rows) { g_scroll = g_sel - rows + 1; }
+    if (g_scroll < 0) { g_scroll = 0; }
+    let is i64 as i with mut = g_scroll;
+    while (i < g_nproc && i < g_scroll + rows) {
+        let is i64 as b = i * 8; let is u32 as bg with mut = BG;
+        if (i == g_sel) { bg = SELBG; fill_rect(0, y, fbw, GH, SELBG); }
+        let is i64 as mem = g_ents[b + 5]; let is i64 as mpct with mut = 0; if (totalb > 0) { mpct = mem / 1024 * 100 / (totalb / 1024); }
+        draw_num(8 + 5 * GW - num_w(g_ents[b]) * GW, y, g_ents[b], FG, bg);
+        draw_num(8 + 10 * GW - num_w(g_ents[b + 1]) * GW, y, g_ents[b + 1], DIM, bg);
+        draw_text(8 + 11 * GW, y, statename(g_ents[b + 2]), state_color(g_ents[b + 2]), bg);
+        draw_text(8 + 19 * GW, y, cast(*u8, cast(i64, &g_ents[0]) + (b + 6) * 8), FG, bg);
+        draw_num(8 + 37 * GW, y, g_ents[b + 4], DIM, bg);
+        draw_bytes(8 + 44 * GW, y, mem, FG, bg);
+        draw_meter(8 + 52 * GW, y + 3, 80, GH - 6, mpct);
+        y = y + GH; i = i + 1;
+    }
+    let is i64 as fy = fbh - GH;
+    let is i64 as fx with mut = draw_text(8, fy, "q", MAUVE, BG); fx = draw_text(fx, fy, " quit   up/dn select   ", DIM, BG);
+    fx = draw_text(fx, fy, "k", MAUVE, BG); draw_text(fx, fy, " kill", DIM, BG);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    font.init();
+    let is gfx.Framebuffer as fb = gfx.open();
+    if (fb.ok != 1) { prog.outs("btop: no framebuffer\n"); return cast(i32, 1); }
+    fbbase = cast(i64, fb.base); fbw = fb.width; fbh = fb.height; fbpitch = fb.pitch;
+    g_kfd = input.open_keyboard();
+    let is input.KeyEvent as ev;
+    while (1 == 1) {
+        sample_cpu();
+        g_nproc = sys.proc_list(cast(*i64, &g_ents[0]), 64); if (g_nproc > 64) { g_nproc = 64; }
+        sort_procs();
+        if (g_sel >= g_nproc) { g_sel = g_nproc - 1; } if (g_sel < 0) { g_sel = 0; }
+        render();
+        sys.present(fb.fd, 0, 0, fbw, fbh);
+        // wait for a key or the frame deadline, then drain non-blocking:
+        // the keyboard read() blocks when the ring is empty, so we re-poll with
+        // timeout 0 between events and stop the moment nothing is left.
+        let is [3]i64 as pe; pe[0] = g_kfd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        sys.poll(cast(*i64, &pe[0]), 1, 150000000);
+        while ((pe[2] & sys.POLL_READABLE) != 0) {
+            if (input.read_event(g_kfd, &ev) != 1) { pe[2] = 0; }
+            else {
+                if (ev.pressed == 1) {
+                    let is i64 as sc = ev.scancode;
+                    if (sc == 0x48) { if (g_sel > 0) { g_sel = g_sel - 1; } }
+                    else if (sc == 0x50) { if (g_sel < g_nproc - 1) { g_sel = g_sel + 1; } }
+                    else {
+                        let is i64 as a = input.scancode_to_ascii(sc, 0);
+                        if (a == 113) { fill_rect(0, 0, fbw, fbh, BG); sys.present(fb.fd, 0, 0, fbw, fbh); gfx.close(&fb); return 0; }
+                        if (a == 107) { if (g_sel >= 0 && g_sel < g_nproc) { sys.kill(g_ents[g_sel * 8]); } }
+                    }
+                }
+                pe[0] = g_kfd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+                sys.poll(cast(*i64, &pe[0]), 1, 0);
+            }
+        }
+    }
+    return 0;
+}
