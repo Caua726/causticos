@@ -36,7 +36,7 @@ if [ "$MODE" = "wm" ]; then
     PROGS="wmpat wterm newterm btop echo cat ls uptime sysinfo vic guess \
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
            touch mkdir rmdir rm mv cp stat du tree find clear \
-           ps free df top pager hexedit"
+           ps free df top pager hexedit date poweroff reboot"
     INITNAME="wm (window manager — Super+Enter opens a window, Alt+Tab cycles, Super+Q closes)"
 else
     addf init.cse shell.cse

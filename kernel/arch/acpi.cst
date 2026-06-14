@@ -20,6 +20,7 @@ use "serial.cst" as serial;
 use "util.cst"   as util;
 use "pmm.cst"    as pmm;
 use "vmm.cst"    as vmm;
+use "port.cst"   as port;
 
 // ============================================================
 // SDT common header — every ACPI table other than the RSDP starts
@@ -134,8 +135,80 @@ struct FadtInfo {
     reset_reg_space as i64;    // 0 = memory, 1 = I/O
     reset_value as i64;        // value to write for reset
     boot_flags as i64;         // IA-PC boot flags (i8042 presence etc)
+    gpe0_blk as i64;           // GPE0 register block I/O port (power button on q35)
+    gpe0_len as i64;           // GPE0_BLK length in bytes (STS + EN halves)
 }
 let is FadtInfo as fadt with mut;
+
+// ============================================================
+// Power: ACPI soft-off (S5) and machine reset, both off the FADT that
+// parse() already captured. No AML interpreter, so SLP_TYPa is taken as 0
+// (QEMU's _S5) and the value written is just SLP_EN. Reset tries the FADT
+// reset register, then the PCI 0xCF9 path, then the i8042 pulse.
+// ============================================================
+fn halt_forever() as void {
+    while (1 == 1) { asm(".byte 0xFA\n"); asm(".byte 0xF4\n"); }   // cli ; hlt (caustic-as drops the mnemonics)
+}
+
+// Set by the power-button poller when PWRBTN_STS latches; read by the WM via
+// SYS_POWER_PENDING so it runs the graceful shutdown (close windows, paint its
+// own notice) before calling SYS_POWEROFF. The kernel only does the mechanism —
+// no screen here; the notice is the WM's UI (policy).
+let is i64 as power_event with mut = 0;
+fn power_pending() as i64 { return power_event; }
+
+fn poweroff() as void {
+    serial.println("acpi: poweroff (S5)", 19);
+    if (fadt.present == 1 && fadt.pm1a_cnt != 0) {
+        if (fadt.smi_cmd != 0 && fadt.acpi_enable != 0) {
+            port.outb(fadt.smi_cmd, fadt.acpi_enable);   // enter ACPI mode
+        }
+        port.outw(fadt.pm1a_cnt, 0x2000);                // SLP_TYPa(0) | SLP_EN
+    }
+    port.outw(0x604, 0x2000);                            // QEMU i440fx PM1a_CNT
+    port.outw(0xB004, 0x2000);                           // QEMU ICH9/q35 PM1a_CNT
+    halt_forever();
+}
+
+fn reboot() as void {
+    serial.println("acpi: reboot", 12);
+    if (fadt.present == 1 && fadt.reset_reg_addr != 0 && fadt.reset_reg_space == 1) {
+        port.outb(fadt.reset_reg_addr, fadt.reset_value);   // FADT reset register (I/O)
+    }
+    port.outb(0xCF9, 0x0E);                                 // PCI reset control: full reset
+    port.outb(0x64, 0xFE);                                  // i8042: pulse CPU reset line
+    halt_forever();
+}
+
+// --- hardware power button (ACPI PM1 PWRBTN) ---
+// The PM1 status block's PWRBTN_STS bit (bit 8) is set by the chipset when the
+// power button is pressed (what QEMU/virt-manager's "Shut Down" raises). We poll
+// the status word instead of wiring the SCI IRQ. CRITICAL: PM1 registers must be
+// accessed 16-bit (inw/outw) — a byte read of the high half (where PWRBTN_STS/EN
+// live) reads back 0, which is why an earlier inb-based version never fired.
+fn power_init() as void {
+    if (fadt.present == 0) { return; }
+    if (fadt.smi_cmd != 0 && fadt.acpi_enable != 0) {
+        port.outb(fadt.smi_cmd, fadt.acpi_enable);          // enter ACPI mode via SMI cmd
+    }
+    // q35 has no SMI command port — set SCI_EN (bit 0 of PM1a_CNT) directly, else
+    // QEMU never arms the power button.
+    if (fadt.pm1a_cnt != 0) {
+        port.outw(fadt.pm1a_cnt, port.inw(fadt.pm1a_cnt) | 0x01);   // SCI_EN
+    }
+    if (fadt.pm1a_evt != 0) {
+        port.outw(fadt.pm1a_evt, 0x100);                    // clear stale PWRBTN_STS (W1C)
+        port.outw(fadt.pm1a_evt + 2, 0x100);                // PM1a_EN: PWRBTN_EN (bit 8)
+    }
+    serial.println("acpi: power button armed", 24);
+}
+// 1 if the power button was pressed since last checked (clears the latch).
+fn power_button_pressed() as i64 {
+    if (fadt.present == 0 || fadt.pm1a_evt == 0) { return 0; }
+    let is i64 as sts = port.inw(fadt.pm1a_evt);            // 16-bit; PWRBTN_STS = bit 8
+    if ((sts & 0x100) != 0) { port.outw(fadt.pm1a_evt, 0x100); power_event = 1; return 1; }   // W1C
+    return 0;
+}
 
 // Top-level parse result so callers can distinguish "fully prod",
 // "partial", "critical table missing". Set by parse().
@@ -423,6 +496,8 @@ fn parse_fadt(virt as i64) as void {
     else                { fadt.pm_timer_width = 24; }
 
     fadt.boot_flags   = read_u16(virt, 109);
+    fadt.gpe0_blk     = read_u32(virt, 80);        // GPE0_BLK
+    fadt.gpe0_len     = read_u8(virt, 92);         // GPE0_BLK_LEN
 
     // Reset register: ACPI 2.0+ only (offset 116 into FADT).
     if (revision >= 2 && total_len >= 129) {

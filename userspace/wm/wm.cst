@@ -68,6 +68,9 @@ let is [8]Win as wins with mut;
 let is [256]u8 as mbufs with mut;                    // 8 × 32B message accumulators
 let is [8]i64 as zord with mut;                      // zord[0] = top of the stack
 let is i64 as nz with mut = 0;
+// shutdown: 0 = normal, 1 = asked clients to close (waiting), then power off.
+let is i64 as shutdown_state with mut = 0;
+let is i64 as shutdown_deadline with mut = 0;
 
 // per-sweep snapshots (filled from each poll's got bits)
 let is [8]i64 as writable with mut;
@@ -524,6 +527,42 @@ fn cursor_shape_for() as i64 {
         zi = zi + 1;
     }
     return CUR_ARROW;
+}
+
+// ---- shutdown notice: the WM owns the framebuffer, so it paints this itself
+// (then blocks in SYS_POWEROFF, stops compositing — nothing overwrites it). ----
+fn cglyph_big(ch as i64, px as i64, py as i64, color as i64, sc as i64) as void {
+    let is *u8 as g = font.get_glyph(cast(i32, ch));
+    let is i64 as row with mut = 0;
+    while (row < 16) {
+        let is i64 as bits = cast(i64, g[row]);
+        let is i64 as col with mut = 0;
+        while (col < 8) {
+            if ((bits & (128 >> col)) != 0) { cfill(px + col * sc, py + row * sc, sc, sc, color); }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    return;
+}
+fn gtext_big(s as *u8, len as i64, x as i64, y as i64, color as i64, sc as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < len) { cglyph_big(cast(i64, s[k]), x + k * 8 * sc, y, color, sc); k = k + 1; }
+    return;
+}
+fn shutdown_screen() as void {
+    clip_x0 = 0; clip_y0 = 0; clip_x1 = scr_w; clip_y1 = scr_h;
+    cfill(0, 0, scr_w, scr_h, 0x00000000);
+    let is i64 as cx = scr_w / 2;
+    let is i64 as cy = scr_h / 2;
+    let is i64 as sc = 5;
+    let is i64 as wx = cx - (9 * 8 * sc) / 2;
+    let is i64 as wy = cy - 16 * sc - 10;
+    gtext_big(cast(*u8, "causticos"), 9, wx + 3, wy + 4, 0x00102838, sc);  // shadow
+    gtext_big(cast(*u8, "causticos"), 9, wx, wy, 0x0073d0ff, sc);          // cyan
+    gtext_big(cast(*u8, "Shutting down..."), 16, cx - (16 * 8 * 2) / 2, cy + 24, 0x008a929c, 2);
+    sys.present(fb_fd, 0, 0, scr_w, scr_h);
+    return;
 }
 
 // Re-composite one rect: desktop, then every window back-to-front.
@@ -1424,6 +1463,20 @@ fn main() as i32 {
                     reap_window(wd, 0);
                 }
                 wd = wd + 1;
+            }
+            // -- shutdown: hardware power button → ask every window to close
+            // (CLOSE_REQ, which terminals propagate to their child app), wait for
+            // them to exit (the loop reaps them → nz drops), then paint the notice
+            // and power off. Wedged clients are forced out after the deadline.
+            if (shutdown_state == 0 && sys.power_pending() == 1) {
+                shutdown_state = 1;
+                shutdown_deadline = now + 2000000000;       // 2 s grace
+                let is i64 as si with mut = 0;
+                while (si < MAX_WIN) { if (wins[si].used == 1) { wins[si].pend_close = 1; } si = si + 1; }
+            }
+            if (shutdown_state == 1 && (nz == 0 || now >= shutdown_deadline)) {
+                shutdown_screen();
+                sys.poweroff();                             // kernel: kill stragglers, sync, halt APs, ACPI
             }
             if (dmg_full == 1 || dmg_n > 0) { flush_damage(); }
             next_frame = now + FRAME_NS;
