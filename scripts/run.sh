@@ -6,7 +6,10 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 echo "==> Compiling kernel..."
-caustic -c kernel/main.cst
+# kernel modules live in subfolders (kernel/arch, kernel/mm, ...); the module
+# names stay simple ('use "pmm.cst"') and resolve via these --path search dirs.
+KPATH="--path kernel --path kernel/arch --path kernel/time --path kernel/mm --path kernel/task --path kernel/drivers --path kernel/fs --path kernel/ipc --path kernel/sys --path kernel/lib --path kernel/test --path font"
+caustic -c kernel/main.cst $KPATH
 
 echo "==> Assembling..."
 caustic-as kernel/main.cst.s

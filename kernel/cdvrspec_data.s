@@ -23,25 +23,25 @@
 .global _cdvrspec_vnet_start
 .global _cdvrspec_vnet_end
 _cdvrspec_dummy_start:
-.incbin "kernel/dummy.cdvrspec"
+.incbin "kernel/drivers/dummy.cdvrspec"
 _cdvrspec_dummy_end:
 _cdvrspec_e1000_start:
-.incbin "kernel/e1000.cdvrspec"
+.incbin "kernel/drivers/e1000.cdvrspec"
 _cdvrspec_e1000_end:
 _cdvrspec_kbd_start:
-.incbin "kernel/kbd.cdvrspec"
+.incbin "kernel/drivers/kbd.cdvrspec"
 _cdvrspec_kbd_end:
 _cdvrspec_mouse_start:
-.incbin "kernel/mouse.cdvrspec"
+.incbin "kernel/drivers/mouse.cdvrspec"
 _cdvrspec_mouse_end:
 _cdvrspec_ahci_start:
-.incbin "kernel/ahci.cdvrspec"
+.incbin "kernel/drivers/ahci.cdvrspec"
 _cdvrspec_ahci_end:
 _cdvrspec_vtablet_start:
-.incbin "kernel/vtablet.cdvrspec"
+.incbin "kernel/drivers/vtablet.cdvrspec"
 _cdvrspec_vtablet_end:
 _cdvrspec_vnet_start:
-.incbin "kernel/vnet.cdvrspec"
+.incbin "kernel/drivers/vnet.cdvrspec"
 _cdvrspec_vnet_end:
 
 .section .cdvrspec_index

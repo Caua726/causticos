@@ -48,7 +48,7 @@ syscall_entry_asm:
     mov rdx, rsi      # rdx <- b
     mov rsi, rdi      # rsi <- a
     mov rdi, rax      # rdi <- nr
-    call _kernel_syscall_cst_dispatch
+    call _kernel_sys_syscall_cst_dispatch
     add rsp, 8        # drop pushed f
     .byte 0xFA        # cli — IRQs off across the unwind
     pop r15
