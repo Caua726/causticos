@@ -1,0 +1,184 @@
+// sed — stream editor. `sed [-n] [-e SCRIPT]... [SCRIPT] [FILE]...`
+//   commands (optionally address-prefixed):
+//     s/RE/REPL/[g][p][i]   substitute (& = whole match in REPL, \& literal)
+//     d   delete    p   print    q   quit    =   print line number
+//   addresses:  N (line) · $ (last) · /RE/ (match) · A,B (range)
+//   -n suppress auto-print. Built on the Pike-VM regex (regex.cst).
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/regex.cst" as re;
+
+let is i64 as NC = 32;
+let is [32]i64 as c_type;                  // 's' 'd' 'p' 'q' '='
+let is [32]i64 as a1t; let is [32]i64 as a1v; let is [32]i64 as a2t; let is [32]i64 as a2v;   // addr type/val (val=line# or pool offset)
+let is [32]i64 as active;                  // range in-progress
+let is [32]i64 as s_re; let is [32]i64 as s_repl; let is [32]i64 as s_flags;   // pool offsets; flags bit0 g, bit1 p, bit2 i
+let is i64 as ncmd with mut = 0;
+let is [16384]u8 as pool; let is i64 as ppos with mut = 0;
+let is i64 as g_n with mut = 0;            // -n
+
+let is [65536]u8 as g_line; let is i64 as g_ll with mut = 0;
+let is [65536]u8 as g_out;
+let is i64 as g_lineno with mut = 0; let is i64 as g_quit with mut = 0;
+
+fn streq(a as *u8, b as *u8) as i64 { let is i64 as i with mut = 0; while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; } if (a[i] == b[i]) { return 1; } return 0; }
+fn die(m as *u8) as void { prog.outs("sed: "); prog.outs(m); prog.out("\n", 1); sys.exit(cast(i32, 1)); }
+fn pool_put(s as *u8, n as i64) as i64 { let is i64 as st = ppos; let is i64 as k with mut = 0; while (k < n) { pool[ppos] = s[k]; ppos = ppos + 1; k = k + 1; } pool[ppos] = cast(u8, 0); ppos = ppos + 1; return st; }
+fn poolp(off as i64) as *u8 { return cast(*u8, cast(i64, &pool[0]) + off); }
+
+// parse one address starting at script[*i]; writes type/val, returns 1 if an address was present.
+fn parse_addr(s as *u8, i as *i64, ty as *i64, vl as *i64) as i64 {
+    let is i64 as p with mut = i[0];
+    if (s[p] >= 48 && s[p] <= 57) { let is i64 as v with mut = 0; while (s[p] >= 48 && s[p] <= 57) { v = v * 10 + (cast(i64, s[p]) - 48); p = p + 1; } ty[0] = 1; vl[0] = v; i[0] = p; return 1; }
+    if (s[p] == 36) { ty[0] = 2; vl[0] = 0; i[0] = p + 1; return 1; }        // $
+    if (s[p] == 47) {                                                        // /RE/
+        p = p + 1; let is i64 as st = p; while (s[p] != 0 && s[p] != 47) { p = p + 1; }
+        ty[0] = 3; vl[0] = pool_put(cast(*u8, cast(i64, s) + st), p - st);
+        if (s[p] == 47) { p = p + 1; } i[0] = p; return 1;
+    }
+    return 0;
+}
+
+// parse a whole script (may hold several ';'/newline-separated commands).
+fn parse_script(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        while (s[i] == 32 || s[i] == 9 || s[i] == 59 || s[i] == 10) { i = i + 1; }   // skip sep
+        if (s[i] == 0) { break; }
+        if (ncmd >= NC) { die("too many commands"); }
+        let is i64 as t1 with mut = 0; let is i64 as v1 with mut = 0; let is i64 as t2 with mut = 0; let is i64 as v2 with mut = 0;
+        let is [1]i64 as ip; ip[0] = i;
+        if (parse_addr(s, cast(*i64, &ip[0]), cast(*i64, &t1), cast(*i64, &v1)) == 1) { i = ip[0];
+            if (s[i] == 44) { i = i + 1; ip[0] = i; if (parse_addr(s, cast(*i64, &ip[0]), cast(*i64, &t2), cast(*i64, &v2)) == 1) { i = ip[0]; } }
+        }
+        while (s[i] == 32) { i = i + 1; }
+        let is i64 as cmd = cast(i64, s[i]);
+        a1t[ncmd] = t1; a1v[ncmd] = v1; a2t[ncmd] = t2; a2v[ncmd] = v2; active[ncmd] = 0;
+        if (cmd == 115) {                                                    // 's'
+            i = i + 1; let is i64 as delim = cast(i64, s[i]); i = i + 1;
+            let is i64 as rst = i; while (s[i] != 0 && cast(i64, s[i]) != delim) { i = i + 1; }
+            s_re[ncmd] = pool_put(cast(*u8, cast(i64, s) + rst), i - rst);
+            if (cast(i64, s[i]) == delim) { i = i + 1; }
+            let is i64 as pst = i; while (s[i] != 0 && cast(i64, s[i]) != delim) { i = i + 1; }
+            s_repl[ncmd] = pool_put(cast(*u8, cast(i64, s) + pst), i - pst);
+            if (cast(i64, s[i]) == delim) { i = i + 1; }
+            let is i64 as fl with mut = 0;
+            while (s[i] == 103 || s[i] == 112 || s[i] == 105) { if (s[i] == 103) { fl = fl | 1; } else if (s[i] == 112) { fl = fl | 2; } else { fl = fl | 4; } i = i + 1; }
+            s_flags[ncmd] = fl; c_type[ncmd] = 115;
+        } else if (cmd == 100) { c_type[ncmd] = 100; i = i + 1; }            // d
+        else if (cmd == 112) { c_type[ncmd] = 112; i = i + 1; }             // p
+        else if (cmd == 113) { c_type[ncmd] = 113; i = i + 1; }             // q
+        else if (cmd == 61) { c_type[ncmd] = 61; i = i + 1; }               // =
+        else { die("unknown command"); }
+        ncmd = ncmd + 1;
+    }
+}
+
+fn line_matches_re(off as i64) as i64 {
+    let is *u8 as p = poolp(off);
+    if (re.re_compile(p, prog.slen(p), 0, 0) != 0) { return 0; }
+    return re.re_match(cast(*u8, &g_line[0]), g_ll);
+}
+fn addr1_hit(ci as i64, is_last as i64) as i64 {
+    let is i64 as t = a1t[ci];
+    if (t == 0) { return 1; }
+    if (t == 1) { if (g_lineno == a1v[ci]) { return 1; } return 0; }
+    if (t == 2) { return is_last; }
+    return line_matches_re(a1v[ci]);
+}
+fn addr2_hit(ci as i64, is_last as i64) as i64 {
+    let is i64 as t = a2t[ci];
+    if (t == 1) { if (g_lineno >= a2v[ci]) { return 1; } return 0; }
+    if (t == 2) { return is_last; }
+    if (t == 3) { return line_matches_re(a2v[ci]); }
+    return 1;
+}
+// does command ci apply to the current line?
+fn selected(ci as i64, is_last as i64) as i64 {
+    if (a2t[ci] == 0) { return addr1_hit(ci, is_last); }                     // single address
+    if (active[ci] == 0) { if (addr1_hit(ci, is_last) == 1) { active[ci] = 1; if (addr2_hit(ci, is_last) == 1) { active[ci] = 0; } return 1; } return 0; }
+    if (addr2_hit(ci, is_last) == 1) { active[ci] = 0; }
+    return 1;
+}
+
+fn emit(s as *u8, n as i64) as void { sys.write(cast(i64, 1), s, n); }
+fn emit_line() as void { emit(cast(*u8, &g_line[0]), g_ll); emit(cast(*u8, "\n"), 1); }
+
+// s/RE/REPL/ on g_line -> g_out, copy back. Returns 1 if any substitution happened.
+fn do_subst(ci as i64) as i64 {
+    let is *u8 as rep = poolp(s_repl[ci]); let is i64 as replen = prog.slen(rep);
+    let is i64 as icase with mut = 0; if ((s_flags[ci] & 4) != 0) { icase = 1; }
+    let is *u8 as pat = poolp(s_re[ci]);
+    if (re.re_compile(pat, prog.slen(pat), icase, 0) != 0) { return 0; }
+    let is i64 as glob = s_flags[ci] & 1;
+    let is i64 as o with mut = 0; let is i64 as pos with mut = 0; let is i64 as did with mut = 0;
+    let is [1]i64 as ms; let is [1]i64 as me;
+    while (pos <= g_ll) {
+        if (re.re_search(cast(*u8, cast(i64, &g_line[0]) + pos), g_ll - pos, cast(*i64, &ms[0]), cast(*i64, &me[0])) == 0) { break; }
+        let is i64 as a = pos + ms[0]; let is i64 as b = pos + me[0];
+        let is i64 as k with mut = pos; while (k < a) { g_out[o] = g_line[k]; o = o + 1; k = k + 1; }     // copy before match
+        let is i64 as r with mut = 0;                                                                    // expand replacement
+        while (r < replen) {
+            if (rep[r] == 38) { let is i64 as m with mut = a; while (m < b) { g_out[o] = g_line[m]; o = o + 1; m = m + 1; } }   // &
+            else if (rep[r] == 92 && r + 1 < replen) { r = r + 1; g_out[o] = rep[r]; o = o + 1; }         // \x literal
+            else { g_out[o] = rep[r]; o = o + 1; }
+            r = r + 1;
+        }
+        did = 1;
+        if (b > a) { pos = b; } else { if (a < g_ll) { g_out[o] = g_line[a]; o = o + 1; } pos = a + 1; }
+        if (glob == 0) { break; }
+    }
+    let is i64 as k2 with mut = pos; while (k2 < g_ll) { g_out[o] = g_line[k2]; o = o + 1; k2 = k2 + 1; }
+    if (did == 1) { let is i64 as q with mut = 0; while (q < o) { g_line[q] = g_out[q]; q = q + 1; } g_ll = o; }
+    return did;
+}
+
+fn process_line(is_last as i64) as void {
+    g_lineno = g_lineno + 1;
+    let is i64 as deleted with mut = 0; let is i64 as ci with mut = 0;
+    while (ci < ncmd && deleted == 0) {
+        if (selected(ci, is_last) == 1) {
+            let is i64 as t = c_type[ci];
+            if (t == 115) { let is i64 as d = do_subst(ci); if (d == 1 && (s_flags[ci] & 2) != 0) { emit_line(); } }
+            else if (t == 100) { deleted = 1; }
+            else if (t == 112) { emit_line(); }
+            else if (t == 61) { prog.out_num(g_lineno); prog.out("\n", 1); }
+            else if (t == 113) { if (g_n == 0) { emit_line(); } g_quit = 1; deleted = 1; }
+        }
+        ci = ci + 1;
+    }
+    if (deleted == 0 && g_n == 0) { emit_line(); }
+}
+
+fn run_fd(fd as i64) as void {
+    let is [65536]u8 as buf;
+    let is i64 as r with mut = sys.read(fd, cast(*u8, &buf[0]), 65536);
+    let is i64 as pending with mut = 0;                                      // a line not yet ended by \n
+    while (r > 0) {
+        let is i64 as j with mut = 0;
+        while (j < r) {
+            if (buf[j] == 0x0A) { process_line(0); g_ll = 0; pending = 0; if (g_quit == 1) { return; } }
+            else { if (g_ll < 65535) { g_line[g_ll] = buf[j]; g_ll = g_ll + 1; pending = 1; } }
+            j = j + 1;
+        }
+        r = sys.read(fd, cast(*u8, &buf[0]), 65536);
+    }
+    if (pending == 1) { process_line(1); g_ll = 0; }                         // last line without trailing \n
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as i with mut = 1; let is i64 as have_script with mut = 0;
+    let is [256]i64 as files; let is i64 as nf with mut = 0;
+    while (i < argc) {
+        let is *u8 as a = prog.arg(argv, i);
+        if (streq(a, "-n") == 1) { g_n = 1; }
+        else if (streq(a, "-e") == 1) { i = i + 1; if (i < argc) { parse_script(prog.arg(argv, i)); have_script = 1; } }
+        else if (a[0] == 45 && a[1] != 0) { prog.outs("usage: sed [-n] [-e SCRIPT] [SCRIPT] [FILE...]\n"); return cast(i32, 1); }
+        else { if (have_script == 0) { parse_script(a); have_script = 1; } else { if (nf < 256) { files[nf] = cast(i64, a); nf = nf + 1; } } }
+        i = i + 1;
+    }
+    if (have_script == 0) { prog.outs("sed: no script\n"); return cast(i32, 1); }
+    if (nf == 0) { run_fd(0); }
+    else { let is i64 as k with mut = 0; while (k < nf && g_quit == 0) { let is [256]u8 as pb; let is *u8 as ap = prog.abspath(cast(*u8, files[k]), cast(*u8, &pb[0])); let is i64 as fd = sys.open_read(ap); if (fd < 0) { prog.outs("sed: cannot open "); prog.outs(cast(*u8, files[k])); prog.out("\n", 1); } else { run_fd(fd); sys.close(fd); } k = k + 1; } }
+    return cast(i32, 0);
+}

@@ -1,0 +1,367 @@
+// sort — sort lines of text. A real sort: key fields, separators, and several
+// orderings, validated against GNU sort.
+//
+//   sort [-bcfhMnrsu] [-t SEP] [-k KEYDEF] [file ...]
+//   -n numeric  -h human (2K 1G)  -M month (JAN..DEC)  -f fold case
+//   -b ignore leading blanks  -r reverse  -u unique  -s stable  -c check only
+//   -t SEP  field separator (default: blank transitions)
+//   -k F[.C][opts][,F[.C][opts]]  sort key over fields F..F2 (1-based), with
+//      optional per-key letters n/r/f/b/M/h. Repeatable; keys break ties in order.
+// No file (or "-") reads stdin. All inputs are merged, then sorted.
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil.cst" as fu;
+
+// flag bits (shared by global flags and per-key flags)
+let is i64 as FN = 1; let is i64 as FR = 2; let is i64 as FU = 4; let is i64 as FF = 8;
+let is i64 as FB = 16; let is i64 as FM = 32; let is i64 as FH = 64; let is i64 as FC = 128; let is i64 as FS = 256;
+
+let is i64 as g_base with mut = 0;     // *u8 of the combined input
+let is i64 as g_fl with mut = 0;       // global flags
+let is i64 as g_t with mut = 0 - 1;    // field separator, -1 = default (blanks)
+
+// up to 8 keys
+let is [8]i64 as KSW;                   // start field, 0-based
+let is [8]i64 as KSC;                   // start char within field, 0-based
+let is [8]i64 as KEW;                   // end field, 0-based (-1 = end of line)
+let is [8]i64 as KEC;                   // end char within field (0 = whole field)
+let is [8]i64 as KFL;                   // per-key flags
+let is i64 as KN with mut = 0;
+
+fn is_blank(c as i64) as i64 { if (c == 32 || c == 9) { return 1; } return 0; }
+fn lc(c as i64) as i64 { if (c >= 65 && c <= 90) { return c + 32; } return c; }
+
+// ---- field boundaries (GNU sort semantics) ----
+// begin offset of field `sword` (0-based) in s[0..len); skip leading blanks of
+// the target field iff skipb.
+fn field_begin(s as *u8, len as i64, sword as i64, skipb as i64) as i64 {
+    let is i64 as pos with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < sword && pos < len) {
+        if (g_t >= 0) { while (pos < len && cast(i64, s[pos]) != g_t) { pos = pos + 1; } if (pos < len) { pos = pos + 1; } }
+        else { while (pos < len && is_blank(cast(i64, s[pos])) != 0) { pos = pos + 1; } while (pos < len && is_blank(cast(i64, s[pos])) == 0) { pos = pos + 1; } }
+        i = i + 1;
+    }
+    if (skipb != 0) { while (pos < len && is_blank(cast(i64, s[pos])) != 0) { pos = pos + 1; } }
+    return pos;
+}
+// end of the field whose content begins at `b`.
+fn field_content_end(s as *u8, len as i64, b as i64) as i64 {
+    let is i64 as p with mut = b;
+    if (g_t >= 0) { while (p < len && cast(i64, s[p]) != g_t) { p = p + 1; } return p; }
+    while (p < len && is_blank(cast(i64, s[p])) != 0) { p = p + 1; }
+    while (p < len && is_blank(cast(i64, s[p])) == 0) { p = p + 1; }
+    return p;
+}
+
+// ---- numeric / month / human comparison on byte ranges ----
+// compare magnitudes of unsigned decimal numbers a=[as,ae) b=[bs,be) (int[.frac]).
+fn mag_cmp(s as *u8, as0 as i64, ae as i64, bs0 as i64, be as i64) as i64 {
+    // integer part: up to '.' or end
+    let is i64 as ai with mut = as0; let is i64 as bi with mut = bs0;
+    let is i64 as adot with mut = ae; let is i64 as bdot with mut = be;
+    let is i64 as t with mut = as0; while (t < ae) { if (cast(i64, s[t]) == 46) { adot = t; break; } t = t + 1; }
+    t = bs0; while (t < be) { if (cast(i64, s[t]) == 46) { bdot = t; break; } t = t + 1; }
+    // strip leading zeros
+    while (ai < adot && cast(i64, s[ai]) == 48) { ai = ai + 1; }
+    while (bi < bdot && cast(i64, s[bi]) == 48) { bi = bi + 1; }
+    let is i64 as alen = adot - ai; let is i64 as blen = bdot - bi;
+    if (alen != blen) { if (alen < blen) { return 0 - 1; } return 1; }
+    while (ai < adot) { if (cast(i64, s[ai]) != cast(i64, s[bi])) { if (cast(i64, s[ai]) < cast(i64, s[bi])) { return 0 - 1; } return 1; } ai = ai + 1; bi = bi + 1; }
+    // fractional part: compare digit by digit, padding the shorter with zeros
+    let is i64 as af with mut = adot + 1; let is i64 as bf with mut = bdot + 1;
+    while (af < ae || bf < be) {
+        let is i64 as da with mut = 48; let is i64 as db with mut = 48;
+        if (af < ae) { da = cast(i64, s[af]); } if (bf < be) { db = cast(i64, s[bf]); }
+        if (da != db) { if (da < db) { return 0 - 1; } return 1; }
+        af = af + 1; bf = bf + 1;
+    }
+    return 0;
+}
+// the end of the numeric token at s[start..limit): digits, then optional .digits.
+fn num_scan(s as *u8, start as i64, limit as i64) as i64 {
+    let is i64 as i with mut = start;
+    while (i < limit && cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) { i = i + 1; }
+    if (i < limit && cast(i64, s[i]) == 46) { i = i + 1; while (i < limit && cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) { i = i + 1; } }
+    return i;
+}
+fn num_cmp(s as *u8, as0 as i64, ae as i64, bs0 as i64, be as i64) as i64 {
+    let is i64 as ai with mut = as0; let is i64 as bi with mut = bs0;
+    while (ai < ae && is_blank(cast(i64, s[ai])) != 0) { ai = ai + 1; }
+    while (bi < be && is_blank(cast(i64, s[bi])) != 0) { bi = bi + 1; }
+    let is i64 as na with mut = 0; let is i64 as nb with mut = 0;
+    if (ai < ae && cast(i64, s[ai]) == 45) { na = 1; ai = ai + 1; }
+    if (bi < be && cast(i64, s[bi]) == 45) { nb = 1; bi = bi + 1; }
+    if (na != nb) { if (na > nb) { return 0 - 1; } return 1; }       // negative < positive
+    let is i64 as aend = num_scan(s, ai, ae);                        // number ends at first non-digit
+    let is i64 as bend = num_scan(s, bi, be);
+    let is i64 as m = mag_cmp(s, ai, aend, bi, bend);
+    if (na != 0) { return 0 - m; }
+    return m;
+}
+fn month_val(s as *u8, off as i64, end as i64) as i64 {
+    let is i64 as i with mut = off;
+    while (i < end && is_blank(cast(i64, s[i])) != 0) { i = i + 1; }
+    if (i + 3 > end) { return 0; }
+    let is i64 as a = lc(cast(i64, s[i])); let is i64 as b = lc(cast(i64, s[i + 1])); let is i64 as c = lc(cast(i64, s[i + 2]));
+    if (a == 106 && b == 97 && c == 110) { return 1; }   // jan
+    if (a == 102 && b == 101 && c == 98) { return 2; }   // feb
+    if (a == 109 && b == 97 && c == 114) { return 3; }   // mar
+    if (a == 97 && b == 112 && c == 114) { return 4; }   // apr
+    if (a == 109 && b == 97 && c == 121) { return 5; }   // may
+    if (a == 106 && b == 117 && c == 110) { return 6; }  // jun
+    if (a == 106 && b == 117 && c == 108) { return 7; }  // jul
+    if (a == 97 && b == 117 && c == 103) { return 8; }   // aug
+    if (a == 115 && b == 101 && c == 112) { return 9; }  // sep
+    if (a == 111 && b == 99 && c == 116) { return 10; }  // oct
+    if (a == 110 && b == 111 && c == 118) { return 11; } // nov
+    if (a == 100 && b == 101 && c == 99) { return 12; }  // dec
+    return 0;
+}
+// human value scaled: integer part * 1024^suffix (K/M/G/T/P), ignoring fraction.
+fn human_val(s as *u8, off as i64, end as i64, neg as *i64) as i64 {
+    let is i64 as i with mut = off;
+    while (i < end && is_blank(cast(i64, s[i])) != 0) { i = i + 1; }
+    neg[0] = 0; if (i < end && cast(i64, s[i]) == 45) { neg[0] = 1; i = i + 1; }
+    let is i64 as v with mut = 0;
+    while (i < end) { let is i64 as c = cast(i64, s[i]); if (c < 48 || c > 57) { break; } v = v * 10 + (c - 48); i = i + 1; }
+    let is i64 as frac with mut = 0;                       // one decimal digit, for tie ordering
+    if (i < end && cast(i64, s[i]) == 46) { i = i + 1; if (i < end && cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) { frac = cast(i64, s[i]) - 48; i = i + 1; } while (i < end && cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) { i = i + 1; } }
+    v = v * 10 + frac;                                     // value scaled by 10
+    let is i64 as mult with mut = 1;
+    if (i < end) {
+        let is i64 as su = cast(i64, s[i]);
+        if (su == 75 || su == 107) { mult = 1024; }
+        else if (su == 77 || su == 109) { mult = 1024 * 1024; }
+        else if (su == 71 || su == 103) { mult = 1024 * 1024 * 1024; }
+        else if (su == 84 || su == 116) { mult = 1024 * 1024 * 1024 * 1024; }
+    }
+    return v * mult;
+}
+
+// compare ranges a=[ao,ae) b=[bo,be) under a key's effective flags.
+fn range_cmp(ao as i64, ae as i64, bo as i64, be as i64, fl as i64) as i64 {
+    let is *u8 as s = cast(*u8, g_base);
+    if ((fl & FN) != 0) { return num_cmp(s, ao, ae, bo, be); }
+    if ((fl & FM) != 0) { let is i64 as ma = month_val(s, ao, ae); let is i64 as mb = month_val(s, bo, be); if (ma < mb) { return 0 - 1; } if (ma > mb) { return 1; } return 0; }
+    if ((fl & FH) != 0) {
+        let is [1]i64 as nea; let is [1]i64 as neb;
+        let is i64 as ha = human_val(s, ao, ae, cast(*i64, &nea[0])); let is i64 as hb = human_val(s, bo, be, cast(*i64, &neb[0]));
+        let is i64 as sa with mut = ha; let is i64 as sb with mut = hb;
+        if (nea[0] != 0) { sa = 0 - ha; } if (neb[0] != 0) { sb = 0 - hb; }
+        if (sa < sb) { return 0 - 1; } if (sa > sb) { return 1; } return 0;
+    }
+    let is i64 as fold = fl & FF;
+    let is i64 as ai with mut = ao; let is i64 as bi with mut = bo;
+    while (ai < ae && bi < be) {
+        let is i64 as ca with mut = cast(i64, s[ai]); let is i64 as cb with mut = cast(i64, s[bi]);
+        if (fold != 0) { ca = lc(ca); cb = lc(cb); }
+        if (ca != cb) { if (ca < cb) { return 0 - 1; } return 1; }
+        ai = ai + 1; bi = bi + 1;
+    }
+    let is i64 as ra = ae - ai; let is i64 as rb = be - bi;
+    if (ra < rb) { return 0 - 1; } if (ra > rb) { return 1; } return 0;
+}
+
+// extract a key's [start,end) for key k from line [lo,lo+ll), into *ks,*ke.
+fn key_extent(lo as i64, ll as i64, k as i64, ks as *i64, ke as *i64) as void {
+    let is *u8 as s = cast(*u8, g_base + lo);
+    let is i64 as skipb = (KFL[k] | g_fl) & FB;
+    let is i64 as bstart = field_begin(s, ll, KSW[k], skipb);
+    let is i64 as st with mut = bstart + KSC[k];
+    if (st > ll) { st = ll; }
+    let is i64 as en with mut = ll;
+    if (KEW[k] >= 0) {
+        let is i64 as ebeg = field_begin(s, ll, KEW[k], skipb);
+        if (KEC[k] > 0) {
+            let is i64 as fe = field_content_end(s, ll, ebeg);
+            en = ebeg + KEC[k]; if (en > fe) { en = fe; }
+        } else { en = field_content_end(s, ll, ebeg); }
+    }
+    if (en < st) { en = st; }
+    ks[0] = lo + st; ke[0] = lo + en;
+}
+
+// compare by keys only (no last-resort, no stable tiebreak). For -u and -c.
+fn cmp_keys(ao as i64, al as i64, bo as i64, bl as i64) as i64 {
+    if (KN == 0) {
+        let is i64 as fl = g_fl;
+        let is i64 as as0 with mut = ao; let is i64 as bs0 with mut = bo;
+        let is i64 as ae with mut = ao + al; let is i64 as be with mut = bo + bl;
+        if ((fl & FB) != 0) { let is *u8 as s = cast(*u8, g_base); while (as0 < ae && is_blank(cast(i64, s[as0])) != 0) { as0 = as0 + 1; } while (bs0 < be && is_blank(cast(i64, s[bs0])) != 0) { bs0 = bs0 + 1; } }
+        let is i64 as c = range_cmp(as0, ae, bs0, be, fl);
+        if ((fl & FR) != 0) { return 0 - c; }
+        return c;
+    }
+    let is i64 as k with mut = 0;
+    while (k < KN) {
+        let is [1]i64 as aks; let is [1]i64 as ake; let is [1]i64 as bks; let is [1]i64 as bke;
+        key_extent(ao, al, k, cast(*i64, &aks[0]), cast(*i64, &ake[0]));
+        key_extent(bo, bl, k, cast(*i64, &bks[0]), cast(*i64, &bke[0]));
+        let is i64 as eff with mut = KFL[k];
+        if ((eff & (FN | FM | FH)) == 0) { eff = eff | (g_fl & (FN | FM | FH)); }
+        if ((eff & FF) == 0) { eff = eff | (g_fl & FF); }
+        let is i64 as c with mut = range_cmp(aks[0], ake[0], bks[0], bke[0], eff);
+        if (((KFL[k] | g_fl) & FR) != 0) { c = 0 - c; }
+        if (c != 0) { return c; }
+        k = k + 1;
+    }
+    return 0;
+}
+// full comparison for the sort: keys, then (unless -s) whole line, then index.
+fn cmp_full(ao as i64, al as i64, oa as i64, bo as i64, bl as i64, ob as i64) as i64 {
+    let is i64 as c = cmp_keys(ao, al, bo, bl);
+    if (c != 0) { return c; }
+    if ((g_fl & FS) == 0) {
+        let is *u8 as s = cast(*u8, g_base);
+        let is i64 as ai with mut = ao; let is i64 as bi with mut = bo;
+        let is i64 as ae = ao + al; let is i64 as be = bo + bl;
+        while (ai < ae && bi < be) { if (cast(i64, s[ai]) != cast(i64, s[bi])) { let is i64 as r with mut = 1; if (cast(i64, s[ai]) < cast(i64, s[bi])) { r = 0 - 1; } if ((g_fl & FR) != 0) { r = 0 - r; } return r; } ai = ai + 1; bi = bi + 1; }
+        let is i64 as ra = ae - ai; let is i64 as rb = be - bi;
+        if (ra != rb) { let is i64 as r with mut = 1; if (ra < rb) { r = 0 - 1; } if ((g_fl & FR) != 0) { r = 0 - r; } return r; }
+    }
+    if (oa < ob) { return 0 - 1; } if (oa > ob) { return 1; } return 0;
+}
+
+fn qsort_idx(idx as *i64, lo as i64, hi as i64) as void {
+    if (lo >= hi) { return; }
+    let is i64 as mid = lo + (hi - lo) / 2;
+    let is i64 as po = idx[mid * 3]; let is i64 as pl = idx[mid * 3 + 1]; let is i64 as pg = idx[mid * 3 + 2];
+    let is i64 as i with mut = lo - 1; let is i64 as j with mut = hi + 1;
+    while (1 == 1) {
+        i = i + 1; while (cmp_full(idx[i * 3], idx[i * 3 + 1], idx[i * 3 + 2], po, pl, pg) < 0) { i = i + 1; }
+        j = j - 1; while (cmp_full(idx[j * 3], idx[j * 3 + 1], idx[j * 3 + 2], po, pl, pg) > 0) { j = j - 1; }
+        if (i >= j) { break; }
+        let is i64 as t0 = idx[i * 3]; let is i64 as t1 = idx[i * 3 + 1]; let is i64 as t2 = idx[i * 3 + 2];
+        idx[i * 3] = idx[j * 3]; idx[i * 3 + 1] = idx[j * 3 + 1]; idx[i * 3 + 2] = idx[j * 3 + 2];
+        idx[j * 3] = t0; idx[j * 3 + 1] = t1; idx[j * 3 + 2] = t2;
+    }
+    qsort_idx(idx, lo, j); qsort_idx(idx, j + 1, hi);
+}
+
+// parse one -k KEYDEF into the key tables.
+fn parse_keydef(d as *u8) as void {
+    if (KN >= 8) { return; }
+    let is i64 as k = KN;
+    KSW[k] = 0; KSC[k] = 0; KEW[k] = 0 - 1; KEC[k] = 0; KFL[k] = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as f with mut = 0;
+    while (cast(i64, d[i]) >= 48 && cast(i64, d[i]) <= 57) { f = f * 10 + (cast(i64, d[i]) - 48); i = i + 1; }
+    if (f > 0) { KSW[k] = f - 1; }
+    if (cast(i64, d[i]) == 46) { i = i + 1; let is i64 as c with mut = 0; while (cast(i64, d[i]) >= 48 && cast(i64, d[i]) <= 57) { c = c * 10 + (cast(i64, d[i]) - 48); i = i + 1; } if (c > 0) { KSC[k] = c - 1; } }
+    while (cast(i64, d[i]) != 0 && cast(i64, d[i]) != 44) { let is i64 as fl = key_letter(cast(i64, d[i])); KFL[k] = KFL[k] | fl; i = i + 1; }
+    if (cast(i64, d[i]) == 44) {
+        i = i + 1;
+        let is i64 as f2 with mut = 0; while (cast(i64, d[i]) >= 48 && cast(i64, d[i]) <= 57) { f2 = f2 * 10 + (cast(i64, d[i]) - 48); i = i + 1; }
+        if (f2 > 0) { KEW[k] = f2 - 1; }
+        if (cast(i64, d[i]) == 46) { i = i + 1; let is i64 as c2 with mut = 0; while (cast(i64, d[i]) >= 48 && cast(i64, d[i]) <= 57) { c2 = c2 * 10 + (cast(i64, d[i]) - 48); i = i + 1; } KEC[k] = c2; }
+        while (cast(i64, d[i]) != 0) { KFL[k] = KFL[k] | key_letter(cast(i64, d[i])); i = i + 1; }
+    }
+    KN = KN + 1;
+}
+fn key_letter(c as i64) as i64 {
+    if (c == 110) { return FN; } if (c == 114) { return FR; } if (c == 102) { return FF; }
+    if (c == 98) { return FB; } if (c == 77) { return FM; } if (c == 104) { return FH; }
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is fu.Opt as o;
+    fu.opt_init(&o, argc, argv);
+    while (1 == 1) {
+        let is i64 as f = fu.opt_next(&o, "nrufbMhcst:k:");
+        if (f < 0) { break; }
+        if (f == 110) { g_fl = g_fl | FN; }
+        else if (f == 114) { g_fl = g_fl | FR; }
+        else if (f == 117) { g_fl = g_fl | FU; }
+        else if (f == 102) { g_fl = g_fl | FF; }
+        else if (f == 98) { g_fl = g_fl | FB; }
+        else if (f == 77) { g_fl = g_fl | FM; }
+        else if (f == 104) { g_fl = g_fl | FH; }
+        else if (f == 99) { g_fl = g_fl | FC; }
+        else if (f == 115) { g_fl = g_fl | FS; }
+        else if (f == 116) { g_t = cast(i64, cast(*u8, o.optarg)[0]); }      // -t SEP
+        else if (f == 107) { parse_keydef(cast(*u8, o.optarg)); }            // -k
+        else { prog.outs("usage: sort [-bcfhMnrsu] [-t sep] [-k keydef] [file ...]\n"); return cast(i32, 2); }
+    }
+
+    let is i64 as cap with mut = 65536;
+    let is i64 as va with mut = sys.mmap(cast(i64, 0), cap, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { prog.outs("sort: out of memory\n"); return cast(i32, 2); }
+    let is i64 as got with mut = 0;
+    let is i64 as nfiles = argc - o.ind;
+    let is i32 as rc with mut = 0;
+    let is i64 as inputs with mut = nfiles; if (inputs <= 0) { inputs = 1; }
+    let is i64 as di with mut = 0; let is i64 as fi with mut = o.ind;
+    while (di < inputs) {
+        let is i64 as fd with mut = 0; let is i64 as opened with mut = 1;
+        if (nfiles > 0) {
+            let is *u8 as name = prog.arg(argv, fi);
+            let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
+            fd = sys.open_read(path);
+            if (fd < 0) { prog.outs("sort: "); prog.outs(name); prog.outs(": cannot open\n"); rc = cast(i32, 2); opened = 0; }
+        }
+        if (opened == 1) {
+            while (1 == 1) {
+                if (got >= cap) {
+                    let is i64 as nc = cap * 2;
+                    let is i64 as nva = sys.mmap(cast(i64, 0), nc, sys.PROT_READ | sys.PROT_WRITE);
+                    if (nva < 0) { prog.outs("sort: out of memory\n"); return cast(i32, 2); }
+                    let is *u8 as s = cast(*u8, va); let is *u8 as d = cast(*u8, nva);
+                    let is i64 as k with mut = 0; while (k < got) { d[k] = s[k]; k = k + 1; }
+                    sys.munmap(va, cap); va = nva; cap = nc;
+                }
+                let is i64 as n = sys.read(fd, cast(*u8, va + got), cap - got);
+                if (n <= 0) { break; }
+                got = got + n;
+            }
+            if (fd != 0) { sys.close(fd); }
+        }
+        fi = fi + 1; di = di + 1;
+    }
+
+    g_base = va;
+    let is *u8 as p = cast(*u8, va);
+    if (got == 0) { return rc; }
+    let is i64 as nl with mut = 0; let is i64 as i with mut = 0;
+    while (i < got) { if (cast(i64, p[i]) == 0x0A) { nl = nl + 1; } i = i + 1; }
+    if (cast(i64, p[got - 1]) != 0x0A) { nl = nl + 1; }
+    let is i64 as isz = fu.page_round(nl * 24);
+    let is i64 as iva = sys.mmap(cast(i64, 0), isz, sys.PROT_READ | sys.PROT_WRITE);
+    if (iva < 0) { prog.outs("sort: out of memory\n"); return cast(i32, 2); }
+    let is *i64 as idx = cast(*i64, iva);
+    let is i64 as li with mut = 0; let is i64 as start with mut = 0;
+    i = 0;
+    while (i < got) {
+        if (cast(i64, p[i]) == 0x0A) { idx[li * 3] = start; idx[li * 3 + 1] = i - start; idx[li * 3 + 2] = li; li = li + 1; start = i + 1; }
+        i = i + 1;
+    }
+    if (start < got) { idx[li * 3] = start; idx[li * 3 + 1] = got - start; idx[li * 3 + 2] = li; li = li + 1; }
+
+    // -c: check only, don't sort.
+    if ((g_fl & FC) != 0) {
+        let is i64 as j with mut = 1;
+        while (j < li) {
+            let is i64 as c = cmp_keys(idx[j * 3], idx[j * 3 + 1], idx[(j - 1) * 3], idx[(j - 1) * 3 + 1]);
+            let is i64 as bad with mut = 0;
+            if ((g_fl & FU) != 0) { if (c <= 0) { bad = 1; } } else { if (c < 0) { bad = 1; } }
+            if (bad != 0) { prog.outs("sort: disorder at line "); prog.out_num(j + 1); prog.out("\n", 1); return cast(i32, 1); }
+            j = j + 1;
+        }
+        return 0;
+    }
+
+    qsort_idx(idx, 0, li - 1);
+
+    let is i64 as uniq = g_fl & FU;
+    let is i64 as k2 with mut = 0;
+    while (k2 < li) {
+        let is i64 as dup with mut = 0;
+        if (uniq != 0 && k2 > 0) {
+            if (cmp_keys(idx[k2 * 3], idx[k2 * 3 + 1], idx[(k2 - 1) * 3], idx[(k2 - 1) * 3 + 1]) == 0) { dup = 1; }
+        }
+        if (dup == 0) { prog.out(cast(*u8, va + idx[k2 * 3]), idx[k2 * 3 + 1]); prog.out("\n", 1); }
+        k2 = k2 + 1;
+    }
+    return rc;
+}

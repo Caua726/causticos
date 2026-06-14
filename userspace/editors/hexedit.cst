@@ -1,0 +1,226 @@
+// hexedit — a hex editor as a terminal TUI. `hexedit <file>`.
+//   arrows move   hex digits overwrite the nibble   i insert  x delete
+//   g goto (hex offset)   / search ascii   n next   s save   q quit
+// It writes text + ANSI to stdout and reads keys from stdin: the TERMINAL
+// renders it (wterm in the WM, or the shell), never the framebuffer.
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil.cst" as fu;
+
+let is i64 as C_FG = 0x00cdd6f4; let is i64 as C_DIM = 0x00888a8c;
+let is i64 as CUR = 0x00ffd166; let is i64 as CURTXT = 0x00121417;
+let is i64 as ST_BG = 0x00313244; let is i64 as ST_FG = 0x00cdd6f4;
+
+let is i64 as g_buf with mut = 0; let is i64 as g_len with mut = 0; let is i64 as g_cap with mut = 0;
+let is i64 as g_path with mut = 0;
+let is [128]u8 as g_find; let is i64 as g_findlen with mut = 0;
+let is i64 as g_cur with mut = 0; let is i64 as g_nib with mut = 0; let is i64 as g_view with mut = 0;
+let is i64 as g_modified with mut = 0; let is i64 as g_quit with mut = 0;
+let is i64 as g_rows with mut = 24; let is i64 as g_cols with mut = 80;
+let is i64 as g_prompt with mut = 0;                       // 0 none, 1 goto, 2 search
+let is [128]u8 as g_pbuf; let is i64 as g_plen with mut = 0;
+let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
+
+// ---- output buffer + ANSI ----
+let is [32768]u8 as obuf; let is i64 as olen with mut = 0;
+fn flush_ob() as void {
+    let is i64 as off with mut = 0;
+    while (off < olen) {
+        let is i64 as w = syscall(11, 1, cast(i64, &obuf[0]) + off, olen - off);
+        if (w > 0) { off = off + w; }
+        else { let is [3]i64 as pe; pe[0] = 1; pe[1] = sys.POLL_WRITABLE; pe[2] = 0; sys.poll(cast(*i64, &pe[0]), 1, 2000000000); if ((pe[2] & sys.POLL_WRITABLE) == 0) { olen = 0; return; } }
+    }
+    olen = 0;
+}
+fn ob(c as i64) as void { if (olen >= 32700) { flush_ob(); } obuf[olen] = cast(u8, c); olen = olen + 1; }
+fn obs(s as *u8) as void { let is i64 as i with mut = 0; while (s[i] != 0) { ob(cast(i64, s[i])); i = i + 1; } }
+fn esc() as void { ob(0x1B); ob(0x5B); }
+fn cup(row as i64, col as i64) as void { esc(); obnum(row); ob(59); obnum(col); ob(72); }
+fn eol() as void { esc(); ob(75); }
+fn fgc(v as i64) as void { esc(); obs("38;2;"); obnum((v >> 16) & 0xFF); ob(59); obnum((v >> 8) & 0xFF); ob(59); obnum(v & 0xFF); ob(109); }
+fn bgc(v as i64) as void { esc(); obs("48;2;"); obnum((v >> 16) & 0xFF); ob(59); obnum((v >> 8) & 0xFF); ob(59); obnum(v & 0xFF); ob(109); }
+fn sgr0() as void { esc(); ob(48); ob(109); }
+fn hidec() as void { esc(); ob(63); obnum(25); ob(108); }
+fn showc() as void { esc(); ob(63); obnum(25); ob(104); }
+fn clr() as void { esc(); ob(50); ob(74); }
+fn obnum(v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x == 0) { ob(48); return; }
+    let is [24]u8 as b; let is i64 as n with mut = 0;
+    while (x > 0) { b[n] = cast(u8, 48 + x - (x / 10) * 10); x = x / 10; n = n + 1; }
+    while (n > 0) { n = n - 1; ob(cast(i64, b[n])); }
+}
+fn hexd(v as i64) as i64 { if (v < 10) { return 48 + v; } return 87 + v; }
+fn ob_hex(v as i64, w as i64) as void { let is i64 as i with mut = 0; while (i < w) { ob(hexd((v >> ((w - 1 - i) * 4)) & 15)); i = i + 1; } }
+
+// ---- buffer edits (reused) ----
+fn do_insert(cur as i64) as void {
+    if (g_len >= g_cap) { return; }
+    let is *u8 as b = cast(*u8, g_buf);
+    let is i64 as j with mut = g_len;
+    while (j > cur) { b[j] = b[j - 1]; j = j - 1; }
+    b[cur] = cast(u8, 0); g_len = g_len + 1;
+}
+fn do_delete(cur as i64) as void {
+    if (g_len == 0 || cur >= g_len) { return; }
+    let is *u8 as b = cast(*u8, g_buf);
+    let is i64 as j with mut = cur;
+    while (j < g_len - 1) { b[j] = b[j + 1]; j = j + 1; }
+    g_len = g_len - 1;
+}
+fn search(from as i64) as i64 {
+    if (g_findlen == 0) { return 0 - 1; }
+    let is i64 as r = fu.mem_find(cast(*u8, g_buf + from), g_len - from, cast(*u8, &g_find[0]), g_findlen);
+    if (r < 0) { return 0 - 1; }
+    return from + r;
+}
+
+// ---- render ----
+fn render() as void {
+    let is *u8 as b = cast(*u8, g_buf);
+    let is i64 as rows = g_rows - 2;
+    if (g_cur < g_view) { g_view = (g_cur / 16) * 16; }
+    if (g_cur >= g_view + rows * 16) { g_view = ((g_cur / 16) - rows + 1) * 16; }
+    if (g_view < 0) { g_view = 0; }
+    // header
+    cup(1, 1); bgc(ST_BG); fgc(ST_FG); ob(32); obs(cast(*u8, g_path));
+    obs("  off "); ob_hex(g_cur, 8); obs("  len "); ob_hex(g_len, 6);
+    if (g_modified == 1) { obs("  *mod"); }
+    eol(); sgr0();
+    // hex rows
+    let is i64 as r with mut = 0;
+    while (r < rows) {
+        let is i64 as row_off = g_view + r * 16;
+        cup(r + 2, 1);
+        if (row_off <= g_len) {
+            fgc(C_DIM); ob_hex(row_off, 8); sgr0(); ob(32); ob(32);
+            let is i64 as k with mut = 0;
+            while (k < 16) {
+                let is i64 as off = row_off + k;
+                if (off < g_len) {
+                    let is i64 as bv = cast(i64, b[off]);
+                    if (off == g_cur) { bgc(CUR); fgc(CURTXT); ob_hex(bv, 2); sgr0(); } else { fgc(C_FG); ob_hex(bv, 2); }
+                    ob(32);
+                } else if (off == g_cur) { bgc(CUR); ob(32); ob(32); sgr0(); ob(32); }
+                else { ob(32); ob(32); ob(32); }
+                k = k + 1;
+            }
+            ob(32);
+            k = 0;
+            while (k < 16) {
+                let is i64 as off = row_off + k;
+                if (off < g_len) {
+                    let is i64 as bv = cast(i64, b[off]); let is i64 as ch with mut = bv; if (bv < 32 || bv >= 127) { ch = 46; }
+                    if (off == g_cur) { bgc(CUR); fgc(CURTXT); ob(ch); sgr0(); } else { fgc(C_DIM); ob(ch); }
+                }
+                k = k + 1;
+            }
+            sgr0();
+        }
+        eol(); r = r + 1;
+    }
+    // footer
+    cup(g_rows, 1); fgc(C_DIM);
+    if (g_prompt == 1) { obs("goto 0x"); let is i64 as i with mut = 0; while (i < g_plen) { ob(cast(i64, g_pbuf[i])); i = i + 1; } }
+    else if (g_prompt == 2) { ob(47); let is i64 as i with mut = 0; while (i < g_plen) { ob(cast(i64, g_pbuf[i])); i = i + 1; } }
+    else { obs("hex edits  i ins  x del  g goto  / search  n next  s save  q quit"); }
+    eol(); sgr0();
+}
+
+// ---- input ----
+fn save() as void {
+    let is i64 as wfd = sys.open_write(cast(*u8, g_path));
+    if (wfd >= 0) { sys.write(wfd, cast(*u8, g_buf), g_len); sys.close(wfd); g_modified = 0; }
+}
+fn feed(c as i64) as void {
+    if (g_prompt != 0) {
+        if (c == 0x0A || c == 0x0D) {
+            if (g_prompt == 1) {
+                let is i64 as off with mut = 0; let is i64 as j with mut = 0;
+                while (j < g_plen) {
+                    let is i64 as cc = cast(i64, g_pbuf[j]); let is i64 as d with mut = 0 - 1;
+                    if (cc >= 48 && cc <= 57) { d = cc - 48; } else if (cc >= 97 && cc <= 102) { d = cc - 87; } else if (cc >= 65 && cc <= 70) { d = cc - 55; }
+                    if (d >= 0) { off = off * 16 + d; } j = j + 1;
+                }
+                if (off > g_len) { off = g_len; } g_cur = off;
+            } else {
+                let is i64 as j with mut = 0; while (j < g_plen) { g_find[j] = g_pbuf[j]; j = j + 1; } g_findlen = g_plen;
+                let is i64 as r = search(g_cur + 1); if (r >= 0) { g_cur = r; }
+            }
+            g_prompt = 0; return;
+        }
+        if (c == 0x1B) { g_prompt = 0; return; }
+        if (c == 0x08 || c == 0x7F) { if (g_plen > 0) { g_plen = g_plen - 1; } return; }
+        if (c >= 32 && c < 127 && g_plen < 127) { g_pbuf[g_plen] = cast(u8, c); g_plen = g_plen + 1; }
+        return;
+    }
+    if (in_esc == 0) {
+        let is *u8 as b = cast(*u8, g_buf);
+        if (c == 0x1B) { in_esc = 1; return; }
+        if (c == 113) { g_quit = 1; }                                   // q
+        else if (c == 115) { save(); }                                  // s
+        else if (c == 105) { do_insert(g_cur); g_modified = 1; }        // i
+        else if (c == 120) { do_delete(g_cur); if (g_cur >= g_len && g_cur > 0) { g_cur = g_cur - 1; } g_modified = 1; }  // x
+        else if (c == 103) { g_prompt = 1; g_plen = 0; }               // g
+        else if (c == 47) { g_prompt = 2; g_plen = 0; }                // /
+        else if (c == 110) { let is i64 as r = search(g_cur + 1); if (r >= 0) { g_cur = r; } }   // n
+        else {
+            let is i64 as d with mut = 0 - 1;
+            if (c >= 48 && c <= 57) { d = c - 48; } else if (c >= 97 && c <= 102) { d = c - 87; }
+            if (d >= 0 && g_cur < g_len) {
+                let is i64 as old = cast(i64, b[g_cur]);
+                if (g_nib == 0) { b[g_cur] = cast(u8, (old & 15) | (d << 4)); g_nib = 1; }
+                else { b[g_cur] = cast(u8, (old & 0xF0) | d); g_nib = 0; if (g_cur < g_len - 1) { g_cur = g_cur + 1; } }
+                g_modified = 1;
+            }
+        }
+        return;
+    }
+    if (in_esc == 1) { if (c == 0x5B) { in_esc = 2; in_np = 0; in_p[0] = 0; return; } in_esc = 0; return; }
+    if (c >= 0x30 && c <= 0x39) { in_p[in_np] = in_p[in_np] * 10 + (c - 0x30); return; }
+    if (c == 0x3B) { if (in_np < 7) { in_np = in_np + 1; in_p[in_np] = 0; } return; }
+    if (c == 65) { if (g_cur >= 16) { g_cur = g_cur - 16; g_nib = 0; } }            // up
+    else if (c == 66) { if (g_cur + 16 <= g_len) { g_cur = g_cur + 16; g_nib = 0; } }  // down
+    else if (c == 67) { if (g_cur < g_len) { g_cur = g_cur + 1; g_nib = 0; } }      // right
+    else if (c == 68) { if (g_cur > 0) { g_cur = g_cur - 1; g_nib = 0; } }          // left
+    else if (c == 116) { if (in_p[0] == 8) { g_rows = in_p[1]; g_cols = in_p[2]; } }   // size report
+    in_esc = 0;
+}
+fn drain_input(timeout as i64) as void {
+    let is [3]i64 as pe; pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+    sys.poll(cast(*i64, &pe[0]), 1, timeout);
+    while ((pe[2] & sys.POLL_READABLE) != 0) {
+        let is [128]u8 as buf;
+        let is i64 as r = syscall(10, 0, cast(i64, &buf[0]), 128);
+        if (r <= 0) { return; }
+        let is i64 as i with mut = 0; while (i < r) { feed(cast(i64, buf[i])); i = i + 1; }
+        pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0; sys.poll(cast(*i64, &pe[0]), 1, 0);
+    }
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    if (argc < 2) { prog.outs("usage: hexedit <file>\n"); return cast(i32, 1); }
+    let is [256]u8 as pbb;
+    let is *u8 as path = prog.abspath(prog.arg(argv, 1), cast(*u8, &pbb[0]));
+    g_path = cast(i64, path);
+    let is [4]i64 as st; let is i64 as size with mut = 0;
+    if (sys.stat(path, cast(*u8, &st[0])) == 0) { size = st[0]; }
+    let is i64 as cap = fu.page_round(size + 1048576);
+    let is i64 as va = sys.mmap(0, cap, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { prog.outs("hexedit: out of memory\n"); return cast(i32, 1); }
+    let is i64 as fd = sys.open_read(path);
+    let is i64 as got with mut = 0;
+    if (fd >= 0) { while (got < size) { let is i64 as r = sys.read(fd, cast(*u8, va + got), size - got); if (r <= 0) { break; } got = got + r; } sys.close(fd); }
+    g_buf = va; g_len = got; g_cap = cap;
+
+    hidec(); clr(); flush_ob();
+    esc(); obnum(18); ob(116); flush_ob();          // CSI 18t size query
+    drain_input(300000000);
+    while (g_quit == 0) {
+        render();
+        flush_ob();
+        drain_input(0 - 1);
+    }
+    sgr0(); showc(); clr(); cup(1, 1); flush_ob();
+    return cast(i32, 0);
+}

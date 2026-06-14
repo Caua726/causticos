@@ -1,0 +1,206 @@
+// pager — a file viewer like `less`, as a terminal TUI. `pager <file>`.
+//   up/down  scroll line     space  page down     b  page up
+//   g / G    top / bottom    /text Enter  search   n / N  next / prev
+//   q  quit
+// It writes text + ANSI to stdout and reads keys from stdin: the TERMINAL
+// renders it (wterm in the WM, or the shell), never the framebuffer. Learns
+// its size in-band via CSI 18t -> ESC[8;rows;cols t.
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil.cst" as fu;
+use "../lib/regex.cst" as re;
+
+let is i64 as HL_BG = 0x0073d0ff; let is i64 as HL_FG = 0x00121417;   // match highlight
+let is i64 as ST_BG = 0x00313244; let is i64 as ST_FG = 0x00cdd6f4;   // status bar
+
+let is i64 as g_base with mut = 0; let is i64 as g_len with mut = 0;
+let is i64 as g_idx with mut = 0;  let is i64 as g_nlines with mut = 0;
+let is [128]u8 as g_term; let is i64 as g_tlen with mut = 0; let is i64 as g_re_ok with mut = 0;
+let is [4096]i64 as g_hlmask;
+let is i64 as g_rows with mut = 24; let is i64 as g_cols with mut = 80;
+let is i64 as g_view with mut = 0; let is i64 as g_quit with mut = 0;
+let is i64 as g_searching with mut = 0;          // 1 while typing a /search term
+let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
+
+// ---- output buffer + ANSI (same pattern as btop) ----
+let is [32768]u8 as obuf; let is i64 as olen with mut = 0;
+fn flush_ob() as void {
+    let is i64 as off with mut = 0;
+    while (off < olen) {
+        let is i64 as w = syscall(11, 1, cast(i64, &obuf[0]) + off, olen - off);
+        if (w > 0) { off = off + w; }
+        else { let is [3]i64 as pe; pe[0] = 1; pe[1] = sys.POLL_WRITABLE; pe[2] = 0; sys.poll(cast(*i64, &pe[0]), 1, 2000000000); if ((pe[2] & sys.POLL_WRITABLE) == 0) { olen = 0; return; } }
+    }
+    olen = 0;
+}
+fn ob(c as i64) as void { if (olen >= 32700) { flush_ob(); } obuf[olen] = cast(u8, c); olen = olen + 1; }
+fn obs(s as *u8) as void { let is i64 as i with mut = 0; while (s[i] != 0) { ob(cast(i64, s[i])); i = i + 1; } }
+fn obn(v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { ob(45); x = 0 - x; }
+    if (x == 0) { ob(48); return; }
+    let is [24]u8 as b; let is i64 as n with mut = 0;
+    while (x > 0) { b[n] = cast(u8, 48 + x - (x / 10) * 10); x = x / 10; n = n + 1; }
+    while (n > 0) { n = n - 1; ob(cast(i64, b[n])); }
+}
+fn esc() as void { ob(0x1B); ob(0x5B); }
+fn cup(row as i64, col as i64) as void { esc(); obn(row); ob(59); obn(col); ob(72); }
+fn eol() as void { esc(); ob(75); }
+fn fgc(v as i64) as void { esc(); obs("38;2;"); obn((v >> 16) & 0xFF); ob(59); obn((v >> 8) & 0xFF); ob(59); obn(v & 0xFF); ob(109); }
+fn bgc(v as i64) as void { esc(); obs("48;2;"); obn((v >> 16) & 0xFF); ob(59); obn((v >> 8) & 0xFF); ob(59); obn(v & 0xFF); ob(109); }
+fn sgr0() as void { esc(); ob(48); ob(109); }
+fn hidec() as void { esc(); ob(63); obn(25); ob(108); }
+fn showc() as void { esc(); ob(63); obn(25); ob(104); }
+fn clr() as void { esc(); ob(50); ob(74); }
+
+// ---- file lines + regex search (reused) ----
+fn compile_term() as void {
+    g_re_ok = 0;
+    if (g_tlen == 0) { return; }
+    let is i64 as icase with mut = 1; let is i64 as k with mut = 0;
+    while (k < g_tlen) { let is i64 as c = cast(i64, g_term[k]); if (c >= 65 && c <= 90) { icase = 0; } k = k + 1; }
+    if (re.re_compile(cast(*u8, &g_term[0]), g_tlen, icase, 0) == 0) { g_re_ok = 1; }
+}
+fn mark_matches(lp as i64, ll as i64) as void {
+    let is i64 as cap with mut = ll; if (cap > 4096) { cap = 4096; }
+    let is i64 as z with mut = 0; while (z < cap) { g_hlmask[z] = 0; z = z + 1; }
+    if (g_re_ok == 0 || g_tlen == 0) { return; }
+    let is *u8 as s = cast(*u8, lp);
+    let is i64 as pos with mut = 0;
+    let is [1]i64 as ms; let is [1]i64 as me;
+    while (pos <= ll) {
+        if (re.re_search(cast(*u8, &s[pos]), ll - pos, cast(*i64, &ms[0]), cast(*i64, &me[0])) == 0) { break; }
+        let is i64 as a = pos + ms[0]; let is i64 as b = pos + me[0];
+        let is i64 as kk with mut = a; while (kk < b && kk < 4096) { g_hlmask[kk] = 1; kk = kk + 1; }
+        if (b > pos) { pos = b; } else { pos = pos + 1; }
+    }
+}
+fn line_at(ln as i64, out_len as *i64) as i64 {
+    let is *i64 as idx = cast(*i64, g_idx);
+    let is i64 as s = idx[ln];
+    let is i64 as e with mut = g_len;
+    if (ln + 1 < g_nlines) { e = idx[ln + 1] - 1; }
+    if (e < s) { e = s; }
+    out_len[0] = e - s;
+    return g_base + s;
+}
+fn search_fwd(from as i64) as i64 {
+    if (g_re_ok == 0) { return 0 - 1; }
+    let is i64 as ln with mut = from;
+    while (ln < g_nlines) { let is i64 as ll with mut = 0; let is i64 as lp = line_at(ln, &ll); if (re.re_match(cast(*u8, lp), ll) == 1) { return ln; } ln = ln + 1; }
+    return 0 - 1;
+}
+fn search_bwd(from as i64) as i64 {
+    if (g_re_ok == 0) { return 0 - 1; }
+    let is i64 as ln with mut = from;
+    while (ln >= 0) { let is i64 as ll with mut = 0; let is i64 as lp = line_at(ln, &ll); if (re.re_match(cast(*u8, lp), ll) == 1) { return ln; } ln = ln - 1; }
+    return 0 - 1;
+}
+
+// ---- render: status row + wrapped body, repaint each line (CSI K trims) ----
+fn render() as void {
+    let is i64 as pct with mut = 100; if (g_nlines > 1) { pct = g_view * 100 / (g_nlines - 1); }
+    cup(1, 1); bgc(ST_BG); fgc(ST_FG); ob(32);
+    obn(g_view + 1); ob(47); obn(g_nlines); obs("  ("); obn(pct); obs("%)   /search  n/N  space/b  g/G  q quit"); eol(); sgr0();
+    let is i64 as row with mut = 2; let is i64 as ln with mut = g_view;
+    while (row <= g_rows && ln < g_nlines) {
+        let is i64 as ll with mut = 0;
+        let is i64 as lp = line_at(ln, &ll);
+        let is *u8 as p = cast(*u8, lp);
+        mark_matches(lp, ll);
+        cup(row, 1);
+        let is i64 as col with mut = 0; let is i64 as c with mut = 0; let is i64 as hl with mut = 0;
+        while (c < ll && row <= g_rows) {
+            let is i64 as ch = cast(i64, p[c]);
+            if (ch == 0x09) {
+                if (hl == 1) { sgr0(); hl = 0; }
+                let is i64 as t with mut = 0; while (t < 4) { ob(32); col = col + 1; t = t + 1; if (col >= g_cols) { t = 4; } }
+            } else {
+                let is i64 as want with mut = 0; if (c < 4096 && g_hlmask[c] == 1) { want = 1; }
+                if (want != hl) { if (want == 1) { bgc(HL_BG); fgc(HL_FG); } else { sgr0(); } hl = want; }
+                if (ch < 32) { ob(46); } else { ob(ch); }
+                col = col + 1;
+            }
+            if (col >= g_cols) { if (hl == 1) { sgr0(); hl = 0; } row = row + 1; if (row <= g_rows) { cup(row, 1); col = 0; } }
+            c = c + 1;
+        }
+        if (hl == 1) { sgr0(); }
+        eol(); row = row + 1; ln = ln + 1;
+    }
+    while (row <= g_rows) { cup(row, 1); eol(); row = row + 1; }
+    if (g_searching == 1) { cup(g_rows, 1); fgc(ST_FG); ob(47); let is i64 as i with mut = 0; while (i < g_tlen) { ob(cast(i64, g_term[i])); i = i + 1; } eol(); sgr0(); }
+}
+
+// ---- input ----
+fn page(delta as i64) as void { g_view = g_view + delta; if (g_view > g_nlines - 1) { g_view = g_nlines - 1; } if (g_view < 0) { g_view = 0; } }
+fn feed(c as i64) as void {
+    if (g_searching == 1) {                         // typing a search term
+        if (c == 0x0A || c == 0x0D) { g_searching = 0; compile_term(); let is i64 as r = search_fwd(g_view); if (r >= 0) { g_view = r; } return; }
+        if (c == 0x1B) { g_searching = 0; g_tlen = 0; return; }      // Esc cancels
+        if (c == 0x08 || c == 0x7F) { if (g_tlen > 0) { g_tlen = g_tlen - 1; } return; }
+        if (c >= 32 && c < 127 && g_tlen < 127) { g_term[g_tlen] = cast(u8, c); g_tlen = g_tlen + 1; }
+        return;
+    }
+    if (in_esc == 0) {
+        if (c == 0x1B) { in_esc = 1; return; }
+        if (c == 113) { g_quit = 1; }                               // q
+        else if (c == 32) { page(g_rows - 1); }                     // space: page down
+        else if (c == 98) { page(0 - (g_rows - 1)); }               // b: page up
+        else if (c == 103) { g_view = 0; }                          // g: top
+        else if (c == 71) { g_view = g_nlines - 1; if (g_view < 0) { g_view = 0; } }   // G: bottom
+        else if (c == 47) { g_searching = 1; g_tlen = 0; }          // /
+        else if (c == 110) { let is i64 as r = search_fwd(g_view + 1); if (r >= 0) { g_view = r; } }   // n
+        else if (c == 78) { let is i64 as r = search_bwd(g_view - 1); if (r >= 0) { g_view = r; } }    // N
+        return;
+    }
+    if (in_esc == 1) { if (c == 0x5B) { in_esc = 2; in_np = 0; in_p[0] = 0; return; } in_esc = 0; return; }
+    if (c >= 0x30 && c <= 0x39) { in_p[in_np] = in_p[in_np] * 10 + (c - 0x30); return; }
+    if (c == 0x3B) { if (in_np < 7) { in_np = in_np + 1; in_p[in_np] = 0; } return; }
+    if (c == 65) { if (g_view > 0) { g_view = g_view - 1; } }       // up
+    else if (c == 66) { if (g_view < g_nlines - 1) { g_view = g_view + 1; } }   // down
+    else if (c == 116) { if (in_p[0] == 8) { g_rows = in_p[1]; g_cols = in_p[2]; } }   // size report
+    in_esc = 0;
+}
+fn drain_input(timeout as i64) as void {
+    let is [3]i64 as pe; pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+    sys.poll(cast(*i64, &pe[0]), 1, timeout);
+    while ((pe[2] & sys.POLL_READABLE) != 0) {
+        let is [128]u8 as buf;
+        let is i64 as r = syscall(10, 0, cast(i64, &buf[0]), 128);
+        if (r <= 0) { return; }
+        let is i64 as i with mut = 0; while (i < r) { feed(cast(i64, buf[i])); i = i + 1; }
+        pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0; sys.poll(cast(*i64, &pe[0]), 1, 0);
+    }
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    if (argc < 2) { prog.outs("usage: pager <file>\n"); return cast(i32, 1); }
+    let is [256]u8 as pbb;
+    let is *u8 as path = prog.abspath(prog.arg(argv, 1), cast(*u8, &pbb[0]));
+    let is i64 as len with mut = 0;
+    let is i64 as base = fu.slurp(path, &len);
+    if (len < 0) { prog.outs("pager: cannot open "); prog.outs(path); prog.out("\n", 1); return cast(i32, 1); }
+    g_base = base; g_len = len;
+    let is *u8 as p = cast(*u8, base);
+    let is i64 as nlcap with mut = 1; let is i64 as i with mut = 0;
+    while (i < len) { if (cast(i64, p[i]) == 0x0A) { nlcap = nlcap + 1; } i = i + 1; }
+    let is i64 as isz = fu.page_round(nlcap * 8);
+    let is i64 as iva = sys.mmap(0, isz, sys.PROT_READ | sys.PROT_WRITE);
+    if (iva < 0) { prog.outs("pager: out of memory\n"); return cast(i32, 1); }
+    let is *i64 as idx = cast(*i64, iva);
+    idx[0] = 0;
+    let is i64 as li with mut = 1; i = 0;
+    while (i < len) { if (cast(i64, p[i]) == 0x0A && i + 1 < len) { idx[li] = i + 1; li = li + 1; } i = i + 1; }
+    g_idx = iva; g_nlines = li;
+
+    hidec(); clr(); flush_ob();
+    esc(); obn(18); ob(116); flush_ob();           // CSI 18t size query
+    drain_input(300000000);
+    while (g_quit == 0) {
+        render();
+        flush_ob();
+        drain_input(0 - 1);                        // block until a key (no periodic redraw needed)
+    }
+    sgr0(); showc(); clr(); cup(1, 1); flush_ob();
+    return cast(i32, 0);
+}

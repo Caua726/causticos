@@ -1,0 +1,409 @@
+// regex.cst — a small but real POSIX-ERE engine for the CausticOS tools.
+//
+// It compiles a pattern to a bytecode program and runs it as a Thompson NFA
+// (the Pike VM): a set of threads advanced in lockstep over the input, so there
+// is NO backtracking and no pathological blow-up — matching is O(text * prog).
+// This is the same construction Russ Cox documents in "Regular Expression
+// Matching Can Be Simple And Fast"; here it is a freestanding port (no heap,
+// fixed pools) usable by grep, the pager, and anything else.
+//
+// Supported ERE: literals, '.', anchors '^' '$', '*' '+' '?', '{n,m}', union
+// '|', groups '( )', bracket classes '[...]' / '[^...]' with a-z ranges, and the
+// \d \w \s (and \D \W \S) shorthands. Escapes \. \* \\ \n \t etc. are literals.
+// Flags: case-insensitive, and a fixed-string mode (treat the pattern verbatim).
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+
+// ---- program (bytecode) ----
+let is i64 as OP_CHAR  = 1;     // x = byte
+let is i64 as OP_ANY   = 2;     // any byte
+let is i64 as OP_CLASS = 3;     // x = class index
+let is i64 as OP_MATCH = 4;     // accept
+let is i64 as OP_JMP   = 5;     // x = target
+let is i64 as OP_SPLIT = 6;     // x, y = targets (x has priority = greedy/leftmost)
+let is i64 as OP_BOL   = 7;     // anchor: start of line
+let is i64 as OP_EOL   = 8;     // anchor: end of line
+
+let is [1024]i64 as RE_OP;
+let is [1024]i64 as RE_X;
+let is [1024]i64 as RE_Y;
+let is i64 as RE_NI with mut = 0;
+
+// character classes: a 256-bit bitmap each, four i64 words per class.
+let is [256]i64 as RE_CLS;       // 64 classes * 4 words
+let is i64 as RE_NC with mut = 0;
+
+// ---- AST (built first, then emitted) ----
+let is i64 as A_CHAR  = 1;
+let is i64 as A_ANY   = 2;
+let is i64 as A_CLASS = 3;
+let is i64 as A_BOL   = 4;
+let is i64 as A_EOL   = 5;
+let is i64 as A_CAT   = 6;
+let is i64 as A_ALT   = 7;
+let is i64 as A_STAR  = 8;
+let is i64 as A_PLUS  = 9;
+let is i64 as A_QUEST = 10;
+let is i64 as A_EMPTY = 11;
+
+let is [1024]i64 as AST_T;
+let is [1024]i64 as AST_C;       // literal byte for A_CHAR
+let is [1024]i64 as AST_CLS;     // class index for A_CLASS
+let is [1024]i64 as AST_L;       // left / child
+let is [1024]i64 as AST_R;       // right
+let is i64 as RE_NAST with mut = 0;
+
+// ---- parser + global state ----
+let is i64 as RE_PAT with mut = 0;     // *u8
+let is i64 as RE_PLEN with mut = 0;
+let is i64 as RE_POS with mut = 0;
+let is i64 as RE_ERR with mut = 0;
+let is i64 as RE_ICASE with mut = 0;
+
+// ---- VM thread lists ----
+let is [1024]i64 as RE_CLIST;
+let is [1024]i64 as RE_NLIST;
+let is [1024]i64 as RE_SEEN;            // generation marks for dedup
+let is i64 as RE_GEN with mut = 0;
+
+fn re_lc(c as i64) as i64 { if (c >= 65 && c <= 90) { return c + 32; } return c; }
+
+// ---- class bitmap helpers ----
+fn cls_new() as i64 {
+    if (RE_NC >= 63) { RE_ERR = 1; return 0; }
+    let is i64 as idx = RE_NC; RE_NC = RE_NC + 1;
+    RE_CLS[idx * 4] = 0; RE_CLS[idx * 4 + 1] = 0; RE_CLS[idx * 4 + 2] = 0; RE_CLS[idx * 4 + 3] = 0;
+    return idx;
+}
+fn cls_bit(idx as i64, c as i64) as void {
+    let is i64 as b = c & 255;
+    RE_CLS[idx * 4 + (b >> 6)] = RE_CLS[idx * 4 + (b >> 6)] | (1 << (b & 63));
+}
+fn cls_set(idx as i64, c as i64) as void {
+    cls_bit(idx, c);
+    if (RE_ICASE != 0) {
+        if (c >= 65 && c <= 90) { cls_bit(idx, c + 32); }
+        else if (c >= 97 && c <= 122) { cls_bit(idx, c - 32); }
+    }
+}
+fn cls_range(idx as i64, a0 as i64, b0 as i64) as void {
+    let is i64 as a with mut = a0; let is i64 as b with mut = b0;
+    if (a > b) { let is i64 as t = a; a = b; b = t; }
+    let is i64 as c with mut = a;
+    while (c <= b) { cls_set(idx, c); c = c + 1; }
+}
+fn cls_invert(idx as i64) as void {
+    RE_CLS[idx * 4] = RE_CLS[idx * 4] ^ (0 - 1); RE_CLS[idx * 4 + 1] = RE_CLS[idx * 4 + 1] ^ (0 - 1);
+    RE_CLS[idx * 4 + 2] = RE_CLS[idx * 4 + 2] ^ (0 - 1); RE_CLS[idx * 4 + 3] = RE_CLS[idx * 4 + 3] ^ (0 - 1);
+}
+fn cls_test(idx as i64, c as i64) as i64 {
+    let is i64 as b = c & 255;
+    if ((RE_CLS[idx * 4 + (b >> 6)] & (1 << (b & 63))) != 0) { return 1; }
+    return 0;
+}
+// add a \d \w \s style set (which = the escape letter, lowercased) to a class.
+fn cls_add_named(idx as i64, which as i64) as void {
+    if (which == 100) { cls_range(idx, 48, 57); }                                   // d: 0-9
+    else if (which == 119) { cls_range(idx, 48, 57); cls_range(idx, 65, 90); cls_range(idx, 97, 122); cls_set(idx, 95); }  // w
+    else if (which == 115) { cls_set(idx, 32); cls_set(idx, 9); cls_set(idx, 10); cls_set(idx, 13); cls_set(idx, 12); cls_set(idx, 11); }  // s
+}
+
+// ---- AST builders ----
+fn node(t as i64) as i64 {
+    if (RE_NAST >= 1022) { RE_ERR = 1; return 0; }
+    let is i64 as n = RE_NAST; RE_NAST = RE_NAST + 1;
+    AST_T[n] = t; AST_C[n] = 0; AST_CLS[n] = 0; AST_L[n] = 0 - 1; AST_R[n] = 0 - 1;
+    return n;
+}
+fn node_cat(l as i64, r as i64) as i64 { let is i64 as n = node(A_CAT); AST_L[n] = l; AST_R[n] = r; return n; }
+fn node_wrap(t as i64, ch as i64) as i64 { let is i64 as n = node(t); AST_L[n] = ch; return n; }
+
+// ---- parser ----
+fn re_peek() as i64 { if (RE_POS < RE_PLEN) { let is *u8 as p = cast(*u8, RE_PAT); return cast(i64, p[RE_POS]); } return 0 - 1; }
+fn re_peek2() as i64 { if (RE_POS + 1 < RE_PLEN) { let is *u8 as p = cast(*u8, RE_PAT); return cast(i64, p[RE_POS + 1]); } return 0 - 1; }
+fn re_next() as i64 { let is i64 as c = re_peek(); RE_POS = RE_POS + 1; return c; }
+
+fn esc_literal(d as i64) as i64 {
+    if (d == 110) { return 10; }       // \n
+    if (d == 116) { return 9; }        // \t
+    if (d == 114) { return 13; }       // \r
+    if (d == 102) { return 12; }       // \f
+    if (d == 118) { return 11; }       // \v
+    if (d == 48) { return 0; }         // \0
+    return d;                          // \. \* \\ ... -> the char itself
+}
+fn is_named_escape(d as i64) as i64 {
+    if (d == 100 || d == 68 || d == 119 || d == 87 || d == 115 || d == 83) { return 1; }   // d D w W s S
+    return 0;
+}
+
+// p_class: parse a [...] bracket expression at RE_POS (on '['). Returns a node.
+// (p_atom/p_class call p_alt, defined below — Caustic resolves forward refs.)
+fn p_class() as i64 {
+    re_next();                                        // [
+    let is i64 as idx = cls_new();
+    let is i64 as neg with mut = 0;
+    if (re_peek() == 94) { neg = 1; re_next(); }      // ^
+    let is i64 as first with mut = 1;
+    while (1 == 1) {
+        let is i64 as c = re_peek();
+        if (c < 0) { RE_ERR = 1; break; }
+        if (c == 93 && first == 0) { break; }         // closing ] (not if first char)
+        re_next();
+        first = 0;
+        if (c == 92) {                                // escape inside class
+            let is i64 as d = re_next();
+            if (is_named_escape(d) != 0) { cls_add_named(idx, re_lc(d)); } else { cls_set(idx, esc_literal(d)); }
+        } else if (re_peek() == 45 && re_peek2() != 93 && re_peek2() >= 0) {   // range c-d
+            re_next();                                // -
+            let is i64 as c2v with mut = re_next();
+            if (c2v == 92) { c2v = esc_literal(re_next()); }
+            cls_range(idx, c, c2v);
+        } else {
+            cls_set(idx, c);
+        }
+    }
+    if (re_peek() == 93) { re_next(); } else { RE_ERR = 1; }
+    if (neg != 0) { cls_invert(idx); }
+    let is i64 as n = node(A_CLASS); AST_CLS[n] = idx; return n;
+}
+
+fn p_atom() as i64 {
+    let is i64 as c = re_peek();
+    if (c == 40) {                                    // (
+        re_next();
+        let is i64 as inner = p_alt();
+        if (re_peek() == 41) { re_next(); } else { RE_ERR = 1; }
+        return inner;
+    }
+    if (c == 91) { return p_class(); }                // [
+    if (c == 46) { re_next(); return node(A_ANY); }   // .
+    if (c == 94) { re_next(); return node(A_BOL); }   // ^
+    if (c == 36) { re_next(); return node(A_EOL); }   // $
+    if (c == 92) {                                    // backslash
+        re_next();
+        let is i64 as d = re_next();
+        if (is_named_escape(d) != 0) {
+            let is i64 as idx = cls_new();
+            cls_add_named(idx, re_lc(d));
+            if (d == 68 || d == 87 || d == 83) { cls_invert(idx); }   // upper = negate
+            let is i64 as n = node(A_CLASS); AST_CLS[n] = idx; return n;
+        }
+        let is i64 as n = node(A_CHAR); AST_C[n] = esc_literal(d); return n;
+    }
+    re_next();
+    let is i64 as n = node(A_CHAR); AST_C[n] = c; return n;
+}
+
+// scan a {n,m} starting at RE_POS without consuming; 1 if well-formed.
+fn brace_ok() as i64 {
+    let is *u8 as p = cast(*u8, RE_PAT);
+    let is i64 as i with mut = RE_POS + 1;            // past '{'
+    let is i64 as digits with mut = 0;
+    while (i < RE_PLEN && cast(i64, p[i]) >= 48 && cast(i64, p[i]) <= 57) { i = i + 1; digits = digits + 1; }
+    if (i < RE_PLEN && cast(i64, p[i]) == 44) {       // ,
+        i = i + 1;
+        while (i < RE_PLEN && cast(i64, p[i]) >= 48 && cast(i64, p[i]) <= 57) { i = i + 1; digits = digits + 1; }
+    }
+    if (digits == 0) { return 0; }
+    if (i < RE_PLEN && cast(i64, p[i]) == 125) { return 1; }   // }
+    return 0;
+}
+// parse {n}, {n,}, {n,m}, {,m}; expand by reusing child node `a`.
+fn p_brace(a as i64) as i64 {
+    re_next();                                        // {
+    let is i64 as n with mut = 0; let is i64 as haveN with mut = 0;
+    while (re_peek() >= 48 && re_peek() <= 57) { n = n * 10 + (re_next() - 48); haveN = 1; }
+    let is i64 as m with mut = n; let is i64 as inf with mut = 0;
+    if (re_peek() == 44) {                            // ,
+        re_next();
+        if (re_peek() == 125) { inf = 1; }            // {n,} -> n or more
+        else { m = 0; while (re_peek() >= 48 && re_peek() <= 57) { m = m * 10 + (re_next() - 48); } }
+    }
+    if (re_peek() == 125) { re_next(); }
+    if (n > 100 || m > 100) { RE_ERR = 1; return a; }
+    let is i64 as result with mut = node(A_EMPTY);
+    let is i64 as k with mut = 0;
+    while (k < n) { result = node_cat(result, a); k = k + 1; }
+    if (inf != 0) { result = node_cat(result, node_wrap(A_STAR, a)); }
+    else { k = n; while (k < m) { result = node_cat(result, node_wrap(A_QUEST, a)); k = k + 1; } }
+    return result;
+}
+
+fn p_rep() as i64 {
+    let is i64 as a with mut = p_atom();
+    let is i64 as go with mut = 1;
+    while (go != 0) {
+        let is i64 as c = re_peek();
+        if (c == 42) { re_next(); a = node_wrap(A_STAR, a); }
+        else if (c == 43) { re_next(); a = node_wrap(A_PLUS, a); }
+        else if (c == 63) { re_next(); a = node_wrap(A_QUEST, a); }
+        else if (c == 123 && brace_ok() != 0) { a = p_brace(a); }
+        else { go = 0; }
+    }
+    return a;
+}
+
+fn p_cat() as i64 {
+    let is i64 as c = re_peek();
+    if (c < 0 || c == 124 || c == 41) { return node(A_EMPTY); }
+    let is i64 as acc with mut = p_rep();
+    while (1 == 1) {
+        let is i64 as d = re_peek();
+        if (d < 0 || d == 124 || d == 41) { break; }
+        acc = node_cat(acc, p_rep());
+    }
+    return acc;
+}
+
+fn p_alt() as i64 {
+    let is i64 as l with mut = p_cat();
+    while (re_peek() == 124) {                         // |
+        re_next();
+        let is i64 as r = p_cat();
+        let is i64 as n = node(A_ALT); AST_L[n] = l; AST_R[n] = r; l = n;
+    }
+    return l;
+}
+
+// ---- emit AST -> bytecode ----
+fn new_inst(op as i64) as i64 {
+    if (RE_NI >= 1022) { RE_ERR = 1; return 0; }
+    let is i64 as i = RE_NI; RE_OP[i] = op; RE_X[i] = 0; RE_Y[i] = 0; RE_NI = RE_NI + 1; return i;
+}
+fn emit(n as i64) as void {
+    if (RE_ERR != 0 || n < 0) { return; }
+    let is i64 as t = AST_T[n];
+    if (t == A_CHAR) { let is i64 as i = new_inst(OP_CHAR); RE_X[i] = AST_C[n]; }
+    else if (t == A_ANY) { new_inst(OP_ANY); }
+    else if (t == A_CLASS) { let is i64 as i = new_inst(OP_CLASS); RE_X[i] = AST_CLS[n]; }
+    else if (t == A_BOL) { new_inst(OP_BOL); }
+    else if (t == A_EOL) { new_inst(OP_EOL); }
+    else if (t == A_EMPTY) { }
+    else if (t == A_CAT) { emit(AST_L[n]); emit(AST_R[n]); }
+    else if (t == A_ALT) {
+        let is i64 as s = new_inst(OP_SPLIT); RE_X[s] = RE_NI;
+        emit(AST_L[n]);
+        let is i64 as j = new_inst(OP_JMP); RE_Y[s] = RE_NI;
+        emit(AST_R[n]); RE_X[j] = RE_NI;
+    }
+    else if (t == A_STAR) {
+        let is i64 as l1 = new_inst(OP_SPLIT); RE_X[l1] = RE_NI;
+        emit(AST_L[n]);
+        let is i64 as jj = new_inst(OP_JMP); RE_X[jj] = l1; RE_Y[l1] = RE_NI;
+    }
+    else if (t == A_PLUS) {
+        let is i64 as l1 = RE_NI;
+        emit(AST_L[n]);
+        let is i64 as s = new_inst(OP_SPLIT); RE_X[s] = l1; RE_Y[s] = RE_NI;
+    }
+    else if (t == A_QUEST) {
+        let is i64 as s = new_inst(OP_SPLIT); RE_X[s] = RE_NI;
+        emit(AST_L[n]); RE_Y[s] = RE_NI;
+    }
+    return;
+}
+
+// re_compile: build the program for `pat`. icase=1 folds case; fixed=1 treats
+// the pattern as a literal string. Returns 0 on success, -1 on a malformed
+// pattern (the engine then matches nothing).
+fn re_compile(pat as *u8, plen as i64, icase as i64, fixed as i64) as i64 {
+    RE_NI = 0; RE_NC = 0; RE_NAST = 0; RE_ERR = 0; RE_ICASE = icase;
+    RE_PAT = cast(i64, pat); RE_PLEN = plen; RE_POS = 0;
+    if (fixed != 0) {
+        let is i64 as i with mut = 0;
+        while (i < plen) { let is i64 as ic = new_inst(OP_CHAR); RE_X[ic] = cast(i64, pat[i]); i = i + 1; }
+    } else {
+        let is i64 as root = p_alt();
+        if (RE_POS < RE_PLEN) { RE_ERR = 1; }          // leftover ')' etc.
+        emit(root);
+    }
+    new_inst(OP_MATCH);
+    if (RE_ERR != 0) { return 0 - 1; }
+    return 0;
+}
+
+// ---- NFA simulation ----
+fn char_eq(target as i64, c as i64) as i64 {
+    if (RE_ICASE != 0) { if (re_lc(target) == re_lc(c)) { return 1; } return 0; }
+    if (target == c) { return 1; }
+    return 0;
+}
+// add pc (following epsilon transitions: jmp/split/anchors) to `list`.
+fn addthread(list as *i64, ln as *i64, pc as i64, sp as i64, len as i64) as void {
+    if (RE_SEEN[pc] == RE_GEN) { return; }
+    RE_SEEN[pc] = RE_GEN;
+    let is i64 as op = RE_OP[pc];
+    if (op == OP_JMP) { addthread(list, ln, RE_X[pc], sp, len); return; }
+    if (op == OP_SPLIT) { addthread(list, ln, RE_X[pc], sp, len); addthread(list, ln, RE_Y[pc], sp, len); return; }
+    if (op == OP_BOL) { if (sp == 0) { addthread(list, ln, pc + 1, sp, len); } return; }
+    if (op == OP_EOL) { if (sp == len) { addthread(list, ln, pc + 1, sp, len); } return; }
+    list[ln[0]] = pc; ln[0] = ln[0] + 1;             // CHAR/ANY/CLASS/MATCH
+}
+
+// step the current thread set over byte c; returns the next-list count.
+fn step(s as *u8, sp as i64, len as i64, cn as i64, restart as i64) as i64 {
+    let is i64 as c = cast(i64, s[sp]);
+    RE_GEN = RE_GEN + 1;
+    let is i64 as nn with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < cn) {
+        let is i64 as pc = RE_CLIST[k];
+        let is i64 as op = RE_OP[pc];
+        let is i64 as hit with mut = 0;
+        if (op == OP_CHAR) { hit = char_eq(RE_X[pc], c); }
+        else if (op == OP_ANY) { hit = 1; }
+        else if (op == OP_CLASS) { hit = cls_test(RE_X[pc], c); }
+        if (hit != 0) { addthread(cast(*i64, &RE_NLIST[0]), &nn, pc + 1, sp + 1, len); }
+        k = k + 1;
+    }
+    if (restart != 0) { addthread(cast(*i64, &RE_NLIST[0]), &nn, 0, sp + 1, len); }   // unanchored
+    k = 0; while (k < nn) { RE_CLIST[k] = RE_NLIST[k]; k = k + 1; }
+    return nn;
+}
+fn list_has_match(cn as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < cn) { if (RE_OP[RE_CLIST[k]] == OP_MATCH) { return 1; } k = k + 1; }
+    return 0;
+}
+
+// re_match: does the pattern occur anywhere in s[0..len)? Unanchored, O(len*prog).
+fn re_match(s as *u8, len as i64) as i64 {
+    RE_GEN = RE_GEN + 1;
+    let is i64 as cn with mut = 0;
+    addthread(cast(*i64, &RE_CLIST[0]), &cn, 0, 0, len);
+    let is i64 as sp with mut = 0;
+    while (1 == 1) {
+        if (list_has_match(cn) != 0) { return 1; }
+        if (sp >= len) { break; }
+        cn = step(s, sp, len, cn, 1);
+        sp = sp + 1;
+    }
+    return 0;
+}
+
+// re_match_at: longest match length starting exactly at s[i], or -1. Anchored.
+fn re_match_at(s as *u8, len as i64, i as i64) as i64 {
+    RE_GEN = RE_GEN + 1;
+    let is i64 as cn with mut = 0;
+    addthread(cast(*i64, &RE_CLIST[0]), &cn, 0, i, len);
+    let is i64 as sp with mut = i;
+    let is i64 as best with mut = 0 - 1;
+    while (1 == 1) {
+        if (list_has_match(cn) != 0) { best = sp; }    // longest: keep the latest accept
+        if (sp >= len || cn == 0) { break; }
+        cn = step(s, sp, len, cn, 0);
+        sp = sp + 1;
+    }
+    return best;
+}
+
+// re_search: leftmost-longest match; writes [*ms, *me) and returns 1, else 0.
+fn re_search(s as *u8, len as i64, ms as *i64, me as *i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i <= len) {
+        let is i64 as e = re_match_at(s, len, i);
+        if (e >= 0) { ms[0] = i; me[0] = e; return 1; }
+        i = i + 1;
+    }
+    return 0;
+}

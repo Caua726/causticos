@@ -1,0 +1,289 @@
+// futil.cst — shared helpers for the CausticOS file/text tools. Freestanding:
+// no heap and no String struct, just raw (*u8, len), so every little tool stays
+// cheap and self-contained. Two ways to read a file:
+//   - Reader: a buffered byte stream over an fd, for filters that scan once
+//     front-to-back (wc, grep, head, rev, cut, fold, hexdump).
+//   - slurp:  map the whole file into one anonymous mapping, for tools that
+//     need random access or reverse order (tail, tac, sort). Sized to the file
+//     via stat — no silent truncation.
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+// ---- buffered reader ----
+// All fields i64 (mixed-width struct fields can alias in Caustic — keep them
+// uniform). `buf` is a caller-owned staging buffer the reader fills from the fd.
+struct Reader {
+    fd   as i64;
+    buf  as i64;    // *u8 staging buffer (held as an address)
+    cap  as i64;    // its capacity
+    fill as i64;    // valid bytes currently in buf
+    pos  as i64;    // cursor within [0, fill)
+    eofd as i64;    // 1 once the fd is drained
+}
+
+// rd_open: open `path` (already absolute) for reading, staging through `buf`.
+// Returns the fd (>=0) or a negative errno. The Reader is safe to use either
+// way — rd_byte just reports EOF on a bad fd.
+fn rd_open(r as *Reader, path as *u8, buf as *u8, cap as i64) as i64 {
+    r.fd = sys.open_read(path);
+    r.buf = cast(i64, buf);
+    r.cap = cap;
+    r.fill = 0;
+    r.pos = 0;
+    r.eofd = 0;
+    return r.fd;
+}
+
+// rd_byte: the next byte as 0..255, or -1 at end of file.
+fn rd_byte(r as *Reader) as i64 {
+    if (r.pos >= r.fill) {
+        if (r.eofd == 1) { return 0 - 1; }
+        let is i64 as n = sys.read(r.fd, cast(*u8, r.buf), r.cap);
+        if (n <= 0) { r.eofd = 1; return 0 - 1; }
+        r.fill = n;
+        r.pos = 0;
+    }
+    let is *u8 as p = cast(*u8, r.buf + r.pos);
+    r.pos = r.pos + 1;
+    return cast(i64, p[0]);
+}
+
+fn rd_close(r as *Reader) as void {
+    if (r.fd >= 0) { sys.close(r.fd); }
+}
+
+// ---- whole-file map ----
+fn page_round(n as i64) as i64 { return (n + 4095) / 4096 * 4096; }
+
+// slurp: map the entire file at `path` into a fresh R/W mapping and read it in.
+// Writes the byte length to *out_len and returns the base address. On error
+// out_len = -1 and returns 0; on an empty file out_len = 0 and returns 0. Free
+// it with unslurp(base, len).
+fn slurp(path as *u8, out_len as *i64) as i64 {
+    let is [4]i64 as st;                        // VfsStat: size@0
+    if (sys.stat(path, cast(*u8, &st[0])) != 0) { out_len[0] = 0 - 1; return 0; }
+    let is i64 as size = st[0];
+    if (size <= 0) { out_len[0] = 0; return 0; }
+    let is i64 as mapped = page_round(size);
+    let is i64 as va = sys.mmap(0, mapped, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { out_len[0] = 0 - 1; return 0; }
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { sys.munmap(va, mapped); out_len[0] = 0 - 1; return 0; }
+    let is i64 as got with mut = 0;
+    while (got < size) {
+        let is i64 as r = sys.read(fd, cast(*u8, va + got), size - got);
+        if (r <= 0) { break; }
+        got = got + r;
+    }
+    sys.close(fd);
+    out_len[0] = got;
+    return va;
+}
+
+fn unslurp(va as i64, len as i64) as void {
+    if (va != 0) { sys.munmap(va, page_round(len)); }
+}
+
+// ---- small text helpers ----
+// parse_uint: the decimal value of the leading digits of s[0..len), or -1 if s
+// doesn't start with a digit.
+fn parse_uint(s as *u8, len as i64) as i64 {
+    if (len <= 0) { return 0 - 1; }
+    let is i64 as c0 = cast(i64, s[0]);
+    if (c0 < 48 || c0 > 57) { return 0 - 1; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c < 48 || c > 57) { break; }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+// parse_int: like parse_uint but accepts a leading '-'. Non-numeric → 0.
+fn parse_int(s as *u8, len as i64) as i64 {
+    if (len <= 0) { return 0; }
+    let is i64 as i with mut = 0;
+    let is i64 as neg with mut = 0;
+    if (cast(i64, s[0]) == 45) { neg = 1; i = 1; }      // '-'
+    let is i64 as v with mut = 0;
+    while (i < len) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c < 48 || c > 57) { break; }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+// mem_find: index of the first occurrence of needle[0..nlen) in hay[0..hlen),
+// or -1. An empty needle matches at 0.
+fn mem_find(hay as *u8, hlen as i64, needle as *u8, nlen as i64) as i64 {
+    if (nlen <= 0) { return 0; }
+    if (nlen > hlen) { return 0 - 1; }
+    let is i64 as last = hlen - nlen;
+    let is i64 as i with mut = 0;
+    while (i <= last) {
+        let is i64 as j with mut = 0;
+        while (j < nlen) {
+            if (hay[i + j] != needle[j]) { break; }
+            j = j + 1;
+        }
+        if (j == nlen) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ---- directory walking ----
+// path_join: write "dir/name" into dst (NUL-terminated), collapsing the slash
+// when dir already ends in one (so "/" + "x" is "/x", not "//x"). Returns the
+// new length. dst must hold dirlen + namelen + 2.
+fn path_join(dst as *u8, dir as *u8, dirlen as i64, name as *u8, namelen as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < dirlen) { dst[n] = dir[i]; n = n + 1; i = i + 1; }
+    if (n > 0 && cast(i64, dst[n - 1]) != 47) { dst[n] = cast(u8, 47); n = n + 1; }
+    i = 0;
+    while (i < namelen) { dst[n] = name[i]; n = n + 1; i = i + 1; }
+    dst[n] = cast(u8, 0);
+    return n;
+}
+
+// is_dot: 1 if name[0..nlen) is "." or "..". A recursive walk must skip these
+// or it loops on itself / its parent.
+fn is_dot(name as *u8, nlen as i64) as i64 {
+    if (nlen == 1 && cast(i64, name[0]) == 46) { return 1; }
+    if (nlen == 2 && cast(i64, name[0]) == 46 && cast(i64, name[1]) == 46) { return 1; }
+    return 0;
+}
+
+// readdir field offsets in the VfsDirEntry the kernel copies out (name[256]
+// then five i64): name_len@256, first_cluster@264, size@272, attr@280,
+// is_dir@288. Helpers so tools don't hard-code the magic.
+fn de_name_len(de as *u8) as i64 { let is *i64 as p = cast(*i64, cast(i64, de) + 256); return p[0]; }
+fn de_size(de as *u8) as i64     { let is *i64 as p = cast(*i64, cast(i64, de) + 272); return p[0]; }
+fn de_is_dir(de as *u8) as i64   { let is *i64 as p = cast(*i64, cast(i64, de) + 288); return p[0]; }
+
+// read_dir: collect a directory's entries (skipping . and ..) into caller-owned
+// arrays in ONE pass, then close — so a caller can recurse or delete without a
+// second readdir on the same fd interfering. `names` holds the concatenated
+// NUL-terminated names; per entry i: off[i] (offset into names), nlen[i], and
+// isdir[i]. Returns the count, capped at maxn / names_cap (a huge directory is
+// handled by the caller re-reading after it shrinks).
+fn read_dir(path as *u8, names as *u8, names_cap as i64, off as *i64, nlen as *i64, isdir as *i64, maxn as i64) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as count with mut = 0;
+    let is i64 as used with mut = 0;
+    let is [320]u8 as de;
+    while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+        let is i64 as nl = de_name_len(cast(*u8, &de[0]));
+        if (is_dot(cast(*u8, &de[0]), nl) == 0 && count < maxn && used + nl + 1 <= names_cap) {
+            off[count] = used;
+            let is i64 as k with mut = 0;
+            while (k < nl) { names[used] = de[k]; used = used + 1; k = k + 1; }
+            names[used] = cast(u8, 0); used = used + 1;
+            nlen[count] = nl;
+            isdir[count] = de_is_dir(cast(*u8, &de[0]));
+            count = count + 1;
+        }
+    }
+    sys.close(fd);
+    return count;
+}
+
+// ---- stdin / whole-fd ----
+// rd_open_fd: a Reader over an already-open fd (e.g. 0 = stdin), no path.
+fn rd_open_fd(r as *Reader, fd as i64, buf as *u8, cap as i64) as void {
+    r.fd = fd; r.buf = cast(i64, buf); r.cap = cap; r.fill = 0; r.pos = 0; r.eofd = 0;
+}
+
+// slurp_fd: read an entire fd (stdin) into a fresh mapping that grows as needed
+// (the size isn't known up front). Returns the base, sets *out_len; the mapping
+// is freed when the process exits (no exact unslurp — the length and the mapped
+// capacity differ). On error out_len = -1, returns 0.
+fn slurp_fd(fd as i64, out_len as *i64) as i64 {
+    let is i64 as cap with mut = 65536;
+    let is i64 as va with mut = sys.mmap(0, cap, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { out_len[0] = 0 - 1; return 0; }
+    let is i64 as got with mut = 0;
+    while (1 == 1) {
+        if (got >= cap) {
+            let is i64 as ncap = cap * 2;
+            let is i64 as nva = sys.mmap(0, ncap, sys.PROT_READ | sys.PROT_WRITE);
+            if (nva < 0) { out_len[0] = 0 - 1; return 0; }
+            let is *u8 as src = cast(*u8, va);
+            let is *u8 as dst = cast(*u8, nva);
+            let is i64 as k with mut = 0;
+            while (k < got) { dst[k] = src[k]; k = k + 1; }
+            sys.munmap(va, cap); va = nva; cap = ncap;
+        }
+        let is i64 as n = sys.read(fd, cast(*u8, va + got), cap - got);
+        if (n <= 0) { break; }
+        got = got + n;
+    }
+    out_len[0] = got;
+    return va;
+}
+
+// ---- a small getopt ----
+// Opt walks argv[1..] like POSIX getopt: bundled short flags (-lwc), flags that
+// take a value (-n5 or -n 5), "--" terminator, and "-" treated as an operand
+// (stdin). opt_next returns the flag char, 63 ('?') for an unknown flag, or -1
+// when the flags end (o.ind then indexes the first operand). For a value flag,
+// o.optarg holds the value pointer.
+struct Opt {
+    argc   as i64;
+    argv   as i64;     // *u8 (char**), held as an address
+    ind    as i64;     // index into argv
+    cpos   as i64;     // position within a bundled flag arg (0 = not mid-bundle)
+    optarg as i64;     // *u8 value when the returned flag takes one
+}
+
+fn opt_init(o as *Opt, argc as i64, argv as *u8) as void {
+    o.argc = argc; o.argv = cast(i64, argv); o.ind = 1; o.cpos = 0; o.optarg = 0;
+}
+
+fn _opt_arg(o as *Opt, i as i64) as *u8 {
+    let is *i64 as p = cast(*i64, o.argv);
+    return cast(*u8, p[i]);
+}
+
+fn _spec_find(spec as *u8, c as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (spec[i] != 0) { if (cast(i64, spec[i]) == c) { return i; } i = i + 1; }
+    return 0 - 1;
+}
+
+fn opt_next(o as *Opt, spec as *u8) as i64 {
+    if (o.cpos == 0) {
+        if (o.ind >= o.argc) { return 0 - 1; }
+        let is *u8 as a = _opt_arg(o, o.ind);
+        if (cast(i64, a[0]) != 45) { return 0 - 1; }                                   // not '-' → operand
+        if (cast(i64, a[1]) == 0) { return 0 - 1; }                                    // "-" → operand (stdin)
+        if (cast(i64, a[1]) == 45 && cast(i64, a[2]) == 0) { o.ind = o.ind + 1; return 0 - 1; }  // "--"
+        o.cpos = 1;
+    }
+    let is *u8 as a = _opt_arg(o, o.ind);
+    let is i64 as c = cast(i64, a[o.cpos]);
+    o.cpos = o.cpos + 1;
+    let is i64 as si = _spec_find(spec, c);
+    if (si < 0) {
+        if (cast(i64, a[o.cpos]) == 0) { o.ind = o.ind + 1; o.cpos = 0; }
+        return 63;                                                                     // '?'
+    }
+    if (cast(i64, spec[si + 1]) == 58) {                                               // ':' → takes a value
+        if (cast(i64, a[o.cpos]) != 0) { o.optarg = cast(i64, &a[o.cpos]); o.ind = o.ind + 1; o.cpos = 0; }
+        else {
+            o.ind = o.ind + 1; o.cpos = 0;
+            if (o.ind < o.argc) { o.optarg = cast(i64, _opt_arg(o, o.ind)); o.ind = o.ind + 1; }
+            else { o.optarg = 0; }
+        }
+        return c;
+    }
+    if (cast(i64, a[o.cpos]) == 0) { o.ind = o.ind + 1; o.cpos = 0; }                  // end of bundle
+    return c;
+}

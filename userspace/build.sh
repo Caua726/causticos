@@ -41,8 +41,10 @@ PROGS="$PROGS run cc make objdump"
 #   grab stack (the WM yields while they run), like vic.
 PROGS="$PROGS pager hexedit"
 for p in $PROGS; do
-    if ! "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse" >/dev/null 2>&1; then
-        echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 "$HERE/$p.cst" -o "$OUT/$p.cse"; exit 1
+    # programs live in subfolders (coreutils/ sysutils/ wm/ ...); find by name.
+    src=$(find "$HERE" -name "$p.cst" -not -path '*/build/*' | head -1)
+    if ! "$CAUSTIC" --target=caustic-x86_64 "$src" -o "$OUT/$p.cse" >/dev/null 2>&1; then
+        echo "FAIL building $p:"; "$CAUSTIC" --target=caustic-x86_64 "$src" -o "$OUT/$p.cse"; exit 1
     fi
     printf "  %-10s %s\n" "$p.cse" "$(stat -c%s "$OUT/$p.cse")b"
 done

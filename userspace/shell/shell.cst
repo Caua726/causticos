@@ -1,0 +1,389 @@
+// examples/causticos/shell.cst — CausticOS framebuffer shell (the /init).
+//
+// Fuses the terminal (architecture.md §9) and the shell: it holds the framebuffer
+// surface + the keyboard, renders text (term.cst), applies the keymap, and runs a
+// REPL. A command line is split into argv; a builtin runs in-process, otherwise
+// the shell loads "/<cmd>.cse" from the FAT32 disk, mints a console channel,
+// spawns the program with argv + its stdout wired to the channel (fd 1), pumps
+// the program's output to the screen, and waits. argv is data; the kernel never
+// resolves it — the child acts only through the channel key it was handed.
+//
+// Build: caustic --target=caustic-x86_64 examples/causticos/shell.cst -o /tmp/init.cse
+use "../../../Caustic/std/causticos/gfx.cst" as gfx;
+use "../../../Caustic/std/causticos/term.cst" as term;
+use "../../../Caustic/std/causticos/input.cst" as input;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as MAX_ARGS  with imut = 16;
+let is i64 as LINE_CAP  with imut = 256;
+let is i64 as IMG_CAP   with imut = 4194304;   // 4 MiB = SPAWN_IMG_MAX (fits the 1.2 MiB compiler)
+
+// Palette (soft Tango-ish console colours, not harsh #fff-on-#000).
+let is u32 as C_TEXT   with imut = 0x00d3d7cf;   // body text — soft light grey
+let is u32 as C_PROMPT with imut = 0x008bbf63;   // prompt — soft green (calmer than neon, blends with the body)
+let is u32 as C_ERR    with imut = 0x00ef5350;   // errors — red
+let is u32 as C_DIM    with imut = 0x00888a8c;   // secondary text — dim grey
+let is u32 as C_TITLE  with imut = 0x0073d0ff;   // headings — soft cyan-blue
+let is u32 as C_BG     with imut = 0x00121417;   // background
+
+// Command history (a 16-deep ring; Up/Down walk it).
+let is [4096]u8 as hbuf;             // 16 slots * 256 bytes
+let is [16]i64 as hlen;              // length stored in each slot
+let is i64 as hhead with mut = 0;    // next write slot
+let is i64 as hsize with mut = 0;    // commands stored (<=16)
+let is i64 as hnav with mut = 0;     // 0 = editing fresh; 1..hsize = walking back
+
+// --- small helpers ---
+fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
+fn puts(t as *term.Term, s as *u8) as void { term.puts(t, s, slen(s)); }
+fn _col(t as *term.Term, fg as u32) as void { term.set_color(t, fg, C_BG); }
+fn prompt(t as *term.Term) as void { _col(t, C_PROMPT); puts(t, "> "); _col(t, C_TEXT); }
+fn err(t as *term.Term, s as *u8) as void { _col(t, C_ERR); puts(t, s); _col(t, C_TEXT); }
+// hline — draw n copies of a glyph byte (e.g. 0xC4 = CP437 '─') for separators.
+fn hline(t as *term.Term, ch as i64, n as i64) as void { let is i64 as i with mut = 0; while (i < n) { term.putc(t, ch); i = i + 1; } }
+
+// serial trace (headless): markers so a screenless boot can confirm the path.
+fn _log(s as *u8) as void { sys.write_serial(s, slen(s)); }
+fn _lognum(v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial("-", 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial("0", 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+}
+
+// Read a whole file into a fresh mmap'd buffer. Returns the buffer (or null) and
+// writes the byte count to *out_len.
+fn read_file(path as *u8, out_len as *i64) as *u8 {
+    *out_len = 0;
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return cast(*u8, 0); }
+    let is i64 as va = sys.mmap(cast(i64, 0), IMG_CAP, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
+    let is *u8 as buf = cast(*u8, va);
+    let is i64 as got = sys.read(fd, buf, sz);
+    sys.close(fd);
+    *out_len = got;
+    return buf;
+}
+
+// Run an external program: argv_ptr[i] = byte pointer, argv_len[i] = length
+// Keyboard fd + modifier state, shared with run_program so a running TUI can
+// be fed keystrokes (the shell is a fullscreen terminal: it owns DEV_KEYBOARD).
+let is i64 as g_kfd with mut = 0;
+let is i64 as g_shift with mut = 0;
+let is i64 as g_ctrl with mut = 0;
+
+// Reply to a TUI child's CSI 18t query: report the grid as ESC[8;rows;cols t on
+// the child's stdin — the same in-band, no-ioctl size protocol the wterm uses.
+fn _emit_num(buf as *u8, pos as i64, val as i64) as i64 {
+    let is i64 as v with mut = val;
+    if (v <= 0) { buf[pos] = cast(u8, 48); return pos + 1; }
+    let is [12]u8 as tmp; let is i64 as nd with mut = 0;
+    while (v > 0) { tmp[nd] = cast(u8, 48 + v - (v / 10) * 10); v = v / 10; nd = nd + 1; }
+    let is i64 as k with mut = 0;
+    while (k < nd) { buf[pos + k] = tmp[nd - 1 - k]; k = k + 1; }
+    return pos + nd;
+}
+fn send_size(t as *term.Term, cin as i64) as void {
+    let is [40]u8 as b;
+    b[0] = cast(u8, 0x1B); b[1] = cast(u8, 0x5B); b[2] = cast(u8, 56); b[3] = cast(u8, 59);
+    let is i64 as i with mut = 4;
+    i = _emit_num(cast(*u8, &b[0]), i, t.rows);
+    b[i] = cast(u8, 59); i = i + 1;
+    i = _emit_num(cast(*u8, &b[0]), i, t.cols);
+    b[i] = cast(u8, 116); i = i + 1;
+    sys.write(cin, cast(*u8, &b[0]), i);
+}
+
+// (argv[0] is the command). Loads /<cmd>.cse, spawns with a stdin + stdout
+// console channel + argv, then multiplexes the child's stdout and the keyboard
+// (so a TUI like btop renders AND receives keys) until the child exits.
+fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64) as void {
+    // path = "/" + argv[0] + ".cse"
+    let is [128]u8 as path;
+    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
+    let is i64 as cl = argv_len[0];
+    if (cl > 110) { err(t, "name too long\n"); return; }
+    path[0] = cast(u8, 47);                              // '/'
+    let is i64 as i with mut = 0;
+    while (i < cl) { path[1 + i] = cmd[i]; i = i + 1; }
+    let is *u8 as ext = ".cse";
+    let is i64 as j with mut = 0;
+    while (j < 4) { path[1 + cl + j] = ext[j]; j = j + 1; }
+    path[1 + cl + 4] = cast(u8, 0);
+
+    let is i64 as img_len with mut = 0;
+    let is *u8 as img = read_file(cast(*u8, &path[0]), &img_len);
+    if (cast(i64, img) == 0) {
+        _col(t, C_ERR); puts(t, cast(*u8, &path[0])); puts(t, ": not found\n"); _col(t, C_TEXT);
+        return;
+    }
+
+    // stdout channel (child fd 1) + stdin channel (child fd 0). The shell keeps
+    // the read end of stdout (fds[0]) and the write end of stdin (ifds[0]).
+    let is [2]i64 as fds;
+    if (sys.channel_create(cast(*i64, &fds[0])) != 0) { err(t, "channel fail\n"); return; }
+    let is [2]i64 as ifds;
+    if (sys.channel_create(cast(*i64, &ifds[0])) != 0) { err(t, "channel fail\n"); sys.close(fds[0]); sys.close(fds[1]); return; }
+    let is [4]i64 as fdacts;
+    fdacts[0] = 0; fdacts[1] = ifds[1];                  // child fd 0 (stdin)  = stdin read end
+    fdacts[2] = 1; fdacts[3] = fds[1];                   // child fd 1 (stdout) = stdout write end
+
+    // argv array of {str_ptr, str_len} (16 B each) — the parsed tokens.
+    let is [32]i64 as av;
+    let is i64 as k with mut = 0;
+    while (k < argc) { av[2 * k] = argv_ptr[k]; av[2 * k + 1] = argv_len[k]; k = k + 1; }
+
+    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 2, cast(*u8, &av[0]), argc);
+    sys.close(fds[1]); sys.close(ifds[1]);               // shell drops the child's ends
+    if (pid < 0) { err(t, "spawn failed\n"); sys.close(fds[0]); sys.close(ifds[0]); return; }
+    _col(t, C_TEXT);
+
+    // Multiplex the child's stdout and the keyboard: stdout -> term (which parses
+    // the ANSI a TUI emits), keys -> child's stdin (raw bytes, arrows as ESC[A..).
+    // Ctrl+C kills it (the shell is the child's parent, holding the authority).
+    let is i64 as cout = fds[0]; let is i64 as cin = ifds[0];
+    let is [256]u8 as pbuf;
+    let is [6]i64 as pe;
+    let is i64 as alive with mut = 1;
+    while (alive == 1) {
+        pe[0] = cout; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        pe[3] = g_kfd; pe[4] = sys.POLL_READABLE; pe[5] = 0;
+        sys.poll(cast(*i64, &pe[0]), 2, 0 - 1);
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            let is i64 as n = sys.read(cout, cast(*u8, &pbuf[0]), 256);
+            if (n > 0) {
+                term.puts(t, cast(*u8, &pbuf[0]), n);
+                if (t.want_size == 1) { t.want_size = 0; send_size(t, cin); }   // CSI 18t reply
+                term.flush(t);
+            } else { alive = 0; }
+        }
+        if ((pe[2] & sys.POLL_CLOSED) != 0 && (pe[2] & sys.POLL_READABLE) == 0) { alive = 0; }
+        if ((pe[5] & sys.POLL_READABLE) != 0) {
+            let is input.KeyEvent as kev;
+            if (input.read_event(g_kfd, &kev) == 1) {
+                if (input.is_shift(kev.scancode) == 1) { g_shift = kev.pressed; }
+                else if (input.is_ctrl(kev.scancode) == 1) { g_ctrl = kev.pressed; }
+                else if (kev.pressed == 1) {
+                    if (g_ctrl == 1 && kev.scancode == 0x2E) { sys.kill(pid); }   // Ctrl+C
+                    else if (kev.extended == 1 && (kev.scancode == 0x48 || kev.scancode == 0x50 || kev.scancode == 0x4D || kev.scancode == 0x4B)) {
+                        let is [3]u8 as ek; ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
+                        if (kev.scancode == 0x48) { ek[2] = cast(u8, 65); }
+                        else if (kev.scancode == 0x50) { ek[2] = cast(u8, 66); }
+                        else if (kev.scancode == 0x4D) { ek[2] = cast(u8, 67); }
+                        else { ek[2] = cast(u8, 68); }
+                        sys.write(cin, cast(*u8, &ek[0]), 3);
+                    } else {
+                        let is i64 as ic = input.scancode_to_ascii(kev.scancode, g_shift);
+                        if (ic != 0) { let is [1]u8 as kb; kb[0] = cast(u8, ic); sys.write(cin, cast(*u8, &kb[0]), 1); }
+                    }
+                }
+            }
+        }
+    }
+    sys.close(cout); sys.close(cin);
+    let is i64 as status with mut = 0;
+    sys.wait(pid, &status);
+    sys.munmap(cast(i64, img), IMG_CAP);                 // free the program image buffer
+}
+
+// Tokenise `line` (len bytes) in place: NUL-terminate each token, fill argv_ptr/
+// argv_len, return argc. Splits on spaces; collapses runs.
+fn parse(line as *u8, len as i64, argv_ptr as *i64, argv_len as *i64) as i64 {
+    let is i64 as argc with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len && argc < MAX_ARGS) {
+        while (i < len && line[i] == 32) { i = i + 1; }   // skip spaces
+        if (i >= len) { break; }
+        let is i64 as start = i;
+        while (i < len && line[i] != 32) { i = i + 1; }
+        argv_ptr[argc] = cast(i64, line) + start;
+        argv_len[argc] = i - start;
+        argc = argc + 1;
+    }
+    return argc;
+}
+
+fn streq(a as *u8, alen as i64, lit as *u8) as i64 {
+    let is i64 as ll = slen(lit);
+    if (alen != ll) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < ll) { if (a[i] != lit[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn run_line(t as *term.Term, line as *u8, len as i64) as void {
+    let is [16]i64 as argv_ptr;
+    let is [16]i64 as argv_len;
+    let is i64 as argc = parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
+    if (argc == 0) { return; }
+    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
+    let is i64 as cl = argv_len[0];
+    if (streq(cmd, cl, "clear") == 1 || streq(cmd, cl, "reset") == 1) { term.clear(t); return; }
+    if (streq(cmd, cl, "help") == 1) {
+        _col(t, C_DIM); puts(t, "built-in\n"); _col(t, C_TEXT);
+        puts(t, "  help              show this help\n");
+        puts(t, "  clear / reset     clear the screen\n");
+        _col(t, C_DIM); puts(t, "programs  (/<name>.cse)\n"); _col(t, C_TEXT);
+        puts(t, "  echo <args...>    print the arguments\n");
+        puts(t, "  cat  <file>       print a file\n");
+        puts(t, "  ls   [path]       list a directory\n");
+        puts(t, "  uptime            time since boot\n");
+        puts(t, "  sysinfo           kernel version + limits\n");
+        return;
+    }
+    run_program(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc);
+}
+
+// recall — replace the current input line with `src[0..srclen]`: erase what's
+// typed (backspaces), then echo the recalled text. Used by Up/Down history.
+fn recall(t as *term.Term, line as *u8, llen_ptr as *i64, src as *u8, srclen as i64) as void {
+    let is i64 as j with mut = 0;
+    while (j < llen_ptr[0]) { term.putc(t, 0x08); j = j + 1; }
+    let is i64 as i with mut = 0;
+    while (i < srclen && i < LINE_CAP - 1) { line[i] = src[i]; term.putc(t, cast(i64, src[i])); i = i + 1; }
+    llen_ptr[0] = i;
+    term.flush(t);
+}
+
+// --- Tab completion ---
+// does cand[0..cl] start with the typed prefix line[ts..ts+plen]?
+fn _cand_match(cand as *u8, cl as i64, line as *u8, ts as i64, plen as i64) as i64 {
+    if (cl < plen) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < plen) { if (cand[k] != line[ts + k]) { return 0; } k = k + 1; }
+    return 1;
+}
+// fold a matching candidate into the longest-common-prefix accumulator.
+fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
+    nmatch_ptr[0] = nmatch_ptr[0] + 1;
+    if (acclen_ptr[0] < 0) {                                  // first match -> acc = candidate
+        let is i64 as i with mut = 0;
+        while (i < cl && i < 255) { acc[i] = cand[i]; i = i + 1; }
+        acclen_ptr[0] = i;
+    } else {                                                  // shrink acc to the shared prefix
+        let is i64 as i with mut = 0; let is i64 as al = acclen_ptr[0];
+        while (i < al && i < cl && acc[i] == cand[i]) { i = i + 1; }
+        acclen_ptr[0] = i;
+    }
+}
+// Tab: complete the last token against `help` + the programs (/*.cse, suffix
+// stripped) when it's the command, or against every file in / when it's an arg.
+fn complete(t as *term.Term, line as *u8, llen_ptr as *i64) as void {
+    let is i64 as llen = llen_ptr[0];
+    let is i64 as ts with mut = llen;
+    while (ts > 0 && line[ts - 1] != 32) { ts = ts - 1; }     // start of the last token
+    let is i64 as plen = llen - ts;
+    let is i64 as is_cmd with mut = 0;
+    if (ts == 0) { is_cmd = 1; }
+    let is [256]u8 as acc;
+    let is i64 as acclen with mut = 0 - 1;
+    let is i64 as nmatch with mut = 0;
+    if (is_cmd == 1) {
+        if (_cand_match("help", 4, line, ts, plen) == 1) { _acc_update("help", 4, cast(*u8, &acc[0]), &acclen, &nmatch); }
+        if (_cand_match("clear", 5, line, ts, plen) == 1) { _acc_update("clear", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
+        if (_cand_match("reset", 5, line, ts, plen) == 1) { _acc_update("reset", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
+    }
+    let is i64 as fd = sys.open_read("/");
+    if (fd < 0) { return; }
+    let is [320]u8 as de;
+    while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+        let is *u8 as nm = cast(*u8, &de[0]);
+        let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
+        let is i64 as nl = nlp[0];
+        let is i64 as cl with mut = nl;
+        let is i64 as ok with mut = 1;
+        if (is_cmd == 1) {                                    // only ".cse" programs; strip the suffix
+            if (nl >= 4 && nm[nl-4] == 46 && nm[nl-3] == 99 && nm[nl-2] == 115 && nm[nl-1] == 101) { cl = nl - 4; }
+            else { ok = 0; }
+        }
+        if (ok == 1 && _cand_match(nm, cl, line, ts, plen) == 1) { _acc_update(nm, cl, cast(*u8, &acc[0]), &acclen, &nmatch); }
+    }
+    sys.close(fd);
+    if (nmatch == 0) { return; }
+    let is i64 as i with mut = plen;                          // append acc[plen..acclen] to the line
+    while (i < acclen && llen_ptr[0] < LINE_CAP - 1) {
+        line[llen_ptr[0]] = acc[i];
+        term.putc(t, cast(i64, acc[i]));
+        llen_ptr[0] = llen_ptr[0] + 1;
+        i = i + 1;
+    }
+    if (nmatch == 1 && llen_ptr[0] < LINE_CAP - 1) {          // sole match -> trailing space
+        line[llen_ptr[0]] = cast(u8, 32); term.putc(t, 0x20); llen_ptr[0] = llen_ptr[0] + 1;
+    }
+    term.flush(t);
+}
+
+fn main() as i32 {
+    let is gfx.Framebuffer as fb = gfx.open();
+    if (fb.ok == 0) { sys.write_serial("shell: NO FB\n", 13); sys.exit(cast(i32, 1)); }
+    let is term.Term as t = term.init(fb.base, fb.fd, fb.width, fb.height, fb.pitch, fb.bpp);
+    _col(&t, C_TITLE);
+    puts(&t, "Caustic Shell  v0.1\n");
+    _col(&t, C_DIM);
+    hline(&t, 0xC4, 36); puts(&t, "\n");                 // 0xC4 = CP437 '─'
+    puts(&t, "type 'help' for commands\n\n");
+    _col(&t, C_TEXT);
+    sys.write_serial("shell: ready\n", 13);
+
+    g_kfd = input.open_keyboard();
+    if (g_kfd < 0) { sys.write_serial("shell: NO KBD\n", 14); sys.exit(cast(i32, 2)); }
+
+    let is [256]u8 as line;
+    let is i64 as llen with mut = 0;
+    let is input.KeyEvent as ev;
+    prompt(&t);
+    term.flush(&t);
+    while (1 == 1) {
+        if (input.read_event(g_kfd, &ev) == 1) {
+            if (input.is_shift(ev.scancode) == 1) { g_shift = ev.pressed; }
+            else if (ev.pressed == 1 && ev.extended == 1 && ev.scancode == 0x48) {   // Up — older history
+                if (hnav < hsize) {
+                    hnav = hnav + 1;
+                    let is i64 as slot = (hhead - hnav + 16) % 16;
+                    recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
+                }
+            }
+            else if (ev.pressed == 1 && ev.extended == 1 && ev.scancode == 0x50) {   // Down — newer history
+                if (hnav > 0) {
+                    hnav = hnav - 1;
+                    if (hnav == 0) { recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &line[0]), 0); }
+                    else {
+                        let is i64 as slot = (hhead - hnav + 16) % 16;
+                        recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
+                    }
+                }
+            }
+            else if (ev.pressed == 1) {
+                let is i64 as c = input.scancode_to_ascii(ev.scancode, g_shift);
+                if (c == 0x0A) {
+                    term.putc(&t, 0x0A); term.flush(&t);
+                    if (llen > 0) {                            // push the command onto the history ring
+                        let is i64 as hi with mut = 0;
+                        while (hi < llen) { hbuf[hhead * 256 + hi] = line[hi]; hi = hi + 1; }
+                        hlen[hhead] = llen;
+                        hhead = (hhead + 1) % 16;
+                        if (hsize < 16) { hsize = hsize + 1; }
+                    }
+                    hnav = 0;
+                    run_line(&t, cast(*u8, &line[0]), llen);
+                    llen = 0;
+                    prompt(&t); term.flush(&t);
+                } else if (c == 0x09) {                       // Tab — autocomplete
+                    complete(&t, cast(*u8, &line[0]), &llen);
+                } else if (c == 0x08) {
+                    if (llen > 0) { llen = llen - 1; term.putc(&t, 0x08); term.flush(&t); }
+                } else if (c != 0) {
+                    if (llen < LINE_CAP - 1) { line[llen] = cast(u8, c); llen = llen + 1; term.putc(&t, c); term.flush(&t); }
+                }
+            }
+        }
+    }
+    return 0;
+}

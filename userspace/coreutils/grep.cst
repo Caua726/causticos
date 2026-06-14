@@ -1,0 +1,298 @@
+// grep — print lines matching a pattern, with real POSIX-ERE regular
+// expressions (regex.cst, a linear Thompson NFA — no backtracking blow-up).
+//
+//   grep [options] PATTERN [file ...]
+//   grep [options] -e PAT [-e PAT ...] [file ...]
+//
+//   -E  extended regexp (the default)        -F  fixed strings (no metachars)
+//   -i  ignore case        -v  invert        -w  whole word    -x  whole line
+//   -n  line numbers       -o  only matches  -c  count         -m N  stop after N
+//   -l  files with matches -L  files without -H  show filename -h  hide filename
+//   -r  recurse into dirs  -s  no error msgs -q  quiet (exit only)
+//   -A N after  -B N before  -C N around (context, groups split by "--")
+//   -e PAT  add a pattern (repeatable)
+//
+// Exit 0 if a line matched, 1 if none, 2 on error.
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil.cst" as fu;
+use "../lib/regex.cst" as re;
+
+// ---- flags / state (globals to keep the per-line path lean) ----
+let is i64 as G_i with mut = 0; let is i64 as G_v with mut = 0; let is i64 as G_c with mut = 0;
+let is i64 as G_l with mut = 0; let is i64 as G_L with mut = 0; let is i64 as G_n with mut = 0;
+let is i64 as G_H with mut = 0; let is i64 as G_h with mut = 0; let is i64 as G_o with mut = 0;
+let is i64 as G_w with mut = 0; let is i64 as G_x with mut = 0; let is i64 as G_q with mut = 0;
+let is i64 as G_s with mut = 0; let is i64 as G_r with mut = 0; let is i64 as G_fixed with mut = 0;
+let is i64 as G_A with mut = 0; let is i64 as G_B with mut = 0; let is i64 as G_m with mut = 0;
+let is i64 as G_multi with mut = 0; let is i64 as G_any with mut = 0; let is i64 as G_exit with mut = 0;
+
+// combined pattern buffer (patterns joined by '|', metachars escaped under -F)
+let is [8192]u8 as G_PAT;
+let is i64 as G_PATLEN with mut = 0;
+
+// before-context ring (offsets into the current buffer)
+let is [64]i64 as RB_OFF;
+let is [64]i64 as RB_LEN;
+let is i64 as RB_N with mut = 0;
+let is i64 as RB_HEAD with mut = 0;
+let is i64 as G_CAP with mut = 0;           // ring capacity = B
+let is i64 as G_GROUPED with mut = 0;       // 1 if A or B > 0 (print "--" separators)
+
+fn word_char(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c == 95) { return 1; }
+    return 0;
+}
+fn is_meta(c as i64) as i64 {
+    if (c == 46 || c == 42 || c == 43 || c == 63 || c == 91 || c == 93 || c == 40 || c == 41) { return 1; }
+    if (c == 123 || c == 125 || c == 124 || c == 94 || c == 36 || c == 92) { return 1; }
+    return 0;
+}
+// append one pattern to G_PAT, escaping metachars when -F.
+fn pat_append(p as *u8, plen as i64) as void {
+    if (G_PATLEN > 0 && G_PATLEN < 8190) { G_PAT[G_PATLEN] = cast(u8, 124); G_PATLEN = G_PATLEN + 1; }   // '|'
+    let is i64 as i with mut = 0;
+    while (i < plen && G_PATLEN < 8189) {
+        let is i64 as c = cast(i64, p[i]);
+        if (G_fixed != 0 && is_meta(c) != 0) { G_PAT[G_PATLEN] = cast(u8, 92); G_PATLEN = G_PATLEN + 1; }
+        G_PAT[G_PATLEN] = cast(u8, c); G_PATLEN = G_PATLEN + 1;
+        i = i + 1;
+    }
+}
+
+// does s[0..llen) match? honours -w (word boundaries) and -x (whole line).
+fn line_hit(s as *u8, llen as i64) as i64 {
+    if (G_x != 0) { if (re.re_match_at(s, llen, 0) == llen) { return 1; } return 0; }
+    if (G_w == 0) { return re.re_match(s, llen); }
+    let is i64 as i with mut = 0;
+    while (i <= llen) {
+        let is i64 as e = re.re_match_at(s, llen, i);
+        if (e >= 0) {
+            let is i64 as lok with mut = 1; let is i64 as rok with mut = 1;
+            if (i > 0 && word_char(cast(i64, s[i - 1])) != 0) { lok = 0; }
+            if (e < llen && word_char(cast(i64, s[e])) != 0) { rok = 0; }
+            if (lok != 0 && rok != 0) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn put_prefix(name as *u8, lineno as i64, sep as i64) as void {
+    if (G_multi != 0 && G_h == 0) { prog.outs(name); prog.out(cast(*u8, &sep), 1); }
+    if (G_n != 0) { prog.out_num(lineno); prog.out(cast(*u8, &sep), 1); }
+}
+
+// -o: print every (non-overlapping, boundary-valid under -w) match on the line.
+fn print_only(name as *u8, lineno as i64, s as *u8, llen as i64) as void {
+    let is i64 as pos with mut = 0;
+    let is [1]i64 as ms; let is [1]i64 as me;
+    while (pos <= llen) {
+        if (re.re_search(cast(*u8, &s[pos]), llen - pos, cast(*i64, &ms[0]), cast(*i64, &me[0])) == 0) { break; }
+        let is i64 as a = pos + ms[0]; let is i64 as b = pos + me[0];
+        let is i64 as ok with mut = 1;
+        if (G_w != 0) {
+            if (a > 0 && word_char(cast(i64, s[a - 1])) != 0) { ok = 0; }
+            if (b < llen && word_char(cast(i64, s[b])) != 0) { ok = 0; }
+        }
+        if (ok != 0 && b > a) { let is i64 as colon = 58; put_prefix(name, lineno, colon); prog.out(cast(*u8, &s[a]), b - a); prog.out("\n", 1); }
+        if (b > pos) { pos = b; } else { pos = pos + 1; }
+    }
+}
+
+fn print_line(name as *u8, lineno as i64, s as *u8, llen as i64, sep as i64) as void {
+    put_prefix(name, lineno, sep);
+    prog.out(s, llen); prog.out("\n", 1);
+}
+
+// process one whole buffer (a file or stdin) for matches, with context.
+fn grep_buf(name as *u8, buf as i64, len as i64) as void {
+    let is *u8 as b = cast(*u8, buf);
+    RB_N = 0; RB_HEAD = 0;
+    let is i64 as pos with mut = 0;
+    let is i64 as lineno with mut = 0;
+    let is i64 as after with mut = 0;            // remaining after-context lines to print
+    let is i64 as last_end with mut = 0 - 1;     // lineno last printed (for "--")
+    let is i64 as fcount with mut = 0;           // matches in this file
+    while (pos < len || (pos == len && lineno == 0 && len == 0)) {
+        if (pos >= len) { break; }
+        let is i64 as start = pos;
+        while (pos < len && cast(i64, b[pos]) != 0x0A) { pos = pos + 1; }
+        let is i64 as llen = pos - start;
+        if (pos < len) { pos = pos + 1; }
+        lineno = lineno + 1;
+        let is *u8 as ls = cast(*u8, buf + start);
+        let is i64 as hit with mut = line_hit(ls, llen);
+        if (G_v != 0) { if (hit == 0) { hit = 1; } else { hit = 0; } }
+        if (hit != 0) {
+            G_any = 1; fcount = fcount + 1;
+            // quiet / list modes short-circuit
+            if (G_q != 0 || G_l != 0 || G_L != 0) { if (G_q != 0) { return; } }
+            if (G_c == 0 && G_l == 0 && G_L == 0) {
+                if (G_o != 0) { print_only(name, lineno, ls, llen); }
+                else {
+                    // before-context: print the ring, with a "--" if there is a gap
+                    if (G_GROUPED != 0 && last_end >= 0) {
+                        let is i64 as firstctx with mut = lineno - RB_N;
+                        if (firstctx > last_end + 1) { prog.outs("--\n"); }
+                    }
+                    let is i64 as k with mut = 0;
+                    while (k < RB_N) {
+                        let is i64 as idx = (RB_HEAD - RB_N + k + 128) % 64;
+                        let is i64 as dash = 45;
+                        print_line(name, lineno - RB_N + k, cast(*u8, buf + RB_OFF[idx]), RB_LEN[idx], dash);
+                        k = k + 1;
+                    }
+                    let is i64 as colon = 58;
+                    print_line(name, lineno, ls, llen, colon);
+                    last_end = lineno;
+                    after = G_A;
+                }
+                RB_N = 0; RB_HEAD = 0;            // ring consumed
+            }
+            if (G_m != 0 && fcount >= G_m) { break; }
+        } else {
+            if (after > 0 && G_o == 0 && G_c == 0 && G_l == 0 && G_L == 0) {
+                let is i64 as dash = 45;
+                print_line(name, lineno, ls, llen, dash);
+                last_end = lineno; after = after - 1;
+            } else if (G_B > 0 && G_o == 0) {
+                RB_OFF[RB_HEAD] = start; RB_LEN[RB_HEAD] = llen;
+                RB_HEAD = (RB_HEAD + 1) % 64;
+                if (RB_N < G_CAP) { RB_N = RB_N + 1; }
+            }
+        }
+    }
+    if (G_c != 0) {
+        if (G_multi != 0 && G_h == 0) { prog.outs(name); prog.outs(":"); }
+        prog.out_num(fcount); prog.out("\n", 1);
+    } else if (G_l != 0) {
+        if (fcount > 0) { prog.outs(name); prog.out("\n", 1); }
+    } else if (G_L != 0) {
+        if (fcount == 0) { prog.outs(name); prog.out("\n", 1); }
+    }
+}
+
+fn do_path(name as *u8, path as *u8) as void {
+    let is i64 as len with mut = 0;
+    let is i64 as buf = fu.slurp(path, &len);
+    if (len < 0) {
+        if (G_s == 0) { prog.outs("grep: "); prog.outs(name); prog.outs(": cannot open\n"); }
+        G_exit = 2; return;
+    }
+    grep_buf(name, buf, len);
+    if (buf != 0) { fu.unslurp(buf, len); }
+}
+
+// a path is a directory iff opening it and calling readdir succeeds (a regular
+// file's readdir fails). Returns 1 dir, 0 file, -1 cannot open.
+fn path_is_dir(path as *u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is [320]u8 as de;
+    let is i64 as rr = sys.readdir(fd, cast(*u8, &de[0]));
+    sys.close(fd);
+    if (rr == 0) { return 1; }
+    return 0;
+}
+
+// recursive descent: grep every regular file under `path`.
+fn do_recursive(name as *u8, path as *u8) as void {
+    let is i64 as d = path_is_dir(path);
+    if (d < 0) {
+        if (G_s == 0) { prog.outs("grep: "); prog.outs(name); prog.outs(": no such file\n"); }
+        G_exit = 2; return;
+    }
+    if (d == 0) { do_path(name, path); return; }
+    let is [4096]u8 as names; let is [128]i64 as off; let is [128]i64 as nlen; let is [128]i64 as isdir;
+    let is i64 as nent = fu.read_dir(path, cast(*u8, &names[0]), 4096, cast(*i64, &off[0]), cast(*i64, &nlen[0]), cast(*i64, &isdir[0]), 128);
+    let is i64 as i with mut = 0;
+    while (i < nent) {
+        let is [512]u8 as childp; let is [512]u8 as childn;
+        fu.path_join(cast(*u8, &childp[0]), path, prog.slen(path), cast(*u8, &names[off[i]]), nlen[i]);
+        fu.path_join(cast(*u8, &childn[0]), name, prog.slen(name), cast(*u8, &names[off[i]]), nlen[i]);
+        do_recursive(cast(*u8, &childn[0]), cast(*u8, &childp[0]));
+        i = i + 1;
+    }
+}
+
+fn usage() as i32 { prog.outs("usage: grep [-EFivwxnoclLHhrsq] [-A n] [-B n] [-C n] [-m n] [-e pat] PATTERN [file ...]\n"); return cast(i32, 2); }
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is fu.Opt as o;
+    fu.opt_init(&o, argc, argv);
+    let is i64 as npat with mut = 0;
+    let is i64 as want_C with mut = 0;
+    while (1 == 1) {
+        let is i64 as f = fu.opt_next(&o, "EFivwxnoclLHhrsqA:B:C:m:e:");
+        if (f < 0) { break; }
+        if (f == 69) { G_fixed = 0; }                                        // -E
+        else if (f == 70) { G_fixed = 1; }                                   // -F
+        else if (f == 105) { G_i = 1; }
+        else if (f == 118) { G_v = 1; }
+        else if (f == 119) { G_w = 1; }
+        else if (f == 120) { G_x = 1; }
+        else if (f == 110) { G_n = 1; }
+        else if (f == 111) { G_o = 1; }
+        else if (f == 99) { G_c = 1; }
+        else if (f == 108) { G_l = 1; }
+        else if (f == 76) { G_L = 1; }
+        else if (f == 72) { G_H = 1; }
+        else if (f == 104) { G_h = 1; }
+        else if (f == 114) { G_r = 1; }
+        else if (f == 115) { G_s = 1; }
+        else if (f == 113) { G_q = 1; }
+        else if (f == 65) { G_A = fu.parse_uint(cast(*u8, o.optarg), 19); }   // -A
+        else if (f == 66) { G_B = fu.parse_uint(cast(*u8, o.optarg), 19); }   // -B
+        else if (f == 67) { want_C = fu.parse_uint(cast(*u8, o.optarg), 19); } // -C
+        else if (f == 109) { G_m = fu.parse_uint(cast(*u8, o.optarg), 19); }  // -m
+        else if (f == 101) {                                                 // -e
+            let is *u8 as p = cast(*u8, o.optarg); pat_append(p, prog.slen(p)); npat = npat + 1;
+        }
+        else { return usage(); }
+    }
+    if (want_C > 0) { if (G_A == 0) { G_A = want_C; } if (G_B == 0) { G_B = want_C; } }
+    // -C/-A/-B sanity
+    if (G_A < 0) { G_A = 0; } if (G_B < 0) { G_B = 0; }
+    G_CAP = G_B; if (G_CAP > 64) { G_CAP = 64; }
+    if (G_A > 0 || G_B > 0) { G_GROUPED = 1; }
+
+    // pattern: from -e (already collected) or the first operand
+    if (npat == 0) {
+        if (o.ind >= argc) { return usage(); }
+        let is *u8 as p = prog.arg(argv, o.ind); pat_append(p, prog.slen(p)); o.ind = o.ind + 1;
+    }
+    if (re.re_compile(cast(*u8, &G_PAT[0]), G_PATLEN, G_i, 0) != 0) {
+        prog.outs("grep: bad pattern\n"); return cast(i32, 2);
+    }
+
+    let is i64 as nfiles = argc - o.ind;
+    if (nfiles <= 0 && G_r == 0) {
+        // stdin
+        let is i64 as len with mut = 0;
+        let is i64 as buf = fu.slurp_fd(cast(i64, 0), &len);
+        if (len > 0) { grep_buf("(standard input)", buf, len); }
+    } else {
+        if (nfiles > 1 || G_r != 0) { G_multi = 1; }
+        if (G_H != 0) { G_multi = 1; }
+        let is i64 as i with mut = o.ind;
+        if (nfiles <= 0 && G_r != 0) {
+            // grep -r with no path: search "."
+            do_recursive(".", ".");
+        }
+        while (i < argc) {
+            let is *u8 as name = prog.arg(argv, i);
+            let is [256]u8 as pb;
+            let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
+            if (G_r != 0) { do_recursive(name, path); } else { do_path(name, path); }
+            i = i + 1;
+        }
+    }
+
+    if (G_exit == 2) { return cast(i32, 2); }
+    if (G_any != 0) { return 0; }
+    return cast(i32, 1);
+}

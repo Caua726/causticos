@@ -1,0 +1,129 @@
+// wmpat.cst — the dumbest possible WM client: a colored checkerboard.
+//
+// Exists to prove the protocol and the compositor with zero terminal
+// machinery: WELCOME → segment handshake → paint a pid-seeded pattern →
+// COMMIT, then sit in a poll loop answering KEY (cycle the hue), RESIZE
+// (repaint at the new size) and CLOSE_REQ. With argv[1] == "stuck" it stops
+// reading its channel after the first frame — the test dummy for the WM's
+// stuck-client drop path.
+
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/wmproto.cst" as wmp;
+
+let is i64 as seg_base with mut = 0;
+let is i64 as seg_stride with mut = 0;
+let is i64 as win_w with mut = 0;
+let is i64 as win_h with mut = 0;
+let is i64 as hue with mut = 0;
+
+// Two hue-derived fill colors; 32px checker.
+fn paint() as void {
+    let is i64 as c1 = 0x00203040 + ((hue * 0x1F3B) & 0x003F3F3F);
+    let is i64 as c2 = 0x00C0B080 - ((hue * 0x2B17) & 0x003F3F3F);
+    let is i64 as y with mut = 0;
+    while (y < win_h) {
+        let is *u32 as row = cast(*u32, seg_base + y * seg_stride);
+        let is i64 as x with mut = 0;
+        while (x < win_w) {
+            let is i64 as cell = ((x >> 5) + (y >> 5)) & 1;
+            if (cell == 0) { row[x] = cast(u32, c1); }
+            else { row[x] = cast(u32, c2); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return;
+}
+
+fn commit_full() as void {
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_COMMIT, 0, 0, wmp.pack_wh(win_w, win_h));
+    return;
+}
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] == b[i]) { return 1; }
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is [4]i64 as m;
+    let is [32]u8 as acc;
+    let is i64 as fill with mut = 0;
+
+    // WELCOME is written before we were spawned — one read assembles it.
+    let is i64 as got with mut = 0;
+    while (got != 1) {
+        got = wmp.msg_read(wmp.WM_FD, &fill, cast(*u8, &acc[0]), &m[0]);
+        if (got < 0) { return 1; }
+    }
+    if (m[0] != wmp.MSG_WELCOME) { return 1; }
+    let is i64 as screen_w = m[1];
+    let is i64 as screen_h = m[2];
+    win_w = wmp.unpack_w(m[3]);
+    win_h = wmp.unpack_h(m[3]);
+    seg_stride = screen_w * 4;
+
+    // Full-screen-sized buffer, once; resize only changes the used sub-rect.
+    let is i64 as npages = (screen_w * screen_h * 4 + 4095) / 4096;
+    let is i64 as seg = sys.seg_create(npages, 0);
+    if (seg < 0) { return 2; }
+    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
+    if (va < 0) { return 2; }
+    seg_base = va;
+
+    // fd FIRST, then the message that announces it (single-slot FD_SEND).
+    if (sys.fd_send(wmp.WM_FD, seg) != 0) { return 3; }
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_HELLO, npages, seg_stride, wmp.PROTO_VER);
+    let is [2]i64 as tb;
+    wmp.title_pack(cast(*u8, "pattern"), 7, &tb[0], &tb[1]);
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_SET_TITLE, 7, tb[0], tb[1]);
+
+    hue = sys.getpid();
+    paint();
+    commit_full();
+
+    // Stuck mode: prove the WM's drop path — first frame up, then deafness.
+    let is i64 as stuck with mut = 0;
+    if (argc >= 2) {
+        let is *i64 as av = cast(*i64, cast(i64, argv));
+        if (streq(cast(*u8, av[1]), cast(*u8, "stuck")) == 1) { stuck = 1; }
+    }
+    if (stuck == 1) {
+        while (1 == 1) { sys.sleep_ns(1000000000); }
+    }
+
+    let is [3]i64 as pe;
+    while (1 == 1) {
+        pe[0] = wmp.WM_FD;
+        pe[1] = sys.POLL_READABLE;
+        pe[2] = 0;
+        sys.poll(&pe[0], 1, 0 - 1);
+        let is i64 as r = wmp.msg_read(wmp.WM_FD, &fill, cast(*u8, &acc[0]), &m[0]);
+        if (r < 0) { return 0; }                       // WM gone
+        if (r == 1) {
+            if (m[0] == wmp.MSG_KEY) {
+                // key down: shift the hue, repaint, commit
+                if ((m[2] & 1) == 1) {
+                    hue = hue + m[1];
+                    paint();
+                    commit_full();
+                }
+            } else if (m[0] == wmp.MSG_RESIZE) {
+                win_w = m[1];
+                win_h = m[2];
+                paint();
+                commit_full();
+            } else if (m[0] == wmp.MSG_CLOSE_REQ) {
+                wmp.msg_send(wmp.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+                return 0;
+            }
+            // FOCUS / MOUSE_*: nothing to do in a checkerboard
+        }
+    }
+    return 0;
+}
