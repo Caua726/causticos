@@ -63,6 +63,8 @@ struct Win {
     maximized as i64;                                // 0 = floating, 1 = maximized/snapped
     sav_x as i64;  sav_y as i64;  sav_w as i64;  sav_h as i64;   // geometry to restore
     minimized as i64;                                // 1 = hidden, lives only on the taskbar
+    is_text as i64;                                  // 1 = TEXT surface (cell grid, WM rasterises);
+                                                     // 0 = PIXEL surface (segment blit, the default)
 }
 let is [8]Win as wins with mut;
 let is [256]u8 as mbufs with mut;                    // 8 × 32B message accumulators
@@ -334,8 +336,65 @@ fn draw_win_buttons(i as i64, tcol as i64) as void {
     return;
 }
 
+// Rasterise a TEXT window's content: the client ships a CELL GRID segment
+// (header + cols*rows i64 cells) instead of a pixel buffer, and the WM paints
+// the glyphs here on compose. Per cell: fill the 8x16 background, then stamp
+// the glyph in the foreground; the cursor cell is drawn inverted. Clipping is
+// per-pixel (cfill/cglyph honour the clip box), so a partial-rect re-compose
+// only repaints the cells it touches. ~4 MiB/terminal saved vs. a pixel buffer.
+fn cblit_text(i as i64) as void {
+    let is i64 as cx = wins[i].x + BORDER;           // content origin on screen
+    let is i64 as cy = wins[i].y + BORDER + TITLE_H;
+    let is *i64 as hdr = cast(*i64, wins[i].seg_base);
+    let is i64 as cols with mut = hdr[wmp.TXT_H_COLS];
+    let is i64 as rows with mut = hdr[wmp.TXT_H_ROWS];
+    if (cols <= 0 || rows <= 0) { return; }
+    // never read past the window's own pixel extent
+    let is i64 as vis_cols = wins[i].w / 8;
+    let is i64 as vis_rows = wins[i].h / 16;
+    if (cols > vis_cols) { cols = vis_cols; }
+    if (rows > vis_rows) { rows = vis_rows; }
+    let is i64 as cur_col = hdr[wmp.TXT_H_CUR_COL];
+    let is i64 as cur_row = hdr[wmp.TXT_H_CUR_ROW];
+    let is i64 as cur_vis = hdr[wmp.TXT_H_CUR_VIS];
+    let is *i64 as cells = cast(*i64, wins[i].seg_base + wmp.TXT_HDR_CELLS * 8);
+    // base bg (cell [0,0]'s) paints the slack to the right/below the grid — the
+    // window content is w x h px but the grid is only cols*8 x rows*16, so the
+    // remainder would otherwise show the frame's border colour through.
+    let is i64 as base_bg = wmp.txt_cell_bg(cells[0]);
+    let is i64 as gw = cols * 8;
+    let is i64 as gh = rows * 16;
+    if (gw < wins[i].w) { cfill(cx + gw, cy, wins[i].w - gw, wins[i].h, base_bg); }
+    if (gh < wins[i].h) { cfill(cx, cy + gh, gw, wins[i].h - gh, base_bg); }
+    let is i64 as r with mut = 0;
+    while (r < rows) {
+        let is i64 as py = cy + r * 16;
+        if (py + 16 > clip_y0 && py < clip_y1) {      // row band touches the clip
+            let is i64 as c with mut = 0;
+            while (c < cols) {
+                let is i64 as px = cx + c * 8;
+                if (px + 8 > clip_x0 && px < clip_x1) {
+                    let is i64 as cell = cells[r * cols + c];
+                    let is i64 as ch = wmp.txt_cell_char(cell);
+                    let is i64 as fg with mut = wmp.txt_cell_fg(cell);
+                    let is i64 as bg with mut = wmp.txt_cell_bg(cell);
+                    if (cur_vis == 1 && r == cur_row && c == cur_col) {
+                        let is i64 as tmp = fg; fg = bg; bg = tmp;   // invert the cursor cell
+                    }
+                    cfill(px, py, 8, 16, bg);
+                    if (ch != 0x20 && ch != 0) { cglyph(ch, px, py, fg); }
+                }
+                c = c + 1;
+            }
+        }
+        r = r + 1;
+    }
+    return;
+}
+
 // Blit the window's content sub-rect (segment → backbuffer), clipped.
 fn cblit_content(i as i64) as void {
+    if (wins[i].is_text == 1) { cblit_text(i); return; }
     let is i64 as cx = wins[i].x + BORDER;           // content origin on screen
     let is i64 as cy = wins[i].y + BORDER + TITLE_H;
     let is i64 as x0 with mut = cx;
@@ -743,6 +802,7 @@ fn spawn_client() as void {
     wins[i].mb_fill = 0;
     wins[i].maximized = 0;
     wins[i].minimized = 0;
+    wins[i].is_text = 0;
     set_focus(i);
     wmp.log_kv(cast(*u8, "wm: spawn pid="), 14, pid);
     return;
@@ -809,12 +869,28 @@ fn handle_msg(i as i64, m as *i64) as void {
         wins[i].seg_base = va;
         wins[i].seg_pages = m[1];
         wins[i].seg_stride = m[2];
+        wins[i].is_text = 0;
+        if (wmp.hello_kind(m[3]) == wmp.SURFACE_TEXT) { wins[i].is_text = 1; }
         wins[i].state = 2;
         damage_frame(i);
         damage_taskbar();                            // its bar button can now show
         wmp.log_kv(cast(*u8, "wm: hello win="), 14, i);
     } else if (m[0] == wmp.MSG_COMMIT) {
         if (wins[i].state != 2) { return; }
+        if (wins[i].is_text == 1) {
+            // TEXT commit: a = first dirty row, (c>>32) = row count; a dirty
+            // band spans the full content width, 16 px per text row.
+            let is i64 as row0 with mut = m[1];
+            let is i64 as nrows with mut = wmp.unpack_w(m[3]);
+            if (row0 < 0) { nrows = nrows + row0; row0 = 0; }
+            let is i64 as py0 = row0 * 16;
+            let is i64 as ph with mut = nrows * 16;
+            if (py0 + ph > wins[i].h) { ph = wins[i].h - py0; }
+            if (ph > 0 && py0 < wins[i].h) {
+                damage(wins[i].x + BORDER, wins[i].y + BORDER + TITLE_H + py0, wins[i].w, ph);
+            }
+            return;
+        }
         let is i64 as cx with mut = m[1];
         let is i64 as cy with mut = m[2];
         let is i64 as cw with mut = wmp.unpack_w(m[3]);

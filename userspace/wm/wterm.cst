@@ -36,20 +36,28 @@ let is i64 as hhead with mut = 0;
 let is i64 as hsize with mut = 0;
 let is i64 as hnav with mut = 0;
 
-// The cell grid: 160 cols cover a full 1280px-wide window; 250 ring lines =
-// up to ~200 lines of scrollback above a full-screen view (term.cst turns
-// the grid into a ring — lines scrolling off the top become history, the
-// wheel slides the view back into it).
-let is [40000]i64 as gridbuf with mut;
+// The cell grid: 160 cols cover a full 1280px-wide window; 80 ring lines = a
+// full-screen view (50 rows) plus ~30 lines of scrollback (term.cst turns the
+// grid into a ring — lines scrolling off the top become history, the wheel
+// slides the view back into it). 160×80×8B = 100K, down from 320K — a 200-line
+// scrollback was 5× the screen and the bulk of the per-terminal BSS.
+let is [12800]i64 as gridbuf with mut;
 let is i64 as GRID_STRIDE with imut = 160;
-let is i64 as GRID_ROWS   with imut = 250;
+let is i64 as GRID_ROWS   with imut = 80;
 
-// Coalesced damage awaiting a WRITABLE channel (exclusive x1/y1).
+// The TEXT surface: the WM rasterises glyphs, so we ship only the cell grid.
+// segcells points just past the 8-i64 header in the shared segment; seg_cols is
+// the column stride the WM reads from the header (kept == t.cols). Dirty is now
+// coalesced as a RANGE OF ROWS (inclusive lo, exclusive hi) instead of a pixel
+// rect — the WM re-rasterises whole rows.
+let is i64 as seg_base with mut = 0;     // segment VA (header at [0])
+let is i64 as segcells with mut = 0;     // VA of cell[0] (header + 8 i64)
+let is i64 as seg_cap_cells with mut = 0;// capacity in cells (cols*rows ceiling)
+
+// Coalesced dirty ROW range awaiting a WRITABLE channel (hi exclusive).
 let is i64 as pend_on with mut = 0;
-let is i64 as pend_x0 with mut = 0;
-let is i64 as pend_y0 with mut = 0;
-let is i64 as pend_x1 with mut = 0;
-let is i64 as pend_y1 with mut = 0;
+let is i64 as pend_r0 with mut = 0;
+let is i64 as pend_r1 with mut = 0;
 
 // Running child (one at a time, like the shell).
 let is i64 as child_pid with mut = 0;
@@ -99,21 +107,67 @@ fn send_size(t as *term.Term) as void {
 }
 fn _log(s as *u8) as void { sys.write_serial(s, slen(s)); }
 
-// Fold the term's accumulated dirty rect into the pending commit.
+// Pixel-row → text-row: the term lays cells out at PAD_Y + r*16 (term.cst's
+// PAD_Y is 12). A dirty pixel band [y0,y1) covers rows [(y0-12)/16 ..].
+fn _px_to_row(py as i64) as i64 {
+    let is i64 as r with mut = (py - 12) / 16;
+    if (r < 0) { r = 0; }
+    return r;
+}
+
+// Flatten the visible grid view into the shared text segment and write the
+// header (geometry + cursor). Only rows [r0,r1) are copied — the WM re-reads
+// the whole header but only the rows we commit are re-rasterised.
+fn flatten_rows(t as *term.Term, r0 as i64, r1 as i64) as void {
+    let is i64 as cols = t.cols;
+    let is i64 as rows = t.rows;
+    let is *i64 as hdr = cast(*i64, seg_base);
+    hdr[0] = cols;            // TXT_H_COLS
+    hdr[1] = rows;            // TXT_H_ROWS
+    hdr[2] = t.cx;            // TXT_H_CUR_COL
+    hdr[3] = t.cy;            // TXT_H_CUR_ROW
+    let is i64 as vis with mut = 1;
+    if (t.cur_vis == 0) { vis = 0; }
+    if (t.view_off != 0) { vis = 0; }   // scrolled back: no live cursor
+    hdr[4] = vis;             // TXT_H_CUR_VIS
+    hdr[5] = 0; hdr[6] = 0; hdr[7] = 0;
+    let is *i64 as grid = cast(*i64, t.grid);
+    let is *i64 as dst = cast(*i64, segcells);
+    let is i64 as r with mut = r0;
+    while (r < r1 && r < rows) {
+        // _phys_row(t, r): physical ring row of the r-th visible line,
+        // inlined to avoid depending on term.cst's internal helper.
+        let is i64 as p = t.live_top + t.grid_rows - t.view_off + r;
+        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+        let is i64 as gbase = phys * t.grid_stride;
+        let is i64 as dbase = r * cols;
+        let is i64 as c with mut = 0;
+        while (c < cols) {
+            dst[dbase + c] = grid[gbase + c];
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return;
+}
+
+// Fold the term's accumulated dirty rect into the pending row range, then
+// flatten those rows into the segment so the bytes are ready to commit.
 fn note_dirty(t as *term.Term) as void {
     let is [4]i64 as d;
     if (term.take_dirty(t, &d[0]) == 0) { return; }
-    let is i64 as x1 = d[0] + d[2];
-    let is i64 as y1 = d[1] + d[3];
+    let is i64 as r0 with mut = _px_to_row(d[1]);
+    let is i64 as r1 with mut = _px_to_row(d[1] + d[3] - 1) + 1;   // inclusive last → exclusive
+    if (r0 < 0) { r0 = 0; }
+    if (r1 > t.rows) { r1 = t.rows; }
+    if (r1 <= r0) { return; }
+    flatten_rows(t, r0, r1);
     if (pend_on == 0) {
-        pend_x0 = d[0]; pend_y0 = d[1]; pend_x1 = x1; pend_y1 = y1;
-        pend_on = 1;
+        pend_r0 = r0; pend_r1 = r1; pend_on = 1;
         return;
     }
-    if (d[0] < pend_x0) { pend_x0 = d[0]; }
-    if (d[1] < pend_y0) { pend_y0 = d[1]; }
-    if (x1 > pend_x1) { pend_x1 = x1; }
-    if (y1 > pend_y1) { pend_y1 = y1; }
+    if (r0 < pend_r0) { pend_r0 = r0; }
+    if (r1 > pend_r1) { pend_r1 = r1; }
     return;
 }
 
@@ -124,6 +178,11 @@ fn show(t as *term.Term) as void {
     return;
 }
 
+// Bytes actually mmap'd by the last successful read_file (page-aligned). The
+// munmaps below must hand back this real size, not IMG_CAP — allocating the 4
+// MiB ceiling for every child (even a 20 KiB `ls`) was the whole leak.
+let is i64 as img_alloc with mut = 0;
+
 fn read_file(path as *u8, out_len as *i64) as *u8 {
     *out_len = 0;
     let is i64 as fd = sys.open_read(path);
@@ -131,8 +190,12 @@ fn read_file(path as *u8, out_len as *i64) as *u8 {
     let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
     sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
     if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return cast(*u8, 0); }
-    let is i64 as va = sys.mmap(cast(i64, 0), IMG_CAP, sys.PROT_READ | sys.PROT_WRITE);
+    // Allocate only what the image needs, rounded up to a page — IMG_CAP stays
+    // a safety ceiling (checked above), never the allocation size.
+    let is i64 as alloc = (sz + 4095) & (0 - 4096);
+    let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
     if (va < 0) { sys.close(fd); return cast(*u8, 0); }
+    img_alloc = alloc;
     let is *u8 as buf = cast(*u8, va);
     let is i64 as got = sys.read(fd, buf, sz);
     sys.close(fd);
@@ -142,6 +205,8 @@ fn read_file(path as *u8, out_len as *i64) as *u8 {
 
 // the loaded child image, freed when the child is reaped
 let is i64 as child_img with mut = 0;
+// the byte size of that image's mapping (== img_alloc at spawn time)
+let is i64 as child_img_alloc with mut = 0;
 
 // Launch /<cmd>.cse with its stdout wired to a console channel — and DON'T
 // pump: the read end joins the main poll loop as child_out.
@@ -168,7 +233,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     let is [2]i64 as fds;
     if (sys.channel_create(cast(*i64, &fds[0])) != 0) {
         err(t, "channel fail\n");
-        sys.munmap(cast(i64, img), IMG_CAP);
+        sys.munmap(cast(i64, img), img_alloc);
         return;
     }
     // control channel: the child's window onto terminal services (fd 4)
@@ -176,7 +241,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     if (sys.channel_create(cast(*i64, &cfds[0])) != 0) {
         err(t, "channel fail\n");
         sys.close(fds[0]); sys.close(fds[1]);
-        sys.munmap(cast(i64, img), IMG_CAP);
+        sys.munmap(cast(i64, img), img_alloc);
         return;
     }
     // stdin channel: the terminal keeps [0] (writes keystrokes), the child gets
@@ -186,7 +251,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
         err(t, "channel fail\n");
         sys.close(fds[0]); sys.close(fds[1]);
         sys.close(cfds[0]); sys.close(cfds[1]);
-        sys.munmap(cast(i64, img), IMG_CAP);
+        sys.munmap(cast(i64, img), img_alloc);
         return;
     }
     let is [6]i64 as fdacts;
@@ -210,7 +275,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
         sys.close(fds[0]);
         sys.close(cfds[0]);
         sys.close(ifds[0]);
-        sys.munmap(cast(i64, img), IMG_CAP);
+        sys.munmap(cast(i64, img), img_alloc);
         return;
     }
     _col(t, C_TEXT);
@@ -220,6 +285,7 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     child_in = ifds[0];
     ctl_fill = 0;
     child_img = cast(i64, img);
+    child_img_alloc = img_alloc;
     return;
 }
 
@@ -257,12 +323,13 @@ fn child_eof(t as *term.Term) as void {
     if (child_in >= 0) { sys.close(child_in); }
     let is i64 as st with mut = 0;
     sys.wait(child_pid, &st);
-    sys.munmap(child_img, IMG_CAP);
+    sys.munmap(child_img, child_img_alloc);
     child_out = 0 - 1;
     child_ctl = 0 - 1;
     child_in = 0 - 1;
     child_pid = 0;
     child_img = 0;
+    child_img_alloc = 0;
     prompt(t);
     show(t);
     return;
@@ -413,20 +480,34 @@ fn main() as i32 {
     let is i64 as screen_h = m[2];
     let is i64 as win_w with mut = wmp.unpack_w(m[3]);
     let is i64 as win_h with mut = wmp.unpack_h(m[3]);
-    let is i64 as stride = screen_w * 4;
 
-    let is i64 as npages = (screen_w * screen_h * 4 + 4095) / 4096;
+    // TEXT surface: a tiny CELL-GRID segment (header + cols*rows i64), sized for
+    // the WORST CASE this terminal could ever show — the whole screen — so a
+    // resize never has to reallocate. For 1280x800 that is 160x50 = ~64 KiB,
+    // versus the ~4 MiB full-screen PIXEL buffer the old path allocated.
+    let is i64 as cols_max with mut = screen_w / 8;
+    let is i64 as rows_max with mut = screen_h / 16;
+    if (cols_max > GRID_STRIDE) { cols_max = GRID_STRIDE; }
+    if (rows_max > GRID_ROWS) { rows_max = GRID_ROWS; }
+    seg_cap_cells = cols_max * rows_max;
+    let is i64 as npages with mut = (wmp.TXT_HDR_CELLS + seg_cap_cells) * 8;
+    npages = (npages + 4095) / 4096;
     let is i64 as seg = sys.seg_create(npages, 0);
     if (seg < 0) { return 2; }
     let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
     if (va < 0) { return 2; }
+    seg_base = va;
+    segcells = va + wmp.TXT_HDR_CELLS * 8;
     if (sys.fd_send(wmp.WM_FD, seg) != 0) { return 3; }
-    wmp.msg_send(wmp.WM_FD, wmp.MSG_HELLO, npages, stride, wmp.PROTO_VER);
+    // HELLO.c carries PROTO_VER and the surface kind (TEXT). a/b (npages/stride)
+    // keep their pixel-path meaning; for text the WM ignores stride.
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_HELLO, npages, cols_max * 8,
+                 wmp.hello_c(wmp.PROTO_VER, wmp.SURFACE_TEXT));
     let is [2]i64 as tb;
     wmp.title_pack(cast(*u8, "terminal"), 8, &tb[0], &tb[1]);
     wmp.msg_send(wmp.WM_FD, wmp.MSG_SET_TITLE, 8, tb[0], tb[1]);
 
-    let is term.Term as t = term.init_buffer(cast(*u8, va), win_w, win_h, stride, 4);
+    let is term.Term as t = term.init_text(win_w, win_h);
     term.attach_grid(&t, &gridbuf[0], GRID_STRIDE, GRID_ROWS);
     _col(&t, C_TITLE);
     puts(&t, "Caustic Terminal\n");
@@ -465,10 +546,12 @@ fn main() as i32 {
         sys.poll(&pe[0], n, 0 - 1);
 
         // -- flush the coalesced commit while the channel has room --
+        // TEXT commit: a = first dirty row, c = (rowcount << 32). The cells were
+        // already flattened into the segment by note_dirty.
         if (pend_on == 1 && (pe[2] & sys.POLL_WRITABLE) != 0) {
             let is i64 as rc = wmp.msg_send(wmp.WM_FD, wmp.MSG_COMMIT,
-                                            pend_x0, pend_y0,
-                                            wmp.pack_wh(pend_x1 - pend_x0, pend_y1 - pend_y0));
+                                            pend_r0, 0,
+                                            wmp.pack_wh(pend_r1 - pend_r0, 0));
             if (rc < 0) { return 0; }                  // WM gone
             pend_on = 0;
         }
