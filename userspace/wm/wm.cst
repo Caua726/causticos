@@ -28,6 +28,10 @@ let is i64 as MIN_W    with imut = 160;
 let is i64 as MIN_H    with imut = 64;
 let is i64 as HELLO_NS with imut = 5000000000; // 5s for a client to handshake
 let is i64 as MAX_DROPS with imut = 256;       // stuck-client disconnect bar
+let is i64 as BTN_W     with imut = 24;        // titlebar control button width
+let is i64 as SNAP_PX   with imut = 12;        // drag-to-edge snap trigger band
+let is i64 as DCLICK_NS with imut = 400000000; // titlebar double-click window (400ms)
+let is i64 as COL_CLOSE_H with imut = 0x00c84040;  // close-button hover red
 
 let is i64 as COL_DESKTOP  with imut = 0x00202830;
 let is i64 as COL_BORDER_F with imut = 0x0073d0ff;
@@ -50,6 +54,8 @@ struct Win {
     pend_close as i64;
     hello_deadline as i64;
     mb_fill as i64;                                  // partial-message fill (buf in mbufs)
+    maximized as i64;                                // 0 = floating, 1 = maximized/snapped
+    sav_x as i64;  sav_y as i64;  sav_w as i64;  sav_h as i64;   // geometry to restore
 }
 let is [8]Win as wins with mut;
 let is [256]u8 as mbufs with mut;                    // 8 × 32B message accumulators
@@ -123,6 +129,8 @@ let is i64 as drag_ox with mut = 0;    // window geometry at press
 let is i64 as drag_oy with mut = 0;
 let is i64 as drag_ow with mut = 0;
 let is i64 as drag_oh with mut = 0;
+let is i64 as last_click_ns with mut = 0;        // titlebar double-click → maximize
+let is i64 as last_click_win with mut = 0 - 1;
 
 // ---- the client image (/wmpat.cse for now; the terminal later) ----
 let is i64 as img_base with mut = 0;
@@ -243,6 +251,57 @@ fn cglyph(ch as i64, px as i64, py as i64, color as i64) as void {
     return;
 }
 
+// One clipped pixel — for diagonal icon strokes cfill can't draw.
+fn cpix(x as i64, y as i64, color as i64) as void {
+    if (x >= clip_x0 && x < clip_x1 && y >= clip_y0 && y < clip_y1) {
+        let is *u32 as p = cast(*u32, fb_base + y * scr_pitch + x * 4);
+        p[0] = cast(u32, color);
+    }
+    return;
+}
+// A 1px-thick rectangle outline (4 cfills).
+fn rect_outline(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
+    cfill(x, y, w, 1, color); cfill(x, y + h - 1, w, 1, color);
+    cfill(x, y, 1, h, color); cfill(x + w - 1, y, 1, h, color);
+    return;
+}
+// An X of size sz from (x0,y0) — the close-button glyph.
+fn draw_x(x0 as i64, y0 as i64, sz as i64, color as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < sz) {
+        cpix(x0 + k, y0 + k, color);
+        cpix(x0 + k, y0 + sz - 1 - k, color);
+        k = k + 1;
+    }
+    return;
+}
+
+// Titlebar control buttons [ max/restore ][ close ], right-aligned. `tcol` is
+// the titlebar fill (used to clear behind the restore icon's front square).
+fn draw_win_buttons(i as i64, tcol as i64) as void {
+    let is i64 as tb_y = wins[i].y + BORDER;
+    let is i64 as right = wins[i].x + BORDER + wins[i].w;
+    let is i64 as icon = 8;
+    let is i64 as iy = tb_y + (TITLE_H - icon) / 2;
+    // close button: hover turns the cell red
+    let is i64 as cbx = right - BTN_W;
+    if (mx >= cbx && mx < right && my >= tb_y && my < tb_y + TITLE_H) {
+        cfill(cbx, tb_y, BTN_W, TITLE_H, COL_CLOSE_H);
+    }
+    draw_x(cbx + (BTN_W - icon) / 2, iy, icon, COL_TEXT);
+    // maximize / restore button
+    let is i64 as mbx = cbx - BTN_W;
+    let is i64 as mxx = mbx + (BTN_W - icon) / 2;
+    if (wins[i].maximized == 1) {                    // restore: two stacked squares
+        rect_outline(mxx + 2, iy - 1, icon - 2, icon - 2, COL_TEXT);
+        cfill(mxx, iy + 1, icon - 2, icon - 2, tcol);
+        rect_outline(mxx, iy + 1, icon - 2, icon - 2, COL_TEXT);
+    } else {                                          // maximize: one square
+        rect_outline(mxx, iy, icon, icon, COL_TEXT);
+    }
+    return;
+}
+
 // Blit the window's content sub-rect (segment → backbuffer), clipped.
 fn cblit_content(i as i64) as void {
     let is i64 as cx = wins[i].x + BORDER;           // content origin on screen
@@ -289,17 +348,19 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
             cfill(wins[i].x, wins[i].y,
                   wins[i].w + 2 * BORDER, wins[i].h + TITLE_H + 2 * BORDER, bcol);
             cfill(wins[i].x + BORDER, wins[i].y + BORDER, wins[i].w, TITLE_H, tcol);
+            let is i64 as tx_max = wins[i].x + BORDER + wins[i].w - 2 * BTN_W;  // stop before buttons
             if (wins[i].title_len > 0) {
                 let is [16]u8 as tbuf;
                 wmp.title_unpack(wins[i].t0, wins[i].t1, wins[i].title_len, cast(*u8, &tbuf[0]));
                 let is i64 as k with mut = 0;
                 while (k < wins[i].title_len) {
-                    cglyph(cast(i64, tbuf[k]),
-                           wins[i].x + BORDER + 6 + k * 8,
-                           wins[i].y + BORDER + 2, COL_TEXT);
+                    let is i64 as gx = wins[i].x + BORDER + 6 + k * 8;
+                    if (gx + 8 > tx_max) { break; }
+                    cglyph(cast(i64, tbuf[k]), gx, wins[i].y + BORDER + 2, COL_TEXT);
                     k = k + 1;
                 }
             }
+            draw_win_buttons(i, tcol);
             cblit_content(i);
         }
         zi = zi - 1;
@@ -460,6 +521,7 @@ fn spawn_client() as void {
     wins[i].pend_close = 0;
     wins[i].hello_deadline = sys.time_ns() + HELLO_NS;
     wins[i].mb_fill = 0;
+    wins[i].maximized = 0;
     set_focus(i);
     wmp.log_kv(cast(*u8, "wm: spawn pid="), 14, pid);
     return;
@@ -671,7 +733,66 @@ fn drain_kbd() as void {
     return;
 }
 
+// ---- maximize / snap / restore ----
+fn set_geometry(i as i64, nx as i64, ny as i64, nw as i64, nh as i64) as void {
+    damage_frame(i);
+    wins[i].x = nx; wins[i].y = ny; wins[i].w = nw; wins[i].h = nh;
+    damage_frame(i);
+    wins[i].pend_resize_w = nw; wins[i].pend_resize_h = nh;
+    return;
+}
+fn save_geometry(i as i64) as void {
+    wins[i].sav_x = wins[i].x; wins[i].sav_y = wins[i].y;
+    wins[i].sav_w = wins[i].w; wins[i].sav_h = wins[i].h;
+    return;
+}
+fn maximize_win(i as i64) as void {
+    if (wins[i].maximized == 0) { save_geometry(i); }
+    set_geometry(i, 0, 0, scr_w - 2 * BORDER, scr_h - TITLE_H - 2 * BORDER);
+    wins[i].maximized = 1;
+    return;
+}
+fn snap_win(i as i64, rightside as i64) as void {
+    if (wins[i].maximized == 0) { save_geometry(i); }
+    let is i64 as halfw = scr_w / 2;
+    let is i64 as nx with mut = 0;
+    if (rightside == 1) { nx = halfw; }
+    set_geometry(i, nx, 0, halfw - 2 * BORDER, scr_h - TITLE_H - 2 * BORDER);
+    wins[i].maximized = 1;
+    return;
+}
+fn restore_win(i as i64) as void {
+    set_geometry(i, wins[i].sav_x, wins[i].sav_y, wins[i].sav_w, wins[i].sav_h);
+    wins[i].maximized = 0;
+    return;
+}
+fn toggle_maximize(i as i64) as void {
+    if (wins[i].maximized == 1) { restore_win(i); } else { maximize_win(i); }
+    return;
+}
+// Which titlebar control button is under the cursor: 0 none, 1 close, 2 max.
+fn titlebar_button_at(i as i64) as i64 {
+    let is i64 as tb_y0 = wins[i].y + BORDER;
+    if (my < tb_y0 || my >= tb_y0 + TITLE_H) { return 0; }
+    let is i64 as right = wins[i].x + BORDER + wins[i].w;
+    if (mx >= right - BTN_W && mx < right) { return 1; }
+    if (mx >= right - 2 * BTN_W && mx < right - BTN_W) { return 2; }
+    return 0;
+}
+
 fn start_move(i as i64) as void {
+    if (wins[i].maximized == 1) {
+        // un-snap: shrink to the saved size, recentre under the cursor, then drag
+        let is i64 as nw = wins[i].sav_w;
+        let is i64 as nh = wins[i].sav_h;
+        let is i64 as nx with mut = mx - nw / 2;
+        let is i64 as ny with mut = my - TITLE_H / 2;
+        if (nx < 0) { nx = 0; }
+        if (ny < 0) { ny = 0; }
+        if (nx + nw + 2 * BORDER > scr_w) { nx = scr_w - nw - 2 * BORDER; }
+        set_geometry(i, nx, ny, nw, nh);
+        wins[i].maximized = 0;
+    }
     drag_mode = 1;
     drag_win = i;
     drag_ax = mx; drag_ay = my;
@@ -721,13 +842,25 @@ fn press_at() as void {
             if (mx >= fx && mx < fx + fw && my >= fy && my < fy + fh) {
                 set_focus(i);
                 if (mod_super == 1) { start_move(i); return; }
+                // titlebar control buttons beat the resize band and the move grab
+                let is i64 as btn = titlebar_button_at(i);
+                if (btn == 1) { wins[i].pend_close = 1; return; }
+                if (btn == 2) { toggle_maximize(i); return; }
                 let is i64 as dirs with mut = 0;
                 if (mx < fx + EDGE) { dirs = dirs | DIR_W; }
                 if (mx >= fx + fw - EDGE) { dirs = dirs | DIR_E; }
                 if (my < fy + EDGE) { dirs = dirs | DIR_N; }
                 if (my >= fy + fh - EDGE) { dirs = dirs | DIR_S; }
                 if (dirs != 0) { start_resize(i, dirs); return; }
-                if (my < fy + BORDER + TITLE_H) { start_move(i); return; }
+                if (my < fy + BORDER + TITLE_H) {
+                    let is i64 as now = sys.time_ns();              // double-click = maximize
+                    if (last_click_win == i && now - last_click_ns < DCLICK_NS) {
+                        last_click_ns = 0; last_click_win = 0 - 1;
+                        toggle_maximize(i); return;
+                    }
+                    last_click_ns = now; last_click_win = i;
+                    start_move(i); return;
+                }
                 forward_mouse(i, wmp.MSG_MOUSE_BTN, mbuttons);
                 return;
             }
@@ -743,6 +876,12 @@ fn handle_buttons(oldb as i64, newb as i64) as void {
     mbuttons = newb;
     if (lp_old == 0 && lp_new == 1) { press_at(); return; }
     if (lp_old == 1 && lp_new == 0) {
+        if (drag_mode == 1) {                            // drag-to-edge snap on release
+            if (my <= SNAP_PX) { maximize_win(drag_win); }
+            else if (mx <= SNAP_PX) { snap_win(drag_win, 0); }
+            else if (mx >= scr_w - SNAP_PX) { snap_win(drag_win, 1); }
+            drag_mode = 0; return;
+        }
         if (drag_mode != 0) { drag_mode = 0; return; }
         if (nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_BTN, newb); }
         return;
@@ -802,6 +941,14 @@ fn apply_motion() as void {
     if (mx != cur_last_x || my != cur_last_y) {
         damage(cur_last_x, cur_last_y, CUR_W, CUR_H);
         damage(mx, my, CUR_W, CUR_H);
+        // keep the focused window's button strip re-composed so close-hover tracks
+        if (nz > 0) {
+            let is i64 as f = zord[0];
+            let is i64 as tby = wins[f].y + BORDER;
+            if (my >= tby - CUR_H && my < tby + TITLE_H) {
+                damage(wins[f].x + BORDER + wins[f].w - 2 * BTN_W, tby, 2 * BTN_W, TITLE_H);
+            }
+        }
         cur_last_x = mx;
         cur_last_y = my;
     }
