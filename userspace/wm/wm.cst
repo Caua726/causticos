@@ -363,8 +363,8 @@ fn spawn_client() as void {
 // clients are KILLED for real (the spawn key is the kill authority).
 fn reap_window(i as i64, do_wait as i64) as void {
     if (wins[i].state == 2) {
-        sys.munmap(wins[i].seg_base, wins[i].seg_pages * 4096);
-        sys.close(wins[i].seg_fd);
+        // the compositor holds the content segment now — tell it to detach
+        wc_send(cp.MSG_WC_DETACH_SURFACE, i, 0, 0);
     }
     sys.close(wins[i].chan);
     let is i64 as was_top with mut = 0;
@@ -402,23 +402,37 @@ fn reap_window(i as i64, do_wait as i64) as void {
 // ============================================================
 fn handle_msg(i as i64, m as *i64) as void {
     if (m[0] == wmp.MSG_HELLO && wins[i].state == 1) {
+        // The client parked its content segment with FD_SEND before the HELLO
+        // bytes — collect it, then HAND IT OFF to the compositor (the WM never
+        // maps client pixels anymore). fd_send precedes the WC message so the
+        // compositor's fd_recv on MSG_WC_ATTACH_SURFACE is guaranteed.
         let is i64 as seg = sys.fd_recv(wins[i].chan);
         if (seg < 0) {
             reap_window(i, 0);
             return;
         }
-        let is i64 as va = sys.mmap_fd(sys.PROT_READ, seg);
-        if (va < 0) {
-            sys.close(seg);
+        wins[i].is_text = 0;
+        if (wmp.hello_kind(m[3]) == wmp.SURFACE_TEXT) { wins[i].is_text = 1; }
+        wins[i].seg_pages = m[1];
+        wins[i].seg_stride = m[2];
+        // hand the segment to the compositor (fd_send then the attach message)
+        let is i64 as tries with mut = 0;
+        let is i64 as sent with mut = 0;
+        while (tries < 1000 && sent == 0) {
+            let is i64 as fr = sys.fd_send(wc_fd, seg);
+            if (fr == 0) { sent = 1; }
+            else if (fr == sys.E_AGAIN) { tries = tries + 1; sys.poll(cast(*i64, 0), 0, 200000); }
+            else { sent = 0 - 1; tries = 1000; }
+        }
+        sys.close(seg);                              // the compositor owns its copy now
+        if (sent != 1) {
             reap_window(i, 0);
             return;
         }
-        wins[i].seg_fd = seg;
-        wins[i].seg_base = va;
-        wins[i].seg_pages = m[1];
-        wins[i].seg_stride = m[2];
-        wins[i].is_text = 0;
-        if (wmp.hello_kind(m[3]) == wmp.SURFACE_TEXT) { wins[i].is_text = 1; }
+        wc_send(cp.MSG_WC_ATTACH_SURFACE, i, m[1],
+                (wins[i].is_text & 1) | ((m[2] & 0xFFFFFFFF) << 32));
+        wins[i].seg_fd = 0;
+        wins[i].seg_base = 0;
         wins[i].state = 2;
         damage_frame(i);
         damage_taskbar();

@@ -92,6 +92,17 @@ let is i64 as comp_nz with mut = 0;
 let is i64 as scene_pending with mut = 0;        // entries still expected this SCENE
 let is i64 as needs_compose with mut = 0;
 
+// Content surfaces — indexed by win_id, INDEPENDENT of the scene snapshot (a new
+// SCENE replaces geometry/flags but never the mapped client segment). Handed over
+// by the WM via fd_send + MSG_WC_ATTACH_SURFACE; mapped read-only here.
+struct CSurf {
+    has as i64;                                  // 1 = a segment is mapped
+    seg_fd as i64;  seg_base as i64;
+    seg_pages as i64;  seg_stride as i64;        // pixel surface: bytes per row
+    is_text as i64;                              // 1 = TEXT cell grid, 0 = PIXEL buffer
+}
+let is [8]CSurf as surfs with mut;
+
 // ---- cursor shape (the contextual shape is WM policy; the position is ours) ----
 let is i64 as cur_shape with mut = 0;
 
@@ -389,6 +400,91 @@ fn draw_taskbar() as void {
     return;
 }
 
+// Rasterise a TEXT window's content from its cell-grid segment (header + cols*
+// rows i64 cells). Per cell: fill the 8x16 background, stamp the glyph; the
+// cursor cell is inverted. Clipping is per-pixel so a partial re-compose only
+// repaints the touched cells.
+fn cblit_text(i as i64) as void {
+    let is i64 as cx = cwins[i].x + BORDER;
+    let is i64 as cy = cwins[i].y + BORDER + TITLE_H;
+    let is *i64 as hdr = cast(*i64, surfs[i].seg_base);
+    let is i64 as cols with mut = hdr[wmp.TXT_H_COLS];
+    let is i64 as rows with mut = hdr[wmp.TXT_H_ROWS];
+    if (cols <= 0 || rows <= 0) { return; }
+    let is i64 as vis_cols = cwins[i].w / 8;
+    let is i64 as vis_rows = cwins[i].h / 16;
+    if (cols > vis_cols) { cols = vis_cols; }
+    if (rows > vis_rows) { rows = vis_rows; }
+    let is i64 as cur_col = hdr[wmp.TXT_H_CUR_COL];
+    let is i64 as cur_row = hdr[wmp.TXT_H_CUR_ROW];
+    let is i64 as cur_vis = hdr[wmp.TXT_H_CUR_VIS];
+    let is *i64 as cells = cast(*i64, surfs[i].seg_base + wmp.TXT_HDR_CELLS * 8);
+    let is i64 as base_bg = wmp.txt_cell_bg(cells[0]);
+    let is i64 as gw = cols * 8;
+    let is i64 as gh = rows * 16;
+    if (gw < cwins[i].w) { cfill(cx + gw, cy, cwins[i].w - gw, cwins[i].h, base_bg); }
+    if (gh < cwins[i].h) { cfill(cx, cy + gh, gw, cwins[i].h - gh, base_bg); }
+    let is i64 as r with mut = 0;
+    while (r < rows) {
+        let is i64 as py = cy + r * 16;
+        if (py + 16 > clip_y0 && py < clip_y1) {
+            let is i64 as c with mut = 0;
+            while (c < cols) {
+                let is i64 as px = cx + c * 8;
+                if (px + 8 > clip_x0 && px < clip_x1) {
+                    let is i64 as cell = cells[r * cols + c];
+                    let is i64 as ch = wmp.txt_cell_char(cell);
+                    let is i64 as fg with mut = wmp.txt_cell_fg(cell);
+                    let is i64 as bg with mut = wmp.txt_cell_bg(cell);
+                    if (cur_vis == 1 && r == cur_row && c == cur_col) {
+                        let is i64 as tmp = fg; fg = bg; bg = tmp;
+                    }
+                    cfill(px, py, 8, 16, bg);
+                    if (ch != 0x20 && ch != 0) { cglyph(ch, px, py, fg); }
+                }
+                c = c + 1;
+            }
+        }
+        r = r + 1;
+    }
+    return;
+}
+
+// Blit a PIXEL window's content sub-rect (segment → backbuffer), clipped.
+fn cblit_pixels(i as i64) as void {
+    let is i64 as cx = cwins[i].x + BORDER;
+    let is i64 as cy = cwins[i].y + BORDER + TITLE_H;
+    let is i64 as x0 with mut = cx;
+    let is i64 as y0 with mut = cy;
+    let is i64 as x1 with mut = cx + cwins[i].w;
+    let is i64 as y1 with mut = cy + cwins[i].h;
+    if (x0 < clip_x0) { x0 = clip_x0; }
+    if (y0 < clip_y0) { y0 = clip_y0; }
+    if (x1 > clip_x1) { x1 = clip_x1; }
+    if (y1 > clip_y1) { y1 = clip_y1; }
+    if (x1 <= x0 || y1 <= y0) { return; }
+    let is i64 as nbytes = (x1 - x0) * 4;
+    let is i64 as yy with mut = y0;
+    while (yy < y1) {
+        let is i64 as dst = fb_base + yy * scr_pitch + x0 * 4;
+        let is i64 as src = surfs[i].seg_base + (yy - cy) * surfs[i].seg_stride + (x0 - cx) * 4;
+        wmp.copy_row(dst, src, nbytes);
+        yy = yy + 1;
+    }
+    return;
+}
+
+fn cblit_content(i as i64) as void {
+    if (surfs[i].has == 0) {
+        // no client surface yet — leave the body dark so it still reads as a window
+        cfill(cwins[i].x + BORDER, cwins[i].y + BORDER + TITLE_H,
+              cwins[i].w, cwins[i].h, 0x00101418);
+        return;
+    }
+    if (surfs[i].is_text == 1) { cblit_text(i); } else { cblit_pixels(i); }
+    return;
+}
+
 // Re-composite one rect: desktop, then every window back-to-front, taskbar, cursor.
 fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
     clip_x0 = rx; clip_y0 = ry; clip_x1 = rx + rw; clip_y1 = ry + rh;
@@ -410,11 +506,7 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
                   cwins[i].w + 2 * BORDER, cwins[i].h + TITLE_H + 2 * BORDER, bcol);
             cfill(cwins[i].x + BORDER, cwins[i].y + BORDER, cwins[i].w, TITLE_H, tcol);
             draw_win_buttons(i, tcol);
-            // content is drawn from the client's surface in M4; in M3 the body
-            // is the frame colour, so just leave the inner content as desktop-
-            // less border — paint it dark so the window reads as a window.
-            cfill(cwins[i].x + BORDER, cwins[i].y + BORDER + TITLE_H,
-                  cwins[i].w, cwins[i].h, 0x00101418);
+            cblit_content(i);                        // client surface (text/pixels)
         }
         zi = zi + 1;
     }
@@ -628,6 +720,41 @@ fn handle_wc(m as *i64) as void {
             if (comp_nz < MAX_WIN) { comp_z[comp_nz] = win; comp_nz = comp_nz + 1; }
         }
         if (scene_pending > 0) { scene_pending = scene_pending - 1; }
+    } else if (m[0] == cp.MSG_WC_ATTACH_SURFACE) {
+        // the WM parked the client's content segment with fd_send before this
+        // message — collect it and map it read-only. a=win_id, b=npages,
+        // c = is_text | (stride << 32).
+        let is i64 as win = m[1];
+        if (win >= 0 && win < MAX_WIN) {
+            let is i64 as seg = sys.fd_recv(wc_fd);
+            if (seg >= 0) {
+                let is i64 as va = sys.mmap_fd(sys.PROT_READ, seg);
+                if (va >= 0) {
+                    // drop any previous surface for this slot
+                    if (surfs[win].has == 1) {
+                        sys.munmap(surfs[win].seg_base, surfs[win].seg_pages * 4096);
+                        sys.close(surfs[win].seg_fd);
+                    }
+                    surfs[win].has = 1;
+                    surfs[win].seg_fd = seg;
+                    surfs[win].seg_base = va;
+                    surfs[win].seg_pages = m[2];
+                    surfs[win].seg_stride = (m[3] >> 32) & 0xFFFFFFFF;
+                    surfs[win].is_text = m[3] & 1;
+                    needs_compose = 1;
+                } else {
+                    sys.close(seg);
+                }
+            }
+        }
+    } else if (m[0] == cp.MSG_WC_DETACH_SURFACE) {
+        let is i64 as win = m[1];
+        if (win >= 0 && win < MAX_WIN && surfs[win].has == 1) {
+            sys.munmap(surfs[win].seg_base, surfs[win].seg_pages * 4096);
+            sys.close(surfs[win].seg_fd);
+            surfs[win].has = 0;
+            surfs[win].seg_base = 0;
+        }
     } else if (m[0] == cp.MSG_WC_DAMAGE) {
         if (m[1] < 0) { damage_all(); }
         else { damage(m[1], m[2], cp.unpack_w(m[3]), cp.unpack_h(m[3])); }
