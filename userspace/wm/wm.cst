@@ -17,6 +17,7 @@
 use "../../../Caustic/std/causticos/font.cst" as font;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
 
 // ---- layout & palette ----
 let is i64 as MAX_WIN  with imut = 8;
@@ -91,9 +92,13 @@ let is i64 as clock_len with mut = 0;
 let is i64 as clock_next with mut = 0;               // next wall read (monotonic ns)
 
 // ---- input ----
-let is i64 as kbd_fd with mut = 0;
-let is i64 as mouse_fd with mut = 0;
-let is i64 as tab_fd with mut = 0;     // virtio tablet: absolute position, no grab
+// Input no longer comes from a device fd: the COMPOSITOR (our parent) owns the
+// keyboard/mouse/tablet, normalises the raw events and forwards MSG_CP_* down
+// the CMD channel (fd 4). The WM just reads that channel and applies policy.
+let is i64 as cmd_fd with mut = 0;     // compositor → WM (normalised input)
+let is i64 as cmd_fill with mut = 0;   // partial-message accumulator state
+let is [32]u8 as cmd_acc with mut;     // partial-message bytes
+let is i64 as have_input with mut = 0; // 1 once SCR_READY arrived (pointer drawn)
 let is i64 as mod_alt with mut = 0;
 let is i64 as mod_super with mut = 0;
 let is i64 as mx with mut = 0;
@@ -664,7 +669,7 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
     }
     draw_taskbar();                                  // bar sits above windows, below cursor
     // the cursor rides on top of everything (contextual shape, clipped)
-    if (mouse_fd >= 0 || tab_fd >= 0) {
+    if (have_input == 1) {
         draw_cursor_at(mx, my);
     }
     return;
@@ -1020,17 +1025,6 @@ fn handle_key(sc as i64, flags as i64) as void {
     return;
 }
 
-fn drain_kbd() as void {
-    let is [64]u8 as evs;
-    let is i64 as n = syscall(10, kbd_fd, cast(i64, &evs[0]), 64);
-    if (n < 2) { return; }
-    let is i64 as k with mut = 0;
-    while (k + 1 < n) {
-        handle_key(cast(i64, evs[k]), cast(i64, evs[k + 1]));
-        k = k + 2;
-    }
-    return;
-}
 
 // ---- maximize / snap / restore ----
 fn set_geometry(i as i64, nx as i64, ny as i64, nw as i64, nh as i64) as void {
@@ -1311,56 +1305,56 @@ fn apply_motion() as void {
     return;
 }
 
-fn drain_mouse() as void {
-    let is [64]u8 as recs;
-    let is i64 as n = syscall(10, mouse_fd, cast(i64, &recs[0]), 64);
-    if (n < 4) { return; }
-    let is i64 as k with mut = 0;
-    while (k + 3 < n) {
-        let is i64 as dx with mut = cast(i64, recs[k]);
-        if (dx >= 128) { dx = dx - 256; }
-        let is i64 as dy with mut = cast(i64, recs[k + 1]);
-        if (dy >= 128) { dy = dy - 256; }
-        mx = mx + dx;
-        my = my - dy;                                 // PS/2 dy is positive-up
-        if (mx < 0) { mx = 0; }
-        if (my < 0) { my = 0; }
-        if (mx >= scr_w) { mx = scr_w - 1; }
-        if (my >= scr_h) { my = scr_h - 1; }
-        let is i64 as nb = cast(i64, recs[k + 2]);
-        if (nb != mbuttons) { handle_buttons(mbuttons, nb); }
-        let is i64 as wh with mut = cast(i64, recs[k + 3]);
-        if (wh >= 128) { wh = wh - 256; }
-        if (wh != 0 && nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_WHEEL, wh); }
-        k = k + 4;
-    }
+// Apply one normalised pointer event from the compositor (absolute position +
+// button mask). Run a button transition through the device path's hit-test,
+// then reconcile drag geometry + cursor damage (apply_motion).
+fn handle_ptr(nx as i64, ny as i64, nb as i64) as void {
+    mx = nx; my = ny;
+    if (nb != mbuttons) { handle_buttons(mbuttons, nb); }
     apply_motion();
     return;
 }
 
-// Tablet records carry ABSOLUTE 0..32767 positions — the cursor lands
-// exactly where the host pointer is over the VM window, no grab anywhere.
-fn drain_tablet() as void {
-    let is [64]u8 as recs;
-    let is i64 as n = syscall(10, tab_fd, cast(i64, &recs[0]), 64);
-    if (n < 8) { return; }
-    let is i64 as k with mut = 0;
-    while (k + 7 < n) {
-        let is i64 as ax = cast(i64, recs[k]) | (cast(i64, recs[k + 1]) << 8);
-        let is i64 as ay = cast(i64, recs[k + 2]) | (cast(i64, recs[k + 3]) << 8);
-        mx = ax * scr_w / 32768;
-        my = ay * scr_h / 32768;
-        if (mx >= scr_w) { mx = scr_w - 1; }
-        if (my >= scr_h) { my = scr_h - 1; }
-        let is i64 as nb = cast(i64, recs[k + 4]);
-        if (nb != mbuttons) { handle_buttons(mbuttons, nb); }
-        let is i64 as wh with mut = cast(i64, recs[k + 5]);
-        if (wh >= 128) { wh = wh - 256; }
-        if (wh != 0 && nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_WHEEL, wh); }
-        k = k + 8;
+// Drain everything readable on the CMD channel (compositor → WM). One sweep
+// applies every queued input event; SCR_READY (sent once, before any input)
+// fixes the screen geometry and unblocks the cursor. Returns -1 if the channel
+// closed (the compositor died) so the caller can exit.
+fn service_cmd() as i64 {
+    let is [4]i64 as m;
+    let is i64 as guard with mut = 0;
+    while (1 == 1) {
+        let is i64 as r = cp.msg_read(cmd_fd, &cmd_fill, cast(*u8, &cmd_acc[0]), &m[0]);
+        if (r < 0) { return 0 - 1; }                 // compositor gone
+        if (r == 0) { return 0; }                    // partial — wait for more
+        if (m[0] == cp.MSG_CP_SCR_READY) {
+            scr_w = m[1];
+            scr_h = m[2];
+            work_h = scr_h - BAR_H;
+            have_input = 1;
+        } else if (m[0] == cp.MSG_CP_KEY) {
+            handle_key(m[3], cp.key_devflags(m[2]));  // route by scancode (c word)
+        } else if (m[0] == cp.MSG_CP_PTR) {
+            handle_ptr(m[1], m[2], m[3]);
+        } else if (m[0] == cp.MSG_CP_WHEEL) {
+            if (nz > 0) { forward_mouse(zord[0], wmp.MSG_MOUSE_WHEEL, m[1]); }
+        } else if (m[0] == cp.MSG_CP_SHUTDOWN_REQ) {
+            if (shutdown_state == 0) {
+                shutdown_state = 1;
+                shutdown_deadline = sys.time_ns() + 2000000000;   // 2 s grace
+                let is i64 as si with mut = 0;
+                while (si < MAX_WIN) { if (wins[si].used == 1) { wins[si].pend_close = 1; } si = si + 1; }
+            }
+        }
+        guard = guard + 1;
+        if (guard > 128) { return 0; }               // fairness: bound one sweep's burst
+        let is [3]i64 as pe2;                         // non-blocking re-check
+        pe2[0] = cmd_fd;
+        pe2[1] = sys.POLL_READABLE;
+        pe2[2] = 0;
+        sys.poll(&pe2[0], 1, 0);
+        if ((pe2[2] & sys.POLL_READABLE) == 0) { return 0; }
     }
-    apply_motion();
-    return;
+    return 0;
 }
 
 // ============================================================
@@ -1397,10 +1391,13 @@ fn main() as i32 {
     //   fd 3 = framebuffer surface, fd 4 = keyboard, fd 5 = mouse, fd 6 = tablet.
     // We just adopt those keys (no dev_open/gfx.open). The framebuffer is the
     // surface_info + mmap_fd half of gfx.open(), starting from the passed fd.
-    let is i64 as FB_FD    with imut = 3;
-    let is i64 as KBD_FD   with imut = 4;
-    let is i64 as MOUSE_FD with imut = 5;
-    let is i64 as TAB_FD   with imut = 6;
+    // INPUT no longer arrives on device fds: the compositor (our parent) owns
+    // the keyboard/mouse/tablet and forwards normalised MSG_CP_* events down
+    // the CMD channel (fd 4). The WC channel (fd 5) is the WM → compositor scene
+    // path (used from M3 on; held open here so the link exists end to end).
+    let is i64 as FB_FD  with imut = 3;
+    let is i64 as CMD_FD with imut = 4;
+    let is i64 as WC_FD  with imut = 5;
 
     let is [5]i64 as fbinfo;     // {width, height, pitch, bpp_bytes, format}
     if (sys.surface_info(FB_FD, cast(*u8, &fbinfo[0])) != 0) {
@@ -1420,12 +1417,11 @@ fn main() as i32 {
     fb_fd = FB_FD;
     work_h = scr_h - BAR_H;
 
-    kbd_fd = KBD_FD;
-    mouse_fd = MOUSE_FD;
-    tab_fd = TAB_FD;
-    if (kbd_fd < 0) { sys.write_serial(cast(*u8, "wm: no keyboard\n"), 16); }
-    if (mouse_fd < 0) { sys.write_serial(cast(*u8, "wm: no mouse\n"), 13); }
-    if (tab_fd >= 0) { sys.write_serial(cast(*u8, "wm: tablet (absolute, no grab)\n"), 31); }
+    cmd_fd = CMD_FD;
+    cmd_fill = 0;
+    // SCR_READY (from the compositor) re-confirms the geometry and unblocks the
+    // cursor; we already have it from surface_info, so the desktop draws now.
+    have_input = 1;
 
     wmp.log_kv(cast(*u8, "wm: ready w="), 12, scr_w);
     wmp.log_kv(cast(*u8, "wm: ready h="), 12, scr_h);
@@ -1459,22 +1455,13 @@ fn main() as i32 {
 
     while (1 == 1) {
         // -- build the poll set --
+        // The single device-side fd is the compositor's CMD channel: all input
+        // arrives here as normalised MSG_CP_* events. A CLOSED CMD channel means
+        // the compositor died — we exit.
         let is i64 as n with mut = 0;
-        let is i64 as kbd_e with mut = 0 - 1;
-        let is i64 as mouse_e with mut = 0 - 1;
-        let is i64 as tab_e with mut = 0 - 1;
-        if (kbd_fd >= 0) {
-            pe[n*3+0] = kbd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
-            pmap[n] = 0 - 1; kbd_e = n; n = n + 1;
-        }
-        if (mouse_fd >= 0) {
-            pe[n*3+0] = mouse_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
-            pmap[n] = 0 - 1; mouse_e = n; n = n + 1;
-        }
-        if (tab_fd >= 0) {
-            pe[n*3+0] = tab_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
-            pmap[n] = 0 - 1; tab_e = n; n = n + 1;
-        }
+        let is i64 as cmd_e with mut = 0 - 1;
+        pe[n*3+0] = cmd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        pmap[n] = 0 - 1; cmd_e = n; n = n + 1;
         // READABLE always; WRITABLE only while a control message is queued
         // for that window. An empty channel is permanently writable, so
         // asking for WRITABLE unconditionally turns the poll into a busy
@@ -1513,10 +1500,20 @@ fn main() as i32 {
             e = e + 1;
         }
 
-        // -- inputs --
-        if (kbd_e >= 0 && (pe[kbd_e*3+2] & sys.POLL_READABLE) != 0) { drain_kbd(); }
-        if (mouse_e >= 0 && (pe[mouse_e*3+2] & sys.POLL_READABLE) != 0) { drain_mouse(); }
-        if (tab_e >= 0 && (pe[tab_e*3+2] & sys.POLL_READABLE) != 0) { drain_tablet(); }
+        // -- input: drain normalised events off the compositor's CMD channel --
+        if (cmd_e >= 0) {
+            let is i64 as cgot = pe[cmd_e*3+2];
+            if ((cgot & sys.POLL_READABLE) != 0) {
+                if (service_cmd() < 0) {
+                    sys.write_serial(cast(*u8, "wm: compositor gone\n"), 20);
+                    return 0;
+                }
+            }
+            if ((cgot & (sys.POLL_CLOSED | sys.POLL_ERROR)) != 0) {
+                sys.write_serial(cast(*u8, "wm: compositor gone\n"), 20);
+                return 0;
+            }
+        }
 
         // -- client channels --
         e = 0;
@@ -1555,16 +1552,12 @@ fn main() as i32 {
                 }
                 wd = wd + 1;
             }
-            // -- shutdown: hardware power button → ask every window to close
-            // (CLOSE_REQ, which terminals propagate to their child app), wait for
-            // them to exit (the loop reaps them → nz drops), then paint the notice
-            // and power off. Wedged clients are forced out after the deadline.
-            if (shutdown_state == 0 && sys.power_pending() == 1) {
-                shutdown_state = 1;
-                shutdown_deadline = now + 2000000000;       // 2 s grace
-                let is i64 as si with mut = 0;
-                while (si < MAX_WIN) { if (wins[si].used == 1) { wins[si].pend_close = 1; } si = si + 1; }
-            }
+            // -- shutdown: the COMPOSITOR watches the hardware power button and
+            // sends MSG_CP_SHUTDOWN_REQ; service_cmd flips shutdown_state and asks
+            // every window to close (CLOSE_REQ, which terminals propagate to their
+            // child app). We wait for them to exit (the loop reaps them → nz drops),
+            // then paint the notice and power off. Wedged clients are forced out
+            // after the grace deadline.
             if (shutdown_state == 1 && (nz == 0 || now >= shutdown_deadline)) {
                 shutdown_screen();
                 sys.poweroff();                             // kernel: kill stragglers, sync, halt APs, ACPI

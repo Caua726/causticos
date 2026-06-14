@@ -1,44 +1,52 @@
-// compositor.cst — the CausticOS compositor, MARCO 1 (dumb launcher).
+// compositor.cst — the CausticOS compositor.
 //
-// This is the new /init. Today the window manager (wm.cst) is monolithic: it
-// opens the framebuffer + input devices itself, composites, and runs policy.
-// The compositor/WM split peels that apart in stages; M1 is the smallest, least
-// risky step — it ONLY moves device ownership up one level:
+// This is the /init. The compositor owns the HARDWARE: the framebuffer and the
+// raw input devices. The window manager (wm.cse, spawned as our child) owns
+// POLICY: focus, geometry, z-order, the taskbar. They talk over two channels
+// (userspace/lib/compo_proto.cst):
 //
 //   kernel → compositor (/init) → wm → wterm → app
 //
-// The compositor opens the four hardware device keys it will eventually own
-// (framebuffer + keyboard + mouse + tablet), then spawns /wm.cse and HANDS THOSE
-// FDS to the WM via spawn fdacts at FIXED fd numbers. The WM does everything
-// exactly as before — composition, input, policy — except its device fds now
-// arrive as inherited keys instead of dev_open()/gfx.open() calls. No new
-// protocol, no input normalization, no compositor-side composition yet. This
-// just proves the WM can run as a child of the compositor over passed devices.
+// MARCO 2 — the compositor assumes INPUT. It opens DEV_KEYBOARD/MOUSE/TABLET,
+// runs the SYS_POLL pump over them, NORMALISES the raw events (scancode → key
+// transition with modifier tracking; mouse deltas → absolute cursor; tablet
+// absolutes → cursor; buttons; wheel) and forwards MSG_CP_* down the CMD
+// channel to the WM. The WM no longer touches an input device — it reads its
+// input from the CMD channel. The framebuffer fd is still handed to the WM
+// (fd 3): until M3 the WM composes; M3 moves composition up here.
 //
-// FIXED fd map handed to the WM (must match wm.cst's FB_FD/KBD_FD/...):
+// Fd map handed to the WM (must match wm.cst's FB_FD/CMD_FD/WC_FD):
 //   fd 3 = framebuffer surface (DEV_FB)
-//   fd 4 = keyboard            (DEV_KEYBOARD)
-//   fd 5 = mouse               (DEV_MOUSE)
-//   fd 6 = tablet              (DEV_TABLET)
-//
-// After the spawn the compositor is a dumb launcher: it just waits on the WM so
-// it stays alive and reaps it if it ever exits. Later marcos turn this loop into
-// the real input-pump + compositor.
+//   fd 4 = CMD channel  (compositor → WM, normalised input)
+//   fd 5 = WC  channel  (WM → compositor, the scene)
 
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto.cst" as wmp;
-
-// Child-side fd numbers the WM expects (see the comment block above).
-let is i64 as WM_FB_FD    with imut = 3;
-let is i64 as WM_KBD_FD   with imut = 4;
-let is i64 as WM_MOUSE_FD with imut = 5;
-let is i64 as WM_TAB_FD   with imut = 6;
+use "../lib/compo_proto.cst" as cp;
 
 let is i64 as IMG_CAP with imut = 4194304;   // 4 MiB ceiling (matches SPAWN_IMG_MAX)
 
+// ---- owned hardware ----
+let is i64 as fb_fd    with mut = 0;
+let is i64 as kbd_fd   with mut = 0;
+let is i64 as mouse_fd with mut = 0;
+let is i64 as tab_fd   with mut = 0;
+let is i64 as cmd_fd   with mut = 0;         // compositor side of the CMD channel
+let is i64 as wc_fd    with mut = 0;         // compositor side of the WC channel
+
+// ---- screen geometry (from surface_info) ----
+let is i64 as scr_w with mut = 0;
+let is i64 as scr_h with mut = 0;
+
+// ---- cursor / button state (the compositor owns pointer normalisation) ----
+let is i64 as mx with mut = 0;
+let is i64 as my with mut = 0;
+let is i64 as mbuttons with mut = 0;
+
+// ---- shutdown: 1 once we've told the WM the power button was pressed ----
+let is i64 as shutdown_sent with mut = 0;
+
 // load_image — read /wm.cse off the FAT32 disk into a fresh anonymous mapping.
-// Mirrors wterm.cst's read_file: size the file, allocate page-rounded, slurp it.
-// Returns the image VA (0 on failure) and writes the byte length to *out_len.
 fn load_image(path as *u8, out_len as *i64) as i64 {
     *out_len = 0;
     let is i64 as fd = sys.open_read(path);
@@ -56,14 +64,117 @@ fn load_image(path as *u8, out_len as *i64) as i64 {
     return va;
 }
 
+// Send one CMD message to the WM, riding out a transiently-full channel. Input
+// is human-rate so a brief retry loop is correct (and the WM drains promptly).
+fn cmd_send(mtype as i64, a as i64, b as i64, c as i64) as void {
+    cp.msg_send(cmd_fd, mtype, a, b, c);
+    return;
+}
+
+// ---- input normalisation ----
+// modifier tracking lives here now (the WM used to do it). Bit 0 = alt,
+// bit 1 = super; carried in MSG_CP_KEY's b word for a future keymap-in-WM.
+let is i64 as mod_alt   with mut = 0;
+let is i64 as mod_super with mut = 0;
+
+fn clamp_cursor() as void {
+    if (mx < 0) { mx = 0; }
+    if (my < 0) { my = 0; }
+    if (mx >= scr_w) { mx = scr_w - 1; }
+    if (my >= scr_h) { my = scr_h - 1; }
+    return;
+}
+
+fn handle_key(sc as i64, devflags as i64) as void {
+    let is i64 as pressed = devflags & 1;
+    let is i64 as ext = (devflags >> 1) & 1;
+    if (sc == 0x38) { mod_alt = pressed; }
+    if (ext == 1 && sc == 0x5B) { mod_super = pressed; }
+    let is i64 as mods = mod_alt | (mod_super << 1);
+    // keysym is left 0 for now (keymap-in-WM deferred); the WM routes by the
+    // raw scancode in `c`, which is all wterm and friends consume.
+    cmd_send(cp.MSG_CP_KEY, 0, cp.key_b(mods, pressed, ext), sc);
+    return;
+}
+
+fn pump_kbd() as void {
+    let is [64]u8 as evs;
+    let is i64 as n = syscall(10, kbd_fd, cast(i64, &evs[0]), 64);
+    if (n < 2) { return; }
+    let is i64 as k with mut = 0;
+    while (k + 1 < n) {
+        handle_key(cast(i64, evs[k]), cast(i64, evs[k + 1]));
+        k = k + 2;
+    }
+    return;
+}
+
+fn pump_mouse() as void {
+    let is [64]u8 as recs;
+    let is i64 as n = syscall(10, mouse_fd, cast(i64, &recs[0]), 64);
+    if (n < 4) { return; }
+    let is i64 as k with mut = 0;
+    let is i64 as moved with mut = 0;
+    while (k + 3 < n) {
+        let is i64 as dx with mut = cast(i64, recs[k]);
+        if (dx >= 128) { dx = dx - 256; }
+        let is i64 as dy with mut = cast(i64, recs[k + 1]);
+        if (dy >= 128) { dy = dy - 256; }
+        mx = mx + dx;
+        my = my - dy;                                 // PS/2 dy is positive-up
+        clamp_cursor();
+        moved = 1;
+        let is i64 as nb = cast(i64, recs[k + 2]);
+        if (nb != mbuttons) {
+            mbuttons = nb;
+            cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons);
+            moved = 0;
+        }
+        let is i64 as wh with mut = cast(i64, recs[k + 3]);
+        if (wh >= 128) { wh = wh - 256; }
+        if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, mx, my); }
+        k = k + 4;
+    }
+    if (moved == 1) { cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons); }
+    return;
+}
+
+// Tablet records carry ABSOLUTE 0..32767 positions — the cursor lands exactly
+// where the host pointer is over the VM window, no grab anywhere.
+fn pump_tablet() as void {
+    let is [64]u8 as recs;
+    let is i64 as n = syscall(10, tab_fd, cast(i64, &recs[0]), 64);
+    if (n < 8) { return; }
+    let is i64 as k with mut = 0;
+    let is i64 as moved with mut = 0;
+    while (k + 7 < n) {
+        let is i64 as ax = cast(i64, recs[k]) | (cast(i64, recs[k + 1]) << 8);
+        let is i64 as ay = cast(i64, recs[k + 2]) | (cast(i64, recs[k + 3]) << 8);
+        mx = ax * scr_w / 32768;
+        my = ay * scr_h / 32768;
+        clamp_cursor();
+        moved = 1;
+        let is i64 as nb = cast(i64, recs[k + 4]);
+        if (nb != mbuttons) {
+            mbuttons = nb;
+            cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons);
+            moved = 0;
+        }
+        let is i64 as wh with mut = cast(i64, recs[k + 5]);
+        if (wh >= 128) { wh = wh - 256; }
+        if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, mx, my); }
+        k = k + 8;
+    }
+    if (moved == 1) { cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons); }
+    return;
+}
+
 fn main() as i32 {
-    // 1. Take ownership of the hardware device keys. DEV_FB becomes a surface
-    //    fd; the input classes become event-stream fds. We don't touch them
-    //    here (no surface_info/mmap, no reads) — they're just handed downward.
-    let is i64 as fb_fd    = sys.dev_open(sys.DEV_FB, 0, 0);
-    let is i64 as kbd_fd   = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
-    let is i64 as mouse_fd = sys.dev_open(sys.DEV_MOUSE, 0, 0);
-    let is i64 as tab_fd   = sys.dev_open(sys.DEV_TABLET, 0, 0);
+    // 1. Take ownership of the hardware device keys.
+    fb_fd    = sys.dev_open(sys.DEV_FB, 0, 0);
+    kbd_fd   = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
+    mouse_fd = sys.dev_open(sys.DEV_MOUSE, 0, 0);
+    tab_fd   = sys.dev_open(sys.DEV_TABLET, 0, 0);
     if (fb_fd < 0) {
         sys.write_serial(cast(*u8, "comp: no framebuffer\n"), 21);
         return 1;
@@ -72,60 +183,101 @@ fn main() as i32 {
     if (mouse_fd < 0) { sys.write_serial(cast(*u8, "comp: no mouse\n"), 15); }
     if (tab_fd < 0)   { sys.write_serial(cast(*u8, "comp: no tablet\n"), 16); }
 
-    // 2. Load the WM image from disk.
+    // 2. Screen geometry (the WM needs it before any input, to clamp/lay out).
+    let is [5]i64 as fbinfo;     // {width, height, pitch, bpp_bytes, format}
+    if (sys.surface_info(fb_fd, cast(*u8, &fbinfo[0])) != 0) {
+        sys.write_serial(cast(*u8, "comp: no surface info\n"), 22);
+        return 1;
+    }
+    scr_w = fbinfo[0];
+    scr_h = fbinfo[1];
+    mx = scr_w / 2;
+    my = scr_h / 2;
+
+    // 3. The two channels. channel_create writes [a, b]; we keep our side and
+    //    hand the WM its side at a fixed fd. CMD: we write input → WM reads.
+    //    WC: WM writes the scene → we read (used from M3 on).
+    let is [2]i64 as cmd_ch;
+    let is [2]i64 as wc_ch;
+    if (sys.channel_create(&cmd_ch[0]) != 0) {
+        sys.write_serial(cast(*u8, "comp: no cmd chan\n"), 18);
+        return 1;
+    }
+    if (sys.channel_create(&wc_ch[0]) != 0) {
+        sys.write_serial(cast(*u8, "comp: no wc chan\n"), 17);
+        return 1;
+    }
+    cmd_fd = cmd_ch[0];                  // compositor writes input here
+    let is i64 as cmd_wm = cmd_ch[1];    // WM reads input here (its fd 4)
+    wc_fd = wc_ch[0];                    // compositor reads the scene here
+    let is i64 as wc_wm = wc_ch[1];      // WM writes the scene here (its fd 5)
+
+    // 4. Load + spawn the WM, installing fb / CMD / WC at their fixed slots.
     let is i64 as img_len with mut = 0;
     let is i64 as img = load_image(cast(*u8, "/wm.cse"), &img_len);
     if (img == 0) {
         sys.write_serial(cast(*u8, "comp: /wm.cse missing\n"), 22);
         return 1;
     }
-
-    // 3. Spawn the WM, installing each device fd at its FIXED child slot via
-    //    fdacts (pairs of {child_fd, src_fd}). Only the devices we actually
-    //    have are passed; a missing input class is simply not installed (the WM
-    //    already tolerates a negative input fd, but here the slot just stays
-    //    empty — the WM's KBD_FD/... constants point at it regardless).
-    let is [8]i64 as acts;     // up to 4 pairs
-    let is i64 as nacts with mut = 0;
-    acts[nacts * 2 + 0] = WM_FB_FD;    acts[nacts * 2 + 1] = fb_fd;    nacts = nacts + 1;
-    if (kbd_fd >= 0) {
-        acts[nacts * 2 + 0] = WM_KBD_FD;   acts[nacts * 2 + 1] = kbd_fd;   nacts = nacts + 1;
-    }
-    if (mouse_fd >= 0) {
-        acts[nacts * 2 + 0] = WM_MOUSE_FD; acts[nacts * 2 + 1] = mouse_fd; nacts = nacts + 1;
-    }
-    if (tab_fd >= 0) {
-        acts[nacts * 2 + 0] = WM_TAB_FD;   acts[nacts * 2 + 1] = tab_fd;   nacts = nacts + 1;
-    }
-
+    let is [6]i64 as acts;     // 3 pairs {child_fd, src_fd}
+    acts[0] = cp.CP_FB_FD;  acts[1] = fb_fd;
+    acts[2] = cp.CP_CMD_FD; acts[3] = cmd_wm;
+    acts[4] = cp.CP_WC_FD;  acts[5] = wc_wm;
     let is i64 as pid = sys.spawn(cast(*u8, img), img_len,
-                                  cast(*u8, &acts[0]), nacts, cast(*u8, 0), 0);
+                                  cast(*u8, &acts[0]), 3, cast(*u8, 0), 0);
+    sys.close(cmd_wm);                    // the WM owns its inherited copies now
+    sys.close(wc_wm);
     if (pid < 0) {
         wmp.log_kv(cast(*u8, "comp: spawn wm FAIL rc="), 23, pid);
         return 1;
     }
     wmp.log_kv(cast(*u8, "comp: launched wm pid="), 22, pid);
 
-    // The compositor keeps the device fds open (it owns them; the child got its
-    // own inherited copies). We don't close them — later marcos read/compose
-    // through them. For now we just stay alive as the WM's parent.
+    // 5. Announce the screen geometry BEFORE pumping any input.
+    cmd_send(cp.MSG_CP_SCR_READY, scr_w, scr_h, 0);
 
-    // 4. Dumb launcher: block on the WM so we remain its live parent and reap it
-    //    when it exits. sys.wait() is BOUNDED (the kernel's proc_wait polls for a
-    //    zombie for 5 s, then returns E_AGAIN so a wedged child can't pin the
-    //    waiter forever) — for a long-lived WM that's not an exit, it's "still
-    //    running", so we loop and wait again. Only a real exit code (>= 0) or a
-    //    hard error (a negative that ISN'T E_AGAIN) ends the launcher.
+    // 6. The input pump. Poll the input devices (and the CMD channel, so a dead
+    //    WM unblocks us → reap → exit). On readiness, normalise + forward.
+    let is [15]i64 as pe;                 // up to 5 entries × 3 (kbd/mouse/tab/cmd)
     let is i64 as st with mut = 0;
     while (1 == 1) {
-        let is i64 as rc = sys.wait(pid, &st);
-        if (rc == sys.E_AGAIN) { }                  // WM still alive — keep waiting
-        else if (rc < 0) {
-            wmp.log_kv(cast(*u8, "comp: wait err rc="), 18, rc);
-            return 1;
-        } else {
-            wmp.log_kv(cast(*u8, "comp: wm exited st="), 19, rc);
+        let is i64 as n with mut = 0;
+        let is i64 as kbd_e   with mut = 0 - 1;
+        let is i64 as mouse_e with mut = 0 - 1;
+        let is i64 as tab_e   with mut = 0 - 1;
+        let is i64 as cmd_e   with mut = 0 - 1;
+        if (kbd_fd >= 0) {
+            pe[n*3+0] = kbd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            kbd_e = n; n = n + 1;
+        }
+        if (mouse_fd >= 0) {
+            pe[n*3+0] = mouse_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            mouse_e = n; n = n + 1;
+        }
+        if (tab_fd >= 0) {
+            pe[n*3+0] = tab_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            tab_e = n; n = n + 1;
+        }
+        pe[n*3+0] = cmd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        cmd_e = n; n = n + 1;
+
+        sys.poll(&pe[0], n, 100000000);   // 100 ms tick — also polls power_pending
+
+        if (kbd_e >= 0 && (pe[kbd_e*3+2] & sys.POLL_READABLE) != 0) { pump_kbd(); }
+        if (mouse_e >= 0 && (pe[mouse_e*3+2] & sys.POLL_READABLE) != 0) { pump_mouse(); }
+        if (tab_e >= 0 && (pe[tab_e*3+2] & sys.POLL_READABLE) != 0) { pump_tablet(); }
+
+        // CMD channel closed → the WM died. Reap it and exit.
+        if (cmd_e >= 0 && (pe[cmd_e*3+2] & (sys.POLL_CLOSED | sys.POLL_ERROR)) != 0) {
+            sys.wait(pid, &st);
+            wmp.log_kv(cast(*u8, "comp: wm exited st="), 19, st);
             return 0;
+        }
+
+        // hardware power button → tell the WM once (M6 acts on it).
+        if (shutdown_sent == 0 && sys.power_pending() == 1) {
+            cmd_send(cp.MSG_CP_SHUTDOWN_REQ, 0, 0, 0);
+            shutdown_sent = 1;
         }
     }
     return 0;

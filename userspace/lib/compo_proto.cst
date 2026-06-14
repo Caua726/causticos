@@ -1,0 +1,146 @@
+// compo_proto.cst — the wire protocol between the COMPOSITOR and the WM.
+//
+// The compositor/WM split peels the monolithic window manager apart. The
+// compositor (the /init) owns the hardware — the framebuffer and the raw
+// input devices — and the WM owns POLICY (focus, geometry, z-order, the
+// taskbar). They talk over TWO channels, each carrying the same fixed 32-byte
+// messages (4 x i64: {mtype, a, b, c}) the WM↔client protocol already uses, so
+// the kernel's POLL_WRITE_UNIT (64B) makes a poll-then-write of one message
+// never split. 1024B channel buffer = 32 messages in flight.
+//
+//   CMD channel (compositor → WM): normalised INPUT events. The compositor
+//   reads raw scancodes / mouse deltas / tablet absolutes off the devices,
+//   normalises them (modifier tracking, cursor position, button/wheel state),
+//   and forwards MSG_CP_* here. The WM no longer touches an input device.
+//
+//   WC channel (WM → compositor): SCENE + DAMAGE descriptions and SURFACE
+//   handoffs. The WM never touches the framebuffer; it describes WHAT to draw
+//   (a back-to-front snapshot of windows + decorations) and the compositor
+//   composes it. Surface/decoration segments arrive out-of-band via fd_send,
+//   each immediately preceding its MSG_WC_*_SURFACE.
+//
+// Fd map handed to the WM at spawn (fdacts), see compositor.cst:
+//   fd 3 = framebuffer surface (DEV_FB)         [used by the WM until M3]
+//   fd 4 = CMD channel  (compositor → WM)       [WM reads input here]
+//   fd 5 = WC  channel  (WM → compositor)       [WM writes the scene here]
+
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+// Child-side fd numbers (must match compositor.cst's spawn fdacts).
+let is i64 as CP_FB_FD  with imut = 3;    // framebuffer surface
+let is i64 as CP_CMD_FD with imut = 4;    // compositor → WM (input)
+let is i64 as CP_WC_FD  with imut = 5;    // WM → compositor (scene)
+
+let is i64 as MSG_BYTES with imut = 32;
+
+// ---- compositor → WM (CMD channel): normalised input ----
+// MSG_CP_SCR_READY{a=width, b=height}: sent ONCE, before any input, so the WM
+//   learns the screen geometry it needs to clamp the cursor / lay windows out.
+let is i64 as MSG_CP_SCR_READY with imut = 1;
+// MSG_CP_KEY{a=keysym, b=mods|(pressed<<8)|(extended<<9), c=scancode}: one key
+//   transition. The WM routes by SCANCODE (campo c) exactly as it did from the
+//   raw device — keysym/mods are carried for a future keymap-in-WM but the WM
+//   (and every client) still consumes the scancode (architecture.md §8).
+let is i64 as MSG_CP_KEY with imut = 2;
+// MSG_CP_PTR{a=x, b=y, c=buttons}: absolute cursor position + button mask. The
+//   compositor owns cursor motion (deltas → abs for the mouse, abs passthrough
+//   for the tablet) and clamps to the screen; the WM just consumes x/y/buttons.
+let is i64 as MSG_CP_PTR with imut = 3;
+// MSG_CP_WHEEL{a=delta, b=x, c=y}: a wheel notch at the current cursor.
+let is i64 as MSG_CP_WHEEL with imut = 4;
+// MSG_CP_SHUTDOWN_REQ: the hardware power button was pressed. The WM should
+//   ask its clients to close, then reply MSG_WC_SHUTDOWN.
+let is i64 as MSG_CP_SHUTDOWN_REQ with imut = 5;
+
+// ---- WM → compositor (WC channel): the scene ----
+// MSG_WC_SCENE{a=count}: begins a full back-to-front snapshot; followed by
+//   `count` MSG_WC_SCENE_ENTRY messages, top-of-stack LAST (paint order). A
+//   scene replaces the previous one entirely (snapshot, not a delta).
+let is i64 as MSG_WC_SCENE with imut = 16;
+// MSG_WC_SCENE_ENTRY{a=win_id|(flags<<32), b=pack(x,y), c=pack(w,h)}: one
+//   window's frame placement. flags bit0 = focused. (x,y) = FRAME corner,
+//   (w,h) = CONTENT size (the compositor draws border/titlebar from its own
+//   decoration surface, see MSG_WC_DEC_SURFACE).
+let is i64 as MSG_WC_SCENE_ENTRY with imut = 17;
+// MSG_WC_DAMAGE{a=x, b=y, c=pack(w,h)}: a screen rect to recompose. a<0 (a==-1)
+//   means full-screen.
+let is i64 as MSG_WC_DAMAGE with imut = 18;
+// MSG_WC_CURSOR{a=shape, b=x, c=y}: the cursor's contextual shape + position.
+let is i64 as MSG_WC_CURSOR with imut = 19;
+// MSG_WC_ATTACH_SURFACE{a=win_id, b=npages, c=is_text|(stride<<32)}: a client's
+//   content segment, preceded by fd_send of the seg fd. is_text=1 → cell grid.
+let is i64 as MSG_WC_ATTACH_SURFACE with imut = 20;
+// MSG_WC_DETACH_SURFACE{a=win_id}: drop a window's content segment.
+let is i64 as MSG_WC_DETACH_SURFACE with imut = 21;
+// MSG_WC_DEC_SURFACE{a=win_id, b=npages, c=cols|(rows<<32)}: a per-window
+//   decoration segment (a cell grid: char|fg<<8|bg<<32), preceded by fd_send.
+//   win_id == DEC_TASKBAR_ID is the global taskbar strip.
+let is i64 as MSG_WC_DEC_SURFACE with imut = 22;
+// MSG_WC_SHUTDOWN: every client is gone (or the grace expired) — paint the
+//   notice and power off.
+let is i64 as MSG_WC_SHUTDOWN with imut = 23;
+
+// The taskbar's decoration uses this reserved win_id.
+let is i64 as DEC_TASKBAR_ID with imut = 1000000;
+
+// ---- packing helpers (geometry into one i64) ----
+fn pack_xy(x as i64, y as i64) as i64 { return ((x & 0xFFFFFFFF) << 32) | (y & 0xFFFFFFFF); }
+fn unpack_x(v as i64) as i64 { return (v >> 32) & 0xFFFFFFFF; }
+fn unpack_y(v as i64) as i64 {
+    let is i64 as y = v & 0xFFFFFFFF;
+    return y;
+}
+fn pack_wh(w as i64, h as i64) as i64 { return ((w & 0xFFFFFFFF) << 32) | (h & 0xFFFFFFFF); }
+fn unpack_w(v as i64) as i64 { return (v >> 32) & 0xFFFFFFFF; }
+fn unpack_h(v as i64) as i64 { return v & 0xFFFFFFFF; }
+
+// KEY field b: mods (low 8) | pressed<<8 | extended<<9.
+fn key_b(mods as i64, pressed as i64, ext as i64) as i64 {
+    return (mods & 0xFF) | ((pressed & 1) << 8) | ((ext & 1) << 9);
+}
+fn key_pressed(b as i64) as i64 { return (b >> 8) & 1; }
+fn key_ext(b as i64) as i64 { return (b >> 9) & 1; }
+// The raw device flags the WM's handle_key still expects: bit0 pressed, bit1 ext.
+fn key_devflags(b as i64) as i64 { return ((b >> 8) & 1) | (((b >> 9) & 1) << 1); }
+
+// SCENE_ENTRY a field: win_id (low 32) | flags<<32.
+fn entry_a(win_id as i64, flags as i64) as i64 { return (win_id & 0xFFFFFFFF) | ((flags & 0xFFFFFFFF) << 32); }
+fn entry_win(a as i64) as i64 { return a & 0xFFFFFFFF; }
+fn entry_flags(a as i64) as i64 { return (a >> 32) & 0xFFFFFFFF; }
+let is i64 as ENTRY_FOCUSED with imut = 1;
+
+// ---- raw channel I/O (same discipline as wmproto.cst) ----
+fn _wr(fd as i64, buf as i64, n as i64) as i64 { return syscall(11, fd, buf, n); }
+fn _rd(fd as i64, buf as i64, n as i64) as i64 { return syscall(10, fd, buf, n); }
+
+fn msg_write(fd as i64, m as *i64) as i64 {
+    let is i64 as sent with mut = 0;
+    while (sent < MSG_BYTES) {
+        let is i64 as w = _wr(fd, cast(i64, m) + sent, MSG_BYTES - sent);
+        if (w < 0) { return w; }
+        if (w == 0) { return sys.E_PIPE; }
+        sent = sent + w;
+    }
+    return 0;
+}
+
+fn msg_send(fd as i64, mtype as i64, a as i64, b as i64, c as i64) as i64 {
+    let is [4]i64 as m;
+    m[0] = mtype; m[1] = a; m[2] = b; m[3] = c;
+    return msg_write(fd, &m[0]);
+}
+
+// msg_read — assemble one 32-byte message from a possibly-fragmented stream.
+// `fill`/`acc` persist across calls per channel. 1 = whole message in out[];
+// 0 = partial (poll again); -1 = EOF/error. Call only when fd is READABLE.
+fn msg_read(fd as i64, fill as *i64, acc as *u8, out as *i64) as i64 {
+    let is i64 as have with mut = *fill;
+    let is i64 as r = _rd(fd, cast(i64, acc) + have, MSG_BYTES - have);
+    if (r <= 0) { return 0 - 1; }
+    have = have + r;
+    if (have < MSG_BYTES) { *fill = have; return 0; }
+    *fill = 0;
+    let is *i64 as p = cast(*i64, cast(i64, acc));
+    out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; out[3] = p[3];
+    return 1;
+}
