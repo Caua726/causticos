@@ -32,12 +32,15 @@ mkfs.fat -F 32 -n CAUSTICOS build/disk.img >/dev/null
 addf() { [ -f "$B/$2" ] && python3 scripts/fat32_add_file.py build/disk.img addfilebin "$1" "$B/$2" >/dev/null; }
 
 if [ "$MODE" = "wm" ]; then
-    addf init.cse wm.cse
+    # /init = the compositor (the launcher); it opens the devices and spawns
+    # /wm.cse, handing the device fds down via fdacts. Both must be on the disk.
+    addf init.cse compositor.cse
+    addf wm.cse wm.cse
     PROGS="wmpat wterm newterm btop echo cat ls uptime sysinfo vic guess \
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
            touch mkdir rmdir rm mv cp stat du tree find clear \
            ps free df top pager hexedit date poweroff reboot"
-    INITNAME="wm (window manager — Super+Enter opens a window, Alt+Tab cycles, Super+Q closes)"
+    INITNAME="compositor (launches the window manager — Super+Enter opens a window, Alt+Tab cycles, Super+Q closes)"
 else
     addf init.cse shell.cse
     PROGS="echo cat ls uptime sysinfo vic btop ps top free df \
