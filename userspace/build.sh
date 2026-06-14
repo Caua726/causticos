@@ -24,6 +24,7 @@ PROGS="shell echo cat ls uptime sysinfo vic wm wmpat wterm newterm guess"
 PROGS="$PROGS tr wc head tail grep rev tac uniq fold cmp seq cut sort hexdump"
 PROGS="$PROGS tee true false yes comm paste nl basename dirname expand unexpand"
 PROGS="$PROGS nproc sleep expr base64 md5sum"
+PROGS="$PROGS sed"
 PROGS="$PROGS touch mkdir rmdir rm mv cp stat du tree find clear"
 #   monitors (category D): read SYS_PROC_LIST / SYS_MEM_INFO / SYS_STATFS.
 #   ("kill" is Ctrl+C in the terminal — the wterm is the job's parent and holds
