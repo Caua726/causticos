@@ -71,6 +71,32 @@ fn _col(t as *term.Term, fg as u32) as void { term.set_color(t, fg, C_BG); }
 fn prompt(t as *term.Term) as void { _col(t, C_PROMPT); puts(t, "> "); _col(t, C_TEXT); }
 fn err(t as *term.Term, s as *u8) as void { _col(t, C_ERR); puts(t, s); _col(t, C_TEXT); }
 fn hline(t as *term.Term, ch as i64, n as i64) as void { let is i64 as i with mut = 0; while (i < n) { term.putc(t, ch); i = i + 1; } }
+
+// Reply to a TUI child's "CSI 18t" size query — and resend on resize. The
+// terminal reports its grid as ESC[8;rows;cols t on the child's stdin: the
+// in-band, no-ioctl way (the byte-stream IS the channel) for a program like
+// btop to learn and track the window size.
+fn _emit_num(buf as *u8, pos as i64, val as i64) as i64 {
+    let is i64 as v with mut = val;
+    if (v <= 0) { buf[pos] = cast(u8, 48); return pos + 1; }
+    let is [12]u8 as tmp;
+    let is i64 as nd with mut = 0;
+    while (v > 0) { tmp[nd] = cast(u8, 48 + v - (v / 10) * 10); v = v / 10; nd = nd + 1; }
+    let is i64 as k with mut = 0;
+    while (k < nd) { buf[pos + k] = tmp[nd - 1 - k]; k = k + 1; }
+    return pos + nd;
+}
+fn send_size(t as *term.Term) as void {
+    if (child_in < 0) { return; }
+    let is [40]u8 as b;
+    b[0] = cast(u8, 0x1B); b[1] = cast(u8, 0x5B); b[2] = cast(u8, 56); b[3] = cast(u8, 59);  // ESC [ 8 ;
+    let is i64 as i with mut = 4;
+    i = _emit_num(cast(*u8, &b[0]), i, t.rows);
+    b[i] = cast(u8, 59); i = i + 1;        // ';'
+    i = _emit_num(cast(*u8, &b[0]), i, t.cols);
+    b[i] = cast(u8, 116); i = i + 1;       // 't'
+    syscall(11, child_in, cast(i64, &b[0]), i);
+}
 fn _log(s as *u8) as void { sys.write_serial(s, slen(s)); }
 
 // Fold the term's accumulated dirty rect into the pending commit.
@@ -458,8 +484,8 @@ fn main() as i32 {
             let is i64 as r = syscall(10, child_out, cast(i64, &pbuf[0]), 256);
             if (r > 0) {
                 term.puts(&t, cast(*u8, &pbuf[0]), r);
+                if (t.want_size == 1) { t.want_size = 0; send_size(&t); }   // CSI 18t reply
                 show(&t);
-                sys.write_serial(cast(*u8, &pbuf[0]), r);   // headless tee
             } else {
                 child_eof(&t);
             }
@@ -497,6 +523,17 @@ fn main() as i32 {
                         if (ctrl == 1 && pressed == 1 && sc == 0x2E && child_pid != 0) {
                             term.puts(&t, "^C", 2); term.putc(&t, 0x0A); show(&t);
                             sys.kill(child_pid);
+                        }
+                        // Arrow keys → ANSI ESC[A/B/C/D on the child's stdin,
+                        // exactly like a real terminal, so a TUI reads them.
+                        else if (child_in >= 0 && pressed == 1 && ext == 1 && (sc == 0x48 || sc == 0x50 || sc == 0x4D || sc == 0x4B)) {
+                            let is [3]u8 as ek;
+                            ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
+                            if (sc == 0x48) { ek[2] = cast(u8, 65); }        // A up
+                            else if (sc == 0x50) { ek[2] = cast(u8, 66); }   // B down
+                            else if (sc == 0x4D) { ek[2] = cast(u8, 67); }   // C right
+                            else { ek[2] = cast(u8, 68); }                   // D left
+                            syscall(11, child_in, cast(i64, &ek[0]), 3);
                         }
                         // Otherwise forward the keystroke to the child's stdin
                         // (raw byte, no echo — the program echoes if it wants).
@@ -564,6 +601,7 @@ fn main() as i32 {
                     win_w = m[1];
                     win_h = m[2];
                     term.resize(&t, win_w, win_h);
+                    if (child_in >= 0) { send_size(&t); }   // tell a running TUI its new grid
                     show(&t);                          // repaint the text cursor too
                 } else if (m[0] == wmp.MSG_MOUSE_WHEEL) {
                     // wheel up (positive) = back into history, 3 lines a notch

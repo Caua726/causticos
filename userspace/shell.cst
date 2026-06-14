@@ -73,8 +73,37 @@ fn read_file(path as *u8, out_len as *i64) as *u8 {
 }
 
 // Run an external program: argv_ptr[i] = byte pointer, argv_len[i] = length
-// (argv[0] is the command). Loads /<cmd>.cse, spawns with a console channel +
-// argv, pumps its stdout to the terminal, waits.
+// Keyboard fd + modifier state, shared with run_program so a running TUI can
+// be fed keystrokes (the shell is a fullscreen terminal: it owns DEV_KEYBOARD).
+let is i64 as g_kfd with mut = 0;
+let is i64 as g_shift with mut = 0;
+let is i64 as g_ctrl with mut = 0;
+
+// Reply to a TUI child's CSI 18t query: report the grid as ESC[8;rows;cols t on
+// the child's stdin — the same in-band, no-ioctl size protocol the wterm uses.
+fn _emit_num(buf as *u8, pos as i64, val as i64) as i64 {
+    let is i64 as v with mut = val;
+    if (v <= 0) { buf[pos] = cast(u8, 48); return pos + 1; }
+    let is [12]u8 as tmp; let is i64 as nd with mut = 0;
+    while (v > 0) { tmp[nd] = cast(u8, 48 + v - (v / 10) * 10); v = v / 10; nd = nd + 1; }
+    let is i64 as k with mut = 0;
+    while (k < nd) { buf[pos + k] = tmp[nd - 1 - k]; k = k + 1; }
+    return pos + nd;
+}
+fn send_size(t as *term.Term, cin as i64) as void {
+    let is [40]u8 as b;
+    b[0] = cast(u8, 0x1B); b[1] = cast(u8, 0x5B); b[2] = cast(u8, 56); b[3] = cast(u8, 59);
+    let is i64 as i with mut = 4;
+    i = _emit_num(cast(*u8, &b[0]), i, t.rows);
+    b[i] = cast(u8, 59); i = i + 1;
+    i = _emit_num(cast(*u8, &b[0]), i, t.cols);
+    b[i] = cast(u8, 116); i = i + 1;
+    sys.write(cin, cast(*u8, &b[0]), i);
+}
+
+// (argv[0] is the command). Loads /<cmd>.cse, spawns with a stdin + stdout
+// console channel + argv, then multiplexes the child's stdout and the keyboard
+// (so a TUI like btop renders AND receives keys) until the child exits.
 fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64) as void {
     // path = "/" + argv[0] + ".cse"
     let is [128]u8 as path;
@@ -96,45 +125,72 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
         return;
     }
 
-    // console channel: child's stdout (fd 1) = channel write end.
+    // stdout channel (child fd 1) + stdin channel (child fd 0). The shell keeps
+    // the read end of stdout (fds[0]) and the write end of stdin (ifds[0]).
     let is [2]i64 as fds;
     if (sys.channel_create(cast(*i64, &fds[0])) != 0) { err(t, "channel fail\n"); return; }
-    let is [2]i64 as fdacts;
-    fdacts[0] = 1;                                       // child_fd 1 (stdout)
-    fdacts[1] = fds[1];                                  // <- shell's channel write end
+    let is [2]i64 as ifds;
+    if (sys.channel_create(cast(*i64, &ifds[0])) != 0) { err(t, "channel fail\n"); sys.close(fds[0]); sys.close(fds[1]); return; }
+    let is [4]i64 as fdacts;
+    fdacts[0] = 0; fdacts[1] = ifds[1];                  // child fd 0 (stdin)  = stdin read end
+    fdacts[2] = 1; fdacts[3] = fds[1];                   // child fd 1 (stdout) = stdout write end
 
     // argv array of {str_ptr, str_len} (16 B each) — the parsed tokens.
     let is [32]i64 as av;
     let is i64 as k with mut = 0;
     while (k < argc) { av[2 * k] = argv_ptr[k]; av[2 * k + 1] = argv_len[k]; k = k + 1; }
 
-    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 1, cast(*u8, &av[0]), argc);
-    sys.close(fds[1]);                                   // shell drops the write end; child holds it
-    _log("shell: spawn "); _log(cast(*u8, &path[0])); _log(" len="); _lognum(img_len); _log(" pid="); _lognum(pid); _log("\n");
-    if (pid < 0) { err(t, "spawn failed\n"); sys.close(fds[0]); return; }
-    _col(t, C_TEXT);                                     // program output in body colour
+    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 2, cast(*u8, &av[0]), argc);
+    sys.close(fds[1]); sys.close(ifds[1]);               // shell drops the child's ends
+    if (pid < 0) { err(t, "spawn failed\n"); sys.close(fds[0]); sys.close(ifds[0]); return; }
+    _col(t, C_TEXT);
 
-    // pump the child's stdout to the screen until it closes (EOF) / exits. Also
-    // tee to serial so a screenless boot can see the program's actual output
-    // (the framebuffer isn't visible with -display none).
-    _log("shell: pump\n");
+    // Multiplex the child's stdout and the keyboard: stdout -> term (which parses
+    // the ANSI a TUI emits), keys -> child's stdin (raw bytes, arrows as ESC[A..).
+    // Ctrl+C kills it (the shell is the child's parent, holding the authority).
+    let is i64 as cout = fds[0]; let is i64 as cin = ifds[0];
     let is [256]u8 as pbuf;
-    let is i64 as n with mut = sys.read(fds[0], cast(*u8, &pbuf[0]), 256);
-    _log("shell: read n="); _lognum(n); _log("\n");
-    while (n > 0) {
-        term.puts(t, cast(*u8, &pbuf[0]), n);
-        term.flush(t);
-        sys.write_serial(cast(*u8, &pbuf[0]), n);
-        n = sys.read(fds[0], cast(*u8, &pbuf[0]), 256);
-        _log("shell: read n="); _lognum(n); _log("\n");
+    let is [6]i64 as pe;
+    let is i64 as alive with mut = 1;
+    while (alive == 1) {
+        pe[0] = cout; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        pe[3] = g_kfd; pe[4] = sys.POLL_READABLE; pe[5] = 0;
+        sys.poll(cast(*i64, &pe[0]), 2, 0 - 1);
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            let is i64 as n = sys.read(cout, cast(*u8, &pbuf[0]), 256);
+            if (n > 0) {
+                term.puts(t, cast(*u8, &pbuf[0]), n);
+                if (t.want_size == 1) { t.want_size = 0; send_size(t, cin); }   // CSI 18t reply
+                term.flush(t);
+            } else { alive = 0; }
+        }
+        if ((pe[2] & sys.POLL_CLOSED) != 0 && (pe[2] & sys.POLL_READABLE) == 0) { alive = 0; }
+        if ((pe[5] & sys.POLL_READABLE) != 0) {
+            let is input.KeyEvent as kev;
+            if (input.read_event(g_kfd, &kev) == 1) {
+                if (input.is_shift(kev.scancode) == 1) { g_shift = kev.pressed; }
+                else if (input.is_ctrl(kev.scancode) == 1) { g_ctrl = kev.pressed; }
+                else if (kev.pressed == 1) {
+                    if (g_ctrl == 1 && kev.scancode == 0x2E) { sys.kill(pid); }   // Ctrl+C
+                    else if (kev.extended == 1 && (kev.scancode == 0x48 || kev.scancode == 0x50 || kev.scancode == 0x4D || kev.scancode == 0x4B)) {
+                        let is [3]u8 as ek; ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
+                        if (kev.scancode == 0x48) { ek[2] = cast(u8, 65); }
+                        else if (kev.scancode == 0x50) { ek[2] = cast(u8, 66); }
+                        else if (kev.scancode == 0x4D) { ek[2] = cast(u8, 67); }
+                        else { ek[2] = cast(u8, 68); }
+                        sys.write(cin, cast(*u8, &ek[0]), 3);
+                    } else {
+                        let is i64 as ic = input.scancode_to_ascii(kev.scancode, g_shift);
+                        if (ic != 0) { let is [1]u8 as kb; kb[0] = cast(u8, ic); sys.write(cin, cast(*u8, &kb[0]), 1); }
+                    }
+                }
+            }
+        }
     }
-    _log("shell: pumped\n");
-    sys.close(fds[0]);
+    sys.close(cout); sys.close(cin);
     let is i64 as status with mut = 0;
-    _log("shell: waiting\n");
     sys.wait(pid, &status);
     sys.munmap(cast(i64, img), IMG_CAP);                 // free the program image buffer
-    _log("shell: exit="); _lognum(status); _log("\n");
 }
 
 // Tokenise `line` (len bytes) in place: NUL-terminate each token, fill argv_ptr/
@@ -276,18 +332,17 @@ fn main() as i32 {
     _col(&t, C_TEXT);
     sys.write_serial("shell: ready\n", 13);
 
-    let is i64 as kfd = input.open_keyboard();
-    if (kfd < 0) { sys.write_serial("shell: NO KBD\n", 14); sys.exit(cast(i32, 2)); }
+    g_kfd = input.open_keyboard();
+    if (g_kfd < 0) { sys.write_serial("shell: NO KBD\n", 14); sys.exit(cast(i32, 2)); }
 
     let is [256]u8 as line;
     let is i64 as llen with mut = 0;
-    let is i64 as shift with mut = 0;
     let is input.KeyEvent as ev;
     prompt(&t);
     term.flush(&t);
     while (1 == 1) {
-        if (input.read_event(kfd, &ev) == 1) {
-            if (input.is_shift(ev.scancode) == 1) { shift = ev.pressed; }
+        if (input.read_event(g_kfd, &ev) == 1) {
+            if (input.is_shift(ev.scancode) == 1) { g_shift = ev.pressed; }
             else if (ev.pressed == 1 && ev.extended == 1 && ev.scancode == 0x48) {   // Up — older history
                 if (hnav < hsize) {
                     hnav = hnav + 1;
@@ -306,7 +361,7 @@ fn main() as i32 {
                 }
             }
             else if (ev.pressed == 1) {
-                let is i64 as c = input.scancode_to_ascii(ev.scancode, shift);
+                let is i64 as c = input.scancode_to_ascii(ev.scancode, g_shift);
                 if (c == 0x0A) {
                     term.putc(&t, 0x0A); term.flush(&t);
                     if (llen > 0) {                            // push the command onto the history ring
