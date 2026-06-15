@@ -70,6 +70,44 @@ let is i64 as mx with mut = 0;
 let is i64 as my with mut = 0;
 let is i64 as mbuttons with mut = 0;
 
+// ============================================================
+// Pointer acceleration — the "feel" of the mouse lives HERE (evdev/libinput's
+// job in X11). The driver hands us raw 8-bit signed deltas; we turn them into
+// cursor motion through one of two profiles. ALL fixed-point, base 256 (a gain
+// of ACCEL_UNIT = 256 means exactly 1:1) — no float (Caustic gotcha).
+//
+//   accel_profile = 0 → FLAT: gain is constant (ACCEL_FLAT_GAIN/256). Raw, no
+//     velocity term — every delta is scaled the same. Set ACCEL_FLAT_GAIN=256
+//     for true 1:1 passthrough, or higher for a fixed multiplier.
+//
+//   accel_profile = 1 → ADAPTIVE (DEFAULT): the gain rises with the speed of
+//     the gesture, a smooth curve in the spirit of libinput / Windows "enhance
+//     pointer precision". Per event we measure v = |dx| + |dy| (the L1 speed of
+//     this packet) and compute  gain = ACCEL_BASE + ACCEL_K * v,  clamped to
+//     ACCEL_MAX. Slow gestures land near ACCEL_BASE (≈1:1 → fine aim); fast
+//     flicks ramp toward ACCEL_MAX (cross the screen). The motion applied is
+//     (delta * gain) >> 8, with the sub-pixel remainder carried so slow drift
+//     never quantises to zero.
+//
+// TO SWITCH PROFILES: flip accel_profile's default below (0 = flat, 1 =
+// adaptive), or at runtime press Super+Ctrl+A (handled in handle_key). Tune the
+// curve with the four ACCEL_* constants.
+let is i64 as ACCEL_UNIT      with imut = 256;   // fixed-point one (gain == 256 ⇒ 1:1)
+let is i64 as ACCEL_BASE      with imut = 200;   // adaptive: gain at zero speed (~0.78:1, fine aim)
+let is i64 as ACCEL_K         with imut = 28;    // adaptive: gain added per unit of L1 speed
+let is i64 as ACCEL_MAX       with imut = 1280;  // adaptive: gain ceiling (~5:1, screen-crossing flick)
+let is i64 as ACCEL_FLAT_GAIN with imut = 256;   // flat: constant gain (256 ⇒ 1:1)
+
+// THE TOGGLE. Default 1 = adaptive. Set to 0 here (and rebuild) for flat, or
+// press Super+Ctrl+A live.
+let is i64 as accel_profile with mut = 1;
+
+// Sub-pixel accumulators: the fractional part of (delta*gain) we couldn't apply
+// this event, carried into the next so slow motion integrates instead of
+// rounding to nothing. Reset on a profile switch to avoid a stale carry jump.
+let is i64 as accel_rem_x with mut = 0;
+let is i64 as accel_rem_y with mut = 0;
+
 // ---- shutdown: 1 once we've told the WM the power button was pressed ----
 let is i64 as shutdown_sent with mut = 0;
 
@@ -571,6 +609,42 @@ fn clamp_cursor() as void {
     return;
 }
 
+// abs() — no std here; we keep the sign handling explicit so the fixed-point
+// shift never goes through a negative >> (sign of >> on a negative is a trap).
+fn iabs(v as i64) as i64 { if (v < 0) { return 0 - v; } return v; }
+
+// accel_gain — the fixed-point gain (base 256) for a packet whose L1 speed is v.
+// FLAT ignores v; ADAPTIVE ramps base→max linearly in v, clamped.
+fn accel_gain(v as i64) as i64 {
+    if (accel_profile == 0) { return ACCEL_FLAT_GAIN; }
+    let is i64 as g with mut = ACCEL_BASE + ACCEL_K * v;
+    if (g > ACCEL_MAX) { g = ACCEL_MAX; }
+    return g;
+}
+
+// accel_move — apply one raw packet (dx,dy 8-bit signed, dy already in screen
+// orientation: caller passes -dy so + = down) to the cursor through the active
+// profile. Fixed-point: scaled = |delta|*gain + carry; whole part shifts the
+// cursor, the remainder (< 256) carries so slow drift integrates instead of
+// quantising to 0. Sign restored after the magnitude math.
+fn accel_move(dx as i64, dy as i64) as void {
+    let is i64 as v = iabs(dx) + iabs(dy);
+    let is i64 as g = accel_gain(v);
+
+    let is i64 as ax = iabs(dx) * g + accel_rem_x;
+    let is i64 as mvx = ax / ACCEL_UNIT;
+    accel_rem_x = ax - mvx * ACCEL_UNIT;
+    if (dx < 0) { mx = mx - mvx; } else { mx = mx + mvx; }
+
+    let is i64 as ay = iabs(dy) * g + accel_rem_y;
+    let is i64 as mvy = ay / ACCEL_UNIT;
+    accel_rem_y = ay - mvy * ACCEL_UNIT;
+    if (dy < 0) { my = my - mvy; } else { my = my + mvy; }
+
+    clamp_cursor();
+    return;
+}
+
 // The cursor lives on the compositor now: when it moves, damage the old + new
 // boxes so the next compose redraws it (the WM no longer touches pixels).
 let is i64 as cur_last_x with mut = 0;
@@ -594,6 +668,17 @@ fn handle_key(sc as i64, devflags as i64) as void {
     if (sc == 0x1D) { mod_ctrl = pressed; }
     if (sc == 0x38) { mod_alt = pressed; }
     if (ext == 1 && sc == 0x5B) { mod_super = pressed; }
+    // Super+Ctrl+A toggles the pointer accel profile live (0 flat / 1 adaptive).
+    // The compositor owns the pointer "feel", so it consumes the chord itself —
+    // it is NOT forwarded to the WM (no hotkey clash, no stray 'A' to clients).
+    if (pressed == 1 && sc == 0x1E && mod_super == 1 && mod_ctrl == 1) {
+        if (accel_profile == 0) { accel_profile = 1; } else { accel_profile = 0; }
+        accel_rem_x = 0;
+        accel_rem_y = 0;
+        if (accel_profile == 1) { sys.write_serial(cast(*u8, "comp: accel=adaptive\n"), 21); }
+        else { sys.write_serial(cast(*u8, "comp: accel=flat\n"), 17); }
+        return;
+    }
     let is i64 as mods with mut = 0;
     if (mod_shift == 1) { mods = mods | cp.MOD_SHIFT; }
     if (mod_ctrl == 1)  { mods = mods | cp.MOD_CTRL; }
@@ -623,15 +708,18 @@ fn pump_mouse() as void {
     let is i64 as k with mut = 0;
     let is i64 as moved with mut = 0;
     while (k + 3 < n) {
+        // Raw record: [dx i8, dy i8 (+ = up), buttons u8, wheel i8].
         let is i64 as dx with mut = cast(i64, recs[k]);
         if (dx >= 128) { dx = dx - 256; }
         let is i64 as dy with mut = cast(i64, recs[k + 1]);
         if (dy >= 128) { dy = dy - 256; }
-        mx = mx + dx;
-        my = my - dy;
-        clamp_cursor();
+        // Drive the cursor through the active accel profile. dy is flipped here
+        // (driver + = up, screen + = down) so accel_move sees screen orientation.
+        accel_move(dx, 0 - dy);
         moved = 1;
-        let is i64 as nb = cast(i64, recs[k + 2]);
+        // Buttons: the low bits map onto BTN_*; mask off any raw status flags
+        // so the WM only ever sees defined button bits.
+        let is i64 as nb = cast(i64, recs[k + 2]) & cp.BTN_MASK;
         if (nb != mbuttons) {
             mbuttons = nb;
             cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons);
@@ -640,6 +728,8 @@ fn pump_mouse() as void {
         let is i64 as wh with mut = cast(i64, recs[k + 3]);
         if (wh >= 128) { wh = wh - 256; }
         if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, mx, my); }
+        // REL_HWHEEL: the standard 4-byte IntelliMouse record has no horizontal
+        // axis, so there is nothing to forward here on PS/2 (see MSG_CP_HWHEEL).
         k = k + 4;
     }
     if (moved == 1) { cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons); }
@@ -656,11 +746,13 @@ fn pump_tablet() as void {
     while (k + 7 < n) {
         let is i64 as ax = cast(i64, recs[k]) | (cast(i64, recs[k + 1]) << 8);
         let is i64 as ay = cast(i64, recs[k + 2]) | (cast(i64, recs[k + 3]) << 8);
+        // The tablet is ABSOLUTE — position passes through untouched (no accel:
+        // 1:1 is the whole point of an absolute device, like a drawing tablet).
         mx = ax * scr_w / 32768;
         my = ay * scr_h / 32768;
         clamp_cursor();
         moved = 1;
-        let is i64 as nb = cast(i64, recs[k + 4]);
+        let is i64 as nb = cast(i64, recs[k + 4]) & cp.BTN_MASK;
         if (nb != mbuttons) {
             mbuttons = nb;
             cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons);
