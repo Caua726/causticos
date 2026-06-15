@@ -398,11 +398,39 @@ fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
     if (maxn > abi.PROC_LIST_MAX) { maxn = abi.PROC_LIST_MAX; }
     let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
     let is [512]i64 as kbuf;            // PROC_LIST_MAX(64) * PROC_INFO_WORDS(8)
+    let is i64 as total with mut = 0;
+    let is i64 as n with mut = 0;
+
+    // Entry 0 is always the kernel itself (pid 0, name "kernel") — the honest
+    // counterpart of per-process RSS, so the RAM the kernel holds (code, page
+    // tables, heap, kstacks, frame_meta, FAT cache) is a visible line instead of
+    // hiding in the gap between "used" and the sum of process RSS. Emitted FIRST
+    // so it survives a snapshot truncated to `max` (the kernel is never the row
+    // dropped). pid/ppid 0, state run(1), "threads" = kernel thread count, MEM =
+    // the kernel total from kmem_total().
+    if (n < maxn) {
+        let is i64 as kb0 = n * 8;
+        kbuf[kb0 + 0] = 0;                        // pid
+        kbuf[kb0 + 1] = 0;                        // ppid
+        kbuf[kb0 + 2] = 1;                        // state = run
+        kbuf[kb0 + 3] = 0;                        // exit_code
+        kbuf[kb0 + 4] = sched.get_thread_count(); // "threads" = live kernel threads
+        kbuf[kb0 + 5] = kmem_total();             // MEM = honest kernel footprint
+        // name "kernel\0" packed into the two name words (little-endian bytes).
+        let is *u8 as knm = cast(*u8, &kbuf[kb0 + 6]);
+        knm[0] = cast(u8, 107); knm[1] = cast(u8, 101); knm[2] = cast(u8, 114);   // k e r
+        knm[3] = cast(u8, 110); knm[4] = cast(u8, 101); knm[5] = cast(u8, 108);   // n e l
+        knm[6] = cast(u8, 0);   knm[7] = cast(u8, 0);   knm[8] = cast(u8, 0);
+        knm[9] = cast(u8, 0);   knm[10] = cast(u8, 0);  knm[11] = cast(u8, 0);
+        knm[12] = cast(u8, 0);  knm[13] = cast(u8, 0);  knm[14] = cast(u8, 0);
+        knm[15] = cast(u8, 0);
+        n = n + 1;
+    }
+    total = total + 1;
+
     let is [256]i64 as stk;             // DFS worklist of *Process
     let is i64 as sp with mut = 0;
     if (proc.init_proc != 0) { stk[0] = proc.init_proc; sp = 1; }
-    let is i64 as total with mut = 0;
-    let is i64 as n with mut = 0;
     while (sp > 0) {
         sp = sp - 1;
         let is i64 as p = stk[sp];
@@ -418,8 +446,11 @@ fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
                 kbuf[base + 4] = proc.proc_thread_count(p);
                 let is i64 as asp = proc.proc_aspace(p);
                 if (asp != 0) {
-                    let is *vma.Aspace as ap = cast(*vma.Aspace, asp);
-                    kbuf[base + 5] = ap.committed_bytes;
+                    // Honest RSS: anon committed + every VMA_FILE region (a
+                    // surface's backbuffer, shared segments) the aspace maps —
+                    // not just committed_bytes. So the compositor's 4 MiB
+                    // backbuffer shows up against the compositor, where it lives.
+                    kbuf[base + 5] = vma.aspace_rss_bytes(cast(*vma.Aspace, asp));
                 } else { kbuf[base + 5] = 0; }
                 let is *i64 as nmsrc = cast(*i64, p + 112);      // Process.name @112, 16 bytes
                 kbuf[base + 6] = nmsrc[0]; kbuf[base + 7] = nmsrc[1];
@@ -435,6 +466,44 @@ fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
         if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), n * 64) != 0) { return abi.E_FAULT; }
     }
     return total;
+}
+
+// ============================================================
+// Kernel memory accounting — the breakdown that guides future optimisation.
+// kmem_total() is the single number shown as the "kernel" proc_list row; each
+// component is measured from the subsystem that owns it. No double counting:
+// surface/segment/anon RAM is mapped into user aspaces and so is charged to
+// those processes via RSS, never here — this line is the RAM that is ONLY the
+// kernel's (code, page tables, heap slabs, kstacks, frame_meta, FAT cache).
+// kmem_report() logs the decomposition to serial at boot to guide optimisation.
+// ============================================================
+
+fn kmem_total() as i64 {
+    let is i64 as t with mut = 0;
+    t = t + pmm.kernel_image_bytes();
+    t = t + pmm.usage_pages_bytes(pmm.USAGE_PAGE_TABLE);
+    t = t + pmm.usage_pages_bytes(pmm.USAGE_KERNEL_HEAP);
+    t = t + sched.kstacks_bytes();
+    t = t + pmm.frame_meta_bytes();
+    t = t + fat32.dma_cache_bytes();
+    return t;
+}
+
+fn kmem_report() as void {
+    let is i64 as img  = pmm.kernel_image_bytes();
+    let is i64 as pt   = pmm.usage_pages_bytes(pmm.USAGE_PAGE_TABLE);
+    let is i64 as hp   = pmm.usage_pages_bytes(pmm.USAGE_KERNEL_HEAP);
+    let is i64 as ks   = sched.kstacks_bytes();
+    let is i64 as fm   = pmm.frame_meta_bytes();
+    let is i64 as fat  = fat32.dma_cache_bytes();
+    serial.print("kmem: image=", 12);   util.print_num(img);
+    serial.print(" pgtab=", 7);         util.print_num(pt);
+    serial.print(" heap=", 6);          util.print_num(hp);
+    serial.print(" kstacks=", 9);       util.print_num(ks);
+    serial.print(" frame_meta=", 12);   util.print_num(fm);
+    serial.print(" fat=", 5);           util.print_num(fat);
+    serial.print(" TOTAL=", 7);         util.print_num(img + pt + hp + ks + fm + fat);
+    serial.println("", 0);
 }
 
 // SYS_CPU_STAT(out) — read-only sample: writes [ncpu, busy0, busy1, ...] where
@@ -1277,4 +1346,10 @@ fn install_all() as void {
     install(abi.SYS_POWER_PENDING,   cast(i64, fn_ptr(sys_power_pending)));
     install(abi.SYS_MEM_INFO,        cast(i64, fn_ptr(sys_mem_info)));
     install(abi.SYS_STATFS,          cast(i64, fn_ptr(sys_statfs)));
+
+    // Boot-time baseline of the kernel's own memory footprint, to guide future
+    // optimisation. (FAT cache + most user threads come up later on worker
+    // threads, so this is a floor; the live `ps`/`free` "kernel" row reflects
+    // the running total.)
+    kmem_report();
 }
