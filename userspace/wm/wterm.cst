@@ -6,17 +6,19 @@
 //   - renders into a shared SEGMENT via term.init_buffer (present suppressed;
 //     dirty rects flow to the WM as MSG_COMMIT, coalesced, sent only when the
 //     channel polls WRITABLE)
-//   - keys arrive as MSG_KEY over the WM channel (fd 3), raw scancodes — the
-//     keymap stays here, as policy
+//   - keys arrive as MSG_KEY over the WM channel (fd 3) ALREADY NORMALISED:
+//     a = a keysym (printable ASCII byte or a KEY_* code), b = mods|pressed.
+//     The compositor owns the keymap; the terminal only maps the special
+//     keysyms to its own ESC-sequences for a child (arrows → ESC[A…).
 //   - a running child's stdout is one more SYS_POLL entry, not a blocking
 //     pump: output streams into the grid while the WM stays responsive
 //   - MSG_RESIZE re-lays the grid out via term.resize (bottom-anchored)
 // The cell grid (attach_grid) is what makes that resize re-render content.
 
 use "../../../Caustic/std/causticos/term.cst" as term;
-use "../../../Caustic/std/causticos/input.cst" as input;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
 
 let is i64 as MAX_ARGS with imut = 16;
 let is i64 as LINE_CAP with imut = 256;
@@ -521,8 +523,6 @@ fn main() as i32 {
 
     let is [256]u8 as line;
     let is i64 as llen with mut = 0;
-    let is i64 as shift with mut = 0;
-    let is i64 as ctrl with mut = 0;
     let is [9]i64 as pe;
     let is [256]u8 as pbuf;
 
@@ -584,59 +584,70 @@ fn main() as i32 {
             if (r2 < 0) { return 0; }                  // WM gone
             if (r2 == 1) {
                 if (m[0] == wmp.MSG_KEY) {
-                    let is i64 as sc = m[1];
-                    let is i64 as pressed = m[2] & 1;
-                    let is i64 as ext = (m[2] >> 1) & 1;
-                    if (input.is_shift(sc) == 1) { shift = pressed; }
-                    else if (input.is_ctrl(sc) == 1) { ctrl = pressed; }
-                    else if (pressed == 1 && ext == 1 && sc == 0x49) {     // PgUp: history
+                    // a = normalised keysym (ASCII byte or KEY_* code); b = mods|
+                    // pressed<<8|ext<<9. The compositor owns the keymap now — the
+                    // terminal just acts on the keysym. ESC-sequences for a child
+                    // (arrows → ESC[A…) stay HERE: that is terminal policy.
+                    let is i64 as ks = m[1];
+                    let is i64 as pressed = cp.key_pressed(m[2]);
+                    let is i64 as ctrl = (cp.key_mods(m[2]) >> 1) & 1;        // MOD_CTRL
+                    if (pressed == 1 && ks == cp.KEY_PGUP) {                  // PgUp: history
                         term.scroll_view(&t, t.rows - 1);
                         show(&t);
                     }
-                    else if (pressed == 1 && ext == 1 && sc == 0x51) {     // PgDn: toward live
+                    else if (pressed == 1 && ks == cp.KEY_PGDN) {            // PgDn: toward live
                         term.scroll_view(&t, 0 - (t.rows - 1));
                         show(&t);
                     }
                     else if (child_out >= 0) {
-                        // A child is running. Ctrl+C (ctrl held + 'c', sc 0x2E)
-                        // forcibly kills it — the wterm IS the child's parent, so
-                        // it holds the kill authority (CausticOS has no ambient
-                        // pid namespace). The child's death closes its stdout;
-                        // the poll loop then runs child_eof() to reap + reprompt.
-                        if (ctrl == 1 && pressed == 1 && sc == 0x2E && child_pid != 0) {
+                        // A child is running. Ctrl+C (ctrl held + 'c') forcibly
+                        // kills it — the wterm IS the child's parent, so it holds
+                        // the kill authority (CausticOS has no ambient pid
+                        // namespace). The child's death closes its stdout; the
+                        // poll loop then runs child_eof() to reap + reprompt.
+                        if (ctrl == 1 && pressed == 1 && (ks == 0x63 || ks == 0x43) && child_pid != 0) {
                             term.puts(&t, "^C", 2); term.putc(&t, 0x0A); show(&t);
                             sys.kill(child_pid);
                         }
                         // Arrow keys → ANSI ESC[A/B/C/D on the child's stdin,
-                        // exactly like a real terminal, so a TUI reads them.
-                        else if (child_in >= 0 && pressed == 1 && ext == 1 && (sc == 0x48 || sc == 0x50 || sc == 0x4D || sc == 0x4B)) {
+                        // exactly like a real terminal, so a TUI reads them. The
+                        // keysym → ESC-sequence map is terminal policy.
+                        else if (child_in >= 0 && pressed == 1 &&
+                                 (ks == cp.KEY_UP || ks == cp.KEY_DOWN || ks == cp.KEY_RIGHT || ks == cp.KEY_LEFT)) {
                             let is [3]u8 as ek;
                             ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
-                            if (sc == 0x48) { ek[2] = cast(u8, 65); }        // A up
-                            else if (sc == 0x50) { ek[2] = cast(u8, 66); }   // B down
-                            else if (sc == 0x4D) { ek[2] = cast(u8, 67); }   // C right
-                            else { ek[2] = cast(u8, 68); }                   // D left
+                            if (ks == cp.KEY_UP) { ek[2] = cast(u8, 65); }        // A up
+                            else if (ks == cp.KEY_DOWN) { ek[2] = cast(u8, 66); } // B down
+                            else if (ks == cp.KEY_RIGHT) { ek[2] = cast(u8, 67); }// C right
+                            else { ek[2] = cast(u8, 68); }                        // D left
                             syscall(11, child_in, cast(i64, &ek[0]), 3);
                         }
-                        // Otherwise forward the keystroke to the child's stdin
+                        // Special keys the child still expects as a control byte.
+                        else if (child_in >= 0 && pressed == 1 &&
+                                 (ks == cp.KEY_ENTER || ks == cp.KEY_BACKSPACE || ks == cp.KEY_TAB || ks == cp.KEY_ESC)) {
+                            let is [1]u8 as kb;
+                            if (ks == cp.KEY_ENTER) { kb[0] = cast(u8, 0x0A); }
+                            else if (ks == cp.KEY_BACKSPACE) { kb[0] = cast(u8, 0x08); }
+                            else if (ks == cp.KEY_TAB) { kb[0] = cast(u8, 0x09); }
+                            else { kb[0] = cast(u8, 0x1B); }
+                            syscall(11, child_in, cast(i64, &kb[0]), 1);
+                        }
+                        // Otherwise forward a printable byte to the child's stdin
                         // (raw byte, no echo — the program echoes if it wants).
-                        else if (child_in >= 0 && pressed == 1) {
-                            let is i64 as ic = input.scancode_to_ascii(sc, shift);
-                            if (ic != 0) {
-                                let is [1]u8 as kb;
-                                kb[0] = cast(u8, ic);
-                                syscall(11, child_in, cast(i64, &kb[0]), 1);
-                            }
+                        else if (child_in >= 0 && pressed == 1 && ks > 0 && ks < 0x80) {
+                            let is [1]u8 as kb;
+                            kb[0] = cast(u8, ks);
+                            syscall(11, child_in, cast(i64, &kb[0]), 1);
                         }
                     }
-                    else if (pressed == 1 && ext == 1 && sc == 0x48) {       // Up
+                    else if (pressed == 1 && ks == cp.KEY_UP) {              // Up: history
                         if (hnav < hsize) {
                             hnav = hnav + 1;
                             let is i64 as slot = (hhead - hnav + 16) % 16;
                             recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
                         }
                     }
-                    else if (pressed == 1 && ext == 1 && sc == 0x50) {       // Down
+                    else if (pressed == 1 && ks == cp.KEY_DOWN) {           // Down: history
                         if (hnav > 0) {
                             hnav = hnav - 1;
                             if (hnav == 0) { recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &line[0]), 0); }
@@ -647,8 +658,7 @@ fn main() as i32 {
                         }
                     }
                     else if (pressed == 1) {
-                        let is i64 as c = input.scancode_to_ascii(sc, shift);
-                        if (c == 0x0A) {
+                        if (ks == cp.KEY_ENTER) {
                             term.putc(&t, 0x0A);
                             show(&t);
                             if (llen > 0) {
@@ -667,15 +677,15 @@ fn main() as i32 {
                             }
                             if (child_out < 0) { prompt(&t); }
                             show(&t);
-                        } else if (c == 0x09) {
+                        } else if (ks == cp.KEY_TAB) {
                             complete(&t, cast(*u8, &line[0]), &llen);
-                        } else if (c == 0x08) {
+                        } else if (ks == cp.KEY_BACKSPACE) {
                             if (llen > 0) { llen = llen - 1; term.putc(&t, 0x08); show(&t); }
-                        } else if (c != 0) {
+                        } else if (ks > 0 && ks < 0x80) {
                             if (llen < LINE_CAP - 1) {
-                                line[llen] = cast(u8, c);
+                                line[llen] = cast(u8, ks);
                                 llen = llen + 1;
-                                term.putc(&t, c);
+                                term.putc(&t, ks);
                                 show(&t);
                             }
                         }

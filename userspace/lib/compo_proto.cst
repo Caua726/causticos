@@ -38,9 +38,13 @@ let is i64 as MSG_BYTES with imut = 32;
 //   learns the screen geometry it needs to clamp the cursor / lay windows out.
 let is i64 as MSG_CP_SCR_READY with imut = 1;
 // MSG_CP_KEY{a=keysym, b=mods|(pressed<<8)|(extended<<9), c=scancode}: one key
-//   transition. The WM routes by SCANCODE (campo c) exactly as it did from the
-//   raw device — keysym/mods are carried for a future keymap-in-WM but the WM
-//   (and every client) still consumes the scancode (architecture.md §8).
+//   transition. The compositor OWNS THE KEYMAP — `a` is the fully normalised
+//   key: a printable ASCII char (shift already applied → 'A' vs 'a'), or one of
+//   the KEY_* keysyms below for the special keys (enter/backspace/tab/arrows/…),
+//   or 0 when nothing maps (a bare modifier, an unmapped key). `b` carries the
+//   modifier state + pressed/extended bits (see key_b/key_mods). The raw
+//   SCANCODE rides in `c` as a fallback and so the WM can keep routing its
+//   hotkeys (Alt+Tab/Super+Enter/Super+Q) by scancode. Clients consume `a`.
 let is i64 as MSG_CP_KEY with imut = 2;
 // MSG_CP_PTR{a=x, b=y, c=buttons}: absolute cursor position + button mask. The
 //   compositor owns cursor motion (deltas → abs for the mouse, abs passthrough
@@ -115,14 +119,108 @@ fn pack_wh(w as i64, h as i64) as i64 { return ((w & 0xFFFFFFFF) << 32) | (h & 0
 fn unpack_w(v as i64) as i64 { return (v >> 32) & 0xFFFFFFFF; }
 fn unpack_h(v as i64) as i64 { return v & 0xFFFFFFFF; }
 
+// ---- modifier mask (field b, low 8 bits) --------------------------------
+let is i64 as MOD_SHIFT with imut = 1;
+let is i64 as MOD_CTRL  with imut = 2;
+let is i64 as MOD_ALT   with imut = 4;
+let is i64 as MOD_SUPER with imut = 8;
+
 // KEY field b: mods (low 8) | pressed<<8 | extended<<9.
 fn key_b(mods as i64, pressed as i64, ext as i64) as i64 {
     return (mods & 0xFF) | ((pressed & 1) << 8) | ((ext & 1) << 9);
 }
+fn key_mods(b as i64) as i64 { return b & 0xFF; }
 fn key_pressed(b as i64) as i64 { return (b >> 8) & 1; }
 fn key_ext(b as i64) as i64 { return (b >> 9) & 1; }
 // The raw device flags the WM's handle_key still expects: bit0 pressed, bit1 ext.
 fn key_devflags(b as i64) as i64 { return ((b >> 8) & 1) | (((b >> 9) & 1) << 1); }
+
+// ---- normalised keysyms (field a) ---------------------------------------
+// Printable keys carry their ASCII byte (0x20..0x7E) in `a`, shift already
+// applied. The special keys carry one of these codes (high range, no ASCII
+// overlap). A client switches on `a`: < 0x100 → a literal byte, else a keysym.
+let is i64 as KEY_NONE      with imut = 0;
+let is i64 as KEY_BASE      with imut = 0x1000000;
+let is i64 as KEY_ENTER     with imut = 0x1000001;
+let is i64 as KEY_BACKSPACE with imut = 0x1000002;
+let is i64 as KEY_TAB       with imut = 0x1000003;
+let is i64 as KEY_ESC       with imut = 0x1000004;
+let is i64 as KEY_UP        with imut = 0x1000005;
+let is i64 as KEY_DOWN      with imut = 0x1000006;
+let is i64 as KEY_LEFT      with imut = 0x1000007;
+let is i64 as KEY_RIGHT     with imut = 0x1000008;
+let is i64 as KEY_PGUP      with imut = 0x1000009;
+let is i64 as KEY_PGDN      with imut = 0x100000A;
+let is i64 as KEY_HOME      with imut = 0x100000B;
+let is i64 as KEY_END       with imut = 0x100000C;
+let is i64 as KEY_DEL       with imut = 0x100000D;
+
+// keysym_of — the compositor's keymap: a raw PS/2 Set-1 scancode (+ extended
+// flag + shift) → a normalised keysym. Printable keys return their ASCII byte
+// (shift = the shifted glyph / uppercase); special keys return a KEY_* code;
+// 0 (KEY_NONE) for modifiers and anything unmapped. US QWERTY. This is the ONE
+// place scancodes turn into characters — clients never see a scancode again.
+fn keysym_of(sc as i64, ext as i64, shift as i64) as i64 {
+    // extended (0xE0-prefixed) keys first: arrows, navigation cluster.
+    if (ext == 1) {
+        if (sc == 0x48) { return KEY_UP; }
+        if (sc == 0x50) { return KEY_DOWN; }
+        if (sc == 0x4B) { return KEY_LEFT; }
+        if (sc == 0x4D) { return KEY_RIGHT; }
+        if (sc == 0x49) { return KEY_PGUP; }
+        if (sc == 0x51) { return KEY_PGDN; }
+        if (sc == 0x47) { return KEY_HOME; }
+        if (sc == 0x4F) { return KEY_END; }
+        if (sc == 0x53) { return KEY_DEL; }
+        if (sc == 0x1C) { return KEY_ENTER; }      // keypad Enter
+        return KEY_NONE;
+    }
+    // special non-extended keys
+    if (sc == 0x1C) { return KEY_ENTER; }
+    if (sc == 0x0E) { return KEY_BACKSPACE; }
+    if (sc == 0x0F) { return KEY_TAB; }
+    if (sc == 0x01) { return KEY_ESC; }
+    if (sc == 0x39) { return 0x20; }               // space
+    // number row 0x02..0x0B
+    if (sc >= 0x02 && sc <= 0x0B) {
+        let is *u8 as d = "1234567890";
+        let is *u8 as s = "!@#$%^&*()";
+        if (shift != 0) { return cast(i64, s[sc - 0x02]); }
+        return cast(i64, d[sc - 0x02]);
+    }
+    if (sc == 0x0C) { if (shift != 0) { return 0x5F; } return 0x2D; }   // - _
+    if (sc == 0x0D) { if (shift != 0) { return 0x2B; } return 0x3D; }   // = +
+    // letter rows (uppercase when shifted: subtract 0x20)
+    if (sc >= 0x10 && sc <= 0x19) {
+        let is *u8 as r = "qwertyuiop";
+        let is i64 as c = cast(i64, r[sc - 0x10]);
+        if (shift != 0) { return c - 0x20; }
+        return c;
+    }
+    if (sc >= 0x1E && sc <= 0x26) {
+        let is *u8 as r = "asdfghjkl";
+        let is i64 as c = cast(i64, r[sc - 0x1E]);
+        if (shift != 0) { return c - 0x20; }
+        return c;
+    }
+    if (sc >= 0x2C && sc <= 0x32) {
+        let is *u8 as r = "zxcvbnm";
+        let is i64 as c = cast(i64, r[sc - 0x2C]);
+        if (shift != 0) { return c - 0x20; }
+        return c;
+    }
+    // punctuation (US QWERTY Set-1)
+    if (sc == 0x1A) { if (shift != 0) { return 0x7B; } return 0x5B; }   // [ {
+    if (sc == 0x1B) { if (shift != 0) { return 0x7D; } return 0x5D; }   // ] }
+    if (sc == 0x27) { if (shift != 0) { return 0x3A; } return 0x3B; }   // ; :
+    if (sc == 0x28) { if (shift != 0) { return 0x22; } return 0x27; }   // ' "
+    if (sc == 0x29) { if (shift != 0) { return 0x7E; } return 0x60; }   // ` ~
+    if (sc == 0x2B) { if (shift != 0) { return 0x7C; } return 0x5C; }   // \ |
+    if (sc == 0x33) { if (shift != 0) { return 0x3C; } return 0x2C; }   // , <
+    if (sc == 0x34) { if (shift != 0) { return 0x3E; } return 0x2E; }   // . >
+    if (sc == 0x35) { if (shift != 0) { return 0x3F; } return 0x2F; }   // / ?
+    return KEY_NONE;
+}
 
 // SCENE_ENTRY a field: win_id (low 32) | flags<<32.
 fn entry_a(win_id as i64, flags as i64) as i64 { return (win_id & 0xFFFFFFFF) | ((flags & 0xFFFFFFFF) << 32); }
