@@ -187,22 +187,34 @@ fn show(t as *term.Term) as void {
 // MiB ceiling for every child (even a 20 KiB `ls`) was the whole leak.
 let is i64 as img_alloc with mut = 0;
 
-fn read_file(path as *u8, out_len as *i64) as *u8 {
+// read_file failure codes, written to *out_err so the caller can tell the truth
+// instead of blaming a missing file for every failure. A NON-existent program
+// and an out-of-memory mmap are very different bugs — conflating them as "not
+// found" sent us chasing the wrong cause for the intermittent failure.
+let is i64 as RF_OK     with imut = 0;
+let is i64 as RF_NOENT  with imut = 1;    // open failed: the file is not there
+let is i64 as RF_BADSZ  with imut = 2;    // size <= 0 or > IMG_CAP
+let is i64 as RF_NOMEM  with imut = 3;    // mmap for the image failed
+let is i64 as RF_IOERR  with imut = 4;    // short/failed read off the disk
+
+fn read_file(path as *u8, out_len as *i64, out_err as *i64) as *u8 {
     *out_len = 0;
+    *out_err = RF_OK;
     let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { return cast(*u8, 0); }
+    if (fd < 0) { *out_err = RF_NOENT; return cast(*u8, 0); }
     let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
     sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
-    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return cast(*u8, 0); }
+    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); *out_err = RF_BADSZ; return cast(*u8, 0); }
     // Allocate only what the image needs, rounded up to a page — IMG_CAP stays
     // a safety ceiling (checked above), never the allocation size.
     let is i64 as alloc = (sz + 4095) & (0 - 4096);
     let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
-    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
+    if (va < 0) { sys.close(fd); *out_err = RF_NOMEM; return cast(*u8, 0); }
     img_alloc = alloc;
     let is *u8 as buf = cast(*u8, va);
     let is i64 as got = sys.read(fd, buf, sz);
     sys.close(fd);
+    if (got != sz) { sys.munmap(va, alloc); *out_err = RF_IOERR; return cast(*u8, 0); }
     *out_len = got;
     return buf;
 }
@@ -228,9 +240,16 @@ fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64)
     path[1 + cl + 4] = cast(u8, 0);
 
     let is i64 as img_len with mut = 0;
-    let is *u8 as img = read_file(cast(*u8, &path[0]), &img_len);
+    let is i64 as rferr with mut = 0;
+    let is *u8 as img = read_file(cast(*u8, &path[0]), &img_len, &rferr);
     if (cast(i64, img) == 0) {
-        _col(t, C_ERR); puts(t, cast(*u8, &path[0])); puts(t, ": not found\n"); _col(t, C_TEXT);
+        _col(t, C_ERR); puts(t, cast(*u8, &path[0]));
+        if (rferr == RF_NOENT)      { puts(t, ": not found\n"); }
+        else if (rferr == RF_BADSZ) { puts(t, ": bad size\n"); }
+        else if (rferr == RF_NOMEM) { puts(t, ": out of memory\n"); }
+        else if (rferr == RF_IOERR) { puts(t, ": read error\n"); }
+        else                        { puts(t, ": load failed\n"); }
+        _col(t, C_TEXT);
         return;
     }
 
