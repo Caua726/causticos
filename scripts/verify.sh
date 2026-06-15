@@ -28,7 +28,7 @@ for i in $(seq 1 "$RUNS"); do
   # kept build/disk.img locked and made the *next* run fail to boot (a
   # spurious "no-phase6 (timeout?)"). We enforce the hard deadline here.
   qemu-system-x86_64 \
-    -cdrom build/causticos.iso -m 128M -machine q35 \
+    -cdrom build/causticos.iso -m 128M -machine q35 -enable-kvm -cpu host \
     -drive id=disk,file=build/disk.img,if=none,format=raw \
     -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
     -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -device virtio-tablet-pci -netdev user,id=net1 -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off \
@@ -41,7 +41,7 @@ for i in $(seq 1 "$RUNS"); do
   # leave every run spinning to the deadline (and mis-report it).
   DEADLINE=$((SECONDS + TOUT))
   while kill -0 $QPID 2>/dev/null; do
-    if tr -d '\000' < "$TMPLOG" | grep -qE "vfs\.test: ALL PASS|EXCEPTION|panic:|kernel halted"; then
+    if tr -d '\000' < "$TMPLOG" | grep -qE "ALL PHASE-6 TESTS PASS|vfs\.test: ALL PASS|EXCEPTION|panic:|kernel halted"; then
       break
     fi
     if [ "$SECONDS" -ge "$DEADLINE" ]; then
