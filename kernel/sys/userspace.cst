@@ -3129,6 +3129,39 @@ fn wait_boot_ready() as void {
     sched.sleep_for_ns(100000000);     // let the bind/mount settle
 }
 
+// Wait for the INPUT drivers to register before launching /init (bounded).
+//
+// The input drivers (keyboard, mouse) bind on the SAME phase-2 thread as the
+// disk drivers — but BEHIND them, so their device_register lands AFTER the FS
+// has already mounted. wait_boot_ready() returns the instant mount_head is
+// populated, which can be well before the i8042 keyboard/mouse have registered.
+// The /init compositor dev_open()s DEV_KEYBOARD/MOUSE the moment it starts, so
+// without this gate it races the bind and loses ("comp: no keyboard/mouse") —
+// deterministically under KVM headless, where boot is fast and the disk bind
+// finishes first. Gating /init on the input classes appearing in the registry
+// makes the launch happen only once its devices exist: the compositor's
+// dev_open then always succeeds. (The framebuffer is registered in phase 1, so
+// it is never the racy one; the tablet is optional — virtio-input may be absent
+// — so we do NOT block on it.) Bounded + fail-loud: real hardware without a
+// keyboard still boots (the compositor logs "no keyboard" and runs), it just
+// can't deadlock the launch waiting forever.
+fn wait_input_ready() as void {
+    let is i64 as deadline = timer.current_time_ns() + 4000000000;
+    let is i64 as waiting with mut = 1;
+    while (waiting == 1) {
+        if (driver.device_count(abi.DEV_KEYBOARD) > 0
+            && driver.device_count(abi.DEV_MOUSE) > 0)  { waiting = 0; }
+        else if (timer.current_time_ns() >= deadline)   { waiting = 0; }
+        else { sched.sleep_for_ns(20000000); }
+    }
+    if (driver.device_count(abi.DEV_KEYBOARD) == 0) {
+        serial.println("boot: WARN no keyboard registered before /init", 46);
+    }
+    if (driver.device_count(abi.DEV_MOUSE) == 0) {
+        serial.println("boot: WARN no mouse registered before /init", 43);
+    }
+}
+
 // The real boot→userspace handoff: wait for mount, launch /init.cse. NO smokes
 // — this is the clean production path (run.sh, the bootstrap). The smokes live
 // in smoke_init() and never share or block this path.
@@ -3152,6 +3185,7 @@ fn system_reboot() as void {
 
 fn init_thread() as void {
     wait_boot_ready();
+    wait_input_ready();                // keyboard/mouse must be registered first
     acpi.power_init();                 // arm the ACPI power button
     spawn_init_from_disk();
     // Done launching — this thread never returns; it becomes the power-button
