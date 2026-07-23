@@ -19,6 +19,8 @@ use "pmm.cst"     as pmm;
 use "sched.cst"   as sched;
 use "vfs.cst"     as vfs;
 use "timer.cst"   as timer;
+use "rtc.cst"     as rtc;
+use "abi.cst"     as abi;
 
 // ============================================================
 // BPB offsets (see FAT spec). Bytes unless suffixed _w (u16) or _d (u32).
@@ -619,6 +621,11 @@ let is i64 as lfn_total_entries with mut = 0;  // N from the last-physical marke
 // single-threaded today, same as target_name/lfn_buf above, so no locking.
 let is i64 as found_ent_cluster with mut = 0;
 let is i64 as found_ent_off with mut = 0;
+// DOS write-date / write-time packed (LE) for the most recent dir_find hit.
+// 0 = unset (no timestamp; old or pre-RTC files). Used by vfs_statx to
+// surface the mtime via SYS_STATX without re-reading the SFN buffer.
+let is i64 as found_ent_wdate with mut = 0;
+let is i64 as found_ent_wtime with mut = 0;
 
 fn dir_find(v as *Fat32Volume,
             start_cluster as i64,
@@ -683,6 +690,9 @@ fn dir_find(v as *Fat32Volume,
                     *out_attr    = attr;
                     found_ent_cluster = cluster;   // stable slot identity for update_entry
                     found_ent_off    = i;
+                    // Capture DOS write date/time (LE u16 at offsets 24 and 22).
+                    found_ent_wdate = read_u16(buf, i + 24);
+                    found_ent_wtime = read_u16(buf, i + 22);
                     return 0;
                 }
                 // Consumed the preceding LFN run regardless of match.
@@ -1113,18 +1123,30 @@ fn emit_sfn(buf as *u8, off as i64, short11 as *u8, attr as i32,
     let is i64 as i with mut = 0;
     while (i < 11) { buf[off + i] = short11[i]; i = i + 1; }
     buf[off + 11] = cast(u8, attr & 0xFF);
-    // 12..21 zeroed (NTRes, ctime tenths, ctime/cdate/adate) — we
-    // intentionally leave timestamps at 0; a future pass wires an RTC.
-    let is i64 as j with mut = 12;
-    while (j < 22) { buf[off + j] = cast(u8, 0); j = j + 1; }
-    // First cluster high (20..21), time/date write (22..25), first
-    // cluster low (26..27), size (28..31).
+    // 12 NTRes (kept 0)
+    buf[off + 12] = cast(u8, 0);
+    // 13 ctime tenths (kept 0 — 2s resolution is enough for DOS time)
+    buf[off + 13] = cast(u8, 0);
+    // 14..15 ctime (kept 0 — DOS ctime was rarely used; leave it for now)
+    buf[off + 14] = cast(u8, 0); buf[off + 15] = cast(u8, 0);
+    // 16..17 cdate — DOS-format creation date, packed LE
+    // 18..19 adate — last access date (kept 0 — no read-tracking yet)
+    // 20..21 first cluster high
+    // 22..23 wtime, 24..25 wdate, 26..27 first cluster low, 28..31 size.
+    let is i64 as now_date with mut = 0;
+    let is i64 as now_time with mut = 0;
+    rtc.now_dos(&now_date, &now_time);
+    buf[off + 16] = cast(u8, now_date & 0xFF);
+    buf[off + 17] = cast(u8, (now_date >> 8) & 0xFF);
+    buf[off + 18] = cast(u8, 0); buf[off + 19] = cast(u8, 0);
     let is i64 as hi = (first_cluster >> 16) & 0xFFFF;
     let is i64 as lo = first_cluster & 0xFFFF;
     buf[off + 20] = cast(u8, hi & 0xFF);
     buf[off + 21] = cast(u8, (hi >> 8) & 0xFF);
-    buf[off + 22] = cast(u8, 0); buf[off + 23] = cast(u8, 0);
-    buf[off + 24] = cast(u8, 0); buf[off + 25] = cast(u8, 0);
+    buf[off + 22] = cast(u8, now_time & 0xFF);
+    buf[off + 23] = cast(u8, (now_time >> 8) & 0xFF);
+    buf[off + 24] = cast(u8, now_date & 0xFF);
+    buf[off + 25] = cast(u8, (now_date >> 8) & 0xFF);
     buf[off + 26] = cast(u8, lo & 0xFF);
     buf[off + 27] = cast(u8, (lo >> 8) & 0xFF);
     buf[off + 28] = cast(u8, size & 0xFF);
@@ -2331,6 +2353,34 @@ fn vfs_stat(priv as *u8, path as *u8, path_len as i64,
     return 0;
 }
 
+// statx_fill: same as vfs_stat but also returns the mtime (Unix epoch s)
+// in the caller's Statx. The DOS wdate/wtime come from dir_find's globals
+// — the SFN buffer is read once during resolve, no extra disk hit.
+//   Returns 0 on success, -1 if nothing mounted / resolve failed.
+//   *out_mtime is set to 0 for the root directory (dir_find isn't run) or
+//   for entries whose SFN still has wdate=wtime=0 (pre-RTC fixtures).
+fn statx_fill(priv as *u8, path as *u8, path_len as i64,
+              out as *abi.Statx) as i32 {
+    let is i64 as pc with mut = 0;
+    let is i64 as fc with mut = 0;
+    let is i64 as sz with mut = 0;
+    let is i32 as at with mut = 0;
+    let is i64 as ec with mut = 0;
+    let is i64 as eo with mut = 0;
+    let is i32 as rc = vfs_resolve(priv, path, path_len,
+                                   &pc, &fc, &sz, &at, &ec, &eo);
+    if (rc != 0) { return rc; }
+    out.size = sz;
+    out.first_cluster = fc;
+    out.attr = at;
+    if ((at & ATTR_DIRECTORY) != 0) { out.is_dir = 1; } else { out.is_dir = 0; }
+    // The root '/' case: vfs_resolve returns early without calling dir_find,
+    // so found_ent_wdate/wtime stay 0 — which is the honest "no mtime for
+    // the mount root" answer (Linux does the same: stat / shows mtime 0).
+    out.mtime = rtc.epoch_seconds(found_ent_wdate, found_ent_wtime);
+    return 0;
+}
+
 // Offset-based read that pulls only the requested window — avoids
 // file_read's copy-from-start model so seek + read stays O(n) in
 // bytes requested, not file size.
@@ -2472,6 +2522,7 @@ let is vfs.FileSystemOps as ops_vtable;
 fn vfs_ops_init() as void {
     ops_vtable.resolve      = fn_ptr(vfs_resolve);
     ops_vtable.stat         = fn_ptr(vfs_stat);
+    ops_vtable.statx        = fn_ptr(statx_fill);
     ops_vtable.read         = fn_ptr(vfs_read);
     ops_vtable.write_at     = fn_ptr(vfs_write_at);
     ops_vtable.truncate     = fn_ptr(vfs_truncate);

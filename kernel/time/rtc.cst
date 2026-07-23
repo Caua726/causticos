@@ -34,3 +34,109 @@ fn rtc_read(out as *i64) as void {
     }
     out[0] = 1970; out[1] = 1; out[2] = 1; out[3] = 0; out[4] = 0; out[5] = 0;
 }
+
+// ============================================================
+// DOS date/time + epoch conversion (used by FAT32 timestamps).
+//
+// FAT write-date / write-time on disk are 16-bit DOS format, packed LE:
+//   date = ((year-1980)<<9) | (month<<5) | day        -> 0..65534
+//   time = (hour<<11) | (minute<<5) | (sec/2)         -> 0..65534
+//
+// For SYS_STATX we want a Unix epoch-seconds value. Two helpers:
+//   dos_pack(year, mon, day) -> u16 date
+//   dos_pack_t(hour, min, sec) -> u16 time
+//   dos_unpack_date(u16 date) -> [year, mon, day]
+//   dos_unpack_time(u16 time) -> [hour, min, sec]
+//   epoch_seconds(date16, time16) -> i64 seconds since 1970-01-01 UTC
+//
+// The pack/unpack helpers are pure bit-ops and don't touch the RTC; they
+// take already-decoded values from rtc_read() so callers decide when to
+// snap the clock. epoch_seconds does the full gregorian arithmetic with
+// no leap-second table — accurate to 1980..2100 (FAT32's range), which
+// is plenty for a v0 filesystem timestamp.
+// ============================================================
+
+fn dos_pack_date(year as i64, mon as i64, day as i64) as i64 {
+    let is i64 as y with mut = year - 1980;
+    if (y < 0) { y = 0; }
+    if (y > 127) { y = 127; }
+    return (y << 9) | (mon << 5) | day;
+}
+
+fn dos_pack_time(hour as i64, min as i64, sec as i64) as i64 {
+    let is i64 as s with mut = sec / 2;
+    if (s > 29) { s = 29; }
+    return (hour << 11) | (min << 5) | s;
+}
+
+fn dos_unpack_date(v as i64) as i64 {
+    return 1980 + ((v >> 9) & 0x7F);
+}
+
+// Return [day, month] packed into a [month, day] pair via the caller's
+// two output slots. Saves the helper from needing a struct return.
+fn dos_unpack_date_md(v as i64, mon_out as *i64, day_out as *i64) as void {
+    mon_out[0] = (v >> 5) & 0x0F;
+    day_out[0] = v & 0x1F;
+}
+
+// Days in a non-leap year, indexed by month (1..12).
+let is [13]i64 as DAYS_MONTH with mut;
+let is i64 as days_month_init with mut = 0;
+
+fn days_in_month(mon as i64, year as i64) as i64 {
+    if (days_month_init == 0) {
+        DAYS_MONTH[1] = 31; DAYS_MONTH[2] = 28; DAYS_MONTH[3] = 31;
+        DAYS_MONTH[4] = 30; DAYS_MONTH[5] = 31; DAYS_MONTH[6] = 30;
+        DAYS_MONTH[7] = 31; DAYS_MONTH[8] = 31; DAYS_MONTH[9] = 30;
+        DAYS_MONTH[10] = 31; DAYS_MONTH[11] = 30; DAYS_MONTH[12] = 31;
+        days_month_init = 1;
+    }
+    let is i64 as d with mut = DAYS_MONTH[mon];
+    if (mon == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) { d = d + 1; }
+    return d;
+}
+
+fn is_leap(y as i64) as i64 {
+    if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) { return 1; }
+    return 0;
+}
+
+// epoch_seconds(date16, time16): convert FAT DOS date/time to Unix seconds.
+// Both inputs are raw 16-bit packed values from the SFN (or 0 = unset).
+// Returns 0 if either field is 0 — FAT32's "unset timestamp" sentinel,
+// which callers (ls -l) render as "????-??-?? ??:??".
+fn epoch_seconds(date16 as i64, time16 as i64) as i64 {
+    if (date16 == 0 || time16 == 0) { return 0; }
+    let is i64 as year = 1980 + ((date16 >> 9) & 0x7F);
+    let is i64 as mon = (date16 >> 5) & 0x0F;
+    let is i64 as day = date16 & 0x1F;
+    let is i64 as hour = (time16 >> 11) & 0x1F;
+    let is i64 as min = (time16 >> 5) & 0x3F;
+    let is i64 as sec = (time16 & 0x1F) * 2;
+    // Days from 1970-01-01 to year-01-01:
+    let is i64 as days with mut = 0;
+    let is i64 as y with mut = 1970;
+    while (y < year) {
+        days = days + 365;
+        if (is_leap(y) != 0) { days = days + 1; }
+        y = y + 1;
+    }
+    let is i64 as m with mut = 1;
+    while (m < mon) {
+        days = days + days_in_month(m, year);
+        m = m + 1;
+    }
+    days = days + (day - 1);
+    return days * 86400 + hour * 3600 + min * 60 + sec;
+}
+
+// now_dos(date_out, time_out): read RTC and pack the current moment as a
+// DOS date+time pair. Convenience for fat32.emit_sfn — single call, no
+// two-step (read → pack).
+fn now_dos(date_out as *i64, time_out as *i64) as void {
+    let is [6]i64 as t;
+    rtc_read(cast(*i64, &t[0]));
+    date_out[0] = dos_pack_date(t[0], t[1], t[2]);
+    time_out[0] = dos_pack_time(t[3], t[4], t[5]);
+}
