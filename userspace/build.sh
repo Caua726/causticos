@@ -20,7 +20,7 @@ cd "$OUT"; rm -rf .caustic            # the module cache lands in cwd
 # declares one — non-recursive ones still get an exact computed stack.
 #   core: the shell, the window manager + clients, and the original demos.
 #   file/text tools (category C): share userspace/futil.cst.
-PROGS="shell echo cat ls uptime sysinfo vic compositor wm wmpat wterm newterm guess"
+PROGS="shell echo cat ls uptime sysinfo vic compositor wm wmpat wterm newterm launcher guess"
 PROGS="$PROGS tr wc head tail grep rev tac uniq fold cmp seq cut sort hexdump"
 PROGS="$PROGS tee true false yes comm paste nl basename dirname expand unexpand"
 PROGS="$PROGS nproc sleep expr base64 md5sum poweroff reboot"

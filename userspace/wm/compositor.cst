@@ -29,6 +29,7 @@ use "../../../Caustic/std/causticos/font.cst" as font;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto.cst" as wmp;
 use "../lib/compo_proto.cst" as cp;
+use "../../../Caustic/std/causticos/img/csif.cst" as csif;
 
 let is i64 as IMG_CAP with imut = 4194304;   // 4 MiB ceiling (matches SPAWN_IMG_MAX)
 
@@ -64,6 +65,14 @@ let is i64 as scr_w with mut = 0;
 let is i64 as scr_h with mut = 0;
 let is i64 as scr_pitch with mut = 0;
 let is i64 as fb_base with mut = 0;
+
+// ---- wallpaper (a CSIF image drawn as the desktop base; falls back to the
+// solid COL_DESKTOP fill when absent — never a hang) ----
+let is i64 as wp_ok    with mut = 0;
+let is i64 as wp_w     with mut = 0;
+let is i64 as wp_h     with mut = 0;
+let is i64 as wp_nchan with mut = 0;
+let is i64 as wp_pix   with mut = 0;   // *u8 (interleaved R,G,B[,A]) held as i64
 
 // ---- cursor / button state (the compositor owns pointer normalisation) ----
 let is i64 as mx with mut = 0;
@@ -482,7 +491,7 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
     if (clip_x1 > scr_w) { clip_x1 = scr_w; }
     if (clip_y1 > scr_h) { clip_y1 = scr_h; }
     if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) { return; }
-    cfill(0, 0, scr_w, scr_h, COL_DESKTOP);
+    if (wp_ok == 1) { wp_blit(); } else { cfill(0, 0, scr_w, scr_h, COL_DESKTOP); }
     let is i64 as zi with mut = 0;
     while (zi < comp_nz) {
         let is i64 as i = comp_z[zi];
@@ -584,6 +593,49 @@ fn load_image(path as *u8, out_len as *i64) as i64 {
     if (got <= 0) { return 0; }
     *out_len = got;
     return va;
+}
+
+// wallpaper_init — decode a CSIF background once at startup. Tries /etc/ first,
+// then the root. On any failure wp_ok stays 0 and the desktop uses COL_DESKTOP.
+// The decoded pixels live for the compositor's lifetime (never freed).
+fn wallpaper_init() as void {
+    let is csif.Image as im with mut = csif.load(cast(*u8, "/etc/wallpaper.csif"));
+    if (im.ok == 0) { im = csif.load(cast(*u8, "/wallpaper.csif")); }
+    if (im.ok == 0) { return; }
+    wp_w = im.width; wp_h = im.height; wp_nchan = im.nchan;
+    wp_pix = cast(i64, im.pixels);
+    wp_ok = 1;
+    wmp.log_kv(cast(*u8, "comp: wallpaper w="), 19, wp_w);
+    return;
+}
+
+// wp_blit — fill the current clip box from the wallpaper, nearest-neighbor
+// scaled to the screen. Writes XRGB8888 (alpha ignored — opaque base). Reads
+// the framebuffer directly like cfill, so it is the same cost as the solid fill.
+fn wp_blit() as void {
+    let is i64 as x0 = clip_x0;
+    let is i64 as y0 = clip_y0;
+    let is i64 as x1 = clip_x1;
+    let is i64 as y1 = clip_y1;
+    if (x1 <= x0 || y1 <= y0) { return; }
+    let is *u8 as src = cast(*u8, wp_pix);
+    let is i64 as yy with mut = y0;
+    while (yy < y1) {
+        let is i64 as sy = yy * wp_h / scr_h;
+        let is i64 as srow = sy * wp_w * wp_nchan;
+        let is *u32 as row = cast(*u32, fb_base + yy * scr_pitch);
+        let is i64 as xx with mut = x0;
+        while (xx < x1) {
+            let is i64 as sp = srow + (xx * wp_w / scr_w) * wp_nchan;
+            let is i64 as r = cast(i64, src[sp]);
+            let is i64 as g = cast(i64, src[sp + 1]);
+            let is i64 as b = cast(i64, src[sp + 2]);
+            row[xx] = cast(u32, (r << 16) | (g << 8) | b);
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    return;
 }
 
 // Send one CMD message to the WM.
@@ -931,6 +983,7 @@ fn main() as i32 {
     cur_last_x = mx;
     cur_last_y = my;
     cursor_init();
+    wallpaper_init();       // decode /etc/wallpaper.csif (or /wallpaper.csif) if present
 
     // 3. The two channels.
     let is [2]i64 as cmd_ch;

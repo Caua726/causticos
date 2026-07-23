@@ -561,7 +561,10 @@ fn alloc_win() as i64 {
     return 0 - 1;
 }
 
-fn spawn_client() as void {
+// spawn_client_img — open a window running the CSE image at (cimg, clen), with
+// `cname` as its argv[0] display name. The generic spawn path: the default
+// terminal (spawn_client) and the launcher's spawn-by-name both funnel here.
+fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64) as void {
     let is i64 as i = alloc_win();
     if (i < 0) { return; }
     let is [2]i64 as chans;
@@ -585,11 +588,10 @@ fn spawn_client() as void {
     let is [2]i64 as acts;
     acts[0] = wmp.WM_FD;     // child fd 3 ← side B
     acts[1] = b;
-    // argv = ["wterm"] — DATA, not authority: just the display name for ps/btop.
-    let is *u8 as wt_name = "wterm";
+    // argv = [name] — DATA, not authority: just the display name for ps/btop.
     let is [2]i64 as av;
-    av[0] = cast(i64, wt_name); av[1] = 5;
-    let is i64 as pid = sys.spawn(cast(*u8, img_base), img_len,
+    av[0] = cast(i64, cname); av[1] = cnlen;
+    let is i64 as pid = sys.spawn(cast(*u8, cimg), clen,
                                   cast(*u8, &acts[0]), 1, cast(*u8, &av[0]), 1);
     sys.close(b);
     if (pid < 0) {
@@ -623,6 +625,59 @@ fn spawn_client() as void {
     wins[i].dec_attached = 0;
     set_focus(i);
     wmp.log_kv(cast(*u8, "wm: spawn pid="), 14, pid);
+    return;
+}
+
+// The default client: another windowed terminal (Super+Enter / MSG_SPAWN_REQ).
+fn spawn_client() as void {
+    spawn_client_img(img_base, img_len, cast(*u8, "wterm"), 5);
+    return;
+}
+
+// load_file — read a whole file into a fresh anonymous mapping; returns the
+// buffer VA (0 on any failure) and writes the byte length to *out_len. Unlike
+// load_image it does NOT touch the img_base/img_len globals, so a named spawn
+// never clobbers the default terminal image.
+fn load_file(path as *u8, plen as i64, out_len as *i64) as i64 {
+    *out_len = 0;
+    let is i64 as fd = syscall(9, cast(i64, path), plen, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    let is i64 as IMG_CAP with imut = 4194304;
+    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return 0; }
+    let is i64 as alloc = (sz + 4095) & (0 - 4096);
+    let is i64 as buf = sys.mmap(0, alloc, sys.PROT_READ | sys.PROT_WRITE);
+    if (buf < 0) { sys.close(fd); return 0; }
+    let is i64 as total with mut = 0;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as r = syscall(10, fd, buf + total, sz - total);
+        if (r <= 0) { more = 0; }
+        else { total = total + r; if (total >= sz) { more = 0; } }
+    }
+    sys.close(fd);
+    if (total <= 0) { sys.munmap(buf, alloc); return 0; }
+    *out_len = total;
+    return buf;
+}
+
+// spawn_named — the launcher path: resolve `name` to "/<name>", load it, and
+// spawn it as a window. The image is copied into the child at spawn, so the
+// WM's temporary buffer is freed right after. Fails quietly (a missing/oversized
+// file just doesn't open a window) — never a hang.
+fn spawn_named(name as *u8, nlen as i64) as void {
+    if (nlen <= 0 || nlen > 30) { return; }
+    let is [40]u8 as path;
+    path[0] = cast(u8, 47);                 // '/'
+    let is i64 as k with mut = 0;
+    while (k < nlen) { path[1 + k] = name[k]; k = k + 1; }
+    path[1 + nlen] = cast(u8, 0);
+    let is i64 as flen with mut = 0;
+    let is i64 as buf = load_file(cast(*u8, &path[0]), 1 + nlen, &flen);
+    if (buf == 0) { wmp.log_kv(cast(*u8, "wm: spawn_named miss nlen="), 27, nlen); return; }
+    spawn_client_img(buf, flen, name, nlen);
+    sys.munmap(buf, (flen + 4095) & (0 - 4096));
     return;
 }
 
@@ -753,6 +808,10 @@ fn handle_msg(i as i64, m as *i64) as void {
         reap_window(i, 1);
     } else if (m[0] == wmp.MSG_SPAWN_REQ) {
         spawn_client();
+    } else if (m[0] == wmp.MSG_SPAWN_NAMED) {
+        let is [16]u8 as nm;
+        wmp.title_unpack(m[2], m[3], m[1], cast(*u8, &nm[0]));
+        spawn_named(cast(*u8, &nm[0]), m[1]);
     }
     return;
 }
@@ -848,6 +907,9 @@ fn handle_key(keysym as i64, kb as i64, sc as i64) as void {
     if (pressed == 1) {
         if (mod_alt == 1 && ext == 0 && sc == 0x0F) { cycle_focus(); return; }   // Alt+Tab
         if (mod_super == 1 && sc == 0x1C) { spawn_client(); return; }            // Super+Enter
+        if (mod_super == 1 && sc == 0x39) {                                      // Super+Space
+            spawn_named(cast(*u8, "launcher.cse"), 12); return;                  //   open the app launcher
+        }
         if (mod_super == 1 && sc == 0x10) {                                      // Super+Q
             if (nz > 0) { wins[zord[0]].pend_close = 1; }
             return;
@@ -1236,29 +1298,11 @@ fn service_cmd() as i64 {
 // the real size and allocate only the pages we'll fill (same discipline as the
 // compositor's load_image).
 fn load_image(path as *u8, plen as i64) as i64 {
-    let is i64 as fd = syscall(9, cast(i64, path), plen, 0);
-    if (fd < 0) { return fd; }
-    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
-    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
-    let is i64 as IMG_CAP with imut = 4194304;        // 4 MiB ceiling (matches SPAWN_IMG_MAX)
-    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return 0 - 1; }
-    let is i64 as alloc = (sz + 4095) & (0 - 4096);
-    let is i64 as buf = sys.mmap(0, alloc, sys.PROT_READ | sys.PROT_WRITE);
-    if (buf < 0) { sys.close(fd); return buf; }
-    let is i64 as total with mut = 0;
-    let is i64 as more with mut = 1;
-    while (more == 1) {
-        let is i64 as r = syscall(10, fd, buf + total, sz - total);
-        if (r <= 0) { more = 0; }
-        else {
-            total = total + r;
-            if (total >= sz) { more = 0; }
-        }
-    }
-    sys.close(fd);
-    if (total <= 0) { sys.munmap(buf, alloc); return 0 - 1; }
+    let is i64 as l with mut = 0;
+    let is i64 as buf = load_file(path, plen, &l);
+    if (buf == 0) { return 0 - 1; }
     img_base = buf;
-    img_len = total;
+    img_len = l;
     return 0;
 }
 
@@ -1310,7 +1354,10 @@ fn main() as i32 {
 
     update_clock();
     clock_next = sys.time_ns() + 1000000000;
-    spawn_client();
+    // Open the app launcher at boot (Super+Space reopens it, Super+Enter still
+    // opens a terminal directly). Falls back to a terminal if it isn't on disk.
+    spawn_named(cast(*u8, "launcher.cse"), 12);
+    if (nz == 0) { spawn_client(); }
 
     let is [33]i64 as pe;                            // up to 9 poll entries × 3
     let is [11]i64 as pmap;                          // entry → window (-1 = cmd channel)

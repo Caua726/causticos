@@ -36,6 +36,7 @@ if [ "$MODE" = "wm" ]; then
     # /wm.cse, handing the device fds down via fdacts. Both must be on the disk.
     addf init.cse compositor.cse
     addf wm.cse wm.cse
+    addf launcher.cse launcher.cse
     PROGS="wmpat wterm newterm btop echo cat ls uptime sysinfo vic guess \
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
            touch mkdir rmdir rm mv cp stat du tree find clear \

@@ -1,0 +1,299 @@
+// launcher.cst — a graphical app launcher (a windowed WM client).
+//
+// Scans the FAT32 root for *.cse programs, draws a grid of icon tiles (a CSIF
+// icon from /icons/<name>.csif when present, else a generic lettered tile), and
+// on a click asks the WM to spawn that program as a window (MSG_SPAWN_NAMED).
+// The launcher never holds a spawn key itself — authority stays chained: it
+// asks the WM (its parent), the WM resolves the name and spawns. Icons prove the
+// CSIF decoder end to end (image on disk → decode → blit into a surface).
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../../../Caustic/std/causticos/font.cst" as font;
+use "../../../Caustic/std/causticos/img/csif.cst" as csif;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+
+let is i64 as seg_base   with mut = 0;
+let is i64 as seg_stride with mut = 0;
+let is i64 as win_w with mut = 0;
+let is i64 as win_h with mut = 0;
+
+// ---- app list (flat name pool; base name = filename minus ".cse") ----
+let is i64 as MAXAPP with imut = 32;
+let is i64 as NAMEW  with imut = 16;          // bytes per name slot
+let is [512]u8 as names;                       // MAXAPP*NAMEW
+let is [32]i64 as name_len;
+let is [32]i64 as ico_pix;                     // decoded icon pixels (0 = none)
+let is [32]i64 as ico_w;
+let is [32]i64 as ico_h;
+let is [32]i64 as ico_nc;
+let is i64 as app_count with mut = 0;
+
+// ---- layout / palette ----
+let is i64 as TILE with imut = 104;            // tile cell size (px)
+let is i64 as ICO  with imut = 56;             // icon size within a tile
+let is i64 as PAD  with imut = 12;             // top padding
+let is i64 as COL_BG    with imut = 0x001b2129;
+let is i64 as COL_TILE  with imut = 0x00263039;
+let is i64 as COL_LABEL with imut = 0x00d3d7cf;
+let is i64 as COL_ICO0  with imut = 0x003a4655;
+let is i64 as COL_ICOB  with imut = 0x0073d0ff;
+
+// ============================================================ drawing prims
+fn gpix(x as i64, y as i64, color as i64) as void {
+    if (x < 0 || y < 0 || x >= win_w || y >= win_h) { return; }
+    let is *u32 as p = cast(*u32, seg_base + y * seg_stride + x * 4);
+    p[0] = cast(u32, color);
+    return;
+}
+fn gfill(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
+    let is i64 as yy with mut = y;
+    while (yy < y + h) {
+        let is i64 as xx with mut = x;
+        while (xx < x + w) { gpix(xx, yy, color); xx = xx + 1; }
+        yy = yy + 1;
+    }
+    return;
+}
+// one 8x16 glyph, scaled by sc (each set bit -> sc x sc block).
+fn gglyph(ch as i64, px as i64, py as i64, color as i64, sc as i64) as void {
+    let is *u8 as g = font.get_glyph(cast(i32, ch));
+    let is i64 as row with mut = 0;
+    while (row < 16) {
+        let is i64 as bits = cast(i64, g[row]);
+        let is i64 as col with mut = 0;
+        while (col < 8) {
+            if ((bits & (128 >> col)) != 0) {
+                gfill(px + col * sc, py + row * sc, sc, sc, color);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    return;
+}
+fn gtext(s as *u8, len as i64, x as i64, y as i64, color as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < len) { gglyph(cast(i64, s[i]), x + i * 8, y, color, 1); i = i + 1; }
+    return;
+}
+
+// ============================================================ app discovery
+// ends_cse(name, len) — does name[0..len) end with ".cse"?
+fn ends_cse(nm as *u8, len as i64) as i64 {
+    if (len < 5) { return 0; }
+    if (nm[len-4] == cast(u8, 46) && nm[len-3] == cast(u8, 99)
+        && nm[len-2] == cast(u8, 115) && nm[len-1] == cast(u8, 101)) { return 1; }   // ".cse"
+    return 0;
+}
+// skip the OS internals that aren't launchable-as-app.
+fn is_internal(base as *u8, blen as i64) as i64 {
+    // "init" (the compositor), "wm"
+    if (blen == 4 && base[0]==cast(u8,105) && base[1]==cast(u8,110) && base[2]==cast(u8,105) && base[3]==cast(u8,116)) { return 1; }
+    if (blen == 2 && base[0]==cast(u8,119) && base[1]==cast(u8,109)) { return 1; }
+    return 0;
+}
+// try /icons/<base>.csif → decode, store pixels; else leave ico_pix=0.
+fn load_icon(idx as i64, base as *u8, blen as i64) as void {
+    ico_pix[idx] = 0;
+    if (blen > 22) { return; }
+    let is [40]u8 as path;                     // "/icons/" + base + ".csif"
+    let is *u8 as pfx = "/icons/";
+    let is i64 as o with mut = 0;
+    while (o < 7) { path[o] = pfx[o]; o = o + 1; }
+    let is i64 as i with mut = 0;
+    while (i < blen) { path[7 + i] = base[i]; i = i + 1; }
+    let is *u8 as sfx = ".csif";
+    let is i64 as j with mut = 0;
+    while (j < 6) { path[7 + blen + j] = sfx[j]; j = j + 1; }   // includes NUL
+    let is csif.Image as im = csif.load(cast(*u8, &path[0]));
+    if (im.ok == 0) { return; }
+    ico_pix[idx] = cast(i64, im.pixels);
+    ico_w[idx] = im.width; ico_h[idx] = im.height; ico_nc[idx] = im.nchan;
+    return;
+}
+// scan "/" for *.cse, filling the app list (base names, minus ".cse").
+fn scan_apps() as void {
+    app_count = 0;
+    let is i64 as fd = sys.open_read(cast(*u8, "/"));
+    if (fd < 0) { return; }
+    let is [37]i64 as ent;                     // VfsDirEntry: name[256]+5*i64 = 296 B
+    while (app_count < MAXAPP) {
+        let is i64 as rc = sys.readdir(fd, cast(*u8, &ent[0]));
+        if (rc != 0) { return; }               // E_NOENT = end
+        let is *u8 as nm = cast(*u8, &ent[0]);
+        let is i64 as nlen = ent[32];          // name_len at byte 256 = i64 index 32
+        let is i64 as isdir = ent[36];         // is_dir at byte 288 = index 36
+        if (isdir == 1) { continue; }
+        if (ends_cse(nm, nlen) == 0) { continue; }
+        let is i64 as blen = nlen - 4;         // strip ".cse"
+        if (blen <= 0 || blen >= NAMEW) { continue; }
+        if (is_internal(nm, blen) == 1) { continue; }
+        let is i64 as slot = app_count * NAMEW;
+        let is i64 as k with mut = 0;
+        while (k < blen) { names[slot + k] = nm[k]; k = k + 1; }
+        name_len[app_count] = blen;
+        load_icon(app_count, cast(*u8, &names[slot]), blen);
+        app_count = app_count + 1;
+    }
+    sys.close(fd);
+    return;
+}
+
+// ============================================================ rendering
+fn cols_per_row() as i64 {
+    let is i64 as c = win_w / TILE;
+    if (c < 1) { return 1; }
+    return c;
+}
+// blit app idx's icon into the ICOxICO box at (bx,by): CSIF (nearest-neighbor
+// scaled) if present, else a generic lettered tile.
+fn draw_icon(idx as i64, bx as i64, by as i64) as void {
+    if (ico_pix[idx] != 0) {
+        let is *u8 as src = cast(*u8, ico_pix[idx]);
+        let is i64 as iw = ico_w[idx];
+        let is i64 as ih = ico_h[idx];
+        let is i64 as nc = ico_nc[idx];
+        let is i64 as yy with mut = 0;
+        while (yy < ICO) {
+            let is i64 as sy = yy * ih / ICO;
+            let is i64 as xx with mut = 0;
+            while (xx < ICO) {
+                let is i64 as sp = (sy * iw + (xx * iw / ICO)) * nc;
+                let is i64 as r = cast(i64, src[sp]);
+                let is i64 as g = cast(i64, src[sp + 1]);
+                let is i64 as b = cast(i64, src[sp + 2]);
+                gpix(bx + xx, by + yy, (r << 16) | (g << 8) | b);
+                xx = xx + 1;
+            }
+            yy = yy + 1;
+        }
+        return;
+    }
+    // generic: filled square + border + the base name's first letter (scale 3).
+    gfill(bx, by, ICO, ICO, COL_ICO0);
+    gfill(bx, by, ICO, 2, COL_ICOB);
+    gfill(bx, by + ICO - 2, ICO, 2, COL_ICOB);
+    gfill(bx, by, 2, ICO, COL_ICOB);
+    gfill(bx + ICO - 2, by, 2, ICO, COL_ICOB);
+    let is i64 as ch = cast(i64, names[idx * NAMEW]);
+    gglyph(ch, bx + (ICO - 24) / 2, by + (ICO - 48) / 2, COL_LABEL, 3);
+    return;
+}
+fn paint() as void {
+    gfill(0, 0, win_w, win_h, COL_BG);
+    let is i64 as cols = cols_per_row();
+    let is i64 as i with mut = 0;
+    while (i < app_count) {
+        let is i64 as cx = i - (i / cols) * cols;   // i % cols
+        let is i64 as cy = i / cols;
+        let is i64 as tx = cx * TILE;
+        let is i64 as ty = PAD + cy * TILE;
+        // tile background
+        gfill(tx + 4, ty, TILE - 8, TILE - 6, COL_TILE);
+        draw_icon(i, tx + (TILE - ICO) / 2, ty + 8);
+        // label: base name, centered, clipped to the tile width
+        let is i64 as blen = name_len[i];
+        let is i64 as lw = blen * 8;
+        let is i64 as lx with mut = tx + (TILE - lw) / 2;
+        if (lx < tx + 4) { lx = tx + 4; }
+        gtext(cast(*u8, &names[i * NAMEW]), blen, lx, ty + 8 + ICO + 6, COL_LABEL);
+        i = i + 1;
+    }
+    return;
+}
+fn commit_full() as void {
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_COMMIT, 0, 0, wmp.pack_wh(win_w, win_h));
+    return;
+}
+
+// click at content (cx,cy) → the app index under it, or -1.
+fn hit(cx as i64, cy as i64) as i64 {
+    if (cy < PAD) { return 0 - 1; }
+    let is i64 as cols = cols_per_row();
+    let is i64 as col = cx / TILE;
+    let is i64 as rowi = (cy - PAD) / TILE;
+    if (col >= cols) { return 0 - 1; }
+    let is i64 as idx = rowi * cols + col;
+    if (idx < 0 || idx >= app_count) { return 0 - 1; }
+    return idx;
+}
+// ask the WM to spawn app idx: send "<base>.cse" via MSG_SPAWN_NAMED.
+fn launch(idx as i64) as void {
+    let is i64 as blen = name_len[idx];
+    let is [16]u8 as full;
+    let is i64 as k with mut = 0;
+    while (k < blen && k < 12) { full[k] = names[idx * NAMEW + k]; k = k + 1; }
+    let is *u8 as ext = ".cse";
+    let is i64 as e with mut = 0;
+    while (e < 4) { full[k + e] = ext[e]; e = e + 1; }
+    let is i64 as flen = k + 4;
+    let is [2]i64 as tb;
+    wmp.title_pack(cast(*u8, &full[0]), flen, &tb[0], &tb[1]);
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_SPAWN_NAMED, flen, tb[0], tb[1]);
+    return;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is [4]i64 as m;
+    let is [32]u8 as acc;
+    let is i64 as fill with mut = 0;
+
+    let is i64 as got with mut = 0;
+    while (got != 1) {
+        got = wmp.msg_read(wmp.WM_FD, &fill, cast(*u8, &acc[0]), &m[0]);
+        if (got < 0) { return 1; }
+    }
+    if (m[0] != wmp.MSG_WELCOME) { return 1; }
+    let is i64 as screen_w = m[1];
+    win_w = wmp.unpack_w(m[3]);
+    win_h = wmp.unpack_h(m[3]);
+    seg_stride = screen_w * 4;
+
+    let is i64 as npages = (screen_w * m[2] * 4 + 4095) / 4096;
+    let is i64 as seg = sys.seg_create(npages, 0);
+    if (seg < 0) { return 2; }
+    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
+    if (va < 0) { return 2; }
+    seg_base = va;
+    if (sys.fd_send(wmp.WM_FD, seg) != 0) { return 3; }
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_HELLO, npages, seg_stride, wmp.PROTO_VER);
+    let is [2]i64 as tb;
+    wmp.title_pack(cast(*u8, "Launcher"), 8, &tb[0], &tb[1]);
+    wmp.msg_send(wmp.WM_FD, wmp.MSG_SET_TITLE, 8, tb[0], tb[1]);
+
+    font.init();
+    scan_apps();
+    paint();
+    commit_full();
+
+    let is i64 as mb_prev with mut = 0;          // previous mouse-button mask
+    let is [3]i64 as pe;
+    while (1 == 1) {
+        pe[0] = wmp.WM_FD; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        sys.poll(&pe[0], 1, 0 - 1);
+        let is i64 as r = wmp.msg_read(wmp.WM_FD, &fill, cast(*u8, &acc[0]), &m[0]);
+        if (r < 0) { return 0; }
+        if (r == 1) {
+            if (m[0] == wmp.MSG_MOUSE_BTN) {
+                let is i64 as btn = m[1];
+                if ((btn & 1) != 0 && (mb_prev & 1) == 0) {   // left-button rising edge
+                    let is i64 as idx = hit(m[2], m[3]);
+                    if (idx >= 0) { launch(idx); }
+                }
+                mb_prev = btn;
+            } else if (m[0] == wmp.MSG_RESIZE) {
+                win_w = m[1]; win_h = m[2];
+                paint(); commit_full();
+            } else if (m[0] == wmp.MSG_KEY) {
+                if (cp.key_pressed(m[2]) == 1 && m[1] == 27) {   // Esc closes
+                    wmp.msg_send(wmp.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+                    return 0;
+                }
+            } else if (m[0] == wmp.MSG_CLOSE_REQ) {
+                wmp.msg_send(wmp.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
