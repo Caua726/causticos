@@ -1453,6 +1453,69 @@ fn sleep_locked_and_yield(saved_flags as i64) as void {
     schedule();
 }
 
+// ============================================================
+// Poll parking (§ idle cost)
+// ============================================================
+// A thread with nothing ready used to sleep 1 ms and ask again. That is a
+// thousand wake-ups a second PER WAITER, and it is the entire idle cost of a
+// desktop: measured, a still machine burned 24% of a host core, and raising
+// the interval fourfold cut it fourfold — the work per wake is nothing, the
+// wake itself is everything.
+//
+// Now a waiter PARKS and whoever changes a readiness answer wakes it. The park
+// still carries a deadline, and that deadline is capped: it bounds a wakeup
+// that never comes (a future object whose writer forgets to call poll_wake) to
+// one cap instead of a hang. The cap is a safety net on a liveness hazard, not
+// the mechanism — events wake a parked poller immediately.
+let is i64 as POLL_PARK_CAP_NS = 50000000;      // 50 ms
+let is i64 as THR_POLL_PARKED = 336;            // reserved slot in the thread struct
+
+fn poll_park(deadline as i64) as void {
+    let is i64 as tid = current_tid();
+    if (tid < 0) { return; }
+    let is i64 as now = timer.current_time_ns();
+    let is i64 as wake_at with mut = now + POLL_PARK_CAP_NS;
+    if (deadline > 0 && deadline < wake_at) { wake_at = deadline; }
+    let is i64 as cpu = thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    if (thr_state(tid) != THREAD_RUNNING) {
+        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        return;
+    }
+    thr_set(tid, 272, wake_at);                 // sleep_until_ns
+    thr_set(tid, THR_POLL_PARKED, 1);
+    thr_set(tid, 8, THREAD_SLEEPING);
+    set_nr_running(cpu, nr_running(cpu) - 1);
+    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
+    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    schedule();
+    thr_set(tid, THR_POLL_PARKED, 0);
+}
+
+// poll_wake — something happened that a poll could be waiting on: bytes into a
+// channel, an event posted, a device ring filled, an endpoint closed. Wakes
+// every parked poller; they re-ask and go back to sleep if it was not theirs.
+// A broadcast is right here: the waiters are a handful of desktop processes,
+// and per-object wait lists would buy nothing at this scale.
+//
+// Safe from an IRQ handler: wakeup_thread takes the target cpu's sched_lock
+// with acquire_irq, and a cpu holding that lock runs with interrupts off, so
+// the handler cannot have preempted a holder on this cpu.
+fn poll_wake() as void {
+    let is i64 as ntid = next_tid;
+    let is i64 as tid with mut = 0;
+    while (tid < ntid) {
+        if (thread_ptr(tid) != 0) {
+            if (thr_get(tid, THR_POLL_PARKED) == 1 && thr_state(tid) == THREAD_SLEEPING) {
+                thr_set(tid, THR_POLL_PARKED, 0);
+                wakeup_thread(tid);
+            }
+        }
+        tid = tid + 1;
+    }
+    return;
+}
+
 fn wakeup_thread(tid as i64) as void {
     let is i64 as cpu = thr_home_cpu(tid);
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
