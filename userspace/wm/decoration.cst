@@ -1,0 +1,221 @@
+// wm/decoration.cst — titlebar strip + global taskbar + clock. Reads/mutates
+// the decoration cell grids (per-window + the global taskbar segment) and the
+// clock string. State lives in state.cst.
+
+use "state.cst" as s;
+use "damage.cst" as dmg;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+fn dec_handoff(seg_fd as i64, win_id as i64, npages as i64, cols as i64, rows as i64) as i64 {
+    let is i64 as tries with mut = 0;
+    while (tries < 1000) {
+        let is i64 as fr = sys.fd_send(s.wc_fd, seg_fd);
+        if (fr == 0) {
+            cp.msg_send(s.wc_fd, cp.MSG_WC_DEC_SURFACE, win_id, npages,
+                (cols & 0xFFFFFFFF) | ((rows & 0xFFFFFFFF) << 32));
+            return 0;
+        }
+        if (fr != sys.E_AGAIN) { return 0 - 1; }
+        tries = tries + 1;
+        sys.poll(cast(*i64, 0), 0, 200000);
+    }
+    return 0 - 1;
+}
+
+fn dec_set_header(base as i64, cols as i64, rows as i64) as void {
+    let is *i64 as h = cast(*i64, base);
+    h[cp.DEC_H_COLS] = cols;
+    h[cp.DEC_H_ROWS] = rows;
+    return;
+}
+
+fn dec_cell_ptr(base as i64, idx as i64) as *i64 {
+    return cast(*i64, base + cp.DEC_HDR_CELLS * 8 + idx * 8);
+}
+
+fn titlebar_ensure(i as i64) as i64 {
+    if (s.wins[i].dec_fd != 0) { return 0; }
+    let is i64 as cols = s.scr_w / 8;
+    let is i64 as pages = cp.dec_seg_pages(cols, 1);
+    let is i64 as seg = sys.seg_create(pages, 0);
+    if (seg < 0) { return 0 - 1; }
+    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
+    if (va < 0) { sys.close(seg); return 0 - 1; }
+    s.wins[i].dec_fd = seg;
+    s.wins[i].dec_base = va;
+    s.wins[i].dec_pages = pages;
+    dec_set_header(va, cols, 1);
+    if (dec_handoff(seg, i, pages, cols, 1) != 0) { return 0 - 1; }
+    s.wins[i].dec_attached = 1;
+    return 0;
+}
+
+fn render_titlebar(i as i64) as void {
+    if (titlebar_ensure(i) != 0) { return; }
+    let is i64 as cols = s.wins[i].w / 8;
+    if (cols <= 0) { return; }
+    let is i64 as focused with mut = 0;
+    if (s.nz > 0 && s.zord[0] == i && s.wins[i].minimized == 0) { focused = 1; }
+    let is i64 as tcol with mut = s.COL_TITLE_U;
+    if (focused == 1) { tcol = s.COL_TITLE_F; }
+    dec_set_header(s.wins[i].dec_base, cols, 1);
+    let is i64 as c with mut = 0;
+    while (c < cols) {
+        let is *i64 as cell = dec_cell_ptr(s.wins[i].dec_base, c);
+        cell[0] = cp.make_cell(0, s.COL_TEXT, tcol);
+        c = c + 1;
+    }
+    let is i64 as btn_cols = 3 * (s.BTN_W / 8);
+    let is i64 as title_max = cols - btn_cols - 1;
+    if (s.wins[i].title_len > 0 && title_max > 0) {
+        let is [16]u8 as tb;
+        wmp.title_unpack(s.wins[i].t0, s.wins[i].t1, s.wins[i].title_len, cast(*u8, &tb[0]));
+        let is i64 as k with mut = 0;
+        while (k < s.wins[i].title_len && k < title_max) {
+            let is *i64 as cell = dec_cell_ptr(s.wins[i].dec_base, k);
+            cell[0] = cp.make_cell(cast(i64, tb[k]), s.COL_TEXT, tcol);
+            k = k + 1;
+        }
+    }
+    let is i64 as per = s.BTN_W / 8;
+    let is i64 as close0 = cols - per;
+    let is i64 as max0   = cols - 2 * per;
+    let is i64 as min0   = cols - 3 * per;
+    let is i64 as tb_y = s.wins[i].y + s.BORDER;
+    let is i64 as right = s.wins[i].x + s.BORDER + s.wins[i].w;
+    let is i64 as cbx = right - s.BTN_W;
+    let is i64 as close_hover with mut = 0;
+    if (s.mx >= cbx && s.mx < right && s.my >= tb_y && s.my < tb_y + s.TITLE_H) { close_hover = 1; }
+    if (min0 >= 0) {
+        let is *i64 as cm = dec_cell_ptr(s.wins[i].dec_base, min0 + 1);
+        cm[0] = cp.make_cell(cast(i64, 95), s.COL_TEXT, tcol);
+    }
+    if (max0 >= 0) {
+        let is *i64 as cx2 = dec_cell_ptr(s.wins[i].dec_base, max0 + 1);
+        cx2[0] = cp.make_cell(cast(i64, 91), s.COL_TEXT, tcol);
+    }
+    if (close0 >= 0) {
+        let is i64 as cbg with mut = tcol;
+        if (close_hover == 1) { cbg = s.COL_CLOSE_H; }
+        let is i64 as cc with mut = 0;
+        while (cc < per) {
+            let is *i64 as cl = dec_cell_ptr(s.wins[i].dec_base, close0 + cc);
+            let is i64 as ch with mut = 0;
+            if (cc == 1) { ch = cast(i64, 120); }
+            cl[0] = cp.make_cell(ch, s.COL_TEXT, cbg);
+            cc = cc + 1;
+        }
+    }
+    dmg.dmg_add(s.wins[i].x + s.BORDER, s.wins[i].y + s.BORDER, s.wins[i].w, s.TITLE_H);
+    return;
+}
+
+fn fmt2(off as i64, v as i64) as void {
+    s.clock_str[off] = cast(u8, 48 + v / 10);
+    s.clock_str[off + 1] = cast(u8, 48 + v - (v / 10) * 10);
+    return;
+}
+
+fn update_clock() as void {
+    let is [6]i64 as t;
+    if (sys.time_wall(cast(*i64, &t[0])) != 0) { return; }
+    fmt2(0, t[3]); s.clock_str[2] = cast(u8, 58);
+    fmt2(3, t[4]); s.clock_str[5] = cast(u8, 58);
+    fmt2(6, t[5]);
+    s.clock_len = 8;
+    return;
+}
+
+fn taskbar_ensure() as i64 {
+    if (s.tb_dec_fd != 0) { return 0; }
+    let is i64 as cols = s.scr_w / 8;
+    let is i64 as pages = cp.dec_seg_pages(cols, 1);
+    let is i64 as seg = sys.seg_create(pages, 0);
+    if (seg < 0) { return 0 - 1; }
+    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
+    if (va < 0) { sys.close(seg); return 0 - 1; }
+    s.tb_dec_fd = seg;
+    s.tb_dec_base = va;
+    s.tb_dec_pages = pages;
+    s.tb_cols = cols;
+    dec_set_header(va, cols, 1);
+    if (dec_handoff(seg, cp.DEC_TASKBAR_ID, pages, cols, 1) != 0) {
+        sys.munmap(va, pages * 4096); sys.close(seg);
+        s.tb_dec_fd = 0; s.tb_dec_base = 0;
+        return 0 - 1;
+    }
+    s.tb_attached = 1;
+    return 0;
+}
+
+fn tb_puts(col as i64, s_in as *u8, len as i64, fg as i64, bg as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < len && col + k < s.tb_cols) {
+        let is *i64 as cell = dec_cell_ptr(s.tb_dec_base, col + k);
+        cell[0] = cp.make_cell(cast(i64, s_in[k]), fg, bg);
+        k = k + 1;
+    }
+    return;
+}
+
+fn render_taskbar() as void {
+    if (taskbar_ensure() != 0) { return; }
+    dec_set_header(s.tb_dec_base, s.tb_cols, 1);
+    let is i64 as c with mut = 0;
+    while (c < s.tb_cols) {
+        let is *i64 as cell = dec_cell_ptr(s.tb_dec_base, c);
+        cell[0] = cp.make_cell(0, s.COL_TEXT, s.COL_BAR);
+        c = c + 1;
+    }
+    let is i64 as task_cols = s.TASK_W / 8;
+    let is i64 as col with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2) {
+            let is i64 as active with mut = 0;
+            if (s.nz > 0 && s.zord[0] == i && s.wins[i].minimized == 0) { active = 1; }
+            let is i64 as bg with mut = s.COL_BAR_ITEM;
+            if (active == 1) { bg = s.COL_TITLE_F; }
+            let is i64 as fg with mut = s.COL_TEXT;
+            if (s.wins[i].minimized == 1) { fg = s.COL_BAR_DIM; }
+            let is i64 as bc with mut = 0;
+            while (bc < task_cols && col + bc < s.tb_cols) {
+                let is *i64 as cell = dec_cell_ptr(s.tb_dec_base, col + bc);
+                cell[0] = cp.make_cell(0, fg, bg);
+                bc = bc + 1;
+            }
+            if (s.wins[i].title_len > 0) {
+                let is [16]u8 as tbn;
+                wmp.title_unpack(s.wins[i].t0, s.wins[i].t1, s.wins[i].title_len, cast(*u8, &tbn[0]));
+                let is i64 as ll with mut = s.wins[i].title_len;
+                if (ll > task_cols - 1) { ll = task_cols - 1; }
+                tb_puts(col + 1, cast(*u8, &tbn[0]), ll, fg, bg);
+            }
+            col = col + task_cols + 1;
+        }
+        i = i + 1;
+    }
+    if (s.clock_len > 0) {
+        let is i64 as cc = s.tb_cols - s.clock_len - 1;
+        tb_puts(cc, cast(*u8, &s.clock_str[0]), s.clock_len, s.COL_TEXT, s.COL_BAR);
+    }
+    dmg.dmg_add(0, s.scr_h - s.BAR_H, s.scr_w, s.BAR_H);
+    return;
+}
+
+// Render every live, non-minimised window's titlebar, then the global taskbar.
+fn render_all_decorations() as void {
+    if (s.deco_dirty == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0) {
+            render_titlebar(i);
+        }
+        i = i + 1;
+    }
+    render_taskbar();
+    s.deco_dirty = 0;
+    return;
+}

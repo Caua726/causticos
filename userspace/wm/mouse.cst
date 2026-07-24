@@ -1,0 +1,265 @@
+// wm/mouse.cst — pointer state + drag state machine + hit-test + cursor shape.
+// Forward relative coords to focused child as MSG_MOUSE_BTN / MSG_MOUSE_WHEEL.
+
+use "state.cst" as s;
+use "window.cst" as win;
+use "damage.cst" as dmg;
+use "client.cst" as cli;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+// Forward a mouse event (BTN or WHEEL) to window i in client-relative coords.
+// rx/ry already adjusted for the window's frame.
+fn forward_mouse(i as i64, mtype as i64, a as i64) as void {
+    if (s.wins[i].state != 2) { return; }
+    let is i64 as rx = s.mx - (s.wins[i].x + s.BORDER);
+    let is i64 as ry = s.my - (s.wins[i].y + s.BORDER + s.TITLE_H);
+    if (rx < 0 || ry < 0 || rx >= s.wins[i].w || ry >= s.wins[i].h) { return; }
+    if (s.quota[i] < 2 && cli.chan_writable_now(i) == 1) {
+        wmp.msg_send(s.wins[i].chan, mtype, a, rx, ry);
+        s.quota[i] = s.quota[i] + 1;
+    } else {
+        s.wins[i].drops = s.wins[i].drops + 1;
+        if (s.wins[i].drops > s.MAX_DROPS) { cli.reap_window(i, 0); }
+    }
+    return;
+}
+
+fn titlebar_button_at(i as i64) as i64 {
+    let is i64 as tb_y0 = s.wins[i].y + s.BORDER;
+    if (s.my < tb_y0 || s.my >= tb_y0 + s.TITLE_H) { return 0; }
+    let is i64 as right = s.wins[i].x + s.BORDER + s.wins[i].w;
+    if (s.mx >= right - s.BTN_W && s.mx < right) { return 1; }
+    if (s.mx >= right - 2 * s.BTN_W && s.mx < right - s.BTN_W) { return 2; }
+    if (s.mx >= right - 3 * s.BTN_W && s.mx < right - 2 * s.BTN_W) { return 3; }
+    return 0;
+}
+
+// Taskbar hit-test: returns the window idx whose taskbar button covers mx/my.
+fn taskbar_window_at() as i64 {
+    if (s.my < s.scr_h - s.BAR_H) { return 0 - 1; }
+    let is i64 as bx with mut = 4;
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2) {
+            if (s.mx >= bx && s.mx < bx + s.TASK_W) { return i; }
+            bx = bx + s.TASK_W + 4;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn taskbar_click() as void {
+    let is i64 as i = taskbar_window_at();
+    if (i < 0) { return; }
+    if (s.wins[i].minimized == 1) { win.win_unminimize(i); win.win_focus(i); return; }
+    if (s.nz > 0 && s.zord[0] == i) { win.win_minimize(i); return; }
+    win.win_focus(i);
+    return;
+}
+
+// Hit-test on click: taskbar first, then iterates zord top-down to find the
+// window under the cursor. Sets focus, checks titlebar buttons, then edge
+// resize, then starts a drag.
+fn press_at() as void {
+    if (s.my >= s.scr_h - s.BAR_H) { taskbar_click(); return; }
+    let is i64 as zi with mut = 0;
+    while (zi < s.nz) {
+        let is i64 as i = s.zord[zi];
+        if (s.wins[i].used == 1 && s.wins[i].state == 2) {
+            let is i64 as fx = s.wins[i].x;
+            let is i64 as fy = s.wins[i].y;
+            let is i64 as fw = s.wins[i].w + 2 * s.BORDER;
+            let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
+            if (s.mx >= fx && s.mx < fx + fw && s.my >= fy && s.my < fy + fh) {
+                win.win_focus(i);
+                if (s.mod_super == 1) { start_move(i); return; }
+                let is i64 as btn = titlebar_button_at(i);
+                if (btn == 1) { s.wins[i].pend_close = 1; return; }
+                if (btn == 2) { win.win_toggle_max(i); return; }
+                if (btn == 3) { win.win_minimize(i); return; }
+                let is i64 as dirs with mut = 0;
+                if (s.mx < fx + s.EDGE) { dirs = dirs | s.DIR_W; }
+                if (s.mx >= fx + fw - s.EDGE) { dirs = dirs | s.DIR_E; }
+                if (s.my < fy + s.EDGE) { dirs = dirs | s.DIR_N; }
+                if (s.my >= fy + fh - s.EDGE) { dirs = dirs | s.DIR_S; }
+                if (dirs != 0) { start_resize(i, dirs); return; }
+                if (s.my < fy + s.BORDER + s.TITLE_H) {
+                    let is i64 as now = sys.time_ns();
+                    if (s.last_click_win == i && now - s.last_click_ns < s.DCLICK_NS) {
+                        s.last_click_ns = 0; s.last_click_win = 0 - 1;
+                        win.win_toggle_max(i); return;
+                    }
+                    s.last_click_ns = now; s.last_click_win = i;
+                    start_move(i); return;
+                }
+                forward_mouse(i, wmp.MSG_MOUSE_BTN, s.mbuttons);
+                return;
+            }
+        }
+        zi = zi + 1;
+    }
+    return;
+}
+
+fn mouse_buttons(oldb as i64, newb as i64) as void {
+    let is i64 as lp_old = oldb & 1;
+    let is i64 as lp_new = newb & 1;
+    s.mbuttons = newb;
+    if (lp_old == 0 && lp_new == 1) { press_at(); return; }
+    if (lp_old == 1 && lp_new == 0) {
+        if (s.drag_mode == 1) {
+            if (s.my <= s.SNAP_PX) { win.win_maximize(s.drag_win); }
+            else if (s.mx <= s.SNAP_PX) { win.win_snap(s.drag_win, 0); }
+            else if (s.mx >= s.scr_w - s.SNAP_PX) { win.win_snap(s.drag_win, 1); }
+            s.drag_mode = 0; return;
+        }
+        if (s.drag_mode != 0) { s.drag_mode = 0; return; }
+        if (s.nz > 0) { forward_mouse(s.zord[0], wmp.MSG_MOUSE_BTN, newb); }
+        return;
+    }
+    if (s.nz > 0) { forward_mouse(s.zord[0], wmp.MSG_MOUSE_BTN, newb); }
+    return;
+}
+
+fn start_move(i as i64) as void {
+    if (s.wins[i].maximized == 1) {
+        let is i64 as nw = s.wins[i].sav_w;
+        let is i64 as nh = s.wins[i].sav_h;
+        let is i64 as nx with mut = s.mx - nw / 2;
+        let is i64 as ny with mut = s.my - s.TITLE_H / 2;
+        if (nx < 0) { nx = 0; }
+        if (ny < 0) { ny = 0; }
+        if (nx + nw + 2 * s.BORDER > s.scr_w) { nx = s.scr_w - nw - 2 * s.BORDER; }
+        win.win_set_geom(i, nx, ny, nw, nh);
+        s.wins[i].maximized = 0;
+    }
+    s.drag_mode = 1;
+    s.drag_win = i;
+    s.drag_ax = s.mx; s.drag_ay = s.my;
+    s.drag_ox = s.wins[i].x; s.drag_oy = s.wins[i].y;
+    s.drag_ow = s.wins[i].w; s.drag_oh = s.wins[i].h;
+    return;
+}
+
+fn start_resize(i as i64, dirs as i64) as void {
+    s.drag_mode = 2;
+    s.drag_win = i;
+    s.drag_dirs = dirs;
+    s.drag_ax = s.mx; s.drag_ay = s.my;
+    s.drag_ox = s.wins[i].x; s.drag_oy = s.wins[i].y;
+    s.drag_ow = s.wins[i].w; s.drag_oh = s.wins[i].h;
+    return;
+}
+
+fn resize_shape(dirs as i64) as i64 {
+    let is i64 as nn = dirs & s.DIR_N; let is i64 as ss = dirs & s.DIR_S;
+    let is i64 as ww = dirs & s.DIR_W; let is i64 as ee = dirs & s.DIR_E;
+    if ((nn != 0 && ww != 0) || (ss != 0 && ee != 0)) { return s.CUR_NWSE; }
+    if ((nn != 0 && ee != 0) || (ss != 0 && ww != 0)) { return s.CUR_NESW; }
+    if (ww != 0 || ee != 0) { return s.CUR_EW; }
+    return s.CUR_NS;
+}
+
+// Decide the contextual cursor shape for the current mx/my. Mirrors press_at
+// (sans state mutation) so the cursor can update between clicks too.
+fn cursor_shape_for() as i64 {
+    if (s.drag_mode == 1) { return s.CUR_MOVE; }
+    if (s.drag_mode == 2) { return resize_shape(s.drag_dirs); }
+    if (s.my >= s.scr_h - s.BAR_H) { return s.CUR_ARROW; }
+    let is i64 as zi with mut = 0;
+    while (zi < s.nz) {
+        let is i64 as i = s.zord[zi];
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0) {
+            let is i64 as fx = s.wins[i].x; let is i64 as fy = s.wins[i].y;
+            let is i64 as fw = s.wins[i].w + 2 * s.BORDER; let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
+            if (s.mx >= fx && s.mx < fx + fw && s.my >= fy && s.my < fy + fh) {
+                let is i64 as dirs with mut = 0;
+                if (s.mx < fx + s.EDGE)       { dirs = dirs | s.DIR_W; }
+                if (s.mx >= fx + fw - s.EDGE) { dirs = dirs | s.DIR_E; }
+                if (s.my < fy + s.EDGE)       { dirs = dirs | s.DIR_N; }
+                if (s.my >= fy + fh - s.EDGE) { dirs = dirs | s.DIR_S; }
+                if (dirs != 0) { return resize_shape(dirs); }
+                if (s.my < fy + s.BORDER + s.TITLE_H) { return s.CUR_ARROW; }
+                return s.CUR_IBEAM;
+            }
+        }
+        zi = zi + 1;
+    }
+    return s.CUR_ARROW;
+}
+
+// Apply the cursor move: drag geometry, then damage the old + new cursor box,
+// then re-evaluate the close-button hover, then refresh the cursor shape.
+fn mouse_apply_motion() as void {
+    if (s.drag_mode == 1) {
+        let is i64 as i = s.drag_win;
+        let is i64 as fw = s.wins[i].w + 2 * s.BORDER;
+        let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
+        let is i64 as nx2 with mut = s.drag_ox + (s.mx - s.drag_ax);
+        let is i64 as ny2 with mut = s.drag_oy + (s.my - s.drag_ay);
+        if (nx2 < 0) { nx2 = 0; }
+        if (ny2 < 0) { ny2 = 0; }
+        if (nx2 + fw > s.scr_w) { nx2 = s.scr_w - fw; }
+        if (ny2 + fh > s.scr_h) { ny2 = s.scr_h - fh; }
+        if (nx2 != s.wins[i].x || ny2 != s.wins[i].y) {
+            dmg.dmg_frame(i);
+            s.wins[i].x = nx2;
+            s.wins[i].y = ny2;
+            dmg.dmg_frame(i);
+            s.scene_dirty = 1;
+            s.deco_dirty = 1;
+        }
+    } else if (s.drag_mode == 2) {
+        let is i64 as i = s.drag_win;
+        let is i64 as nw with mut = s.drag_ow;
+        let is i64 as nh with mut = s.drag_oh;
+        let is i64 as nx with mut = s.drag_ox;
+        let is i64 as ny with mut = s.drag_oy;
+        if ((s.drag_dirs & s.DIR_E) != 0) { nw = s.drag_ow + (s.mx - s.drag_ax); }
+        if ((s.drag_dirs & s.DIR_S) != 0) { nh = s.drag_oh + (s.my - s.drag_ay); }
+        if ((s.drag_dirs & s.DIR_W) != 0) { nw = s.drag_ow - (s.mx - s.drag_ax); }
+        if ((s.drag_dirs & s.DIR_N) != 0) { nh = s.drag_oh - (s.my - s.drag_ay); }
+        if (nw < s.MIN_W) { nw = s.MIN_W; }
+        if (nh < s.MIN_H) { nh = s.MIN_H; }
+        if (nw > s.scr_w - 2 * s.BORDER) { nw = s.scr_w - 2 * s.BORDER; }
+        if (nh > s.scr_h - s.TITLE_H - 2 * s.BORDER) { nh = s.scr_h - s.TITLE_H - 2 * s.BORDER; }
+        if ((s.drag_dirs & s.DIR_W) != 0) { nx = s.drag_ox + (s.drag_ow - nw); }
+        if ((s.drag_dirs & s.DIR_N) != 0) { ny = s.drag_oy + (s.drag_oh - nh); }
+        if (nx < 0) { nw = nw + nx; nx = 0; }
+        if (ny < 0) { nh = nh + ny; ny = 0; }
+        if (nx + nw + 2 * s.BORDER > s.scr_w) { nw = s.scr_w - 2 * s.BORDER - nx; }
+        if (ny + nh + s.TITLE_H + 2 * s.BORDER > s.scr_h) { nh = s.scr_h - s.TITLE_H - 2 * s.BORDER - ny; }
+        if (nw != s.wins[i].w || nh != s.wins[i].h || nx != s.wins[i].x || ny != s.wins[i].y) {
+            dmg.dmg_frame(i);
+            s.wins[i].x = nx; s.wins[i].y = ny;
+            s.wins[i].w = nw; s.wins[i].h = nh;
+            dmg.dmg_frame(i);
+            s.scene_dirty = 1;
+            s.deco_dirty = 1;
+            s.wins[i].pend_resize_w = nw;
+            s.wins[i].pend_resize_h = nh;
+        }
+    }
+    dmg.dmg_add(s.mx - 13, s.my - 13, 28, 32);
+    let is i64 as hov with mut = 0 - 1;
+    if (s.nz > 0) {
+        let is i64 as f = s.zord[0];
+        let is i64 as right = s.wins[f].x + s.BORDER + s.wins[f].w;
+        let is i64 as tby = s.wins[f].y + s.BORDER;
+        if (s.mx >= right - s.BTN_W && s.mx < right && s.my >= tby && s.my < tby + s.TITLE_H) { hov = f; }
+    }
+    if (hov != s.close_hover_win) {
+        s.close_hover_win = hov;
+        s.deco_dirty = 1;
+        if (s.nz > 0) {
+            let is i64 as f2 = s.zord[0];
+            dmg.dmg_add(s.wins[f2].x + s.BORDER + s.wins[f2].w - 3 * s.BTN_W,
+                      s.wins[f2].y + s.BORDER, 3 * s.BTN_W, s.TITLE_H);
+        }
+    }
+    s.cur_shape = cursor_shape_for();
+    return;
+}

@@ -1,0 +1,301 @@
+// wm/client.cst — client lifecycle + per-client message handling. Loads the
+// spawned image, wires up its end of the WM channel, and drains per-window
+// messages (HELLO/COMMIT/SET_TITLE/CLOSE/SPAWN_*).
+
+use "state.cst" as s;
+use "window.cst" as win;
+use "damage.cst" as dmg;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+fn load_file_into(path as *u8, plen as i64, out_len as *i64) as i64 {
+    *out_len = 0;
+    let is i64 as fd = syscall(9, cast(i64, path), plen, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0 || sz > 4194304) { sys.close(fd); return 0; }
+    let is i64 as alloc = (sz + 4095) & (0 - 4096);
+    let is i64 as buf = sys.mmap(0, alloc, sys.PROT_READ | sys.PROT_WRITE);
+    if (buf < 0) { sys.close(fd); return 0; }
+    let is i64 as total with mut = 0;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as r = syscall(10, fd, buf + total, sz - total);
+        if (r <= 0) { more = 0; }
+        else { total = total + r; if (total >= sz) { more = 0; } }
+    }
+    sys.close(fd);
+    if (total <= 0) { sys.munmap(buf, alloc); return 0; }
+    *out_len = total;
+    return buf;
+}
+
+fn load_image(path as *u8, plen as i64) as i64 {
+    let is i64 as l with mut = 0;
+    let is i64 as buf = load_file_into(path, plen, &l);
+    if (buf == 0) { return 0 - 1; }
+    s.img_base = buf;
+    s.img_len = l;
+    return 0;
+}
+
+fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64) as void {
+    let is i64 as i = win.win_alloc();
+    if (i < 0) { return; }
+    let is [2]i64 as chans;
+    if (sys.channel_create(&chans[0]) != 0) { return; }
+    let is i64 as a = chans[0];
+    let is i64 as b = chans[1];
+    let is i64 as w with mut = 640;
+    let is i64 as h with mut = 400;
+    if (w > s.scr_w - 80) { w = s.scr_w - 80; }
+    if (h > s.scr_h - 80) { h = s.scr_h - 80; }
+    if (w < s.MIN_W) { w = s.MIN_W; }
+    if (h < s.MIN_H) { h = s.MIN_H; }
+    let is i64 as px with mut = 40 + i * 32;
+    let is i64 as py with mut = 40 + i * 32;
+    if (px + w + 2 > s.scr_w) { px = 16; }
+    if (py + h + s.TITLE_H + 2 > s.scr_h) { py = 16; }
+    wmp.msg_send(a, wmp.MSG_WELCOME, s.scr_w, s.scr_h, wmp.pack_wh(w, h));
+    let is [2]i64 as acts;
+    acts[0] = wmp.WM_FD;
+    acts[1] = b;
+    let is [2]i64 as av;
+    av[0] = cast(i64, cname); av[1] = cnlen;
+    let is i64 as pid = sys.spawn(cast(*u8, cimg), clen,
+                                  cast(*u8, &acts[0]), 1, cast(*u8, &av[0]), 1);
+    sys.close(b);
+    if (pid < 0) {
+        sys.close(a);
+        return;
+    }
+    s.wins[i].used = 1;
+    s.wins[i].state = 1;
+    s.wins[i].chan = a;
+    s.wins[i].pid = pid;
+    s.wins[i].seg_fd = 0;
+    s.wins[i].seg_base = 0;
+    s.wins[i].seg_pages = 0;
+    s.wins[i].seg_stride = 0;
+    s.wins[i].x = px; s.wins[i].y = py; s.wins[i].w = w; s.wins[i].h = h;
+    s.wins[i].title_len = 0; s.wins[i].t0 = 0; s.wins[i].t1 = 0;
+    s.wins[i].drops = 0;
+    s.wins[i].pend_resize_w = 0; s.wins[i].pend_resize_h = 0;
+    s.wins[i].pend_focus = 0 - 1;
+    s.wins[i].pend_close = 0;
+    s.wins[i].hello_deadline = sys.time_ns() + s.HELLO_NS;
+    s.wins[i].mb_fill = 0;
+    s.wins[i].maximized = 0;
+    s.wins[i].minimized = 0;
+    s.wins[i].is_text = 0;
+    s.wins[i].dec_fd = 0;
+    s.wins[i].dec_base = 0;
+    s.wins[i].dec_pages = 0;
+    s.wins[i].dec_attached = 0;
+    win.win_focus(i);
+    return;
+}
+
+fn spawn_client() as void {
+    spawn_client_img(s.img_base, s.img_len, cast(*u8, "wterm"), 5);
+    return;
+}
+
+fn spawn_named(name as *u8, nlen as i64) as void {
+    if (nlen <= 0 || nlen > 30) { return; }
+    let is [40]u8 as path;
+    path[0] = cast(u8, 47);
+    let is i64 as k with mut = 0;
+    while (k < nlen) { path[1 + k] = name[k]; k = k + 1; }
+    path[1 + nlen] = cast(u8, 0);
+    let is i64 as flen with mut = 0;
+    let is i64 as buf = load_file_into(cast(*u8, &path[0]), 1 + nlen, &flen);
+    if (buf == 0) { return; }
+    spawn_client_img(buf, flen, name, nlen);
+    sys.munmap(buf, (flen + 4095) & (0 - 4096));
+    return;
+}
+
+// Tear a window down. do_wait = the client exited (reap the zombie);
+// do_wait = 0 → the client is wedged, force-kill it (the spawn key is the
+// kill authority).
+fn reap_window(i as i64, do_wait as i64) as void {
+    if (s.wins[i].state == 2) {
+        cp.msg_send(s.wc_fd, cp.MSG_WC_DETACH_SURFACE, i, 0, 0);
+    }
+    if (s.wins[i].dec_fd != 0) {
+        cp.msg_send(s.wc_fd, cp.MSG_WC_DEC_DETACH, i, 0, 0);
+        sys.munmap(s.wins[i].dec_base, s.wins[i].dec_pages * 4096);
+        sys.close(s.wins[i].dec_fd);
+        s.wins[i].dec_fd = 0;
+        s.wins[i].dec_base = 0;
+        s.wins[i].dec_attached = 0;
+    }
+    sys.close(s.wins[i].chan);
+    let is i64 as was_top with mut = 0;
+    if (s.nz > 0 && s.zord[0] == i) { was_top = 1; }
+    win.win_zremove(i);
+    dmg.dmg_frame(i);
+    dmg.dmg_taskbar();
+    s.scene_dirty = 1;
+    s.deco_dirty = 1;
+    s.wins[i].used = 0;
+    s.wins[i].state = 0;
+    if (do_wait == 1) {
+        let is i64 as st with mut = 0;
+        sys.wait(s.wins[i].pid, &st);
+    } else {
+        let is i64 as krc = sys.kill(s.wins[i].pid);
+        if (krc == 0) {
+            let is i64 as st2 with mut = 0;
+            sys.wait(s.wins[i].pid, &st2);
+        }
+    }
+    if (was_top == 1 && s.nz > 0) {
+        s.wins[s.zord[0]].pend_focus = 1;
+        dmg.dmg_frame(s.zord[0]);
+    }
+    return;
+}
+
+fn handle_msg(i as i64, m as *i64) as void {
+    if (m[0] == wmp.MSG_HELLO && s.wins[i].state == 1) {
+        let is i64 as seg = sys.fd_recv(s.wins[i].chan);
+        if (seg < 0) {
+            reap_window(i, 0);
+            return;
+        }
+        s.wins[i].is_text = 0;
+        if (wmp.hello_kind(m[3]) == wmp.SURFACE_TEXT) { s.wins[i].is_text = 1; }
+        s.wins[i].seg_pages = m[1];
+        s.wins[i].seg_stride = m[2];
+        let is i64 as tries with mut = 0;
+        let is i64 as sent with mut = 0;
+        while (tries < 1000 && sent == 0) {
+            let is i64 as fr = sys.fd_send(s.wc_fd, seg);
+            if (fr == 0) { sent = 1; }
+            else if (fr == sys.E_AGAIN) { tries = tries + 1; sys.poll(cast(*i64, 0), 0, 200000); }
+            else { sent = 0 - 1; tries = 1000; }
+        }
+        sys.close(seg);
+        if (sent != 1) {
+            reap_window(i, 0);
+            return;
+        }
+        cp.msg_send(s.wc_fd, cp.MSG_WC_ATTACH_SURFACE, i, m[1],
+                     (s.wins[i].is_text & 1) | ((m[2] & 0xFFFFFFFF) << 32));
+        s.wins[i].seg_fd = 0;
+        s.wins[i].seg_base = 0;
+        s.wins[i].state = 2;
+        dmg.dmg_frame(i);
+        dmg.dmg_taskbar();
+        s.scene_dirty = 1;
+        s.deco_dirty = 1;
+    } else if (m[0] == wmp.MSG_COMMIT) {
+        if (s.wins[i].state != 2) { return; }
+        if (s.wins[i].is_text == 1) {
+            let is i64 as row0 with mut = m[1];
+            let is i64 as nrows with mut = wmp.unpack_w(m[3]);
+            if (row0 < 0) { nrows = nrows + row0; row0 = 0; }
+            let is i64 as py0 = row0 * 16;
+            let is i64 as ph with mut = nrows * 16;
+            if (py0 + ph > s.wins[i].h) { ph = s.wins[i].h - py0; }
+            if (ph > 0 && py0 < s.wins[i].h) {
+                dmg.dmg_add(s.wins[i].x + s.BORDER, s.wins[i].y + s.BORDER + s.TITLE_H + py0,
+                          s.wins[i].w, ph);
+            }
+            return;
+        }
+        let is i64 as cx with mut = m[1];
+        let is i64 as cy with mut = m[2];
+        let is i64 as cw with mut = wmp.unpack_w(m[3]);
+        let is i64 as ch with mut = wmp.unpack_h(m[3]);
+        if (cx < 0) { cw = cw + cx; cx = 0; }
+        if (cy < 0) { ch = ch + cy; cy = 0; }
+        if (cx + cw > s.wins[i].w) { cw = s.wins[i].w - cx; }
+        if (cy + ch > s.wins[i].h) { ch = s.wins[i].h - cy; }
+        if (cw > 0 && ch > 0) {
+            dmg.dmg_add(s.wins[i].x + s.BORDER + cx, s.wins[i].y + s.BORDER + s.TITLE_H + cy, cw, ch);
+        }
+    } else if (m[0] == wmp.MSG_SET_TITLE) {
+        s.wins[i].title_len = m[1];
+        if (s.wins[i].title_len > 16) { s.wins[i].title_len = 16; }
+        s.wins[i].t0 = m[2];
+        s.wins[i].t1 = m[3];
+        dmg.dmg_add(s.wins[i].x, s.wins[i].y, s.wins[i].w + 2 * s.BORDER, s.TITLE_H + s.BORDER);
+        dmg.dmg_taskbar();
+        s.deco_dirty = 1;
+    } else if (m[0] == wmp.MSG_CLOSE) {
+        reap_window(i, 1);
+    } else if (m[0] == wmp.MSG_SPAWN_REQ) {
+        spawn_client();
+    } else if (m[0] == wmp.MSG_SPAWN_NAMED) {
+        let is [16]u8 as nm;
+        wmp.title_unpack(m[2], m[3], m[1], cast(*u8, &nm[0]));
+        spawn_named(cast(*u8, &nm[0]), m[1]);
+    }
+    return;
+}
+
+fn service_win(i as i64, got as i64) as void {
+    let is i64 as g with mut = got;
+    let is [4]i64 as m;
+    let is i64 as guard with mut = 0;
+    while ((g & sys.POLL_READABLE) != 0) {
+        let is i64 as r = wmp.msg_read(s.wins[i].chan, &s.wins[i].mb_fill,
+                                       cast(*u8, cast(i64, &s.mbufs[0]) + i * 32), &m[0]);
+        if (r < 0) { reap_window(i, 1); return; }
+        if (r == 1) {
+            handle_msg(i, &m[0]);
+            if (s.wins[i].used == 0) { return; }
+        }
+        guard = guard + 1;
+        if (guard > 64) { break; }
+        let is [3]i64 as pe;
+        pe[0] = s.wins[i].chan;
+        pe[1] = sys.POLL_READABLE;
+        pe[2] = 0;
+        sys.poll(&pe[0], 1, 0);
+        g = pe[2];
+    }
+    if ((got & sys.POLL_CLOSED) != 0 || (got & sys.POLL_ERROR) != 0) {
+        reap_window(i, 1);
+    }
+    return;
+}
+
+// Drain per-window control messages: CLOSE_REQ, RESIZE, FOCUS. Quota of 2 per
+// sweep per window.
+fn drain_pending(i as i64) as void {
+    if (s.wins[i].state != 2) { return; }
+    if (s.writable[i] == 0) { return; }
+    if (s.wins[i].pend_close == 1 && s.quota[i] < 2) {
+        wmp.msg_send(s.wins[i].chan, wmp.MSG_CLOSE_REQ, 0, 0, 0);
+        s.wins[i].pend_close = 0;
+        s.quota[i] = s.quota[i] + 1;
+    }
+    if (s.wins[i].pend_resize_w > 0 && s.quota[i] < 2) {
+        wmp.msg_send(s.wins[i].chan, wmp.MSG_RESIZE, s.wins[i].pend_resize_w, s.wins[i].pend_resize_h, 0);
+        s.wins[i].pend_resize_w = 0;
+        s.wins[i].pend_resize_h = 0;
+        s.quota[i] = s.quota[i] + 1;
+    }
+    if (s.wins[i].pend_focus >= 0 && s.quota[i] < 2) {
+        wmp.msg_send(s.wins[i].chan, wmp.MSG_FOCUS, s.wins[i].pend_focus, 0, 0);
+        s.wins[i].pend_focus = 0 - 1;
+        s.quota[i] = s.quota[i] + 1;
+    }
+    return;
+}
+
+fn chan_writable_now(i as i64) as i64 {
+    let is [3]i64 as ce;
+    ce[0] = s.wins[i].chan;
+    ce[1] = sys.POLL_WRITABLE;
+    ce[2] = 0;
+    sys.poll(&ce[0], 1, 0);
+    if ((ce[2] & sys.POLL_WRITABLE) != 0) { return 1; }
+    return 0;
+}
