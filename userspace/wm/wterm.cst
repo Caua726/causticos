@@ -51,6 +51,96 @@ fn forward_key(t as *term.Term, keysym as i64, kb as i64) as void {
     return;
 }
 
+// Append decimal `v` (>= 0) to buf at off; return the new offset.
+fn _dec(buf as *u8, off as i64, v as i64) as i64 {
+    let is i64 as x with mut = v;
+    if (x < 0) { x = 0; }
+    if (x == 0) { buf[off] = cast(u8, 48); return off + 1; }
+    let is [12]u8 as tmp;
+    let is i64 as nn with mut = 0;
+    while (x > 0) { tmp[nn] = cast(u8, 48 + (x - (x / 10) * 10)); x = x / 10; nn = nn + 1; }
+    let is i64 as o with mut = off;
+    let is i64 as i with mut = nn - 1;
+    while (i >= 0) { buf[o] = tmp[i]; o = o + 1; i = i - 1; }
+    return o;
+}
+
+fn px_to_cell_col(t as *term.Term, px as i64) as i64 {
+    let is i64 as c with mut = 1;
+    if (t.width > 0 && t.cols > 0) { c = px * t.cols / t.width + 1; }
+    if (c < 1) { c = 1; }
+    if (c > t.cols) { c = t.cols; }
+    return c;
+}
+fn px_to_cell_row(t as *term.Term, py as i64) as i64 {
+    let is i64 as r with mut = 1;
+    if (t.height > 0 && t.rows > 0) { r = py * t.rows / t.height + 1; }
+    if (r < 1) { r = 1; }
+    if (r > t.rows) { r = t.rows; }
+    return r;
+}
+
+// Encode one mouse event into the child's stdin. xbtn = xterm button code
+// (0 left, 1 middle, 2 right, 64 wheel-up, 65 wheel-down). SGR (CSI < b;x;y M/m)
+// when the child asked for ?1006, else legacy X10 (CSI M Cb Cx Cy, 32-based).
+fn mouse_emit(t as *term.Term, xbtn as i64, col as i64, row as i64, press as i64) as void {
+    if (s.child_in < 0) { return; }
+    let is [32]u8 as seq;
+    let is i64 as n with mut = 0;
+    if (t.mouse_sgr == 1) {
+        seq[0] = cast(u8, 0x1B); seq[1] = cast(u8, 0x5B); seq[2] = cast(u8, 0x3C); n = 3;   // ESC [ <
+        n = _dec(cast(*u8, &seq[0]), n, xbtn);
+        seq[n] = cast(u8, 0x3B); n = n + 1;
+        n = _dec(cast(*u8, &seq[0]), n, col);
+        seq[n] = cast(u8, 0x3B); n = n + 1;
+        n = _dec(cast(*u8, &seq[0]), n, row);
+        if (press == 1) { seq[n] = cast(u8, 77); } else { seq[n] = cast(u8, 109); }         // 'M' / 'm'
+        n = n + 1;
+    } else {
+        let is i64 as cb with mut = 32 + xbtn;
+        if (press == 0) { cb = 32 + 3; }                                                    // release => button 3
+        let is i64 as cx = 32 + col; let is i64 as cy = 32 + row;
+        seq[0] = cast(u8, 0x1B); seq[1] = cast(u8, 0x5B); seq[2] = cast(u8, 77);            // ESC [ M
+        seq[3] = cast(u8, cb & 0xFF); seq[4] = cast(u8, cx & 0xFF); seq[5] = cast(u8, cy & 0xFF);
+        n = 6;
+    }
+    syscall(11, s.child_in, cast(i64, &seq[0]), n);
+    return;
+}
+
+// A button mask arrived (MSG_MOUSE_BTN). If the child enabled tracking, emit a
+// press/release for every button that changed since last time.
+fn forward_mouse_btn(t as *term.Term, newmask as i64, px as i64, py as i64) as void {
+    if (s.child_in < 0 || t.mouse_mode == 0) { s.mouse_prev_btn = newmask; return; }
+    let is i64 as col = px_to_cell_col(t, px);
+    let is i64 as row = px_to_cell_row(t, py);
+    let is i64 as diff = newmask ^ s.mouse_prev_btn;
+    if ((diff & cp.BTN_LEFT) != 0) {
+        let is i64 as pr with mut = 0; if ((newmask & cp.BTN_LEFT) != 0) { pr = 1; }
+        mouse_emit(t, 0, col, row, pr);
+    }
+    if ((diff & cp.BTN_MIDDLE) != 0) {
+        let is i64 as pr with mut = 0; if ((newmask & cp.BTN_MIDDLE) != 0) { pr = 1; }
+        mouse_emit(t, 1, col, row, pr);
+    }
+    if ((diff & cp.BTN_RIGHT) != 0) {
+        let is i64 as pr with mut = 0; if ((newmask & cp.BTN_RIGHT) != 0) { pr = 1; }
+        mouse_emit(t, 2, col, row, pr);
+    }
+    s.mouse_prev_btn = newmask;
+    return;
+}
+
+// A wheel notch arrived (MSG_MOUSE_WHEEL). Wheel is a press-only button 64/65.
+fn forward_mouse_wheel(t as *term.Term, delta as i64, px as i64, py as i64) as void {
+    if (s.child_in < 0 || t.mouse_mode == 0) { return; }
+    let is i64 as col = px_to_cell_col(t, px);
+    let is i64 as row = px_to_cell_row(t, py);
+    if (delta > 0) { mouse_emit(t, 64, col, row, 1); }
+    else if (delta < 0) { mouse_emit(t, 65, col, row, 1); }
+    return;
+}
+
 // Tab is "auto-commit at first whitespace, else emit completion and stay".
 fn handle_key(t as *term.Term, keysym as i64, kb as i64, line as *u8, llen_ptr as *i64) as void {
     let is i64 as pressed = cp.key_pressed(kb);
@@ -119,6 +209,10 @@ fn handle_msg(t as *term.Term, m as *i64) as void {
     } else if (m[0] == wmp.MSG_CLOSE_REQ) {
         term.putc(t, 0x0A); g.show(t);
         cli.child_eof(t);
+    } else if (m[0] == wmp.MSG_MOUSE_BTN) {
+        forward_mouse_btn(t, m[1], m[2], m[3]);   // a=buttons, b=x, c=y (content-relative)
+    } else if (m[0] == wmp.MSG_MOUSE_WHEEL) {
+        forward_mouse_wheel(t, m[1], m[2], m[3]); // a=delta, b=x, c=y
     }
     return;
 }
