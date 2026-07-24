@@ -1,590 +1,27 @@
-// compositor.cst — the CausticOS compositor.
-//
-// This is the /init. The compositor owns the HARDWARE: the framebuffer and the
-// raw input devices. The window manager (wm.cse, spawned as our child) owns
-// POLICY: focus, geometry, z-order, the taskbar. They talk over two channels
-// (userspace/lib/compo_proto.cst):
-//
-//   kernel → compositor (/init) → wm → wterm → app
-//
-// MARCO 2 — the compositor assumed INPUT (the SYS_POLL pump over the keyboard/
-// mouse/tablet, normalising raw events into MSG_CP_* down the CMD channel).
-//
-// MARCO 3 — the compositor assumes the FRAMEBUFFER and COMPOSITION. It maps the
-// backbuffer (mmap_fd), owns the drawing primitives (cfill/cglyph/cblit/cursor/
-// taskbar/clock), and composes the scene. The WM no longer touches the
-// framebuffer: it describes the scene (a back-to-front snapshot of windows over
-// the WC channel — MSG_WC_SCENE + N x MSG_WC_SCENE_ENTRY) and the damage rects,
-// and the compositor composes them at the 60 Hz tick. Window CONTENT (client
-// surfaces) and TEXT decorations arrive in M4/M5; in M3 the compositor draws
-// the desktop, each window's frame + titlebar, the taskbar buttons, the clock
-// and the cursor.
-//
-// Fd map handed to the WM (must match wm.cst's FB_FD/CMD_FD/WC_FD):
-//   fd 3 = framebuffer surface (DEV_FB)   — still inherited (mmap'd here too)
-//   fd 4 = CMD channel  (compositor → WM, normalised input)
-//   fd 5 = WC  channel  (WM → compositor, the scene)
+// compositor.cst — orchestrator (/init). Imports state + per-domain modules;
+// owns main(). Boot-time device acquisition, channel pair, WM spawn, main
+// poll loop, frame tick + dirty flush all live here.
 
 use "../../../Caustic/std/causticos/font.cst" as font;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto.cst" as wmp;
 use "../lib/compo_proto.cst" as cp;
-use "../../../Caustic/std/causticos/img/csif.cst" as csif;
 
-let is i64 as IMG_CAP with imut = 4194304;   // 4 MiB ceiling (matches SPAWN_IMG_MAX)
+use "comp_state.cst" as s;
+use "comp_render.cst" as r;
+use "comp_damage.cst" as dmg;
+use "comp_wallpaper.cst" as wp;
+use "comp_input.cst" as inp;
+use "comp_scene.cst" as scn;
+use "comp_wc.cst" as wc;
 
-// ---- layout & palette (must match the WM's policy geometry) ----
-let is i64 as MAX_WIN  with imut = 8;
-let is i64 as TITLE_H  with imut = 20;
-let is i64 as BORDER   with imut = 1;
-let is i64 as FRAME_NS with imut = 16666667;   // ~60 Hz compose tick
-let is i64 as BTN_W    with imut = 24;
-
-let is i64 as COL_DESKTOP  with imut = 0x00202830;
-let is i64 as COL_BORDER_F with imut = 0x0073d0ff;
-let is i64 as COL_BORDER_U with imut = 0x003a4048;
-let is i64 as COL_TITLE_F  with imut = 0x002a3a4a;
-let is i64 as COL_TITLE_U  with imut = 0x001c2228;
-let is i64 as COL_TEXT     with imut = 0x00d3d7cf;
-// ---- taskbar ----
-let is i64 as BAR_H        with imut = 26;
-let is i64 as TASK_W       with imut = 150;
-let is i64 as COL_BAR      with imut = 0x00161b21;
-let is i64 as COL_BAR_ITEM with imut = 0x00262f38;
-
-// ---- owned hardware ----
-let is i64 as fb_fd    with mut = 0;
-let is i64 as kbd_fd   with mut = 0;
-let is i64 as mouse_fd with mut = 0;
-let is i64 as tab_fd   with mut = 0;
-let is i64 as cmd_fd   with mut = 0;         // compositor side of the CMD channel
-let is i64 as wc_fd    with mut = 0;         // compositor side of the WC channel
-
-// ---- screen geometry + framebuffer ----
-let is i64 as scr_w with mut = 0;
-let is i64 as scr_h with mut = 0;
-let is i64 as scr_pitch with mut = 0;
-let is i64 as fb_base with mut = 0;
-
-// ---- wallpaper (a CSIF image drawn as the desktop base; falls back to the
-// solid COL_DESKTOP fill when absent — never a hang) ----
-let is i64 as wp_ok    with mut = 0;
-let is i64 as wp_w     with mut = 0;
-let is i64 as wp_h     with mut = 0;
-let is i64 as wp_nchan with mut = 0;
-let is i64 as wp_pix   with mut = 0;   // *u8 (interleaved R,G,B[,A]) held as i64
-
-// ---- cursor / button state (the compositor owns pointer normalisation) ----
-let is i64 as mx with mut = 0;
-let is i64 as my with mut = 0;
-let is i64 as mbuttons with mut = 0;
-
-// ============================================================
-// Pointer acceleration — the "feel" of the mouse lives HERE (evdev/libinput's
-// job in X11). The driver hands us raw 8-bit signed deltas; we turn them into
-// cursor motion through one of two profiles. ALL fixed-point, base 256 (a gain
-// of ACCEL_UNIT = 256 means exactly 1:1) — no float (Caustic gotcha).
-//
-//   accel_profile = 0 → FLAT: gain is constant (ACCEL_FLAT_GAIN/256). Raw, no
-//     velocity term — every delta is scaled the same. Set ACCEL_FLAT_GAIN=256
-//     for true 1:1 passthrough, or higher for a fixed multiplier.
-//
-//   accel_profile = 1 → ADAPTIVE (DEFAULT): the gain rises with the speed of
-//     the gesture, a smooth curve in the spirit of libinput / Windows "enhance
-//     pointer precision". Per event we measure v = |dx| + |dy| (the L1 speed of
-//     this packet) and compute  gain = ACCEL_BASE + ACCEL_K * v,  clamped to
-//     ACCEL_MAX. Slow gestures land near ACCEL_BASE (≈1:1 → fine aim); fast
-//     flicks ramp toward ACCEL_MAX (cross the screen). The motion applied is
-//     (delta * gain) >> 8, with the sub-pixel remainder carried so slow drift
-//     never quantises to zero.
-//
-// TO SWITCH PROFILES: flip accel_profile's default below (0 = flat, 1 =
-// adaptive), or at runtime press Super+Ctrl+A (handled in handle_key). Tune the
-// curve with the four ACCEL_* constants.
-let is i64 as ACCEL_UNIT      with imut = 256;   // fixed-point one (gain == 256 ⇒ 1:1)
-let is i64 as ACCEL_BASE      with imut = 200;   // adaptive: gain at zero speed (~0.78:1, fine aim)
-let is i64 as ACCEL_K         with imut = 28;    // adaptive: gain added per unit of L1 speed
-let is i64 as ACCEL_MAX       with imut = 1280;  // adaptive: gain ceiling (~5:1, screen-crossing flick)
-let is i64 as ACCEL_FLAT_GAIN with imut = 256;   // flat: constant gain (256 ⇒ 1:1)
-
-// THE TOGGLE. Default 1 = adaptive. Set to 0 here (and rebuild) for flat, or
-// press Super+Ctrl+A live.
-let is i64 as accel_profile with mut = 1;
-
-// Sub-pixel accumulators: the fractional part of (delta*gain) we couldn't apply
-// this event, carried into the next so slow motion integrates instead of
-// rounding to nothing. Reset on a profile switch to avoid a stale carry jump.
-let is i64 as accel_rem_x with mut = 0;
-let is i64 as accel_rem_y with mut = 0;
-
-// ---- shutdown: 1 once we've told the WM the power button was pressed ----
-let is i64 as shutdown_sent with mut = 0;
-
-// ---- WC channel reader state ----
-let is i64 as wc_fill with mut = 0;
-let is [32]u8 as wc_acc with mut;
-
-// ============================================================
-// The scene: a back-to-front snapshot the WM hands us. comp_win is indexed by
-// win_id (slot); comp_z holds the paint order (back→front) as entries arrive.
-// ============================================================
-struct CWin {
-    used as i64;
-    flags as i64;                                // bit0 focused, bit1 minimized
-    x as i64;  y as i64;  w as i64;  h as i64;   // x,y = FRAME corner; w,h = content
-}
-let is [8]CWin as cwins with mut;
-let is [8]i64 as comp_z with mut;                // paint order (entry order)
-let is i64 as comp_nz with mut = 0;
-let is i64 as scene_pending with mut = 0;        // entries still expected this SCENE
-let is i64 as needs_compose with mut = 0;
-
-// Content surfaces — indexed by win_id, INDEPENDENT of the scene snapshot (a new
-// SCENE replaces geometry/flags but never the mapped client segment). Handed over
-// by the WM via fd_send + MSG_WC_ATTACH_SURFACE; mapped read-only here.
-struct CSurf {
-    has as i64;                                  // 1 = a segment is mapped
-    seg_fd as i64;  seg_base as i64;
-    seg_pages as i64;  seg_stride as i64;        // pixel surface: bytes per row
-    is_text as i64;                              // 1 = TEXT cell grid, 0 = PIXEL buffer
-}
-let is [8]CSurf as surfs with mut;
-
-// Decoration surfaces — also per win_id, plus one global taskbar strip. Cell
-// grids (compo_proto txt_cell format) the WM writes the titlebar/taskbar into;
-// the compositor rasterises them like text. Independent of the scene snapshot.
-struct CDec {
-    has as i64;
-    seg_fd as i64;  seg_base as i64;  seg_pages as i64;
-}
-let is [8]CDec as decs with mut;                 // per-window titlebar decorations
-let is CDec as tb_dec with mut;                  // global taskbar decoration
-
-// ---- cursor shape (the contextual shape is WM policy; the position is ours) ----
-let is i64 as cur_shape with mut = 0;
-
-// ============================================================
-// Damage: a small rect list, collapsing to full-screen on overflow.
-// ============================================================
-let is [32]i64 as dmg with mut;                  // 8 × {x,y,w,h}
-let is i64 as dmg_n with mut = 0;
-let is i64 as dmg_full with mut = 0;
-
-fn damage(x as i64, y as i64, w as i64, h as i64) as void {
-    if (dmg_full == 1) { return; }
-    let is i64 as x0 with mut = x;
-    let is i64 as y0 with mut = y;
-    let is i64 as x1 with mut = x + w;
-    let is i64 as y1 with mut = y + h;
-    if (x0 < 0) { x0 = 0; }
-    if (y0 < 0) { y0 = 0; }
-    if (x1 > scr_w) { x1 = scr_w; }
-    if (y1 > scr_h) { y1 = scr_h; }
-    if (x1 <= x0 || y1 <= y0) { return; }
-    let is i64 as k with mut = 0;
-    while (k < dmg_n) {
-        let is i64 as ex0 = dmg[k*4+0];
-        let is i64 as ey0 = dmg[k*4+1];
-        let is i64 as ex1 = ex0 + dmg[k*4+2];
-        let is i64 as ey1 = ey0 + dmg[k*4+3];
-        if (x0 < ex1 && x1 > ex0 && y0 < ey1 && y1 > ey0) {
-            let is i64 as nx0 with mut = x0;
-            let is i64 as ny0 with mut = y0;
-            let is i64 as nx1 with mut = x1;
-            let is i64 as ny1 with mut = y1;
-            if (ex0 < nx0) { nx0 = ex0; }
-            if (ey0 < ny0) { ny0 = ey0; }
-            if (ex1 > nx1) { nx1 = ex1; }
-            if (ey1 > ny1) { ny1 = ey1; }
-            dmg[k*4+0] = nx0;
-            dmg[k*4+1] = ny0;
-            dmg[k*4+2] = nx1 - nx0;
-            dmg[k*4+3] = ny1 - ny0;
-            needs_compose = 1;
-            return;
-        }
-        k = k + 1;
-    }
-    if (dmg_n >= 8) { dmg_full = 1; needs_compose = 1; return; }
-    dmg[dmg_n * 4 + 0] = x0;
-    dmg[dmg_n * 4 + 1] = y0;
-    dmg[dmg_n * 4 + 2] = x1 - x0;
-    dmg[dmg_n * 4 + 3] = y1 - y0;
-    dmg_n = dmg_n + 1;
-    needs_compose = 1;
-    return;
-}
-fn damage_all() as void { dmg_full = 1; needs_compose = 1; return; }
-
-// ============================================================
-// Clipped drawing primitives — compose_rect sets the clip box.
-// ============================================================
-let is i64 as clip_x0 with mut = 0;
-let is i64 as clip_y0 with mut = 0;
-let is i64 as clip_x1 with mut = 0;
-let is i64 as clip_y1 with mut = 0;
-
-fn cfill(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
-    let is i64 as x0 with mut = x;
-    let is i64 as y0 with mut = y;
-    let is i64 as x1 with mut = x + w;
-    let is i64 as y1 with mut = y + h;
-    if (x0 < clip_x0) { x0 = clip_x0; }
-    if (y0 < clip_y0) { y0 = clip_y0; }
-    if (x1 > clip_x1) { x1 = clip_x1; }
-    if (y1 > clip_y1) { y1 = clip_y1; }
-    if (x1 <= x0 || y1 <= y0) { return; }
-    let is i64 as yy with mut = y0;
-    while (yy < y1) {
-        let is *u32 as row = cast(*u32, fb_base + yy * scr_pitch);
-        let is i64 as xx with mut = x0;
-        while (xx < x1) { row[xx] = cast(u32, color); xx = xx + 1; }
-        yy = yy + 1;
-    }
-    return;
-}
-
-fn cglyph(ch as i64, px as i64, py as i64, color as i64) as void {
-    let is *u8 as g = font.get_glyph(cast(i32, ch));
-    let is i64 as row with mut = 0;
-    while (row < 16) {
-        let is i64 as bits = cast(i64, g[row]);
-        let is i64 as col with mut = 0;
-        while (col < 8) {
-            if ((bits & (128 >> col)) != 0) {
-                let is i64 as xx = px + col;
-                let is i64 as yy = py + row;
-                if (xx >= clip_x0 && xx < clip_x1 && yy >= clip_y0 && yy < clip_y1) {
-                    let is *u32 as p = cast(*u32, fb_base + yy * scr_pitch + xx * 4);
-                    p[0] = cast(u32, color);
-                }
-            }
-            col = col + 1;
-        }
-        row = row + 1;
-    }
-    return;
-}
-
-fn cpix(x as i64, y as i64, color as i64) as void {
-    if (x >= clip_x0 && x < clip_x1 && y >= clip_y0 && y < clip_y1) {
-        let is *u32 as p = cast(*u32, fb_base + y * scr_pitch + x * 4);
-        p[0] = cast(u32, color);
-    }
-    return;
-}
-// ---- software cursor: a 10x16 arrow + contextual resize/move/ibeam shapes ----
-let is i64 as CUR_W with imut = 10;
-let is i64 as CUR_H with imut = 16;
-let is [16]i64 as cur_o with mut;
-let is [16]i64 as cur_f with mut;
-let is i64 as CUR_ARROW with imut = 0;
-let is i64 as CUR_EW    with imut = 1;
-let is i64 as CUR_NS    with imut = 2;
-let is i64 as CUR_NWSE  with imut = 3;
-let is i64 as CUR_NESW  with imut = 4;
-let is i64 as CUR_IBEAM with imut = 5;
-let is i64 as CUR_MOVE  with imut = 6;
-let is i64 as CUR_BLACK with imut = 0x00101010;
-let is i64 as CUR_WHITE with imut = 0x00FFFFFF;
-
-fn cursor_init() as void {
-    cur_o[0]  = 0x001; cur_f[0]  = 0x000;
-    cur_o[1]  = 0x003; cur_f[1]  = 0x000;
-    cur_o[2]  = 0x005; cur_f[2]  = 0x002;
-    cur_o[3]  = 0x009; cur_f[3]  = 0x006;
-    cur_o[4]  = 0x011; cur_f[4]  = 0x00E;
-    cur_o[5]  = 0x021; cur_f[5]  = 0x01E;
-    cur_o[6]  = 0x041; cur_f[6]  = 0x03E;
-    cur_o[7]  = 0x081; cur_f[7]  = 0x07E;
-    cur_o[8]  = 0x101; cur_f[8]  = 0x0FE;
-    cur_o[9]  = 0x201; cur_f[9]  = 0x1FE;
-    cur_o[10] = 0x3E1; cur_f[10] = 0x01E;
-    cur_o[11] = 0x011; cur_f[11] = 0x00E;
-    cur_o[12] = 0x009; cur_f[12] = 0x006;
-    cur_o[13] = 0x005; cur_f[13] = 0x002;
-    cur_o[14] = 0x003; cur_f[14] = 0x000;
-    cur_o[15] = 0x001; cur_f[15] = 0x000;
-    return;
-}
-fn tri_l(px as i64, py as i64, s as i64, col as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px + i, py - i, 1, 2 * i + 1, col); i = i + 1; } }
-fn tri_r(px as i64, py as i64, s as i64, col as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px - i, py - i, 1, 2 * i + 1, col); i = i + 1; } }
-fn tri_u(px as i64, py as i64, s as i64, col as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px - i, py + i, 2 * i + 1, 1, col); i = i + 1; } }
-fn tri_d(px as i64, py as i64, s as i64, col as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px - i, py - i, 2 * i + 1, 1, col); i = i + 1; } }
-fn dh_nw(px as i64, py as i64, s as i64, c as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px, py + i, i + 1, 1, c); i = i + 1; } }
-fn dh_se(px as i64, py as i64, s as i64, c as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px - i, py - i, i + 1, 1, c); i = i + 1; } }
-fn dh_ne(px as i64, py as i64, s as i64, c as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px - i, py + i, i + 1, 1, c); i = i + 1; } }
-fn dh_sw(px as i64, py as i64, s as i64, c as i64) as void { let is i64 as i with mut = 0; while (i < s) { cfill(px, py - i, i + 1, 1, c); i = i + 1; } }
-fn dshaft(cx as i64, cy as i64, half as i64, t as i64, c as i64) as void { let is i64 as i with mut = 0 - half; while (i <= half) { cfill(cx + i, cy + i, t, t, c); i = i + 1; } }
-fn dshaft2(cx as i64, cy as i64, half as i64, t as i64, c as i64) as void { let is i64 as i with mut = 0 - half; while (i <= half) { cfill(cx + i, cy - i, t, t, c); i = i + 1; } }
-fn cur_ew(cx as i64, cy as i64) as void {
-    tri_l(cx - 9, cy, 5, CUR_BLACK); tri_r(cx + 9, cy, 5, CUR_BLACK); cfill(cx - 7, cy - 3, 14, 6, CUR_BLACK);
-    tri_l(cx - 8, cy, 4, CUR_WHITE); tri_r(cx + 8, cy, 4, CUR_WHITE); cfill(cx - 6, cy - 1, 12, 2, CUR_WHITE);
-}
-fn cur_ns(cx as i64, cy as i64) as void {
-    tri_u(cx, cy - 9, 5, CUR_BLACK); tri_d(cx, cy + 9, 5, CUR_BLACK); cfill(cx - 3, cy - 7, 6, 14, CUR_BLACK);
-    tri_u(cx, cy - 8, 4, CUR_WHITE); tri_d(cx, cy + 8, 4, CUR_WHITE); cfill(cx - 1, cy - 6, 2, 12, CUR_WHITE);
-}
-fn cur_nwse(cx as i64, cy as i64) as void {
-    dshaft(cx, cy, 6, 4, CUR_BLACK); dh_nw(cx - 7, cy - 7, 6, CUR_BLACK); dh_se(cx + 7, cy + 7, 6, CUR_BLACK);
-    dshaft(cx, cy, 5, 2, CUR_WHITE); dh_nw(cx - 6, cy - 6, 4, CUR_WHITE); dh_se(cx + 6, cy + 6, 4, CUR_WHITE);
-}
-fn cur_nesw(cx as i64, cy as i64) as void {
-    dshaft2(cx, cy, 6, 4, CUR_BLACK); dh_ne(cx + 7, cy - 7, 6, CUR_BLACK); dh_sw(cx - 7, cy + 7, 6, CUR_BLACK);
-    dshaft2(cx, cy, 5, 2, CUR_WHITE); dh_ne(cx + 6, cy - 6, 4, CUR_WHITE); dh_sw(cx - 6, cy + 6, 4, CUR_WHITE);
-}
-fn cur_ibeam(cx as i64, cy as i64) as void {
-    cfill(cx - 4, cy - 9, 8, 2, CUR_BLACK); cfill(cx - 2, cy - 9, 4, 18, CUR_BLACK); cfill(cx - 4, cy + 7, 8, 2, CUR_BLACK);
-    cfill(cx - 3, cy - 8, 6, 1, CUR_WHITE); cfill(cx - 1, cy - 8, 2, 16, CUR_WHITE); cfill(cx - 3, cy + 7, 6, 1, CUR_WHITE);
-}
-fn cur_move(cx as i64, cy as i64) as void {
-    cfill(cx - 10, cy - 2, 20, 4, CUR_BLACK); cfill(cx - 2, cy - 10, 4, 20, CUR_BLACK);
-    tri_l(cx - 10, cy, 4, CUR_BLACK); tri_r(cx + 10, cy, 4, CUR_BLACK); tri_u(cx, cy - 10, 4, CUR_BLACK); tri_d(cx, cy + 10, 4, CUR_BLACK);
-    cfill(cx - 9, cy - 1, 18, 2, CUR_WHITE); cfill(cx - 1, cy - 9, 2, 18, CUR_WHITE);
-    tri_l(cx - 9, cy, 3, CUR_WHITE); tri_r(cx + 9, cy, 3, CUR_WHITE); tri_u(cx, cy - 9, 3, CUR_WHITE); tri_d(cx, cy + 9, 3, CUR_WHITE);
-}
-fn draw_arrow(cx as i64, cy as i64) as void {
-    let is i64 as r with mut = 0;
-    while (r < CUR_H) {
-        let is i64 as c with mut = 0;
-        while (c < CUR_W) {
-            let is i64 as bit = 1 << c;
-            if ((cur_f[r] & bit) != 0)      { cpix(cx + c, cy + r, CUR_WHITE); }
-            else if ((cur_o[r] & bit) != 0) { cpix(cx + c, cy + r, CUR_BLACK); }
-            c = c + 1;
-        }
-        r = r + 1;
-    }
-}
-fn draw_cursor_at(cx as i64, cy as i64) as void {
-    if (cur_shape == CUR_EW)         { cur_ew(cx, cy); }
-    else if (cur_shape == CUR_NS)    { cur_ns(cx, cy); }
-    else if (cur_shape == CUR_NWSE)  { cur_nwse(cx, cy); }
-    else if (cur_shape == CUR_NESW)  { cur_nesw(cx, cy); }
-    else if (cur_shape == CUR_IBEAM) { cur_ibeam(cx, cy); }
-    else if (cur_shape == CUR_MOVE)  { cur_move(cx, cy); }
-    else                             { draw_arrow(cx, cy); }
-}
-
-// Rasterise a TEXT window's content from its cell-grid segment (header + cols*
-// rows i64 cells). Per cell: fill the 8x16 background, stamp the glyph; the
-// cursor cell is inverted. Clipping is per-pixel so a partial re-compose only
-// repaints the touched cells.
-fn cblit_text(i as i64) as void {
-    let is i64 as cx = cwins[i].x + BORDER;
-    let is i64 as cy = cwins[i].y + BORDER + TITLE_H;
-    let is *i64 as hdr = cast(*i64, surfs[i].seg_base);
-    let is i64 as cols with mut = hdr[wmp.TXT_H_COLS];
-    let is i64 as rows with mut = hdr[wmp.TXT_H_ROWS];
-    if (cols <= 0 || rows <= 0) { return; }
-    let is i64 as vis_cols = cwins[i].w / 8;
-    let is i64 as vis_rows = cwins[i].h / 16;
-    if (cols > vis_cols) { cols = vis_cols; }
-    if (rows > vis_rows) { rows = vis_rows; }
-    let is i64 as cur_col = hdr[wmp.TXT_H_CUR_COL];
-    let is i64 as cur_row = hdr[wmp.TXT_H_CUR_ROW];
-    let is i64 as cur_vis = hdr[wmp.TXT_H_CUR_VIS];
-    let is *i64 as cells = cast(*i64, surfs[i].seg_base + wmp.TXT_HDR_CELLS * 8);
-    let is i64 as base_bg = wmp.txt_cell_bg(cells[0]);
-    let is i64 as gw = cols * 8;
-    let is i64 as gh = rows * 16;
-    if (gw < cwins[i].w) { cfill(cx + gw, cy, cwins[i].w - gw, cwins[i].h, base_bg); }
-    if (gh < cwins[i].h) { cfill(cx, cy + gh, gw, cwins[i].h - gh, base_bg); }
-    let is i64 as r with mut = 0;
-    while (r < rows) {
-        let is i64 as py = cy + r * 16;
-        if (py + 16 > clip_y0 && py < clip_y1) {
-            let is i64 as c with mut = 0;
-            while (c < cols) {
-                let is i64 as px = cx + c * 8;
-                if (px + 8 > clip_x0 && px < clip_x1) {
-                    let is i64 as cell = cells[r * cols + c];
-                    let is i64 as ch = wmp.txt_cell_char(cell);
-                    let is i64 as fg with mut = wmp.txt_cell_fg(cell);
-                    let is i64 as bg with mut = wmp.txt_cell_bg(cell);
-                    if (cur_vis == 1 && r == cur_row && c == cur_col) {
-                        let is i64 as tmp = fg; fg = bg; bg = tmp;
-                    }
-                    cfill(px, py, 8, 16, bg);
-                    if (ch != 0x20 && ch != 0) { cglyph(ch, px, py, fg); }
-                }
-                c = c + 1;
-            }
-        }
-        r = r + 1;
-    }
-    return;
-}
-
-// Blit a PIXEL window's content sub-rect (segment → backbuffer), clipped.
-fn cblit_pixels(i as i64) as void {
-    let is i64 as cx = cwins[i].x + BORDER;
-    let is i64 as cy = cwins[i].y + BORDER + TITLE_H;
-    let is i64 as x0 with mut = cx;
-    let is i64 as y0 with mut = cy;
-    let is i64 as x1 with mut = cx + cwins[i].w;
-    let is i64 as y1 with mut = cy + cwins[i].h;
-    if (x0 < clip_x0) { x0 = clip_x0; }
-    if (y0 < clip_y0) { y0 = clip_y0; }
-    if (x1 > clip_x1) { x1 = clip_x1; }
-    if (y1 > clip_y1) { y1 = clip_y1; }
-    if (x1 <= x0 || y1 <= y0) { return; }
-    let is i64 as nbytes = (x1 - x0) * 4;
-    let is i64 as yy with mut = y0;
-    while (yy < y1) {
-        let is i64 as dst = fb_base + yy * scr_pitch + x0 * 4;
-        let is i64 as src = surfs[i].seg_base + (yy - cy) * surfs[i].seg_stride + (x0 - cx) * 4;
-        wmp.copy_row(dst, src, nbytes);
-        yy = yy + 1;
-    }
-    return;
-}
-
-fn cblit_content(i as i64) as void {
-    if (surfs[i].has == 0) {
-        // no client surface yet — leave the body dark so it still reads as a window
-        cfill(cwins[i].x + BORDER, cwins[i].y + BORDER + TITLE_H,
-              cwins[i].w, cwins[i].h, 0x00101418);
-        return;
-    }
-    if (surfs[i].is_text == 1) { cblit_text(i); } else { cblit_pixels(i); }
-    return;
-}
-
-// Rasterise a decoration cell grid (header + cols*rows cells, txt_cell format)
-// at screen origin (ox, oy). Each cell is 8x16; clipped to the active clip box.
-// A char==0 cell is a coloured block (just the bg fill).
-fn cblit_dec(seg_base as i64, ox as i64, oy as i64) as void {
-    let is *i64 as hdr = cast(*i64, seg_base);
-    let is i64 as cols = hdr[cp.DEC_H_COLS];
-    let is i64 as rows = hdr[cp.DEC_H_ROWS];
-    if (cols <= 0 || rows <= 0) { return; }
-    let is *i64 as cells = cast(*i64, seg_base + cp.DEC_HDR_CELLS * 8);
-    let is i64 as r with mut = 0;
-    while (r < rows) {
-        let is i64 as py = oy + r * 16;
-        if (py + 16 > clip_y0 && py < clip_y1) {
-            let is i64 as c with mut = 0;
-            while (c < cols) {
-                let is i64 as px = ox + c * 8;
-                if (px + 8 > clip_x0 && px < clip_x1) {
-                    let is i64 as cell = cells[r * cols + c];
-                    let is i64 as ch = wmp.txt_cell_char(cell);
-                    let is i64 as fg = wmp.txt_cell_fg(cell);
-                    let is i64 as bg = wmp.txt_cell_bg(cell);
-                    cfill(px, py, 8, 16, bg);
-                    if (ch != 0x20 && ch != 0) { cglyph(ch, px, py, fg); }
-                }
-                c = c + 1;
-            }
-        }
-        r = r + 1;
-    }
-    return;
-}
-
-// Re-composite one rect: desktop, then every window back-to-front, taskbar, cursor.
-fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
-    clip_x0 = rx; clip_y0 = ry; clip_x1 = rx + rw; clip_y1 = ry + rh;
-    if (clip_x0 < 0) { clip_x0 = 0; }
-    if (clip_y0 < 0) { clip_y0 = 0; }
-    if (clip_x1 > scr_w) { clip_x1 = scr_w; }
-    if (clip_y1 > scr_h) { clip_y1 = scr_h; }
-    if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) { return; }
-    if (wp_ok == 1) { wp_blit(); } else { cfill(0, 0, scr_w, scr_h, COL_DESKTOP); }
-    let is i64 as zi with mut = 0;
-    while (zi < comp_nz) {
-        let is i64 as i = comp_z[zi];
-        if (cwins[i].used == 1 && (cwins[i].flags & 2) == 0) {
-            let is i64 as focused with mut = cwins[i].flags & 1;
-            let is i64 as bcol with mut = COL_BORDER_U;
-            let is i64 as tcol with mut = COL_TITLE_U;
-            if (focused == 1) { bcol = COL_BORDER_F; tcol = COL_TITLE_F; }
-            cfill(cwins[i].x, cwins[i].y,
-                  cwins[i].w + 2 * BORDER, cwins[i].h + TITLE_H + 2 * BORDER, bcol);
-            cfill(cwins[i].x + BORDER, cwins[i].y + BORDER, cwins[i].w, TITLE_H, tcol);
-            cblit_content(i);                        // client surface (text/pixels)
-            // titlebar decoration (title + buttons) on top of the strip; the
-            // cell row is 16px so centre it vertically in the TITLE_H strip.
-            if (decs[i].has == 1) {
-                cblit_dec(decs[i].seg_base,
-                          cwins[i].x + BORDER, cwins[i].y + BORDER + (TITLE_H - 16) / 2);
-            }
-        }
-        zi = zi + 1;
-    }
-    // taskbar: a decoration the WM owns (labels + clock). Draw its background
-    // strip first (the WM's grid only spans the used columns), then the cells.
-    cfill(0, scr_h - BAR_H, scr_w, BAR_H, COL_BAR);
-    cfill(0, scr_h - BAR_H, scr_w, 1, COL_BORDER_U);
-    if (tb_dec.has == 1) {
-        cblit_dec(tb_dec.seg_base, 0, scr_h - BAR_H + (BAR_H - 16) / 2);
-    }
-    draw_cursor_at(mx, my);
-    return;
-}
-
-fn flush_damage() as void {
-    if (dmg_full == 1) {
-        compose_rect(0, 0, scr_w, scr_h);
-        sys.present(fb_fd, 0, 0, scr_w, scr_h);
-    } else {
-        let is i64 as k with mut = 0;
-        while (k < dmg_n) {
-            compose_rect(dmg[k*4+0], dmg[k*4+1], dmg[k*4+2], dmg[k*4+3]);
-            sys.present(fb_fd, dmg[k*4+0], dmg[k*4+1], dmg[k*4+2], dmg[k*4+3]);
-            k = k + 1;
-        }
-    }
-    dmg_n = 0;
-    dmg_full = 0;
-    needs_compose = 0;
-    return;
-}
-
-// ---- shutdown notice (compositor owns the framebuffer) ----
-fn cglyph_big(ch as i64, px as i64, py as i64, color as i64, sc as i64) as void {
-    let is *u8 as g = font.get_glyph(cast(i32, ch));
-    let is i64 as row with mut = 0;
-    while (row < 16) {
-        let is i64 as bits = cast(i64, g[row]);
-        let is i64 as col with mut = 0;
-        while (col < 8) {
-            if ((bits & (128 >> col)) != 0) { cfill(px + col * sc, py + row * sc, sc, sc, color); }
-            col = col + 1;
-        }
-        row = row + 1;
-    }
-    return;
-}
-fn gtext_big(s as *u8, len as i64, x as i64, y as i64, color as i64, sc as i64) as void {
-    let is i64 as k with mut = 0;
-    while (k < len) { cglyph_big(cast(i64, s[k]), x + k * 8 * sc, y, color, sc); k = k + 1; }
-    return;
-}
-fn shutdown_screen() as void {
-    clip_x0 = 0; clip_y0 = 0; clip_x1 = scr_w; clip_y1 = scr_h;
-    cfill(0, 0, scr_w, scr_h, 0x00000000);
-    let is i64 as cx = scr_w / 2;
-    let is i64 as cy = scr_h / 2;
-    let is i64 as sc = 5;
-    let is i64 as wx = cx - (9 * 8 * sc) / 2;
-    let is i64 as wy = cy - 16 * sc - 10;
-    gtext_big(cast(*u8, "causticos"), 9, wx + 3, wy + 4, 0x00102838, sc);
-    gtext_big(cast(*u8, "causticos"), 9, wx, wy, 0x0073d0ff, sc);
-    gtext_big(cast(*u8, "Shutting down..."), 16, cx - (16 * 8 * 2) / 2, cy + 24, 0x008a929c, 2);
-    sys.present(fb_fd, 0, 0, scr_w, scr_h);
-    return;
-}
-
-// load_image — read /wm.cse off the FAT32 disk into a fresh anonymous mapping.
 fn load_image(path as *u8, out_len as *i64) as i64 {
     *out_len = 0;
     let is i64 as fd = sys.open_read(path);
     if (fd < 0) { return 0; }
     let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
     sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
-    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return 0; }
+    if (sz <= 0 || sz > s.IMG_CAP) { sys.close(fd); return 0; }
     let is i64 as alloc = (sz + 4095) & (0 - 4096);
     let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
     if (va < 0) { sys.close(fd); return 0; }
@@ -595,397 +32,41 @@ fn load_image(path as *u8, out_len as *i64) as i64 {
     return va;
 }
 
-// wallpaper_init — decode a CSIF background once at startup. Tries /etc/ first,
-// then the root. On any failure wp_ok stays 0 and the desktop uses COL_DESKTOP.
-// The decoded pixels live for the compositor's lifetime (never freed).
-fn wallpaper_init() as void {
-    let is csif.Image as im with mut = csif.load(cast(*u8, "/etc/wallpaper.csif"));
-    if (im.ok == 0) { im = csif.load(cast(*u8, "/wallpaper.csif")); }
-    if (im.ok == 0) { return; }
-    wp_w = im.width; wp_h = im.height; wp_nchan = im.nchan;
-    wp_pix = cast(i64, im.pixels);
-    wp_ok = 1;
-    wmp.log_kv(cast(*u8, "comp: wallpaper w="), 19, wp_w);
-    return;
-}
-
-// wp_blit — fill the current clip box from the wallpaper, nearest-neighbor
-// scaled to the screen. Writes XRGB8888 (alpha ignored — opaque base). Reads
-// the framebuffer directly like cfill, so it is the same cost as the solid fill.
-fn wp_blit() as void {
-    let is i64 as x0 = clip_x0;
-    let is i64 as y0 = clip_y0;
-    let is i64 as x1 = clip_x1;
-    let is i64 as y1 = clip_y1;
-    if (x1 <= x0 || y1 <= y0) { return; }
-    let is *u8 as src = cast(*u8, wp_pix);
-    let is i64 as yy with mut = y0;
-    while (yy < y1) {
-        let is i64 as sy = yy * wp_h / scr_h;
-        let is i64 as srow = sy * wp_w * wp_nchan;
-        let is *u32 as row = cast(*u32, fb_base + yy * scr_pitch);
-        let is i64 as xx with mut = x0;
-        while (xx < x1) {
-            let is i64 as sp = srow + (xx * wp_w / scr_w) * wp_nchan;
-            let is i64 as r = cast(i64, src[sp]);
-            let is i64 as g = cast(i64, src[sp + 1]);
-            let is i64 as b = cast(i64, src[sp + 2]);
-            row[xx] = cast(u32, (r << 16) | (g << 8) | b);
-            xx = xx + 1;
-        }
-        yy = yy + 1;
-    }
-    return;
-}
-
-// Send one CMD message to the WM.
-fn cmd_send(mtype as i64, a as i64, b as i64, c as i64) as void {
-    cp.msg_send(cmd_fd, mtype, a, b, c);
-    return;
-}
-
-// ---- input normalisation (modifier tracking + cursor) ----
-// The compositor owns the FULL keymap: it tracks every modifier and turns the
-// raw scancode into a normalised keysym (printable char with shift applied, or
-// a KEY_* code for the special keys) so no client ever parses a scancode.
-let is i64 as mod_shift with mut = 0;
-let is i64 as mod_ctrl  with mut = 0;
-let is i64 as mod_alt   with mut = 0;
-let is i64 as mod_super with mut = 0;
-
-fn clamp_cursor() as void {
-    if (mx < 0) { mx = 0; }
-    if (my < 0) { my = 0; }
-    if (mx >= scr_w) { mx = scr_w - 1; }
-    if (my >= scr_h) { my = scr_h - 1; }
-    return;
-}
-
-// abs() — no std here; we keep the sign handling explicit so the fixed-point
-// shift never goes through a negative >> (sign of >> on a negative is a trap).
-fn iabs(v as i64) as i64 { if (v < 0) { return 0 - v; } return v; }
-
-// accel_gain — the fixed-point gain (base 256) for a packet whose L1 speed is v.
-// FLAT ignores v; ADAPTIVE ramps base→max linearly in v, clamped.
-fn accel_gain(v as i64) as i64 {
-    if (accel_profile == 0) { return ACCEL_FLAT_GAIN; }
-    let is i64 as g with mut = ACCEL_BASE + ACCEL_K * v;
-    if (g > ACCEL_MAX) { g = ACCEL_MAX; }
-    return g;
-}
-
-// accel_move — apply one raw packet (dx,dy 8-bit signed, dy already in screen
-// orientation: caller passes -dy so + = down) to the cursor through the active
-// profile. Fixed-point: scaled = |delta|*gain + carry; whole part shifts the
-// cursor, the remainder (< 256) carries so slow drift integrates instead of
-// quantising to 0. Sign restored after the magnitude math.
-fn accel_move(dx as i64, dy as i64) as void {
-    let is i64 as v = iabs(dx) + iabs(dy);
-    let is i64 as g = accel_gain(v);
-
-    let is i64 as ax = iabs(dx) * g + accel_rem_x;
-    let is i64 as mvx = ax / ACCEL_UNIT;
-    accel_rem_x = ax - mvx * ACCEL_UNIT;
-    if (dx < 0) { mx = mx - mvx; } else { mx = mx + mvx; }
-
-    let is i64 as ay = iabs(dy) * g + accel_rem_y;
-    let is i64 as mvy = ay / ACCEL_UNIT;
-    accel_rem_y = ay - mvy * ACCEL_UNIT;
-    if (dy < 0) { my = my - mvy; } else { my = my + mvy; }
-
-    clamp_cursor();
-    return;
-}
-
-// The cursor lives on the compositor now: when it moves, damage the old + new
-// boxes so the next compose redraws it (the WM no longer touches pixels).
-let is i64 as cur_last_x with mut = 0;
-let is i64 as cur_last_y with mut = 0;
-fn cursor_moved() as void {
-    if (mx == cur_last_x && my == cur_last_y) { return; }
-    damage(cur_last_x - 13, cur_last_y - 13, 28, 32);
-    damage(mx - 13, my - 13, 28, 32);
-    cur_last_x = mx;
-    cur_last_y = my;
-    return;
-}
-
-fn handle_key(sc as i64, devflags as i64) as void {
-    let is i64 as pressed = devflags & 1;
-    let is i64 as ext = (devflags >> 1) & 1;
-    // Track every modifier off its make/break. Shift L=0x2A R=0x36; Ctrl=0x1D
-    // (right ctrl is ext+0x1D, same base); Alt=0x38 (right alt ext+0x38, same
-    // base); Super (left GUI) is ext+0x5B.
-    if (sc == 0x2A || sc == 0x36) { mod_shift = pressed; }
-    if (sc == 0x1D) { mod_ctrl = pressed; }
-    if (sc == 0x38) { mod_alt = pressed; }
-    if (ext == 1 && sc == 0x5B) { mod_super = pressed; }
-    // Super+Ctrl+A toggles the pointer accel profile live (0 flat / 1 adaptive).
-    // The compositor owns the pointer "feel", so it consumes the chord itself —
-    // it is NOT forwarded to the WM (no hotkey clash, no stray 'A' to clients).
-    if (pressed == 1 && sc == 0x1E && mod_super == 1 && mod_ctrl == 1) {
-        if (accel_profile == 0) { accel_profile = 1; } else { accel_profile = 0; }
-        accel_rem_x = 0;
-        accel_rem_y = 0;
-        if (accel_profile == 1) { sys.write_serial(cast(*u8, "comp: accel=adaptive\n"), 21); }
-        else { sys.write_serial(cast(*u8, "comp: accel=flat\n"), 17); }
-        return;
-    }
-    let is i64 as mods with mut = 0;
-    if (mod_shift == 1) { mods = mods | cp.MOD_SHIFT; }
-    if (mod_ctrl == 1)  { mods = mods | cp.MOD_CTRL; }
-    if (mod_alt == 1)   { mods = mods | cp.MOD_ALT; }
-    if (mod_super == 1) { mods = mods | cp.MOD_SUPER; }
-    let is i64 as keysym = cp.keysym_of(sc, ext, mod_shift);
-    cmd_send(cp.MSG_CP_KEY, keysym, cp.key_b(mods, pressed, ext), sc);
-    return;
-}
-
-fn pump_kbd() as void {
-    let is [64]u8 as evs;
-    let is i64 as n = syscall(10, kbd_fd, cast(i64, &evs[0]), 64);
-    if (n < 2) { return; }
-    let is i64 as k with mut = 0;
-    while (k + 1 < n) {
-        handle_key(cast(i64, evs[k]), cast(i64, evs[k + 1]));
-        k = k + 2;
-    }
-    return;
-}
-
-fn pump_mouse() as void {
-    let is [64]u8 as recs;
-    let is i64 as n = syscall(10, mouse_fd, cast(i64, &recs[0]), 64);
-    if (n < 4) { return; }
-    let is i64 as k with mut = 0;
-    let is i64 as moved with mut = 0;
-    while (k + 3 < n) {
-        // Raw record: [dx i8, dy i8 (+ = up), buttons u8, wheel i8].
-        let is i64 as dx with mut = cast(i64, recs[k]);
-        if (dx >= 128) { dx = dx - 256; }
-        let is i64 as dy with mut = cast(i64, recs[k + 1]);
-        if (dy >= 128) { dy = dy - 256; }
-        // Drive the cursor through the active accel profile. dy is flipped here
-        // (driver + = up, screen + = down) so accel_move sees screen orientation.
-        accel_move(dx, 0 - dy);
-        moved = 1;
-        // Buttons: the low bits map onto BTN_*; mask off any raw status flags
-        // so the WM only ever sees defined button bits.
-        let is i64 as nb = cast(i64, recs[k + 2]) & cp.BTN_MASK;
-        if (nb != mbuttons) {
-            mbuttons = nb;
-            cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons);
-            moved = 0;
-        }
-        let is i64 as wh with mut = cast(i64, recs[k + 3]);
-        if (wh >= 128) { wh = wh - 256; }
-        if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, mx, my); }
-        // REL_HWHEEL: the standard 4-byte IntelliMouse record has no horizontal
-        // axis, so there is nothing to forward here on PS/2 (see MSG_CP_HWHEEL).
-        k = k + 4;
-    }
-    if (moved == 1) { cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons); }
-    cursor_moved();
-    return;
-}
-
-fn pump_tablet() as void {
-    let is [64]u8 as recs;
-    let is i64 as n = syscall(10, tab_fd, cast(i64, &recs[0]), 64);
-    if (n < 8) { return; }
-    let is i64 as k with mut = 0;
-    let is i64 as moved with mut = 0;
-    while (k + 7 < n) {
-        let is i64 as ax = cast(i64, recs[k]) | (cast(i64, recs[k + 1]) << 8);
-        let is i64 as ay = cast(i64, recs[k + 2]) | (cast(i64, recs[k + 3]) << 8);
-        // The tablet is ABSOLUTE — position passes through untouched (no accel:
-        // 1:1 is the whole point of an absolute device, like a drawing tablet).
-        mx = ax * scr_w / 32768;
-        my = ay * scr_h / 32768;
-        clamp_cursor();
-        moved = 1;
-        let is i64 as nb = cast(i64, recs[k + 4]) & cp.BTN_MASK;
-        if (nb != mbuttons) {
-            mbuttons = nb;
-            cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons);
-            moved = 0;
-        }
-        let is i64 as wh with mut = cast(i64, recs[k + 5]);
-        if (wh >= 128) { wh = wh - 256; }
-        if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, mx, my); }
-        k = k + 8;
-    }
-    if (moved == 1) { cmd_send(cp.MSG_CP_PTR, mx, my, mbuttons); }
-    cursor_moved();
-    return;
-}
-
-// ---- WC channel: drain the scene/damage/cursor the WM hands us ----
-fn handle_wc(m as *i64) as void {
-    if (m[0] == cp.MSG_WC_SCENE) {
-        // begin a new snapshot: clear the window table, expect `count` entries
-        let is i64 as i with mut = 0;
-        while (i < MAX_WIN) { cwins[i].used = 0; i = i + 1; }
-        comp_nz = 0;
-        scene_pending = m[1];
-    } else if (m[0] == cp.MSG_WC_SCENE_ENTRY) {
-        let is i64 as win = cp.entry_win(m[1]);
-        let is i64 as flags = cp.entry_flags(m[1]);
-        if (win >= 0 && win < MAX_WIN) {
-            cwins[win].used = 1;
-            cwins[win].flags = flags;
-            cwins[win].x = cp.unpack_x(m[2]);
-            cwins[win].y = cp.unpack_y(m[2]);
-            cwins[win].w = cp.unpack_w(m[3]);
-            cwins[win].h = cp.unpack_h(m[3]);
-            if (comp_nz < MAX_WIN) { comp_z[comp_nz] = win; comp_nz = comp_nz + 1; }
-        }
-        if (scene_pending > 0) { scene_pending = scene_pending - 1; }
-    } else if (m[0] == cp.MSG_WC_ATTACH_SURFACE) {
-        // the WM parked the client's content segment with fd_send before this
-        // message — collect it and map it read-only. a=win_id, b=npages,
-        // c = is_text | (stride << 32).
-        let is i64 as win = m[1];
-        if (win >= 0 && win < MAX_WIN) {
-            let is i64 as seg = sys.fd_recv(wc_fd);
-            if (seg >= 0) {
-                let is i64 as va = sys.mmap_fd(sys.PROT_READ, seg);
-                if (va >= 0) {
-                    // drop any previous surface for this slot
-                    if (surfs[win].has == 1) {
-                        sys.munmap(surfs[win].seg_base, surfs[win].seg_pages * 4096);
-                        sys.close(surfs[win].seg_fd);
-                    }
-                    surfs[win].has = 1;
-                    surfs[win].seg_fd = seg;
-                    surfs[win].seg_base = va;
-                    surfs[win].seg_pages = m[2];
-                    surfs[win].seg_stride = (m[3] >> 32) & 0xFFFFFFFF;
-                    surfs[win].is_text = m[3] & 1;
-                    needs_compose = 1;
-                } else {
-                    sys.close(seg);
-                }
-            }
-        }
-    } else if (m[0] == cp.MSG_WC_DETACH_SURFACE) {
-        let is i64 as win = m[1];
-        if (win >= 0 && win < MAX_WIN && surfs[win].has == 1) {
-            sys.munmap(surfs[win].seg_base, surfs[win].seg_pages * 4096);
-            sys.close(surfs[win].seg_fd);
-            surfs[win].has = 0;
-            surfs[win].seg_base = 0;
-        }
-    } else if (m[0] == cp.MSG_WC_DEC_SURFACE) {
-        // a decoration cell grid — fd_send parked it before this message. win_id
-        // < MAX_WIN = a per-window titlebar; DEC_TASKBAR_ID = the global bar.
-        let is i64 as win = m[1];
-        let is i64 as seg = sys.fd_recv(wc_fd);
-        if (seg >= 0) {
-            let is i64 as va = sys.mmap_fd(sys.PROT_READ, seg);
-            if (va >= 0) {
-                if (win == cp.DEC_TASKBAR_ID) {
-                    if (tb_dec.has == 1) {
-                        sys.munmap(tb_dec.seg_base, tb_dec.seg_pages * 4096);
-                        sys.close(tb_dec.seg_fd);
-                    }
-                    tb_dec.has = 1; tb_dec.seg_fd = seg; tb_dec.seg_base = va; tb_dec.seg_pages = m[2];
-                    needs_compose = 1;
-                } else if (win >= 0 && win < MAX_WIN) {
-                    if (decs[win].has == 1) {
-                        sys.munmap(decs[win].seg_base, decs[win].seg_pages * 4096);
-                        sys.close(decs[win].seg_fd);
-                    }
-                    decs[win].has = 1; decs[win].seg_fd = seg; decs[win].seg_base = va; decs[win].seg_pages = m[2];
-                    needs_compose = 1;
-                } else {
-                    sys.munmap(va, m[2] * 4096);
-                    sys.close(seg);
-                }
-            } else {
-                sys.close(seg);
-            }
-        }
-    } else if (m[0] == cp.MSG_WC_DEC_DETACH) {
-        let is i64 as win = m[1];
-        if (win >= 0 && win < MAX_WIN && decs[win].has == 1) {
-            sys.munmap(decs[win].seg_base, decs[win].seg_pages * 4096);
-            sys.close(decs[win].seg_fd);
-            decs[win].has = 0;
-            decs[win].seg_base = 0;
-        }
-    } else if (m[0] == cp.MSG_WC_DAMAGE) {
-        if (m[1] < 0) { damage_all(); }
-        else { damage(m[1], m[2], cp.unpack_w(m[3]), cp.unpack_h(m[3])); }
-    } else if (m[0] == cp.MSG_WC_CURSOR) {
-        cur_shape = m[1];
-        needs_compose = 1;
-    } else if (m[0] == cp.MSG_WC_SHUTDOWN) {
-        sys.write_serial(cast(*u8, "comp: shutdown -> poweroff\n"), 26);
-        shutdown_screen();
-        sys.poweroff();                              // ACPI S5 — does not return
-    }
-    return;
-}
-
-fn service_wc() as i64 {
-    let is [4]i64 as m;
-    let is i64 as guard with mut = 0;
-    while (1 == 1) {
-        let is i64 as r = cp.msg_read(wc_fd, &wc_fill, cast(*u8, &wc_acc[0]), &m[0]);
-        if (r < 0) { return 0 - 1; }
-        if (r == 0) { return 0; }
-        handle_wc(&m[0]);
-        guard = guard + 1;
-        if (guard > 128) { return 0; }
-        let is [3]i64 as pe2;
-        pe2[0] = wc_fd;
-        pe2[1] = sys.POLL_READABLE;
-        pe2[2] = 0;
-        sys.poll(&pe2[0], 1, 0);
-        if ((pe2[2] & sys.POLL_READABLE) == 0) { return 0; }
-    }
-    return 0;
-}
-
 fn main() as i32 {
-    // 1. Take ownership of the hardware device keys.
-    fb_fd    = sys.dev_open(sys.DEV_FB, 0, 0);
-    kbd_fd   = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
-    mouse_fd = sys.dev_open(sys.DEV_MOUSE, 0, 0);
-    tab_fd   = sys.dev_open(sys.DEV_TABLET, 0, 0);
-    if (fb_fd < 0) {
+    s.fb_fd    = sys.dev_open(sys.DEV_FB, 0, 0);
+    s.kbd_fd   = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
+    s.mouse_fd = sys.dev_open(sys.DEV_MOUSE, 0, 0);
+    s.tab_fd   = sys.dev_open(sys.DEV_TABLET, 0, 0);
+    if (s.fb_fd < 0) {
         sys.write_serial(cast(*u8, "comp: no framebuffer\n"), 21);
         return 1;
     }
-    if (kbd_fd < 0)   { sys.write_serial(cast(*u8, "comp: no keyboard\n"), 18); }
-    if (mouse_fd < 0) { sys.write_serial(cast(*u8, "comp: no mouse\n"), 15); }
-    if (tab_fd < 0)   { sys.write_serial(cast(*u8, "comp: no tablet\n"), 16); }
+    if (s.kbd_fd < 0)   { sys.write_serial(cast(*u8, "comp: no keyboard\n"), 18); }
+    if (s.mouse_fd < 0) { sys.write_serial(cast(*u8, "comp: no mouse\n"), 15); }
+    if (s.tab_fd < 0)   { sys.write_serial(cast(*u8, "comp: no tablet\n"), 16); }
 
-    // 2. Map the framebuffer + read its geometry.
-    let is [5]i64 as fbinfo;     // {width, height, pitch, bpp_bytes, format}
-    if (sys.surface_info(fb_fd, cast(*u8, &fbinfo[0])) != 0) {
+    let is [5]i64 as fbinfo;
+    if (sys.surface_info(s.fb_fd, cast(*u8, &fbinfo[0])) != 0) {
         sys.write_serial(cast(*u8, "comp: no surface info\n"), 22);
         return 1;
     }
-    let is i64 as fbva = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, fb_fd);
+    let is i64 as fbva = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, s.fb_fd);
     if (fbva < 0) {
         sys.write_serial(cast(*u8, "comp: fb mmap fail\n"), 19);
         return 1;
     }
     font.init();
-    scr_w = fbinfo[0];
-    scr_h = fbinfo[1];
-    scr_pitch = fbinfo[2];
-    fb_base = fbva;
-    mx = scr_w / 2;
-    my = scr_h / 2;
-    cur_last_x = mx;
-    cur_last_y = my;
-    cursor_init();
-    wallpaper_init();       // decode /etc/wallpaper.csif (or /wallpaper.csif) if present
+    s.scr_w = fbinfo[0];
+    s.scr_h = fbinfo[1];
+    s.scr_pitch = fbinfo[2];
+    s.fb_base = fbva;
+    s.mx = s.scr_w / 2;
+    s.my = s.scr_h / 2;
+    s.cur_last_x = s.mx;
+    s.cur_last_y = s.my;
+    r.cursor_init();
+    wp.wallpaper_init();
 
-    // 3. The two channels.
     let is [2]i64 as cmd_ch;
     let is [2]i64 as wc_ch;
     if (sys.channel_create(&cmd_ch[0]) != 0) {
@@ -996,12 +77,11 @@ fn main() as i32 {
         sys.write_serial(cast(*u8, "comp: no wc chan\n"), 17);
         return 1;
     }
-    cmd_fd = cmd_ch[0];
+    s.cmd_fd = cmd_ch[0];
     let is i64 as cmd_wm = cmd_ch[1];
-    wc_fd = wc_ch[0];
+    s.wc_fd = wc_ch[0];
     let is i64 as wc_wm = wc_ch[1];
 
-    // 4. Load + spawn the WM.
     let is i64 as img_len with mut = 0;
     let is i64 as img = load_image(cast(*u8, "/wm.cse"), &img_len);
     if (img == 0) {
@@ -1009,10 +89,9 @@ fn main() as i32 {
         return 1;
     }
     let is [6]i64 as acts;
-    acts[0] = cp.CP_FB_FD;  acts[1] = fb_fd;
+    acts[0] = cp.CP_FB_FD;  acts[1] = s.fb_fd;
     acts[2] = cp.CP_CMD_FD; acts[3] = cmd_wm;
     acts[4] = cp.CP_WC_FD;  acts[5] = wc_wm;
-    // argv = ["wm"] — DATA, not authority: just the display name for ps/btop.
     let is *u8 as wm_name = "wm";
     let is [2]i64 as av;
     av[0] = cast(i64, wm_name); av[1] = 2;
@@ -1026,39 +105,33 @@ fn main() as i32 {
     }
     wmp.log_kv(cast(*u8, "comp: launched wm pid="), 22, pid);
 
-    // 5. Paint the bare desktop now (the WM's scene fills in the windows).
-    damage_all();
-    flush_damage();
+    dmg.damage_all();
+    scn.flush_damage();
 
-    // 6. Announce the screen geometry BEFORE pumping any input.
-    cmd_send(cp.MSG_CP_SCR_READY, scr_w, scr_h, 0);
+    inp.cmd_send(cp.MSG_CP_SCR_READY, s.scr_w, s.scr_h, 0);
 
-    // 7. The main loop: poll input devices + the WC channel; compose at 60 Hz.
-    let is [18]i64 as pe;                 // up to 6 entries × 3 (kbd/mouse/tab/cmd/wc)
+    let is [18]i64 as pe;
     let is i64 as st with mut = 0;
-    let is i64 as next_frame with mut = sys.time_ns() + FRAME_NS;
+    let is i64 as next_frame with mut = sys.time_ns() + s.FRAME_NS;
     while (1 == 1) {
         let is i64 as n with mut = 0;
         let is i64 as kbd_e   with mut = 0 - 1;
         let is i64 as mouse_e with mut = 0 - 1;
         let is i64 as tab_e   with mut = 0 - 1;
-        let is i64 as cmd_e   with mut = 0 - 1;
         let is i64 as wc_e    with mut = 0 - 1;
-        if (kbd_fd >= 0) {
-            pe[n*3+0] = kbd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        if (s.kbd_fd >= 0) {
+            pe[n*3+0] = s.kbd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
             kbd_e = n; n = n + 1;
         }
-        if (mouse_fd >= 0) {
-            pe[n*3+0] = mouse_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        if (s.mouse_fd >= 0) {
+            pe[n*3+0] = s.mouse_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
             mouse_e = n; n = n + 1;
         }
-        if (tab_fd >= 0) {
-            pe[n*3+0] = tab_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        if (s.tab_fd >= 0) {
+            pe[n*3+0] = s.tab_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
             tab_e = n; n = n + 1;
         }
-        pe[n*3+0] = cmd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
-        cmd_e = n; n = n + 1;
-        pe[n*3+0] = wc_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        pe[n*3+0] = s.wc_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
         wc_e = n; n = n + 1;
 
         let is i64 as now with mut = sys.time_ns();
@@ -1066,15 +139,14 @@ fn main() as i32 {
         if (tmo < 0) { tmo = 0; }
         sys.poll(&pe[0], n, tmo);
 
-        if (kbd_e >= 0 && (pe[kbd_e*3+2] & sys.POLL_READABLE) != 0) { pump_kbd(); }
-        if (mouse_e >= 0 && (pe[mouse_e*3+2] & sys.POLL_READABLE) != 0) { pump_mouse(); }
-        if (tab_e >= 0 && (pe[tab_e*3+2] & sys.POLL_READABLE) != 0) { pump_tablet(); }
+        if (kbd_e >= 0 && (pe[kbd_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_kbd(); }
+        if (mouse_e >= 0 && (pe[mouse_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_mouse(); }
+        if (tab_e >= 0 && (pe[tab_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_tablet(); }
 
-        // WC channel: the scene from the WM.
         if (wc_e >= 0) {
             let is i64 as wgot = pe[wc_e*3+2];
             if ((wgot & sys.POLL_READABLE) != 0) {
-                if (service_wc() < 0) {
+                if (wc.service_wc() < 0) {
                     sys.write_serial(cast(*u8, "comp: wm gone (wc)\n"), 19);
                     sys.wait(pid, &st);
                     return 0;
@@ -1087,25 +159,15 @@ fn main() as i32 {
             }
         }
 
-        // CMD channel closed → the WM died.
-        if (cmd_e >= 0 && (pe[cmd_e*3+2] & (sys.POLL_CLOSED | sys.POLL_ERROR)) != 0) {
-            sys.wait(pid, &st);
-            wmp.log_kv(cast(*u8, "comp: wm exited st="), 19, st);
-            return 0;
+        if (s.shutdown_sent == 0 && sys.power_pending() == 1) {
+            inp.cmd_send(cp.MSG_CP_SHUTDOWN_REQ, 0, 0, 0);
+            s.shutdown_sent = 1;
         }
 
-        // hardware power button → tell the WM once (M6 acts on it).
-        if (shutdown_sent == 0 && sys.power_pending() == 1) {
-            cmd_send(cp.MSG_CP_SHUTDOWN_REQ, 0, 0, 0);
-            shutdown_sent = 1;
-        }
-
-        // frame tick: compose if anything is dirty. (The clock lives in the WM
-        // now — it rides the taskbar decoration.)
         now = sys.time_ns();
         if (now >= next_frame) {
-            if (needs_compose == 1 || dmg_full == 1 || dmg_n > 0) { flush_damage(); }
-            next_frame = now + FRAME_NS;
+            if (s.needs_compose == 1 || s.dmg_full == 1 || s.dmg_n > 0) { scn.flush_damage(); }
+            next_frame = now + s.FRAME_NS;
         }
     }
     return 0;

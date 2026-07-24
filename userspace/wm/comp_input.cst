@@ -1,0 +1,152 @@
+// compositor/comp_input.cst — keyboard/mouse/tablet pumps, modifier tracking,
+// the keymap → keysym normaliser, and the cursor-acceleration profile.
+use "comp_state.cst" as s;
+use "comp_damage.cst" as dmg;
+use "comp_render.cst" as r;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+
+fn cmd_send(mtype as i64, a as i64, b as i64, c as i64) as void {
+    cp.msg_send(s.cmd_fd, mtype, a, b, c);
+    return;
+}
+
+fn clamp_cursor() as void {
+    if (s.mx < 0) { s.mx = 0; }
+    if (s.my < 0) { s.my = 0; }
+    if (s.mx >= s.scr_w) { s.mx = s.scr_w - 1; }
+    if (s.my >= s.scr_h) { s.my = s.scr_h - 1; }
+    return;
+}
+
+// accel_gain — the fixed-point gain (base 256) for a packet whose L1 speed is v.
+// FLAT ignores v; ADAPTIVE ramps base→max linearly in v, clamped.
+fn accel_gain(v as i64) as i64 {
+    if (s.accel_profile == 0) { return s.ACCEL_FLAT_GAIN; }
+    let is i64 as g with mut = s.ACCEL_BASE + s.ACCEL_K * v;
+    if (g > s.ACCEL_MAX) { g = s.ACCEL_MAX; }
+    return g;
+}
+
+// accel_move — dy already in screen orientation: caller passes -dy so + = down.
+fn accel_move(dx as i64, dy as i64) as void {
+    let is i64 as v = r.iabs(dx) + r.iabs(dy);
+    let is i64 as g = accel_gain(v);
+    let is i64 as ax = r.iabs(dx) * g + s.accel_rem_x;
+    let is i64 as mvx = ax / s.ACCEL_UNIT;
+    s.accel_rem_x = ax - mvx * s.ACCEL_UNIT;
+    if (dx < 0) { s.mx = s.mx - mvx; } else { s.mx = s.mx + mvx; }
+    let is i64 as ay = r.iabs(dy) * g + s.accel_rem_y;
+    let is i64 as mvy = ay / s.ACCEL_UNIT;
+    s.accel_rem_y = ay - mvy * s.ACCEL_UNIT;
+    if (dy < 0) { s.my = s.my - mvy; } else { s.my = s.my + mvy; }
+    clamp_cursor();
+    return;
+}
+
+// Cursor moved: damage the OLD + NEW boxes so the next compose redraws it.
+fn cursor_moved() as void {
+    if (s.mx == s.cur_last_x && s.my == s.cur_last_y) { return; }
+    dmg.damage(s.cur_last_x - 13, s.cur_last_y - 13, 28, 32);
+    dmg.damage(s.mx - 13, s.my - 13, 28, 32);
+    s.cur_last_x = s.mx;
+    s.cur_last_y = s.my;
+    return;
+}
+
+fn handle_key(sc as i64, devflags as i64) as void {
+    let is i64 as pressed = devflags & 1;
+    let is i64 as ext = (devflags >> 1) & 1;
+    if (sc == 0x2A || sc == 0x36) { s.mod_shift = pressed; }
+    if (sc == 0x1D) { s.mod_ctrl = pressed; }
+    if (sc == 0x38) { s.mod_alt = pressed; }
+    if (ext == 1 && sc == 0x5B) { s.mod_super = pressed; }
+    // Super+Ctrl+A toggles the pointer accel profile live. The compositor owns
+    // the pointer "feel", so it consumes the chord itself — it is NOT forwarded.
+    if (pressed == 1 && sc == 0x1E && s.mod_super == 1 && s.mod_ctrl == 1) {
+        if (s.accel_profile == 0) { s.accel_profile = 1; } else { s.accel_profile = 0; }
+        s.accel_rem_x = 0; s.accel_rem_y = 0;
+        if (s.accel_profile == 1) { sys.write_serial(cast(*u8, "comp: accel=adaptive\n"), 21); }
+        else { sys.write_serial(cast(*u8, "comp: accel=flat\n"), 17); }
+        return;
+    }
+    let is i64 as mods with mut = 0;
+    if (s.mod_shift == 1) { mods = mods | cp.MOD_SHIFT; }
+    if (s.mod_ctrl == 1)  { mods = mods | cp.MOD_CTRL; }
+    if (s.mod_alt == 1)   { mods = mods | cp.MOD_ALT; }
+    if (s.mod_super == 1) { mods = mods | cp.MOD_SUPER; }
+    let is i64 as keysym = cp.keysym_of(sc, ext, s.mod_shift);
+    cmd_send(cp.MSG_CP_KEY, keysym, cp.key_b(mods, pressed, ext), sc);
+    return;
+}
+
+fn pump_kbd() as void {
+    let is [64]u8 as evs;
+    let is i64 as n = syscall(10, s.kbd_fd, cast(i64, &evs[0]), 64);
+    if (n < 2) { return; }
+    let is i64 as k with mut = 0;
+    while (k + 1 < n) {
+        handle_key(cast(i64, evs[k]), cast(i64, evs[k + 1]));
+        k = k + 2;
+    }
+    return;
+}
+
+fn pump_mouse() as void {
+    let is [64]u8 as recs;
+    let is i64 as n = syscall(10, s.mouse_fd, cast(i64, &recs[0]), 64);
+    if (n < 4) { return; }
+    let is i64 as k with mut = 0;
+    let is i64 as moved with mut = 0;
+    while (k + 3 < n) {
+        let is i64 as dx with mut = cast(i64, recs[k]);
+        if (dx >= 128) { dx = dx - 256; }
+        let is i64 as dy with mut = cast(i64, recs[k + 1]);
+        if (dy >= 128) { dy = dy - 256; }
+        accel_move(dx, 0 - dy);
+        moved = 1;
+        let is i64 as nb = cast(i64, recs[k + 2]) & cp.BTN_MASK;
+        if (nb != s.mbuttons) {
+            s.mbuttons = nb;
+            cmd_send(cp.MSG_CP_PTR, s.mx, s.my, s.mbuttons);
+            moved = 0;
+        }
+        let is i64 as wh with mut = cast(i64, recs[k + 3]);
+        if (wh >= 128) { wh = wh - 256; }
+        if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, s.mx, s.my); }
+        k = k + 4;
+    }
+    if (moved == 1) { cmd_send(cp.MSG_CP_PTR, s.mx, s.my, s.mbuttons); }
+    cursor_moved();
+    return;
+}
+
+fn pump_tablet() as void {
+    let is [64]u8 as recs;
+    let is i64 as n = syscall(10, s.tab_fd, cast(i64, &recs[0]), 64);
+    if (n < 8) { return; }
+    let is i64 as k with mut = 0;
+    let is i64 as moved with mut = 0;
+    while (k + 7 < n) {
+        let is i64 as ax = cast(i64, recs[k]) | (cast(i64, recs[k + 1]) << 8);
+        let is i64 as ay = cast(i64, recs[k + 2]) | (cast(i64, recs[k + 3]) << 8);
+        s.mx = ax * s.scr_w / 32768;
+        s.my = ay * s.scr_h / 32768;
+        clamp_cursor();
+        moved = 1;
+        let is i64 as nb = cast(i64, recs[k + 4]) & cp.BTN_MASK;
+        if (nb != s.mbuttons) {
+            s.mbuttons = nb;
+            cmd_send(cp.MSG_CP_PTR, s.mx, s.my, s.mbuttons);
+            moved = 0;
+        }
+        let is i64 as wh with mut = cast(i64, recs[k + 5]);
+        if (wh >= 128) { wh = wh - 256; }
+        if (wh != 0) { cmd_send(cp.MSG_CP_WHEEL, wh, s.mx, s.my); }
+        k = k + 8;
+    }
+    if (moved == 1) { cmd_send(cp.MSG_CP_PTR, s.mx, s.my, s.mbuttons); }
+    cursor_moved();
+    return;
+}

@@ -1,0 +1,135 @@
+// compositor/comp_wc.cst — drain the WM's WC channel. The channel carries the
+// scene snapshot, surface/decoration attach/detach, damage rects and the
+// cursor shape. Reads/mutates scene state in state.cst.
+use "comp_state.cst" as s;
+use "comp_damage.cst" as dmg;
+use "comp_scene.cst" as scn;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+
+fn handle_wc(m as *i64) as void {
+    if (m[0] == cp.MSG_WC_SCENE) {
+        let is i64 as i with mut = 0;
+        while (i < s.MAX_WIN) { s.cwins[i].used = 0; i = i + 1; }
+        s.comp_nz = 0;
+        s.scene_pending = m[1];
+    } else if (m[0] == cp.MSG_WC_SCENE_ENTRY) {
+        let is i64 as win = cp.entry_win(m[1]);
+        let is i64 as flags = cp.entry_flags(m[1]);
+        if (win >= 0 && win < s.MAX_WIN) {
+            s.cwins[win].used = 1;
+            s.cwins[win].flags = flags;
+            s.cwins[win].x = cp.unpack_x(m[2]);
+            s.cwins[win].y = cp.unpack_y(m[2]);
+            s.cwins[win].w = cp.unpack_w(m[3]);
+            s.cwins[win].h = cp.unpack_h(m[3]);
+            if (s.comp_nz < s.MAX_WIN) { s.comp_z[s.comp_nz] = win; s.comp_nz = s.comp_nz + 1; }
+        }
+        if (s.scene_pending > 0) { s.scene_pending = s.scene_pending - 1; }
+    } else if (m[0] == cp.MSG_WC_ATTACH_SURFACE) {
+        let is i64 as win = m[1];
+        if (win >= 0 && win < s.MAX_WIN) {
+            let is i64 as seg = sys.fd_recv(s.wc_fd);
+            if (seg >= 0) {
+                let is i64 as va = sys.mmap_fd(sys.PROT_READ, seg);
+                if (va >= 0) {
+                    if (s.surfs[win].has == 1) {
+                        sys.munmap(s.surfs[win].seg_base, s.surfs[win].seg_pages * 4096);
+                        sys.close(s.surfs[win].seg_fd);
+                    }
+                    s.surfs[win].has = 1;
+                    s.surfs[win].seg_fd = seg;
+                    s.surfs[win].seg_base = va;
+                    s.surfs[win].seg_pages = m[2];
+                    s.surfs[win].seg_stride = (m[3] >> 32) & 0xFFFFFFFF;
+                    s.surfs[win].is_text = m[3] & 1;
+                    s.needs_compose = 1;
+                } else {
+                    sys.close(seg);
+                }
+            }
+        }
+    } else if (m[0] == cp.MSG_WC_DETACH_SURFACE) {
+        let is i64 as win = m[1];
+        if (win >= 0 && win < s.MAX_WIN && s.surfs[win].has == 1) {
+            sys.munmap(s.surfs[win].seg_base, s.surfs[win].seg_pages * 4096);
+            sys.close(s.surfs[win].seg_fd);
+            s.surfs[win].has = 0;
+            s.surfs[win].seg_base = 0;
+        }
+    } else if (m[0] == cp.MSG_WC_DEC_SURFACE) {
+        let is i64 as win = m[1];
+        let is i64 as seg = sys.fd_recv(s.wc_fd);
+        if (seg >= 0) {
+            let is i64 as va = sys.mmap_fd(sys.PROT_READ, seg);
+            if (va >= 0) {
+                if (win == cp.DEC_TASKBAR_ID) {
+                    if (s.tb_dec.has == 1) {
+                        sys.munmap(s.tb_dec.seg_base, s.tb_dec.seg_pages * 4096);
+                        sys.close(s.tb_dec.seg_fd);
+                    }
+                    s.tb_dec.has = 1;
+                    s.tb_dec.seg_fd = seg;
+                    s.tb_dec.seg_base = va;
+                    s.tb_dec.seg_pages = m[2];
+                    s.needs_compose = 1;
+                } else if (win >= 0 && win < s.MAX_WIN) {
+                    if (s.decs[win].has == 1) {
+                        sys.munmap(s.decs[win].seg_base, s.decs[win].seg_pages * 4096);
+                        sys.close(s.decs[win].seg_fd);
+                    }
+                    s.decs[win].has = 1;
+                    s.decs[win].seg_fd = seg;
+                    s.decs[win].seg_base = va;
+                    s.decs[win].seg_pages = m[2];
+                    s.needs_compose = 1;
+                } else {
+                    sys.munmap(va, m[2] * 4096);
+                    sys.close(seg);
+                }
+            } else {
+                sys.close(seg);
+            }
+        }
+    } else if (m[0] == cp.MSG_WC_DEC_DETACH) {
+        let is i64 as win = m[1];
+        if (win >= 0 && win < s.MAX_WIN && s.decs[win].has == 1) {
+            sys.munmap(s.decs[win].seg_base, s.decs[win].seg_pages * 4096);
+            sys.close(s.decs[win].seg_fd);
+            s.decs[win].has = 0;
+            s.decs[win].seg_base = 0;
+        }
+    } else if (m[0] == cp.MSG_WC_DAMAGE) {
+        if (m[1] < 0) { dmg.damage_all(); }
+        else { dmg.damage(m[1], m[2], cp.unpack_w(m[3]), cp.unpack_h(m[3])); }
+    } else if (m[0] == cp.MSG_WC_CURSOR) {
+        s.cur_shape = m[1];
+        s.needs_compose = 1;
+    } else if (m[0] == cp.MSG_WC_SHUTDOWN) {
+        sys.write_serial(cast(*u8, "comp: shutdown -> poweroff\n"), 26);
+        scn.shutdown_screen();
+        sys.poweroff();
+    }
+    return;
+}
+
+fn service_wc() as i64 {
+    let is [4]i64 as m;
+    let is i64 as guard with mut = 0;
+    while (1 == 1) {
+        let is i64 as r = cp.msg_read(s.wc_fd, &s.wc_fill, cast(*u8, &s.wc_acc[0]), &m[0]);
+        if (r < 0) { return 0 - 1; }
+        if (r == 0) { return 0; }
+        handle_wc(&m[0]);
+        guard = guard + 1;
+        if (guard > 128) { return 0; }
+        let is [3]i64 as pe2;
+        pe2[0] = s.wc_fd;
+        pe2[1] = sys.POLL_READABLE;
+        pe2[2] = 0;
+        sys.poll(&pe2[0], 1, 0);
+        if ((pe2[2] & sys.POLL_READABLE) == 0) { return 0; }
+    }
+    return 0;
+}

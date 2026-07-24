@@ -1,0 +1,193 @@
+// compositor/comp_scene.cst — the back-to-front composer. cblit_* + compose_rect
+// read scene state from state.cst (CWin/CSurf/CDec arrays) and call into
+// render.cst + wallpaper.cst for primitives.
+use "comp_state.cst" as s;
+use "comp_render.cst" as r;
+use "comp_wallpaper.cst" as wp;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/wmproto.cst" as wmp;
+use "../lib/compo_proto.cst" as cp;
+
+// Rasterise a TEXT window's content from its cell-grid segment (header + cols*
+// rows i64 cells). Per cell: fill the 8x16 background, stamp the glyph; the
+// cursor cell is inverted. Clipping is per-pixel so a partial re-compose only
+// repaints the touched cells.
+fn cblit_text(i as i64) as void {
+    let is i64 as cx = s.cwins[i].x + s.BORDER;
+    let is i64 as cy = s.cwins[i].y + s.BORDER + s.TITLE_H;
+    let is *i64 as hdr = cast(*i64, s.surfs[i].seg_base);
+    let is i64 as cols with mut = hdr[wmp.TXT_H_COLS];
+    let is i64 as rows with mut = hdr[wmp.TXT_H_ROWS];
+    if (cols <= 0 || rows <= 0) { return; }
+    let is i64 as vis_cols = s.cwins[i].w / 8;
+    let is i64 as vis_rows = s.cwins[i].h / 16;
+    if (cols > vis_cols) { cols = vis_cols; }
+    if (rows > vis_rows) { rows = vis_rows; }
+    let is i64 as cur_col = hdr[wmp.TXT_H_CUR_COL];
+    let is i64 as cur_row = hdr[wmp.TXT_H_CUR_ROW];
+    let is i64 as cur_vis = hdr[wmp.TXT_H_CUR_VIS];
+    let is *i64 as cells = cast(*i64, s.surfs[i].seg_base + wmp.TXT_HDR_CELLS * 8);
+    let is i64 as base_bg = wmp.txt_cell_bg(cells[0]);
+    let is i64 as gw = cols * 8;
+    let is i64 as gh = rows * 16;
+    if (gw < s.cwins[i].w) { r.cfill(cx + gw, cy, s.cwins[i].w - gw, s.cwins[i].h, base_bg); }
+    if (gh < s.cwins[i].h) { r.cfill(cx, cy + gh, gw, s.cwins[i].h - gh, base_bg); }
+    let is i64 as rr with mut = 0;
+    while (rr < rows) {
+        let is i64 as py = cy + rr * 16;
+        if (py + 16 > s.clip_y0 && py < s.clip_y1) {
+            let is i64 as cc with mut = 0;
+            while (cc < cols) {
+                let is i64 as px = cx + cc * 8;
+                if (px + 8 > s.clip_x0 && px < s.clip_x1) {
+                    let is i64 as cell = cells[rr * cols + cc];
+                    let is i64 as ch = wmp.txt_cell_char(cell);
+                    let is i64 as fg with mut = wmp.txt_cell_fg(cell);
+                    let is i64 as bg with mut = wmp.txt_cell_bg(cell);
+                    if (cur_vis == 1 && rr == cur_row && cc == cur_col) {
+                        let is i64 as tmp = fg; fg = bg; bg = tmp;
+                    }
+                    r.cfill(px, py, 8, 16, bg);
+                    if (ch != 0x20 && ch != 0) { r.cglyph(ch, px, py, fg); }
+                }
+                cc = cc + 1;
+            }
+        }
+        rr = rr + 1;
+    }
+    return;
+}
+
+fn cblit_pixels(i as i64) as void {
+    let is i64 as cx = s.cwins[i].x + s.BORDER;
+    let is i64 as cy = s.cwins[i].y + s.BORDER + s.TITLE_H;
+    let is i64 as x0 with mut = cx;
+    let is i64 as y0 with mut = cy;
+    let is i64 as x1 with mut = cx + s.cwins[i].w;
+    let is i64 as y1 with mut = cy + s.cwins[i].h;
+    if (x0 < s.clip_x0) { x0 = s.clip_x0; }
+    if (y0 < s.clip_y0) { y0 = s.clip_y0; }
+    if (x1 > s.clip_x1) { x1 = s.clip_x1; }
+    if (y1 > s.clip_y1) { y1 = s.clip_y1; }
+    if (x1 <= x0 || y1 <= y0) { return; }
+    let is i64 as nbytes = (x1 - x0) * 4;
+    let is i64 as yy with mut = y0;
+    while (yy < y1) {
+        let is i64 as dst = s.fb_base + yy * s.scr_pitch + x0 * 4;
+        let is i64 as src = s.surfs[i].seg_base + (yy - cy) * s.surfs[i].seg_stride + (x0 - cx) * 4;
+        wmp.copy_row(dst, src, nbytes);
+        yy = yy + 1;
+    }
+    return;
+}
+
+fn cblit_content(i as i64) as void {
+    if (s.surfs[i].has == 0) {
+        r.cfill(s.cwins[i].x + s.BORDER, s.cwins[i].y + s.BORDER + s.TITLE_H,
+                s.cwins[i].w, s.cwins[i].h, 0x00101418);
+        return;
+    }
+    if (s.surfs[i].is_text == 1) { cblit_text(i); } else { cblit_pixels(i); }
+    return;
+}
+
+fn cblit_dec(seg_base as i64, ox as i64, oy as i64) as void {
+    let is *i64 as hdr = cast(*i64, seg_base);
+    let is i64 as cols = hdr[cp.DEC_H_COLS];
+    let is i64 as rows = hdr[cp.DEC_H_ROWS];
+    if (cols <= 0 || rows <= 0) { return; }
+    let is *i64 as cells = cast(*i64, seg_base + cp.DEC_HDR_CELLS * 8);
+    let is i64 as rr with mut = 0;
+    while (rr < rows) {
+        let is i64 as py = oy + rr * 16;
+        if (py + 16 > s.clip_y0 && py < s.clip_y1) {
+            let is i64 as cc with mut = 0;
+            while (cc < cols) {
+                let is i64 as px = ox + cc * 8;
+                if (px + 8 > s.clip_x0 && px < s.clip_x1) {
+                    let is i64 as cell = cells[rr * cols + cc];
+                    let is i64 as ch = wmp.txt_cell_char(cell);
+                    let is i64 as fg = wmp.txt_cell_fg(cell);
+                    let is i64 as bg = wmp.txt_cell_bg(cell);
+                    r.cfill(px, py, 8, 16, bg);
+                    if (ch != 0x20 && ch != 0) { r.cglyph(ch, px, py, fg); }
+                }
+                cc = cc + 1;
+            }
+        }
+        rr = rr + 1;
+    }
+    return;
+}
+
+fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
+    s.clip_x0 = rx; s.clip_y0 = ry; s.clip_x1 = rx + rw; s.clip_y1 = ry + rh;
+    if (s.clip_x0 < 0) { s.clip_x0 = 0; }
+    if (s.clip_y0 < 0) { s.clip_y0 = 0; }
+    if (s.clip_x1 > s.scr_w) { s.clip_x1 = s.scr_w; }
+    if (s.clip_y1 > s.scr_h) { s.clip_y1 = s.scr_h; }
+    if (s.clip_x1 <= s.clip_x0 || s.clip_y1 <= s.clip_y0) { return; }
+    if (s.wp_ok == 1) { wp.wp_blit(); } else { r.cfill(0, 0, s.scr_w, s.scr_h, s.COL_DESKTOP); }
+    let is i64 as zi with mut = 0;
+    while (zi < s.comp_nz) {
+        let is i64 as i = s.comp_z[zi];
+        if (s.cwins[i].used == 1 && (s.cwins[i].flags & 2) == 0) {
+            let is i64 as focused with mut = s.cwins[i].flags & 1;
+            let is i64 as bcol with mut = s.COL_BORDER_U;
+            let is i64 as tcol with mut = s.COL_TITLE_U;
+            if (focused == 1) { bcol = s.COL_BORDER_F; tcol = s.COL_TITLE_F; }
+            r.cfill(s.cwins[i].x, s.cwins[i].y,
+                    s.cwins[i].w + 2 * s.BORDER, s.cwins[i].h + s.TITLE_H + 2 * s.BORDER, bcol);
+            r.cfill(s.cwins[i].x + s.BORDER, s.cwins[i].y + s.BORDER,
+                    s.cwins[i].w, s.TITLE_H, tcol);
+            cblit_content(i);
+            if (s.decs[i].has == 1) {
+                cblit_dec(s.decs[i].seg_base,
+                          s.cwins[i].x + s.BORDER, s.cwins[i].y + s.BORDER + (s.TITLE_H - 16) / 2);
+            }
+        }
+        zi = zi + 1;
+    }
+    r.cfill(0, s.scr_h - s.BAR_H, s.scr_w, s.BAR_H, s.COL_BAR);
+    r.cfill(0, s.scr_h - s.BAR_H, s.scr_w, 1, s.COL_BORDER_U);
+    if (s.tb_dec.has == 1) {
+        cblit_dec(s.tb_dec.seg_base, 0, s.scr_h - s.BAR_H + (s.BAR_H - 16) / 2);
+    }
+    r.draw_cursor_at(s.mx, s.my);
+    return;
+}
+
+fn flush_damage() as void {
+    if (s.dmg_full == 1) {
+        compose_rect(0, 0, s.scr_w, s.scr_h);
+        sys.present(s.fb_fd, 0, 0, s.scr_w, s.scr_h);
+    } else {
+        let is i64 as k with mut = 0;
+        while (k < s.dmg_n) {
+            compose_rect(s.dmg[k*4+0], s.dmg[k*4+1], s.dmg[k*4+2], s.dmg[k*4+3]);
+            sys.present(s.fb_fd, s.dmg[k*4+0], s.dmg[k*4+1], s.dmg[k*4+2], s.dmg[k*4+3]);
+            k = k + 1;
+        }
+    }
+    s.dmg_n = 0;
+    s.dmg_full = 0;
+    s.needs_compose = 0;
+    return;
+}
+
+// shutdown_screen — paint the "causticos / Shutting down..." notice directly
+// to the framebuffer, then present. Called once after MSG_WC_SHUTDOWN.
+fn shutdown_screen() as void {
+    s.clip_x0 = 0; s.clip_y0 = 0; s.clip_x1 = s.scr_w; s.clip_y1 = s.scr_h;
+    r.cfill(0, 0, s.scr_w, s.scr_h, 0x00000000);
+    let is i64 as cx = s.scr_w / 2;
+    let is i64 as cy = s.scr_h / 2;
+    let is i64 as sc = 5;
+    let is i64 as wx = cx - (9 * 8 * sc) / 2;
+    let is i64 as wy = cy - 16 * sc - 10;
+    r.gtext_big(cast(*u8, "causticos"), 9, wx + 3, wy + 4, 0x00102838, sc);
+    r.gtext_big(cast(*u8, "causticos"), 9, wx, wy, 0x0073d0ff, sc);
+    r.gtext_big(cast(*u8, "Shutting down..."), 16, cx - (16 * 8 * 2) / 2, cy + 24, 0x008a929c, 2);
+    sys.present(s.fb_fd, 0, 0, s.scr_w, s.scr_h);
+    return;
+}
