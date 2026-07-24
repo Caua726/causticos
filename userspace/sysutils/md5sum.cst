@@ -61,7 +61,36 @@ fn init_K() as void {
     let is i64 as i with mut = 0; while (i < 64) { K[i] = kv[i]; i = i + 1; }
 }
 
-// hash an open fd into the 16-byte digest `out`
+// Round `n` up to the next 4096-byte page boundary. The kernel only
+// honours page-aligned munmap ranges, so callers must round before
+// releasing a mmap_fd mapping.
+fn page_round(n as i64) as i64 {
+    return (n + 4095) & 0xFFFFF000;
+}
+
+// hash_path(path, out): stat → mmap_fd → md5 → munmap. ONE syscall per
+// operation instead of N read syscalls for big files. Returns 0 on
+// success, errno on stat/open/mmap failure (caller prints the error).
+fn hash_path(path as *u8, out as *u8) as i64 {
+    let is [4]i64 as st;
+    if (sys.stat(path, cast(*u8, &st[0])) != 0) { return 0 - 9; }
+    let is i64 as sz = st[0];
+    if (sz < 0) { return 0 - 22; }
+    if (sz == 0) { md5_init(); md5_final(out); return 0; }
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 9; }
+    let is i64 as va = sys.mmap_fd(sys.PROT_READ, fd);
+    sys.close(fd);
+    if (va <= 0) { return 0 - 5; }
+    md5_init();
+    md5_update(cast(*u8, va), sz);
+    sys.munmap(va, page_round(sz));
+    md5_final(out);
+    return 0;
+}
+
+// hash_fd(fd, out): streaming hash for fds that don't have a backing
+// path (stdin = 0, pipes). One 64 KiB read loop — no mmap possible.
 fn hash_fd(fd as i64, out as *u8) as void {
     md5_init();
     let is [65536]u8 as buf;
@@ -73,10 +102,14 @@ fn put_hex(out as *u8) as void { let is *u8 as H = "0123456789abcdef"; let is i6
 fn streq(a as *u8, b as *u8) as i64 { let is i64 as i with mut = 0; while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; } if (a[i] == b[i]) { return 1; } return 0; }
 
 fn hash_one(name as *u8) as i64 {
-    let is i64 as fd with mut = 0;
-    if (cast(i64, name) != 0 && streq(name, "-") == 0) { let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0])); fd = sys.open_read(path); if (fd < 0) { prog.outs("md5sum: "); prog.outs(name); prog.outs(": cannot open\n"); return 1; } }
-    let is [16]u8 as dig; hash_fd(fd, cast(*u8, &dig[0]));
-    if (fd != 0) { sys.close(fd); }
+    let is [16]u8 as dig;
+    if (cast(i64, name) == 0 || streq(name, "-") == 1) {
+        hash_fd(cast(i64, 0), cast(*u8, &dig[0]));
+    } else {
+        let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
+        let is i64 as rc = hash_path(path, cast(*u8, &dig[0]));
+        if (rc != 0) { prog.outs("md5sum: "); prog.outs(name); prog.outs(": cannot hash\n"); return 1; }
+    }
     put_hex(cast(*u8, &dig[0])); prog.outs("  "); if (cast(i64, name) != 0) { prog.outs(name); } else { prog.outs("-"); } prog.out("\n", 1);
     return 0;
 }
@@ -97,13 +130,13 @@ fn check(listpath as *u8) as i32 {
             let is [40]u8 as want; let is i64 as k with mut = 0; while (k < 32) { want[k] = data[ls + k]; k = k + 1; } want[32] = cast(u8, 0);
             let is i64 as np with mut = ls + 32; while (np < le && (data[np] == 32 || data[np] == 42)) { np = np + 1; }   // skip "  " or " *"
             let is [256]u8 as nm; let is i64 as m with mut = 0; while (np < le && m < 255) { nm[m] = data[np]; m = m + 1; np = np + 1; } nm[m] = cast(u8, 0);
-            let is [256]u8 as cpb; let is i64 as cfd = sys.open_read(prog.abspath(cast(*u8, &nm[0]), cast(*u8, &cpb[0])));
+            let is [256]u8 as cpb; let is *u8 as cpath = prog.abspath(cast(*u8, &nm[0]), cast(*u8, &cpb[0]));
             prog.outs(cast(*u8, &nm[0])); prog.outs(": ");
-            if (cfd < 0) { prog.outs("FAILED open\n"); rc = cast(i32, 1); }
+            let is [16]u8 as dig;
+            if (hash_path(cpath, cast(*u8, &dig[0])) != 0) { prog.outs("FAILED open\n"); rc = cast(i32, 1); }
             else {
-                let is [16]u8 as dig; hash_fd(cfd, cast(*u8, &dig[0])); sys.close(cfd);
                 let is *u8 as H = "0123456789abcdef"; let is [33]u8 as got; let is i64 as g with mut = 0;
-                while (g < 16) { got[g * 2] = H[(cast(i64, dig[g]) >> 4) & 15]; got[g * 2 + 1] = H[cast(i64, dig[g]) & 15]; g = g + 1; } got[32] = cast(u8, 0);
+                while (g < 16) { got[g * 2] = H[(cast(i64, dig[g]) >> 4) & 15]; got[g * 2 + 1] = H[(cast(i64, dig[g]) & 15)]; g = g + 1; } got[32] = cast(u8, 0);
                 if (streq(cast(*u8, &got[0]), cast(*u8, &want[0])) == 1) { prog.outs("OK\n"); } else { prog.outs("FAILED\n"); rc = cast(i32, 1); }
             }
         }
