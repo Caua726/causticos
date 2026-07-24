@@ -1,0 +1,114 @@
+// wterm/wterm_grid.cst — cell grid rendering + size protocol + REPL prompt/err
+// helpers. Owns no global write beyond state.cst (via 's.').
+use "wterm_state.cst" as s;
+use "../../../Caustic/std/causticos/term.cst" as term;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+fn slen(s_in as *u8) as i64 { let is i64 as n with mut = 0; while (s_in[n] != 0) { n = n + 1; } return n; }
+fn puts(t as *term.Term, s_in as *u8) as void { term.puts(t, s_in, slen(s_in)); }
+fn _col(t as *term.Term, fg as u32) as void { term.set_color(t, fg, s.C_BG); }
+fn prompt(t as *term.Term) as void { _col(t, s.C_PROMPT); puts(t, "> "); _col(t, s.C_TEXT); }
+fn err(t as *term.Term, s_in as *u8) as void { _col(t, s.C_ERR); puts(t, s_in); _col(t, s.C_TEXT); }
+fn hline(t as *term.Term, ch as i64, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { term.putc(t, ch); i = i + 1; }
+}
+
+// Reply to a TUI child's "CSI 18t" size query, and resend on resize. The
+// terminal reports its grid as ESC[8;rows;cols t on the child's stdin — the
+// in-band, no-ioctl way for a program like btop to learn and track size.
+fn _emit_num(buf as *u8, pos as i64, val as i64) as i64 {
+    let is i64 as v with mut = val;
+    if (v <= 0) { buf[pos] = cast(u8, 48); return pos + 1; }
+    let is [12]u8 as tmp;
+    let is i64 as nd with mut = 0;
+    while (v > 0) { tmp[nd] = cast(u8, 48 + v - (v / 10) * 10); v = v / 10; nd = nd + 1; }
+    let is i64 as k with mut = 0;
+    while (k < nd) { buf[pos + k] = tmp[nd - 1 - k]; k = k + 1; }
+    return pos + nd;
+}
+fn send_size(t as *term.Term) as void {
+    if (s.child_in < 0) { return; }
+    let is [40]u8 as b;
+    b[0] = cast(u8, 0x1B); b[1] = cast(u8, 0x5B); b[2] = cast(u8, 56); b[3] = cast(u8, 59);
+    let is i64 as i with mut = 4;
+    i = _emit_num(cast(*u8, &b[0]), i, t.rows);
+    b[i] = cast(u8, 59); i = i + 1;
+    i = _emit_num(cast(*u8, &b[0]), i, t.cols);
+    b[i] = cast(u8, 116); i = i + 1;
+    syscall(11, s.child_in, cast(i64, &b[0]), i);
+}
+
+fn _log(s_in as *u8) as void { sys.write_serial(s_in, slen(s_in)); }
+
+// Pixel-row → text-row: the term lays cells out at PAD_Y + r*16 (term.cst's
+// PAD_Y is 12). A dirty pixel band [y0,y1) covers rows [(y0-12)/16 ..].
+fn _px_to_row(py as i64) as i64 {
+    let is i64 as r with mut = (py - 12) / 16;
+    if (r < 0) { r = 0; }
+    return r;
+}
+
+fn flatten_rows(t as *term.Term, r0 as i64, r1 as i64) as void {
+    let is i64 as cols = t.cols;
+    let is i64 as rows = t.rows;
+    let is *i64 as hdr = cast(*i64, s.seg_base);
+    hdr[0] = cols;
+    hdr[1] = rows;
+    hdr[2] = t.cx;
+    hdr[3] = t.cy;
+    let is i64 as vis with mut = 1;
+    if (t.cur_vis == 0) { vis = 0; }
+    if (t.view_off != 0) { vis = 0; }
+    hdr[4] = vis;
+    hdr[5] = 0; hdr[6] = 0; hdr[7] = 0;
+    let is *i64 as grid = cast(*i64, t.grid);
+    let is *i64 as dst = cast(*i64, s.segcells);
+    let is i64 as r with mut = r0;
+    while (r < r1 && r < rows) {
+        let is i64 as p = t.live_top + t.grid_rows - t.view_off + r;
+        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
+        let is i64 as gbase = phys * t.grid_stride;
+        let is i64 as dbase = r * cols;
+        let is i64 as c with mut = 0;
+        while (c < cols) { dst[dbase + c] = grid[gbase + c]; c = c + 1; }
+        r = r + 1;
+    }
+    return;
+}
+
+fn note_dirty(t as *term.Term) as void {
+    let is [4]i64 as d;
+    if (term.take_dirty(t, &d[0]) == 0) { return; }
+    let is i64 as r0 with mut = _px_to_row(d[1]);
+    let is i64 as r1 with mut = _px_to_row(d[1] + d[3] - 1) + 1;
+    if (r0 < 0) { r0 = 0; }
+    if (r1 > t.rows) { r1 = t.rows; }
+    if (r1 <= r0) { return; }
+    flatten_rows(t, r0, r1);
+    if (s.pend_on == 0) {
+        s.pend_r0 = r0; s.pend_r1 = r1; s.pend_on = 1;
+        return;
+    }
+    if (r0 < s.pend_r0) { s.pend_r0 = r0; }
+    if (r1 > s.pend_r1) { s.pend_r1 = r1; }
+    return;
+}
+
+fn show(t as *term.Term) as void {
+    term.flush(t);
+    note_dirty(t);
+    return;
+}
+
+// recall — overwrite the live line buffer from a stored history slot and
+// redraw every character; the caller is responsible for resetting the cursor.
+fn recall(t as *term.Term, line as *u8, llen_ptr as *i64, src as *u8, srclen as i64) as void {
+    let is i64 as j with mut = 0;
+    while (j < llen_ptr[0]) { term.putc(t, 0x08); j = j + 1; }
+    let is i64 as i with mut = 0;
+    while (i < srclen && i < s.LINE_CAP - 1) { line[i] = src[i]; term.putc(t, cast(i64, src[i])); i = i + 1; }
+    llen_ptr[0] = i;
+    show(t);
+    return;
+}

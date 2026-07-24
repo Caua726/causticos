@@ -1,546 +1,162 @@
-// wterm.cst — the windowed terminal: the shell REPL living inside a WM
-// window instead of owning the screen.
-//
-// Same brain as userspace/shell.cst (line editing, 16-deep history, tab
-// completion, /<cmd>.cse spawning with a console channel), different body:
-//   - renders into a shared SEGMENT via term.init_buffer (present suppressed;
-//     dirty rects flow to the WM as MSG_COMMIT, coalesced, sent only when the
-//     channel polls WRITABLE)
-//   - keys arrive as MSG_KEY over the WM channel (fd 3) ALREADY NORMALISED:
-//     a = a keysym (printable ASCII byte or a KEY_* code), b = mods|pressed.
-//     The compositor owns the keymap; the terminal only maps the special
-//     keysyms to its own ESC-sequences for a child (arrows → ESC[A…).
-//   - a running child's stdout is one more SYS_POLL entry, not a blocking
-//     pump: output streams into the grid while the WM stays responsive
-//   - MSG_RESIZE re-lays the grid out via term.resize (bottom-anchored)
-// The cell grid (attach_grid) is what makes that resize re-render content.
-
+// wterm.cst — orchestrator (/wterm.cse). Imports state + per-domain modules;
+// owns main() and the per-sweep dispatchers. Module-level state lives
+// exclusively in wterm_state.cst; this file only orchestrates.
+use "wterm_state.cst" as s;
+use "wterm_grid.cst" as g;
+use "wterm_child.cst" as cli;
+use "wterm_repl.cst" as r;
 use "../../../Caustic/std/causticos/term.cst" as term;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto.cst" as wmp;
 use "../lib/compo_proto.cst" as cp;
 
-let is i64 as MAX_ARGS with imut = 16;
-let is i64 as LINE_CAP with imut = 256;
-let is i64 as IMG_CAP  with imut = 4194304;    // 4 MiB = SPAWN_IMG_MAX (fits the 1.2 MiB compiler)
-
-let is u32 as C_TEXT   with imut = 0x00d3d7cf;
-let is u32 as C_PROMPT with imut = 0x008bbf63;
-let is u32 as C_ERR    with imut = 0x00ef5350;
-let is u32 as C_DIM    with imut = 0x00888a8c;
-let is u32 as C_TITLE  with imut = 0x0073d0ff;
-let is u32 as C_BG     with imut = 0x00121417;
-
-// Command history (16-deep ring; Up/Down walk it).
-let is [4096]u8 as hbuf with mut;
-let is [16]i64 as hlen with mut;
-let is i64 as hhead with mut = 0;
-let is i64 as hsize with mut = 0;
-let is i64 as hnav with mut = 0;
-
-// The cell grid: 160 cols cover a full 1280px-wide window (the worst-case
-// maximised width). 60 ring lines = a full-screen view (a 1280×800 screen tops
-// out at ~43 text rows once decorations + padding are removed) plus ~17 lines
-// of scrollback (term.cst turns the grid into a ring — lines scrolling off the
-// top become history, the wheel slides the view back into it). 160×60×8B = 75K,
-// down from the old 160×80=100K: 80 rows reserved ~37 scrollback lines that the
-// screen can never even display at once, dead BSS resident for the term's life.
-let is [9600]i64 as gridbuf with mut;
-let is i64 as GRID_STRIDE with imut = 160;
-let is i64 as GRID_ROWS   with imut = 60;
-
-// The TEXT surface: the WM rasterises glyphs, so we ship only the cell grid.
-// segcells points just past the 8-i64 header in the shared segment; seg_cols is
-// the column stride the WM reads from the header (kept == t.cols). Dirty is now
-// coalesced as a RANGE OF ROWS (inclusive lo, exclusive hi) instead of a pixel
-// rect — the WM re-rasterises whole rows.
-let is i64 as seg_base with mut = 0;     // segment VA (header at [0])
-let is i64 as segcells with mut = 0;     // VA of cell[0] (header + 8 i64)
-let is i64 as seg_cap_cells with mut = 0;// capacity in cells (cols*rows ceiling)
-
-// Coalesced dirty ROW range awaiting a WRITABLE channel (hi exclusive).
-let is i64 as pend_on with mut = 0;
-let is i64 as pend_r0 with mut = 0;
-let is i64 as pend_r1 with mut = 0;
-
-// Running child (one at a time, like the shell).
-let is i64 as child_pid with mut = 0;
-let is i64 as child_out with mut = 0 - 1;
-// The child's stdin (its fd 0): a channel the terminal writes keystrokes into
-// while the child runs, so interactive programs can read input. Raw bytes,
-// byte-at-a-time, no echo — the program echoes if it wants (terminal raw mode).
-let is i64 as child_in with mut = 0 - 1;
-// The child's control channel (its fd wmp.TERM_CTL): 32-byte requests the
-// terminal relays — today, MSG_SPAWN_REQ ("open another terminal").
-let is i64 as child_ctl with mut = 0 - 1;
-let is i64 as ctl_fill with mut = 0;
-let is [32]u8 as ctl_acc with mut;
-
-// --- helpers (transplanted from shell.cst) ---
-fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
-fn puts(t as *term.Term, s as *u8) as void { term.puts(t, s, slen(s)); }
-fn _col(t as *term.Term, fg as u32) as void { term.set_color(t, fg, C_BG); }
-fn prompt(t as *term.Term) as void { _col(t, C_PROMPT); puts(t, "> "); _col(t, C_TEXT); }
-fn err(t as *term.Term, s as *u8) as void { _col(t, C_ERR); puts(t, s); _col(t, C_TEXT); }
-fn hline(t as *term.Term, ch as i64, n as i64) as void { let is i64 as i with mut = 0; while (i < n) { term.putc(t, ch); i = i + 1; } }
-
-// Reply to a TUI child's "CSI 18t" size query — and resend on resize. The
-// terminal reports its grid as ESC[8;rows;cols t on the child's stdin: the
-// in-band, no-ioctl way (the byte-stream IS the channel) for a program like
-// btop to learn and track the window size.
-fn _emit_num(buf as *u8, pos as i64, val as i64) as i64 {
-    let is i64 as v with mut = val;
-    if (v <= 0) { buf[pos] = cast(u8, 48); return pos + 1; }
-    let is [12]u8 as tmp;
-    let is i64 as nd with mut = 0;
-    while (v > 0) { tmp[nd] = cast(u8, 48 + v - (v / 10) * 10); v = v / 10; nd = nd + 1; }
-    let is i64 as k with mut = 0;
-    while (k < nd) { buf[pos + k] = tmp[nd - 1 - k]; k = k + 1; }
-    return pos + nd;
-}
-fn send_size(t as *term.Term) as void {
-    if (child_in < 0) { return; }
-    let is [40]u8 as b;
-    b[0] = cast(u8, 0x1B); b[1] = cast(u8, 0x5B); b[2] = cast(u8, 56); b[3] = cast(u8, 59);  // ESC [ 8 ;
-    let is i64 as i with mut = 4;
-    i = _emit_num(cast(*u8, &b[0]), i, t.rows);
-    b[i] = cast(u8, 59); i = i + 1;        // ';'
-    i = _emit_num(cast(*u8, &b[0]), i, t.cols);
-    b[i] = cast(u8, 116); i = i + 1;       // 't'
-    syscall(11, child_in, cast(i64, &b[0]), i);
-}
-fn _log(s as *u8) as void { sys.write_serial(s, slen(s)); }
-
-// Pixel-row → text-row: the term lays cells out at PAD_Y + r*16 (term.cst's
-// PAD_Y is 12). A dirty pixel band [y0,y1) covers rows [(y0-12)/16 ..].
-fn _px_to_row(py as i64) as i64 {
-    let is i64 as r with mut = (py - 12) / 16;
-    if (r < 0) { r = 0; }
-    return r;
+// Forward one keystroke to the running child. Raw bytes, byte-at-a-time,
+// no echo: the program echoes if it wants (terminal raw mode). Special keys
+// become 1-byte codes (Enter 0x0A, BS 0x08, Tab 0x09, Esc 0x1B) or 3-byte
+// ANSI sequences (arrows → ESC[A/B/C/D) so a TUI like btop can read them.
+fn forward_key(t as *term.Term, keysym as i64, kb as i64) as void {
+    if (s.child_in < 0) { return; }
+    if (keysym == cp.KEY_UP) {
+        let is [3]u8 as ek;
+        ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 65);
+        syscall(11, s.child_in, cast(i64, &ek[0]), 3);
+    } else if (keysym == cp.KEY_DOWN) {
+        let is [3]u8 as ek;
+        ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 66);
+        syscall(11, s.child_in, cast(i64, &ek[0]), 3);
+    } else if (keysym == cp.KEY_RIGHT) {
+        let is [3]u8 as ek;
+        ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 67);
+        syscall(11, s.child_in, cast(i64, &ek[0]), 3);
+    } else if (keysym == cp.KEY_LEFT) {
+        let is [3]u8 as ek;
+        ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 68);
+        syscall(11, s.child_in, cast(i64, &ek[0]), 3);
+    } else if (keysym == cp.KEY_ENTER) {
+        let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x0A);
+        syscall(11, s.child_in, cast(i64, &kb_b[0]), 1);
+    } else if (keysym == cp.KEY_BACKSPACE) {
+        let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x08);
+        syscall(11, s.child_in, cast(i64, &kb_b[0]), 1);
+    } else if (keysym == cp.KEY_TAB) {
+        let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x09);
+        syscall(11, s.child_in, cast(i64, &kb_b[0]), 1);
+    } else if (keysym == cp.KEY_ESC) {
+        let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x1B);
+        syscall(11, s.child_in, cast(i64, &kb_b[0]), 1);
+    } else if (keysym > 0 && keysym < 0x80) {
+        let is [1]u8 as kb_b; kb_b[0] = cast(u8, keysym);
+        syscall(11, s.child_in, cast(i64, &kb_b[0]), 1);
+    }
+    return;
 }
 
-// Flatten the visible grid view into the shared text segment and write the
-// header (geometry + cursor). Only rows [r0,r1) are copied — the WM re-reads
-// the whole header but only the rows we commit are re-rasterised.
-fn flatten_rows(t as *term.Term, r0 as i64, r1 as i64) as void {
-    let is i64 as cols = t.cols;
-    let is i64 as rows = t.rows;
-    let is *i64 as hdr = cast(*i64, seg_base);
-    hdr[0] = cols;            // TXT_H_COLS
-    hdr[1] = rows;            // TXT_H_ROWS
-    hdr[2] = t.cx;            // TXT_H_CUR_COL
-    hdr[3] = t.cy;            // TXT_H_CUR_ROW
-    let is i64 as vis with mut = 1;
-    if (t.cur_vis == 0) { vis = 0; }
-    if (t.view_off != 0) { vis = 0; }   // scrolled back: no live cursor
-    hdr[4] = vis;             // TXT_H_CUR_VIS
-    hdr[5] = 0; hdr[6] = 0; hdr[7] = 0;
-    let is *i64 as grid = cast(*i64, t.grid);
-    let is *i64 as dst = cast(*i64, segcells);
-    let is i64 as r with mut = r0;
-    while (r < r1 && r < rows) {
-        // _phys_row(t, r): physical ring row of the r-th visible line,
-        // inlined to avoid depending on term.cst's internal helper.
-        let is i64 as p = t.live_top + t.grid_rows - t.view_off + r;
-        let is i64 as phys = p - (p / t.grid_rows) * t.grid_rows;
-        let is i64 as gbase = phys * t.grid_stride;
-        let is i64 as dbase = r * cols;
-        let is i64 as c with mut = 0;
-        while (c < cols) {
-            dst[dbase + c] = grid[gbase + c];
-            c = c + 1;
+// Tab is "auto-commit at first whitespace, else emit completion and stay".
+fn handle_key(t as *term.Term, keysym as i64, kb as i64, line as *u8, llen_ptr as *i64) as void {
+    let is i64 as pressed = cp.key_pressed(kb);
+    if (pressed != 1) { return; }
+    if (s.child_out >= 0) {
+        // A child is running — keys go to the child, not the REPL.
+        forward_key(t, keysym, kb);
+        return;
+    }
+    if (keysym == cp.KEY_ENTER) {
+        term.putc(t, 0x0A);
+        g.show(t);
+        if (llen_ptr[0] > 0) {
+            let is i64 as hi with mut = 0;
+            while (hi < llen_ptr[0]) { s.hbuf[s.hhead * 256 + hi] = line[hi]; hi = hi + 1; }
+            s.hlen[s.hhead] = llen_ptr[0];
+            s.hhead = (s.hhead + 1) % 16;
+            if (s.hsize < 16) { s.hsize = s.hsize + 1; }
         }
-        r = r + 1;
-    }
-    return;
-}
-
-// Fold the term's accumulated dirty rect into the pending row range, then
-// flatten those rows into the segment so the bytes are ready to commit.
-fn note_dirty(t as *term.Term) as void {
-    let is [4]i64 as d;
-    if (term.take_dirty(t, &d[0]) == 0) { return; }
-    let is i64 as r0 with mut = _px_to_row(d[1]);
-    let is i64 as r1 with mut = _px_to_row(d[1] + d[3] - 1) + 1;   // inclusive last → exclusive
-    if (r0 < 0) { r0 = 0; }
-    if (r1 > t.rows) { r1 = t.rows; }
-    if (r1 <= r0) { return; }
-    flatten_rows(t, r0, r1);
-    if (pend_on == 0) {
-        pend_r0 = r0; pend_r1 = r1; pend_on = 1;
-        return;
-    }
-    if (r0 < pend_r0) { pend_r0 = r0; }
-    if (r1 > pend_r1) { pend_r1 = r1; }
-    return;
-}
-
-// flush + harvest in one move — every render batch ends here.
-fn show(t as *term.Term) as void {
-    term.flush(t);
-    note_dirty(t);
-    return;
-}
-
-// Bytes actually mmap'd by the last successful read_file (page-aligned). The
-// munmaps below must hand back this real size, not IMG_CAP — allocating the 4
-// MiB ceiling for every child (even a 20 KiB `ls`) was the whole leak.
-let is i64 as img_alloc with mut = 0;
-
-// read_file failure codes, written to *out_err so the caller can tell the truth
-// instead of blaming a missing file for every failure. A NON-existent program
-// and an out-of-memory mmap are very different bugs — conflating them as "not
-// found" sent us chasing the wrong cause for the intermittent failure.
-let is i64 as RF_OK     with imut = 0;
-let is i64 as RF_NOENT  with imut = 1;    // open failed: the file is not there
-let is i64 as RF_BADSZ  with imut = 2;    // size <= 0 or > IMG_CAP
-let is i64 as RF_NOMEM  with imut = 3;    // mmap for the image failed
-let is i64 as RF_IOERR  with imut = 4;    // short/failed read off the disk
-
-fn read_file(path as *u8, out_len as *i64, out_err as *i64) as *u8 {
-    *out_len = 0;
-    *out_err = RF_OK;
-    let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { *out_err = RF_NOENT; return cast(*u8, 0); }
-    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
-    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
-    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); *out_err = RF_BADSZ; return cast(*u8, 0); }
-    // Allocate only what the image needs, rounded up to a page — IMG_CAP stays
-    // a safety ceiling (checked above), never the allocation size.
-    let is i64 as alloc = (sz + 4095) & (0 - 4096);
-    let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
-    if (va < 0) { sys.close(fd); *out_err = RF_NOMEM; return cast(*u8, 0); }
-    img_alloc = alloc;
-    let is *u8 as buf = cast(*u8, va);
-    let is i64 as got = sys.read(fd, buf, sz);
-    sys.close(fd);
-    if (got != sz) { sys.munmap(va, alloc); *out_err = RF_IOERR; return cast(*u8, 0); }
-    *out_len = got;
-    return buf;
-}
-
-// the loaded child image, freed when the child is reaped
-let is i64 as child_img with mut = 0;
-// the byte size of that image's mapping (== img_alloc at spawn time)
-let is i64 as child_img_alloc with mut = 0;
-
-// Launch /<cmd>.cse with its stdout wired to a console channel — and DON'T
-// pump: the read end joins the main poll loop as child_out.
-fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64) as void {
-    let is [128]u8 as path;
-    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
-    let is i64 as cl = argv_len[0];
-    if (cl > 110) { err(t, "name too long\n"); return; }
-    path[0] = cast(u8, 47);
-    let is i64 as i with mut = 0;
-    while (i < cl) { path[1 + i] = cmd[i]; i = i + 1; }
-    let is *u8 as ext = ".cse";
-    let is i64 as j with mut = 0;
-    while (j < 4) { path[1 + cl + j] = ext[j]; j = j + 1; }
-    path[1 + cl + 4] = cast(u8, 0);
-
-    let is i64 as img_len with mut = 0;
-    let is i64 as rferr with mut = 0;
-    let is *u8 as img = read_file(cast(*u8, &path[0]), &img_len, &rferr);
-    if (cast(i64, img) == 0) {
-        _col(t, C_ERR); puts(t, cast(*u8, &path[0]));
-        if (rferr == RF_NOENT)      { puts(t, ": not found\n"); }
-        else if (rferr == RF_BADSZ) { puts(t, ": bad size\n"); }
-        else if (rferr == RF_NOMEM) { puts(t, ": out of memory\n"); }
-        else if (rferr == RF_IOERR) { puts(t, ": read error\n"); }
-        else                        { puts(t, ": load failed\n"); }
-        _col(t, C_TEXT);
-        return;
-    }
-
-    let is [2]i64 as fds;
-    if (sys.channel_create(cast(*i64, &fds[0])) != 0) {
-        err(t, "channel fail\n");
-        sys.munmap(cast(i64, img), img_alloc);
-        return;
-    }
-    // control channel: the child's window onto terminal services (fd 4)
-    let is [2]i64 as cfds;
-    if (sys.channel_create(cast(*i64, &cfds[0])) != 0) {
-        err(t, "channel fail\n");
-        sys.close(fds[0]); sys.close(fds[1]);
-        sys.munmap(cast(i64, img), img_alloc);
-        return;
-    }
-    // stdin channel: the terminal keeps [0] (writes keystrokes), the child gets
-    // [1] as fd 0 (reads them). Same keep-[0]/give-[1] convention as stdout.
-    let is [2]i64 as ifds;
-    if (sys.channel_create(cast(*i64, &ifds[0])) != 0) {
-        err(t, "channel fail\n");
-        sys.close(fds[0]); sys.close(fds[1]);
-        sys.close(cfds[0]); sys.close(cfds[1]);
-        sys.munmap(cast(i64, img), img_alloc);
-        return;
-    }
-    let is [6]i64 as fdacts;
-    fdacts[0] = 0;
-    fdacts[1] = ifds[1];
-    fdacts[2] = 1;
-    fdacts[3] = fds[1];
-    fdacts[4] = wmp.TERM_CTL;
-    fdacts[5] = cfds[1];
-
-    let is [32]i64 as av;
-    let is i64 as k with mut = 0;
-    while (k < argc) { av[2 * k] = argv_ptr[k]; av[2 * k + 1] = argv_len[k]; k = k + 1; }
-
-    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), 3, cast(*u8, &av[0]), argc);
-    sys.close(fds[1]);
-    sys.close(cfds[1]);
-    sys.close(ifds[1]);
-    if (pid < 0) {
-        err(t, "spawn failed\n");
-        sys.close(fds[0]);
-        sys.close(cfds[0]);
-        sys.close(ifds[0]);
-        sys.munmap(cast(i64, img), img_alloc);
-        return;
-    }
-    _col(t, C_TEXT);
-    child_pid = pid;
-    child_out = fds[0];
-    child_ctl = cfds[0];
-    child_in = ifds[0];
-    ctl_fill = 0;
-    child_img = cast(i64, img);
-    child_img_alloc = img_alloc;
-    return;
-}
-
-// Drain every complete control request still buffered and relay it. The
-// child's exit closes its end together with its last write — the request
-// must be honored even when its EOF arrives in the same sweep.
-fn drain_ctl() as void {
-    if (child_ctl < 0) { return; }
-    let is [3]i64 as ce;
-    let is [4]i64 as cm;
-    let is i64 as more with mut = 1;
-    while (more == 1) {
-        ce[0] = child_ctl;
-        ce[1] = sys.POLL_READABLE;
-        ce[2] = 0;
-        sys.poll(&ce[0], 1, 0);
-        if ((ce[2] & sys.POLL_READABLE) == 0) { more = 0; }
-        else {
-            let is i64 as cr = wmp.msg_read(child_ctl, &ctl_fill, cast(*u8, &ctl_acc[0]), &cm[0]);
-            if (cr < 0) { more = 0; }
-            else if (cr == 1 && cm[0] == wmp.MSG_SPAWN_REQ) {
-                wmp.msg_send(wmp.WM_FD, wmp.MSG_SPAWN_REQ, 0, 0, 0);
+        s.hnav = 0;
+        let is i64 as quit = r.run_line(t, line, llen_ptr[0]);
+        llen_ptr[0] = 0;
+        if (quit == 1) {
+            wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+            return;
+        }
+        if (s.child_out < 0) { g.prompt(t); }
+        g.show(t);
+    } else if (keysym == cp.KEY_TAB) {
+        r.complete(t, line, llen_ptr);
+    } else if (keysym == cp.KEY_BACKSPACE) {
+        if (llen_ptr[0] > 0) { llen_ptr[0] = llen_ptr[0] - 1; term.putc(t, 0x08); g.show(t); }
+    } else if (keysym == cp.KEY_UP) {
+        if (s.hnav < s.hsize) {
+            s.hnav = s.hnav + 1;
+            let is i64 as slot = (s.hhead - s.hnav + 16) % 16;
+            g.recall(t, line, llen_ptr, cast(*u8, &s.hbuf[slot * 256]), s.hlen[slot]);
+        }
+    } else if (keysym == cp.KEY_DOWN) {
+        if (s.hnav > 0) {
+            s.hnav = s.hnav - 1;
+            if (s.hnav == 0) { g.recall(t, line, llen_ptr, cast(*u8, &line[0]), 0); }
+            else {
+                let is i64 as slot2 = (s.hhead - s.hnav + 16) % 16;
+                g.recall(t, line, llen_ptr, cast(*u8, &s.hbuf[slot2 * 256]), s.hlen[slot2]);
             }
         }
-    }
-    return;
-}
-
-// Child stdout drained to EOF → flush its control channel, reap, free the
-// image, fresh prompt.
-fn child_eof(t as *term.Term) as void {
-    drain_ctl();
-    sys.close(child_out);
-    sys.close(child_ctl);
-    if (child_in >= 0) { sys.close(child_in); }
-    let is i64 as st with mut = 0;
-    sys.wait(child_pid, &st);
-    sys.munmap(child_img, child_img_alloc);
-    child_out = 0 - 1;
-    child_ctl = 0 - 1;
-    child_in = 0 - 1;
-    child_pid = 0;
-    child_img = 0;
-    child_img_alloc = 0;
-    prompt(t);
-    show(t);
-    return;
-}
-
-fn parse(line as *u8, len as i64, argv_ptr as *i64, argv_len as *i64) as i64 {
-    let is i64 as argc with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < len && argc < MAX_ARGS) {
-        while (i < len && line[i] == 32) { i = i + 1; }
-        if (i >= len) { break; }
-        let is i64 as start = i;
-        while (i < len && line[i] != 32) { i = i + 1; }
-        argv_ptr[argc] = cast(i64, line) + start;
-        argv_len[argc] = i - start;
-        argc = argc + 1;
-    }
-    return argc;
-}
-
-fn streq(a as *u8, alen as i64, lit as *u8) as i64 {
-    let is i64 as ll = slen(lit);
-    if (alen != ll) { return 0; }
-    let is i64 as i with mut = 0;
-    while (i < ll) { if (a[i] != lit[i]) { return 0; } i = i + 1; }
-    return 1;
-}
-
-// `exit` is windowed-terminal-specific: tell the WM and die.
-fn run_line(t as *term.Term, line as *u8, len as i64) as i64 {
-    let is [16]i64 as argv_ptr;
-    let is [16]i64 as argv_len;
-    let is i64 as argc = parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
-    if (argc == 0) { return 0; }
-    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
-    let is i64 as cl = argv_len[0];
-    if (streq(cmd, cl, "clear") == 1 || streq(cmd, cl, "reset") == 1) { term.clear(t); return 0; }
-    if (streq(cmd, cl, "exit") == 1) { return 1; }
-    if (streq(cmd, cl, "help") == 1) {
-        _col(t, C_DIM); puts(t, "built-in\n"); _col(t, C_TEXT);
-        puts(t, "  help              show this help\n");
-        puts(t, "  clear / reset     clear the screen\n");
-        puts(t, "  exit              close this window\n");
-        _col(t, C_DIM); puts(t, "programs  (/<name>.cse)\n"); _col(t, C_TEXT);
-        puts(t, "  echo <args...>    print the arguments\n");
-        puts(t, "  cat  <file>       print a file\n");
-        puts(t, "  ls   [path]       list a directory\n");
-        puts(t, "  uptime            time since boot\n");
-        puts(t, "  sysinfo           kernel version + limits\n");
-        puts(t, "  newterm           open another terminal window\n");
-        return 0;
-    }
-    run_program(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc);
-    return 0;
-}
-
-fn recall(t as *term.Term, line as *u8, llen_ptr as *i64, src as *u8, srclen as i64) as void {
-    let is i64 as j with mut = 0;
-    while (j < llen_ptr[0]) { term.putc(t, 0x08); j = j + 1; }
-    let is i64 as i with mut = 0;
-    while (i < srclen && i < LINE_CAP - 1) { line[i] = src[i]; term.putc(t, cast(i64, src[i])); i = i + 1; }
-    llen_ptr[0] = i;
-    show(t);
-    return;
-}
-
-fn _cand_match(cand as *u8, cl as i64, line as *u8, ts as i64, plen as i64) as i64 {
-    if (cl < plen) { return 0; }
-    let is i64 as k with mut = 0;
-    while (k < plen) { if (cand[k] != line[ts + k]) { return 0; } k = k + 1; }
-    return 1;
-}
-
-fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
-    nmatch_ptr[0] = nmatch_ptr[0] + 1;
-    if (acclen_ptr[0] < 0) {
-        let is i64 as i with mut = 0;
-        while (i < cl && i < 255) { acc[i] = cand[i]; i = i + 1; }
-        acclen_ptr[0] = i;
-    } else {
-        let is i64 as i with mut = 0; let is i64 as al = acclen_ptr[0];
-        while (i < al && i < cl && acc[i] == cand[i]) { i = i + 1; }
-        acclen_ptr[0] = i;
-    }
-    return;
-}
-
-fn complete(t as *term.Term, line as *u8, llen_ptr as *i64) as void {
-    let is i64 as llen = llen_ptr[0];
-    let is i64 as ts with mut = llen;
-    while (ts > 0 && line[ts - 1] != 32) { ts = ts - 1; }
-    let is i64 as plen = llen - ts;
-    let is i64 as is_cmd with mut = 0;
-    if (ts == 0) { is_cmd = 1; }
-    let is [256]u8 as acc;
-    let is i64 as acclen with mut = 0 - 1;
-    let is i64 as nmatch with mut = 0;
-    if (is_cmd == 1) {
-        if (_cand_match("help", 4, line, ts, plen) == 1) { _acc_update("help", 4, cast(*u8, &acc[0]), &acclen, &nmatch); }
-        if (_cand_match("clear", 5, line, ts, plen) == 1) { _acc_update("clear", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
-        if (_cand_match("reset", 5, line, ts, plen) == 1) { _acc_update("reset", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
-        if (_cand_match("exit", 4, line, ts, plen) == 1) { _acc_update("exit", 4, cast(*u8, &acc[0]), &acclen, &nmatch); }
-    }
-    let is i64 as fd = sys.open_read("/");
-    if (fd < 0) { return; }
-    let is [320]u8 as de;
-    while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
-        let is *u8 as nm = cast(*u8, &de[0]);
-        let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
-        let is i64 as nl = nlp[0];
-        let is i64 as cl with mut = nl;
-        let is i64 as ok with mut = 1;
-        if (is_cmd == 1) {
-            if (nl >= 4 && nm[nl-4] == 46 && nm[nl-3] == 99 && nm[nl-2] == 115 && nm[nl-1] == 101) { cl = nl - 4; }
-            else { ok = 0; }
+    } else if (keysym > 0 && keysym < 0x80) {
+        if (llen_ptr[0] < s.LINE_CAP - 1) {
+            line[llen_ptr[0]] = cast(u8, keysym);
+            llen_ptr[0] = llen_ptr[0] + 1;
+            term.putc(t, keysym);
+            g.show(t);
         }
-        if (ok == 1 && _cand_match(nm, cl, line, ts, plen) == 1) { _acc_update(nm, cl, cast(*u8, &acc[0]), &acclen, &nmatch); }
     }
-    sys.close(fd);
-    if (nmatch == 0) { return; }
-    let is i64 as i with mut = plen;
-    while (i < acclen && llen_ptr[0] < LINE_CAP - 1) {
-        line[llen_ptr[0]] = acc[i];
-        term.putc(t, cast(i64, acc[i]));
-        llen_ptr[0] = llen_ptr[0] + 1;
-        i = i + 1;
+    return;
+}
+
+fn handle_msg(t as *term.Term, m as *i64) as void {
+    if (m[0] == wmp.MSG_RESIZE) {
+        term.resize(t, m[1], m[2]);
+        term.clear(t);
+        g.prompt(t);
+        g.show(t);
+        g.send_size(t);
+    } else if (m[0] == wmp.MSG_CLOSE_REQ) {
+        term.putc(t, 0x0A); g.show(t);
+        cli.child_eof(t);
     }
-    if (nmatch == 1 && llen_ptr[0] < LINE_CAP - 1) {
-        line[llen_ptr[0]] = cast(u8, 32); term.putc(t, 0x20); llen_ptr[0] = llen_ptr[0] + 1;
-    }
-    show(t);
     return;
 }
 
 fn main() as i32 {
-    let is [4]i64 as m;
-    let is [32]u8 as acc;
-    let is i64 as fill with mut = 0;
-
-    // WELCOME was written before we were spawned.
+    let is [4]i64 as welcome_m;
     let is i64 as got with mut = 0;
     while (got != 1) {
-        got = wmp.msg_read(wmp.WM_FD, &fill, cast(*u8, &acc[0]), &m[0]);
+        got = wmp.msg_read(s.WM_FD, &s.cmd_fill, cast(*u8, &s.cmd_acc[0]), &welcome_m[0]);
         if (got < 0) { return 1; }
     }
-    if (m[0] != wmp.MSG_WELCOME) { return 1; }
-    let is i64 as screen_w = m[1];
-    let is i64 as screen_h = m[2];
-    let is i64 as win_w with mut = wmp.unpack_w(m[3]);
-    let is i64 as win_h with mut = wmp.unpack_h(m[3]);
+    if (welcome_m[0] != wmp.MSG_WELCOME) { return 1; }
+    let is i64 as win_w = wmp.unpack_w(welcome_m[3]);
+    let is i64 as win_h = wmp.unpack_h(welcome_m[3]);
 
-    // TEXT surface: a tiny CELL-GRID segment (header + cols*rows i64), sized for
-    // the WORST CASE this terminal could ever show — the whole screen — so a
-    // resize never has to reallocate. For 1280x800 that is 160x50 = ~64 KiB,
-    // versus the ~4 MiB full-screen PIXEL buffer the old path allocated.
-    let is i64 as cols_max with mut = screen_w / 8;
-    let is i64 as rows_max with mut = screen_h / 16;
-    if (cols_max > GRID_STRIDE) { cols_max = GRID_STRIDE; }
-    if (rows_max > GRID_ROWS) { rows_max = GRID_ROWS; }
-    seg_cap_cells = cols_max * rows_max;
-    let is i64 as npages with mut = (wmp.TXT_HDR_CELLS + seg_cap_cells) * 8;
+    s.seg_cap_cells = s.GRID_STRIDE * s.GRID_ROWS;
+    let is i64 as npages with mut = (8 + s.seg_cap_cells) * 8;
     npages = (npages + 4095) / 4096;
     let is i64 as seg = sys.seg_create(npages, 0);
     if (seg < 0) { return 2; }
     let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
     if (va < 0) { return 2; }
-    seg_base = va;
-    segcells = va + wmp.TXT_HDR_CELLS * 8;
-    if (sys.fd_send(wmp.WM_FD, seg) != 0) { return 3; }
-    // HELLO.c carries PROTO_VER and the surface kind (TEXT). a/b (npages/stride)
-    // keep their pixel-path meaning; for text the WM ignores stride.
-    wmp.msg_send(wmp.WM_FD, wmp.MSG_HELLO, npages, cols_max * 8,
+    s.seg_base = va;
+    s.segcells = va + 8 * 8;
+    if (sys.fd_send(s.WM_FD, seg) != 0) { return 3; }
+    wmp.msg_send(s.WM_FD, wmp.MSG_HELLO, npages, s.GRID_STRIDE * 8,
                  wmp.hello_c(wmp.PROTO_VER, wmp.SURFACE_TEXT));
-    let is [2]i64 as tb;
-    wmp.title_pack(cast(*u8, "terminal"), 8, &tb[0], &tb[1]);
-    wmp.msg_send(wmp.WM_FD, wmp.MSG_SET_TITLE, 8, tb[0], tb[1]);
 
     let is term.Term as t = term.init_text(win_w, win_h);
-    term.attach_grid(&t, &gridbuf[0], GRID_STRIDE, GRID_ROWS);
-    _col(&t, C_TITLE);
-    puts(&t, "Caustic Terminal\n");
-    _col(&t, C_DIM);
-    hline(&t, 0xC4, 24); puts(&t, "\n");
-    puts(&t, "'help' for commands, 'exit' to close\n\n");
-    _col(&t, C_TEXT);
-    prompt(&t);
-    show(&t);
-    wmp.log_kv(cast(*u8, "wterm: ready cols="), 18, t.cols);
+    term.attach_grid(&t, &s.gridbuf[0], s.GRID_STRIDE, s.GRID_ROWS);
+    g._col(&t, s.C_TITLE);
+    g.puts(&t, "Caustic Terminal\n");
+    g._col(&t, s.C_DIM);
+    g.hline(&t, 0xC4, 24); g.puts(&t, "\n");
+    g.puts(&t, "'help' for commands, 'exit' to close\n\n");
+    g._col(&t, s.C_TEXT);
+    g.prompt(&t);
+    g.show(&t);
 
     let is [256]u8 as line;
     let is i64 as llen with mut = 0;
@@ -548,188 +164,44 @@ fn main() as i32 {
     let is [256]u8 as pbuf;
 
     while (1 == 1) {
-        // entry 0: the WM channel; entries 1/2 (optional): the running
-        // child's stdout and control channel
-        let is i64 as n with mut = 1;
-        pe[0] = wmp.WM_FD;
-        pe[1] = sys.POLL_READABLE;
-        if (pend_on == 1) { pe[1] = sys.POLL_READABLE | sys.POLL_WRITABLE; }
-        pe[2] = 0;
-        if (child_out >= 0) {
-            pe[3] = child_out;
-            pe[4] = sys.POLL_READABLE;
-            pe[5] = 0;
-            pe[6] = child_ctl;
-            pe[7] = sys.POLL_READABLE;
-            pe[8] = 0;
-            n = 3;
+        let is i64 as n with mut = 0;
+        pe[n*3+0] = s.WM_FD; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+        n = n + 1;
+        if (s.child_out >= 0) {
+            pe[n*3+0] = s.child_out; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            n = n + 1;
         }
-        sys.poll(&pe[0], n, 0 - 1);
+        sys.poll(&pe[0], n, 0);
 
-        // -- flush the coalesced commit while the channel has room --
-        // TEXT commit: a = first dirty row, c = (rowcount << 32). The cells were
-        // already flattened into the segment by note_dirty.
-        if (pend_on == 1 && (pe[2] & sys.POLL_WRITABLE) != 0) {
-            let is i64 as rc = wmp.msg_send(wmp.WM_FD, wmp.MSG_COMMIT,
-                                            pend_r0, 0,
-                                            wmp.pack_wh(pend_r1 - pend_r0, 0));
-            if (rc < 0) { return 0; }                  // WM gone
-            pend_on = 0;
-        }
-
-        // -- child control requests first: a child's last request and its
-        //    stdout EOF can land in the same sweep --
-        if (child_ctl >= 0 && (pe[8] & sys.POLL_READABLE) != 0) {
-            drain_ctl();
-        }
-
-        // -- child output --
-        if (child_out >= 0 && (pe[5] & sys.POLL_READABLE) != 0) {
-            let is i64 as r = syscall(10, child_out, cast(i64, &pbuf[0]), 256);
-            if (r > 0) {
-                term.puts(&t, cast(*u8, &pbuf[0]), r);
-                if (t.want_size == 1) { t.want_size = 0; send_size(&t); }   // CSI 18t reply
-                show(&t);
+        if (s.child_out >= 0 && n >= 2 && (pe[1*3+2] & sys.POLL_READABLE) != 0) {
+            let is i64 as n2 = syscall(10, s.child_out, cast(i64, &pbuf[0]), 256);
+            if (n2 > 0) {
+                term.puts(&t, cast(*u8, &pbuf[0]), n2);
+                g.show(&t);
+                if (t.want_size == 1) { t.want_size = 0; g.send_size(&t); }
             } else {
-                child_eof(&t);
+                cli.child_eof(&t);
             }
         }
-        if (child_out >= 0 && (pe[5] & sys.POLL_CLOSED) != 0 && (pe[5] & sys.POLL_READABLE) == 0) {
-            child_eof(&t);
-        }
 
-
-        // -- WM messages --
-        if ((pe[2] & sys.POLL_READABLE) != 0) {
-            let is i64 as r2 = wmp.msg_read(wmp.WM_FD, &fill, cast(*u8, &acc[0]), &m[0]);
-            if (r2 < 0) { return 0; }                  // WM gone
+        if ((pe[0*3+2] & sys.POLL_READABLE) != 0) {
+            let is [4]i64 as m;
+            let is i64 as r2 = wmp.msg_read(s.WM_FD, &s.cmd_fill, cast(*u8, &s.cmd_acc[0]), &m[0]);
+            if (r2 < 0) { return 0; }
             if (r2 == 1) {
                 if (m[0] == wmp.MSG_KEY) {
-                    // a = normalised keysym (ASCII byte or KEY_* code); b = mods|
-                    // pressed<<8|ext<<9. The compositor owns the keymap now — the
-                    // terminal just acts on the keysym. ESC-sequences for a child
-                    // (arrows → ESC[A…) stay HERE: that is terminal policy.
-                    let is i64 as ks = m[1];
-                    let is i64 as pressed = cp.key_pressed(m[2]);
-                    let is i64 as ctrl = (cp.key_mods(m[2]) >> 1) & 1;        // MOD_CTRL
-                    if (pressed == 1 && ks == cp.KEY_PGUP) {                  // PgUp: history
-                        term.scroll_view(&t, t.rows - 1);
-                        show(&t);
-                    }
-                    else if (pressed == 1 && ks == cp.KEY_PGDN) {            // PgDn: toward live
-                        term.scroll_view(&t, 0 - (t.rows - 1));
-                        show(&t);
-                    }
-                    else if (child_out >= 0) {
-                        // A child is running. Ctrl+C (ctrl held + 'c') forcibly
-                        // kills it — the wterm IS the child's parent, so it holds
-                        // the kill authority (CausticOS has no ambient pid
-                        // namespace). The child's death closes its stdout; the
-                        // poll loop then runs child_eof() to reap + reprompt.
-                        if (ctrl == 1 && pressed == 1 && (ks == 0x63 || ks == 0x43) && child_pid != 0) {
-                            term.puts(&t, "^C", 2); term.putc(&t, 0x0A); show(&t);
-                            sys.kill(child_pid);
-                        }
-                        // Arrow keys → ANSI ESC[A/B/C/D on the child's stdin,
-                        // exactly like a real terminal, so a TUI reads them. The
-                        // keysym → ESC-sequence map is terminal policy.
-                        else if (child_in >= 0 && pressed == 1 &&
-                                 (ks == cp.KEY_UP || ks == cp.KEY_DOWN || ks == cp.KEY_RIGHT || ks == cp.KEY_LEFT)) {
-                            let is [3]u8 as ek;
-                            ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
-                            if (ks == cp.KEY_UP) { ek[2] = cast(u8, 65); }        // A up
-                            else if (ks == cp.KEY_DOWN) { ek[2] = cast(u8, 66); } // B down
-                            else if (ks == cp.KEY_RIGHT) { ek[2] = cast(u8, 67); }// C right
-                            else { ek[2] = cast(u8, 68); }                        // D left
-                            syscall(11, child_in, cast(i64, &ek[0]), 3);
-                        }
-                        // Special keys the child still expects as a control byte.
-                        else if (child_in >= 0 && pressed == 1 &&
-                                 (ks == cp.KEY_ENTER || ks == cp.KEY_BACKSPACE || ks == cp.KEY_TAB || ks == cp.KEY_ESC)) {
-                            let is [1]u8 as kb;
-                            if (ks == cp.KEY_ENTER) { kb[0] = cast(u8, 0x0A); }
-                            else if (ks == cp.KEY_BACKSPACE) { kb[0] = cast(u8, 0x08); }
-                            else if (ks == cp.KEY_TAB) { kb[0] = cast(u8, 0x09); }
-                            else { kb[0] = cast(u8, 0x1B); }
-                            syscall(11, child_in, cast(i64, &kb[0]), 1);
-                        }
-                        // Otherwise forward a printable byte to the child's stdin
-                        // (raw byte, no echo — the program echoes if it wants).
-                        else if (child_in >= 0 && pressed == 1 && ks > 0 && ks < 0x80) {
-                            let is [1]u8 as kb;
-                            kb[0] = cast(u8, ks);
-                            syscall(11, child_in, cast(i64, &kb[0]), 1);
-                        }
-                    }
-                    else if (pressed == 1 && ks == cp.KEY_UP) {              // Up: history
-                        if (hnav < hsize) {
-                            hnav = hnav + 1;
-                            let is i64 as slot = (hhead - hnav + 16) % 16;
-                            recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
-                        }
-                    }
-                    else if (pressed == 1 && ks == cp.KEY_DOWN) {           // Down: history
-                        if (hnav > 0) {
-                            hnav = hnav - 1;
-                            if (hnav == 0) { recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &line[0]), 0); }
-                            else {
-                                let is i64 as slot = (hhead - hnav + 16) % 16;
-                                recall(&t, cast(*u8, &line[0]), &llen, cast(*u8, &hbuf[slot * 256]), hlen[slot]);
-                            }
-                        }
-                    }
-                    else if (pressed == 1) {
-                        if (ks == cp.KEY_ENTER) {
-                            term.putc(&t, 0x0A);
-                            show(&t);
-                            if (llen > 0) {
-                                let is i64 as hi with mut = 0;
-                                while (hi < llen) { hbuf[hhead * 256 + hi] = line[hi]; hi = hi + 1; }
-                                hlen[hhead] = llen;
-                                hhead = (hhead + 1) % 16;
-                                if (hsize < 16) { hsize = hsize + 1; }
-                            }
-                            hnav = 0;
-                            let is i64 as quit = run_line(&t, cast(*u8, &line[0]), llen);
-                            llen = 0;
-                            if (quit == 1) {
-                                wmp.msg_send(wmp.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
-                                return 0;
-                            }
-                            if (child_out < 0) { prompt(&t); }
-                            show(&t);
-                        } else if (ks == cp.KEY_TAB) {
-                            complete(&t, cast(*u8, &line[0]), &llen);
-                        } else if (ks == cp.KEY_BACKSPACE) {
-                            if (llen > 0) { llen = llen - 1; term.putc(&t, 0x08); show(&t); }
-                        } else if (ks > 0 && ks < 0x80) {
-                            if (llen < LINE_CAP - 1) {
-                                line[llen] = cast(u8, ks);
-                                llen = llen + 1;
-                                term.putc(&t, ks);
-                                show(&t);
-                            }
-                        }
-                    }
-                } else if (m[0] == wmp.MSG_RESIZE) {
-                    win_w = m[1];
-                    win_h = m[2];
-                    term.resize(&t, win_w, win_h);
-                    if (child_in >= 0) { send_size(&t); }   // tell a running TUI its new grid
-                    show(&t);                          // repaint the text cursor too
-                } else if (m[0] == wmp.MSG_MOUSE_WHEEL) {
-                    // wheel up (positive) = back into history, 3 lines a notch
-                    term.scroll_view(&t, m[1] * 3);
-                    show(&t);
-                } else if (m[0] == wmp.MSG_CLOSE_REQ) {
-                    wmp.msg_send(wmp.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
-                    return 0;
+                    handle_key(&t, m[1], m[2], cast(*u8, &line[0]), &llen);
+                } else {
+                    handle_msg(&t, &m[0]);
                 }
-                // FOCUS: cursor styling later
             }
         }
-        if ((pe[2] & sys.POLL_CLOSED) != 0 && (pe[2] & sys.POLL_READABLE) == 0) {
-            return 0;                                  // WM gone, nothing buffered
+
+        if (s.pend_on == 1 && (pe[0*3+2] & sys.POLL_WRITABLE) != 0) {
+            let is i64 as nrows = s.pend_r1 - s.pend_r0;
+            wmp.msg_send(s.WM_FD, wmp.MSG_COMMIT, 0, s.pend_r0,
+                         wmp.pack_wh(nrows, 0));
+            s.pend_on = 0;
         }
     }
     return 0;
