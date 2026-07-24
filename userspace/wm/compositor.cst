@@ -35,6 +35,12 @@ fn load_image(path as *u8, out_len as *i64) as i64 {
     return va;
 }
 
+// Frame profiling: one serial line a second with frames, rects, kilopixels and
+// the microseconds spent composing vs presenting. Off by default (it is log
+// noise on a healthy system); flip to 1 when a frame feels expensive, because
+// guessing which effect costs what has a poor track record.
+let is i64 as PROF with imut = 0;
+
 fn main() as i32 {
     s.fb_fd    = sys.dev_open(sys.DEV_FB, 0, 0);
     s.kbd_fd   = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
@@ -140,9 +146,24 @@ fn main() as i32 {
         pe[n*3+0] = s.wc_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
         wc_e = n; n = n + 1;
 
+        // A still desktop needs no frame clock. Waking 60 times a second to
+        // find nothing damaged and nothing animating is the whole idle cost of
+        // a compositor: the work per wake is microseconds, but the wake itself
+        // is a scheduler round trip on every cpu it touches.
+        //
+        // So the timeout is the frame deadline only while something is
+        // MOVING; otherwise it is the slowest periodic effect (the cursor's
+        // 4 Hz shimmer), and real input wakes the poll immediately anyway.
         let is i64 as now with mut = sys.time_ns();
-        let is i64 as tmo with mut = next_frame - now;
-        if (tmo < 0) { tmo = 0; }
+        let is i64 as busy with mut = 0;
+        if (s.anim_live > 0 || s.needs_compose == 1 || s.dmg_full == 1 || s.dmg_n > 0) {
+            busy = 1;
+        }
+        let is i64 as tmo with mut = 250000000;
+        if (busy == 1) {
+            tmo = next_frame - now;
+            if (tmo < 0) { tmo = 0; }
+        }
         sys.poll(&pe[0], n, tmo);
 
         if (kbd_e >= 0 && (pe[kbd_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_kbd(); }
@@ -186,6 +207,21 @@ fn main() as i32 {
             fx.tick(now);
             if (s.needs_compose == 1 || s.dmg_full == 1 || s.dmg_n > 0) { scn.flush_damage(); }
             next_frame = now + s.FRAME_NS;
+            // Once a second: what the frame actually cost. Reasoning about
+            // composition from the code is how three wrong guesses happen in
+            // a row; this is the number.
+            if (PROF == 1 && now >= s.prof_next) {
+                if (s.prof_next > 0) {
+                    wmp.log_kv(cast(*u8, "prof: frames="), 14, s.prof_frames);
+                    wmp.log_kv(cast(*u8, "prof: rects="), 13, s.prof_rects);
+                    wmp.log_kv(cast(*u8, "prof: kpx="), 11, s.prof_px / 1000);
+                    wmp.log_kv(cast(*u8, "prof: compose_us="), 18, s.prof_compose_ns / 1000);
+                    wmp.log_kv(cast(*u8, "prof: present_us="), 18, s.prof_present_ns / 1000);
+                }
+                s.prof_next = now + 1000000000;
+                s.prof_frames = 0; s.prof_rects = 0; s.prof_px = 0;
+                s.prof_compose_ns = 0; s.prof_present_ns = 0;
+            }
         }
     }
     return 0;
