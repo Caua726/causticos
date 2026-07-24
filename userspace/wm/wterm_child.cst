@@ -1,7 +1,13 @@
-// wterm/wterm_child.cst — child process lifecycle: load CSE, mmap, hand to
-// compositor, control + data channel plumbing, reap on exit.
+// wterm/wterm_child.cst — starting and retiring the jobs this terminal runs.
+//
+// The job table itself is lib/jobs, shared with the fullscreen shell: one place
+// decides what "a job finished" means. What is wterm-specific lives here — the
+// third channel each child gets (so it can ask for another window), the window
+// title following the running command, and drawing into a cell grid.
 use "wterm_state.cst" as s;
 use "wterm_grid.cst" as g;
+use "../lib/jobs/jobs.cst" as jobs;
+use "../lib/repl/repl.cst" as repl;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto/wmproto.cst" as wmp;
 
@@ -10,8 +16,6 @@ let is i64 as RF_NOENT  with imut = 1;
 let is i64 as RF_BADSZ  with imut = 2;
 let is i64 as RF_NOMEM  with imut = 3;
 let is i64 as RF_IOERR  with imut = 4;
-
-let is i64 as img_alloc with mut = 0;
 
 // set_title — the window title IS what the terminal is doing: the running job
 // while one runs, the terminal's own name at the prompt. The WM shows it in the
@@ -45,123 +49,41 @@ fn read_file(path as *u8, out_len as *i64, out_err as *i64) as *u8 {
     return cast(*u8, va);
 }
 
-fn run_program(t as *term.Term, argv_ptr as *i64, argv_len as *i64, argc as i64) as void {
-    let is [128]u8 as path;
-    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
-    let is i64 as cl = argv_len[0];
-    if (cl > 110) { g.err(t, "name too long\n"); return; }
-    path[0] = cast(u8, 47);
-    let is i64 as i with mut = 0;
-    while (i < cl) { path[1 + i] = cmd[i]; i = i + 1; }
-    let is *u8 as ext = ".cse";
-    let is i64 as j with mut = 0;
-    while (j < 4) { path[1 + cl + j] = ext[j]; j = j + 1; }
-    path[1 + cl + 4] = cast(u8, 0);
-
-    let is i64 as img_len with mut = 0;
-    let is i64 as rferr with mut = 0;
-    let is *u8 as img = read_file(cast(*u8, &path[0]), &img_len, &rferr);
-    if (cast(i64, img) == 0) {
-        g.err(t, cast(*u8, &path[0]));
-        if (rferr == RF_NOENT)      { g.err(t, ": not found\n"); }
-        else if (rferr == RF_BADSZ) { g.err(t, ": bad size\n"); }
-        else if (rferr == RF_NOMEM) { g.err(t, ": out of memory\n"); }
-        else if (rferr == RF_IOERR) { g.err(t, ": read error\n"); }
-        else                        { g.err(t, ": load failed\n"); }
-        return;
-    }
-
-    let is [2]i64 as fds;
-    if (sys.channel_create(&fds[0]) != 0) { g.err(t, "channel fail\n"); sys.munmap(cast(i64, img), s.img_alloc); return; }
-    let is [2]i64 as cfds;
-    if (sys.channel_create(&cfds[0]) != 0) {
-        g.err(t, "channel fail\n");
-        sys.close(fds[0]); sys.close(fds[1]);
-        sys.munmap(cast(i64, img), s.img_alloc);
-        return;
-    }
-    let is [2]i64 as ifds;
-    if (sys.channel_create(&ifds[0]) != 0) {
-        g.err(t, "channel fail\n");
-        sys.close(fds[0]); sys.close(fds[1]);
-        sys.close(cfds[0]); sys.close(cfds[1]);
-        sys.munmap(cast(i64, img), s.img_alloc);
-        return;
-    }
-    let is [6]i64 as fdacts;
-    fdacts[0] = 0;          fdacts[1] = ifds[1];
-    fdacts[2] = 1;          fdacts[3] = fds[1];
-    fdacts[4] = s.CTL_FD;   fdacts[5] = cfds[1];
-
-    let is [32]i64 as av;
-    let is i64 as k with mut = 0;
-    while (k < argc) { av[2 * k] = argv_ptr[k]; av[2 * k + 1] = argv_len[k]; k = k + 1; }
-
-    let is i64 as pid = sys.spawn(cast(*u8, img), img_len,
-                                  cast(*u8, &fdacts[0]), 3, cast(*u8, &av[0]), argc);
-    sys.close(fds[1]);
-    sys.close(cfds[1]);
-    sys.close(ifds[1]);
-    if (pid < 0) {
-        g.err(t, "spawn failed\n");
-        sys.close(fds[0]);
-        sys.close(cfds[0]);
-        sys.close(ifds[0]);
-        sys.munmap(cast(i64, img), s.img_alloc);
-        return;
-    }
-
-    set_title(cmd, cl);
-    s.child_pid = pid;
-    s.child_out = fds[0];
-    s.child_ctl = cfds[0];
-    s.child_in = ifds[0];
-    s.ctl_fill = 0;
-    return;
-}
-
-// Drain every control request still buffered and forward them. The child's
-// exit closes its end together with its last write — the request must be
-// honored even when its EOF arrives in the same sweep.
-fn drain_ctl() as void {
-    if (s.child_ctl < 0) { return; }
+// drain_ctl — forward every control request this job has buffered. A child's
+// exit closes its end together with its last write, so the request must be
+// honored even when its EOF lands in the same sweep.
+fn drain_ctl(slot as i64) as void {
+    let is *jobs.Job as jb = jobs.get(slot);
+    if (jb.aux_fd < 0) { return; }
     let is [3]i64 as ce;
     let is [4]i64 as cm;
     let is i64 as more with mut = 1;
     while (more == 1) {
-        ce[0] = s.child_ctl;
+        ce[0] = jb.aux_fd;
         ce[1] = sys.POLL_READABLE;
         ce[2] = 0;
         sys.poll(&ce[0], 1, 0);
         if ((ce[2] & sys.POLL_READABLE) == 0) { more = 0; }
         else {
-            let is i64 as cr = wmp.msg_read(s.child_ctl, &s.ctl_fill, cast(*u8, &s.ctl_acc[0]), &cm[0]);
+            let is i64 as cr = wmp.msg_read(jb.aux_fd, &s.ctl_fill, cast(*u8, &s.ctl_acc[0]), &cm[0]);
             if (cr < 0) { more = 0; }
             else if (cr == 1 && cm[0] == wmp.MSG_SPAWN_REQ) {
-                wmp.msg_send(wmp.WM_FD, wmp.MSG_SPAWN_REQ, 0, 0, 0);
+                wmp.msg_send(s.WM_FD, wmp.MSG_SPAWN_REQ, 0, 0, 0);
             }
         }
     }
     return;
 }
 
-// child_eof — the job ended (or is being ended). Guarded because it is also
-// reached from a close request that may arrive at an idle prompt, where
-// closing fd -1 and waiting on pid 0 would be nonsense.
-fn child_eof(t as *term.Term) as void {
-    if (s.child_pid == 0) { return; }
-    drain_ctl();
-    sys.close(s.child_out);
-    sys.close(s.child_ctl);
-    if (s.child_in >= 0) { sys.close(s.child_in); }
-    let is i64 as st with mut = 0;
-    sys.wait(s.child_pid, &st);
-    s.child_out = 0 - 1;
-    s.child_ctl = 0 - 1;
-    s.child_in = 0 - 1;
-    s.child_pid = 0;
-    set_title(cast(*u8, "wterm"), 5);
-    g.prompt(t);
+// pump_job — move a job's output into the grid. Returns 1 at end-of-stream.
+fn pump_job(t as *term.Term, slot as i64) as i64 {
+    let is *jobs.Job as jb = jobs.get(slot);
+    if (jb.out_fd < 0) { return 1; }
+    let is [256]u8 as pbuf;
+    let is i64 as n = sys.read(jb.out_fd, cast(*u8, &pbuf[0]), 256);
+    if (n <= 0) { return 1; }
+    term.puts(t, cast(*u8, &pbuf[0]), n);
     g.show(t);
-    return;
+    if (t.want_size == 1) { t.want_size = 0; g.send_size(t); }
+    return 0;
 }

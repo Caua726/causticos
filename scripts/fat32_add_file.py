@@ -323,6 +323,69 @@ def mkdir(f, bpb, name, parent_cluster):
     return new_c
 
 
+def dir_find(f, bpb, dir_cluster, name):
+    """Find `name` (case-insensitive) among dir_cluster's entries. Returns
+    (first_cluster, attr) or None. Reads the LFN run when present, so a name
+    that does not fit 8.3 is matched by its real spelling."""
+    cluster_bytes = bpb["bps"] * bpb["spc"]
+    want = name.upper()
+    cluster = dir_cluster
+    lfn_parts = {}
+    while True:
+        f.seek(cluster_to_offset(bpb, cluster))
+        data = f.read(cluster_bytes)
+        for i in range(0, cluster_bytes, 32):
+            e = data[i:i + 32]
+            if e[0] == 0x00:
+                return None
+            if e[0] == 0xE5:
+                lfn_parts = {}
+                continue
+            if e[11] == 0x0F:
+                seq = e[0] & 0x1F
+                raw = e[1:11] + e[14:26] + e[28:32]
+                lfn_parts[seq] = raw.decode("utf-16-le", "ignore").split("\x00")[0]
+                continue
+            long_name = "".join(lfn_parts[k] for k in sorted(lfn_parts)) if lfn_parts else ""
+            lfn_parts = {}
+            base = e[:8].decode("ascii", "ignore").rstrip()
+            ext = e[8:11].decode("ascii", "ignore").rstrip()
+            short = base + ("." + ext if ext else "")
+            if long_name.upper() == want or short.upper() == want:
+                clus = struct.unpack_from("<H", e, 26)[0] | (struct.unpack_from("<H", e, 20)[0] << 16)
+                return (clus, e[11])
+        nxt = read_fat_entry(f, bpb, cluster)
+        if nxt >= 0x0FFFFFF8:
+            return None
+        cluster = nxt
+
+
+def resolve_path(f, bpb, path, make_dirs):
+    """Split `path` on '/' and walk it for real, so "var/wm/pointer.cst"
+    becomes a file named "pointer.cst" inside a directory "wm" inside a
+    directory "var" — not one root entry whose name contains slashes. The
+    kernel's path_lookup walks components; a flat entry is invisible to it,
+    which is why seeded nested fixtures used to read back as E_NOENT.
+
+    Returns (parent_cluster, leaf_name). With make_dirs, missing intermediate
+    directories are created; without it, a missing one is an error."""
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        raise SystemExit("empty path")
+    cluster = bpb["root_clus"]
+    for comp in parts[:-1]:
+        found = dir_find(f, bpb, cluster, comp)
+        if found is None:
+            if not make_dirs:
+                raise SystemExit(f"no such directory: {comp} (in {path})")
+            cluster = mkdir(f, bpb, comp, cluster)
+        else:
+            if not (found[1] & 0x10):
+                raise SystemExit(f"not a directory: {comp} (in {path})")
+            cluster = found[0]
+    return cluster, parts[-1]
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__, file=sys.stderr)
@@ -334,11 +397,14 @@ def main():
             if len(sys.argv) < 5:
                 print("addfile <name> <content> [<parent>]", file=sys.stderr)
                 sys.exit(1)
-            name = sys.argv[3]
+            path = sys.argv[3]
             content = sys.argv[4]
-            parent = int(sys.argv[5]) if len(sys.argv) > 5 else bpb["root_clus"]
+            if len(sys.argv) > 5:
+                parent, name = int(sys.argv[5]), path
+            else:
+                parent, name = resolve_path(f, bpb, path, make_dirs=True)
             c = addfile(f, bpb, name, content, parent)
-            print(f"file {name} cluster={c}")
+            print(f"file {path} cluster={c}")
         elif op == "addfilebin":
             # addfilebin <name> <hostpath> [<parent>] — content is raw bytes
             # from a host file (binaries with NUL bytes, e.g. an .cse image,
@@ -346,17 +412,29 @@ def main():
             if len(sys.argv) < 5:
                 print("addfilebin <name> <hostpath> [<parent>]", file=sys.stderr)
                 sys.exit(1)
-            name = sys.argv[3]
+            path = sys.argv[3]
             with open(sys.argv[4], "rb") as src:
                 content = src.read()
-            parent = int(sys.argv[5]) if len(sys.argv) > 5 else bpb["root_clus"]
+            if len(sys.argv) > 5:
+                parent, name = int(sys.argv[5]), path
+            else:
+                parent, name = resolve_path(f, bpb, path, make_dirs=True)
             c = addfile(f, bpb, name, content, parent)
-            print(f"file {name} cluster={c} ({len(content)} bytes, binary)")
+            print(f"file {path} cluster={c} ({len(content)} bytes, binary)")
         elif op == "mkdir":
-            name = sys.argv[3]
-            parent = int(sys.argv[4]) if len(sys.argv) > 4 else bpb["root_clus"]
-            c = mkdir(f, bpb, name, parent)
-            print(f"mkdir {name} cluster={c}")
+            path = sys.argv[3]
+            if len(sys.argv) > 4:
+                parent, name = int(sys.argv[4]), path
+            else:
+                parent, name = resolve_path(f, bpb, path, make_dirs=True)
+            existing = dir_find(f, bpb, parent, name)
+            if existing is not None:
+                if not (existing[1] & 0x10):
+                    raise SystemExit(f"not a directory: {path}")
+                print(f"mkdir {path} cluster={existing[0]} (exists)")
+            else:
+                c = mkdir(f, bpb, name, parent)
+                print(f"mkdir {path} cluster={c}")
         else:
             print(f"unknown op: {op}", file=sys.stderr)
             sys.exit(1)

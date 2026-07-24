@@ -1,0 +1,886 @@
+// shexec.cst — turning a typed line into running processes.
+//
+// One line goes through five passes, in this order, because each one produces
+// the input the next one expects:
+//
+//   1. expand   $VAR, $?, $$ and $(cmd) are replaced by their text
+//   2. tokenise quotes are removed, words are split on unquoted whitespace
+//   3. split    words are cut into pipeline stages on '|'
+//   4. redirect >, >>, <, 2>&1 are lifted out of each stage's argv
+//   5. glob     *, ? and [..] are matched against the directory
+//
+// Globbing last is deliberate: an expansion that yields "*.cst" must still be
+// matched, and a quoted "*" must not be. Only step 5 is skipped for quoted
+// words, which is why quoting is tracked per word rather than stripped early.
+//
+// Both shells share this. The only thing they differ on is the extra channel
+// they hand a child (the windowed one gives it a control endpoint), which is
+// why that is a parameter and not a policy baked in here.
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../../../../Caustic/std/causticos/term.cst" as term;
+use "../jobs/jobs.cst" as jobs;
+
+let is i64 as MAX_CMDS with imut = 8;       // pipeline stages
+let is i64 as MAX_WORDS with imut = 64;
+let is i64 as BUF_CAP  with imut = 4096;    // expanded + globbed bytes
+let is i64 as IMG_CAP  with imut = 4194304; // = SPAWN_IMG_MAX
+
+// A pipeline stage: a slice of the word table plus where its ends are wired.
+struct Cmd {
+    w0 as i64;          // first word index
+    wn as i64;          // word count (argv)
+    in_w as i64;        // word index of a '<' target, or -1
+    out_w as i64;       // word index of a '>' / '>>' target, or -1
+    append as i64;      // 1 when the redirect was '>>'
+    err_to_out as i64;  // 1 when '2>&1' was seen
+}
+
+let is [8]Cmd as cmds with mut;
+let is i64 as ncmd with mut = 0;
+
+// The word table. Words point INTO wbuf, which holds everything expansion and
+// globbing produced; the original line is never referenced past tokenising.
+let is [64]i64 as w_off with mut;
+let is [64]i64 as w_len with mut;
+let is [64]i64 as w_quoted with mut;        // 1 = came from quotes, never globbed
+let is i64 as nword with mut = 0;
+let is [4096]u8 as wbuf with mut;
+let is i64 as wfill with mut = 0;
+
+let is [4096]u8 as expbuf with mut;         // the line after pass 1
+
+// Status of the last foreground command, for '$?'.
+let is i64 as last_status with mut = 0;
+fn set_status(v as i64) as void { last_status = v; return; }
+fn status() as i64 { return last_status; }
+
+// ---- current directory -----------------------------------------------------
+//
+// The kernel has no cwd and must not grow one: "no ambient global namespace" is
+// the second principle, and a per-process directory the kernel resolves against
+// is exactly that. So the shell keeps one itself and hands the VFS absolute
+// paths only. A child inherits nothing — it gets argv, and argv is already
+// resolved by the time it is spawned.
+let is [256]u8 as cwd with mut;
+let is i64 as cwd_len with mut = 0;
+
+fn cwd_init() as void {
+    cwd[0] = cast(u8, 47);      // "/"
+    cwd_len = 1;
+    env_set(cast(*u8, "PWD"), 3, cast(*u8, &cwd[0]), 1);
+    return;
+}
+fn cwd_ptr() as *u8 { return cast(*u8, &cwd[0]); }
+fn cwd_size() as i64 { return cwd_len; }
+
+let is [256]u8 as resbuf with mut;
+
+// resolve — make `path` absolute against the cwd, folding "." and ".." as it
+// goes. Returns a NUL-terminated pointer valid until the next call.
+fn resolve(path as *u8, len as i64) as *u8 {
+    let is i64 as n with mut = 0;
+    if (len > 0 && path[0] == cast(u8, 47)) { resbuf[0] = cast(u8, 47); n = 1; }
+    else {
+        let is i64 as i with mut = 0;
+        while (i < cwd_len && n < 250) { resbuf[n] = cwd[i]; n = n + 1; i = i + 1; }
+        if (n == 0 || resbuf[n - 1] != cast(u8, 47)) { resbuf[n] = cast(u8, 47); n = n + 1; }
+    }
+    let is i64 as p with mut = 0;
+    while (p < len) {
+        while (p < len && path[p] == cast(u8, 47)) { p = p + 1; }
+        let is i64 as st = p;
+        while (p < len && path[p] != cast(u8, 47)) { p = p + 1; }
+        let is i64 as cl = p - st;
+        if (cl == 0) { }
+        else if (cl == 1 && path[st] == cast(u8, 46)) { }             // "."
+        else if (cl == 2 && path[st] == cast(u8, 46) && path[st+1] == cast(u8, 46)) {
+            // ".." — walk back over the previous component, never past the root.
+            if (n > 1) {
+                n = n - 1;                                            // drop the trailing '/'
+                while (n > 1 && resbuf[n - 1] != cast(u8, 47)) { n = n - 1; }
+            }
+        } else {
+            let is i64 as k with mut = 0;
+            while (k < cl && n < 250) { resbuf[n] = path[st + k]; n = n + 1; k = k + 1; }
+            if (n < 250) { resbuf[n] = cast(u8, 47); n = n + 1; }
+        }
+    }
+    if (n > 1 && resbuf[n - 1] == cast(u8, 47)) { n = n - 1; }        // no trailing slash
+    if (n == 0) { resbuf[0] = cast(u8, 47); n = 1; }
+    resbuf[n] = cast(u8, 0);
+    return cast(*u8, &resbuf[0]);
+}
+
+// cd — the directory must exist AND be a directory; anything else leaves the
+// shell where it was rather than silently moving somewhere unusable.
+fn cd(path as *u8, len as i64) as i64 {
+    let is *u8 as abs = resolve(path, len);
+    let is i64 as fd = sys.open_read(abs);
+    if (fd < 0) { return 0 - 1; }
+    // A readdir on a plain file fails, which is how a non-directory is caught
+    // without a stat that reports the type.
+    let is [320]u8 as de;
+    let is i64 as rc = sys.readdir(fd, cast(*u8, &de[0]));
+    sys.close(fd);
+    if (rc < 0) { return 0 - 2; }
+    let is i64 as n with mut = 0;
+    while (abs[n] != cast(u8, 0) && n < 254) { cwd[n] = abs[n]; n = n + 1; }
+    cwd_len = n;
+    // $PWD is how a relative name reaches a CHILD: the child has no directory
+    // of its own, so `cat $PWD/note.txt` is the explicit form of what other
+    // systems do behind your back.
+    env_set(cast(*u8, "PWD"), 3, cast(*u8, &cwd[0]), cwd_len);
+    return 0;
+}
+
+// ---- environment -----------------------------------------------------------
+//
+// The shell's own table, not something the kernel knows: causticos has no
+// ambient environment, and a child receives argv only. `export` therefore means
+// "remember this for expansion", which is the honest scope of it here.
+let is i64 as MAX_ENV with imut = 32;
+let is [32]i64 as env_noff with mut;
+let is [32]i64 as env_nlen with mut;
+let is [32]i64 as env_voff with mut;
+let is [32]i64 as env_vlen with mut;
+let is i64 as nenv with mut = 0;
+let is [2048]u8 as envbuf with mut;
+let is i64 as envfill with mut = 0;
+
+fn _eq(a as *u8, alen as i64, b as *u8, blen as i64) as i64 {
+    if (alen != blen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < alen) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn env_find(name as *u8, len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < nenv) {
+        if (_eq(cast(*u8, &envbuf[env_noff[i]]), env_nlen[i], name, len) == 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// env_set — append name and value to the arena. An overwrite appends a fresh
+// value and repoints the slot: the arena only grows, which is fine for a table
+// this small and keeps every live pointer valid.
+fn env_set(name as *u8, nlen as i64, val as *u8, vlen as i64) as i64 {
+    if (envfill + nlen + vlen > 2048) { return 0 - 1; }
+    let is i64 as slot with mut = env_find(name, nlen);
+    if (slot < 0) {
+        if (nenv >= MAX_ENV) { return 0 - 1; }
+        slot = nenv; nenv = nenv + 1;
+        env_noff[slot] = envfill;
+        env_nlen[slot] = nlen;
+        let is i64 as i with mut = 0;
+        while (i < nlen) { envbuf[envfill] = name[i]; envfill = envfill + 1; i = i + 1; }
+    }
+    env_voff[slot] = envfill;
+    env_vlen[slot] = vlen;
+    let is i64 as j with mut = 0;
+    while (j < vlen) { envbuf[envfill] = val[j]; envfill = envfill + 1; j = j + 1; }
+    return slot;
+}
+
+fn env_unset(name as *u8, nlen as i64) as void {
+    let is i64 as slot = env_find(name, nlen);
+    if (slot < 0) { return; }
+    let is i64 as i with mut = slot;
+    while (i + 1 < nenv) {
+        env_noff[i] = env_noff[i+1]; env_nlen[i] = env_nlen[i+1];
+        env_voff[i] = env_voff[i+1]; env_vlen[i] = env_vlen[i+1];
+        i = i + 1;
+    }
+    nenv = nenv - 1;
+    return;
+}
+
+fn env_count() as i64 { return nenv; }
+fn env_name(i as i64) as *u8 { return cast(*u8, &envbuf[env_noff[i]]); }
+fn env_name_len(i as i64) as i64 { return env_nlen[i]; }
+fn env_val(i as i64) as *u8 { return cast(*u8, &envbuf[env_voff[i]]); }
+fn env_val_len(i as i64) as i64 { return env_vlen[i]; }
+
+// ---- pass 1: expansion -----------------------------------------------------
+
+fn _is_name(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c == 95) { return 1; }
+    return 0;
+}
+
+fn _put(buf as *u8, n as *i64, c as i64) as void {
+    if (n[0] < BUF_CAP - 1) { buf[n[0]] = cast(u8, c); n[0] = n[0] + 1; }
+    return;
+}
+
+fn _put_num(buf as *u8, n as *i64, v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { _put(buf, n, 45); x = 0 - x; }
+    if (x == 0) { _put(buf, n, 48); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    while (i < 24) { _put(buf, n, cast(i64, b[i])); i = i + 1; }
+    return;
+}
+
+// capture — run `line` as a command and return its stdout as text appended to
+// buf. This is $(...): a whole sub-shell, so it recurses into run_capture.
+// Declared here and defined after the executor it needs.
+let is i64 as capture_depth with mut = 0;
+
+// expand_line — pass 1. Writes the rewritten line to expbuf and returns its
+// length. Single quotes suppress expansion entirely; double quotes do not.
+fn expand_line(src as *u8, len as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is *u8 as out = cast(*u8, &expbuf[0]);
+    let is i64 as i with mut = 0;
+    let is i64 as sq with mut = 0;
+    while (i < len) {
+        let is i64 as c = cast(i64, src[i]);
+        if (c == 39) { sq = 1 - sq; _put(out, &n, c); i = i + 1; }
+        else if (c == 36 && sq == 0 && i + 1 < len) {         // '$'
+            let is i64 as c2 = cast(i64, src[i + 1]);
+            if (c2 == 63) { _put_num(out, &n, last_status); i = i + 2; }        // $?
+            else if (c2 == 36) { _put_num(out, &n, sys.getpid()); i = i + 2; }  // $$
+            else if (c2 == 40) {                                               // $(
+                let is i64 as depth with mut = 1;
+                let is i64 as st = i + 2;
+                let is i64 as k with mut = st;
+                while (k < len && depth > 0) {
+                    if (src[k] == cast(u8, 40)) { depth = depth + 1; }
+                    else if (src[k] == cast(u8, 41)) { depth = depth - 1; }
+                    if (depth > 0) { k = k + 1; }
+                }
+                if (depth != 0) { _put(out, &n, c); i = i + 1; }   // unbalanced: literal
+                else {
+                    capture(cast(*u8, cast(i64, src) + st), k - st, out, &n);
+                    i = k + 1;
+                }
+            }
+            else if (_is_name(c2) == 1) {
+                let is i64 as st = i + 1;
+                let is i64 as k with mut = st;
+                while (k < len && _is_name(cast(i64, src[k])) == 1) { k = k + 1; }
+                let is i64 as slot = env_find(cast(*u8, cast(i64, src) + st), k - st);
+                if (slot >= 0) {
+                    let is i64 as v with mut = 0;
+                    while (v < env_vlen[slot]) {
+                        _put(out, &n, cast(i64, envbuf[env_voff[slot] + v]));
+                        v = v + 1;
+                    }
+                }
+                // An unset variable expands to nothing, the way every shell does.
+                i = k;
+            }
+            else { _put(out, &n, c); i = i + 1; }
+        }
+        else { _put(out, &n, c); i = i + 1; }
+    }
+    return n;
+}
+
+// ---- pass 2: tokenise ------------------------------------------------------
+
+fn _wpush(off as i64, len as i64, quoted as i64) as void {
+    if (nword >= MAX_WORDS) { return; }
+    w_off[nword] = off; w_len[nword] = len; w_quoted[nword] = quoted;
+    nword = nword + 1;
+    return;
+}
+
+fn word_ptr(i as i64) as *u8 { return cast(*u8, &wbuf[w_off[i]]); }
+fn word_len(i as i64) as i64 { return w_len[i]; }
+
+// tokenise — pass 2. Splits on unquoted spaces and keeps '|' '<' '>' '>>' as
+// their own words so pass 3 and 4 can see them. Quotes are removed here and
+// remembered per word so globbing can skip them.
+fn tokenise(src as *u8, len as i64) as i64 {
+    nword = 0; wfill = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        while (i < len && (src[i] == cast(u8, 32) || src[i] == cast(u8, 9))) { i = i + 1; }
+        if (i >= len) { i = len; }
+        else {
+            let is i64 as c = cast(i64, src[i]);
+            if (c == 124) {                                    // '|'
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 124); wfill = wfill + 1;
+                _wpush(o, 1, 1);
+                i = i + 1;
+            } else if (c == 60) {                              // '<'
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 60); wfill = wfill + 1;
+                _wpush(o, 1, 1);
+                i = i + 1;
+            } else if (c == 62) {                              // '>' or '>>'
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 62); wfill = wfill + 1;
+                let is i64 as wl with mut = 1;
+                if (i + 1 < len && src[i + 1] == cast(u8, 62)) {
+                    wbuf[wfill] = cast(u8, 62); wfill = wfill + 1; wl = 2; i = i + 1;
+                }
+                _wpush(o, wl, 1);
+                i = i + 1;
+            } else {
+                let is i64 as o = wfill;
+                let is i64 as q with mut = 0;
+                let is i64 as done with mut = 0;
+                while (i < len && done == 0) {
+                    let is i64 as ch = cast(i64, src[i]);
+                    if (ch == 34 || ch == 39) {                // '"' or '\''
+                        let is i64 as close = ch;
+                        q = 1;
+                        i = i + 1;
+                        while (i < len && cast(i64, src[i]) != close) {
+                            if (wfill < BUF_CAP - 1) { wbuf[wfill] = src[i]; wfill = wfill + 1; }
+                            i = i + 1;
+                        }
+                        if (i < len) { i = i + 1; }            // skip the closer
+                    } else if (ch == 32 || ch == 9 || ch == 124 || ch == 60 || ch == 62) {
+                        done = 1;
+                    } else {
+                        if (wfill < BUF_CAP - 1) { wbuf[wfill] = src[i]; wfill = wfill + 1; }
+                        i = i + 1;
+                    }
+                }
+                _wpush(o, wfill - o, q);
+            }
+        }
+    }
+    return nword;
+}
+
+// ---- pass 5: glob ----------------------------------------------------------
+
+// match — '*' any run, '?' one char, '[abc]' / '[a-z]' / '[!abc]' a class.
+// Recursive on '*', which is the shortest correct formulation and bounded by
+// the name length.
+fn fnmatch(pat as *u8, plen as i64, nm as *u8, nlen as i64) as i64 {
+    let is i64 as pi with mut = 0;
+    let is i64 as ni with mut = 0;
+    while (pi < plen) {
+        let is i64 as pc = cast(i64, pat[pi]);
+        if (pc == 42) {                                        // '*'
+            if (pi + 1 >= plen) { return 1; }                  // trailing star: rest matches
+            let is i64 as k with mut = ni;
+            while (k <= nlen) {
+                if (fnmatch(cast(*u8, cast(i64, pat) + pi + 1), plen - pi - 1,
+                          cast(*u8, cast(i64, nm) + k), nlen - k) == 1) { return 1; }
+                k = k + 1;
+            }
+            return 0;
+        }
+        if (ni >= nlen) { return 0; }
+        if (pc == 63) { pi = pi + 1; ni = ni + 1; }            // '?'
+        else if (pc == 91) {                                   // '['
+            let is i64 as neg with mut = 0;
+            let is i64 as k with mut = pi + 1;
+            if (k < plen && (pat[k] == cast(u8, 33) || pat[k] == cast(u8, 94))) { neg = 1; k = k + 1; }
+            let is i64 as hit with mut = 0;
+            let is i64 as first with mut = 1;
+            while (k < plen && (pat[k] != cast(u8, 93) || first == 1)) {
+                first = 0;
+                if (k + 2 < plen && pat[k + 1] == cast(u8, 45) && pat[k + 2] != cast(u8, 93)) {
+                    if (nm[ni] >= pat[k] && nm[ni] <= pat[k + 2]) { hit = 1; }
+                    k = k + 3;
+                } else {
+                    if (nm[ni] == pat[k]) { hit = 1; }
+                    k = k + 1;
+                }
+            }
+            if (k >= plen) { return 0; }                       // unterminated class
+            if (neg == 1) { hit = 1 - hit; }
+            if (hit == 0) { return 0; }
+            pi = k + 1; ni = ni + 1;
+        }
+        else {
+            if (pat[pi] != nm[ni]) { return 0; }
+            pi = pi + 1; ni = ni + 1;
+        }
+    }
+    if (ni == nlen) { return 1; }
+    return 0;
+}
+
+fn has_meta(w as i64) as i64 {
+    if (w_quoted[w] == 1) { return 0; }
+    let is *u8 as p = cast(*u8, &wbuf[w_off[w]]);
+    let is i64 as i with mut = 0;
+    while (i < w_len[w]) {
+        let is i64 as c = cast(i64, p[i]);
+        if (c == 42 || c == 63 || c == 91) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// glob_words — pass 5. Rebuilds the word table with every pattern replaced by
+// the names it matched, sorted the way readdir returns them. A pattern that
+// matches nothing is kept verbatim: that is what a user typing a literal '?'
+// means, and it is what every shell does by default.
+fn glob_words() as void {
+    let is [64]i64 as n_off;
+    let is [64]i64 as n_len;
+    let is [64]i64 as n_q;
+    let is i64 as nn with mut = 0;
+    let is i64 as w with mut = 0;
+    while (w < nword) {
+        if (has_meta(w) == 0) {
+            if (nn < MAX_WORDS) { n_off[nn] = w_off[w]; n_len[nn] = w_len[w]; n_q[nn] = w_quoted[w]; nn = nn + 1; }
+        } else {
+            // Split "dir/pat" so only the last component is matched; the
+            // directory part is a literal prefix on every result.
+            let is *u8 as pw = cast(*u8, &wbuf[w_off[w]]);
+            let is i64 as slash with mut = 0 - 1;
+            let is i64 as k with mut = 0;
+            while (k < w_len[w]) { if (pw[k] == cast(u8, 47)) { slash = k; } k = k + 1; }
+            let is [128]u8 as dir;
+            let is i64 as dlen with mut = 0;
+            if (slash < 0) {
+                // No directory part: the pattern matches in the shell's cwd.
+                while (dlen < 120 && dlen < cwd_len) { dir[dlen] = cwd[dlen]; dlen = dlen + 1; }
+                if (dlen == 0) { dir[0] = cast(u8, 47); dlen = 1; }
+            }
+            else {
+                dlen = slash + 1;
+                if (dlen > 120) { dlen = 120; }
+                let is i64 as d with mut = 0;
+                while (d < dlen) { dir[d] = pw[d]; d = d + 1; }
+                if (dlen == 0) { dir[0] = cast(u8, 47); dlen = 1; }
+            }
+            dir[dlen] = cast(u8, 0);
+            let is i64 as poff = w_off[w] + slash + 1;
+            let is i64 as plen = w_len[w] - slash - 1;
+
+            let is i64 as hits with mut = 0;
+            let is i64 as fd = sys.open_read(cast(*u8, &dir[0]));
+            if (fd >= 0) {
+                let is [320]u8 as de;
+                while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+                    let is *u8 as nm = cast(*u8, &de[0]);
+                    let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
+                    let is i64 as nl = nlp[0];
+                    if (fnmatch(cast(*u8, &wbuf[poff]), plen, nm, nl) == 1) {
+                        if (nn < MAX_WORDS && wfill + dlen + nl + 1 < BUF_CAP) {
+                            let is i64 as o = wfill;
+                            // The directory is ALWAYS prefixed, even when the
+                            // pattern carried none. A child process has no cwd
+                            // to resolve against — the kernel has none to give
+                            // it — so a match found in the shell's directory has
+                            // to reach the child as the absolute path it is.
+                            let is i64 as d2 with mut = 0;
+                            while (d2 < dlen) { wbuf[wfill] = dir[d2]; wfill = wfill + 1; d2 = d2 + 1; }
+                            if (wfill > o && wbuf[wfill - 1] != cast(u8, 47)) {
+                                wbuf[wfill] = cast(u8, 47); wfill = wfill + 1;
+                            }
+                            let is i64 as m with mut = 0;
+                            while (m < nl) { wbuf[wfill] = nm[m]; wfill = wfill + 1; m = m + 1; }
+                            n_off[nn] = o; n_len[nn] = wfill - o; n_q[nn] = 1;
+                            nn = nn + 1; hits = hits + 1;
+                        }
+                    }
+                }
+                sys.close(fd);
+            }
+            if (hits == 0) {
+                if (nn < MAX_WORDS) { n_off[nn] = w_off[w]; n_len[nn] = w_len[w]; n_q[nn] = w_quoted[w]; nn = nn + 1; }
+            }
+        }
+        w = w + 1;
+    }
+    let is i64 as c with mut = 0;
+    while (c < nn) { w_off[c] = n_off[c]; w_len[c] = n_len[c]; w_quoted[c] = n_q[c]; c = c + 1; }
+    nword = nn;
+    return;
+}
+
+// ---- passes 3 + 4: pipeline and redirects ----------------------------------
+
+fn _is_op(w as i64, lit as i64) as i64 {
+    if (w_len[w] != 1) { return 0; }
+    if (cast(i64, wbuf[w_off[w]]) != lit) { return 0; }
+    return 1;
+}
+
+// build_cmds — cut the word list into stages on '|', then lift each stage's
+// redirects out of its argv. Returns the stage count, or -1 on a syntax error
+// (message written through `t`).
+fn build_cmds() as i64 {
+    ncmd = 0;
+    let is i64 as w with mut = 0;
+    let is i64 as start with mut = 0;
+    while (w <= nword) {
+        if (w == nword || _is_op(w, 124) == 1) {
+            if (ncmd >= MAX_CMDS) { return 0 - 1; }
+            cmds[ncmd].w0 = start;
+            cmds[ncmd].wn = w - start;
+            cmds[ncmd].in_w = 0 - 1;
+            cmds[ncmd].out_w = 0 - 1;
+            cmds[ncmd].append = 0;
+            cmds[ncmd].err_to_out = 0;
+            ncmd = ncmd + 1;
+            start = w + 1;
+        }
+        w = w + 1;
+    }
+    // Lift redirects: scan each stage, moving '<'/'>' and their target out of
+    // argv by compacting the remaining words down.
+    let is i64 as c with mut = 0;
+    while (c < ncmd) {
+        let is i64 as rd with mut = cmds[c].w0;
+        let is i64 as wr with mut = cmds[c].w0;
+        let is i64 as end = cmds[c].w0 + cmds[c].wn;
+        while (rd < end) {
+            if (_is_op(rd, 60) == 1) {                          // '<'
+                if (rd + 1 >= end) { return 0 - 2; }
+                cmds[c].in_w = rd + 1; rd = rd + 2;
+            } else if (w_len[rd] == 1 && cast(i64, wbuf[w_off[rd]]) == 62) {   // '>'
+                if (rd + 1 >= end) { return 0 - 2; }
+                cmds[c].out_w = rd + 1; cmds[c].append = 0; rd = rd + 2;
+            } else if (w_len[rd] == 2 && cast(i64, wbuf[w_off[rd]]) == 62
+                                      && cast(i64, wbuf[w_off[rd] + 1]) == 62) { // '>>'
+                if (rd + 1 >= end) { return 0 - 2; }
+                cmds[c].out_w = rd + 1; cmds[c].append = 1; rd = rd + 2;
+            } else if (w_len[rd] == 4 && cast(i64, wbuf[w_off[rd]]) == 50
+                       && cast(i64, wbuf[w_off[rd]+1]) == 62
+                       && cast(i64, wbuf[w_off[rd]+2]) == 38
+                       && cast(i64, wbuf[w_off[rd]+3]) == 49) {  // "2>&1"
+                cmds[c].err_to_out = 1; rd = rd + 1;
+            } else {
+                w_off[wr] = w_off[rd]; w_len[wr] = w_len[rd]; w_quoted[wr] = w_quoted[rd];
+                // A redirect target moved down with the words; keep the index
+                // pointing at the same word after compaction.
+                if (cmds[c].in_w == rd)  { cmds[c].in_w = wr; }
+                if (cmds[c].out_w == rd) { cmds[c].out_w = wr; }
+                wr = wr + 1; rd = rd + 1;
+            }
+        }
+        cmds[c].wn = wr - cmds[c].w0;
+        c = c + 1;
+    }
+    return ncmd;
+}
+
+fn cmd_count() as i64 { return ncmd; }
+fn cmd_at(i as i64) as *Cmd { return &cmds[i]; }
+
+// ---- execution -------------------------------------------------------------
+
+// A NUL-terminated copy of a word, for the syscalls that take a C string.
+let is [256]u8 as pathtmp with mut;
+fn _cpath(w as i64) as *u8 {
+    // Redirect targets are FILES, so they resolve against the shell's cwd —
+    // unlike a command name, which is looked up where the programs live.
+    return resolve(cast(*u8, &wbuf[w_off[w]]), w_len[w]);
+}
+
+// load — read /<name>.cse into a fresh mapping. Returns the buffer or 0, and
+// writes the byte count and the mapped size the caller must eventually unmap.
+fn load(w as i64, out_len as *i64, out_alloc as *i64) as *u8 {
+    *out_len = 0; *out_alloc = 0;
+    let is [128]u8 as path;
+    if (w_len[w] > 110) { return cast(*u8, 0); }
+    path[0] = cast(u8, 47);
+    let is i64 as i with mut = 0;
+    while (i < w_len[w]) { path[1 + i] = wbuf[w_off[w] + i]; i = i + 1; }
+    let is *u8 as ext = ".cse";
+    let is i64 as j with mut = 0;
+    while (j < 4) { path[1 + w_len[w] + j] = ext[j]; j = j + 1; }
+    path[1 + w_len[w] + 4] = cast(u8, 0);
+
+    let is i64 as fd = sys.open_read(cast(*u8, &path[0]));
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return cast(*u8, 0); }
+    let is i64 as alloc = (sz + 4095) & (0 - 4096);
+    let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
+    let is i64 as got = sys.read(fd, cast(*u8, va), sz);
+    sys.close(fd);
+    if (got != sz) { sys.munmap(va, alloc); return cast(*u8, 0); }
+    *out_len = got; *out_alloc = alloc;
+    return cast(*u8, va);
+}
+
+// exec — build the whole pipeline and register it as one job.
+//
+// Every stage is spawned before any is waited on, and each one's stdout is the
+// next one's stdin: a plain chain of channel pairs, which is exactly what the
+// architecture says a pipe is. The shell keeps only the ends it needs — the
+// first stage's stdin and the last stage's stdout — and drops the rest as soon
+// as the child that owns them exists, or the reader would never see EOF.
+//
+// aux_fd_slot: the child fd to install the caller's extra channel on, or -1.
+// aux_maker: a channel pair the caller minted, or 0 for none.
+fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
+        aux_fd_slot as i64, aux_out as *i64) as i64 {
+    if (ncmd <= 0) { return 0 - 1; }
+    let is i64 as slot = jobs.alloc();
+    if (slot < 0) { return 0 - 2; }
+    let is *jobs.Job as jb = jobs.get(slot);
+
+    let is i64 as prev_read with mut = 0 - 1;      // read end of the previous stage
+    let is i64 as c with mut = 0;
+    let is i64 as failed with mut = 0;
+    while (c < ncmd && failed == 0) {
+        if (cmds[c].wn <= 0) { failed = 4; }
+        else {
+            let is i64 as img_len with mut = 0;
+            let is i64 as alloc with mut = 0;
+            let is *u8 as img = load(cmds[c].w0, &img_len, &alloc);
+            if (cast(i64, img) == 0) { failed = 1; }
+            else {
+                // stdin: the previous stage's output, an explicit '<' file, or
+                // a fresh channel the shell can type into (first stage only).
+                let is i64 as child_in with mut = 0 - 1;
+                let is i64 as keep_in with mut = 0 - 1;
+                if (prev_read >= 0) { child_in = prev_read; }
+                else if (cmds[c].in_w >= 0) {
+                    child_in = sys.open_read(_cpath(cmds[c].in_w));
+                    if (child_in < 0) { failed = 2; }
+                } else {
+                    let is [2]i64 as ich;
+                    if (sys.channel_create(&ich[0]) != 0) { failed = 3; }
+                    else { keep_in = ich[0]; child_in = ich[1]; }
+                }
+
+                let is i64 as child_out with mut = 0 - 1;
+                let is i64 as keep_out with mut = 0 - 1;
+                let is i64 as next_read with mut = 0 - 1;
+                if (failed == 0) {
+                    if (cmds[c].out_w >= 0) {
+                        if (cmds[c].append == 1) { child_out = sys.open_append(_cpath(cmds[c].out_w)); }
+                        else { child_out = sys.open_write(_cpath(cmds[c].out_w)); }
+                        if (child_out < 0) { failed = 2; }
+                    } else {
+                        let is [2]i64 as och;
+                        if (sys.channel_create(&och[0]) != 0) { failed = 3; }
+                        else {
+                            child_out = och[1];
+                            if (c + 1 < ncmd) { next_read = och[0]; }   // feeds the next stage
+                            else { keep_out = och[0]; }                 // the shell reads it
+                        }
+                    }
+                }
+
+                if (failed == 0) {
+                    let is [8]i64 as fdacts;
+                    let is i64 as nact with mut = 2;
+                    fdacts[0] = 0; fdacts[1] = child_in;
+                    fdacts[2] = 1; fdacts[3] = child_out;
+                    // '2>&1' installs the SAME endpoint on fd 2. There is no
+                    // dup: handing one object to two slots IS the duplication.
+                    if (cmds[c].err_to_out == 1) { fdacts[4] = 2; fdacts[5] = child_out; nact = 3; }
+                    if (aux_fd_slot >= 0 && aux_out[0] >= 0) {
+                        fdacts[nact*2] = aux_fd_slot; fdacts[nact*2+1] = aux_out[1];
+                        nact = nact + 1;
+                    }
+                    let is [64]i64 as av;
+                    let is i64 as k with mut = 0;
+                    while (k < cmds[c].wn && k < 32) {
+                        av[2 * k] = cast(i64, &wbuf[w_off[cmds[c].w0 + k]]);
+                        av[2 * k + 1] = w_len[cmds[c].w0 + k];
+                        k = k + 1;
+                    }
+                    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), nact,
+                                                  cast(*u8, &av[0]), k);
+                    // The child owns its ends now; the shell must let go of them
+                    // or the next stage never sees end-of-stream.
+                    if (child_in >= 0 && prev_read < 0 && cmds[c].in_w < 0) { sys.close(child_in); }
+                    else if (child_in >= 0) { sys.close(child_in); }
+                    if (child_out >= 0) { sys.close(child_out); }
+                    if (pid < 0) {
+                        failed = 3;
+                        if (keep_in >= 0) { sys.close(keep_in); }
+                        if (keep_out >= 0) { sys.close(keep_out); }
+                        if (next_read >= 0) { sys.close(next_read); }
+                        sys.munmap(cast(i64, img), alloc);
+                    } else {
+                        jobs.add_pid(slot, pid);
+                        if (keep_in >= 0)  { jb.in_fd = keep_in; }
+                        if (keep_out >= 0) { jb.out_fd = keep_out; }
+                        // Only the last image is tracked for unmapping; the
+                        // earlier stages' buffers are released right away since
+                        // spawn has already copied what it needs.
+                        if (c + 1 == ncmd) { jb.img = cast(i64, img); jb.img_len = alloc; }
+                        else { sys.munmap(cast(i64, img), alloc); }
+                        prev_read = next_read;
+                    }
+                } else {
+                    if (keep_in >= 0) { sys.close(keep_in); }
+                    if (child_in >= 0) { sys.close(child_in); }
+                    if (keep_out >= 0) { sys.close(keep_out); }
+                    if (child_out >= 0) { sys.close(child_out); }
+                    if (next_read >= 0) { sys.close(next_read); }
+                    sys.munmap(cast(i64, img), alloc);
+                }
+            }
+        }
+        c = c + 1;
+    }
+    if (failed != 0) {
+        if (prev_read >= 0) { sys.close(prev_read); }
+        if (jobs.get(slot).npids == 0) { jobs.release(slot); return 0 - failed; }
+        // Some stages started: keep the job so they are reaped, and report.
+        return 0 - failed;
+    }
+    jb.bg = bg;
+    jobs.set_cmd(slot, cmdline, cmdlen);
+    return slot;
+}
+
+// capture — $(cmd): run a line and append its stdout to `out`. Trailing
+// newlines are stripped, the way command substitution is expected to behave.
+// Recursion is capped: $(echo $(echo ...)) is fine, a self-referential alias
+// would otherwise not terminate.
+fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
+    if (capture_depth >= 4) { return; }
+    capture_depth = capture_depth + 1;
+
+    // The word table is global and we are in the middle of using it, so save
+    // and restore it around the nested parse.
+    let is [64]i64 as s_off; let is [64]i64 as s_len; let is [64]i64 as s_q;
+    let is i64 as s_nword = nword;
+    let is i64 as s_wfill = wfill;
+    let is i64 as s_ncmd = ncmd;
+    let is i64 as i with mut = 0;
+    while (i < s_nword) { s_off[i] = w_off[i]; s_len[i] = w_len[i]; s_q[i] = w_quoted[i]; i = i + 1; }
+    // Field by field: a whole-struct assignment would depend on the compiler
+    // emitting a copy, and this is the one place a silent aliasing bug would
+    // corrupt the caller's half-parsed line rather than fail loudly.
+    let is [48]i64 as s_cmds;
+    i = 0;
+    while (i < s_ncmd) {
+        s_cmds[i*6+0] = cmds[i].w0;    s_cmds[i*6+1] = cmds[i].wn;
+        s_cmds[i*6+2] = cmds[i].in_w;  s_cmds[i*6+3] = cmds[i].out_w;
+        s_cmds[i*6+4] = cmds[i].append; s_cmds[i*6+5] = cmds[i].err_to_out;
+        i = i + 1;
+    }
+
+    let is [4096]u8 as sub;
+    let is i64 as j with mut = 0;
+    while (j < len && j < 4095) { sub[j] = src[j]; j = j + 1; }
+
+    tokenise(cast(*u8, &sub[0]), j);
+    glob_words();
+    let is i64 as nc = build_cmds();
+    let is i64 as slot with mut = 0 - 1;
+    if (nc > 0) { slot = exec(0, cast(*u8, &sub[0]), j, 0 - 1, cast(*i64, 0)); }
+
+    if (slot >= 0) {
+        let is *jobs.Job as jb = jobs.get(slot);
+        let is [256]u8 as buf;
+        let is i64 as tmpn with mut = 0;
+        let is [1024]u8 as acc;
+        let is i64 as guard with mut = 0;
+        let is i64 as reading with mut = 1;
+        while (reading == 1 && guard < 65536) {
+            let is [3]i64 as pe;
+            pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+            sys.poll(&pe[0], 1, 1000000000);
+            if ((pe[2] & sys.POLL_READABLE) != 0) {
+                let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
+                if (got <= 0) { reading = 0; }
+                else {
+                    let is i64 as k with mut = 0;
+                    while (k < got) {
+                        if (tmpn < 1024) { acc[tmpn] = buf[k]; tmpn = tmpn + 1; }
+                        k = k + 1;
+                    }
+                }
+            } else if ((pe[2] & sys.POLL_CLOSED) != 0) { reading = 0; }
+            else if (jobs.get(slot).status != jobs.JOB_RUN) { reading = 0; }
+            guard = guard + 1;
+        }
+        while (tmpn > 0 && (acc[tmpn - 1] == cast(u8, 10) || acc[tmpn - 1] == cast(u8, 13))) {
+            tmpn = tmpn - 1;
+        }
+        let is i64 as m with mut = 0;
+        while (m < tmpn) { _put(out, n, cast(i64, acc[m])); m = m + 1; }
+        jobs.kill_job(slot);
+        jobs.poll_events();
+        jobs.release(slot);
+    }
+
+    // Restore the caller's parse state.
+    i = 0;
+    while (i < s_nword) { w_off[i] = s_off[i]; w_len[i] = s_len[i]; w_quoted[i] = s_q[i]; i = i + 1; }
+    nword = s_nword; wfill = s_wfill; ncmd = s_ncmd;
+    i = 0;
+    while (i < s_ncmd) {
+        cmds[i].w0 = s_cmds[i*6+0];    cmds[i].wn = s_cmds[i*6+1];
+        cmds[i].in_w = s_cmds[i*6+2];  cmds[i].out_w = s_cmds[i*6+3];
+        cmds[i].append = s_cmds[i*6+4]; cmds[i].err_to_out = s_cmds[i*6+5];
+        i = i + 1;
+    }
+    capture_depth = capture_depth - 1;
+    return;
+}
+
+// run_sync — run one line and WAIT, pumping its output to the terminal, then
+// return its exit status.
+//
+// The interactive prompt runs jobs asynchronously (that is what makes '&' and
+// job control possible), but a script is a sequence: the next statement cannot
+// start before this one's status is known, because that status is what `if` and
+// `while` branch on. So scripting gets its own synchronous path rather than
+// bending the interactive loop into one.
+fn run_sync(t as *term.Term, line as *u8, len as i64) as i64 {
+    let is i64 as nc = prepare(line, len);
+    if (nc <= 0) { last_status = 2; return 2; }
+    let is i64 as slot = exec(0, line, len, 0 - 1, cast(*i64, 0));
+    if (slot < 0) { last_status = 127; return 127; }
+    let is *jobs.Job as jb = jobs.get(slot);
+    let is [256]u8 as buf;
+    let is i64 as guard with mut = 0;
+    let is i64 as running with mut = 1;
+    while (running == 1 && guard < 1000000) {
+        let is [6]i64 as pe;
+        let is i64 as n with mut = 0;
+        if (jb.out_fd >= 0) { pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0; n = 1; }
+        if (jobs.event_fd() >= 0) {
+            pe[n*3+0] = jobs.event_fd(); pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            n = n + 1;
+        }
+        if (n == 0) { running = 0; }
+        else {
+            sys.poll(&pe[0], n, 100000000);
+            if (jb.out_fd >= 0 && (pe[2] & sys.POLL_READABLE) != 0) {
+                let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
+                if (got > 0) { term.puts(t, cast(*u8, &buf[0]), got); }
+            }
+            jobs.poll_events();
+            if (jobs.get(slot).status == jobs.JOB_DONE) {
+                // Drain whatever the child wrote just before exiting.
+                let is i64 as tail with mut = 0;
+                while (jb.out_fd >= 0 && tail < 4096) {
+                    let is i64 as g2 = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
+                    if (g2 <= 0) { tail = 4096; }
+                    else { term.puts(t, cast(*u8, &buf[0]), g2); tail = tail + 1; }
+                }
+                running = 0;
+            }
+        }
+        guard = guard + 1;
+    }
+    let is i64 as st = jobs.get(slot).exit_code;
+    jobs.release(slot);
+    last_status = st;
+    return st;
+}
+
+// prepare — passes 1..5 for one line. Returns the stage count, or negative on
+// a syntax error the caller reports.
+fn prepare(line as *u8, len as i64) as i64 {
+    let is i64 as elen = expand_line(line, len);
+    tokenise(cast(*u8, &expbuf[0]), elen);
+    glob_words();
+    return build_cmds();
+}

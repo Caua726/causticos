@@ -113,32 +113,63 @@ fn wp_blit() as void {
     let is i64 as y1 = s.clip_y1;
     if (x1 <= x0 || y1 <= y0) { return; }
     let is *u8 as src = cast(*u8, s.wp_pix);
+    // Every module-level name in the inner loop is a fresh memory load — the
+    // compiler keeps no global in a register across statements. At a million
+    // pixels those ~15 reloads per pixel, not the arithmetic, were the cost: a
+    // full-screen repaint measured 12.4 ms and the compositor serves no input
+    // while it runs (the animated wallpaper full-damages once a second).
+    // Hoisting them into locals is the whole optimisation; the shape of the
+    // loop is untouched, and no helper is called per pixel (that crashes the
+    // compiler's codegen).
+    let is i64 as offx  = s.wp_off_x;
+    let is i64 as offy  = s.wp_off_y;
+    let is i64 as sw    = s.scr_w;
+    let is i64 as sh    = s.scr_h;
+    let is i64 as wpw   = s.wp_w;
+    let is i64 as wph   = s.wp_h;
+    let is i64 as nch   = s.wp_nchan;
+    let is i64 as pitch = s.scr_pitch;
+    let is i64 as base  = s.fb_base;
+    let is i64 as gon   = s.gam_on;
+    // The wallpaper is a small tile stretched over the screen — 54 source rows
+    // across 800 screen rows means roughly fifteen consecutive screen rows are
+    // byte-identical. Scaling each of them from scratch did the expensive work
+    // (divide, three byte loads, three LUT reads) a million times instead of
+    // seventy thousand. Scale a row ONCE per distinct source row into scratch,
+    // then copy it for the repeats. x0/x1/offx/gamma are fixed for the whole
+    // call, so the source row is the only thing the cache must key on.
+    let is i64 as last_sy with mut = 0 - 1;
     let is i64 as yy with mut = y0;
     while (yy < y1) {
-        let is i64 as py with mut = yy + s.wp_off_y;
+        let is i64 as py with mut = yy + offy;
         if (py < 0) { py = 0; }
-        if (py >= s.scr_h) { py = s.scr_h - 1; }
-        let is i64 as sy = py * s.wp_h / s.scr_h;
-        let is i64 as srow = sy * s.wp_w * s.wp_nchan;
-        let is *u32 as row = cast(*u32, s.fb_base + yy * s.scr_pitch);
-        let is i64 as xx with mut = x0;
-        while (xx < x1) {
-            let is i64 as px with mut = xx + s.wp_off_x;
-            if (px < 0) { px = 0; }
-            if (px >= s.scr_w) { px = s.scr_w - 1; }
-            let is i64 as sp = srow + (px * s.wp_w / s.scr_w) * s.wp_nchan;
-            let is i64 as r with mut = cast(i64, src[sp]);
-            let is i64 as g with mut = cast(i64, src[sp + 1]);
-            let is i64 as b with mut = cast(i64, src[sp + 2]);
-            // Night light applies to the desktop too — it is the largest
-            // surface on screen. Three LUT reads, inlined: a helper call in a
-            // per-pixel loop is what crashes the compiler's codegen.
-            if (s.gam_on == 1) {
-                r = s.gam_lut[r]; g = s.gam_lut[256 + g]; b = s.gam_lut[512 + b];
+        if (py >= sh) { py = sh - 1; }
+        let is i64 as sy = py * wph / sh;
+        if (sy != last_sy) {
+            let is i64 as srow = sy * wpw * nch;
+            let is i64 as xx with mut = x0;
+            while (xx < x1) {
+                let is i64 as px with mut = xx + offx;
+                if (px < 0) { px = 0; }
+                if (px >= sw) { px = sw - 1; }
+                let is i64 as sp = srow + (px * wpw / sw) * nch;
+                let is i64 as r with mut = cast(i64, src[sp]);
+                let is i64 as g with mut = cast(i64, src[sp + 1]);
+                let is i64 as b with mut = cast(i64, src[sp + 2]);
+                // Night light applies to the desktop too — it is the largest
+                // surface on screen. Three LUT reads, inlined: a helper call in
+                // a per-pixel loop is what crashes the compiler's codegen.
+                if (gon == 1) {
+                    r = s.gam_lut[r]; g = s.gam_lut[256 + g]; b = s.gam_lut[512 + b];
+                }
+                s.wp_row[xx] = cast(u32, (r << 16) | (g << 8) | b);
+                xx = xx + 1;
             }
-            row[xx] = cast(u32, (r << 16) | (g << 8) | b);
-            xx = xx + 1;
+            last_sy = sy;
         }
+        let is *u32 as row = cast(*u32, base + yy * pitch);
+        let is i64 as cx with mut = x0;
+        while (cx < x1) { row[cx] = s.wp_row[cx]; cx = cx + 1; }
         yy = yy + 1;
     }
     return;

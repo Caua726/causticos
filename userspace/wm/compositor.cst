@@ -38,15 +38,17 @@ fn load_image(path as *u8, out_len as *i64) as i64 {
 fn main() as i32 {
     s.fb_fd    = sys.dev_open(sys.DEV_FB, 0, 0);
     s.kbd_fd   = sys.dev_open(sys.DEV_KEYBOARD, 0, 0);
-    s.mouse_fd = sys.dev_open(sys.DEV_MOUSE, 0, 0);
-    s.tab_fd   = sys.dev_open(sys.DEV_TABLET, 0, 0);
     if (s.fb_fd < 0) {
         sys.write_serial(cast(*u8, "comp: no framebuffer\n"), 21);
         return 1;
     }
-    if (s.kbd_fd < 0)   { sys.write_serial(cast(*u8, "comp: no keyboard\n"), 18); }
-    if (s.mouse_fd < 0) { sys.write_serial(cast(*u8, "comp: no mouse\n"), 15); }
-    if (s.tab_fd < 0)   { sys.write_serial(cast(*u8, "comp: no tablet\n"), 16); }
+    if (s.kbd_fd < 0) { sys.write_serial(cast(*u8, "comp: no keyboard\n"), 18); }
+    // Pointers are discovered, not assumed: every registered mouse/tablet is
+    // adopted with its own identity, then the config binds a curve to each.
+    pconf.open_all();
+    pconf.load();
+    if (s.ptr_n == 0) { sys.write_serial(cast(*u8, "comp: no pointer\n"), 17); }
+    else { wmp.log_kv(cast(*u8, "comp: pointers n="), 17, s.ptr_n); pconf.dump(); }
 
     let is [5]i64 as fbinfo;
     if (sys.surface_info(s.fb_fd, cast(*u8, &fbinfo[0])) != 0) {
@@ -69,7 +71,6 @@ fn main() as i32 {
     s.cur_last_y = s.my;
     r.cursor_init();
     anim.init();
-    pconf.load();          // optional /var/wm/pointer.cst accel overrides
     wp.wallpaper_init();
 
     let is [2]i64 as cmd_ch;
@@ -115,26 +116,26 @@ fn main() as i32 {
 
     inp.cmd_send(cp.MSG_CP_SCR_READY, s.scr_w, s.scr_h, 0);
 
+    // 6 entries x 3 words: keyboard + PTR_MAX pointers + the WC channel. Sized
+    // off PTR_MAX, so raising that bound means raising this too.
     let is [18]i64 as pe;
     let is i64 as st with mut = 0;
     let is i64 as next_frame with mut = sys.time_ns() + s.FRAME_NS;
     while (1 == 1) {
         let is i64 as n with mut = 0;
         let is i64 as kbd_e   with mut = 0 - 1;
-        let is i64 as mouse_e with mut = 0 - 1;
-        let is i64 as tab_e   with mut = 0 - 1;
+        let is i64 as ptr_e0  with mut = 0 - 1;    // first pointer entry; the rest follow in order
         let is i64 as wc_e    with mut = 0 - 1;
         if (s.kbd_fd >= 0) {
             pe[n*3+0] = s.kbd_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
             kbd_e = n; n = n + 1;
         }
-        if (s.mouse_fd >= 0) {
-            pe[n*3+0] = s.mouse_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
-            mouse_e = n; n = n + 1;
-        }
-        if (s.tab_fd >= 0) {
-            pe[n*3+0] = s.tab_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
-            tab_e = n; n = n + 1;
+        let is i64 as pi with mut = 0;
+        while (pi < s.ptr_n) {
+            if (pi == 0) { ptr_e0 = n; }
+            pe[n*3+0] = s.ptrs[pi].fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            n = n + 1;
+            pi = pi + 1;
         }
         pe[n*3+0] = s.wc_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
         wc_e = n; n = n + 1;
@@ -145,8 +146,16 @@ fn main() as i32 {
         sys.poll(&pe[0], n, tmo);
 
         if (kbd_e >= 0 && (pe[kbd_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_kbd(); }
-        if (mouse_e >= 0 && (pe[mouse_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_mouse(); }
-        if (tab_e >= 0 && (pe[tab_e*3+2] & sys.POLL_READABLE) != 0) { inp.pump_tablet(); }
+        if (ptr_e0 >= 0) {
+            pi = 0;
+            while (pi < s.ptr_n) {
+                if ((pe[(ptr_e0 + pi)*3+2] & sys.POLL_READABLE) != 0) {
+                    if (s.ptrs[pi].is_abs == 1) { inp.pump_tablet(&s.ptrs[pi]); }
+                    else { inp.pump_mouse(&s.ptrs[pi]); }
+                }
+                pi = pi + 1;
+            }
+        }
 
         if (wc_e >= 0) {
             let is i64 as wgot = pe[wc_e*3+2];

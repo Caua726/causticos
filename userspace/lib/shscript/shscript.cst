@@ -1,0 +1,812 @@
+// shscript.cst — control flow for the shell: if / while / for / switch /
+// function, in the Caustic-style `begin ... end` shape rather than POSIX's.
+//
+//   if <cmd> begin <stmts> else begin <stmts> end
+//   while <cmd> begin <stmts> end
+//   for <name> in <words> begin <stmts> end
+//   switch <word> begin case <pat> <stmts> case <pat> <stmts> end
+//   function <name> begin <stmts> end
+//
+// A condition is a COMMAND, and its exit status is the truth value — status 0
+// is true. There is no separate expression language, and there is no `[`
+// builtin pretending to be syntax: `if true`, `if grep -q x file`.
+//
+// Simple commands are not re-parsed here. A statement holds the SPAN of its
+// source text and hands it to shexec, so a command inside a loop goes through
+// exactly the same expansion, globbing, redirection and piping as one typed at
+// the prompt. This file only decides which spans run, and how often.
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../../../../Caustic/std/causticos/term.cst" as term;
+use "../shexec/shexec.cst" as sx;
+use "../shbuiltin/shbuiltin.cst" as bi;
+use "../repl/repl.cst" as repl;
+
+let is i64 as SRC_CAP  with imut = 4096;
+let is i64 as MAX_TOK  with imut = 512;
+let is i64 as MAX_STMT with imut = 128;
+let is i64 as MAX_FN   with imut = 8;
+
+// token kinds
+let is i64 as T_WORD  with imut = 0;
+let is i64 as T_BEGIN with imut = 1;
+let is i64 as T_END   with imut = 2;
+let is i64 as T_IF    with imut = 3;
+let is i64 as T_ELSE  with imut = 4;
+let is i64 as T_ELSIF with imut = 5;
+let is i64 as T_WHILE with imut = 6;
+let is i64 as T_FOR   with imut = 7;
+let is i64 as T_IN    with imut = 8;
+let is i64 as T_SWITCH with imut = 9;
+let is i64 as T_CASE  with imut = 10;
+let is i64 as T_FUNC  with imut = 11;
+let is i64 as T_SEMI  with imut = 12;      // ';' or newline: a statement break
+
+// statement kinds
+let is i64 as S_CMD    with imut = 0;
+let is i64 as S_IF     with imut = 1;
+let is i64 as S_WHILE  with imut = 2;
+let is i64 as S_FOR    with imut = 3;
+let is i64 as S_SWITCH with imut = 4;
+let is i64 as S_FUNC   with imut = 5;
+
+let is [4096]u8 as src with mut;
+let is i64 as srclen with mut = 0;
+
+let is [512]i64 as t_kind with mut;
+let is [512]i64 as t_off with mut;
+let is [512]i64 as t_len with mut;
+let is [512]i64 as t_line with mut;
+let is [512]i64 as t_col with mut;
+let is i64 as ntok with mut = 0;
+
+// A statement. Spans are token ranges; children are statement indices, held as
+// a first/count pair into the same flat table (a tree in an array — no
+// allocator, and the whole script is one contiguous object).
+struct Stmt {
+    kind as i64;
+    a0 as i64;      // first token of the head span (condition / subject / argv)
+    a1 as i64;      // one past the last
+    b0 as i64;      // body: first child statement
+    bn as i64;      // body: child count
+    c0 as i64;      // else / second body: first child
+    cn as i64;
+    d0 as i64;      // for: the variable's token; switch: first case; func: name token
+    dn as i64;
+}
+let is [128]Stmt as st with mut;
+let is i64 as nst with mut = 0;
+
+// Named functions.
+//
+// A definition cannot be kept as statement indices: statements point at tokens,
+// tokens point into `src`, and `src` is overwritten by the NEXT thing typed. So
+// a function stores its own name and body TEXT in an arena that outlives the
+// script that defined it, and is re-parsed when it is called. That costs a
+// parse per call and buys a definition that is still there next time.
+let is [8]i64 as fn_name_off with mut;
+let is [8]i64 as fn_name_len with mut;
+let is [8]i64 as fn_body_off with mut;
+let is [8]i64 as fn_body_len with mut;
+let is i64 as nfn with mut = 0;
+let is [4096]u8 as fnbuf with mut;
+let is i64 as fnfill with mut = 0;
+
+// ---- errors ----------------------------------------------------------------
+//
+// A parse error names the line and column it was found at and does NOT abort
+// the session: the shell drops the whole construct and returns to the prompt,
+// which is what a person retyping it needs.
+let is i64 as err_line with mut = 0;
+let is i64 as err_col with mut = 0;
+let is i64 as err_msg with mut = 0;
+
+fn _fail(tok as i64, msg as *u8) as i64 {
+    if (tok >= 0 && tok < ntok) { err_line = t_line[tok]; err_col = t_col[tok]; }
+    else if (ntok > 0) { err_line = t_line[ntok - 1]; err_col = t_col[ntok - 1]; }
+    else { err_line = 1; err_col = 1; }
+    err_msg = cast(i64, msg);
+    return 0 - 1;
+}
+
+fn _puts(t as *term.Term, s as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    term.puts(t, s, n);
+    return;
+}
+fn _putn(t as *term.Term, v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x == 0) { term.putc(t, 48); return; }
+    if (x < 0) { term.putc(t, 45); x = 0 - x; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    term.puts(t, cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn report_error(t as *term.Term) as void {
+    _puts(t, "shell:");
+    _putn(t, err_line);
+    term.putc(t, 58);
+    _putn(t, err_col);
+    _puts(t, ": ");
+    if (err_msg != 0) { _puts(t, cast(*u8, err_msg)); }
+    term.putc(t, 0x0A);
+    return;
+}
+
+// ---- tokenising ------------------------------------------------------------
+
+fn _kw(off as i64, len as i64) as i64 {
+    if (repl.streq(cast(*u8, &src[off]), len, "begin") == 1)    { return T_BEGIN; }
+    if (repl.streq(cast(*u8, &src[off]), len, "end") == 1)      { return T_END; }
+    if (repl.streq(cast(*u8, &src[off]), len, "if") == 1)       { return T_IF; }
+    if (repl.streq(cast(*u8, &src[off]), len, "else") == 1)     { return T_ELSE; }
+    if (repl.streq(cast(*u8, &src[off]), len, "elsif") == 1)    { return T_ELSIF; }
+    if (repl.streq(cast(*u8, &src[off]), len, "while") == 1)    { return T_WHILE; }
+    if (repl.streq(cast(*u8, &src[off]), len, "for") == 1)      { return T_FOR; }
+    if (repl.streq(cast(*u8, &src[off]), len, "in") == 1)       { return T_IN; }
+    if (repl.streq(cast(*u8, &src[off]), len, "switch") == 1)   { return T_SWITCH; }
+    if (repl.streq(cast(*u8, &src[off]), len, "case") == 1)     { return T_CASE; }
+    if (repl.streq(cast(*u8, &src[off]), len, "function") == 1) { return T_FUNC; }
+    return T_WORD;
+}
+
+// tokenise — words, with quotes kept intact (shexec strips them later, and it
+// must see them to know what not to glob). Newlines and ';' are breaks.
+fn tokenise() as void {
+    ntok = 0;
+    let is i64 as line with mut = 1;
+    let is i64 as bol with mut = 0;          // offset of the current line's start
+    let is i64 as i with mut = 0;
+    while (i < srclen) {
+        let is i64 as c = cast(i64, src[i]);
+        if (c == 32 || c == 9) { i = i + 1; }
+        else if (c == 10 || c == 59) {                          // newline or ';'
+            if (ntok < MAX_TOK) {
+                t_kind[ntok] = T_SEMI; t_off[ntok] = i; t_len[ntok] = 1;
+                t_line[ntok] = line; t_col[ntok] = i - bol + 1;
+                ntok = ntok + 1;
+            }
+            i = i + 1;
+            if (c == 10) { line = line + 1; bol = i; }
+        }
+        else if (c == 35) {                                     // '#' to end of line
+            while (i < srclen && src[i] != cast(u8, 10)) { i = i + 1; }
+        }
+        else {
+            let is i64 as o = i;
+            let is i64 as col = i - bol + 1;
+            // A separate flag ends the word, NOT a sentinel value of `i`: the
+            // position where the word stops is the position the outer loop must
+            // resume from, and clobbering it swallowed the rest of the line into
+            // one token (so `if true begin` never looked like three words).
+            let is i64 as stop with mut = 0;
+            while (i < srclen && stop == 0) {
+                let is i64 as ch = cast(i64, src[i]);
+                if (ch == 34 || ch == 39) {
+                    let is i64 as close = ch;
+                    i = i + 1;
+                    while (i < srclen && cast(i64, src[i]) != close) { i = i + 1; }
+                    if (i < srclen) { i = i + 1; }
+                } else if (ch == 32 || ch == 9 || ch == 10 || ch == 59) { stop = 1; }
+                else { i = i + 1; }
+            }
+            if (ntok < MAX_TOK) {
+                t_off[ntok] = o; t_len[ntok] = i - o;
+                t_kind[ntok] = _kw(o, i - o);
+                t_line[ntok] = line; t_col[ntok] = col;
+                ntok = ntok + 1;
+            }
+        }
+    }
+    return;
+}
+
+// depth — how many blocks are still open in what has been typed. The REPL asks
+// this to decide between running the line and asking for more.
+fn depth() as i64 {
+    let is i64 as d with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < ntok) {
+        let is i64 as k = t_kind[i];
+        if (k == T_IF || k == T_WHILE || k == T_FOR || k == T_SWITCH || k == T_FUNC) {
+            d = d + 1;
+        } else if (k == T_BEGIN) {
+            // The `begin` of a construct was already counted by its keyword,
+            // and `else begin` / `elsif ... begin` continue a construct rather
+            // than opening one — one `end` closes the whole chain. So only a
+            // bare grouping block, which starts a statement, adds a level.
+            if (i == 0 || t_kind[i - 1] == T_SEMI) { d = d + 1; }
+        } else if (k == T_END) { d = d - 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+// ---- parsing ---------------------------------------------------------------
+
+let is i64 as pos with mut = 0;
+
+fn _skip_semis() as void {
+    while (pos < ntok && t_kind[pos] == T_SEMI) { pos = pos + 1; }
+    return;
+}
+
+fn _alloc_stmt() as i64 {
+    if (nst >= MAX_STMT) { return 0 - 1; }
+    let is i64 as k = nst;
+    nst = nst + 1;
+    st[k].kind = S_CMD; st[k].a0 = 0; st[k].a1 = 0;
+    st[k].b0 = 0; st[k].bn = 0; st[k].c0 = 0; st[k].cn = 0;
+    st[k].d0 = 0; st[k].dn = 0;
+    return k;
+}
+
+// A block's statements are parsed into the flat table in order, so a body is a
+// contiguous [first, count) range — no child pointers to fix up.
+let is [512]i64 as kids with mut;
+let is i64 as nkids with mut = 0;
+
+// parse_stmt — one statement. Returns its index, or -1 with the error set.
+fn parse_stmt() as i64 {
+    _skip_semis();
+    if (pos >= ntok) { return 0 - 1; }
+    let is i64 as k = t_kind[pos];
+
+    if (k == T_IF || k == T_WHILE) {
+        let is i64 as node = _alloc_stmt();
+        if (node < 0) { return _fail(pos, "script too large"); }
+        if (k == T_IF) { st[node].kind = S_IF; } else { st[node].kind = S_WHILE; }
+        pos = pos + 1;
+        st[node].a0 = pos;
+        while (pos < ntok && t_kind[pos] != T_BEGIN && t_kind[pos] != T_SEMI) { pos = pos + 1; }
+        st[node].a1 = pos;
+        if (st[node].a1 == st[node].a0) { return _fail(pos, "expected a condition command"); }
+        _skip_semis();
+        if (pos >= ntok || t_kind[pos] != T_BEGIN) { return _fail(pos, "expected 'begin'"); }
+        pos = pos + 1;
+        let is i64 as f with mut = 0;
+        let is i64 as n with mut = 0;
+        if (parse_block(&f, &n) < 0) { return 0 - 1; }
+        st[node].b0 = f; st[node].bn = n;
+        // 'else begin ... end' and 'elsif <cond> begin ...' both continue the
+        // chain; elsif is parsed as a nested if in the else branch, which is
+        // what it means and costs no extra node kind.
+        if (pos < ntok && t_kind[pos] == T_ELSE) {
+            pos = pos + 1;
+            _skip_semis();
+            if (pos >= ntok || t_kind[pos] != T_BEGIN) { return _fail(pos, "expected 'begin' after 'else'"); }
+            pos = pos + 1;
+            let is i64 as ef with mut = 0;
+            let is i64 as en with mut = 0;
+            if (parse_block(&ef, &en) < 0) { return 0 - 1; }
+            st[node].c0 = ef; st[node].cn = en;
+        } else if (pos < ntok && t_kind[pos] == T_ELSIF) {
+            t_kind[pos] = T_IF;                        // rewrite: elsif IS a nested if
+            let is i64 as inner = parse_stmt();
+            if (inner < 0) { return 0 - 1; }
+            kids[nkids] = inner; st[node].c0 = nkids; st[node].cn = 1; nkids = nkids + 1;
+            return node;                               // the inner if consumed the 'end'
+        }
+        if (pos >= ntok || t_kind[pos] != T_END) { return _fail(pos, "expected 'end'"); }
+        pos = pos + 1;
+        return node;
+    }
+
+    if (k == T_FOR) {
+        let is i64 as node = _alloc_stmt();
+        if (node < 0) { return _fail(pos, "script too large"); }
+        st[node].kind = S_FOR;
+        pos = pos + 1;
+        if (pos >= ntok || t_kind[pos] != T_WORD) { return _fail(pos, "expected a loop variable"); }
+        st[node].d0 = pos; st[node].dn = 1;
+        pos = pos + 1;
+        if (pos >= ntok || t_kind[pos] != T_IN) { return _fail(pos, "expected 'in'"); }
+        pos = pos + 1;
+        st[node].a0 = pos;
+        while (pos < ntok && t_kind[pos] != T_BEGIN && t_kind[pos] != T_SEMI) { pos = pos + 1; }
+        st[node].a1 = pos;
+        _skip_semis();
+        if (pos >= ntok || t_kind[pos] != T_BEGIN) { return _fail(pos, "expected 'begin'"); }
+        pos = pos + 1;
+        let is i64 as f with mut = 0;
+        let is i64 as n with mut = 0;
+        if (parse_block(&f, &n) < 0) { return 0 - 1; }
+        st[node].b0 = f; st[node].bn = n;
+        if (pos >= ntok || t_kind[pos] != T_END) { return _fail(pos, "expected 'end'"); }
+        pos = pos + 1;
+        return node;
+    }
+
+    if (k == T_SWITCH) {
+        let is i64 as node = _alloc_stmt();
+        if (node < 0) { return _fail(pos, "script too large"); }
+        st[node].kind = S_SWITCH;
+        pos = pos + 1;
+        if (pos >= ntok) { return _fail(pos, "expected a value to switch on"); }
+        st[node].a0 = pos; st[node].a1 = pos + 1;
+        pos = pos + 1;
+        _skip_semis();
+        if (pos >= ntok || t_kind[pos] != T_BEGIN) { return _fail(pos, "expected 'begin'"); }
+        pos = pos + 1;
+        // Each case is one statement whose head span is the pattern and whose
+        // body is the arm. They are NOT contiguous in the statement table —
+        // every arm allocates its own body in between — so, like any block's
+        // children, the arms are recorded as a run in `kids`.
+        let is [32]i64 as arms;
+        let is i64 as count with mut = 0;
+        _skip_semis();
+        while (pos < ntok && t_kind[pos] == T_CASE) {
+            let is i64 as arm = _alloc_stmt();
+            if (arm < 0) { return _fail(pos, "script too large"); }
+            st[arm].kind = S_CMD;
+            pos = pos + 1;
+            if (pos >= ntok) { return _fail(pos, "expected a case pattern"); }
+            st[arm].a0 = pos; st[arm].a1 = pos + 1;
+            pos = pos + 1;
+            _skip_semis();
+            let is i64 as f with mut = 0;
+            let is i64 as n with mut = 0;
+            if (parse_block(&f, &n) < 0) { return 0 - 1; }
+            st[arm].b0 = f; st[arm].bn = n;
+            if (count < 32) { arms[count] = arm; count = count + 1; }
+            _skip_semis();
+        }
+        let is i64 as abase = nkids;
+        let is i64 as ai with mut = 0;
+        while (ai < count && nkids < 512) { kids[nkids] = arms[ai]; nkids = nkids + 1; ai = ai + 1; }
+        st[node].d0 = abase; st[node].dn = count;
+        if (pos >= ntok || t_kind[pos] != T_END) { return _fail(pos, "expected 'end'"); }
+        pos = pos + 1;
+        return node;
+    }
+
+    if (k == T_FUNC) {
+        let is i64 as node = _alloc_stmt();
+        if (node < 0) { return _fail(pos, "script too large"); }
+        st[node].kind = S_FUNC;
+        pos = pos + 1;
+        if (pos >= ntok || t_kind[pos] != T_WORD) { return _fail(pos, "expected a function name"); }
+        st[node].d0 = pos; st[node].dn = 1;
+        pos = pos + 1;
+        _skip_semis();
+        if (pos >= ntok || t_kind[pos] != T_BEGIN) { return _fail(pos, "expected 'begin'"); }
+        pos = pos + 1;
+        // a0/a1 bracket the body as RAW SOURCE, not as a token span: the text
+        // between 'begin' and 'end' is what gets stored, newlines and all, so
+        // the statement separators survive.
+        st[node].a0 = pos;
+        let is i64 as f with mut = 0;
+        let is i64 as n with mut = 0;
+        if (parse_block(&f, &n) < 0) { return 0 - 1; }
+        st[node].a1 = pos;
+        st[node].b0 = f; st[node].bn = n;
+        if (pos >= ntok || t_kind[pos] != T_END) { return _fail(pos, "expected 'end'"); }
+        pos = pos + 1;
+        return node;
+    }
+
+    if (k == T_BEGIN) {                                 // a bare block: grouping
+        let is i64 as node = _alloc_stmt();
+        if (node < 0) { return _fail(pos, "script too large"); }
+        st[node].kind = S_IF;
+        st[node].a0 = 0 - 1; st[node].a1 = 0 - 1;       // no condition = always run
+        pos = pos + 1;
+        let is i64 as f with mut = 0;
+        let is i64 as n with mut = 0;
+        if (parse_block(&f, &n) < 0) { return 0 - 1; }
+        st[node].b0 = f; st[node].bn = n;
+        if (pos >= ntok || t_kind[pos] != T_END) { return _fail(pos, "expected 'end'"); }
+        pos = pos + 1;
+        return node;
+    }
+
+    if (k == T_END || k == T_ELSE || k == T_ELSIF || k == T_CASE) {
+        return _fail(pos, "unexpected keyword");
+    }
+
+    // A plain command: everything up to the next break or block keyword.
+    let is i64 as node = _alloc_stmt();
+    if (node < 0) { return _fail(pos, "script too large"); }
+    st[node].kind = S_CMD;
+    st[node].a0 = pos;
+    while (pos < ntok && t_kind[pos] != T_SEMI) { pos = pos + 1; }
+    st[node].a1 = pos;
+    return node;
+}
+
+// parse_block — statements until 'end', 'else', 'elsif' or 'case'.
+//
+// A child that is itself a block allocates its own statements while it parses,
+// so the parent's children are NOT contiguous in the statement table. The block
+// therefore records a run in `kids`, a list of statement indices: gathered
+// locally first, appended after every descendant has finished, so the run is
+// contiguous there even though the statements are not.
+fn parse_block(out_first as *i64, out_n as *i64) as i64 {
+    let is [64]i64 as local;
+    let is i64 as count with mut = 0;
+    _skip_semis();
+    while (pos < ntok && t_kind[pos] != T_END && t_kind[pos] != T_ELSE
+           && t_kind[pos] != T_ELSIF && t_kind[pos] != T_CASE) {
+        let is i64 as s = parse_stmt();
+        if (s < 0) { return 0 - 1; }
+        if (count < 64) { local[count] = s; count = count + 1; }
+        _skip_semis();
+    }
+    let is i64 as base = nkids;
+    let is i64 as i with mut = 0;
+    while (i < count && nkids < 512) { kids[nkids] = local[i]; nkids = nkids + 1; i = i + 1; }
+    out_first[0] = base;
+    out_n[0] = count;
+    return 0;
+}
+
+// ---- interpretation --------------------------------------------------------
+
+// The text of a token span, rebuilt as one line with single spaces. Tokens are
+// slices of the source, so this is a copy, not a re-parse: what reaches shexec
+// is a command line exactly like a typed one.
+let is [1024]u8 as spanbuf with mut;
+
+fn span_text(a0 as i64, a1 as i64, out_len as *i64) as *u8 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = a0;
+    while (i < a1 && i < ntok) {
+        if (n > 0 && n < 1023) { spanbuf[n] = cast(u8, 32); n = n + 1; }
+        let is i64 as k with mut = 0;
+        while (k < t_len[i] && n < 1023) { spanbuf[n] = src[t_off[i] + k]; n = n + 1; k = k + 1; }
+        i = i + 1;
+    }
+    out_len[0] = n;
+    return cast(*u8, &spanbuf[0]);
+}
+
+// One token's raw text, for a loop variable's name or a case pattern.
+let is [256]u8 as tokbuf with mut;
+fn tok_text(i as i64, out_len as *i64) as *u8 {
+    let is i64 as n with mut = t_len[i];
+    if (n > 255) { n = 255; }
+    let is i64 as k with mut = 0;
+    while (k < n) { tokbuf[k] = src[t_off[i] + k]; k = k + 1; }
+    out_len[0] = n;
+    return cast(*u8, &tokbuf[0]);
+}
+
+// Loop and recursion bounds. A runaway `while true` would otherwise wedge the
+// only shell on the machine with no way to interrupt it, so it is capped and
+// says so rather than hanging.
+let is i64 as MAX_ITER with imut = 100000;
+let is i64 as MAX_DEPTH with imut = 16;
+let is i64 as run_depth with mut = 0;
+
+// find_fn — index of a function by name, or -1.
+fn find_fn(name as *u8, len as i64) as i64 {
+    let is i64 as f with mut = 0;
+    while (f < nfn) {
+        if (fn_name_len[f] == len) {
+            let is i64 as k with mut = 0;
+            while (k < len && fnbuf[fn_name_off[f] + k] == name[k]) { k = k + 1; }
+            if (k == len) { return f; }
+        }
+        f = f + 1;
+    }
+    return 0 - 1;
+}
+
+fn has_fn(name as *u8, len as i64) as i64 {
+    if (find_fn(name, len) >= 0) { return 1; }
+    return 0;
+}
+
+// define_fn — copy the name and the body's raw text into the arena. A redefine
+// reuses the slot but still appends its text: the arena only grows, which is
+// bounded by how much someone types in one session.
+fn define_fn(t as *term.Term, s as i64) as i64 {
+    let is i64 as nlen with mut = t_len[st[s].d0];
+    if (nlen > 64) { nlen = 64; }
+    let is i64 as b_from = t_off[st[s].a0];
+    let is i64 as b_to with mut = srclen;
+    if (st[s].a1 < ntok) { b_to = t_off[st[s].a1]; }
+    let is i64 as blen with mut = b_to - b_from;
+    if (blen < 0) { blen = 0; }
+    if (fnfill + nlen + blen > 4096) { _puts(t, "shell: no room for another function\n"); return 1; }
+
+    let is i64 as slot with mut = find_fn(cast(*u8, &src[t_off[st[s].d0]]), nlen);
+    if (slot < 0) {
+        if (nfn >= MAX_FN) { _puts(t, "shell: too many functions\n"); return 1; }
+        slot = nfn; nfn = nfn + 1;
+    }
+    fn_name_off[slot] = fnfill;
+    fn_name_len[slot] = nlen;
+    let is i64 as i with mut = 0;
+    while (i < nlen) { fnbuf[fnfill] = src[t_off[st[s].d0] + i]; fnfill = fnfill + 1; i = i + 1; }
+    fn_body_off[slot] = fnfill;
+    fn_body_len[slot] = blen;
+    let is i64 as j with mut = 0;
+    while (j < blen) { fnbuf[fnfill] = src[b_from + j]; fnfill = fnfill + 1; j = j + 1; }
+    return 0;
+}
+
+// run_one — a simple command: a builtin if it names one, a function call if it
+// names one of those, otherwise a program. Returns its exit status.
+fn run_one(t as *term.Term, a0 as i64, a1 as i64) as i64 {
+    if (a1 <= a0) { return 0; }
+    let is i64 as len with mut = 0;
+    let is *u8 as text = span_text(a0, a1, &len);
+
+    // A defined function shadows a program of the same name, the way a builtin
+    // does: it is the more specific thing the user just wrote.
+    let is i64 as f = find_fn(cast(*u8, &src[t_off[a0]]), t_len[a0]);
+    if (f >= 0) { return call_fn(t, f); }
+
+    // Builtins run in the shell itself; `cd` inside a loop must move the shell.
+    let is [32]i64 as ap;
+    let is [32]i64 as al;
+    let is i64 as argc = repl.parse(text, len, cast(*i64, &ap[0]), cast(*i64, &al[0]));
+    let is i64 as bst with mut = 0;
+    if (bi.dispatch(t, cast(*i64, &ap[0]), cast(*i64, &al[0]), argc, &bst) == 1) {
+        sx.set_status(bst);
+        return bst;
+    }
+    return sx.run_sync(t, text, len);
+}
+
+fn exec_block(t as *term.Term, first as i64, n as i64) as i64 {
+    let is i64 as status with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        status = exec_stmt(t, kids[first + i]);
+        i = i + 1;
+    }
+    return status;
+}
+
+// call_fn — re-tokenise and re-parse the stored body, run it, and put the
+// caller's parse state back. The token and statement tables are module-wide, so
+// the call has to save and restore them; that also makes recursion work, up to
+// MAX_DEPTH.
+fn call_fn(t as *term.Term, f as i64) as i64 {
+    if (run_depth >= MAX_DEPTH) { _puts(t, "shell: functions nested too deep\n"); return 1; }
+    let is [4096]u8 as save_src;
+    let is i64 as save_srclen = srclen;
+    let is i64 as save_ntok = ntok;
+    let is i64 as save_pos = pos;
+    let is i64 as save_nst = nst;
+    let is i64 as save_nkids = nkids;
+    let is [512]i64 as sk; let is [512]i64 as so; let is [512]i64 as sl;
+    let is [512]i64 as sln; let is [512]i64 as sc;
+    let is i64 as i with mut = 0;
+    while (i < save_srclen) { save_src[i] = src[i]; i = i + 1; }
+    i = 0;
+    while (i < save_ntok) {
+        sk[i] = t_kind[i]; so[i] = t_off[i]; sl[i] = t_len[i];
+        sln[i] = t_line[i]; sc[i] = t_col[i];
+        i = i + 1;
+    }
+
+    srclen = 0;
+    let is i64 as b with mut = 0;
+    while (b < fn_body_len[f] && srclen < SRC_CAP) {
+        src[srclen] = fnbuf[fn_body_off[f] + b];
+        srclen = srclen + 1; b = b + 1;
+    }
+    tokenise();
+    pos = 0;
+    let is i64 as bf with mut = 0;
+    let is i64 as bn with mut = 0;
+    let is i64 as status with mut = 0;
+    run_depth = run_depth + 1;
+    if (parse_block(&bf, &bn) < 0) { report_error(t); status = 2; }
+    else { status = exec_block(t, bf, bn); }
+    run_depth = run_depth - 1;
+
+    // Restore: the statements this call allocated are dropped wholesale, which
+    // is safe because nothing outside the call refers to them.
+    srclen = save_srclen;
+    i = 0;
+    while (i < save_srclen) { src[i] = save_src[i]; i = i + 1; }
+    ntok = save_ntok;
+    i = 0;
+    while (i < save_ntok) {
+        t_kind[i] = sk[i]; t_off[i] = so[i]; t_len[i] = sl[i];
+        t_line[i] = sln[i]; t_col[i] = sc[i];
+        i = i + 1;
+    }
+    pos = save_pos; nst = save_nst; nkids = save_nkids;
+    return status;
+}
+
+fn exec_stmt(t as *term.Term, s as i64) as i64 {
+    if (s < 0 || s >= nst) { return 0; }
+    if (run_depth >= MAX_DEPTH) { return 0; }
+    run_depth = run_depth + 1;
+    let is i64 as status with mut = 0;
+    let is i64 as k = st[s].kind;
+
+    if (k == S_CMD) { status = run_one(t, st[s].a0, st[s].a1); }
+    else if (k == S_IF) {
+        let is i64 as cond with mut = 0;
+        if (st[s].a0 >= 0) { cond = run_one(t, st[s].a0, st[s].a1); }
+        if (cond == 0) { status = exec_block(t, st[s].b0, st[s].bn); }
+        else if (st[s].cn > 0) { status = exec_block(t, st[s].c0, st[s].cn); }
+    }
+    else if (k == S_WHILE) {
+        let is i64 as iter with mut = 0;
+        let is i64 as go with mut = 1;
+        while (go == 1) {
+            if (run_one(t, st[s].a0, st[s].a1) != 0) { go = 0; }
+            else {
+                status = exec_block(t, st[s].b0, st[s].bn);
+                iter = iter + 1;
+                if (iter >= MAX_ITER) {
+                    _puts(t, "shell: while stopped after 100000 iterations\n");
+                    go = 0;
+                }
+            }
+        }
+    }
+    else if (k == S_FOR) {
+        // The item list is expanded and globbed once, the way `for f in *.cst`
+        // has to be, then walked. The loop variable is a normal shell variable,
+        // so the body reaches it through the ordinary $name path.
+        let is i64 as vlen with mut = 0;
+        let is *u8 as vname = tok_text(st[s].d0, &vlen);
+        let is [256]u8 as vsave;
+        let is i64 as vn with mut = 0;
+        while (vn < vlen && vn < 255) { vsave[vn] = vname[vn]; vn = vn + 1; }
+
+        let is i64 as ilen with mut = 0;
+        let is *u8 as items = span_text(st[s].a0, st[s].a1, &ilen);
+        let is i64 as nc = sx.prepare(items, ilen);
+        // The expanded words live in shexec's word buffer, and the FIRST command
+        // in the body reparses a line into that same buffer. So the whole list
+        // is copied out before the loop runs, not one item at a time: reading
+        // item 2 after iteration 1 was reading whatever the body had left there.
+        let is [512]u8 as ibuf;
+        let is [64]i64 as ioff;
+        let is [64]i64 as ilen_of;
+        let is i64 as ifill with mut = 0;
+        let is i64 as count with mut = 0;
+        if (nc > 0) {
+            let is *sx.Cmd as c0 = sx.cmd_at(0);
+            let is i64 as w with mut = 0;
+            while (w < c0.wn && w < 64) {
+                let is *u8 as wp = sx.word_ptr(c0.w0 + w);
+                let is i64 as wl with mut = sx.word_len(c0.w0 + w);
+                if (ifill + wl > 512) { wl = 512 - ifill; }
+                if (wl < 0) { wl = 0; }
+                ioff[count] = ifill;
+                ilen_of[count] = wl;
+                let is i64 as q with mut = 0;
+                while (q < wl) { ibuf[ifill] = wp[q]; ifill = ifill + 1; q = q + 1; }
+                count = count + 1;
+                w = w + 1;
+            }
+        }
+        let is i64 as it with mut = 0;
+        while (it < count) {
+            sx.env_set(cast(*u8, &vsave[0]), vn,
+                       cast(*u8, &ibuf[ioff[it]]), ilen_of[it]);
+            status = exec_block(t, st[s].b0, st[s].bn);
+            it = it + 1;
+        }
+    }
+    else if (k == S_SWITCH) {
+        let is i64 as slen with mut = 0;
+        let is *u8 as subj = span_text(st[s].a0, st[s].a1, &slen);
+        let is [256]u8 as sv;
+        let is i64 as sn with mut = slen;
+        if (sn > 255) { sn = 255; }
+        let is i64 as q with mut = 0;
+        while (q < sn) { sv[q] = subj[q]; q = q + 1; }
+        // Patterns are glob patterns, so `case *.cst` reads the way it looks.
+        let is i64 as a with mut = 0;
+        let is i64 as done with mut = 0;
+        while (a < st[s].dn && done == 0) {
+            let is i64 as arm = kids[st[s].d0 + a];
+            let is i64 as plen with mut = 0;
+            let is *u8 as pat = tok_text(st[arm].a0, &plen);
+            if (sx.fnmatch(pat, plen, cast(*u8, &sv[0]), sn) == 1) {
+                status = exec_block(t, st[arm].b0, st[arm].bn);
+                done = 1;
+            }
+            a = a + 1;
+        }
+    }
+    else if (k == S_FUNC) { status = define_fn(t, s); }
+    run_depth = run_depth - 1;
+    return status;
+}
+
+// ---- the shell's entry points ----------------------------------------------
+
+// A function body must outlive the script that defined it, so the tables are
+// only reset when nothing has been defined yet. Redefining a function reuses
+// the slot; the statement table keeps growing until `reset` is called.
+fn reset() as void {
+    nst = 0; nkids = 0; nfn = 0; ntok = 0; srclen = 0;
+    return;
+}
+
+// call_named — run a defined function by name. Returns its status, or -1 when
+// no function has that name (the shell then looks for a program).
+fn call_named(t as *term.Term, name as *u8, len as i64) as i64 {
+    let is i64 as f = find_fn(name, len);
+    if (f < 0) { return 0 - 1; }
+    return call_fn(t, f);
+}
+
+// is_block_start — does this line open a construct? The REPL asks before it
+// decides whether to run the line or collect more of it.
+fn is_block_start(line as *u8, len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < len && (line[i] == cast(u8, 32) || line[i] == cast(u8, 9))) { i = i + 1; }
+    let is i64 as st0 = i;
+    while (i < len && line[i] != cast(u8, 32) && line[i] != cast(u8, 9)) { i = i + 1; }
+    let is i64 as wl = i - st0;
+    if (wl == 0) { return 0; }
+    let is *u8 as w = cast(*u8, cast(i64, line) + st0);
+    if (repl.streq(w, wl, "if") == 1) { return 1; }
+    if (repl.streq(w, wl, "while") == 1) { return 1; }
+    if (repl.streq(w, wl, "for") == 1) { return 1; }
+    if (repl.streq(w, wl, "switch") == 1) { return 1; }
+    if (repl.streq(w, wl, "function") == 1) { return 1; }
+    if (repl.streq(w, wl, "begin") == 1) { return 1; }
+    return 0;
+}
+
+// The line buffer a multi-line construct accumulates into.
+let is [4096]u8 as pend with mut;
+let is i64 as pendlen with mut = 0;
+fn pending() as i64 { if (pendlen > 0) { return 1; } return 0; }
+fn pending_clear() as void { pendlen = 0; return; }
+
+// feed — hand the REPL's line to the script engine.
+//
+// Returns 1 when the construct is still open (the shell shows a continuation
+// prompt and calls again), 0 when it ran, and -1 on a parse error already
+// reported. Recovery is "drop the whole construct": a half-parsed block has no
+// safe resumption point, and the person can press Up and fix it.
+fn feed(t as *term.Term, line as *u8, len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < len && pendlen < SRC_CAP - 2) { pend[pendlen] = line[i]; pendlen = pendlen + 1; i = i + 1; }
+    if (pendlen < SRC_CAP - 2) { pend[pendlen] = cast(u8, 10); pendlen = pendlen + 1; }
+
+    srclen = 0;
+    let is i64 as k with mut = 0;
+    while (k < pendlen && srclen < SRC_CAP) { src[srclen] = pend[k]; srclen = srclen + 1; k = k + 1; }
+    tokenise();
+    let is i64 as d = depth();
+    if (d > 0) { return 1; }                       // still inside a block
+    if (d < 0) {
+        _fail(ntok - 1, cast(*u8, "unexpected 'end'"));
+        report_error(t);
+        pendlen = 0;
+        return 0 - 1;
+    }
+
+    // Parse the whole thing, then run it. Statements are kept (a `function`
+    // definition's body has to survive), so only the token stream is rebuilt.
+    pos = 0;
+    let is i64 as f with mut = 0;
+    let is i64 as n with mut = 0;
+    let is i64 as base_kids = nkids;
+    if (parse_block(&f, &n) < 0) {
+        report_error(t);
+        pendlen = 0;
+        nkids = base_kids;
+        return 0 - 1;
+    }
+    if (pos < ntok) {
+        _fail(pos, cast(*u8, "unexpected token after the end of the script"));
+        report_error(t);
+        pendlen = 0;
+        nkids = base_kids;
+        return 0 - 1;
+    }
+    pendlen = 0;
+    exec_block(t, f, n);
+    return 0;
+}

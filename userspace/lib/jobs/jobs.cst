@@ -1,0 +1,216 @@
+// jobs.cst — the shell's job table.
+//
+// causticos has no signals, so a child's death is not something that interrupts
+// the parent: it is a record the parent reads from an fd it subscribed to
+// (SYS_EVENT_SUBSCRIBE). That fd sits in the same poll set as the keyboard and
+// the children's output, so "a job finished" is just another readable event and
+// the shell never blocks on wait() to find out.
+//
+// A job is a pipeline: several pids that live and die together. It is done when
+// the LAST one exits — that is the process whose exit code the shell reports,
+// the same rule every shell uses.
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as MAX_JOBS with imut = 16;
+let is i64 as MAX_PIDS with imut = 8;      // pids per pipeline
+let is i64 as CMD_CAP  with imut = 64;     // command text kept for `jobs`
+
+// status
+let is i64 as JOB_FREE with imut = 0;
+let is i64 as JOB_RUN  with imut = 1;
+let is i64 as JOB_DONE with imut = 2;
+
+struct Job {
+    status as i64;
+    npids as i64;
+    nlive as i64;          // pids not yet reaped
+    bg as i64;             // 1 = started with '&'
+    exit_code as i64;      // of the LAST pid in the pipeline
+    cmd_len as i64;
+    out_fd as i64;         // shell's read end of the pipeline's stdout, or -1
+    in_fd as i64;          // shell's write end of its stdin, or -1
+    aux_fd as i64;         // a third endpoint the shell chose to hand this job,
+                           // or -1. The windowed shell uses it for the control
+                           // channel a child asks for a new window on; the
+                           // fullscreen one hands out no such thing. The library
+                           // only promises to close it on release.
+    img as i64;            // mmap'd image to release when it is reaped, or 0
+    img_len as i64;
+    reported as i64;       // 1 once "[n] Done" was shown (background only)
+}
+
+let is [16]Job as tab with mut;
+let is [128]i64 as pids with mut;           // MAX_JOBS * MAX_PIDS
+let is [1024]u8 as cmds with mut;           // MAX_JOBS * CMD_CAP
+let is i64 as evfd with mut = 0 - 1;
+
+fn event_fd() as i64 { return evfd; }
+fn get(i as i64) as *Job { return &tab[i]; }
+fn max_jobs() as i64 { return MAX_JOBS; }
+
+// init — subscribe to our own children's lifecycle. A failure is not fatal: the
+// shell falls back to reaping foreground jobs with wait(), it just cannot
+// notice a background one finishing until then.
+fn init() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_JOBS) {
+        tab[i].status = JOB_FREE;
+        tab[i].out_fd = 0 - 1;
+        tab[i].in_fd = 0 - 1;
+        tab[i].aux_fd = 0 - 1;
+        i = i + 1;
+    }
+    evfd = sys.event_subscribe(sys.getpid(), 0);
+    return evfd;
+}
+
+fn alloc() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_JOBS) {
+        if (tab[i].status == JOB_FREE) {
+            tab[i].npids = 0; tab[i].nlive = 0; tab[i].bg = 0;
+            tab[i].exit_code = 0; tab[i].cmd_len = 0;
+            tab[i].out_fd = 0 - 1; tab[i].in_fd = 0 - 1; tab[i].aux_fd = 0 - 1;
+            tab[i].img = 0; tab[i].img_len = 0; tab[i].reported = 0;
+            tab[i].status = JOB_RUN;
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn add_pid(j as i64, pid as i64) as void {
+    if (j < 0 || j >= MAX_JOBS) { return; }
+    if (tab[j].npids >= MAX_PIDS) { return; }
+    pids[j * MAX_PIDS + tab[j].npids] = pid;
+    tab[j].npids = tab[j].npids + 1;
+    tab[j].nlive = tab[j].nlive + 1;
+    return;
+}
+
+fn pid_at(j as i64, k as i64) as i64 { return pids[j * MAX_PIDS + k]; }
+fn last_pid(j as i64) as i64 {
+    if (tab[j].npids <= 0) { return 0; }
+    return pids[j * MAX_PIDS + tab[j].npids - 1];
+}
+
+fn set_cmd(j as i64, src as *u8, len as i64) as void {
+    let is i64 as n with mut = len;
+    if (n > CMD_CAP) { n = CMD_CAP; }
+    let is i64 as i with mut = 0;
+    while (i < n) { cmds[j * CMD_CAP + i] = src[i]; i = i + 1; }
+    tab[j].cmd_len = n;
+    return;
+}
+fn cmd_ptr(j as i64) as *u8 { return cast(*u8, &cmds[j * CMD_CAP]); }
+fn cmd_len(j as i64) as i64 { return tab[j].cmd_len; }
+
+// find — which job owns `pid`? -1 when none does (a stranger's event, or an
+// already-freed slot).
+fn find(pid as i64) as i64 {
+    let is i64 as j with mut = 0;
+    while (j < MAX_JOBS) {
+        if (tab[j].status != JOB_FREE) {
+            let is i64 as k with mut = 0;
+            while (k < tab[j].npids) {
+                if (pids[j * MAX_PIDS + k] == pid) { return j; }
+                k = k + 1;
+            }
+        }
+        j = j + 1;
+    }
+    return 0 - 1;
+}
+
+// poll_events — drain the subscription without blocking and mark what died.
+// Returns how many jobs finished in this sweep. A 0-byte read means "nothing
+// queued", never end-of-stream: the fd stays in the poll set for the next one.
+fn poll_events() as i64 {
+    if (evfd < 0) { return 0; }
+    let is i64 as finished with mut = 0;
+    let is [24]i64 as recs;                 // 8 records of {pid, kind, code}
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as n = sys.read(evfd, cast(*u8, &recs[0]), 8 * 24);
+        if (n < 24) { more = 0; }
+        else {
+            let is i64 as nrec = n / 24;
+            let is i64 as i with mut = 0;
+            while (i < nrec) {
+                let is i64 as pid  = recs[i * 3 + 0];
+                let is i64 as kind = recs[i * 3 + 1];
+                let is i64 as code = recs[i * 3 + 2];
+                if (kind == sys.EVENT_EXIT) {
+                    let is i64 as j = find(pid);
+                    if (j >= 0) {
+                        // Reap it here: the event says it is a zombie, and the
+                        // wait cannot block once that is true.
+                        let is i64 as st with mut = 0;
+                        sys.wait(pid, &st);
+                        if (tab[j].nlive > 0) { tab[j].nlive = tab[j].nlive - 1; }
+                        if (pid == last_pid(j)) { tab[j].exit_code = code; }
+                        if (tab[j].nlive == 0) {
+                            tab[j].status = JOB_DONE;
+                            finished = finished + 1;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            if (n < 8 * 24) { more = 0; }
+        }
+    }
+    return finished;
+}
+
+// release — close what the job held and free the slot. The image mapping is
+// dropped here and not at spawn: the child runs from its own copy, but the
+// parent's buffer must outlive the spawn call itself.
+fn release(j as i64) as void {
+    if (j < 0 || j >= MAX_JOBS) { return; }
+    if (tab[j].out_fd >= 0) { sys.close(tab[j].out_fd); tab[j].out_fd = 0 - 1; }
+    if (tab[j].in_fd >= 0)  { sys.close(tab[j].in_fd);  tab[j].in_fd = 0 - 1; }
+    if (tab[j].aux_fd >= 0) { sys.close(tab[j].aux_fd); tab[j].aux_fd = 0 - 1; }
+    if (tab[j].img != 0) { sys.munmap(tab[j].img, tab[j].img_len); tab[j].img = 0; }
+    tab[j].status = JOB_FREE;
+    return;
+}
+
+// kill_job — end every pid still live. The shell spawned them and holds the
+// only keys to them, so nobody else can.
+fn kill_job(j as i64) as void {
+    if (j < 0 || j >= MAX_JOBS || tab[j].status != JOB_RUN) { return; }
+    let is i64 as k with mut = 0;
+    while (k < tab[j].npids) { sys.kill(pids[j * MAX_PIDS + k]); k = k + 1; }
+    return;
+}
+
+// parse_pct — "%3" -> job index 2. Returns -1 when the token is not a job spec
+// or names a slot that is not running.
+fn parse_pct(tok as *u8, len as i64) as i64 {
+    if (len < 2 || tok[0] != cast(u8, 37)) { return 0 - 1; }      // '%'
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 1;
+    while (i < len) {
+        let is i64 as c = cast(i64, tok[i]);
+        if (c < 48 || c > 57) { return 0 - 1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (v < 1 || v > MAX_JOBS) { return 0 - 1; }
+    if (tab[v - 1].status == JOB_FREE) { return 0 - 1; }
+    return v - 1;
+}
+
+// n_running — how many jobs are still alive (the shell asks before it lets the
+// window close, and to decide whether it has anything to poll).
+fn n_running() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as j with mut = 0;
+    while (j < MAX_JOBS) {
+        if (tab[j].status == JOB_RUN) { n = n + 1; }
+        j = j + 1;
+    }
+    return n;
+}

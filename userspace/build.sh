@@ -42,7 +42,7 @@ PROGS="$PROGS run cc make objdump"
 PROGS="$PROGS pager hexedit"
 #   lib self-tests: run in the shell, print PASS/FAIL. Building them here keeps
 #   a library honest even before its first consumer lands.
-PROGS="$PROGS animt"
+PROGS="$PROGS animt kabi"
 for p in $PROGS; do
     # programs live in subfolders (coreutils/ sysutils/ wm/ ...); find by name.
     src=$(find "$HERE" -name "$p.cst" -not -path '*/build/*' | head -1)

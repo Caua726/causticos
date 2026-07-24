@@ -1,0 +1,557 @@
+// repl.cst — the line editor every causticos shell shares: the edit buffer,
+// the history ring, recall, and tab completion.
+//
+// causticos has two shells — the fullscreen one that owns the framebuffer and
+// the keyboard, and the windowed wterm that receives keys from the WM — and
+// they had byte-for-byte copies of all of this. A fix landed in one and not the
+// other every time.
+//
+// State is per instance (a *Repl the caller owns), never module globals: the
+// library must not decide that a process has exactly one line being edited.
+// Echo goes through term.putc, which both shells have; the caller flushes,
+// because only it knows whether that means term.flush or a grid commit.
+use "../../../../Caustic/std/causticos/term.cst" as term;
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as LINE_CAP with imut = 256;
+let is i64 as HIST_N   with imut = 16;
+let is i64 as MAX_ARGS with imut = 16;
+
+struct Repl {
+    hhead as i64;              // next history slot to write
+    hsize as i64;              // slots filled, <= HIST_N
+    hnav as i64;               // 0 = editing fresh, 1..hsize = walking back
+    llen as i64;               // bytes in `line`
+    cur as i64;                // cursor, 0..llen — edits happen HERE, not at the end
+    npush as i64;              // total pushes, monotonic
+    npush_load as i64;         // npush when the file was last read/written
+    khead as i64;              // kill ring: next slot to write
+    ksize as i64;              // kill ring: entries stored
+    knav as i64;               // how far back the last yank reached
+    hlen as [16]i64;
+    hbuf as [4096]u8;          // HIST_N * LINE_CAP
+    line as [256]u8;
+    klen as [8]i64;
+    kbuf as [2048]u8;          // KILL_N * LINE_CAP
+}
+
+let is i64 as KILL_N with imut = 8;
+
+fn init(r as *Repl) as void {
+    r.hhead = 0; r.hsize = 0; r.hnav = 0; r.llen = 0; r.cur = 0;
+    r.npush = 0; r.npush_load = 0;
+    r.khead = 0; r.ksize = 0; r.knav = 0;
+    let is i64 as i with mut = 0;
+    while (i < HIST_N) { r.hlen[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < KILL_N) { r.klen[i] = 0; i = i + 1; }
+    return;
+}
+
+fn line_ptr(r as *Repl) as *u8 { return cast(*u8, &r.line[0]); }
+fn line_len(r as *Repl) as i64 { return r.llen; }
+fn line_clear(r as *Repl) as void { r.llen = 0; r.cur = 0; r.hnav = 0; r.knav = 0; return; }
+
+// ---- editing ---------------------------------------------------------------
+//
+// The line is edited at the CURSOR, not only at the end, which means the screen
+// can no longer be kept in step with a single putc per keystroke. `redraw`
+// repaints from wherever the cursor was: back up over it, print the line, blank
+// whatever the line used to be longer by, then walk back to the new cursor.
+// It is the only thing that writes to the terminal here, so every edit is
+// automatically consistent with what is on screen.
+// _back — move the cursor left without erasing. term.putc(0x08) is a
+// DESTRUCTIVE backspace: it blanks the cell it leaves. That is right for
+// rubbing out a character and wrong for repositioning, so repositioning uses
+// the terminal's ANSI "cursor back" instead.
+fn _back(t as *term.Term, n as i64) as void {
+    if (n <= 0) { return; }
+    term.putc(t, 0x1B); term.putc(t, 0x5B);        // ESC [
+    let is i64 as x with mut = n;
+    let is [8]u8 as d;
+    let is i64 as i with mut = 8;
+    while (x > 0) { i = i - 1; d[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    while (i < 8) { term.putc(t, cast(i64, d[i])); i = i + 1; }
+    term.putc(t, 0x44);                            // 'D'
+    return;
+}
+
+fn redraw(r as *Repl, t as *term.Term, prev_len as i64, prev_cur as i64) as void {
+    _back(t, prev_cur);
+    let is i64 as i with mut = 0;
+    while (i < r.llen) { term.putc(t, cast(i64, r.line[i])); i = i + 1; }
+    // Blank whatever the line used to be longer by, then step back over it.
+    let is i64 as extra with mut = prev_len - r.llen;
+    if (extra < 0) { extra = 0; }
+    let is i64 as k with mut = 0;
+    while (k < extra) { term.putc(t, 0x20); k = k + 1; }
+    _back(t, extra);
+    _back(t, r.llen - r.cur);
+    return;
+}
+
+// Insert one byte at the cursor. Returns 0 when the line is full.
+fn line_push(r as *Repl, c as i64) as i64 {
+    if (r.llen >= LINE_CAP - 1) { return 0; }
+    let is i64 as i with mut = r.llen;
+    while (i > r.cur) { r.line[i] = r.line[i - 1]; i = i - 1; }
+    r.line[r.cur] = cast(u8, c);
+    r.llen = r.llen + 1;
+    r.cur = r.cur + 1;
+    r.knav = 0;
+    return 1;
+}
+
+// Delete the byte BEFORE the cursor.
+fn line_backspace(r as *Repl) as i64 {
+    if (r.cur <= 0) { return 0; }
+    let is i64 as i with mut = r.cur;
+    while (i < r.llen) { r.line[i - 1] = r.line[i]; i = i + 1; }
+    r.llen = r.llen - 1;
+    r.cur = r.cur - 1;
+    r.knav = 0;
+    return 1;
+}
+
+fn cursor(r as *Repl) as i64 { return r.cur; }
+fn move_left(r as *Repl) as i64 { if (r.cur <= 0) { return 0; } r.cur = r.cur - 1; return 1; }
+fn move_right(r as *Repl) as i64 { if (r.cur >= r.llen) { return 0; } r.cur = r.cur + 1; return 1; }
+fn move_home(r as *Repl) as i64 { if (r.cur == 0) { return 0; } r.cur = 0; return 1; }
+fn move_end(r as *Repl) as i64 { if (r.cur == r.llen) { return 0; } r.cur = r.llen; return 1; }
+
+// kill_push — remember a cut so it can be yanked back. Empty cuts are not
+// remembered: Ctrl+K at the end of a line must not push the ring's history out.
+fn kill_push(r as *Repl, from as i64, len as i64) as void {
+    if (len <= 0) { return; }
+    let is i64 as n with mut = len;
+    if (n > LINE_CAP - 1) { n = LINE_CAP - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { r.kbuf[r.khead * LINE_CAP + i] = r.line[from + i]; i = i + 1; }
+    r.klen[r.khead] = n;
+    r.khead = (r.khead + 1) % KILL_N;
+    if (r.ksize < KILL_N) { r.ksize = r.ksize + 1; }
+    r.knav = 0;
+    return;
+}
+
+fn _cut(r as *Repl, from as i64, to as i64) as i64 {
+    if (to <= from) { return 0; }
+    kill_push(r, from, to - from);
+    let is i64 as i with mut = to;
+    while (i < r.llen) { r.line[from + i - to] = r.line[i]; i = i + 1; }
+    r.llen = r.llen - (to - from);
+    if (r.cur > from) { r.cur = from; }
+    return 1;
+}
+
+fn kill_to_end(r as *Repl) as i64 { return _cut(r, r.cur, r.llen); }
+fn kill_to_start(r as *Repl) as i64 {
+    let is i64 as c = r.cur;
+    if (c <= 0) { return 0; }
+    kill_push(r, 0, c);
+    let is i64 as i with mut = c;
+    while (i < r.llen) { r.line[i - c] = r.line[i]; i = i + 1; }
+    r.llen = r.llen - c;
+    r.cur = 0;
+    return 1;
+}
+
+// Cut the word before the cursor: trailing blanks, then the run of non-blanks.
+fn kill_word(r as *Repl) as i64 {
+    if (r.cur <= 0) { return 0; }
+    let is i64 as e with mut = r.cur;
+    let is i64 as b with mut = e;
+    while (b > 0 && r.line[b - 1] == cast(u8, 32)) { b = b - 1; }
+    while (b > 0 && r.line[b - 1] != cast(u8, 32)) { b = b - 1; }
+    return _cut(r, b, e);
+}
+
+// yank — paste the most recent cut. Repeating it walks further back through the
+// ring, replacing what the previous yank inserted, which is what a kill ring is
+// for: cut several things, then choose among them.
+fn yank(r as *Repl) as i64 {
+    if (r.ksize == 0) { return 0; }
+    if (r.knav > 0) {
+        // Undo the previous yank before inserting the older entry.
+        let is i64 as prev = (r.khead - r.knav + KILL_N) % KILL_N;
+        let is i64 as pl = r.klen[prev];
+        if (r.cur >= pl) {
+            let is i64 as i with mut = r.cur;
+            while (i < r.llen) { r.line[i - pl] = r.line[i]; i = i + 1; }
+            r.llen = r.llen - pl;
+            r.cur = r.cur - pl;
+        }
+    }
+    r.knav = r.knav + 1;
+    if (r.knav > r.ksize) { r.knav = 1; }
+    let is i64 as slot = (r.khead - r.knav + KILL_N) % KILL_N;
+    let is i64 as n = r.klen[slot];
+    if (n <= 0 || r.llen + n >= LINE_CAP) { return 0; }
+    let is i64 as i with mut = r.llen;
+    while (i > r.cur) { r.line[i + n - 1] = r.line[i - 1]; i = i - 1; }
+    let is i64 as k with mut = 0;
+    while (k < n) { r.line[r.cur + k] = r.kbuf[slot * LINE_CAP + k]; k = k + 1; }
+    r.llen = r.llen + n;
+    r.cur = r.cur + n;
+    return 1;
+}
+
+// transpose — swap the two characters around the cursor and step past them, the
+// readline behaviour: at the end of the line it swaps the last two.
+fn transpose(r as *Repl) as i64 {
+    if (r.llen < 2) { return 0; }
+    let is i64 as c with mut = r.cur;
+    if (c >= r.llen) { c = r.llen - 1; }
+    if (c <= 0) { return 0; }
+    let is u8 as tmp = r.line[c - 1];
+    r.line[c - 1] = r.line[c];
+    r.line[c] = tmp;
+    r.cur = c + 1;
+    r.knav = 0;
+    return 1;
+}
+
+// ---- history ---------------------------------------------------------------
+
+// slot_of(idx) — idx 1 = most recent. Returns the ring slot, or -1 when idx is
+// outside what is stored.
+fn slot_of(r as *Repl, idx as i64) as i64 {
+    if (idx < 1 || idx > r.hsize) { return 0 - 1; }
+    return (r.hhead - idx + HIST_N) % HIST_N;
+}
+
+fn hist_ptr(r as *Repl, slot as i64) as *u8 { return cast(*u8, &r.hbuf[slot * LINE_CAP]); }
+fn hist_len(r as *Repl, slot as i64) as i64 { return r.hlen[slot]; }
+fn hist_count(r as *Repl) as i64 { return r.hsize; }
+
+// push — store a finished command. A blank line is not history, and neither is
+// an immediate repeat: walking back through five identical entries is noise.
+fn hist_push(r as *Repl, src as *u8, len as i64) as void {
+    if (len <= 0) { return; }
+    let is i64 as prev = slot_of(r, 1);
+    if (prev >= 0 && r.hlen[prev] == len) {
+        let is i64 as k with mut = 0;
+        while (k < len && r.hbuf[prev * LINE_CAP + k] == src[k]) { k = k + 1; }
+        if (k == len) { return; }
+    }
+    let is i64 as n with mut = len;
+    if (n > LINE_CAP - 1) { n = LINE_CAP - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { r.hbuf[r.hhead * LINE_CAP + i] = src[i]; i = i + 1; }
+    r.hlen[r.hhead] = n;
+    r.hhead = (r.hhead + 1) % HIST_N;
+    if (r.hsize < HIST_N) { r.hsize = r.hsize + 1; }
+    r.npush = r.npush + 1;
+    return;
+}
+
+// recall — replace what is on screen with src[0..srclen]: rub out the typed
+// characters, then echo the recalled ones. The caller flushes.
+fn recall(r as *Repl, t as *term.Term, src as *u8, srclen as i64) as void {
+    let is i64 as prev_len = r.llen;
+    let is i64 as prev_cur = r.cur;
+    let is i64 as i with mut = 0;
+    while (i < srclen && i < LINE_CAP - 1) { r.line[i] = src[i]; i = i + 1; }
+    r.llen = i;
+    r.cur = i;                       // a recalled line is ready to be extended
+    redraw(r, t, prev_len, prev_cur);
+    return;
+}
+
+// nav_up / nav_down — walk the ring. Return 1 when the line changed (the caller
+// then flushes), 0 at either end.
+fn nav_up(r as *Repl, t as *term.Term) as i64 {
+    if (r.hnav >= r.hsize) { return 0; }
+    r.hnav = r.hnav + 1;
+    let is i64 as slot = slot_of(r, r.hnav);
+    if (slot < 0) { return 0; }
+    recall(r, t, hist_ptr(r, slot), r.hlen[slot]);
+    return 1;
+}
+
+fn nav_down(r as *Repl, t as *term.Term) as i64 {
+    if (r.hnav <= 0) { return 0; }
+    r.hnav = r.hnav - 1;
+    if (r.hnav == 0) { recall(r, t, cast(*u8, &r.line[0]), 0); return 1; }
+    let is i64 as slot = slot_of(r, r.hnav);
+    if (slot < 0) { return 0; }
+    recall(r, t, hist_ptr(r, slot), r.hlen[slot]);
+    return 1;
+}
+
+fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
+
+fn streq(a as *u8, alen as i64, lit as *u8) as i64 {
+    let is i64 as ll = slen(lit);
+    if (alen != ll) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < ll) { if (a[i] != lit[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+// ---- persistence -----------------------------------------------------------
+//
+// /var/history, format v1:
+//   "HIST"            4 bytes
+//   count             u32 LE — records that follow
+//   count x { len:u32 LE, bytes }   oldest first
+//
+// The magic exists so a truncated or foreign file is refused instead of
+// half-parsed. The disk keeps FILE_MAX commands; the ring in memory keeps
+// HIST_N of them, so the file outlives what Up/Down can reach.
+//
+// Writes go to <path>.tmp and are renamed over the target: a shell killed
+// mid-save leaves the previous history intact, never a half-written one.
+let is i64 as FILE_MAX with imut = 128;
+let is i64 as FILE_CAP with imut = 16384;
+
+let is [16384]u8 as fbuf with mut;
+
+fn _u32le(b as *u8, off as i64) as i64 {
+    return cast(i64, b[off]) | (cast(i64, b[off+1]) << 8)
+         | (cast(i64, b[off+2]) << 16) | (cast(i64, b[off+3]) << 24);
+}
+
+fn _put_u32le(b as *u8, off as i64, v as i64) as void {
+    b[off]     = cast(u8, v & 0xFF);
+    b[off + 1] = cast(u8, (v >> 8) & 0xFF);
+    b[off + 2] = cast(u8, (v >> 16) & 0xFF);
+    b[off + 3] = cast(u8, (v >> 24) & 0xFF);
+    return;
+}
+
+// _scan — walk the records in fbuf[0..n], writing each record's offset and
+// length into offs/lens. Returns how many were well-formed; a record that
+// runs past the end ends the scan rather than reading rubbish.
+fn _scan(n as i64, offs as *i64, lens as *i64, max as i64) as i64 {
+    if (n < 8) { return 0; }
+    let is *u8 as b = cast(*u8, &fbuf[0]);
+    if (b[0] != cast(u8, 72) || b[1] != cast(u8, 73)
+        || b[2] != cast(u8, 83) || b[3] != cast(u8, 84)) { return 0; }   // "HIST"
+    let is i64 as count = _u32le(b, 4);
+    let is i64 as p with mut = 8;
+    let is i64 as got with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < count && got < max) {
+        if (p + 4 > n) { i = count; }
+        else {
+            let is i64 as rlen = _u32le(b, p);
+            p = p + 4;
+            if (rlen < 0 || rlen > LINE_CAP - 1 || p + rlen > n) { i = count; }
+            else {
+                offs[got] = p; lens[got] = rlen; got = got + 1;
+                p = p + rlen;
+                i = i + 1;
+            }
+        }
+    }
+    return got;
+}
+
+// file_load — seed the ring from disk. Missing or malformed file = empty
+// history, never an error the caller has to handle: a first boot has no file.
+fn file_load(r as *Repl, path as *u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as n = sys.read(fd, cast(*u8, &fbuf[0]), FILE_CAP);
+    sys.close(fd);
+    if (n <= 0) { return 0; }
+    let is [128]i64 as offs;
+    let is [128]i64 as lens;
+    let is i64 as got = _scan(n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
+    // Only the newest HIST_N reach the ring — pushing all of them would just
+    // overwrite the same slots and cost the loop.
+    let is i64 as first with mut = got - HIST_N;
+    if (first < 0) { first = 0; }
+    let is i64 as i with mut = first;
+    while (i < got) {
+        hist_push(r, cast(*u8, &fbuf[offs[i]]), lens[i]);
+        i = i + 1;
+    }
+    r.npush_load = r.npush;
+    return got;
+}
+
+// file_save — rewrite the file as (what was already on disk) + (what this
+// session added since the last load/save), capped at FILE_MAX.
+//
+// Only the new pushes are appended, so a session that loaded 40 entries does
+// not write them back a second time. Several shells share one file: the last
+// writer wins the tail, which loses interleaving but never corrupts — the
+// rename is the whole transaction.
+fn file_save(r as *Repl, path as *u8) as i64 {
+    let is i64 as fresh with mut = r.npush - r.npush_load;
+    if (fresh <= 0) { return 0; }
+    if (fresh > HIST_N) { fresh = HIST_N; }                 // older ones fell out of the ring
+
+    // Read the current file first: the new records are appended to it.
+    let is i64 as old_n with mut = 0;
+    let is i64 as fd with mut = sys.open_read(path);
+    if (fd >= 0) {
+        old_n = sys.read(fd, cast(*u8, &fbuf[0]), FILE_CAP);
+        sys.close(fd);
+        if (old_n < 0) { old_n = 0; }
+    }
+    let is [128]i64 as offs;
+    let is [128]i64 as lens;
+    let is i64 as old_got = _scan(old_n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
+
+    // Drop the oldest so old + new fits the cap.
+    let is i64 as skip with mut = old_got + fresh - FILE_MAX;
+    if (skip < 0) { skip = 0; }
+    let is i64 as keep = old_got - skip;
+
+    let is [128]u8 as tmp;
+    let is i64 as pl = slen(path);
+    if (pl > 120) { return 0 - 1; }
+    let is i64 as k with mut = 0;
+    while (k < pl) { tmp[k] = path[k]; k = k + 1; }
+    tmp[pl] = cast(u8, 46); tmp[pl+1] = cast(u8, 116);
+    tmp[pl+2] = cast(u8, 109); tmp[pl+3] = cast(u8, 112);    // ".tmp"
+    tmp[pl+4] = cast(u8, 0);
+
+    let is i64 as out = sys.open_write(cast(*u8, &tmp[0]));
+    if (out < 0) { return 0 - 1; }
+    let is [8]u8 as hdr;
+    hdr[0] = cast(u8, 72); hdr[1] = cast(u8, 73); hdr[2] = cast(u8, 83); hdr[3] = cast(u8, 84);
+    _put_u32le(cast(*u8, &hdr[0]), 4, keep + fresh);
+    if (sys.write(out, cast(*u8, &hdr[0]), 8) != 8) { sys.close(out); return 0 - 1; }
+
+    let is [4]u8 as lb;
+    let is i64 as i with mut = skip;
+    while (i < old_got) {
+        _put_u32le(cast(*u8, &lb[0]), 0, lens[i]);
+        sys.write(out, cast(*u8, &lb[0]), 4);
+        sys.write(out, cast(*u8, &fbuf[offs[i]]), lens[i]);
+        i = i + 1;
+    }
+    // The fresh ones, oldest first: ring index `fresh` back to 1.
+    let is i64 as j with mut = fresh;
+    while (j >= 1) {
+        let is i64 as slot = slot_of(r, j);
+        if (slot >= 0) {
+            _put_u32le(cast(*u8, &lb[0]), 0, r.hlen[slot]);
+            sys.write(out, cast(*u8, &lb[0]), 4);
+            sys.write(out, hist_ptr(r, slot), r.hlen[slot]);
+        }
+        j = j - 1;
+    }
+    sys.close(out);
+    if (cast(i64, sys.rename(cast(*u8, &tmp[0]), path)) != 0) {
+        sys.unlink(cast(*u8, &tmp[0]));                      // no half-file left behind
+        return 0 - 1;
+    }
+    r.npush_load = r.npush;
+    return keep + fresh;
+}
+
+// ---- tokenising ------------------------------------------------------------
+
+// parse — split the line on runs of spaces, in place. argv_ptr[i] is a byte
+// pointer INTO the line (no copy), argv_len[i] its length. Returns argc.
+fn parse(line as *u8, len as i64, argv_ptr as *i64, argv_len as *i64) as i64 {
+    let is i64 as argc with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len && argc < MAX_ARGS) {
+        while (i < len && line[i] == 32) { i = i + 1; }
+        if (i >= len) { break; }
+        let is i64 as start = i;
+        while (i < len && line[i] != 32) { i = i + 1; }
+        argv_ptr[argc] = cast(i64, line) + start;
+        argv_len[argc] = i - start;
+        argc = argc + 1;
+    }
+    return argc;
+}
+
+// ---- completion ------------------------------------------------------------
+
+fn _cand_match(cand as *u8, cl as i64, line as *u8, ts as i64, plen as i64) as i64 {
+    if (cl < plen) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < plen) { if (cand[k] != line[ts + k]) { return 0; } k = k + 1; }
+    return 1;
+}
+
+// Fold a match into the longest-common-prefix accumulator.
+fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
+    nmatch_ptr[0] = nmatch_ptr[0] + 1;
+    if (acclen_ptr[0] < 0) {
+        let is i64 as i with mut = 0;
+        while (i < cl && i < LINE_CAP - 1) { acc[i] = cand[i]; i = i + 1; }
+        acclen_ptr[0] = i;
+    } else {
+        let is i64 as i with mut = 0;
+        let is i64 as al = acclen_ptr[0];
+        while (i < al && i < cl && acc[i] == cand[i]) { i = i + 1; }
+        acclen_ptr[0] = i;
+    }
+    return;
+}
+
+// complete — extend the last token to the longest prefix every candidate
+// shares. Candidates are the caller's builtins (pairs of {ptr,len} in `builtins`,
+// only when the token IS the command) plus the directory listing: programs with
+// the .cse suffix stripped for a command, every name for an argument.
+//
+// The builtin list is the caller's because the two shells do not have the same
+// one — the windowed shell can `exit`, the fullscreen one cannot.
+fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as void {
+    let is *u8 as line = cast(*u8, &r.line[0]);
+    // Completion acts on the token the CURSOR is in, not on the end of the
+    // line: with a movable cursor those are no longer the same place.
+    let is i64 as llen = r.cur;
+    let is i64 as ts with mut = llen;
+    while (ts > 0 && line[ts - 1] != 32) { ts = ts - 1; }
+    let is i64 as plen = llen - ts;
+    let is i64 as is_cmd with mut = 0;
+    if (ts == 0) { is_cmd = 1; }
+
+    let is [256]u8 as acc;
+    let is i64 as acclen with mut = 0 - 1;
+    let is i64 as nmatch with mut = 0;
+
+    if (is_cmd == 1) {
+        let is i64 as bi with mut = 0;
+        while (bi < nbuiltin) {
+            let is *u8 as bp = cast(*u8, builtins[bi * 2]);
+            let is i64 as bl = builtins[bi * 2 + 1];
+            if (_cand_match(bp, bl, line, ts, plen) == 1) {
+                _acc_update(bp, bl, cast(*u8, &acc[0]), &acclen, &nmatch);
+            }
+            bi = bi + 1;
+        }
+    }
+
+    let is i64 as fd = sys.open_read(cast(*u8, "/"));
+    if (fd >= 0) {
+        let is [320]u8 as de;
+        while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+            let is *u8 as nm = cast(*u8, &de[0]);
+            let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
+            let is i64 as nl = nlp[0];
+            let is i64 as cl with mut = nl;
+            let is i64 as ok with mut = 1;
+            if (is_cmd == 1) {
+                if (nl >= 4 && nm[nl-4] == 46 && nm[nl-3] == 99 && nm[nl-2] == 115 && nm[nl-1] == 101) { cl = nl - 4; }
+                else { ok = 0; }
+            }
+            if (ok == 1 && _cand_match(nm, cl, line, ts, plen) == 1) {
+                _acc_update(nm, cl, cast(*u8, &acc[0]), &acclen, &nmatch);
+            }
+        }
+        sys.close(fd);
+    }
+    if (nmatch == 0) { return; }
+
+    let is i64 as prev_len = r.llen;
+    let is i64 as prev_cur = r.cur;
+    let is i64 as i with mut = plen;
+    while (i < acclen) {
+        if (line_push(r, cast(i64, acc[i])) == 0) { i = acclen; }
+        else { i = i + 1; }
+    }
+    if (nmatch == 1) { line_push(r, 32); }               // sole match -> trailing space
+    redraw(r, t, prev_len, prev_cur);
+    return;
+}

@@ -1,0 +1,143 @@
+// kabi — ring-3 self-test for the syscalls added in phase A. The kernel has its
+// own boot smokes for these, but those run in ring 0 against the internal
+// functions: they prove the mechanism, not that a userspace program can reach
+// it through the stdlib binding. This closes that gap from the other side.
+//
+// Covers SYS_THREAD_SPAWN/EXIT, SYS_EVENT_SUBSCRIBE, SYS_QUERY_DEVS and
+// SYS_DEV_INFO. Runs from the shell like any other program.
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as fails with mut = 0;
+
+// Everything goes to the terminal AND to the serial line: this test is most
+// useful on a headless boot, where the framebuffer nobody is looking at is the
+// only other place the result would land.
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+// The worker writes here and exits; main spins until it changes. One writer,
+// one reader, one word — and the write happens before thread_exit, which is a
+// syscall, so the store is visible by the time the thread is gone.
+let is i64 as worker_mark with mut = 0;
+
+fn check(name as *u8, ok as i64, got as i64, want as i64) as void {
+    if (ok == 1) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// Thread entry: `arg` arrives in rdi. Ending with thread_exit must NOT take the
+// process down — main is still running and has to observe the mark.
+fn worker(arg as i64) as void {
+    worker_mark = arg + 1;
+    sys.thread_exit(0);
+    return;
+}
+
+fn test_thread() as void {
+    let is i64 as STACK = 65536;
+    let is i64 as sp = sys.mmap(cast(i64, 0), STACK, sys.PROT_READ | sys.PROT_WRITE);
+    if (sp < 0) { check(cast(*u8, "thread stack"), 0, sp, 0); return; }
+    // The stack grows down, so the thread starts at the TOP of the mapping.
+    // 16-byte aligned: the ABI expects it and a misaligned frame faults on the
+    // first aligned store.
+    let is i64 as top = (sp + STACK) & (0 - 16);
+    let is i64 as tid = sys.thread_spawn(cast(i64, fn_ptr(worker)), 41, top);
+    check(cast(*u8, "thread_spawn tid>0"), tid > 0, tid, 1);
+    if (tid <= 0) { sys.munmap(sp, STACK); return; }
+
+    // Bounded wait: a thread that never runs must fail the test, not hang it.
+    let is i64 as spins with mut = 0;
+    while (worker_mark == 0 && spins < 2000) {
+        sys.sleep_ns(1000000);
+        spins = spins + 1;
+    }
+    check(cast(*u8, "worker ran (arg+1)"), worker_mark == 42, worker_mark, 42);
+    // The process is still alive to report that — which is itself the proof
+    // that thread_exit ended one thread and not the whole process.
+    sys.munmap(sp, STACK);
+    return;
+}
+
+fn test_events() as void {
+    let is i64 as me = sys.getpid();
+    let is i64 as fd = sys.event_subscribe(me, 0);
+    check(cast(*u8, "event_subscribe fd>=0"), fd >= 0, fd, 0);
+    if (fd < 0) { return; }
+    // Nothing has exited yet: a read must report "nothing queued", which is 0
+    // bytes and NOT end-of-stream. Anything negative would be an error.
+    let is [3]i64 as rec;
+    let is i64 as n = sys.read(fd, cast(*u8, &rec[0]), 24);
+    check(cast(*u8, "empty read == 0"), n == 0, n, 0);
+    // Subscribing to a pid that is not ours must be refused: the spawn tree is
+    // the authority, so this is the whole access rule for the object.
+    let is i64 as bad = sys.event_subscribe(me + 4242, 0);
+    check(cast(*u8, "foreign pid refused"), bad < 0, bad, 0 - 1);
+    sys.close(fd);
+    return;
+}
+
+fn test_devs() as void {
+    let is [32]i64 as devs;
+    let is i64 as total = sys.query_devs(cast(*i64, &devs[0]), 16);
+    check(cast(*u8, "query_devs total>0"), total > 0, total, 1);
+    if (total <= 0) { return; }
+    let is i64 as n with mut = total;
+    if (n > 16) { n = 16; }
+
+    // Every enumerated pair must resolve to an identity that echoes it back.
+    let is i64 as i with mut = 0;
+    let is i64 as agree with mut = 1;
+    while (i < n) {
+        let is [8]i64 as inf;
+        if (sys.dev_info(devs[i*2], devs[i*2+1], cast(*i64, &inf[0])) != 0) { agree = 0; }
+        else if (inf[0] != devs[i*2] || inf[1] != devs[i*2+1]) { agree = 0; }
+        i = i + 1;
+    }
+    check(cast(*u8, "dev_info echoes pair"), agree == 1, agree, 1);
+
+    // dev_count must agree with what enumeration reported for that class.
+    let is i64 as cls = devs[0];
+    let is i64 as counted with mut = 0;
+    i = 0;
+    while (i < n) { if (devs[i*2] == cls) { counted = counted + 1; } i = i + 1; }
+    let is i64 as dc = sys.dev_count(cls);
+    check(cast(*u8, "dev_count == enum"), dc == counted, dc, counted);
+
+    // An index past the end is E_NOENT, never a silent alias of instance 0.
+    let is [8]i64 as bad;
+    let is i64 as rc = sys.dev_info(cls, 999, cast(*i64, &bad[0]));
+    check(cast(*u8, "index 999 refused"), rc < 0, rc, 0 - 1);
+    return;
+}
+
+fn main() as i32 {
+    say("kabi: phase-A syscalls from ring 3\n");
+    test_thread();
+    test_events();
+    test_devs();
+    if (fails == 0) { say("kabi: PASS\n"); return cast(i32, 0); }
+    say("kabi: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

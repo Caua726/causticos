@@ -1,0 +1,300 @@
+// shbuiltin.cst — the builtins both shells share, as a table rather than a
+// chain of string compares.
+//
+// A builtin is a command the shell must run ITSELF, because running it in a
+// child would change the child and not the shell: cd moves the shell, export
+// writes the shell's table. Everything that could be a program is one.
+//
+// The table is data — name, handler, arity, one-line summary, usage — so `help`
+// and completion read the same rows the dispatcher does, and a builtin cannot
+// exist without being documented.
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../../../../Caustic/std/causticos/term.cst" as term;
+use "../shexec/shexec.cst" as sx;
+use "../repl/repl.cst" as repl;
+
+let is i64 as MAX_B with imut = 16;
+
+struct Builtin {
+    name as i64;        // *u8
+    nlen as i64;
+    handler as i64;     // fn(*term.Term, *i64, *i64, i64) as i64
+    min_args as i64;    // not counting argv[0]
+    max_args as i64;    // -1 = unlimited
+    summary as i64;     // *u8, one line for `help`
+    usage as i64;       // *u8, the argument shape
+}
+
+let is [16]Builtin as tab with mut;
+let is i64 as ntab with mut = 0;
+
+// The Repl the `history` builtin reads. Set once by the shell that owns it.
+let is i64 as repl_ref with mut = 0;
+fn bind_repl(r as *repl.Repl) as void { repl_ref = cast(i64, r); return; }
+
+fn _puts(t as *term.Term, s as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    term.puts(t, s, n);
+    return;
+}
+
+fn _putn(t as *term.Term, v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { term.putc(t, 45); x = 0 - x; }
+    if (x == 0) { term.putc(t, 48); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    term.puts(t, cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn _pad(t as *term.Term, used as i64, width as i64) as void {
+    let is i64 as i with mut = used;
+    while (i < width) { term.putc(t, 32); i = i + 1; }
+    return;
+}
+
+// ---- handlers --------------------------------------------------------------
+// Every handler takes (t, argv_ptr, argv_len, argc) and returns an exit status:
+// 0 for success, non-zero for the shell to publish as $?.
+
+fn b_cd(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (argc < 2) { return cast(i64, sx.cd(cast(*u8, "/"), 1)); }
+    let is i64 as rc = sx.cd(cast(*u8, ap[1]), al[1]);
+    if (rc == 0 - 1) { _puts(t, "cd: no such directory\n"); return 1; }
+    if (rc == 0 - 2) { _puts(t, "cd: not a directory\n"); return 1; }
+    return 0;
+}
+
+fn b_pwd(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    term.puts(t, sx.cwd_ptr(), sx.cwd_size());
+    term.putc(t, 0x0A);
+    return 0;
+}
+
+// export NAME=VALUE, or NAME VALUE. Without '=' and with one argument it prints
+// that variable, which is how you check one without echo.
+fn b_export(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (argc < 2) { return 1; }
+    let is *u8 as a = cast(*u8, ap[1]);
+    let is i64 as n = al[1];
+    let is i64 as eq with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) { if (a[i] == cast(u8, 61) && eq < 0) { eq = i; } i = i + 1; }
+    if (eq > 0) {
+        sx.env_set(a, eq, cast(*u8, cast(i64, a) + eq + 1), n - eq - 1);
+        return 0;
+    }
+    if (argc >= 3) {
+        sx.env_set(a, n, cast(*u8, ap[2]), al[2]);
+        return 0;
+    }
+    let is i64 as slot = sx.env_find(a, n);
+    if (slot < 0) { _puts(t, "export: not set\n"); return 1; }
+    term.puts(t, sx.env_val(slot), sx.env_val_len(slot));
+    term.putc(t, 0x0A);
+    return 0;
+}
+
+// set with no arguments lists the table; that IS the whole of `set` here, since
+// there are no shell options to toggle.
+fn b_set(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (argc >= 2) { return b_export(t, ap, al, argc); }
+    let is i64 as i with mut = 0;
+    while (i < sx.env_count()) {
+        term.puts(t, sx.env_name(i), sx.env_name_len(i));
+        term.putc(t, 61);
+        term.puts(t, sx.env_val(i), sx.env_val_len(i));
+        term.putc(t, 0x0A);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn b_unset(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (argc < 2) { return 1; }
+    sx.env_unset(cast(*u8, ap[1]), al[1]);
+    return 0;
+}
+
+// type NAME — is it a builtin, a program on disk, or nothing?
+fn b_type(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (argc < 2) { return 1; }
+    let is *u8 as nm = cast(*u8, ap[1]);
+    let is i64 as nl = al[1];
+    let is i64 as i with mut = 0;
+    while (i < ntab) {
+        if (repl.streq(nm, nl, cast(*u8, tab[i].name)) == 1) {
+            term.puts(t, nm, nl);
+            _puts(t, " is a shell builtin\n");
+            return 0;
+        }
+        i = i + 1;
+    }
+    let is [128]u8 as path;
+    if (nl > 110) { return 1; }
+    path[0] = cast(u8, 47);
+    let is i64 as k with mut = 0;
+    while (k < nl) { path[1 + k] = nm[k]; k = k + 1; }
+    let is *u8 as ext = ".cse";
+    let is i64 as j with mut = 0;
+    while (j < 4) { path[1 + nl + j] = ext[j]; j = j + 1; }
+    path[1 + nl + 4] = cast(u8, 0);
+    if (sys.exists(cast(*u8, &path[0])) == 1) {
+        term.puts(t, nm, nl);
+        _puts(t, " is ");
+        _puts(t, cast(*u8, &path[0]));
+        term.putc(t, 0x0A);
+        return 0;
+    }
+    term.puts(t, nm, nl);
+    _puts(t, ": not found\n");
+    return 1;
+}
+
+fn b_history(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (repl_ref == 0) { return 1; }
+    let is *repl.Repl as r = cast(*repl.Repl, repl_ref);
+    let is i64 as n = repl.hist_count(r);
+    let is i64 as i with mut = n;
+    while (i >= 1) {
+        let is i64 as slot = repl.slot_of(r, i);
+        if (slot >= 0) {
+            _putn(t, n - i + 1);
+            term.putc(t, 32);
+            term.puts(t, repl.hist_ptr(r, slot), repl.hist_len(r, slot));
+            term.putc(t, 0x0A);
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// help with no topic lists every builtin; help <topic> prints one entry's
+// usage. Both read the same table, so a builtin cannot drift out of the docs.
+fn b_help(t as *term.Term, ap as *i64, al as *i64, argc as i64) as i64 {
+    if (argc >= 2) {
+        let is i64 as i with mut = 0;
+        while (i < ntab) {
+            if (repl.streq(cast(*u8, ap[1]), al[1], cast(*u8, tab[i].name)) == 1) {
+                _puts(t, "usage: ");
+                _puts(t, cast(*u8, tab[i].name));
+                term.putc(t, 32);
+                _puts(t, cast(*u8, tab[i].usage));
+                term.putc(t, 0x0A);
+                _puts(t, "  ");
+                _puts(t, cast(*u8, tab[i].summary));
+                term.putc(t, 0x0A);
+                return 0;
+            }
+            i = i + 1;
+        }
+        // Not a builtin: a program documents itself, so ask it.
+        _puts(t, "no builtin by that name; try `");
+        term.puts(t, cast(*u8, ap[1]), al[1]);
+        _puts(t, " --help`\n");
+        return 1;
+    }
+    _puts(t, "builtins\n");
+    let is i64 as i with mut = 0;
+    while (i < ntab) {
+        _puts(t, "  ");
+        _puts(t, cast(*u8, tab[i].name));
+        _pad(t, tab[i].nlen + 2, 12);
+        _puts(t, cast(*u8, tab[i].summary));
+        term.putc(t, 0x0A);
+        i = i + 1;
+    }
+    _puts(t, "syntax\n");
+    _puts(t, "  a | b       pipe a's output into b\n");
+    _puts(t, "  > >> <      redirect stdout, append, stdin\n");
+    _puts(t, "  2>&1        send stderr where stdout goes\n");
+    _puts(t, "  cmd &       run in the background\n");
+    _puts(t, "  * ? [a-z]   match file names\n");
+    _puts(t, "  $VAR $? $$  expand a variable, last status, shell pid\n");
+    _puts(t, "  $(cmd)      substitute a command's output\n");
+    _puts(t, "  if/while/for ... begin ... end\n");
+    return 0;
+}
+
+// ---- table -----------------------------------------------------------------
+
+fn _add(name as *u8, nlen as i64, h as i64, mn as i64, mx as i64,
+        summary as *u8, usage as *u8) as void {
+    if (ntab >= MAX_B) { return; }
+    tab[ntab].name = cast(i64, name);
+    tab[ntab].nlen = nlen;
+    tab[ntab].handler = h;
+    tab[ntab].min_args = mn;
+    tab[ntab].max_args = mx;
+    tab[ntab].summary = cast(i64, summary);
+    tab[ntab].usage = cast(i64, usage);
+    ntab = ntab + 1;
+    return;
+}
+
+fn init() as void {
+    ntab = 0;
+    sx.cwd_init();
+    _add(cast(*u8, "cd"), 2, cast(i64, fn_ptr(b_cd)), 0, 1,
+         cast(*u8, "change the shell's directory"), cast(*u8, "[dir]"));
+    _add(cast(*u8, "pwd"), 3, cast(i64, fn_ptr(b_pwd)), 0, 0,
+         cast(*u8, "print the shell's directory"), cast(*u8, ""));
+    _add(cast(*u8, "export"), 6, cast(i64, fn_ptr(b_export)), 1, 2,
+         cast(*u8, "set a variable for expansion"), cast(*u8, "NAME=VALUE | NAME VALUE | NAME"));
+    _add(cast(*u8, "set"), 3, cast(i64, fn_ptr(b_set)), 0, 2,
+         cast(*u8, "list or set variables"), cast(*u8, "[NAME=VALUE]"));
+    _add(cast(*u8, "unset"), 5, cast(i64, fn_ptr(b_unset)), 1, 1,
+         cast(*u8, "forget a variable"), cast(*u8, "NAME"));
+    _add(cast(*u8, "type"), 4, cast(i64, fn_ptr(b_type)), 1, 1,
+         cast(*u8, "say what a name resolves to"), cast(*u8, "NAME"));
+    _add(cast(*u8, "history"), 7, cast(i64, fn_ptr(b_history)), 0, 0,
+         cast(*u8, "list the remembered command lines"), cast(*u8, ""));
+    _add(cast(*u8, "help"), 4, cast(i64, fn_ptr(b_help)), 0, 1,
+         cast(*u8, "list builtins, or explain one"), cast(*u8, "[builtin]"));
+    return;
+}
+
+fn count() as i64 { return ntab; }
+fn name_at(i as i64) as *u8 { return cast(*u8, tab[i].name); }
+fn nlen_at(i as i64) as i64 { return tab[i].nlen; }
+
+// dispatch — run argv[0] if it names a builtin. Returns 1 when it handled the
+// line (status in *out_status), 0 when the caller should look for a program.
+fn dispatch(t as *term.Term, ap as *i64, al as *i64, argc as i64, out_status as *i64) as i64 {
+    if (argc <= 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < ntab) {
+        if (repl.streq(cast(*u8, ap[0]), al[0], cast(*u8, tab[i].name)) == 1) {
+            // Arity is checked here, once, rather than in every handler: a
+            // wrong call gets the usage line instead of a silent misbehaviour.
+            let is i64 as n = argc - 1;
+            if (n < tab[i].min_args || (tab[i].max_args >= 0 && n > tab[i].max_args)) {
+                _puts(t, "usage: ");
+                _puts(t, cast(*u8, tab[i].name));
+                term.putc(t, 32);
+                _puts(t, cast(*u8, tab[i].usage));
+                term.putc(t, 0x0A);
+                out_status[0] = 2;
+                return 1;
+            }
+            // '--help' on a builtin is the same answer `help <name>` gives.
+            if (argc >= 2 && repl.streq(cast(*u8, ap[1]), al[1], "--help") == 1) {
+                let is [4]i64 as hp;
+                let is [4]i64 as hl;
+                hp[0] = cast(i64, cast(*u8, "help")); hl[0] = 4;
+                hp[1] = ap[0];                        hl[1] = al[0];
+                out_status[0] = b_help(t, cast(*i64, &hp[0]), cast(*i64, &hl[0]), 2);
+                return 1;
+            }
+            let is fn(*term.Term, *i64, *i64, i64) as i64 as h =
+                cast(fn(*term.Term, *i64, *i64, i64) as i64, tab[i].handler);
+            out_status[0] = call(h, t, ap, al, argc);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}

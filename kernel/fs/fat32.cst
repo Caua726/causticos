@@ -1757,12 +1757,33 @@ fn path_rename(v as *Fat32Volume,
     }
     let is *u8 as d_leaf = cast(*u8, cast(i64, dst) + d_leaf_off);
 
-    let is i64 as dummy_c with mut = 0;
-    let is i64 as dummy_s with mut = 0;
-    let is i32 as dummy_a with mut = 0;
+    // An existing destination is REPLACED, not refused. Rename-over-the-target
+    // is how a file is updated without a window where it is half-written:
+    // write a temp, rename it over the real name, and a reader either sees the
+    // whole old file or the whole new one. Refusing here made that impossible
+    // and every config/state save in userspace silently kept its first version.
+    //
+    // Replacing a directory is still refused: emptiness rules and '..' fixups
+    // make it a different operation, and nothing needs it.
+    let is i64 as old_c with mut = 0;
+    let is i64 as old_s with mut = 0;
+    let is i32 as old_a with mut = 0;
+    let is i64 as had_dst with mut = 0;
     if (dir_find(v, dp_cluster, d_leaf, d_leaf_len,
-                 &dummy_c, &dummy_s, &dummy_a) == 0) {
-        return cast(i32, 0 - 8);   // destination exists
+                 &old_c, &old_s, &old_a) == 0) {
+        if ((cast(i32, old_a) & ATTR_DIRECTORY) != 0) { return cast(i32, 0 - 8); }
+        if ((cast(i32, src_attr) & ATTR_DIRECTORY) != 0) { return cast(i32, 0 - 8); }
+        // Same name in the same directory: nothing to do, and removing the
+        // entry would destroy the file we were asked to keep.
+        if (dp_cluster == sp_cluster && old_c == src_cluster) { return 0; }
+        had_dst = 1;
+        let is i64 as junk_dc with mut = 0;
+        let is i64 as junk_ds with mut = 0;
+        let is i32 as junk_da with mut = 0;
+        if (dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len,
+                             &junk_dc, &junk_ds, &junk_da) != 0) {
+            return cast(i32, 0 - 8);
+        }
     }
 
     // Add new entry first (keeps data reachable even if the crash
@@ -1788,6 +1809,11 @@ fn path_rename(v as *Fat32Volume,
                          &junk_c, &junk_s, &junk_a);
         return cast(i32, 0 - 10);
     }
+
+    // The replaced file's clusters are nobody's now: its only directory entry
+    // is gone. Freed AFTER the rename committed, so a failure above leaves the
+    // old data intact rather than reachable-by-nothing.
+    if (had_dst == 1 && old_c >= 2) { chain_free(v, old_c); }
 
     // If this was a directory rename across parents, patch its '..'
     // to point at the new parent. Same-parent renames leave '..'
@@ -2971,6 +2997,43 @@ fn self_test_dirs(v as *Fat32Volume) as void {
         return;
     }
     serial.println("fat32.test: rename cross-parent OK", 34);
+
+    // rename OVER an existing file — the atomic-update primitive. Userspace
+    // writes <name>.tmp and renames it onto <name>; if that is refused, every
+    // save silently keeps the first version it ever wrote.
+    if (file_create(v, cast(*u8, "/docs/target.txt"), 16,
+                    cast(*u8, "OLD"), 3) != 0) {
+        serial.println("fat32.test: replace fixture create FAIL", 39);
+        return;
+    }
+    if (file_create(v, cast(*u8, "/docs/incoming.txt"), 18,
+                    cast(*u8, "NEWDATA"), 7) != 0) {
+        serial.println("fat32.test: replace fixture2 create FAIL", 40);
+        return;
+    }
+    if (path_rename(v,
+                    cast(*u8, "/docs/incoming.txt"), 18,
+                    cast(*u8, "/docs/target.txt"), 16) != 0) {
+        serial.println("fat32.test: rename over existing FAIL", 37);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/docs/incoming.txt"), 18, &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: source survived a replace", 37);
+        return;
+    }
+    if (path_lookup(v, cast(*u8, "/docs/target.txt"), 16, &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: target gone after replace", 37);
+        return;
+    }
+    if (file_read(v, cc, ss, rb, 4096) != 7) {
+        serial.println("fat32.test: replaced file has the old length", 44);
+        return;
+    }
+    if (rb[0] != cast(u8, 78) || rb[3] != cast(u8, 68)) {      // "NEW...D"
+        serial.println("fat32.test: replaced file has the old bytes", 43);
+        return;
+    }
+    serial.println("fat32.test: rename over existing OK", 35);
 
     // Now /data is empty — rmdir should succeed.
     if (dir_remove(v, cast(*u8, "/data"), 5) != 0) {

@@ -1,139 +1,155 @@
-// wterm/wterm_repl.cst — REPL primitives: parse, history (recall), run_line,
-// tab-completion (with longest-common-prefix acc). Always pointers in/out,
-// state in wterm_state.cst.
+// wterm/wterm_repl.cst — what the windowed shell does with a finished line.
+// The line editor (buffer, history, recall, completion) is lib/repl and the job
+// table is lib/jobs, both shared with the fullscreen shell; this file is only
+// the wterm's policy: its builtin set and how it renders them.
 use "wterm_state.cst" as s;
 use "wterm_child.cst" as cli;
 use "wterm_grid.cst" as g;
+use "../lib/repl/repl.cst" as repl;
+use "../lib/jobs/jobs.cst" as jobs;
+use "../lib/shexec/shexec.cst" as sx;
+use "../lib/shbuiltin/shbuiltin.cst" as bi;
+use "../lib/shscript/shscript.cst" as ss;
+use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../../../Caustic/std/causticos/term.cst" as term;
 
-fn parse(line as *u8, len as i64, argv_ptr as *i64, argv_len as *i64) as i64 {
-    let is i64 as argc with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < len && argc < s.MAX_ARGS) {
-        while (i < len && line[i] == 32) { i = i + 1; }
-        if (i >= len) { break; }
-        let is i64 as start = i;
-        while (i < len && line[i] != 32) { i = i + 1; }
-        argv_ptr[argc] = cast(i64, line) + start;
-        argv_len[argc] = i - start;
-        argc = argc + 1;
+// The wterm's completable builtins. `exit` is here and not in the fullscreen
+// shell: closing the window is only meaningful when there is a window.
+// Completion offers the shared table plus this terminal's own commands: one
+// list, built from the same rows the dispatcher reads.
+fn builtins(out as *i64) as i64 {
+    let is i64 as n with mut = 0;
+    while (n < bi.count() && n < 12) {
+        out[n * 2] = cast(i64, bi.name_at(n));
+        out[n * 2 + 1] = bi.nlen_at(n);
+        n = n + 1;
     }
-    return argc;
+    out[n*2] = cast(i64, cast(*u8, "clear")); out[n*2+1] = 5; n = n + 1;
+    out[n*2] = cast(i64, cast(*u8, "reset")); out[n*2+1] = 5; n = n + 1;
+    out[n*2] = cast(i64, cast(*u8, "exit"));  out[n*2+1] = 4; n = n + 1;
+    out[n*2] = cast(i64, cast(*u8, "jobs"));  out[n*2+1] = 4; n = n + 1;
+    out[n*2] = cast(i64, cast(*u8, "fg"));    out[n*2+1] = 2; n = n + 1;
+    out[n*2] = cast(i64, cast(*u8, "kill"));  out[n*2+1] = 4; n = n + 1;
+    return n;
 }
 
-fn streq(a as *u8, alen as i64, lit as *u8) as i64 {
-    let is i64 as ll = g.slen(lit);
-    if (alen != ll) { return 0; }
-    let is i64 as i with mut = 0;
-    while (i < ll) { if (a[i] != lit[i]) { return 0; } i = i + 1; }
-    return 1;
+fn print_num(t as *term.Term, v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { term.putc(t, 45); x = 0 - x; }
+    if (x == 0) { term.putc(t, 48); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    term.puts(t, cast(*u8, &b[i]), 24 - i);
+    return;
 }
 
+fn print_job(t as *term.Term, slot as i64) as void {
+    term.putc(t, 91); print_num(t, slot + 1); term.puts(t, "] ", 2);
+    print_num(t, jobs.last_pid(slot));
+    term.putc(t, 32);
+    if (jobs.get(slot).status == jobs.JOB_DONE) {
+        g._col(t, s.C_DIM); g.puts(t, "Done   "); g._col(t, s.C_TEXT);
+    } else { g.puts(t, "Running "); }
+    term.puts(t, jobs.cmd_ptr(slot), jobs.cmd_len(slot));
+    g.puts(t, "\n");
+    return;
+}
+
+// run_line — returns 1 when the window should close, 0 otherwise.
 fn run_line(t as *term.Term, line as *u8, len as i64) as i64 {
-    let is [16]i64 as argv_ptr;
-    let is [16]i64 as argv_len;
-    let is i64 as argc = parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
-    if (argc == 0) { return 0; }
-    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
-    let is i64 as cl = argv_len[0];
-    if (streq(cmd, cl, "clear") == 1 || streq(cmd, cl, "reset") == 1) { term.clear(t); return 0; }
-    if (streq(cmd, cl, "exit") == 1) { return 1; }
-    if (streq(cmd, cl, "help") == 1) {
-        g._col(t, s.C_DIM); g.puts(t, "built-in\n"); g._col(t, s.C_TEXT);
-        g.puts(t, "  help              show this help\n");
-        g.puts(t, "  clear / reset     clear the screen\n");
-        g.puts(t, "  exit              close this window\n");
-        g._col(t, s.C_DIM); g.puts(t, "programs  (/<name>.cse)\n"); g._col(t, s.C_TEXT);
-        g.puts(t, "  echo <args...>    print the arguments\n");
-        g.puts(t, "  cat  <file>       print a file\n");
-        g.puts(t, "  ls   [path]       list a directory\n");
-        g.puts(t, "  uptime            time since boot\n");
-        g.puts(t, "  sysinfo           kernel version + limits\n");
-        g.puts(t, "  newterm           open another terminal window\n");
+    // A construct being typed, or a line that opens one, belongs to the script
+    // engine: control flow needs the WHOLE thing before any of it can run.
+    if (ss.pending() == 1 || ss.is_block_start(line, len) == 1) {
+        ss.feed(t, line, len);
         return 0;
     }
-    cli.run_program(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc);
-    return 0;
-}
+    let is [16]i64 as argv_ptr;
+    let is [16]i64 as argv_len;
+    let is i64 as argc with mut = repl.parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
+    if (argc == 0) { return 0; }
 
-// recall — populate the live line buffer from a stored history slot and
-// redraw every character; the caller is responsible for resetting the cursor.
-fn recall(t as *term.Term, line as *u8, llen_ptr as *i64, src as *u8, srclen as i64) as void {
-    let is i64 as j with mut = 0;
-    while (j < llen_ptr[0]) { term.putc(t, 0x08); j = j + 1; }
-    let is i64 as i with mut = 0;
-    while (i < srclen && i < s.LINE_CAP - 1) { line[i] = src[i]; term.putc(t, cast(i64, src[i])); i = i + 1; }
-    llen_ptr[0] = i;
-    g.show(t);
-    return;
-}
-
-// ---- Tab completion ----
-fn _cand_match(cand as *u8, cl as i64, line as *u8, ts as i64, plen as i64) as i64 {
-    if (cl < plen) { return 0; }
-    let is i64 as k with mut = 0;
-    while (k < plen) { if (cand[k] != line[ts + k]) { return 0; } k = k + 1; }
-    return 1;
-}
-
-fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
-    nmatch_ptr[0] = nmatch_ptr[0] + 1;
-    if (acclen_ptr[0] < 0) {
-        let is i64 as i with mut = 0;
-        while (i < cl && i < 255) { acc[i] = cand[i]; i = i + 1; }
-        acclen_ptr[0] = i;
-    } else {
-        let is i64 as i with mut = 0;
-        let is i64 as al = acclen_ptr[0];
-        while (i < al && i < cl && acc[i] == cand[i]) { i = i + 1; }
-        acclen_ptr[0] = i;
+    // A trailing '&' is not an argument: it says "do not wait for this".
+    let is i64 as bg with mut = 0;
+    if (repl.streq(cast(*u8, argv_ptr[argc - 1]), argv_len[argc - 1], "&") == 1) {
+        bg = 1; argc = argc - 1;
+        if (argc == 0) { return 0; }
     }
-    return;
-}
 
-fn complete(t as *term.Term, line as *u8, llen_ptr as *i64) as void {
-    let is i64 as llen = llen_ptr[0];
-    let is i64 as ts with mut = llen;
-    while (ts > 0 && line[ts - 1] != 32) { ts = ts - 1; }
-    let is i64 as plen = llen - ts;
-    let is i64 as is_cmd with mut = 0;
-    if (ts == 0) { is_cmd = 1; }
-    let is [256]u8 as acc;
-    let is i64 as acclen with mut = 0 - 1;
-    let is i64 as nmatch with mut = 0;
-    if (is_cmd == 1) {
-        if (_cand_match("help", 4, line, ts, plen) == 1) { _acc_update("help", 4, cast(*u8, &acc[0]), &acclen, &nmatch); }
-        if (_cand_match("clear", 5, line, ts, plen) == 1) { _acc_update("clear", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
-        if (_cand_match("reset", 5, line, ts, plen) == 1) { _acc_update("reset", 5, cast(*u8, &acc[0]), &acclen, &nmatch); }
-        if (_cand_match("exit", 4, line, ts, plen) == 1) { _acc_update("exit", 4, cast(*u8, &acc[0]), &acclen, &nmatch); }
-    }
-    let is i64 as fd = sys.open_read("/");
-    if (fd < 0) { return; }
-    let is [320]u8 as de;
-    while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
-        let is *u8 as nm = cast(*u8, &de[0]);
-        let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
-        let is i64 as nl = nlp[0];
-        let is i64 as cl with mut = nl;
-        let is i64 as ok with mut = 1;
-        if (is_cmd == 1) {
-            if (nl >= 4 && nm[nl-4] == 46 && nm[nl-3] == 99 && nm[nl-2] == 115 && nm[nl-1] == 101) { cl = nl - 4; }
-            else { ok = 0; }
+    let is *u8 as cmd = cast(*u8, argv_ptr[0]);
+    let is i64 as cl = argv_len[0];
+    if (repl.streq(cmd, cl, "clear") == 1 || repl.streq(cmd, cl, "reset") == 1) { term.clear(t); return 0; }
+    if (repl.streq(cmd, cl, "exit") == 1) { return 1; }
+    if (repl.streq(cmd, cl, "jobs") == 1) {
+        let is i64 as any with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < jobs.max_jobs()) {
+            if (jobs.get(i).status != jobs.JOB_FREE) { print_job(t, i); any = 1; }
+            i = i + 1;
         }
-        if (ok == 1 && _cand_match(nm, cl, line, ts, plen) == 1) { _acc_update(nm, cl, cast(*u8, &acc[0]), &acclen, &nmatch); }
+        if (any == 0) { g._col(t, s.C_DIM); g.puts(t, "no jobs\n"); g._col(t, s.C_TEXT); }
+        return 0;
     }
-    sys.close(fd);
-    if (nmatch == 0) { return; }
-    let is i64 as i with mut = plen;
-    while (i < acclen && llen_ptr[0] < s.LINE_CAP - 1) {
-        line[llen_ptr[0]] = acc[i];
-        term.putc(t, cast(i64, acc[i]));
-        llen_ptr[0] = llen_ptr[0] + 1;
-        i = i + 1;
+    if (repl.streq(cmd, cl, "kill") == 1) {
+        if (argc < 2) { g.err(t, "usage: kill %<n>\n"); return 0; }
+        let is i64 as j = jobs.parse_pct(cast(*u8, argv_ptr[1]), argv_len[1]);
+        if (j < 0) { g.err(t, "no such job\n"); return 0; }
+        jobs.kill_job(j);
+        return 0;
     }
-    if (nmatch == 1 && llen_ptr[0] < s.LINE_CAP - 1) {
-        line[llen_ptr[0]] = cast(u8, 32); term.putc(t, 0x20); llen_ptr[0] = llen_ptr[0] + 1;
+    if (repl.streq(cmd, cl, "fg") == 1) {
+        if (argc < 2) { g.err(t, "usage: fg %<n>\n"); return 0; }
+        let is i64 as j = jobs.parse_pct(cast(*u8, argv_ptr[1]), argv_len[1]);
+        if (j < 0) { g.err(t, "no such job\n"); return 0; }
+        if (jobs.get(j).status != jobs.JOB_RUN) { g.err(t, "job already finished\n"); return 0; }
+        // Bringing a job forward is only a routing change: it is the job keys
+        // now go to, and the one whose completion prints the next prompt.
+        jobs.get(j).bg = 0;
+        s.fg_job = j;
+        cli.set_title(jobs.cmd_ptr(j), jobs.cmd_len(j));
+        term.puts(t, jobs.cmd_ptr(j), jobs.cmd_len(j));
+        term.putc(t, 0x0A);
+        return 0;
     }
-    g.show(t);
-    return;
+    // The shared builtins (cd, export, set, unset, type, history, help) come
+    // from one table both shells read, so `help` cannot drift out of date.
+    let is i64 as bst with mut = 0;
+    if (bi.dispatch(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc, &bst) == 1) {
+        sx.set_status(bst);
+        return 0;
+    }
+
+    // A function defined with `function name begin ... end` is callable by
+    // name, and shadows a program of that name the way a builtin does.
+    if (ss.has_fn(cmd, cl) == 1) {
+        sx.set_status(ss.call_named(t, cmd, cl));
+        return 0;
+    }
+
+    // Everything else is a pipeline: expansion, globbing, redirects and '|'
+    // are shexec's job, and it hands back one job slot for the whole chain.
+    // The extra channel goes on CTL_FD so a child can still ask for a window.
+    let is i64 as nc = sx.prepare(line, len);
+    if (nc == 0 - 2) { g.err(t, "syntax: redirect with no target\n"); return 0; }
+    if (nc <= 0) { g.err(t, "too many pipeline stages\n"); return 0; }
+    let is [2]i64 as aux;
+    if (sys.channel_create(&aux[0]) != 0) { g.err(t, "channel fail\n"); return 0; }
+    let is i64 as slot = sx.exec(bg, line, len, s.CTL_FD, cast(*i64, &aux[0]));
+    sys.close(aux[1]);                       // the child holds its own end now
+    if (slot < 0) {
+        sys.close(aux[0]);
+        if (slot == 0 - 1) { g.err(t, "not found\n"); }
+        else if (slot == 0 - 2) { g.err(t, "too many jobs\n"); }
+        else if (slot == 0 - 3) { g.err(t, "spawn failed\n"); }
+        else { g.err(t, "bad command\n"); }
+        sx.set_status(127);
+        return 0;
+    }
+    jobs.get(slot).aux_fd = aux[0];
+    if (bg == 1) { print_job(t, slot); }
+    else {
+        s.fg_job = slot;
+        cli.set_title(cast(*u8, argv_ptr[0]), argv_len[0]);
+    }
+    return 0;
 }

@@ -12,6 +12,7 @@ use "sched.cst" as sched;
 use "vmm.cst" as vmm;
 use "lapic.cst" as lapic;
 use "lock.cst" as lock;
+use "util.cst" as util;
 
 // ============================================================
 // DriverResult — OK=0, errors positive
@@ -74,6 +75,18 @@ struct DmaBuffer {
 // ============================================================
 // Core structs
 // ============================================================
+
+// Match predicate kinds — the vocabulary of Bus.get_match_field below. They
+// live with the vtable that answers them, not with spec.cst that phrases the
+// questions: both spec matching and SYS_DEV_INFO ask the same bus the same
+// way, and neither should own the numbering.
+let is i64 as MATCH_BUS      = 1;
+let is i64 as MATCH_VENDOR   = 2;
+let is i64 as MATCH_DEVICE   = 3;
+let is i64 as MATCH_CLASS    = 4;
+let is i64 as MATCH_SUBCLASS = 5;
+let is i64 as MATCH_PROG_IF  = 6;
+let is i64 as MATCH_NAME     = 7;
 
 struct Bus {
     name as [32]u8;
@@ -179,6 +192,11 @@ struct DeviceEntry {
     class as i64;          // abi.DEV_FB / DEV_KEYBOARD / ...
     acquire as i64;        // fn(ctx as i64) as i64 — mints a fresh *KObject (0 = fail)
     ctx as i64;            // instance discriminator handed to acquire (device-state ptr, or 0)
+    hw as i64;             // *Hardware this instance sits on, or 0 (boot pseudo-device).
+                           // Kept apart from ctx on purpose: ctx is whatever the
+                           // acquire fn wants, hw is what SYS_DEV_INFO reports. A
+                           // registrant that passes driver state as ctx must still
+                           // yield an honest node here.
 }
 
 let is [16]DeviceEntry as device_table with mut;
@@ -190,13 +208,14 @@ let is lock.TicketLock as device_table_lk;
 // same (class, ctx) is idempotent — it updates the handler instead of
 // appending, so a re-bind can't inflate the count. OK, or OUT_OF_MEMORY when
 // the table is full.
-fn device_register(class as i64, acquire as i64, ctx as i64) as i32 {
+fn device_register(class as i64, acquire as i64, ctx as i64, hw as i64) as i32 {
     let is i64 as fl = lock.acquire_irq(&device_table_lk);
     let is i64 as i with mut = 0;
     while (i < MAX_DEVICES) {
         if (device_table[i].in_use != 0 && device_table[i].class == class
             && device_table[i].ctx == ctx) {
             device_table[i].acquire = acquire;          // same instance — replace handler
+            device_table[i].hw = hw;
             lock.release_irq(&device_table_lk, fl);
             return OK;
         }
@@ -209,6 +228,7 @@ fn device_register(class as i64, acquire as i64, ctx as i64) as i32 {
             device_table[i].class = class;
             device_table[i].acquire = acquire;
             device_table[i].ctx = ctx;
+            device_table[i].hw = hw;
             lock.release_irq(&device_table_lk, fl);
             return OK;
         }
@@ -266,6 +286,50 @@ fn device_enumerate(out as i64, max as i64) as i64 {
     return total;
 }
 
+// Identity of ONE instance: resolve (class, index) and write 8 i64 —
+// {class, index, vendor, product, name[32]}. Vendor/product come from the
+// bus's own match-field dispatch, the same answer spec matching uses, so the
+// kernel invents nothing: a bus with no such notion answers negative and we
+// report 0. hw == 0 (the boot framebuffer) yields zeros and an empty name.
+// Returns OK, or NOT_FOUND when there is no index-th instance of the class.
+fn device_info(class as i64, index as i64, out as *i64) as i32 {
+    let is i64 as fl = lock.acquire_irq(&device_table_lk);
+    let is i64 as seen with mut = 0;
+    let is i64 as hw with mut = 0;
+    let is i64 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_DEVICES) {
+        if (device_table[i].in_use != 0 && device_table[i].class == class) {
+            if (seen == index) { hw = device_table[i].hw; found = 1; i = MAX_DEVICES; }
+            else { seen = seen + 1; }
+        }
+        i = i + 1;
+    }
+    lock.release_irq(&device_table_lk, fl);
+    if (found == 0) { return NOT_FOUND; }
+
+    let is i64 as k with mut = 0;
+    while (k < 8) { out[k] = 0; k = k + 1; }
+    out[0] = class;
+    out[1] = index;
+    if (hw == 0) { return OK; }                  // boot pseudo-device: no bus, no name
+
+    // The node is only walked AFTER the table lock is dropped: the bus
+    // dispatch may touch config space and must not run IRQ-off. v0 never
+    // unregisters, so the node stays valid across the window.
+    let is *Hardware as h = cast(*Hardware, hw);
+    if (cast(i64, h.bus) != 0) {
+        let is i64 as ven = call(h.bus.get_match_field, h, MATCH_VENDOR);
+        let is i64 as prd = call(h.bus.get_match_field, h, MATCH_DEVICE);
+        if (ven > 0) { out[2] = ven; }
+        if (prd > 0) { out[3] = prd; }
+    }
+    let is *u8 as nm = cast(*u8, &out[4]);
+    let is i64 as n with mut = 0;
+    while (n < 32) { nm[n] = h.name[n]; n = n + 1; }
+    return OK;
+}
+
 // Kernel-side smoke: after enumeration there is at least one device (the
 // membus/keyboard/mouse always register), and every record's in-class index is
 // well-formed. Runs at boot; a failure panics so verify.sh catches a regression.
@@ -279,7 +343,32 @@ fn enumerate_smoke() as void {
     let is i64 as k with mut = 0;
     while (k < n) {
         if (buf[k * 2 + 1] < 0) { pmm.panic("dev_enum_smoke: bad index", 25); }
+        // Every enumerated pair must resolve to an identity, and that identity
+        // must echo the pair back — enumeration and info agreeing is the whole
+        // contract userspace binds config against.
+        let is [8]i64 as inf;
+        if (device_info(buf[k * 2], buf[k * 2 + 1], cast(*i64, &inf[0])) != OK) {
+            pmm.panic("dev_enum_smoke: info FAIL", 24);
+        }
+        if (inf[0] != buf[k * 2] || inf[1] != buf[k * 2 + 1]) {
+            pmm.panic("dev_enum_smoke: info mismatch", 28);
+        }
+        serial.print("  dev class=", 12);   util.print_num(inf[0]);
+        serial.print(" idx=", 5);           util.print_num(inf[1]);
+        serial.print(" ven=", 5);           util.print_hex(inf[2]);
+        serial.print(" prod=", 6);          util.print_hex(inf[3]);
+        serial.print(" name=", 6);
+        let is *u8 as inm = cast(*u8, &inf[4]);
+        let is i64 as nl with mut = 0;
+        while (nl < 32 && inm[nl] != cast(u8, 0)) { nl = nl + 1; }
+        serial.println(inm, nl);
         k = k + 1;
+    }
+    // An out-of-range index is NOT_FOUND, never a silent alias of instance 0 —
+    // the same honesty dev_open owes.
+    let is [8]i64 as bad;
+    if (device_info(buf[0], 999, cast(*i64, &bad[0])) == OK) {
+        pmm.panic("dev_enum_smoke: info aliased", 27);
     }
     serial.println("dev_enum_smoke: PASS", 20);
 }
