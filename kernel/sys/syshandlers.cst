@@ -89,26 +89,36 @@ fn sys_time_sleep_ns(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64)
 }
 
 // ============================================================
-// SYS_PROC_EXIT — terminate the current thread. Never returns.
-// If the thread belongs to a Process, publish the zombie (exit code +
-// reparent children) BEFORE scheduling away, so the parent's wait() can
-// collect the status. Resource reclamation (kstack/aspace/struct) is the
-// reaper's / wait()'s job — the thread still runs on its own kstack here.
+// SYS_PROC_EXIT — terminate the WHOLE process. Never returns.
+// If the thread belongs to a Process, first force-kill every sibling thread
+// (SYS_THREAD_SPAWN may have started some) so the process leaves no live
+// thread behind, THEN publish the zombie (exit code + reparent children)
+// BEFORE scheduling away, so the parent's wait() can collect the status.
+// Killing the siblings before zombify keeps the invariant proc_wait relies on:
+// once a process is a zombie, all its threads are off-cpu (or racing to the
+// reaper), so aspace_destroy at reap is safe. Resource reclamation
+// (kstack/aspace/struct) is the reaper's / wait()'s job.
 // ============================================================
 
 fn sys_proc_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     serial.print("sys.proc_exit: code=", 20);
     util.print_num(a);
     serial.println("", 0);
-    let is i64 as p = sched.thr_process_ptr(sched.current_tid());
-    if (p != 0) { proc.zombify(p, a); }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as p = sched.thr_process_ptr(tid);
+    if (p != 0) {
+        if (proc.proc_state(p) == proc.PROC_ALIVE) {
+            sched.kill_process_threads(p, tid);   // reap siblings (spare self)
+            proc.zombify(p, a);
+        }
+    }
     // Close this process's fds NOW, at exit — not later at reap (aspace_destroy).
     // A channel/pipe peer must see EOF the moment the writer exits: a parent that
     // pumps a child's console channel to EOF and only THEN wait()s would otherwise
     // deadlock, since the write end stays open until reap, which comes after the
     // pump. fd_table_drain is idempotent (clears slots), so the reap-time drain is
-    // a harmless no-op. (v0 is one-thread-per-process, so thread exit = proc exit.)
-    let is i64 as asp = sched.thr_aspace_ptr(sched.current_tid());
+    // a harmless no-op.
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
     if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
     sched.exit_current_thread();
     return 0;
@@ -355,30 +365,17 @@ fn sys_proc_kill(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
     let is i64 as child = proc.find_child(me, a);
     if (child == 0) { return abi.E_NOENT; }
     if (proc.proc_state(child) != proc.PROC_ALIVE) { return abi.E_OK; }   // already dying/dead
-    let is i64 as tid = proc.proc_first_tid(child);
-    if (tid < 0) { return abi.E_NOENT; }
 
-    sched.thr_mark_kill(tid);
-    // Wait for it to leave any cpu: the 1ms tick preempts even a pure user
-    // spin, and the scheduler parks marked threads instead of resuming them.
-    let is i64 as deadline = timer.current_time_ns() + 2000000000;
-    while (sched.thr_is_running(tid) == 1) {
-        if (timer.current_time_ns() >= deadline) { return abi.E_AGAIN; }
-        sched.sleep_for_ns(1000000);
-    }
-    // Off-cpu and barred from ever returning: process teardown is safe here.
+    // Kill EVERY thread of the child — a multi-thread process (SYS_THREAD_SPAWN)
+    // has more than first_tid. Each is marked, waited off-cpu (the 1ms tick
+    // preempts even a pure user spin; the scheduler parks marked threads), then
+    // finalized to the deferred reaper. All threads are off-cpu when this
+    // returns, so the teardown below is safe.
+    sched.kill_process_threads(child, 0 - 1);
     proc.zombify(child, 137);
-    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    let is i64 as asp = proc.proc_aspace(child);
     if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
-    // Scheduler-side finalize (detach from queues/sleepers, queue the reaper).
-    let is i64 as tries with mut = 0;
-    while (tries < 2000) {
-        let is i64 as rc = sched.kill_finalize(tid);
-        if (rc >= 0) { return abi.E_OK; }
-        sched.sleep_for_ns(1000000);
-        tries = tries + 1;
-    }
-    return abi.E_AGAIN;
+    return abi.E_OK;
 }
 
 // ============================================================
@@ -402,6 +399,67 @@ fn sys_event_subscribe(a as i64, b as i64, c as i64, d as i64, e as i64, f as i6
     let is i64 as fd = vma.fd_alloc(cast(*vma.Aspace, asp), ko);
     if (fd < 0) { kobject.ko_unref(ko); return abi.E_NOMEM; }   // no free fd slot
     return fd;
+}
+
+// ============================================================
+// SYS_THREAD_SPAWN(entry, arg, stack_top) — start a new ring-3 thread in the
+// CALLER's address space. `entry` is the ring-3 RIP, `arg` arrives in rdi, and
+// the thread runs on `stack_top` (the caller mmap'd its own stack — mechanism
+// stays in the kernel, stack policy in userspace). The new thread shares the
+// process (same pid, same fds via the shared aspace). Created SUSPENDED so we
+// can stash its initial rdi before it can run, then made runnable. Returns the
+// new tid. SYS_PROC_EXIT / SYS_PROC_KILL tear all of a process's threads down
+// together; a worker that just finishes calls SYS_THREAD_EXIT.
+// ============================================================
+
+fn sys_thread_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as entry = a;
+    let is i64 as arg = b;
+    let is i64 as stack_top = c;
+    if (entry == 0) { return abi.E_INVAL; }
+    if (stack_top == 0) { return abi.E_INVAL; }
+    let is i64 as tid = sched.current_tid();
+    let is i64 as me = sched.thr_process_ptr(tid);
+    if (me == 0) { return abi.E_PERM; }                 // only a real process spawns threads
+    let is i64 as pml4 = sched.thr_aspace_pml4(tid);
+    let is i64 as asp = sched.thr_aspace_ptr(tid);
+    if (asp == 0) { return abi.E_INVAL; }
+    // A bad entry/stack in the caller's aspace can only fault the new ring-3
+    // thread itself (supervisor pages are unreachable from ring 3) — no need to
+    // pre-validate the address range here.
+    let is i64 as ntid = sched.create_user_thread_ex(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)),
+        sched.QOS_NORMAL, pml4, entry, stack_top, asp, me, 1);   // suspended
+    if (ntid < 0) { return abi.E_NOMEM; }
+    sched.thr_set_initial_rdi(ntid, arg);
+    proc.proc_inc_threads(me);
+    sched.make_runnable(ntid);
+    return ntid;
+}
+
+// ============================================================
+// SYS_THREAD_EXIT(code) — end the CALLING thread only. Never returns. If this
+// was the process's last live thread, it also publishes the process zombie
+// (exit code) so a waiting parent unblocks — otherwise the process would linger
+// with no runnable thread. Sibling threads keep running; the process stays
+// alive. Use SYS_PROC_EXIT to end the whole process instead.
+// ============================================================
+
+fn sys_thread_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as tid = sched.current_tid();
+    let is i64 as p = sched.thr_process_ptr(tid);
+    if (p != 0) {
+        proc.proc_dec_threads(p);
+        if (proc.proc_thread_count(p) <= 0) {
+            if (proc.proc_state(p) == proc.PROC_ALIVE) {
+                proc.zombify(p, a);
+                let is i64 as asp = sched.thr_aspace_ptr(tid);
+                if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
+            }
+        }
+    }
+    sched.exit_current_thread();
+    return 0;
 }
 
 // ============================================================
@@ -1388,6 +1446,8 @@ fn install_all() as void {
     install(abi.SYS_POLL,            cast(i64, fn_ptr(sys_poll)));
     install(abi.SYS_PROC_KILL,       cast(i64, fn_ptr(sys_proc_kill)));
     install(abi.SYS_EVENT_SUBSCRIBE, cast(i64, fn_ptr(sys_event_subscribe)));
+    install(abi.SYS_THREAD_SPAWN,    cast(i64, fn_ptr(sys_thread_spawn)));
+    install(abi.SYS_THREAD_EXIT,     cast(i64, fn_ptr(sys_thread_exit)));
     install(abi.SYS_PROC_LIST,       cast(i64, fn_ptr(sys_proc_list)));
     install(abi.SYS_CPU_STAT,        cast(i64, fn_ptr(sys_cpu_stat)));
     install(abi.SYS_TIME_WALL,       cast(i64, fn_ptr(sys_time_wall)));

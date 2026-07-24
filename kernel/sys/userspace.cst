@@ -50,6 +50,7 @@ use "driver.cst" as driver;
 let is i64 as USER_TEXT_VA    = 0x0000000000400000;
 let is i64 as USER_DATA_VA    = 0x0000000000401000;
 let is i64 as USER_STACK_VA   = 0x0000000000600000;
+let is i64 as USER_STACK2_VA  = 0x0000000000610000;   // 2nd thread's stack (thread_spawn smoke)
 
 // Page-table flag aliases. PTE_PRESENT / PTE_WRITE / PTE_USER / PTE_NX
 // all live in vmm; we just keep this file readable by giving the
@@ -81,6 +82,10 @@ let is i64 as USER_STACK_VA   = 0x0000000000600000;
 // ----------------------------------------------------------------
 let is i64 as enter_user_rip with mut = 0;
 let is i64 as enter_user_rsp with mut = 0;
+// Initial ring-3 rdi. 0 for a process main thread (args on the stack); the
+// arg SYS_THREAD_SPAWN hands its worker for a spawned thread. Set by
+// user_thread_trampoline from the thread's Thread+336 slot before enter_user.
+let is i64 as enter_user_rdi with mut = 0;
 
 fn enter_user(rip as i64, rsp as i64) as void {
     enter_user_rip = rip;
@@ -118,7 +123,6 @@ fn enter_user(rip as i64, rsp as i64) as void {
     asm(".byte 0x48, 0x31, 0xC9\n");   // xor rcx, rcx
     asm(".byte 0x48, 0x31, 0xD2\n");   // xor rdx, rdx
     asm(".byte 0x48, 0x31, 0xF6\n");   // xor rsi, rsi
-    asm(".byte 0x48, 0x31, 0xFF\n");   // xor rdi, rdi
     asm(".byte 0x48, 0x31, 0xED\n");   // xor rbp, rbp
     asm(".byte 0x4D, 0x31, 0xC0\n");   // xor r8, r8
     asm(".byte 0x4D, 0x31, 0xC9\n");   // xor r9, r9
@@ -128,6 +132,12 @@ fn enter_user(rip as i64, rsp as i64) as void {
     asm(".byte 0x4D, 0x31, 0xED\n");   // xor r13, r13
     asm(".byte 0x4D, 0x31, 0xF6\n");   // xor r14, r14
     asm(".byte 0x4D, 0x31, 0xFF\n");   // xor r15, r15
+    // rdi = enter_user_rdi (0 for a main thread; SYS_THREAD_SPAWN's arg for a
+    // worker). Loaded from a kernel global we own, so it never leaks a kernel
+    // pointer — it is either 0 or the user's own arg value. rax is the scratch,
+    // cleared right after.
+    asm("lea rax, [rip+_kernel_sys_userspace_cst_enter_user_rdi]\n");
+    asm("mov rdi, QWORD PTR [rax]\n");
     asm(".byte 0x48, 0x31, 0xC0\n");   // xor rax, rax (built the frame — clear last)
     asm(".byte 0x48, 0xCF\n");   // iretq (caustic-as drops the mnemonic)
 }
@@ -143,6 +153,7 @@ fn user_thread_trampoline() as void {
         serial.println("userspace: trampoline tid has no user_entry", 44);
         return;
     }
+    enter_user_rdi = sched.thr_initial_rdi(tid);   // 0 for a main thread
     enter_user(rip, rsp);
 }
 
@@ -296,6 +307,136 @@ fn copy_to_user(pml4 as i64, user_va as i64, src as *u8, n as i64) as i32 {
         i = i + 1;
     }
     return 0;
+}
+
+// ----------------------------------------------------------------
+// SYS_THREAD_SPAWN smoke shellcode. Two entry points in one text page:
+//   main  (offset 0)     : SYS_THREAD_SPAWN(worker_va, 0, stack2_top); spin
+//                          until counter[1] != 0 (the worker started in our
+//                          aspace), then SYS_PROC_EXIT(0).
+//   worker(offset 0x80)  : inc counter[1] forever (never exits).
+// The worker running proves the spawned thread executes in the SAME aspace
+// (shared data page). main's SYS_PROC_EXIT must then FORCE-KILL the still-
+// spinning worker and tear the process down — the exact multi-thread path.
+// Deterministic: main does not exit until the worker has provably run.
+// ----------------------------------------------------------------
+fn write_thread_spawn_shellcode(dst as *u8, worker_va as i64, stack2_top as i64) as void {
+    let is i64 as c with mut = 0;
+    // mov rax, 46 (SYS_THREAD_SPAWN)
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xC7); dst[c+2] = cast(u8, 0xC0);
+    dst[c+3] = cast(u8, 46); dst[c+4] = cast(u8, 0); dst[c+5] = cast(u8, 0); dst[c+6] = cast(u8, 0);
+    c = c + 7;
+    // movabs rdi, worker_va
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xBF); c = c + 2;
+    let is i64 as v1 with mut = worker_va;
+    let is i64 as i1 with mut = 0;
+    while (i1 < 8) { dst[c+i1] = cast(u8, v1 & 0xFF); v1 = v1 >> 8; i1 = i1 + 1; }
+    c = c + 8;
+    // xor esi, esi (arg = 0)
+    dst[c] = cast(u8, 0x31); dst[c+1] = cast(u8, 0xF6); c = c + 2;
+    // movabs rdx, stack2_top
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xBA); c = c + 2;
+    let is i64 as v2 with mut = stack2_top;
+    let is i64 as i2 with mut = 0;
+    while (i2 < 8) { dst[c+i2] = cast(u8, v2 & 0xFF); v2 = v2 >> 8; i2 = i2 + 1; }
+    c = c + 8;
+    // syscall
+    dst[c] = cast(u8, 0x0F); dst[c+1] = cast(u8, 0x05); c = c + 2;
+    // movabs rax, USER_DATA_VA
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xB8); c = c + 2;
+    let is i64 as v3 with mut = USER_DATA_VA;
+    let is i64 as i3 with mut = 0;
+    while (i3 < 8) { dst[c+i3] = cast(u8, v3 & 0xFF); v3 = v3 >> 8; i3 = i3 + 1; }
+    c = c + 8;
+    // .wait: mov rcx, [rax+8] ; test rcx, rcx ; jz .wait  (spin until worker ran)
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0x8B); dst[c+2] = cast(u8, 0x48); dst[c+3] = cast(u8, 0x08);
+    c = c + 4;
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0x85); dst[c+2] = cast(u8, 0xC9); c = c + 3;
+    dst[c] = cast(u8, 0x74); dst[c+1] = cast(u8, 0xF7); c = c + 2;      // jz -9 -> .wait
+    // mov rax, 3 (SYS_PROC_EXIT) ; xor edi,edi ; syscall
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xC7); dst[c+2] = cast(u8, 0xC0);
+    dst[c+3] = cast(u8, 3); dst[c+4] = cast(u8, 0); dst[c+5] = cast(u8, 0); dst[c+6] = cast(u8, 0);
+    c = c + 7;
+    dst[c] = cast(u8, 0x31); dst[c+1] = cast(u8, 0xFF); c = c + 2;
+    dst[c] = cast(u8, 0x0F); dst[c+1] = cast(u8, 0x05); c = c + 2;
+
+    // ---- worker at offset 0x80: inc counter[1] forever ----
+    c = 0x80;
+    // movabs rax, USER_DATA_VA
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xB8); c = c + 2;
+    let is i64 as v4 with mut = USER_DATA_VA;
+    let is i64 as i4 with mut = 0;
+    while (i4 < 8) { dst[c+i4] = cast(u8, v4 & 0xFF); v4 = v4 >> 8; i4 = i4 + 1; }
+    c = c + 8;
+    // .loop: inc qword [rax+8] ; jmp .loop
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xFF); dst[c+2] = cast(u8, 0x40); dst[c+3] = cast(u8, 0x08);
+    c = c + 4;
+    dst[c] = cast(u8, 0xEB); dst[c+1] = cast(u8, 0xFA); c = c + 2;      // jmp -6 -> .loop
+}
+
+// Read counter[idx] (idx*8 bytes into USER_DATA_VA) from a foreign aspace via
+// the page-table walk + HHDM, the same trick read_user_counter uses.
+fn read_user_counter_at(a as *vma.Aspace, idx as i64) as i64 {
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, USER_DATA_VA);
+    if (phys == 0) { return cast(i64, 0 - 1); }
+    let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+    return p[idx];
+}
+
+// SYS_THREAD_SPAWN end-to-end: a real process whose main thread spawns a worker
+// into its own aspace. Verifies both threads ran (both counters), then reaps
+// the process (proc_wait) to exercise the multi-thread teardown — the aspace is
+// destroyed only once every thread is off-cpu and reaped.
+fn thread_spawn_smoke() as void {
+    serial.println("thread_spawn_smoke: start", 25);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { serial.println("thread_spawn_smoke: aspace FAIL", 31); return; }
+
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE, cast(*u8, "text"), 4);
+    if (text_kv == 0) { serial.println("thread_spawn_smoke: text FAIL", 29); return; }
+    write_thread_spawn_shellcode(cast(*u8, text_kv), USER_TEXT_VA + 0x80,
+                                 USER_STACK2_VA + pmm.PAGE_SIZE - 16);
+
+    let is i64 as data_kv = mmap_user_fixed(a, USER_DATA_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, cast(*u8, "data"), 4);
+    if (data_kv == 0) { serial.println("thread_spawn_smoke: data FAIL", 29); return; }
+    let is *i64 as cnt = cast(*i64, data_kv);
+    cnt[0] = 0; cnt[1] = 0;
+
+    let is i64 as s1 = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                       vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, cast(*u8, "stk1"), 4);
+    let is i64 as s2 = mmap_user_fixed(a, USER_STACK2_VA, 1,
+                                       vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, cast(*u8, "stk2"), 4);
+    if (s1 == 0 || s2 == 0) { serial.println("thread_spawn_smoke: stack FAIL", 30); return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as p = proc.process_create(proc.init_proc, cast(i64, a), 0);
+    if (p == 0) { serial.println("thread_spawn_smoke: proc FAIL", 29); return; }
+    let is i64 as tid = sched.create_user_thread_ex(
+        cast(i64, fn_ptr(user_thread_trampoline)), sched.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a), p, 1);   // suspended
+    proc.attach_main_thread(p, tid);
+    proc_start(p);
+
+    let is i64 as pid = proc.proc_pid(p);
+    let is i64 as deadline = timer.current_time_ns() + 3000000000;
+    let is i64 as ok with mut = 0;
+    while (timer.current_time_ns() < deadline && ok == 0) {
+        if (read_user_counter_at(a, 1) > 0) { ok = 1; }       // worker ran in our aspace
+        else { sched.sleep_for_ns(50000000); }
+    }
+    if (ok == 0) {
+        serial.print("thread_spawn_smoke: FAIL worker never ran, counter=", 51);
+        util.print_num(read_user_counter_at(a, 1));
+        serial.println("", 0);
+        return;
+    }
+    // Reap the process: proves the multi-thread teardown is clean (both the
+    // worker and main are off-cpu + reaped before aspace_destroy runs).
+    let is i64 as code = proc_wait(proc.init_proc, pid);
+    if (code == abi.E_AGAIN) { serial.println("thread_spawn_smoke: reap TIMEOUT", 32); return; }
+    serial.println("thread_spawn_smoke: PASS", 24);
 }
 
 // ----------------------------------------------------------------
@@ -2770,8 +2911,10 @@ fn proc_wait(parent as i64, pid as i64) as i64 {
     while (timer.current_time_ns() < deadline) {
         let is i64 as child = proc.find_zombie_child(parent, pid);
         if (child != 0) {
-            let is i64 as ctid = proc.proc_first_tid(child);
-            if (sched.thr_exists(ctid) == cast(i32, 0)) {
+            // Wait until EVERY thread of the child is reaped (not just the main
+            // one) — a multi-thread process may still have a worker off-cpu but
+            // not yet freed, and its aspace CR3 must be idle before destroy.
+            if (sched.process_has_live_thread(child) == 0) {
                 let is i64 as code = proc.proc_exit_code(child);
                 let is i64 as casp = proc.proc_aspace(child);
                 if (casp != 0) { vma.aspace_destroy(cast(*vma.Aspace, casp)); }
@@ -3697,6 +3840,7 @@ fn smoke_init() as void {
     spawn_user_cse_smoke();
     spawn_user_fb_smoke();
     spawn_channel_smoke();
+    thread_spawn_smoke();
     spawn_fdacts_smoke();
     spawn_kbd_smoke();
     spawn_mouse_smoke();

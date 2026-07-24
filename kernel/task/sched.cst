@@ -428,6 +428,56 @@ fn kill_finalize(tid as i64) as i64 {
 // The thread is execution; the Process is isolation/identity/lineage.
 fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
 
+// Initial ring-3 rdi for a thread (Thread+336, the arg SYS_THREAD_SPAWN passes
+// to the worker's entry fn). 0 for a normal process main thread — its args
+// arrive on the stack, and enter_user's register clear keeps rdi = 0 there.
+fn thr_set_initial_rdi(tid as i64, v as i64) as void { thr_set(tid, 336, v); }
+fn thr_initial_rdi(tid as i64) as i64                { return thr_get(tid, 336); }
+
+// 1 while any thread of `proc_ptr` is still a live scheduler object (thread_ptr
+// != 0 — RUNNING, parked, or DEAD-but-not-yet-reaped). proc_wait spins on this
+// before aspace_destroy: a DEAD worker is only provably off its aspace CR3 once
+// the reaper has freed it (thread_ptr == 0), so tearing the aspace down before
+// then could pull the page tables out from under a CPU mid context-switch.
+fn process_has_live_thread(proc_ptr as i64) as i64 {
+    let is i64 as tid with mut = 0;
+    while (tid < next_tid) {
+        if (thread_ptr(tid) != 0 && thr_process_ptr(tid) == proc_ptr) { return 1; }
+        tid = tid + 1;
+    }
+    return 0;
+}
+
+// Terminate every live thread of `proc_ptr` except `except_tid` (-1 = none
+// spared). Marks each, waits it off-cpu (the 1ms tick preempts even a pure
+// user spin, and the scheduler parks marked threads), then finalizes it to
+// the deferred reaper. Shared by whole-process exit (except = the caller) and
+// SYS_PROC_KILL of a multi-thread child (except = -1). Runs from syscall
+// context (it sleeps), never from an IRQ.
+fn kill_process_threads(proc_ptr as i64, except_tid as i64) as void {
+    let is i64 as tid with mut = 0;
+    while (tid < next_tid) {
+        if (tid != except_tid && thread_ptr(tid) != 0
+            && thr_process_ptr(tid) == proc_ptr && thr_state(tid) != THREAD_DEAD) {
+            thr_mark_kill(tid);
+            let is i64 as deadline = timer.current_time_ns() + 2000000000;
+            let is i64 as waiting with mut = 1;
+            while (waiting == 1) {
+                if (thr_is_running(tid) == 0) { waiting = 0; }
+                else if (timer.current_time_ns() >= deadline) { waiting = 0; }
+                else { sleep_for_ns(1000000); }
+            }
+            let is i64 as tries with mut = 0;
+            while (tries < 2000) {
+                let is i64 as rc = kill_finalize(tid);
+                if (rc >= 0) { tries = 2000; }
+                else { sleep_for_ns(1000000); tries = tries + 1; }
+            }
+        }
+        tid = tid + 1;
+    }
+}
+
 // Is `tid` still a live scheduler object? Returns 0 once the deferred
 // reaper has freed it (removed from the tid table). The reaper can free a
 // DEAD thread before an observer polls its state, so "exited" detection
