@@ -183,7 +183,7 @@ shell↔terminal, and all future IPC fall out of it.
 
 ---
 
-## 8. Input  *(device built; keymap/focus are userspace, pending the terminal)*
+## 8. Input  *(keyboard + mouse devices built; compositor relays focus + pointer; wterm forwards xterm mouse tracking)*
 
 - **Keyboard = a device yielding RAW events.** `dev_open(DEV_KEYBOARD)` → an fd whose
   reads return raw event records (scancode, key down/up, modifier snapshot). Lossless;
@@ -202,7 +202,11 @@ shell↔terminal, and all future IPC fall out of it.
 - **Focus routing falls out of the channel model.** The holder of the keyboard (the
   compositor) reads raw events and **relays** them to the focused client's channel.
   "Who gets input" = "whom the holder forwards to" = a userspace decision. The kernel
-  has no notion of focus. Mouse later = another device, same shape.
+  has no notion of focus. Mouse is the same shape (DEV_MOUSE / DEV_TABLET): the
+  compositor reads raw deltas, applies the accel curve (accel.cst, a smoothstep
+  gain tunable via /var/wm/pointer.cst), and relays button/wheel to the focused
+  client. The wterm turns those into xterm mouse reports (SGR/X10) on the child's
+  stdin when a TUI enabled tracking — mouse-in-terminal with no kernel change.
 - **A fullscreen app may `dev_open` the keyboard/mouse itself** and read raw — no
   compositor required. A game wanting raw mouse *is* the owner: exclusivity hands it
   the raw stream, it does not exclude it. Either fullscreen (`dev_open(DEV_MOUSE)`) or,
