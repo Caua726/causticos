@@ -97,9 +97,10 @@ yielding raw event streams. The set stays small on purpose: one new concept, the
   KObject. `close` — and process exit, when the address space is torn down — drops the
   reference; the object's `close` op runs at the last reference. Clearing a slot
   *anywhere* must `ko_unref`.
-- Syscalls: `SYS_SPAWN`, `SYS_WAIT`. `SYS_PROC_KILL` (forced, cross-cpu) is designed
-  but not built — it needs to stop a thread possibly running on another cpu (IPI /
-  kill-at-next-kernel-entry).
+- Syscalls: `SYS_SPAWN`, `SYS_WAIT`, `SYS_PROC_KILL` (forced, cross-cpu — marks the
+  thread and parks it at its next preemption, the 1 ms tick bounding a pure-user spin;
+  it kills every thread of a multi-thread process). `SYS_THREAD_SPAWN`/`SYS_THREAD_EXIT`
+  add threads over a shared aspace; `SYS_EVENT_SUBSCRIBE` delivers child-exit events.
 
 ---
 
@@ -133,7 +134,7 @@ shell↔terminal, and all future IPC fall out of it.
 
 ---
 
-## 6. Devices & acquisition  *(acquisition built; preemptible grab stack designed)*
+## 6. Devices & acquisition  *(acquisition + preemptible grab stack built; enumerate via SYS_QUERY_DEVS)*
 
 - **`dev_open(class, index) → fd`** — e.g. `dev_open(DEV_KEYBOARD, 0)`,
   `dev_open(DEV_FB, 0)`. You ask the kernel for a device *by class*; it returns a key.
@@ -309,13 +310,20 @@ in a swappable userspace program.
   that writes a ring-3 serial marker. **This is the last kernel mechanism before the
   terminal — the kernel side of the userspace model is now complete.**
 
+**Built since:**
+- **Preemptible device ownership** (grab stack) — keyboard, mouse, and the framebuffer
+  surface all ride `kernel/sys/grab.cst`; a non-top holder goes quiet, ownership returns
+  on close.
+- The **terminal** (wterm), the **shell**, and the **compositor** + window manager.
+- `SYS_PROC_KILL` (forced, cross-cpu); file-fd handoff at spawn (fdacts); `thread_spawn`
+  (multi-thread process, `SYS_THREAD_SPAWN`/`SYS_THREAD_EXIT`); signal-replacement event
+  fds (`SYS_EVENT_SUBSCRIBE`); device enumeration (`SYS_QUERY_DEVS`).
+
 **Designed here, not yet built:**
 - **Userspace keymap + focus relay** (the kernel side — raw keyboard as a device — is
-  built; layout/cooking/routing land with the terminal).
-- **Preemptible device ownership** (grab stack).
-- The **terminal** and the **shell** (userspace programs); the optional **compositor**.
-- `SYS_PROC_KILL`; file-fd handoff at spawn; `thread_spawn` (multi-thread process);
-  rich granted namespaces; signal-replacement event fds; handle-passing over a channel.
+  built; full layout/cooking/routing policy still lands in the terminal).
+- Rich granted namespaces; handle-passing over a channel (SCM_RIGHTS-style, beyond the
+  current one-slot `SYS_FD_SEND`/`SYS_FD_RECV`).
 
 ---
 
