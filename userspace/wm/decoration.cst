@@ -22,9 +22,13 @@ fn mix_rgb(dst as i64, src as i64, a as i64) as i64 {
          |  ((db + (sb - db) * a / 256) & 0xFF);
 }
 
+// dec_handoff — fd_send the segment then announce it. The retry budget is
+// small on purpose: this runs inside the frame path, and a channel that is
+// briefly full is a reason to come back next frame, not to stall the WM for a
+// fifth of a second. titlebar_ensure retries until it lands.
 fn dec_handoff(seg_fd as i64, win_id as i64, npages as i64, cols as i64, rows as i64) as i64 {
     let is i64 as tries with mut = 0;
-    while (tries < 1000) {
+    while (tries < 8) {
         let is i64 as fr = sys.fd_send(s.wc_fd, seg_fd);
         if (fr == 0) {
             cp.msg_send(s.wc_fd, cp.MSG_WC_DEC_SURFACE, win_id, npages,
@@ -49,20 +53,36 @@ fn dec_cell_ptr(base as i64, idx as i64) as *i64 {
     return cast(*i64, base + cp.DEC_HDR_CELLS * 8 + idx * 8);
 }
 
+// titlebar_ensure — the window's decoration segment exists AND the compositor
+// holds it. Those are two separate facts, and conflating them cost a window its
+// whole titlebar: the old code set dec_fd first and returned on a failed
+// handoff, so a hand-off that lost the channel's single out-of-band fd slot was
+// never retried — dec_fd was non-zero, so every later call returned "already
+// done" and that window stayed undecorated for life. The extra WC traffic
+// animations bring made that race easy to hit.
+//
+// Now dec_attached is the authority on the handoff, and a failed one is simply
+// retried on the next frame against the SAME segment.
 fn titlebar_ensure(i as i64) as i64 {
-    if (s.wins[i].dec_fd != 0) { return 0; }
     let is i64 as cols = s.scr_w / 8;
     let is i64 as pages = cp.dec_seg_pages(cols, 1);
-    let is i64 as seg = sys.seg_create(pages, 0);
-    if (seg < 0) { return 0 - 1; }
-    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
-    if (va < 0) { sys.close(seg); return 0 - 1; }
-    s.wins[i].dec_fd = seg;
-    s.wins[i].dec_base = va;
-    s.wins[i].dec_pages = pages;
-    dec_set_header(va, cols, 1);
-    if (dec_handoff(seg, i, pages, cols, 1) != 0) { return 0 - 1; }
-    s.wins[i].dec_attached = 1;
+    if (s.wins[i].dec_fd == 0) {
+        let is i64 as seg = sys.seg_create(pages, 0);
+        if (seg < 0) { return 0 - 1; }
+        let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
+        if (va < 0) { sys.close(seg); return 0 - 1; }
+        s.wins[i].dec_fd = seg;
+        s.wins[i].dec_base = va;
+        s.wins[i].dec_pages = pages;
+        s.wins[i].dec_attached = 0;
+        dec_set_header(va, cols, 1);
+    }
+    if (s.wins[i].dec_attached == 0) {
+        if (dec_handoff(s.wins[i].dec_fd, i, s.wins[i].dec_pages, cols, 1) != 0) {
+            return 0 - 1;
+        }
+        s.wins[i].dec_attached = 1;
+    }
     return 0;
 }
 
@@ -148,25 +168,28 @@ fn update_clock() as void {
     return;
 }
 
+// Same split as titlebar_ensure: the strip and the handoff are separate facts.
 fn taskbar_ensure() as i64 {
-    if (s.tb_dec_fd != 0) { return 0; }
     let is i64 as cols = s.scr_w / 8;
     let is i64 as pages = cp.dec_seg_pages(cols, 1);
-    let is i64 as seg = sys.seg_create(pages, 0);
-    if (seg < 0) { return 0 - 1; }
-    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
-    if (va < 0) { sys.close(seg); return 0 - 1; }
-    s.tb_dec_fd = seg;
-    s.tb_dec_base = va;
-    s.tb_dec_pages = pages;
-    s.tb_cols = cols;
-    dec_set_header(va, cols, 1);
-    if (dec_handoff(seg, cp.DEC_TASKBAR_ID, pages, cols, 1) != 0) {
-        sys.munmap(va, pages * 4096); sys.close(seg);
-        s.tb_dec_fd = 0; s.tb_dec_base = 0;
-        return 0 - 1;
+    if (s.tb_dec_fd == 0) {
+        let is i64 as seg = sys.seg_create(pages, 0);
+        if (seg < 0) { return 0 - 1; }
+        let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, seg);
+        if (va < 0) { sys.close(seg); return 0 - 1; }
+        s.tb_dec_fd = seg;
+        s.tb_dec_base = va;
+        s.tb_dec_pages = pages;
+        s.tb_cols = cols;
+        s.tb_attached = 0;
+        dec_set_header(va, cols, 1);
     }
-    s.tb_attached = 1;
+    if (s.tb_attached == 0) {
+        if (dec_handoff(s.tb_dec_fd, cp.DEC_TASKBAR_ID, s.tb_dec_pages, s.tb_cols, 1) != 0) {
+            return 0 - 1;
+        }
+        s.tb_attached = 1;
+    }
     return 0;
 }
 
