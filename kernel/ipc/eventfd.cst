@@ -1,0 +1,220 @@
+// eventfd.cst — KOBJ_EVENT: a readable/pollable queue of lifecycle event
+// records, the kernel's signal replacement (docs/architecture.md §317). A
+// process subscribes (SYS_EVENT_SUBSCRIBE) and reads {pid, kind, code}
+// records; today the sole producer is the exit path — process.zombify posts
+// a child-exit record to the parent's subscribed queues.
+//
+// Self-contained: a global singly-linked registry of live queues keyed by
+// owner pid. process.cst posts through a wired fn-pointer (event_post_fn), so
+// there is no process<->eventfd import edge — the same composition trick
+// main.cst uses for the syscall dispatch table.
+//
+// The read op is NON-BLOCKING: it returns whatever whole records are queued
+// (0 bytes if none), never sleeps. A subscriber multiplexes it with SYS_POLL
+// alongside its other fds; poll reports READABLE when a record waits. One
+// global TicketLock guards the registry and every ring — event traffic is
+// tiny, so a single lock is simpler and race-free (no nested acquire).
+
+use "kobject.cst" as kobject;
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "lock.cst" as lock;
+use "abi.cst" as abi;
+use "serial.cst" as serial;
+
+let is i64 as EV_CAP   = 64;          // records buffered per queue (power of 2)
+let is i64 as EV_MASK  = 63;
+let is i64 as EV_WORDS = 3;           // {pid, kind, code}
+
+let is kobject.KObjectOps as EVENT_OPS with mut;
+
+// Registry of every live queue + the one lock that guards it all.
+let is i64 as g_head with mut = 0;    // *EventQueue (0 = none)
+let is lock.TicketLock as g_lock with mut;
+
+// EventQueue — the priv behind a KOBJ_EVENT. All i64 (mixed-width rule); the
+// record ring goes last. head/tail index records; ring[i*3 .. i*3+2] = one
+// {pid, kind, code}.
+struct EventQueue {
+    owner_pid as i64;     // whose children's events land here
+    mask      as i64;     // kind bits the subscriber wants
+    head      as i64;     // next record to read
+    tail      as i64;     // next slot to write
+    count     as i64;     // records queued (0 .. EV_CAP)
+    closed    as i64;     // 1 once the fd was closed
+    g_next    as i64;     // next queue in the registry
+    ring      as [192]i64;   // EV_CAP(64) * EV_WORDS(3)
+}
+
+fn init() as void {
+    EVENT_OPS.read  = fn_ptr(ev_read);
+    EVENT_OPS.poll  = fn_ptr(ev_poll);
+    EVENT_OPS.close = fn_ptr(ev_close);
+    // write/lseek/readdir/mmap/present stay null — an event fd is read-only.
+}
+
+// ============================================================
+// Producer side — called (via the wired fn-pointer) from process.zombify.
+// Enqueue {ev_pid, kind, code} into every open queue whose owner matches
+// and whose mask selects the kind. Drops the oldest record on overflow
+// (newest lifecycle events are the ones a shell must not miss).
+// ============================================================
+
+fn event_post(owner_pid as i64, ev_pid as i64, kind as i64, code as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as cur with mut = g_head;
+    while (cur != 0) {
+        let is *EventQueue as eq = cast(*EventQueue, cur);
+        if (eq.owner_pid == owner_pid) {
+            if (eq.closed == 0) {
+                if ((eq.mask & kind) != 0) {
+                    if (eq.count >= EV_CAP) {
+                        eq.head = (eq.head + 1) & EV_MASK;   // drop oldest
+                        eq.count = eq.count - 1;
+                    }
+                    let is *i64 as r = cast(*i64, cast(i64, &eq.ring[0]));
+                    let is i64 as t = eq.tail * EV_WORDS;
+                    r[t + 0] = ev_pid;
+                    r[t + 1] = kind;
+                    r[t + 2] = code;
+                    eq.tail = (eq.tail + 1) & EV_MASK;
+                    eq.count = eq.count + 1;
+                }
+            }
+        }
+        cur = eq.g_next;
+    }
+    lock.release_irq(&g_lock, fl);
+}
+
+// ============================================================
+// Lifecycle — create registers a queue; ev_close unlinks and frees it.
+// ============================================================
+
+// Mint a KOBJ_EVENT for `owner_pid` watching `mask` kinds. Returns the
+// *KObject as i64 (0 on OOM).
+fn event_create(owner_pid as i64, mask as i64) as i64 {
+    let is i64 as q = heap.kmalloc(sizeof(EventQueue), pmm.ALLOC_ZERO);
+    if (q == 0) { return 0; }
+    let is *EventQueue as eq = cast(*EventQueue, q);
+    eq.owner_pid = owner_pid;
+    eq.mask = mask;
+    // head/tail/count/closed zeroed by ALLOC_ZERO.
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_EVENT, &EVENT_OPS, q);
+    if (ko == 0) { heap.kfree(q); return 0; }
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    eq.g_next = g_head;
+    g_head = q;
+    lock.release_irq(&g_lock, fl);
+    return ko;
+}
+
+// ============================================================
+// Ops. `buf` is a kernel staging address (sys_read staged the copy-out).
+// ============================================================
+
+// Dequeue as many whole 24-byte records as fit in `n`. Non-blocking: returns
+// 0 when the queue is empty (the subscriber polls, it does not spin here).
+fn ev_read(priv as i64, buf as i64, n as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is i64 as recsz = EV_WORDS * 8;             // 24
+    if (n < recsz) { return 0; }
+    let is *EventQueue as eq = cast(*EventQueue, priv);
+    let is i64 as maxrec = n / recsz;
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is *i64 as r = cast(*i64, cast(i64, &eq.ring[0]));
+    let is i64 as out with mut = 0;
+    while (out < maxrec && eq.count > 0) {
+        let is i64 as h = eq.head * EV_WORDS;
+        let is *i64 as dst = cast(*i64, buf + out * recsz);
+        dst[0] = r[h + 0];
+        dst[1] = r[h + 1];
+        dst[2] = r[h + 2];
+        eq.head = (eq.head + 1) & EV_MASK;
+        eq.count = eq.count - 1;
+        out = out + 1;
+    }
+    lock.release_irq(&g_lock, fl);
+    return out * recsz;
+}
+
+fn ev_poll(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *EventQueue as eq = cast(*EventQueue, priv);
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as c = eq.count;
+    let is i64 as cl = eq.closed;
+    lock.release_irq(&g_lock, fl);
+    let is i64 as st with mut = 0;
+    if (c > 0) { st = st | abi.POLL_READABLE; }
+    if (cl != 0) { st = st | abi.POLL_READABLE | abi.POLL_CLOSED; }
+    return st;
+}
+
+fn ev_close(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_OK; }
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as prev with mut = 0;
+    let is i64 as cur with mut = g_head;
+    let is i64 as done with mut = 0;
+    while (cur != 0) {
+        if (done == 0) {
+            let is *EventQueue as ce = cast(*EventQueue, cur);
+            let is i64 as nxt = ce.g_next;
+            if (cur == priv) {
+                if (prev == 0) { g_head = nxt; }
+                else {
+                    let is *EventQueue as pe = cast(*EventQueue, prev);
+                    pe.g_next = nxt;
+                }
+                done = 1;
+            } else {
+                prev = cur;
+                cur = nxt;
+            }
+        } else {
+            cur = 0;
+        }
+    }
+    lock.release_irq(&g_lock, fl);
+    heap.kfree(priv);
+    return abi.E_OK;
+}
+
+// ============================================================
+// Kernel-side smoke: create a queue for pid 42, post 2 exit records, read
+// them back, verify order + contents, confirm a second read is empty, then
+// close. Runs at boot; a failure panics so verify.sh catches a regression.
+// ============================================================
+
+fn smoke() as void {
+    serial.println("eventfd_smoke: start", 20);
+    let is i64 as ko = event_create(42, abi.EVENT_EXIT);
+    if (ko == 0) { pmm.panic("eventfd_smoke: create FAIL", 26); }
+    let is i64 as priv = kobject.ko_priv(ko);
+
+    // A record whose kind is not in the mask must be dropped. Kinds are bit
+    // flags (EVENT_EXIT = bit 0); kind 2 (bit 1) is outside mask = EVENT_EXIT.
+    event_post(42, 7, 2, 0);                // kind 2 not in mask -> ignored
+    event_post(42, 7, abi.EVENT_EXIT, 3);   // child pid 7 exit code 3
+    event_post(42, 9, abi.EVENT_EXIT, 137); // child pid 9 killed (137)
+    event_post(99, 5, abi.EVENT_EXIT, 0);   // wrong owner -> ignored
+
+    let is [6]i64 as got;
+    let is i64 as nb = ev_read(priv, cast(i64, &got[0]), 48);   // room for 2 recs
+    let is i64 as ok with mut = 1;
+    if (nb != 48) { ok = 0; }
+    if (got[0] != 7)   { ok = 0; }          // rec0 pid
+    if (got[1] != abi.EVENT_EXIT) { ok = 0; }
+    if (got[2] != 3)   { ok = 0; }          // rec0 code
+    if (got[3] != 9)   { ok = 0; }          // rec1 pid
+    if (got[5] != 137) { ok = 0; }          // rec1 code
+    // queue now empty
+    if (ev_read(priv, cast(i64, &got[0]), 48) != 0) { ok = 0; }
+    if ((ev_poll(priv) & abi.POLL_READABLE) != 0)   { ok = 0; }
+
+    kobject.ko_unref(ko);                    // runs ev_close, unlinks + frees
+
+    if (ok == 1) { serial.println("eventfd_smoke: PASS", 19); }
+    else { pmm.panic("eventfd_smoke: FAIL", 19); }
+}
