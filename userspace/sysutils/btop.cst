@@ -15,7 +15,7 @@ let is i64 as C_SEL = 0x0045475a;
 let is i64 as g_cols with mut = 80; let is i64 as g_rows with mut = 24;   // until CSI 8t arrives
 let is i64 as HSIZE = 24;
 let is [400]i64 as cpu_hist; let is i64 as cpu_hpos with mut = 0; let is i64 as cpu_filled with mut = 0; let is i64 as ncpu with mut = 1;
-let is [512]i64 as g_ents; let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
+let is [576]i64 as g_ents; let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
 let is i64 as g_quit with mut = 0; let is i64 as totalb with mut = 1;
 let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
 
@@ -155,21 +155,67 @@ fn cpu_pct(core as i64) as i64 {
     while (i < cpu_filled) { sum = sum + cpu_hist[core * HSIZE + i]; i = i + 1; }
     return sum / cpu_filled;
 }
+
+// Per-process CPU. The kernel hands out cumulative nanoseconds; the percentage
+// is the delta over the elapsed clock, keyed by pid so a table that reorders
+// between samples still compares like with like. This is the column that makes
+// "why is the machine busy" a question with an answer on screen.
+let is [64]i64 as pcpu_pid with mut;
+let is [64]i64 as pcpu_ns with mut;
+let is i64 as pcpu_n with mut = 0;
+let is i64 as pcpu_last_t with mut = 0;
+let is [64]i64 as pcpu_pct with mut;
+
+fn proc_pct(idx as i64) as i64 { return pcpu_pct[idx]; }
+
+fn sample_proc_cpu(now as i64) as void {
+    let is i64 as dt = now - pcpu_last_t;
+    let is i64 as i with mut = 0;
+    while (i < g_nproc) {
+        let is i64 as pid = g_ents[i * 9];
+        let is i64 as cur = g_ents[i * 9 + 8];
+        let is i64 as prev with mut = 0 - 1;
+        let is i64 as k with mut = 0;
+        while (k < pcpu_n) {
+            if (pcpu_pid[k] == pid) { prev = pcpu_ns[k]; }
+            k = k + 1;
+        }
+        let is i64 as pct with mut = 0;
+        if (prev >= 0 && pcpu_last_t > 0 && dt > 0) {
+            pct = (cur - prev) * 100 / dt;
+            if (pct < 0) { pct = 0; }
+            if (pct > 100) { pct = 100; }
+        }
+        pcpu_pct[i] = pct;
+        i = i + 1;
+    }
+    // Re-key the history to this snapshot.
+    pcpu_n = g_nproc;
+    if (pcpu_n > 64) { pcpu_n = 64; }
+    i = 0;
+    while (i < pcpu_n) {
+        pcpu_pid[i] = g_ents[i * 9];
+        pcpu_ns[i] = g_ents[i * 9 + 8];
+        i = i + 1;
+    }
+    pcpu_last_t = now;
+}
+
 fn statename(s as i64) as *u8 { if (s == 1) { return "run"; } if (s == 3) { return "zombie"; } if (s == 2) { return "exit"; } return "?"; }
 fn state_col(s as i64) as i64 { if (s == 1) { return C_GREEN; } if (s == 3) { return C_RED; } return C_DIM; }
 fn sort_procs() as void {
     let is i64 as i with mut = 1;
     while (i < g_nproc) {
-        let is [8]i64 as tmp; let is i64 as w with mut = 0; while (w < 8) { tmp[w] = g_ents[i * 8 + w]; w = w + 1; }
+        let is [9]i64 as tmp; let is i64 as w with mut = 0; while (w < 9) { tmp[w] = g_ents[i * 9 + w]; w = w + 1; }
         let is i64 as j with mut = i - 1;
-        while (j >= 0 && g_ents[j * 8] > tmp[0]) { w = 0; while (w < 8) { g_ents[(j + 1) * 8 + w] = g_ents[j * 8 + w]; w = w + 1; } j = j - 1; }
-        w = 0; while (w < 8) { g_ents[(j + 1) * 8 + w] = tmp[w]; w = w + 1; }
+        while (j >= 0 && g_ents[j * 9] > tmp[0]) { w = 0; while (w < 9) { g_ents[(j + 1) * 9 + w] = g_ents[j * 9 + w]; w = w + 1; } j = j - 1; }
+        w = 0; while (w < 9) { g_ents[(j + 1) * 9 + w] = tmp[w]; w = w + 1; }
         i = i + 1;
     }
 }
 
 // ---- stdin: keys + the CSI 8t size report, parsed as a byte stream ----
-fn do_kill() as void { if (g_sel >= 0 && g_sel < g_nproc) { sys.kill(g_ents[g_sel * 8]); } }
+fn do_kill() as void { if (g_sel >= 0 && g_sel < g_nproc) { sys.kill(g_ents[g_sel * 9]); } }
 fn feed(c as i64) as void {
     if (in_esc == 0) {
         if (c == 0x1B) { in_esc = 1; return; }
@@ -239,20 +285,24 @@ fn render() as void {
     }
     row = row + 1;
     // process table
-    cup(row, 1); fgc(C_DIM); obs("  PID PPID STATE   PROGRAM         THR      MEM"); sgr0(); eol(); row = row + 1;
+    cup(row, 1); fgc(C_DIM); obs("  PID PPID STATE   PROGRAM         THR      MEM   CPU"); sgr0(); eol(); row = row + 1;
     let is i64 as avail = g_rows - row;
     if (g_sel < g_scroll) { g_scroll = g_sel; }
     if (g_sel >= g_scroll + avail) { g_scroll = g_sel - avail + 1; }
     if (g_scroll < 0) { g_scroll = 0; }
     let is i64 as i with mut = g_scroll; let is i64 as shown with mut = 0;
     while (i < g_nproc && shown < avail) {
-        let is i64 as b = i * 8;
+        let is i64 as b = i * 9;
         cup(row, 1);
         if (i == g_sel) { bgc(C_SEL); }
         fgc(C_FG); pad_num(g_ents[b], 5); ob(32); fgc(C_DIM); pad_num(g_ents[b + 1], 4); ob(32);
         fgc(state_col(g_ents[b + 2])); pad_str(statename(g_ents[b + 2]), 7); ob(32);
         fgc(C_FG); pad_name(cast(*u8, cast(i64, &g_ents[0]) + (b + 6) * 8), 14); ob(32);
         fgc(C_DIM); pad_num(g_ents[b + 4], 3); ob(32); ob(32); fgc(C_FG); obbytes(g_ents[b + 5]);
+        ob(32); ob(32);
+        let is i64 as pc = proc_pct(i);
+        if (pc >= 10) { fgc(C_RED); } else if (pc > 0) { fgc(C_FG); } else { fgc(C_DIM); }
+        pad_num(pc, 3); obs("%");
         eol(); sgr0(); row = row + 1; i = i + 1; shown = shown + 1;
     }
     while (shown < avail) { cup(row, 1); eol(); row = row + 1; shown = shown + 1; }
@@ -270,6 +320,7 @@ fn main(argc as i64, argv as *u8) as i32 {
         sample_cpu();
         g_nproc = sys.proc_list(cast(*i64, &g_ents[0]), 64); if (g_nproc > 64) { g_nproc = 64; }
         sort_procs();
+        sample_proc_cpu(sys.time_ns());
         if (g_sel >= g_nproc) { g_sel = g_nproc - 1; } if (g_sel < 0) { g_sel = 0; }
         render();
         flush_ob();
