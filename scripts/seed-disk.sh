@@ -37,6 +37,12 @@ if [ "$MODE" = "wm" ]; then
     addf init.cse compositor.cse
     addf wm.cse wm.cse
     addf launcher.cse launcher.cse
+    # The WM's shipped config. /var/wm/config.cst (the user's) is read after it
+    # and overrides key by key; /var/wm also holds the saved layout.
+    python3 scripts/fat32_add_file.py build/disk.img mkdir etc >/dev/null
+    python3 scripts/fat32_add_file.py build/disk.img mkdir var/wm >/dev/null
+    python3 scripts/fat32_add_file.py build/disk.img addfilebin etc/wm.cst \
+        userspace/wm/wm.default.cst >/dev/null
     PROGS="wmpat wterm newterm btop echo cat ls uptime sysinfo vic guess \
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
            touch mkdir rmdir rm mv cp stat du tree find clear \

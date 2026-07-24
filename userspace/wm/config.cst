@@ -1,0 +1,547 @@
+// wm/config.cst — what the window manager reads instead of being rebuilt.
+//
+// Two tiers: /etc/wm.cst ships the defaults, /var/wm/config.cst is the user's
+// and is read second, so it overrides key by key rather than replacing the
+// file. Neither has to exist — the compiled defaults below are the same set
+// /etc/wm.cst ships, so a disk with no config behaves identically to one with
+// the stock one.
+//
+// A line is `key value...`, '#' comments to end of line:
+//
+//   bind   <mods> <key> <action> [arg]   super+shift 1 tag 1
+//   unbind <mods> <key>
+//   color  <name> <hex>                  border_focus 73d0ff
+//   title_h | border | bar_h | btn_w | task_w | snap | min_w | min_h  <px>
+//   layout tile | monocle | float        the layout every tag starts on
+//   mfact  <percent>                     master column width, 10..90
+//   nmaster <n>
+//   float  <name>                        that program's windows start floating
+//   swallow <name>                       it takes over the window that spawned it
+//
+// Reloaded automatically: the mtime of both files is checked once a second,
+// and a change re-reads them. Editing the config is the same act as applying
+// it — there is no reload command because there is no daemon to send it to.
+
+use "state.cst" as s;
+use "damage.cst" as dmg;
+use "../lib/compo_proto/compo_proto.cst" as cp;
+use "../lib/wmproto/wmproto.cst" as wmp;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as ACT_NONE        with imut = 0;
+let is i64 as ACT_CYCLE       with imut = 1;
+let is i64 as ACT_CYCLE_BACK  with imut = 2;
+let is i64 as ACT_SPAWN_TERM  with imut = 3;
+let is i64 as ACT_LAUNCHER    with imut = 4;
+let is i64 as ACT_CLOSE       with imut = 5;
+let is i64 as ACT_LAYOUT_NEXT with imut = 6;
+let is i64 as ACT_LAYOUT_SET  with imut = 7;
+let is i64 as ACT_VIEW        with imut = 8;
+let is i64 as ACT_TAG         with imut = 9;
+let is i64 as ACT_TOGGLE_VIEW with imut = 10;
+let is i64 as ACT_TOGGLE_TAG  with imut = 11;
+let is i64 as ACT_SCRATCH     with imut = 12;
+let is i64 as ACT_SCRATCH_SEND with imut = 13;
+let is i64 as ACT_TOGGLE_FLOAT with imut = 14;
+let is i64 as ACT_ZOOM        with imut = 15;
+let is i64 as ACT_INC_MASTER  with imut = 16;
+let is i64 as ACT_MFACT       with imut = 17;
+let is i64 as ACT_MINIMIZE    with imut = 18;
+let is i64 as ACT_MAXIMIZE    with imut = 19;
+let is i64 as ACT_FOCUS_NEXT  with imut = 20;
+let is i64 as ACT_FOCUS_PREV  with imut = 21;
+let is i64 as ACT_VIEW_ALL    with imut = 22;
+let is i64 as ACT_QUIT        with imut = 23;
+
+// ---- tokens ---------------------------------------------------------------
+
+fn _ws(c as i64) as i64 {
+    if (c == 32 || c == 9) { return 1; }
+    return 0;
+}
+
+fn _tok_eq(buf as *u8, a as i64, b as i64, lit as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a + i < b) {
+        if (lit[i] == cast(u8, 0)) { return 0; }
+        if (buf[a + i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    if (lit[i] != cast(u8, 0)) { return 0; }
+    return 1;
+}
+
+// Decimal, with a leading '-' (mfact steps are signed).
+fn _int(buf as *u8, a as i64, b as i64) as i64 {
+    let is i64 as i with mut = a;
+    let is i64 as neg with mut = 0;
+    if (i < b && cast(i64, buf[i]) == 45) { neg = 1; i = i + 1; }
+    let is i64 as v with mut = 0;
+    while (i < b) {
+        let is i64 as c = cast(i64, buf[i]);
+        if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); }
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+// Hex, with an optional 0x prefix. -1 when a byte is not a hex digit, so a
+// mistyped colour is refused rather than silently drawn as black.
+fn _hex(buf as *u8, a as i64, b as i64) as i64 {
+    let is i64 as i with mut = a;
+    if (i + 1 < b && cast(i64, buf[i]) == 48
+        && (cast(i64, buf[i+1]) == 120 || cast(i64, buf[i+1]) == 88)) { i = i + 2; }
+    if (i >= b) { return 0 - 1; }
+    let is i64 as v with mut = 0;
+    while (i < b) {
+        let is i64 as c = cast(i64, buf[i]);
+        if (c >= 48 && c <= 57)       { v = v * 16 + (c - 48); }
+        else if (c >= 97 && c <= 102) { v = v * 16 + (c - 87); }
+        else if (c >= 65 && c <= 70)  { v = v * 16 + (c - 55); }
+        else { return 0 - 1; }
+        i = i + 1;
+    }
+    return v;
+}
+
+// ---- key + modifier names -------------------------------------------------
+
+// A PS/2 Set-1 scancode for a key NAME. Hotkeys bind to the physical key so a
+// different keymap moves the letters, not the shortcuts.
+fn _scancode_of(buf as *u8, a as i64, b as i64) as i64 {
+    if (b - a == 1) {
+        let is i64 as c with mut = cast(i64, buf[a]);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c >= 97 && c <= 122) {
+            let is *u8 as row1 = "qwertyuiop";
+            let is *u8 as row2 = "asdfghjkl";
+            let is *u8 as row3 = "zxcvbnm";
+            let is i64 as k with mut = 0;
+            while (k < 10) { if (cast(i64, row1[k]) == c) { return 0x10 + k; } k = k + 1; }
+            k = 0;
+            while (k < 9)  { if (cast(i64, row2[k]) == c) { return 0x1E + k; } k = k + 1; }
+            k = 0;
+            while (k < 7)  { if (cast(i64, row3[k]) == c) { return 0x2C + k; } k = k + 1; }
+            return 0 - 1;
+        }
+        if (c >= 49 && c <= 57) { return 0x02 + (c - 49); }   // 1..9
+        if (c == 48) { return 0x0B; }                          // 0
+        return 0 - 1;
+    }
+    if (_tok_eq(buf, a, b, cast(*u8, "enter")) == 1) { return 0x1C; }
+    if (_tok_eq(buf, a, b, cast(*u8, "tab")) == 1) { return 0x0F; }
+    if (_tok_eq(buf, a, b, cast(*u8, "space")) == 1) { return 0x39; }
+    if (_tok_eq(buf, a, b, cast(*u8, "esc")) == 1) { return 0x01; }
+    if (_tok_eq(buf, a, b, cast(*u8, "grave")) == 1) { return 0x29; }
+    if (_tok_eq(buf, a, b, cast(*u8, "minus")) == 1) { return 0x0C; }
+    if (_tok_eq(buf, a, b, cast(*u8, "equal")) == 1) { return 0x0D; }
+    if (_tok_eq(buf, a, b, cast(*u8, "comma")) == 1) { return 0x33; }
+    if (_tok_eq(buf, a, b, cast(*u8, "period")) == 1) { return 0x34; }
+    if (_tok_eq(buf, a, b, cast(*u8, "slash")) == 1) { return 0x35; }
+    if (_tok_eq(buf, a, b, cast(*u8, "backspace")) == 1) { return 0x0E; }
+    if (_tok_eq(buf, a, b, cast(*u8, "lbracket")) == 1) { return 0x1A; }
+    if (_tok_eq(buf, a, b, cast(*u8, "rbracket")) == 1) { return 0x1B; }
+    return 0 - 1;
+}
+
+// "super+shift" -> the MOD_* mask. Unknown names make the whole bind invalid
+// (-1) instead of binding on fewer modifiers than were asked for.
+fn _mods_of(buf as *u8, a as i64, b as i64) as i64 {
+    let is i64 as m with mut = 0;
+    let is i64 as i with mut = a;
+    while (i <= b) {
+        let is i64 as j with mut = i;
+        while (j < b && cast(i64, buf[j]) != 43) { j = j + 1; }   // '+'
+        if (j > i) {
+            if (_tok_eq(buf, i, j, cast(*u8, "super")) == 1) { m = m | cp.MOD_SUPER; }
+            else if (_tok_eq(buf, i, j, cast(*u8, "alt")) == 1) { m = m | cp.MOD_ALT; }
+            else if (_tok_eq(buf, i, j, cast(*u8, "shift")) == 1) { m = m | cp.MOD_SHIFT; }
+            else if (_tok_eq(buf, i, j, cast(*u8, "ctrl")) == 1) { m = m | cp.MOD_CTRL; }
+            else if (_tok_eq(buf, i, j, cast(*u8, "none")) == 1) { m = m | 0; }
+            else { return 0 - 1; }
+        }
+        i = j + 1;
+    }
+    return m;
+}
+
+fn _action_of(buf as *u8, a as i64, b as i64) as i64 {
+    if (_tok_eq(buf, a, b, cast(*u8, "cycle")) == 1) { return ACT_CYCLE; }
+    if (_tok_eq(buf, a, b, cast(*u8, "cycle_back")) == 1) { return ACT_CYCLE_BACK; }
+    if (_tok_eq(buf, a, b, cast(*u8, "spawn_term")) == 1) { return ACT_SPAWN_TERM; }
+    if (_tok_eq(buf, a, b, cast(*u8, "launcher")) == 1) { return ACT_LAUNCHER; }
+    if (_tok_eq(buf, a, b, cast(*u8, "close")) == 1) { return ACT_CLOSE; }
+    if (_tok_eq(buf, a, b, cast(*u8, "layout_next")) == 1) { return ACT_LAYOUT_NEXT; }
+    if (_tok_eq(buf, a, b, cast(*u8, "tile")) == 1) { return ACT_LAYOUT_SET; }
+    if (_tok_eq(buf, a, b, cast(*u8, "monocle")) == 1) { return ACT_LAYOUT_SET; }
+    if (_tok_eq(buf, a, b, cast(*u8, "float")) == 1) { return ACT_LAYOUT_SET; }
+    if (_tok_eq(buf, a, b, cast(*u8, "view")) == 1) { return ACT_VIEW; }
+    if (_tok_eq(buf, a, b, cast(*u8, "view_all")) == 1) { return ACT_VIEW_ALL; }
+    if (_tok_eq(buf, a, b, cast(*u8, "tag")) == 1) { return ACT_TAG; }
+    if (_tok_eq(buf, a, b, cast(*u8, "toggle_view")) == 1) { return ACT_TOGGLE_VIEW; }
+    if (_tok_eq(buf, a, b, cast(*u8, "toggle_tag")) == 1) { return ACT_TOGGLE_TAG; }
+    if (_tok_eq(buf, a, b, cast(*u8, "scratchpad")) == 1) { return ACT_SCRATCH; }
+    if (_tok_eq(buf, a, b, cast(*u8, "scratch_send")) == 1) { return ACT_SCRATCH_SEND; }
+    if (_tok_eq(buf, a, b, cast(*u8, "toggle_float")) == 1) { return ACT_TOGGLE_FLOAT; }
+    if (_tok_eq(buf, a, b, cast(*u8, "zoom")) == 1) { return ACT_ZOOM; }
+    if (_tok_eq(buf, a, b, cast(*u8, "inc_master")) == 1) { return ACT_INC_MASTER; }
+    if (_tok_eq(buf, a, b, cast(*u8, "mfact")) == 1) { return ACT_MFACT; }
+    if (_tok_eq(buf, a, b, cast(*u8, "minimize")) == 1) { return ACT_MINIMIZE; }
+    if (_tok_eq(buf, a, b, cast(*u8, "maximize")) == 1) { return ACT_MAXIMIZE; }
+    if (_tok_eq(buf, a, b, cast(*u8, "focus_next")) == 1) { return ACT_FOCUS_NEXT; }
+    if (_tok_eq(buf, a, b, cast(*u8, "focus_prev")) == 1) { return ACT_FOCUS_PREV; }
+    if (_tok_eq(buf, a, b, cast(*u8, "quit")) == 1) { return ACT_QUIT; }
+    return 0 - 1;
+}
+
+// The layout an action token names, for the three that ARE a layout.
+fn _layout_arg(buf as *u8, a as i64, b as i64) as i64 {
+    if (_tok_eq(buf, a, b, cast(*u8, "tile")) == 1) { return s.LAY_TILE; }
+    if (_tok_eq(buf, a, b, cast(*u8, "monocle")) == 1) { return s.LAY_MONOCLE; }
+    if (_tok_eq(buf, a, b, cast(*u8, "float")) == 1) { return s.LAY_FLOAT; }
+    return 0 - 1;
+}
+
+// ---- bind table -----------------------------------------------------------
+
+fn bind_find(mods as i64, sc as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < s.bind_n) {
+        if (s.bind_sc[i] == sc && s.bind_mods[i] == mods) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// A bind for a chord that is already bound REPLACES it: the user's file
+// rebinds a default rather than shadowing it with a duplicate row.
+fn bind_add(mods as i64, sc as i64, act as i64, arg as i64) as void {
+    let is i64 as at with mut = bind_find(mods, sc);
+    if (at < 0) {
+        if (s.bind_n >= s.BIND_MAX) {
+            sys.write_serial(cast(*u8, "wm: bind table full\n"), 20);
+            return;
+        }
+        at = s.bind_n;
+        s.bind_n = s.bind_n + 1;
+    }
+    s.bind_mods[at] = mods;
+    s.bind_sc[at] = sc;
+    s.bind_act[at] = act;
+    s.bind_arg[at] = arg;
+    return;
+}
+
+fn bind_remove(mods as i64, sc as i64) as void {
+    let is i64 as at = bind_find(mods, sc);
+    if (at < 0) { return; }
+    let is i64 as j with mut = at;
+    while (j < s.bind_n - 1) {
+        s.bind_mods[j] = s.bind_mods[j+1];
+        s.bind_sc[j] = s.bind_sc[j+1];
+        s.bind_act[j] = s.bind_act[j+1];
+        s.bind_arg[j] = s.bind_arg[j+1];
+        j = j + 1;
+    }
+    s.bind_n = s.bind_n - 1;
+    return;
+}
+
+// ---- name rules -----------------------------------------------------------
+
+fn _rule_add(which as i64, buf as *u8, a as i64, b as i64) as void {
+    let is i64 as len with mut = b - a;
+    if (len <= 0) { return; }
+    if (len > 16) { len = 16; }
+    let is [2]i64 as p;
+    wmp.title_pack(cast(*u8, cast(i64, buf) + a), len, &p[0], &p[1]);
+    if (which == 0) {
+        if (s.float_n >= s.RULE_MAX) { return; }
+        s.float_n0[s.float_n] = p[0];
+        s.float_n1[s.float_n] = p[1];
+        s.float_len[s.float_n] = len;
+        s.float_n = s.float_n + 1;
+        return;
+    }
+    if (s.swal_n >= s.RULE_MAX) { return; }
+    s.swal_n0[s.swal_n] = p[0];
+    s.swal_n1[s.swal_n] = p[1];
+    s.swal_len[s.swal_n] = len;
+    s.swal_n = s.swal_n + 1;
+    return;
+}
+
+// Rules match the SPAWN name, so "wterm" is every terminal and never the one
+// that happens to be showing a file called wterm.
+fn float_rule(n0 as i64, n1 as i64, len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < s.float_n) {
+        if (s.float_len[i] == len && s.float_n0[i] == n0 && s.float_n1[i] == n1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn swallow_rule(n0 as i64, n1 as i64, len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < s.swal_n) {
+        if (s.swal_len[i] == len && s.swal_n0[i] == n0 && s.swal_n1[i] == n1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---- defaults -------------------------------------------------------------
+
+fn _defaults() as void {
+    s.TITLE_H = 20; s.BORDER = 1; s.BAR_H = 26; s.BTN_W = 24; s.TASK_W = 150;
+    s.MIN_W = 160; s.MIN_H = 64; s.SNAP_PX = 12;
+    s.COL_BORDER_F = 0x0073d0ff; s.COL_BORDER_U = 0x003a4048;
+    s.COL_TITLE_F  = 0x002a3a4a; s.COL_TITLE_U  = 0x001c2228;
+    s.COL_TEXT     = 0x00d3d7cf; s.COL_CLOSE_H  = 0x00c84040;
+    s.COL_BAR      = 0x00161b21; s.COL_BAR_ITEM = 0x00262f38;
+    s.COL_BAR_DIM  = 0x008a909a; s.COL_MAX_H    = 0x00c8a020;
+    s.COL_MIN_H    = 0x005a6570; s.COL_DESKTOP  = 0x00202830;
+    s.mfact = 55;
+    s.nmaster = 1;
+    s.float_n = 0;
+    s.swal_n = 0;
+    s.bind_n = 0;
+    let is i64 as t with mut = 0;
+    while (t < 10) { s.tag_layout[t] = s.LAY_FLOAT; t = t + 1; }
+
+    bind_add(cp.MOD_SUPER, 0x1C, ACT_SPAWN_TERM, 0);              // Super+Enter
+    bind_add(cp.MOD_SUPER, 0x39, ACT_LAUNCHER, 0);                // Super+Space
+    bind_add(cp.MOD_SUPER, 0x10, ACT_CLOSE, 0);                   // Super+Q
+    bind_add(cp.MOD_ALT,   0x0F, ACT_CYCLE, 0);                   // Alt+Tab
+    bind_add(cp.MOD_ALT | cp.MOD_SHIFT, 0x0F, ACT_CYCLE_BACK, 0); // Alt+Shift+Tab
+    bind_add(cp.MOD_SUPER, 0x14, ACT_LAYOUT_NEXT, 0);             // Super+T
+    bind_add(cp.MOD_SUPER, 0x21, ACT_TOGGLE_FLOAT, 0);            // Super+F
+    bind_add(cp.MOD_SUPER, 0x2C, ACT_ZOOM, 0);                    // Super+Z
+    bind_add(cp.MOD_SUPER, 0x29, ACT_SCRATCH, 0);                 // Super+`
+    bind_add(cp.MOD_SUPER | cp.MOD_SHIFT, 0x29, ACT_SCRATCH_SEND, 0);
+    bind_add(cp.MOD_SUPER, 0x17, ACT_INC_MASTER, 1);              // Super+I
+    bind_add(cp.MOD_SUPER, 0x20, ACT_INC_MASTER, 0 - 1);          // Super+D
+    bind_add(cp.MOD_SUPER, 0x23, ACT_MFACT, 0 - 5);               // Super+H
+    bind_add(cp.MOD_SUPER, 0x26, ACT_MFACT, 5);                   // Super+L
+    bind_add(cp.MOD_SUPER, 0x24, ACT_FOCUS_NEXT, 0);              // Super+J
+    bind_add(cp.MOD_SUPER, 0x25, ACT_FOCUS_PREV, 0);              // Super+K
+    bind_add(cp.MOD_SUPER, 0x0C, ACT_MINIMIZE, 0);                // Super+-
+    bind_add(cp.MOD_SUPER, 0x0D, ACT_MAXIMIZE, 0);                // Super+=
+    bind_add(cp.MOD_SUPER, 0x0B, ACT_VIEW_ALL, 0);                // Super+0
+    bind_add(cp.MOD_SUPER | cp.MOD_SHIFT, 0x10, ACT_QUIT, 0);     // Super+Shift+Q
+    let is i64 as k with mut = 0;
+    while (k < s.TAG_COUNT) {
+        bind_add(cp.MOD_SUPER, 0x02 + k, ACT_VIEW, k);
+        bind_add(cp.MOD_SUPER | cp.MOD_SHIFT, 0x02 + k, ACT_TAG, k);
+        bind_add(cp.MOD_SUPER | cp.MOD_CTRL, 0x02 + k, ACT_TOGGLE_VIEW, k);
+        k = k + 1;
+    }
+    // The launcher is a transient panel and the scratchpad is a drop-down;
+    // neither belongs in a tiling column.
+    _rule_add(0, cast(*u8, "launcher.cse"), 0, 12);
+    return;
+}
+
+// ---- one key/value --------------------------------------------------------
+
+fn _color_set(buf as *u8, ns as i64, ne as i64, v as i64) as void {
+    if (_tok_eq(buf, ns, ne, cast(*u8, "border_focus")) == 1) { s.COL_BORDER_F = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "border_unfocus")) == 1) { s.COL_BORDER_U = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "title_focus")) == 1) { s.COL_TITLE_F = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "title_unfocus")) == 1) { s.COL_TITLE_U = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "text")) == 1) { s.COL_TEXT = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "close_hover")) == 1) { s.COL_CLOSE_H = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "max_hover")) == 1) { s.COL_MAX_H = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "min_hover")) == 1) { s.COL_MIN_H = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "bar")) == 1) { s.COL_BAR = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "bar_item")) == 1) { s.COL_BAR_ITEM = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "bar_dim")) == 1) { s.COL_BAR_DIM = v; return; }
+    if (_tok_eq(buf, ns, ne, cast(*u8, "desktop")) == 1) { s.COL_DESKTOP = v; return; }
+    return;
+}
+
+fn _clampi(v as i64, lo as i64, hi as i64) as i64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// t[] holds up to 4 token ranges as {start,end} pairs; n is how many were found.
+fn _line(buf as *u8, t as *i64, n as i64) as void {
+    if (n < 2) { return; }
+    let is i64 as ks = t[0]; let is i64 as ke = t[1];
+    let is i64 as vs = t[2]; let is i64 as ve = t[3];
+
+    if (_tok_eq(buf, ks, ke, cast(*u8, "bind")) == 1) {
+        if (n < 4) { return; }
+        let is i64 as mods = _mods_of(buf, vs, ve);
+        let is i64 as sc = _scancode_of(buf, t[4], t[5]);
+        let is i64 as act = _action_of(buf, t[6], t[7]);
+        if (mods < 0 || sc < 0 || act < 0) {
+            sys.write_serial(cast(*u8, "wm: bad bind line\n"), 18);
+            return;
+        }
+        let is i64 as arg with mut = 0;
+        let is i64 as lay = _layout_arg(buf, t[6], t[7]);
+        if (lay >= 0) { arg = lay; }
+        else if (n >= 5) {
+            arg = _int(buf, t[8], t[9]);
+            if (act == ACT_VIEW || act == ACT_TAG || act == ACT_TOGGLE_VIEW
+                || act == ACT_TOGGLE_TAG) {
+                arg = arg - 1;                       // the file says tag 1..9
+                if (arg < 0 || arg >= s.TAG_COUNT) { return; }
+            }
+        }
+        bind_add(mods, sc, act, arg);
+        return;
+    }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "unbind")) == 1) {
+        if (n < 3) { return; }
+        let is i64 as mods = _mods_of(buf, vs, ve);
+        let is i64 as sc = _scancode_of(buf, t[4], t[5]);
+        if (mods < 0 || sc < 0) { return; }
+        bind_remove(mods, sc);
+        return;
+    }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "color")) == 1) {
+        if (n < 3) { return; }
+        let is i64 as v = _hex(buf, t[4], t[5]);
+        if (v < 0) {
+            sys.write_serial(cast(*u8, "wm: bad colour value\n"), 21);
+            return;
+        }
+        _color_set(buf, vs, ve, v & 0xFFFFFF);
+        return;
+    }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "float")) == 1) { _rule_add(0, buf, vs, ve); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "swallow")) == 1) { _rule_add(1, buf, vs, ve); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "layout")) == 1) {
+        let is i64 as lay = _layout_arg(buf, vs, ve);
+        if (lay < 0) { return; }
+        let is i64 as g with mut = 0;
+        while (g < 10) { s.tag_layout[g] = lay; g = g + 1; }
+        return;
+    }
+
+    let is i64 as v = _int(buf, vs, ve);
+    if (_tok_eq(buf, ks, ke, cast(*u8, "title_h")) == 1) { s.TITLE_H = _clampi(v, 8, 64); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "border")) == 1) { s.BORDER = _clampi(v, 0, 8); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "bar_h")) == 1) { s.BAR_H = _clampi(v, 16, 64); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "btn_w")) == 1) { s.BTN_W = _clampi(v, 8, 64); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "task_w")) == 1) { s.TASK_W = _clampi(v, 48, 400); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "snap")) == 1) { s.SNAP_PX = _clampi(v, 0, 64); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "min_w")) == 1) { s.MIN_W = _clampi(v, 32, 4096); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "min_h")) == 1) { s.MIN_H = _clampi(v, 32, 4096); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "mfact")) == 1) { s.mfact = _clampi(v, 10, 90); return; }
+    if (_tok_eq(buf, ks, ke, cast(*u8, "nmaster")) == 1) { s.nmaster = _clampi(v, 1, 8); return; }
+    return;
+}
+
+// ---- file reading ---------------------------------------------------------
+
+// Returns the file's mtime (0 when absent), so a reload can tell "unchanged"
+// from "not there" without a second syscall.
+fn _mtime(path as *u8) as i64 {
+    let is [5]i64 as sx;
+    if (sys.statx(path, cast(*u8, &sx[0])) != 0) { return 0; }
+    return sx[4];
+}
+
+let is [4096]u8 as cfg_buf with mut;
+
+fn _read_file(path as *u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n = sys.read(fd, cast(*u8, cast(i64, &cfg_buf[0])), 4095);
+    sys.close(fd);
+    if (n <= 0) { return 0 - 1; }
+    return n;
+}
+
+fn _parse(n as i64) as void {
+    let is *u8 as p = cast(*u8, &cfg_buf[0]);
+    let is [10]i64 as t;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        // skip blank space and blank lines
+        while (i < n && (_ws(cast(i64, p[i])) == 1 || cast(i64, p[i]) == 10
+                         || cast(i64, p[i]) == 13)) { i = i + 1; }
+        if (i < n && cast(i64, p[i]) == 35) {
+            while (i < n && cast(i64, p[i]) != 10) { i = i + 1; }
+        } else {
+            let is i64 as ntok with mut = 0;
+            while (ntok < 5 && i < n && cast(i64, p[i]) != 10 && cast(i64, p[i]) != 13) {
+                let is i64 as ts = i;
+                while (i < n && _ws(cast(i64, p[i])) == 0 && cast(i64, p[i]) != 10
+                       && cast(i64, p[i]) != 13) { i = i + 1; }
+                if (i > ts) {
+                    t[ntok * 2] = ts;
+                    t[ntok * 2 + 1] = i;
+                    ntok = ntok + 1;
+                }
+                while (i < n && _ws(cast(i64, p[i])) == 1) { i = i + 1; }
+            }
+            // anything past the fifth token is not part of the grammar
+            while (i < n && cast(i64, p[i]) != 10) { i = i + 1; }
+            if (ntok >= 1) { _line(p, cast(*i64, &t[0]), ntok); }
+        }
+    }
+    return;
+}
+
+// load — defaults, then the shipped file, then the user's. Reading /etc first
+// means a user file only has to carry what it changes.
+fn load() as void {
+    _defaults();
+    s.cfg_mtime_etc = _mtime(cast(*u8, "/etc/wm.cst"));
+    s.cfg_mtime_var = _mtime(cast(*u8, "/var/wm/config.cst"));
+    let is i64 as n1 = _read_file(cast(*u8, "/etc/wm.cst"));
+    if (n1 > 0) { _parse(n1); }
+    let is i64 as n2 = _read_file(cast(*u8, "/var/wm/config.cst"));
+    if (n2 > 0) { _parse(n2); }
+    s.style_dirty = 1;
+    s.deco_dirty = 1;
+    s.scene_dirty = 1;
+    s.arrange_dirty = 1;
+    dmg.dmg_all();
+    return;
+}
+
+// poll_reload — the config is re-read when either file's mtime moves. Checked
+// once a second on the clock's cadence: editing the file IS applying it, and
+// there is no daemon to send a reload command to.
+fn poll_reload(now as i64) as void {
+    if (now < s.cfg_next_check) { return; }
+    s.cfg_next_check = now + 1000000000;
+    let is i64 as me = _mtime(cast(*u8, "/etc/wm.cst"));
+    let is i64 as mv = _mtime(cast(*u8, "/var/wm/config.cst"));
+    if (me == s.cfg_mtime_etc && mv == s.cfg_mtime_var) { return; }
+    sys.write_serial(cast(*u8, "wm: config reloaded\n"), 20);
+    load();
+    return;
+}
+
+// send_style — hand the compositor every metric and colour it draws with. One
+// message per key; sent at startup and after each reload.
+fn send_style() as void {
+    if (s.style_dirty == 0) { return; }
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_TITLE_H, s.TITLE_H, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_BORDER, s.BORDER, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_BAR_H, s.BAR_H, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_BTN_W, s.BTN_W, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_BORDER_F, s.COL_BORDER_F, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_BORDER_U, s.COL_BORDER_U, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_TITLE_F, s.COL_TITLE_F, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_TITLE_U, s.COL_TITLE_U, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_TEXT, s.COL_TEXT, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_BAR, s.COL_BAR, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_BAR_ITEM, s.COL_BAR_ITEM, 0);
+    cp.msg_send(s.wc_fd, cp.MSG_WC_STYLE, cp.STY_COL_DESKTOP, s.COL_DESKTOP, 0);
+    s.style_dirty = 0;
+    // The work area follows the bar height, and every layout is measured
+    // against it.
+    s.work_h = s.scr_h - s.BAR_H;
+    return;
+}

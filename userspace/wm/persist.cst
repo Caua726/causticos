@@ -1,0 +1,194 @@
+// wm/persist.cst — /var/wm/layout: the desktop as it was left.
+//
+// Saved once a second, and only when something moved AND nothing is moving
+// (no animation, no drag): a snapshot taken mid-tween would record a position
+// no window was ever really at. Written to a temp file and renamed over the
+// old one, so a crash mid-write leaves the previous snapshot intact rather
+// than a truncated one.
+//
+// Restored at spawn, keyed by the program's name — the only stable identity a
+// window has across a boot. The first window of a name claims the first record
+// of that name; a second one falls back to the ordinary cascade placement.
+//
+// Layout of the file (little-endian i64 throughout, after the header):
+//   "WMST" | u32 version=1 | i64 count | i64 sel_tags | i64 tag_layout[10]
+//   | i64 mfact | i64 nmaster
+//   then count records of: n0 n1 name_len x y w h tags floating
+
+use "state.cst" as s;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as REC_WORDS with imut = 9;
+let is i64 as HDR_WORDS with imut = 14;   // count, sel_tags, 10 x layout, mfact, nmaster
+
+// One buffer for both directions: the file is bounded by RST_MAX records.
+let is [4096]u8 as pbuf with mut;
+
+fn _put_u64(off as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, cast(i64, &pbuf[0]) + off);
+    p[0] = v;
+    return;
+}
+
+fn _get_u64(off as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &pbuf[0]) + off);
+    return p[0];
+}
+
+fn _magic_ok() as i64 {
+    if (pbuf[0] != cast(u8, 87)) { return 0; }    // W
+    if (pbuf[1] != cast(u8, 77)) { return 0; }    // M
+    if (pbuf[2] != cast(u8, 83)) { return 0; }    // S
+    if (pbuf[3] != cast(u8, 84)) { return 0; }    // T
+    return 1;
+}
+
+// ---- save -----------------------------------------------------------------
+
+// Whether the snapshot is worth taking right now. Any tween running means the
+// geometry on screen is not the geometry the WM believes in yet.
+fn _settled() as i64 {
+    if (s.drag_mode != 0) { return 0; }
+    if (s.anim_live > 0) { return 0; }
+    return 1;
+}
+
+fn save() as void {
+    let is i64 as n with mut = 0;
+    let is i64 as off with mut = 8 + HDR_WORDS * 8;
+    pbuf[0] = cast(u8, 87); pbuf[1] = cast(u8, 77);
+    pbuf[2] = cast(u8, 83); pbuf[3] = cast(u8, 84);
+    // The version sits in the 4 bytes after the magic; the i64 table starts at 8.
+    pbuf[4] = cast(u8, 1); pbuf[5] = cast(u8, 0);
+    pbuf[6] = cast(u8, 0); pbuf[7] = cast(u8, 0);
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN && n < s.RST_MAX) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0
+            && s.wins[i].name_len > 0) {
+            _put_u64(off + 0, s.wins[i].n0);
+            _put_u64(off + 8, s.wins[i].n1);
+            _put_u64(off + 16, s.wins[i].name_len);
+            _put_u64(off + 24, s.wins[i].x);
+            _put_u64(off + 32, s.wins[i].y);
+            _put_u64(off + 40, s.wins[i].w);
+            _put_u64(off + 48, s.wins[i].h);
+            _put_u64(off + 56, s.wins[i].tags);
+            _put_u64(off + 64, s.wins[i].floating);
+            off = off + REC_WORDS * 8;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    _put_u64(8, n);
+    _put_u64(16, s.sel_tags);
+    let is i64 as t with mut = 0;
+    while (t < 10) { _put_u64(24 + t * 8, s.tag_layout[t]); t = t + 1; }
+    _put_u64(104, s.mfact);
+    _put_u64(112, s.nmaster);
+
+    sys.mkdir(cast(*u8, "/var"));
+    sys.mkdir(cast(*u8, "/var/wm"));
+    let is i64 as fd = sys.open_write(cast(*u8, "/var/wm/layout.tmp"));
+    if (fd < 0) { return; }
+    let is i64 as total with mut = 0;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as w = sys.write(fd, cast(*u8, cast(i64, &pbuf[0]) + total), off - total);
+        if (w <= 0) { more = 0; }
+        else { total = total + w; if (total >= off) { more = 0; } }
+    }
+    sys.close(fd);
+    if (total < off) { sys.unlink(cast(*u8, "/var/wm/layout.tmp")); return; }
+    // Rename replaces the previous snapshot in one step: a reader either sees
+    // the old file whole or the new one whole.
+    if (sys.rename(cast(*u8, "/var/wm/layout.tmp"), cast(*u8, "/var/wm/layout")) != 0) {
+        sys.unlink(cast(*u8, "/var/wm/layout.tmp"));
+    }
+    return;
+}
+
+// poll_save — called every frame; does the work at most once a second, and
+// only when the desktop is both changed and still.
+fn poll_save(now as i64) as void {
+    if (s.layout_dirty == 0) { return; }
+    if (now < s.layout_next_save) { return; }
+    if (_settled() == 0) { return; }
+    s.layout_next_save = now + 1000000000;
+    s.layout_dirty = 0;
+    save();
+    return;
+}
+
+// ---- load -----------------------------------------------------------------
+
+fn load() as void {
+    s.rst_n = 0;
+    let is i64 as fd = sys.open_read(cast(*u8, "/var/wm/layout"));
+    if (fd < 0) { return; }
+    let is i64 as n = sys.read(fd, cast(*u8, &pbuf[0]), 4096);
+    sys.close(fd);
+    if (n < 8 + HDR_WORDS * 8) { return; }
+    if (_magic_ok() == 0) { return; }
+    if (pbuf[4] != cast(u8, 1)) { return; }               // a version we do not read
+    let is i64 as count with mut = _get_u64(8);
+    if (count < 0) { return; }
+    if (count > s.RST_MAX) { count = s.RST_MAX; }
+    let is i64 as sel = _get_u64(16);
+    if ((sel & (s.TAG_MASK | s.SCRATCH_TAG)) != 0) { s.sel_tags = sel; }
+    let is i64 as t with mut = 0;
+    while (t < 10) {
+        let is i64 as l = _get_u64(24 + t * 8);
+        if (l >= 0 && l < s.LAY_COUNT) { s.tag_layout[t] = l; }
+        t = t + 1;
+    }
+    let is i64 as mf = _get_u64(104);
+    if (mf >= 20 && mf <= 85) { s.mfact = mf; }
+    let is i64 as nm = _get_u64(112);
+    if (nm >= 1 && nm <= 8) { s.nmaster = nm; }
+
+    let is i64 as off with mut = 8 + HDR_WORDS * 8;
+    let is i64 as k with mut = 0;
+    while (k < count && off + REC_WORDS * 8 <= n) {
+        s.rst_n0[k] = _get_u64(off + 0);
+        s.rst_n1[k] = _get_u64(off + 8);
+        s.rst_len[k] = _get_u64(off + 16);
+        s.rst_x[k] = _get_u64(off + 24);
+        s.rst_y[k] = _get_u64(off + 32);
+        s.rst_w[k] = _get_u64(off + 40);
+        s.rst_h[k] = _get_u64(off + 48);
+        s.rst_tags[k] = _get_u64(off + 56);
+        s.rst_float[k] = _get_u64(off + 64);
+        s.rst_used[k] = 1;
+        off = off + REC_WORDS * 8;
+        k = k + 1;
+    }
+    s.rst_n = k;
+    return;
+}
+
+// restore_for — if a record was saved for this program name, hand back its
+// geometry and claim the record. Values are only overwritten when the record
+// is sane for the CURRENT screen: a snapshot from a bigger display must not
+// place a window off the edge of a smaller one.
+fn restore_for(n0 as i64, n1 as i64, nlen as i64, px as *i64, py as *i64,
+               pw as *i64, ph as *i64, ptags as *i64, pfloat as *i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < s.rst_n) {
+        if (s.rst_used[k] == 1 && s.rst_len[k] == nlen
+            && s.rst_n0[k] == n0 && s.rst_n1[k] == n1) {
+            s.rst_used[k] = 0;
+            let is i64 as x = s.rst_x[k]; let is i64 as y = s.rst_y[k];
+            let is i64 as w = s.rst_w[k]; let is i64 as h = s.rst_h[k];
+            if (w >= s.MIN_W && h >= s.MIN_H && x >= 0 && y >= 0
+                && x + w + 2 * s.BORDER <= s.scr_w
+                && y + h + s.TITLE_H + 2 * s.BORDER <= s.scr_h) {
+                *px = x; *py = y; *pw = w; *ph = h;
+            }
+            if ((s.rst_tags[k] & (s.TAG_MASK | s.SCRATCH_TAG)) != 0) { *ptags = s.rst_tags[k]; }
+            if (s.rst_float[k] == 0 || s.rst_float[k] == 1) { *pfloat = s.rst_float[k]; }
+            return;
+        }
+        k = k + 1;
+    }
+    return;
+}

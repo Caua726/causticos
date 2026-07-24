@@ -4,46 +4,81 @@
 use "state.cst" as s;
 use "damage.cst" as dmg;
 use "wanim.cst" as wan;
+use "window.cst" as win;
+use "layout.cst" as lay;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 
 fn scene_send(mtype as i64, a as i64, b as i64, c as i64) as i64 {
     return cp.msg_send(s.wc_fd, mtype, a, b, c);
 }
 
-// Send the back-to-front snapshot of windows. SCENE_ENTRY order: bottom (last
-// in zord) first; top (zord[0]) last. Minimised windows are included — they
-// have to be, since their taskbar entry depends on them being in the scene —
-// with the minimised flag set so the compositor draws them as a button.
+// One scene entry, in paint order. Split out because the scene is walked
+// twice — tiled windows, then floating ones — and both runs describe a window
+// identically.
+fn _entry(w as i64) as void {
+    let is i64 as flags with mut = 0;
+    if (win.win_is_focused(w) == 1 && s.wins[w].minimized == 0) {
+        flags = flags | cp.ENTRY_FOCUSED;
+    }
+    if (s.wins[w].minimized == 1) { flags = flags | cp.ENTRY_MINIMIZED; }
+    // Presentation rect: the settled geometry scaled toward its own centre by
+    // whatever tween is running. wins[w].x/y/w/h itself never moves, so clicks
+    // and client RESIZE messages stay on the real one.
+    let is [4]i64 as pr;
+    wan.pres_rect(w, &pr[0]);
+    let is i64 as settled with mut = 0;
+    if ((flags & cp.ENTRY_FOCUSED) != 0) { settled = 255; }
+    flags = cp.entry_with_fblend(flags, wan.focus_blend(w, settled));
+    flags = cp.entry_with_alpha(flags, wan.pres_alpha(w));
+    scene_send(cp.MSG_WC_SCENE_ENTRY,
+               cp.entry_a(w, flags),
+               cp.pack_xy(pr[0], pr[1]),
+               cp.pack_wh(pr[2], pr[3]));
+    return;
+}
+
+// A window belongs in the scene when it is on a visible tag and nothing has
+// taken its place. Minimised ones ride along carrying the flag; a window on
+// another tag is simply absent, which is the whole of how tags hide things.
+fn _in_scene(w as i64) as i64 {
+    if (s.wins[w].used == 0 || s.wins[w].state != 2) { return 0; }
+    if (s.wins[w].swallowed_by >= 0) { return 0; }
+    if ((s.wins[w].tags & s.sel_tags) == 0) { return 0; }
+    return 1;
+}
+
+// Send the back-to-front snapshot. Order: bottom (last in zord) first, top
+// last — and every floating window after every tiled one, so the layer a
+// window is in beats how recently it was used. A window closing is still
+// drawn: it is fading out.
 fn send_scene() as void {
+    // Counted over the SAME walk that sends, so the count and the entries can
+    // never disagree — a window that is used but somehow not stacked would
+    // otherwise be counted and never sent.
     let is i64 as count with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < s.MAX_WIN) {
-        if (s.wins[i].used == 1 && s.wins[i].state == 2) { count = count + 1; }
-        i = i + 1;
+    let is i64 as ci with mut = 0;
+    while (ci < s.nz) {
+        if (_in_scene(s.zord[ci]) == 1) { count = count + 1; }
+        ci = ci + 1;
     }
     scene_send(cp.MSG_WC_SCENE, count, 0, 0);
-    let is i64 as zi with mut = s.nz - 1;
-    while (zi >= 0) {
-        let is i64 as w = s.zord[zi];
-        if (s.wins[w].used == 1 && s.wins[w].state == 2) {
-            let is i64 as flags with mut = 0;
-            if (zi == 0 && s.wins[w].minimized == 0) { flags = flags | cp.ENTRY_FOCUSED; }
-            if (s.wins[w].minimized == 1) { flags = flags | cp.ENTRY_MINIMIZED; }
-            // Presentation rect: the settled geometry scaled toward its own
-            // centre by whatever tween is running. wins[w].x/y/w/h itself never
-            // moves, so clicks and client RESIZE messages stay on the real one.
-            let is [4]i64 as pr;
-            wan.pres_rect(w, &pr[0]);
-            let is i64 as settled with mut = 0;
-            if ((flags & cp.ENTRY_FOCUSED) != 0) { settled = 255; }
-            flags = cp.entry_with_fblend(flags, wan.focus_blend(w, settled));
-            flags = cp.entry_with_alpha(flags, wan.pres_alpha(w));
-            scene_send(cp.MSG_WC_SCENE_ENTRY,
-                       cp.entry_a(w, flags),
-                       cp.pack_xy(pr[0], pr[1]),
-                       cp.pack_wh(pr[2], pr[3]));
+    if (lay.layers_apart() == 0) {
+        let is i64 as fi with mut = s.nz - 1;
+        while (fi >= 0) {
+            if (_in_scene(s.zord[fi]) == 1) { _entry(s.zord[fi]); }
+            fi = fi - 1;
         }
-        zi = zi - 1;
+        return;
+    }
+    let is i64 as layer with mut = 0;
+    while (layer < 2) {
+        let is i64 as zi with mut = s.nz - 1;
+        while (zi >= 0) {
+            let is i64 as w = s.zord[zi];
+            if (_in_scene(w) == 1 && s.wins[w].floating == layer) { _entry(w); }
+            zi = zi - 1;
+        }
+        layer = layer + 1;
     }
     return;
 }

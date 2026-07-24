@@ -1,10 +1,13 @@
-// wm/keyboard.cst — key events: modifier tracking + global hotkeys + forward to
-// focused client. Hotkeys consume the key (never reach the client); any other
-// key becomes MSG_KEY.
+// wm/keyboard.cst — key events: modifier tracking + the bind table + forward
+// to the focused client. A bound chord is consumed (it never reaches the
+// client); every other key becomes MSG_KEY.
 
 use "state.cst" as s;
 use "window.cst" as win;
 use "client.cst" as cli;
+use "config.cst" as cfg;
+use "layout.cst" as lay;
+use "tags.cst" as tags;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../../../Caustic/std/os/causticos.cst" as sys;
@@ -12,8 +15,8 @@ use "../../../Caustic/std/os/causticos.cst" as sys;
 // The raw scancode rides along in the third field: a client that binds a
 // control chord needs the physical key, not what the keymap made of it.
 fn forward_key(keysym as i64, kb as i64, sc as i64) as void {
-    if (s.nz == 0) { return; }
-    let is i64 as i = s.zord[0];
+    if (s.focused < 0) { return; }
+    let is i64 as i = s.focused;
     if (s.wins[i].state != 2) { return; }
     if (s.quota[i] < 2 && cli.chan_writable_now(i) == 1) {
         wmp.msg_send(s.wins[i].chan, wmp.MSG_KEY, keysym, kb, sc);
@@ -27,24 +30,84 @@ fn forward_key(keysym as i64, kb as i64, sc as i64) as void {
 
 fn reap_window(i as i64, do_wait as i64) as void { cli.reap_window(i, do_wait); return; }
 
-// a = keysym, kb = mods|pressed<<8|ext<<9, sc = raw scancode. Hotkeys gate on
+// run_action — one bound action. Everything the WM can be asked to do by a key
+// is here, and the bind table is the only thing that decides which key asks.
+fn run_action(act as i64, arg as i64) as void {
+    // Walking the stack does not restack as it goes — otherwise the second
+    // press would come back to where the first started. The walk is committed
+    // when the modifier holding it comes up.
+    if (act == cfg.ACT_CYCLE || act == cfg.ACT_FOCUS_NEXT) {
+        s.alt_cycling = 1; win.win_cycle(1); return;
+    }
+    if (act == cfg.ACT_CYCLE_BACK || act == cfg.ACT_FOCUS_PREV) {
+        s.alt_cycling = 1; win.win_cycle(0 - 1); return;
+    }
+    if (act == cfg.ACT_SPAWN_TERM) { cli.spawn_client(); return; }
+    if (act == cfg.ACT_LAUNCHER) { cli.spawn_named(cast(*u8, "launcher.cse"), 12); return; }
+    if (act == cfg.ACT_CLOSE) {
+        if (s.focused >= 0 && win.win_mapped(s.focused) == 1) {
+            s.wins[s.focused].pend_close = 1;
+        }
+        return;
+    }
+    if (act == cfg.ACT_LAYOUT_NEXT) { lay.layout_next(); return; }
+    if (act == cfg.ACT_LAYOUT_SET) { lay.set_layout(arg); return; }
+    if (act == cfg.ACT_VIEW) { tags.view_tag(arg); return; }
+    if (act == cfg.ACT_VIEW_ALL) { tags.view_all(); return; }
+    if (act == cfg.ACT_TOGGLE_VIEW) { tags.toggle_view(arg); return; }
+    if (act == cfg.ACT_TAG) { tags.tag_focused(arg); return; }
+    if (act == cfg.ACT_TOGGLE_TAG) { tags.toggle_tag_focused(arg); return; }
+    if (act == cfg.ACT_SCRATCH) { tags.toggle_scratch(); return; }
+    if (act == cfg.ACT_SCRATCH_SEND) { tags.scratch_send(); return; }
+    if (act == cfg.ACT_TOGGLE_FLOAT) { lay.toggle_float(); return; }
+    if (act == cfg.ACT_ZOOM) { lay.zoom(); return; }
+    if (act == cfg.ACT_INC_MASTER) { lay.inc_master(arg); return; }
+    if (act == cfg.ACT_MFACT) { lay.mfact_step(arg); return; }
+    if (act == cfg.ACT_MINIMIZE) {
+        if (s.focused >= 0 && win.win_mapped(s.focused) == 1) { win.win_minimize(s.focused); }
+        return;
+    }
+    if (act == cfg.ACT_MAXIMIZE) {
+        if (s.focused >= 0 && win.win_mapped(s.focused) == 1) { win.win_toggle_max(s.focused); }
+        return;
+    }
+    if (act == cfg.ACT_QUIT) {
+        // The same path the power button takes: ask every client to close,
+        // then tell the compositor when they are gone.
+        if (s.shutdown_state != 0) { return; }
+        s.shutdown_state = 1;
+        s.shutdown_deadline = sys.time_ns() + 2000000000;
+        let is i64 as si with mut = 0;
+        while (si < s.MAX_WIN) {
+            if (s.wins[si].used == 1) { s.wins[si].pend_close = 1; }
+            si = si + 1;
+        }
+        return;
+    }
+    return;
+}
+
+// a = keysym, kb = mods|pressed<<8|ext<<9, sc = raw scancode. Binds gate on
 // scancode + modifier mask (layout-independent); the keysym is forwarded as
 // data to the child.
 fn key_handle(keysym as i64, kb as i64, sc as i64) as void {
     let is i64 as pressed = cp.key_pressed(kb);
     let is i64 as ext = cp.key_ext(kb);
     let is i64 as mods = cp.key_mods(kb);
+    s.mod_shift = mods & 1;
+    s.mod_ctrl = (mods >> 1) & 1;
     s.mod_alt = (mods >> 2) & 1;
     s.mod_super = (mods >> 3) & 1;
-    if (pressed == 1) {
-        if (s.mod_alt == 1 && ext == 0 && sc == 0x0F) { win.win_cycle(); return; }
-        if (s.mod_super == 1 && sc == 0x1C) { cli.spawn_client(); return; }
-        if (s.mod_super == 1 && sc == 0x39) {
-            cli.spawn_named(cast(*u8, "launcher.cse"), 12);
-            return;
-        }
-        if (s.mod_super == 1 && sc == 0x10) {
-            if (s.nz > 0) { s.wins[s.zord[0]].pend_close = 1; }
+    // Releasing the modifier that started an Alt-Tab walk commits it: the
+    // window the walk landed on becomes the top of the stack, not merely the
+    // focused one.
+    if (s.alt_cycling == 1 && s.mod_alt == 0 && s.mod_super == 0) {
+        win.win_cycle_commit();
+    }
+    if (pressed == 1 && ext == 0) {
+        let is i64 as b = cfg.bind_find(mods, sc);
+        if (b >= 0) {
+            run_action(s.bind_act[b], s.bind_arg[b]);
             return;
         }
     }

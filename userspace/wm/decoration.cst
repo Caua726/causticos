@@ -5,6 +5,8 @@
 use "state.cst" as s;
 use "damage.cst" as dmg;
 use "wanim.cst" as wan;
+use "window.cst" as win;
+use "layout.cst" as lay;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../../../Caustic/std/os/causticos.cst" as sys;
@@ -93,7 +95,9 @@ fn btn_cells(i as i64, col0 as i64, glyph as i64, bg as i64, fg as i64,
              per as i64, hi as i64, hv as i64, which as i64) as void {
     if (col0 < 0) { return; }
     let is i64 as b with mut = bg;
-    if (s.hover_win == i && s.hover_btn == which) { b = mix_rgb(bg, hi, hv); }
+    if (s.hover_kind == s.HOV_BTN && s.hover_win == i && s.hover_btn == which) {
+        b = mix_rgb(bg, hi, hv);
+    }
     let is i64 as cc with mut = 0;
     while (cc < per) {
         let is *i64 as cl = dec_cell_ptr(s.wins[i].dec_base, col0 + cc);
@@ -110,7 +114,7 @@ fn render_titlebar(i as i64) as void {
     let is i64 as cols = s.wins[i].w / 8;
     if (cols <= 0) { return; }
     let is i64 as focused with mut = 0;
-    if (s.nz > 0 && s.zord[0] == i && s.wins[i].minimized == 0) { focused = 1; }
+    if (win.win_is_focused(i) == 1 && s.wins[i].minimized == 0) { focused = 1; }
     // The titlebar rides the same focus ramp as the border, so decoration and
     // frame brighten together instead of one snapping ahead of the other.
     let is i64 as fset with mut = 0;
@@ -144,7 +148,7 @@ fn render_titlebar(i as i64) as void {
     // Each button's background ramps toward its highlight while hovered and
     // back when the pointer leaves; mouse.cst owns which one that is.
     let is i64 as hv with mut = 0;
-    if (s.hover_win == i) { hv = wan.hover_v(); }
+    if (s.hover_kind == s.HOV_BTN && s.hover_win == i) { hv = wan.hover_v(); }
     btn_cells(i, min0, 95, tcol, fgc, per, s.COL_MIN_H, hv, 3);
     btn_cells(i, max0, 91, tcol, fgc, per, s.COL_MAX_H, hv, 2);
     btn_cells(i, close0, 120, tcol, fgc, per, s.COL_CLOSE_H, hv, 1);
@@ -203,8 +207,124 @@ fn tb_puts(col as i64, s_in as *u8, len as i64, fg as i64, bg as i64) as void {
     return;
 }
 
+// ---- taskbar geometry ---------------------------------------------------
+// The bar reads left to right: tag boxes, the layout badge, one button per
+// listed window (the minimised ones last), then the clock. Computed ONCE per
+// render into state.cst and read by the hit-test — two copies of this
+// arithmetic is exactly how a click lands next to the button it looks like it
+// is on, which is what the old bar did.
+
+let is i64 as TAG_CW with imut = 2;        // cells per tag box
+
+fn tb_tag_c0() as i64 { return 1; }
+
+// Recompute the layout of the bar for the windows that are currently listed.
+fn tb_layout() as void {
+    s.tb_lay_c0 = tb_tag_c0() + s.TAG_COUNT * TAG_CW + 1;
+    let is [4]u8 as sym;
+    s.tb_lay_cw = lay.lay_sym(cast(*u8, &sym[0])) + 1;
+    s.tb_item_c0 = s.tb_lay_c0 + s.tb_lay_cw + 1;
+
+    // Windows in two runs: ordinary first, minimised after, so the minimised
+    // ones read as a separate section instead of gaps in the first.
+    s.tb_nitems = 0;
+    let is i64 as pass with mut = 0;
+    while (pass < 2) {
+        let is i64 as i with mut = 0;
+        while (i < s.MAX_WIN) {
+            if (win.win_listed(i) == 1 && s.wins[i].minimized == pass) {
+                if (s.tb_nitems < s.MAX_WIN) {
+                    s.tb_items[s.tb_nitems] = i;
+                    s.tb_nitems = s.tb_nitems + 1;
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+
+    let is i64 as clock_cw with mut = 0;
+    if (s.clock_len > 0) { clock_cw = s.clock_len + 2; }
+    let is i64 as avail with mut = s.tb_cols - s.tb_item_c0 - clock_cw;
+    if (avail < 0) { avail = 0; }
+    let is i64 as want = s.TASK_W / 8 + 1;
+    let is i64 as cw with mut = want;
+    if (s.tb_nitems > 0 && cw * s.tb_nitems > avail) { cw = avail / s.tb_nitems; }
+    if (cw < 6) { cw = 6; }                 // below this a button says nothing
+    s.tb_item_cw = cw;
+    // What still does not fit is counted, not silently dropped: a hidden
+    // window with no sign of it is a window the user cannot get back to.
+    let is i64 as fit with mut = avail / cw;
+    if (fit < 0) { fit = 0; }
+    s.tb_hidden = 0;
+    if (s.tb_nitems > fit) {
+        s.tb_hidden = s.tb_nitems - fit;
+        s.tb_nitems = fit;
+    }
+    return;
+}
+
+// What is under cell column `col`: fills kind/idx. Mirrors tb_layout exactly
+// because it reads the very numbers tb_layout produced.
+fn tb_hit(col as i64, kind as *i64, idx as *i64) as void {
+    *kind = s.HOV_NONE;
+    *idx = 0 - 1;
+    if (col < 0) { return; }
+    let is i64 as t0 = tb_tag_c0();
+    if (col >= t0 && col < t0 + s.TAG_COUNT * TAG_CW) {
+        *kind = s.HOV_TAG;
+        *idx = (col - t0) / TAG_CW;
+        return;
+    }
+    if (col >= s.tb_lay_c0 && col < s.tb_lay_c0 + s.tb_lay_cw) {
+        *kind = s.HOV_LAY;
+        *idx = 0;
+        return;
+    }
+    if (col >= s.tb_item_c0 && s.tb_item_cw > 0) {
+        let is i64 as k = (col - s.tb_item_c0) / s.tb_item_cw;
+        if (k >= 0 && k < s.tb_nitems) {
+            *kind = s.HOV_ITEM;
+            *idx = s.tb_items[k];
+            return;
+        }
+    }
+    return;
+}
+
+// A minimised button breathes so it reads as "still there, just put away".
+// Derived from the clock rather than an animation slot: it never ends, and a
+// tween that never ends would hold a slot for the life of the window.
+fn _pulse(now as i64) as i64 {
+    let is i64 as ph = (now / 1000000) % 2000;
+    if (ph < 1000) { return ph * 256 / 1000; }
+    return (2000 - ph) * 256 / 1000;
+}
+
+fn tb_fill(col as i64, n as i64, fg as i64, bg as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n && col + k < s.tb_cols) {
+        let is *i64 as cell = dec_cell_ptr(s.tb_dec_base, col + k);
+        cell[0] = cp.make_cell(0, fg, bg);
+        k = k + 1;
+    }
+    return;
+}
+
+// Is anything on the bar breathing? The frame loop asks so it can step the
+// pulse without repainting the bar every frame for nothing.
+fn has_minimized() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        if (win.win_listed(i) == 1 && s.wins[i].minimized == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn render_taskbar() as void {
     if (taskbar_ensure() != 0) { return; }
+    tb_layout();
     dec_set_header(s.tb_dec_base, s.tb_cols, 1);
     let is i64 as c with mut = 0;
     while (c < s.tb_cols) {
@@ -212,39 +332,87 @@ fn render_taskbar() as void {
         cell[0] = cp.make_cell(0, s.COL_TEXT, s.COL_BAR);
         c = c + 1;
     }
-    let is i64 as task_cols = s.TASK_W / 8;
-    let is i64 as col with mut = 1;
-    let is i64 as i with mut = 0;
-    while (i < s.MAX_WIN) {
-        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0) {
-            let is i64 as active with mut = 0;
-            if (s.nz > 0 && s.zord[0] == i && s.wins[i].minimized == 0) { active = 1; }
-            let is i64 as bg0 with mut = s.COL_BAR_ITEM;
-            if (active == 1) { bg0 = s.COL_TITLE_F; }
-            let is i64 as fg with mut = s.COL_TEXT;
-            if (s.wins[i].minimized == 1) { fg = s.COL_BAR_DIM; }
-            // A new entry grows out of the bar and its colour rises from it,
-            // so windows do not pop into the taskbar fully formed.
-            let is i64 as tv = wan.task_v(i);
-            let is i64 as bg = mix_rgb(s.COL_BAR, bg0, tv);
-            let is i64 as shown = task_cols * tv / 256;
-            let is i64 as bc with mut = 0;
-            while (bc < shown && col + bc < s.tb_cols) {
-                let is *i64 as cell = dec_cell_ptr(s.tb_dec_base, col + bc);
-                cell[0] = cp.make_cell(0, fg, bg);
-                bc = bc + 1;
-            }
-            if (s.wins[i].title_len > 0 && tv == 256) {
-                let is [16]u8 as tbn;
-                wmp.title_unpack(s.wins[i].t0, s.wins[i].t1, s.wins[i].title_len, cast(*u8, &tbn[0]));
-                let is i64 as ll with mut = s.wins[i].title_len;
-                if (ll > task_cols - 1) { ll = task_cols - 1; }
-                tb_puts(col + 1, cast(*u8, &tbn[0]), ll, fg, bg);
-            }
-            col = col + task_cols + 1;
+    let is i64 as now = sys.time_ns();
+    let is i64 as hv = wan.hover_v();
+
+    // Tag boxes: bright when shown, lit when a window lives there, dim when
+    // empty. The digit alone would not say which tags have anything on them.
+    let is i64 as t with mut = 0;
+    while (t < s.TAG_COUNT) {
+        let is i64 as bit = 1 << t;
+        let is i64 as occupied with mut = 0;
+        let is i64 as wi with mut = 0;
+        while (wi < s.MAX_WIN) {
+            if (win.win_mapped(wi) == 1 && s.wins[wi].swallowed_by < 0
+                && (s.wins[wi].tags & bit) != 0) { occupied = 1; }
+            wi = wi + 1;
         }
-        i = i + 1;
+        let is i64 as bg with mut = s.COL_BAR;
+        let is i64 as fg with mut = s.COL_BAR_DIM;
+        if (occupied == 1) { fg = s.COL_TEXT; }
+        if ((s.sel_tags & bit) != 0) { bg = s.COL_TITLE_F; fg = s.COL_TEXT; }
+        if (s.hover_kind == s.HOV_TAG && s.hover_btn == t) {
+            bg = mix_rgb(bg, s.COL_BAR_ITEM, hv);
+        }
+        let is i64 as c0 = tb_tag_c0() + t * TAG_CW;
+        tb_fill(c0, TAG_CW, fg, bg);
+        let is [1]u8 as d;
+        d[0] = cast(u8, 49 + t);
+        tb_puts(c0, cast(*u8, &d[0]), 1, fg, bg);
+        t = t + 1;
     }
+
+    // Layout badge.
+    let is [4]u8 as sym;
+    let is i64 as sn = lay.lay_sym(cast(*u8, &sym[0]));
+    let is i64 as lbg with mut = s.COL_BAR;
+    if (s.hover_kind == s.HOV_LAY) { lbg = mix_rgb(s.COL_BAR, s.COL_BAR_ITEM, hv); }
+    tb_fill(s.tb_lay_c0, s.tb_lay_cw, s.COL_TEXT, lbg);
+    tb_puts(s.tb_lay_c0, cast(*u8, &sym[0]), sn, s.COL_TEXT, lbg);
+
+    // Window buttons.
+    let is i64 as k with mut = 0;
+    while (k < s.tb_nitems) {
+        let is i64 as i = s.tb_items[k];
+        let is i64 as col = s.tb_item_c0 + k * s.tb_item_cw;
+        let is i64 as bg0 with mut = s.COL_BAR_ITEM;
+        if (win.win_is_focused(i) == 1 && s.wins[i].minimized == 0) { bg0 = s.COL_TITLE_F; }
+        let is i64 as fg with mut = s.COL_TEXT;
+        if (s.wins[i].minimized == 1) {
+            fg = s.COL_BAR_DIM;
+            bg0 = mix_rgb(s.COL_BAR, s.COL_BAR_ITEM, _pulse(now));
+        }
+        if (s.hover_kind == s.HOV_ITEM && s.hover_win == i) {
+            bg0 = mix_rgb(bg0, s.COL_TITLE_F, hv);
+        }
+        // A new entry grows out of the bar and its colour rises from it, so
+        // windows do not pop into the taskbar fully formed.
+        let is i64 as tv = wan.task_v(i);
+        let is i64 as bg = mix_rgb(s.COL_BAR, bg0, tv);
+        let is i64 as shown = (s.tb_item_cw - 1) * tv / 256;
+        tb_fill(col, shown, fg, bg);
+        if (s.wins[i].title_len > 0 && tv == 256) {
+            let is [16]u8 as tbn;
+            wmp.title_unpack(s.wins[i].t0, s.wins[i].t1, s.wins[i].title_len, cast(*u8, &tbn[0]));
+            let is i64 as ll with mut = s.wins[i].title_len;
+            if (ll > s.tb_item_cw - 2) { ll = s.tb_item_cw - 2; }
+            if (ll > 0) { tb_puts(col + 1, cast(*u8, &tbn[0]), ll, fg, bg); }
+        }
+        k = k + 1;
+    }
+    // "+N" for what did not fit.
+    if (s.tb_hidden > 0) {
+        let is [4]u8 as more;
+        let is i64 as mn with mut = 0;
+        more[0] = cast(u8, 43); mn = 1;                       // '+'
+        let is i64 as v with mut = s.tb_hidden;
+        if (v > 99) { v = 99; }
+        if (v >= 10) { more[mn] = cast(u8, 48 + v / 10); mn = mn + 1; }
+        more[mn] = cast(u8, 48 + v % 10); mn = mn + 1;
+        let is i64 as mc = s.tb_item_c0 + s.tb_nitems * s.tb_item_cw;
+        tb_puts(mc, cast(*u8, &more[0]), mn, s.COL_BAR_DIM, s.COL_BAR);
+    }
+
     if (s.clock_len > 0) {
         let is i64 as cc = s.tb_cols - s.clock_len - 1;
         tb_puts(cc, cast(*u8, &s.clock_str[0]), s.clock_len, s.COL_TEXT, s.COL_BAR);
@@ -258,10 +426,7 @@ fn render_all_decorations() as void {
     if (s.deco_dirty == 0) { return; }
     let is i64 as i with mut = 0;
     while (i < s.MAX_WIN) {
-        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0
-            && s.wins[i].closing == 0) {
-            render_titlebar(i);
-        }
+        if (win.win_visible(i) == 1) { render_titlebar(i); }
         i = i + 1;
     }
     render_taskbar();

@@ -1,0 +1,210 @@
+// wm/layout.cst — where the windows go when the user is not placing them.
+//
+// Three layouts, dwm's: tile (a master column and a stack), monocle (one at a
+// time, full work area) and float (the WM places nothing). The layout is a
+// property of the TAG, not of the screen, so switching to tag 2 restores the
+// arrangement tag 2 was left in.
+//
+// A layout only ever moves NON-floating windows. Dragging, resizing or
+// maximising a window floats it (window.cst), which is the escape hatch: there
+// is no mode to leave, you just move the window.
+
+use "state.cst" as s;
+use "window.cst" as win;
+use "damage.cst" as dmg;
+
+// The tag the layout keys off: the lowest visible one. With several tags shown
+// at once SOMETHING has to be the current one, and "the first" is the answer
+// the tag keys make obvious (Super+2 shows tag 2 and its layout).
+fn cur_tag() as i64 {
+    let is i64 as k with mut = 0;
+    while (k < s.TAG_COUNT) {
+        if ((s.sel_tags & (1 << k)) != 0) { return k; }
+        k = k + 1;
+    }
+    if ((s.sel_tags & s.SCRATCH_TAG) != 0) { return s.SCRATCH_BIT; }
+    return 0;
+}
+
+fn cur_layout() as i64 { return s.tag_layout[cur_tag()]; }
+
+fn set_layout(l as i64) as void {
+    if (l < 0 || l >= s.LAY_COUNT) { return; }
+    if (s.tag_layout[cur_tag()] == l) { return; }
+    s.tag_layout[cur_tag()] = l;
+    s.arrange_dirty = 1;
+    s.deco_dirty = 1;
+    s.layout_dirty = 1;
+    return;
+}
+
+fn layout_next() as void {
+    let is i64 as l = cur_layout() + 1;
+    if (l >= s.LAY_COUNT) { set_layout(0); return; }
+    set_layout(l);
+    return;
+}
+
+// lay_sym — the current layout's badge for the taskbar, into out[0..3].
+fn lay_sym(out as *u8) as i64 {
+    let is i64 as l = cur_layout();
+    if (l == s.LAY_TILE) {
+        out[0] = cast(u8, 91); out[1] = cast(u8, 93); out[2] = cast(u8, 61);   // []=
+        return 3;
+    }
+    if (l == s.LAY_MONOCLE) {
+        out[0] = cast(u8, 91); out[1] = cast(u8, 77); out[2] = cast(u8, 93);   // [M]
+        return 3;
+    }
+    out[0] = cast(u8, 60); out[1] = cast(u8, 62);                              // <>
+    return 2;
+}
+
+// Whether the floating flag orders the screen. It only means something when
+// something is tiling: the floating layer exists to keep hand-placed windows
+// above the grid, and with the float layout there is no grid to be above — so
+// the stack alone decides, and a window raised is a window on top.
+fn layers_apart() as i64 {
+    if (cur_layout() == s.LAY_FLOAT) { return 0; }
+    return 1;
+}
+
+// A window the layout is allowed to place.
+fn _tiled(i as i64) as i64 {
+    if (win.win_visible(i) == 0) { return 0; }
+    if (s.wins[i].floating == 1) { return 0; }
+    return 1;
+}
+
+fn _count_tiled() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < s.ntord) {
+        if (_tiled(s.tord[k]) == 1) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+// Frame (fx,fy,fw,fh) -> the CONTENT geometry a window with that frame has.
+// The frame is what the layout divides; the window stores its content.
+fn _place(i as i64, fx as i64, fy as i64, fw as i64, fh as i64) as void {
+    let is i64 as cw with mut = fw - 2 * s.BORDER;
+    let is i64 as ch with mut = fh - s.TITLE_H - 2 * s.BORDER;
+    if (cw < 16) { cw = 16; }
+    if (ch < 16) { ch = 16; }
+    win.win_set_geom_tween(i, fx, fy, cw, ch);
+    return;
+}
+
+// tile — nmaster windows in a left column of mfact percent, the rest stacked
+// to the right. With no stack the master column takes the whole width.
+fn _tile() as void {
+    let is i64 as n = _count_tiled();
+    if (n == 0) { return; }
+    let is i64 as nm with mut = s.nmaster;
+    if (nm > n) { nm = n; }
+    if (nm < 1) { nm = 1; }
+    let is i64 as mw with mut = s.scr_w;
+    if (n > nm) { mw = s.scr_w * s.mfact / 100; }
+    if (mw < s.MIN_W) { mw = s.MIN_W; }
+    if (mw > s.scr_w) { mw = s.scr_w; }
+    let is i64 as mi with mut = 0;          // master slot
+    let is i64 as si with mut = 0;          // stack slot
+    let is i64 as ns = n - nm;
+    let is i64 as k with mut = 0;
+    while (k < s.ntord) {
+        let is i64 as i = s.tord[k];
+        if (_tiled(i) == 1) {
+            if (mi < nm) {
+                let is i64 as y0 = s.work_h * mi / nm;
+                let is i64 as y1 = s.work_h * (mi + 1) / nm;
+                _place(i, 0, y0, mw, y1 - y0);
+                mi = mi + 1;
+            } else {
+                let is i64 as y0 = s.work_h * si / ns;
+                let is i64 as y1 = s.work_h * (si + 1) / ns;
+                _place(i, mw, y0, s.scr_w - mw, y1 - y0);
+                si = si + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return;
+}
+
+// monocle — every tiled window gets the whole work area; the stack decides
+// which one is on top. Switching windows is switching focus, not geometry.
+fn _monocle() as void {
+    let is i64 as k with mut = 0;
+    while (k < s.ntord) {
+        let is i64 as i = s.tord[k];
+        if (_tiled(i) == 1) { _place(i, 0, 0, s.scr_w, s.work_h); }
+        k = k + 1;
+    }
+    return;
+}
+
+// arrange — run the current tag's layout. Called from the frame loop when
+// arrange_dirty is set, so a burst of changes (map, tag, close) re-tiles once.
+fn arrange() as void {
+    s.arrange_dirty = 0;
+    let is i64 as l = cur_layout();
+    if (l == s.LAY_TILE) { _tile(); }
+    else if (l == s.LAY_MONOCLE) { _monocle(); }
+    s.scene_dirty = 1;
+    s.deco_dirty = 1;
+    return;
+}
+
+// zoom — make the focused window the master. In monocle and float it is still
+// the useful half of the gesture: it promotes the window in the tiling order,
+// which is what tiling will use the moment the tag goes back to tile.
+fn zoom() as void {
+    if (s.focused < 0 || win.win_visible(s.focused) == 0) { return; }
+    if (s.wins[s.focused].floating == 1) { s.wins[s.focused].floating = 0; }
+    win.tord_to_head(s.focused);
+    s.arrange_dirty = 1;
+    s.layout_dirty = 1;
+    return;
+}
+
+fn inc_master(d as i64) as void {
+    let is i64 as v with mut = s.nmaster + d;
+    if (v < 1) { v = 1; }
+    if (v > 8) { v = 8; }
+    if (v == s.nmaster) { return; }
+    s.nmaster = v;
+    s.arrange_dirty = 1;
+    s.layout_dirty = 1;
+    return;
+}
+
+fn mfact_step(d as i64) as void {
+    let is i64 as v with mut = s.mfact + d;
+    if (v < 20) { v = 20; }
+    if (v > 85) { v = 85; }
+    if (v == s.mfact) { return; }
+    s.mfact = v;
+    s.arrange_dirty = 1;
+    s.layout_dirty = 1;
+    return;
+}
+
+// toggle_float — hand the focused window to the layout, or take it back. A
+// window taken back keeps the size the layout gave it, so it does not jump.
+fn toggle_float() as void {
+    if (s.focused < 0 || win.win_mapped(s.focused) == 0) { return; }
+    let is i64 as i = s.focused;
+    if (s.wins[i].floating == 1) {
+        s.wins[i].floating = 0;
+        s.wins[i].maximized = 0;
+    } else {
+        s.wins[i].floating = 1;
+    }
+    s.arrange_dirty = 1;
+    s.scene_dirty = 1;
+    s.layout_dirty = 1;
+    dmg.dmg_frame(i);
+    return;
+}

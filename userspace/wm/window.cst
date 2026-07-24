@@ -1,5 +1,5 @@
-// wm/window.cst — window table + z-order + focus + geometry. Owns no state;
-// reads/mutates wins[] / zord[] / nz in state.cst.
+// wm/window.cst — window table + z-order + focus + geometry + the tiling order.
+// Owns no state; reads/mutates wins[] / zord[] / tord[] in state.cst.
 
 use "state.cst" as s;
 use "damage.cst" as dmg;
@@ -12,8 +12,11 @@ fn win_init_all() as void {
         s.wins[i].used = 0;
         s.wins[i].state = 0;
         s.wins[i].dec_fd = 0;
+        s.wins[i].swallowed_by = 0 - 1;
+        s.wins[i].swallowing = 0 - 1;
         i = i + 1;
     }
+    return;
 }
 
 fn win_alloc() as i64 {
@@ -24,6 +27,35 @@ fn win_alloc() as i64 {
     }
     return 0 - 1;
 }
+
+// ---- the three questions every other module asks about a window ----------
+// A window EXISTS (mapped), is on a VISIBLE tag, or is DRAWABLE. Keeping them
+// apart is what lets a minimised window keep its taskbar button and a
+// swallowed one disappear from both.
+fn win_mapped(i as i64) as i64 {
+    if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0) { return 1; }
+    return 0;
+}
+
+fn win_listed(i as i64) as i64 {
+    if (win_mapped(i) == 0) { return 0; }
+    if (s.wins[i].swallowed_by >= 0) { return 0; }
+    if ((s.wins[i].tags & s.sel_tags) == 0) { return 0; }
+    return 1;
+}
+
+fn win_visible(i as i64) as i64 {
+    if (win_listed(i) == 0) { return 0; }
+    if (s.wins[i].minimized == 1) { return 0; }
+    return 1;
+}
+
+fn win_is_focused(i as i64) as i64 {
+    if (s.focused == i) { return 1; }
+    return 0;
+}
+
+// ---- z-order (paint + most-recently-used) --------------------------------
 
 fn win_zremove(idx as i64) as void {
     let is i64 as k with mut = 0;
@@ -48,45 +80,129 @@ fn win_zraise(idx as i64) as void {
     return;
 }
 
-// Set focus to idx: raise, pend_focus flag for the child, damage the old
-// and new frame so the compositor re-rasterises them.
-fn win_focus(idx as i64) as void {
-    if (s.wins[idx].closing == 1) { return; }
-    s.scene_dirty = 1;
-    s.deco_dirty = 1;
-    dmg.dmg_taskbar();
-    let is i64 as old with mut = 0 - 1;
-    if (s.nz > 0) { old = s.zord[0]; }
-    if (old == idx) { win_zraise(idx); return; }
-    win_zraise(idx);
+// ---- the tiling order ----------------------------------------------------
+// Separate from zord because raising a window must not re-tile the screen:
+// clicking the stack window would otherwise make it master.
+fn tord_add(i as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < s.ntord) { if (s.tord[k] == i) { return; } k = k + 1; }
+    if (s.ntord >= s.MAX_WIN) { return; }
+    s.tord[s.ntord] = i;
+    s.ntord = s.ntord + 1;
+    return;
+}
+
+fn tord_remove(i as i64) as void {
+    let is i64 as k with mut = 0;
+    let is i64 as at with mut = 0 - 1;
+    while (k < s.ntord) { if (s.tord[k] == i) { at = k; } k = k + 1; }
+    if (at < 0) { return; }
+    let is i64 as j with mut = at;
+    while (j < s.ntord - 1) { s.tord[j] = s.tord[j + 1]; j = j + 1; }
+    s.ntord = s.ntord - 1;
+    return;
+}
+
+// Move i to the head of the tiling order: it becomes the master.
+fn tord_to_head(i as i64) as void {
+    tord_remove(i);
+    let is i64 as j with mut = s.ntord;
+    while (j > 0) { s.tord[j] = s.tord[j - 1]; j = j - 1; }
+    s.tord[0] = i;
+    s.ntord = s.ntord + 1;
+    return;
+}
+
+// ---- focus ---------------------------------------------------------------
+
+// win_focus_only — focus without touching the stack. Alt-Tab walks the stack
+// with this and commits (raises) when the modifier is released; raising as it
+// went would reorder the very list it is walking.
+fn win_focus_only(idx as i64) as void {
+    if (idx >= 0 && s.wins[idx].closing == 1) { return; }
+    let is i64 as old = s.focused;
+    if (old == idx) { return; }
     let is i64 as now = sys.time_ns();
-    if (old >= 0) {
+    if (old >= 0 && s.wins[old].used == 1) {
         s.wins[old].pend_focus = 0;
         wan.focus_start(old, now, 0);
         dmg.dmg_frame(old);
     }
-    s.wins[idx].pend_focus = 1;
-    wan.focus_start(idx, now, 255);
-    dmg.dmg_frame(idx);
+    s.focused = idx;
+    if (idx >= 0) {
+        s.wins[idx].pend_focus = 1;
+        wan.focus_start(idx, now, 255);
+        dmg.dmg_frame(idx);
+    }
+    s.scene_dirty = 1;
+    s.deco_dirty = 1;
+    dmg.dmg_taskbar();
     return;
 }
 
-// Cycle to the next window that can take focus (a fading-out one cannot).
-fn win_cycle() as void {
-    let is i64 as k with mut = 1;
+// Focus idx AND raise it. Everything except the Alt-Tab walk wants this.
+fn win_focus(idx as i64) as void {
+    if (s.wins[idx].closing == 1) { return; }
+    win_focus_only(idx);
+    win_zraise(idx);
+    s.scene_dirty = 1;
+    s.deco_dirty = 1;
+    dmg.dmg_taskbar();
+    return;
+}
+
+// The window that should take focus when the current one goes away or becomes
+// invisible: the most recently used one that can still take it.
+fn win_focus_fallback(except as i64) as void {
+    let is i64 as k with mut = 0;
     while (k < s.nz) {
         let is i64 as cand = s.zord[k];
-        if (s.wins[cand].used == 1 && s.wins[cand].state == 2 && s.wins[cand].closing == 0) {
-            win_focus(cand); return;
-        }
+        if (cand != except && win_visible(cand) == 1) { win_focus(cand); return; }
         k = k + 1;
+    }
+    win_focus_only(0 - 1);
+    return;
+}
+
+// win_cycle — step through the visible windows in stack order. dir 1 = deeper
+// into the stack, -1 = back toward the top. Focus only: the stack is committed
+// when the modifier is released (see keyboard.cst).
+fn win_cycle(dir as i64) as void {
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (k < s.nz) { if (s.zord[k] == s.focused) { at = k; } k = k + 1; }
+    if (s.nz == 0) { return; }
+    let is i64 as steps with mut = 0;
+    let is i64 as cur with mut = at;
+    while (steps < s.nz) {
+        cur = cur + dir;
+        if (cur >= s.nz) { cur = 0; }
+        if (cur < 0) { cur = s.nz - 1; }
+        let is i64 as cand = s.zord[cur];
+        if (win_visible(cand) == 1) { win_focus_only(cand); return; }
+        steps = steps + 1;
     }
     return;
 }
 
+// win_cycle_commit — the modifier came up: the window the walk landed on is
+// now genuinely the top of the stack.
+fn win_cycle_commit() as void {
+    if (s.alt_cycling == 0) { return; }
+    s.alt_cycling = 0;
+    if (s.focused >= 0 && s.wins[s.focused].used == 1) {
+        win_zraise(s.focused);
+        s.scene_dirty = 1;
+        dmg.dmg_frame(s.focused);
+    }
+    return;
+}
+
+// ---- geometry ------------------------------------------------------------
+
 // win_set_geom_tween — same commit, but the drawn frame glides there over
-// GEOM_MS. For maximise/snap/restore, where the jump is the WM's decision and
-// nothing is tracking the pointer.
+// GEOM_MS. For maximise/snap/restore/tile, where the jump is the WM's decision
+// and nothing is tracking the pointer.
 fn win_set_geom_tween(i as i64, nx as i64, ny as i64, nw as i64, nh as i64) as void {
     let is i64 as ox = s.wins[i].x; let is i64 as oy = s.wins[i].y;
     let is i64 as ow = s.wins[i].w; let is i64 as oh = s.wins[i].h;
@@ -106,6 +222,7 @@ fn win_set_geom(i as i64, nx as i64, ny as i64, nw as i64, nh as i64) as void {
     dmg.dmg_frame(i);
     s.scene_dirty = 1;
     s.deco_dirty = 1;
+    s.layout_dirty = 1;
     s.wins[i].pend_resize_w = nw;
     s.wins[i].pend_resize_h = nh;
     return;
@@ -117,8 +234,20 @@ fn win_save_geom(i as i64) as void {
     return;
 }
 
+// A window the user has placed by hand leaves the layout: tiling and a hand
+// placement are two answers to the same question, and the hand wins.
+fn win_make_floating(i as i64) as void {
+    if (s.wins[i].floating == 1) { return; }
+    s.wins[i].floating = 1;
+    s.arrange_dirty = 1;
+    s.scene_dirty = 1;
+    s.layout_dirty = 1;
+    return;
+}
+
 fn win_maximize(i as i64) as void {
     if (s.wins[i].maximized == 0) { win_save_geom(i); }
+    win_make_floating(i);
     win_set_geom_tween(i, 0, 0, s.scr_w - 2 * s.BORDER, s.work_h - s.TITLE_H - 2 * s.BORDER);
     s.wins[i].maximized = 1;
     return;
@@ -126,6 +255,7 @@ fn win_maximize(i as i64) as void {
 
 fn win_snap(i as i64, rightside as i64) as void {
     if (s.wins[i].maximized == 0) { win_save_geom(i); }
+    win_make_floating(i);
     let is i64 as halfw = s.scr_w / 2;
     let is i64 as nx with mut = 0;
     if (rightside == 1) { nx = halfw; }
@@ -152,18 +282,8 @@ fn win_minimize(i as i64) as void {
     dmg.dmg_taskbar();
     s.scene_dirty = 1;
     s.deco_dirty = 1;
-    if (s.nz > 0 && s.zord[0] == i) {
-        let is i64 as k with mut = 1;
-        let is i64 as done with mut = 0;
-        while (k < s.nz && done == 0) {
-            let is i64 as cand = s.zord[k];
-            if (s.wins[cand].used == 1 && s.wins[cand].state == 2
-                && s.wins[cand].minimized == 0 && s.wins[cand].closing == 0) {
-                win_focus(cand); done = 1;
-            }
-            k = k + 1;
-        }
-    }
+    s.arrange_dirty = 1;
+    if (s.focused == i) { win_focus_fallback(i); }
     return;
 }
 
@@ -173,5 +293,6 @@ fn win_unminimize(i as i64) as void {
     dmg.dmg_taskbar();
     s.scene_dirty = 1;
     s.deco_dirty = 1;
+    s.arrange_dirty = 1;
     return;
 }

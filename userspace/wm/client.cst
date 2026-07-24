@@ -6,6 +6,8 @@ use "state.cst" as s;
 use "window.cst" as win;
 use "damage.cst" as dmg;
 use "wanim.cst" as wan;
+use "config.cst" as cfg;
+use "persist.cst" as pst;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../../../Caustic/std/os/causticos.cst" as sys;
@@ -42,23 +44,57 @@ fn load_image(path as *u8, plen as i64) as i64 {
     return 0;
 }
 
-fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64) as void {
+fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64,
+                    swal_from as i64) as void {
     let is i64 as i = win.win_alloc();
-    if (i < 0) { return; }
+    if (i < 0) {
+        sys.write_serial(cast(*u8, "wm: window table full\n"), 22);
+        return;
+    }
     let is [2]i64 as chans;
     if (sys.channel_create(&chans[0]) != 0) { return; }
     let is i64 as a = chans[0];
     let is i64 as b = chans[1];
+    let is [2]i64 as nm;
+    let is i64 as nlen with mut = cnlen;
+    if (nlen > 16) { nlen = 16; }
+    wmp.title_pack(cname, nlen, &nm[0], &nm[1]);
+
     let is i64 as w with mut = 640;
     let is i64 as h with mut = 400;
     if (w > s.scr_w - 80) { w = s.scr_w - 80; }
     if (h > s.scr_h - 80) { h = s.scr_h - 80; }
     if (w < s.MIN_W) { w = s.MIN_W; }
     if (h < s.MIN_H) { h = s.MIN_H; }
-    let is i64 as px with mut = 40 + i * 32;
-    let is i64 as py with mut = 40 + i * 32;
+    let is i64 as px with mut = 40 + (i % 8) * 32;
+    let is i64 as py with mut = 40 + (i % 8) * 32;
     if (px + w + 2 > s.scr_w) { px = 16; }
     if (py + h + s.TITLE_H + 2 > s.scr_h) { py = 16; }
+
+    // Where this window belongs: on the tags in view, floating if a rule says
+    // so, and on the scratchpad tag when it is the scratchpad being opened.
+    let is i64 as tags with mut = s.sel_tags & (s.TAG_MASK | s.SCRATCH_TAG);
+    if (tags == 0) { tags = 1; }
+    let is i64 as flt with mut = cfg.float_rule(nm[0], nm[1], nlen);
+    if (s.scratch_wait == 1) {
+        tags = s.SCRATCH_TAG;
+        flt = 1;
+        w = s.scr_w * 3 / 5; h = s.work_h / 2;
+        px = (s.scr_w - w) / 2; py = 0;
+    }
+    // A saved layout, if this program left one behind, decides the rest.
+    pst.restore_for(nm[0], nm[1], nlen, &px, &py, &w, &h, &tags, &flt);
+    // Swallowing: the new window takes the placeholder's place literally —
+    // same rect, same tags, same layer — so the screen does not move under
+    // the user just because a program launched another one.
+    if (swal_from >= 0 && win.win_mapped(swal_from) == 1) {
+        px = s.wins[swal_from].x; py = s.wins[swal_from].y;
+        w = s.wins[swal_from].w;  h = s.wins[swal_from].h;
+        tags = s.wins[swal_from].tags;
+        flt = s.wins[swal_from].floating;
+    }
+    if (w < s.MIN_W) { w = s.MIN_W; }
+    if (h < s.MIN_H) { h = s.MIN_H; }
     wmp.msg_send(a, wmp.MSG_WELCOME, s.scr_w, s.scr_h, wmp.pack_wh(w, h));
     let is [2]i64 as acts;
     acts[0] = wmp.WM_FD;
@@ -82,6 +118,11 @@ fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64) as voi
     s.wins[i].seg_stride = 0;
     s.wins[i].x = px; s.wins[i].y = py; s.wins[i].w = w; s.wins[i].h = h;
     s.wins[i].title_len = 0; s.wins[i].t0 = 0; s.wins[i].t1 = 0;
+    s.wins[i].name_len = nlen; s.wins[i].n0 = nm[0]; s.wins[i].n1 = nm[1];
+    s.wins[i].tags = tags;
+    s.wins[i].floating = flt;
+    s.wins[i].swallowed_by = 0 - 1;
+    s.wins[i].swallowing = 0 - 1;
     s.wins[i].drops = 0;
     s.wins[i].pend_resize_w = 0; s.wins[i].pend_resize_h = 0;
     s.wins[i].pend_focus = 0 - 1;
@@ -96,16 +137,28 @@ fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64) as voi
     s.wins[i].dec_pages = 0;
     s.wins[i].dec_attached = 0;
     wan.init_win(i);
+    win.tord_add(i);
+    if (s.scratch_wait == 1) { s.scratch_win = i; s.scratch_wait = 0; }
+    if (swal_from >= 0 && win.win_mapped(swal_from) == 1) {
+        s.wins[i].swallowing = swal_from;
+        s.wins[swal_from].swallowed_by = i;
+        dmg.dmg_frame(swal_from);
+    }
+    s.arrange_dirty = 1;
+    s.layout_dirty = 1;
     win.win_focus(i);
     return;
 }
 
 fn spawn_client() as void {
-    spawn_client_img(s.img_base, s.img_len, cast(*u8, "wterm"), 5);
+    spawn_client_img(s.img_base, s.img_len, cast(*u8, "wterm"), 5, 0 - 1);
     return;
 }
 
-fn spawn_named(name as *u8, nlen as i64) as void {
+// spawn_named — run a program by name as a window. `from` is the window that
+// asked (or -1): a program the config marks `swallow` takes that window's
+// place instead of opening beside it.
+fn spawn_named_from(from as i64, name as *u8, nlen as i64) as void {
     if (nlen <= 0 || nlen > 30) { return; }
     let is [40]u8 as path;
     path[0] = cast(u8, 47);
@@ -115,8 +168,21 @@ fn spawn_named(name as *u8, nlen as i64) as void {
     let is i64 as flen with mut = 0;
     let is i64 as buf = load_file_into(cast(*u8, &path[0]), 1 + nlen, &flen);
     if (buf == 0) { return; }
-    spawn_client_img(buf, flen, name, nlen);
+    let is i64 as swal with mut = 0 - 1;
+    if (from >= 0) {
+        let is [2]i64 as nm;
+        let is i64 as nl with mut = nlen;
+        if (nl > 16) { nl = 16; }
+        wmp.title_pack(name, nl, &nm[0], &nm[1]);
+        if (cfg.swallow_rule(nm[0], nm[1], nl) == 1) { swal = from; }
+    }
+    spawn_client_img(buf, flen, name, nlen, swal);
     sys.munmap(buf, (flen + 4095) & (0 - 4096));
+    return;
+}
+
+fn spawn_named(name as *u8, nlen as i64) as void {
+    spawn_named_from(0 - 1, name, nlen);
     return;
 }
 
@@ -136,16 +202,8 @@ fn reap_window(i as i64, do_wait as i64) as void {
         s.wins[i].close_wait = do_wait;
         if (wan.close_start(i, sys.time_ns(), cast(i64, fn_ptr(reap_window_deferred))) == 1) {
             if (s.drag_mode != 0 && s.drag_win == i) { s.drag_mode = 0; }
-            let is i64 as k with mut = 0;
-            let is i64 as done with mut = 0;
-            while (k < s.nz && done == 0) {
-                let is i64 as cand = s.zord[k];
-                if (cand != i && s.wins[cand].used == 1 && s.wins[cand].state == 2
-                    && s.wins[cand].closing == 0 && s.wins[cand].minimized == 0) {
-                    win.win_focus(cand); done = 1;
-                }
-                k = k + 1;
-            }
+            unswallow(i);
+            if (s.focused == i) { win.win_focus_fallback(i); }
             dmg.dmg_taskbar();
             s.scene_dirty = 1;
             s.deco_dirty = 1;
@@ -155,6 +213,27 @@ fn reap_window(i as i64, do_wait as i64) as void {
         s.wins[i].closing = 0;
     }
     reap_window_final(i, do_wait);
+    return;
+}
+
+// unswallow — a window that displaced another is going away: give the
+// placeholder its place back. Done when the close STARTS, not when the fade
+// ends, so the window underneath reappears as the one above it dissolves.
+fn unswallow(i as i64) as void {
+    let is i64 as ph = s.wins[i].swallowing;
+    s.wins[i].swallowing = 0 - 1;
+    if (ph < 0 || ph >= s.MAX_WIN) { return; }
+    if (s.wins[ph].used == 0 || s.wins[ph].swallowed_by != i) { return; }
+    s.wins[ph].swallowed_by = 0 - 1;
+    if (win.win_mapped(ph) == 1) {
+        win.win_set_geom(ph, s.wins[i].x, s.wins[i].y, s.wins[i].w, s.wins[i].h);
+        win.win_focus(ph);
+    }
+    s.arrange_dirty = 1;
+    s.scene_dirty = 1;
+    s.deco_dirty = 1;
+    dmg.dmg_frame(ph);
+    dmg.dmg_taskbar();
     return;
 }
 
@@ -182,13 +261,23 @@ fn reap_window_final(i as i64, do_wait as i64) as void {
         s.wins[i].dec_attached = 0;
     }
     sys.close(s.wins[i].chan);
-    let is i64 as was_top with mut = 0;
-    if (s.nz > 0 && s.zord[0] == i) { was_top = 1; }
+    unswallow(i);
+    // A window this one was standing in for outlives it as an ordinary
+    // window: the placeholder is gone, so nothing is waiting to come back.
+    let is i64 as host = s.wins[i].swallowed_by;
+    if (host >= 0 && host < s.MAX_WIN && s.wins[host].swallowing == i) {
+        s.wins[host].swallowing = 0 - 1;
+    }
+    s.wins[i].swallowed_by = 0 - 1;
     win.win_zremove(i);
+    win.tord_remove(i);
+    if (s.scratch_win == i) { s.scratch_win = 0 - 1; }
     dmg.dmg_frame(i);
     dmg.dmg_taskbar();
     s.scene_dirty = 1;
     s.deco_dirty = 1;
+    s.arrange_dirty = 1;
+    s.layout_dirty = 1;
     s.wins[i].used = 0;
     s.wins[i].state = 0;
     s.wins[i].closing = 0;
@@ -202,10 +291,7 @@ fn reap_window_final(i as i64, do_wait as i64) as void {
             sys.wait(s.wins[i].pid, &st2);
         }
     }
-    if (was_top == 1 && s.nz > 0) {
-        s.wins[s.zord[0]].pend_focus = 1;
-        dmg.dmg_frame(s.zord[0]);
-    }
+    if (s.focused == i) { win.win_focus_fallback(i); }
     return;
 }
 
@@ -246,6 +332,10 @@ fn handle_msg(i as i64, m as *i64) as void {
         dmg.dmg_taskbar();
         s.scene_dirty = 1;
         s.deco_dirty = 1;
+        // It only joins the layout now: a window with no surface has nothing
+        // to show in a column.
+        s.arrange_dirty = 1;
+        s.layout_dirty = 1;
     } else if (m[0] == wmp.MSG_COMMIT) {
         if (s.wins[i].state != 2) { return; }
         if (s.wins[i].is_text == 1) {
@@ -287,7 +377,7 @@ fn handle_msg(i as i64, m as *i64) as void {
     } else if (m[0] == wmp.MSG_SPAWN_NAMED) {
         let is [16]u8 as nm;
         wmp.title_unpack(m[2], m[3], m[1], cast(*u8, &nm[0]));
-        spawn_named(cast(*u8, &nm[0]), m[1]);
+        spawn_named_from(i, cast(*u8, &nm[0]), m[1]);
     }
     return;
 }
