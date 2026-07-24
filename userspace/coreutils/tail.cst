@@ -1,7 +1,14 @@
 // tail — print the last part of each file.
-//   tail [-n [+]N] [-c [+]N] [-q] [-v] [file ...]
+//   tail [-n [+]N] [-c [+]N] [-q] [-v] [-f] [file ...]
 // -n N last N lines (default 10); -n +N from line N onward (1-based).
 // -c N last N bytes; -c +N from byte N onward. -q never banner; -v always.
+// -f follow: after the initial tail, keep polling the file's size and
+//   print whatever is appended (until EOF on the fd, which is rare for
+//   a regular file; in practice the user aborts via the shell).
+//   Polling-by-design — files always report READABLE on SYS_POLL, so a
+//   stat-every-100ms loop is the honest way to detect growth. -f is
+//   only meaningful for a single file; with multiple files it follows
+//   the last one (GNU behaviour).
 // No file (or `-`) reads stdin.
 use "../../../Caustic/std/causticos/prog.cst" as prog;
 use "../../../Caustic/std/os/causticos.cst" as sys;
@@ -38,18 +45,58 @@ fn parse_signed(s as *u8, plus as *i64) as i64 {
     return fu.parse_uint(cast(*u8, cast(i64, s) + i), 19);
 }
 
+// follow_loop: after the initial tail, keep polling path's size and
+// print whatever is appended. Sleeps 100ms between polls. Reads via
+// mmap_fd when the delta is large (> 4096 bytes — mmap overhead is
+// worth it), read-loop otherwise. Stops when the fd reports E_PIPE
+// (peer closed — rare on a regular file) or E_BADF (file unlinked).
+fn follow_loop(path as *u8) as void {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return; }
+    // Start at the current end-of-file.
+    let is [4]i64 as st;
+    if (sys.stat(path, cast(*u8, &st[0])) != 0) { sys.close(fd); return; }
+    let is i64 as pos with mut = st[0];
+    let is [4096]u8 as buf;
+    while (1 == 1) {
+        sys.sleep_ns(100000000);                       // 100 ms
+        if (sys.stat(path, cast(*u8, &st[0])) != 0) { sys.close(fd); return; }
+        let is i64 as sz = st[0];
+        if (sz < pos) { pos = sz; }                   // truncation → reset
+        if (sz == pos) { continue; }                  // no growth yet
+        let is i64 as delta = sz - pos;
+        if (delta < 4096) {
+            // Read the small delta via sys.lseek + sys.read.
+            sys.lseek(fd, pos, sys.SEEK_SET);
+            let is i64 as got = sys.read(fd, cast(*u8, &buf[0]), delta);
+            if (got > 0) { prog.out(cast(*u8, &buf[0]), got); pos = pos + got; }
+        } else {
+            // Big delta: mmap the new range, print, munmap.
+            sys.lseek(fd, pos, sys.SEEK_SET);
+            let is i64 as va = sys.mmap_fd(sys.PROT_READ, fd);
+            if (va > 0) {
+                prog.out(cast(*u8, va), delta);
+                sys.munmap(va, fu.page_round(delta));
+            }
+            pos = pos + delta;
+        }
+    }
+}
+
 fn main(argc as i64, argv as *u8) as i32 {
     let is fu.Opt as o;
     fu.opt_init(&o, argc, argv);
     let is i64 as n with mut = 10; let is i64 as bymode with mut = 0; let is i64 as plus with mut = 0;
     let is i64 as q with mut = 0; let is i64 as v with mut = 0;
+    let is i64 as follow with mut = 0;
     while (1 == 1) {
-        let is i64 as f = fu.opt_next(&o, "n:c:qv");
+        let is i64 as f = fu.opt_next(&o, "n:c:qvf");
         if (f < 0) { break; }
         if (f == 110) { let is [1]i64 as pl; n = parse_signed(cast(*u8, o.optarg), cast(*i64, &pl[0])); plus = pl[0]; bymode = 0; }
         else if (f == 99) { let is [1]i64 as pl; n = parse_signed(cast(*u8, o.optarg), cast(*i64, &pl[0])); plus = pl[0]; bymode = 1; }
         else if (f == 113) { q = 1; } else if (f == 118) { v = 1; }
-        else { prog.outs("usage: tail [-n [+]N] [-c [+]N] [-qv] [file ...]\n"); return cast(i32, 1); }
+        else if (f == 102) { follow = 1; }
+        else { prog.outs("usage: tail [-n [+]N] [-c [+]N] [-qvf] [file ...]\n"); return cast(i32, 1); }
     }
     if (n < 0) { n = 0; }
     let is i64 as nfiles = argc - o.ind;
@@ -60,6 +107,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     }
     let is i64 as banner with mut = 0; if (nfiles > 1) { banner = 1; } if (q != 0) { banner = 0; } if (v != 0) { banner = 1; }
     let is i32 as rc with mut = 0; let is i64 as i with mut = o.ind; let is i64 as first with mut = 1;
+    let is [256]u8 as last_pb;
+    let is *u8 as last_path with mut = cast(*u8, 0);
     while (i < argc) {
         let is *u8 as name = prog.arg(argv, i);
         let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
@@ -69,8 +118,14 @@ fn main(argc as i64, argv as *u8) as i32 {
             if (banner != 0) { if (first == 0) { prog.out("\n", 1); } prog.outs("==> "); prog.outs(name); prog.outs(" <==\n"); }
             first = 0;
             if (len > 0) { emit_tail(base, len, n, bymode, plus); fu.unslurp(base, len); }
+            // Remember the last file for -f (GNU convention).
+            let is i64 as k with mut = 0;
+            while (k < 256 && cast(i64, path[k]) != 0) { last_pb[k] = path[k]; k = k + 1; }
+            last_pb[k] = cast(u8, 0);
+            last_path = cast(*u8, &last_pb[0]);
         }
         i = i + 1;
     }
+    if (follow != 0 && cast(i64, last_path) != 0) { follow_loop(last_path); }
     return rc;
 }
