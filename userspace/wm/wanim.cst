@@ -1,0 +1,254 @@
+// wm/wanim.cst — the WM's animation domain. lib/anim owns "a value moving over
+// time"; this module owns which WINDOW PROPERTY each slot drives, when a tween
+// starts, and what to damage while it runs.
+//
+// An animation never touches wins[i].x/y/w/h. The settled geometry stays the
+// truth for hit-testing, drag maths and the RESIZE messages a client receives;
+// the tween only changes the rect the WM DESCRIBES to the compositor in
+// send_scene. That split is why a window can be mid-fade and still be clicked
+// exactly where the user thinks it is.
+
+use "state.cst" as s;
+use "damage.cst" as dmg;
+use "../lib/anim/anim.cst" as anim;
+use "../lib/anim/bezier.cst" as bez;
+
+let is i64 as OPEN_MS      with imut = 200;
+let is i64 as OPEN_SCALE0  with imut = 235;   // 0.918 of full size, grows to 1.0
+let is i64 as CLOSE_MS     with imut = 150;
+let is i64 as CLOSE_SCALE1 with imut = 235;   // shrinks back to 0.918 while fading
+let is i64 as FOCUS_MS     with imut = 80;
+let is i64 as GEOM_MS      with imut = 120;
+let is i64 as TASK_MS      with imut = 180;
+let is i64 as HOVER_MS     with imut = 60;
+let is i64 as FLING_MS     with imut = 300;
+
+fn init_win(i as i64) as void {
+    s.wins[i].anim_open = s.ANIM_NONE;
+    s.wins[i].anim_close = s.ANIM_NONE;
+    s.wins[i].anim_focus = s.ANIM_NONE;
+    s.wins[i].anim_geom = s.ANIM_NONE;
+    s.wins[i].anim_task = s.ANIM_NONE;
+    s.wins[i].closing = 0;
+    s.wins[i].close_wait = 0;
+    return;
+}
+
+// open_start — a window just mapped (its surface arrived): grow + fade it in.
+// A full anim pool is not an error: the window simply appears settled.
+fn open_start(i as i64, now as i64) as void {
+    s.wins[i].anim_open = anim.start_new(now, 0, 256, OPEN_MS, bez.EASE_OUT, i);
+    return;
+}
+
+fn open_running(i as i64) as i64 {
+    if (s.wins[i].anim_open == s.ANIM_NONE) { return 0; }
+    return anim.active(s.wins[i].anim_open);
+}
+
+// close_start — shrink + fade out, then run `on_done` (the real teardown). The
+// teardown is deferred rather than run now because the window has to stay
+// drawable for the length of the fade: its content segment is still mapped in
+// the compositor and its frame is still in the scene.
+//
+// A full anim pool must not strand a window half-closed, so the caller is told
+// (0) and tears down immediately instead.
+fn close_start(i as i64, now as i64, on_done as i64) as i64 {
+    let is i64 as id = anim.start_new(now, 256, 0, CLOSE_MS, bez.EASE_IN, i);
+    if (id == anim.NONE) { return 0; }
+    anim.set_done(id, on_done);
+    s.wins[i].anim_close = id;
+    s.wins[i].closing = 1;
+    return 1;
+}
+
+fn close_running(i as i64) as i64 {
+    if (s.wins[i].anim_close == s.ANIM_NONE) { return 0; }
+    return anim.active(s.wins[i].anim_close);
+}
+
+// Presentation scale/alpha in 256ths / 255ths. A close overrides an open: a
+// window shut while it is still appearing fades from wherever it got to.
+fn pres_scale(i as i64) as i64 {
+    if (close_running(i) == 1) {
+        let is i64 as v = anim.value(s.wins[i].anim_close);
+        return CLOSE_SCALE1 + (256 - CLOSE_SCALE1) * v / 256;
+    }
+    if (open_running(i) == 0) { return 256; }
+    let is i64 as v = anim.value(s.wins[i].anim_open);
+    return OPEN_SCALE0 + (256 - OPEN_SCALE0) * v / 256;
+}
+
+fn pres_alpha(i as i64) as i64 {
+    let is i64 as v with mut = 256;
+    if (close_running(i) == 1) { v = anim.value(s.wins[i].anim_close); }
+    else if (open_running(i) == 1) { v = anim.value(s.wins[i].anim_open); }
+    if (v > 255) { return 255; }
+    if (v < 0) { return 0; }
+    return v;
+}
+
+// focus_start — ramp a window's decoration between its unfocused and focused
+// palette. Starting from the CURRENT blend (not from the far end) is what makes
+// a fast Alt-Tab back and forth look continuous instead of snapping.
+fn focus_start(i as i64, now as i64, to as i64) as void {
+    let is i64 as settled with mut = 255;
+    if (to != 0) { settled = 0; }
+    let is i64 as from_v = focus_blend(i, settled);
+    s.wins[i].anim_focus = anim.start_new(now, from_v, to, FOCUS_MS, bez.EASE_OUT, i);
+    return;
+}
+
+// focus_blend — 0..255 between the unfocused and focused colours. `settled` is
+// what it must read once the tween is done (the WM owns focus, not this module).
+fn focus_blend(i as i64, settled as i64) as i64 {
+    if (s.wins[i].anim_focus != s.ANIM_NONE && anim.active(s.wins[i].anim_focus) == 1) {
+        let is i64 as v = anim.value(s.wins[i].anim_focus);
+        if (v > 255) { return 255; }
+        if (v < 0) { return 0; }
+        return v;
+    }
+    if (settled > 255) { return 255; }
+    return settled;
+}
+
+// geom_start — glide from the rect the window had to the one it now has. The
+// caller has ALREADY committed the new geometry; only the drawn rect lags.
+// Interactive drags do not come through here: a window must track the pointer
+// exactly, and a tween would put it 120 ms behind the hand moving it.
+fn geom_start_ms(i as i64, now as i64, fx as i64, fy as i64, fw as i64, fh as i64,
+                 ms as i64) as void {
+    s.wins[i].geom_fx = fx; s.wins[i].geom_fy = fy;
+    s.wins[i].geom_fw = fw; s.wins[i].geom_fh = fh;
+    s.wins[i].anim_geom = anim.start_new(now, 0, 256, ms, bez.EASE_OUT, i);
+    return;
+}
+fn geom_start(i as i64, now as i64, fx as i64, fy as i64, fw as i64, fh as i64) as void {
+    geom_start_ms(i, now, fx, fy, fw, fh, GEOM_MS);
+    return;
+}
+// fling — the release of a fast drag carries the window a little further and
+// eases to a stop. Reuses the geometry tween: the WM has already committed the
+// projected position, only the drawn rect trails.
+fn fling_ms() as i64 { return FLING_MS; }
+
+fn geom_running(i as i64) as i64 {
+    if (s.wins[i].anim_geom == s.ANIM_NONE) { return 0; }
+    return anim.active(s.wins[i].anim_geom);
+}
+
+// pres_rect — the frame rect to DRAW this frame: the settled geometry, pulled
+// back toward the tween's start rect, then scaled about its own centre by
+// whatever open/close fade is running. The single place presentation geometry
+// is derived, so send_scene never has to know which tweens exist.
+fn pres_rect(i as i64, out as *i64) as void {
+    let is i64 as x with mut = s.wins[i].x;
+    let is i64 as y with mut = s.wins[i].y;
+    let is i64 as w with mut = s.wins[i].w;
+    let is i64 as h with mut = s.wins[i].h;
+    if (geom_running(i) == 1) {
+        let is i64 as v = anim.value(s.wins[i].anim_geom);
+        x = s.wins[i].geom_fx + (x - s.wins[i].geom_fx) * v / 256;
+        y = s.wins[i].geom_fy + (y - s.wins[i].geom_fy) * v / 256;
+        w = s.wins[i].geom_fw + (w - s.wins[i].geom_fw) * v / 256;
+        h = s.wins[i].geom_fh + (h - s.wins[i].geom_fh) * v / 256;
+    }
+    let is i64 as sc = pres_scale(i);
+    if (sc != 256) {
+        let is i64 as nw = w * sc / 256;
+        let is i64 as nh = h * sc / 256;
+        x = x + (w - nw) / 2;
+        y = y + (h - nh) / 2;
+        w = nw; h = nh;
+    }
+    out[0] = x; out[1] = y; out[2] = w; out[3] = h;
+    return;
+}
+
+// task_start / task_v — a new taskbar button grows out of the bar instead of
+// popping into it. 0..256, 256 once settled.
+fn task_start(i as i64, now as i64) as void {
+    s.wins[i].anim_task = anim.start_new(now, 0, 256, TASK_MS, bez.EASE_OUT, i);
+    return;
+}
+fn task_v(i as i64) as i64 {
+    if (s.wins[i].anim_task == s.ANIM_NONE) { return 256; }
+    if (anim.active(s.wins[i].anim_task) == 0) { return 256; }
+    return anim.value(s.wins[i].anim_task);
+}
+
+// hover_start / hover_v — the ramp behind a titlebar button highlight. One
+// global slot: only one button can be under the pointer.
+fn hover_start(now as i64, from_v as i64, to as i64) as void {
+    s.anim_hover = anim.start_new(now, from_v, to, HOVER_MS, bez.EASE_OUT, 0);
+    return;
+}
+fn hover_v() as i64 {
+    if (s.anim_hover != s.ANIM_NONE && anim.active(s.anim_hover) == 1) {
+        return anim.value(s.anim_hover);
+    }
+    if (s.hover_on == 1) { return 256; }
+    return 0;
+}
+
+// tick — advance every slot against one clock, then damage what moved. The
+// settled frame rect always covers the scaled one, so dmg_frame is enough for
+// both the rect being vacated and the rect being drawn.
+//
+// A close tween's on_done runs INSIDE tick_all and tears the window down, so
+// the sweep below re-checks `used` before touching anything.
+fn tick(now as i64) as void {
+    s.anim_live = anim.tick_all(now);
+    if (s.anim_hover != s.ANIM_NONE) {
+        s.deco_dirty = 1;
+        if (s.hover_win >= 0) {
+            dmg.dmg_add(s.wins[s.hover_win].x + s.BORDER, s.wins[s.hover_win].y + s.BORDER,
+                        s.wins[s.hover_win].w, s.TITLE_H);
+        }
+        // The button keeps being rendered while it ramps DOWN, so it is only
+        // forgotten once the ramp is done and the pointer has left.
+        if (anim.active(s.anim_hover) == 0) {
+            s.anim_hover = s.ANIM_NONE;
+            if (s.hover_on == 0) { s.hover_win = 0 - 1; s.hover_btn = 0; }
+        }
+    }
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        let is i64 as moving with mut = 0;
+        if (s.wins[i].anim_open != s.ANIM_NONE) { moving = 1; }
+        if (s.wins[i].anim_close != s.ANIM_NONE) { moving = 1; }
+        if (s.wins[i].anim_focus != s.ANIM_NONE) { moving = 1; }
+        if (s.wins[i].anim_geom != s.ANIM_NONE) { moving = 1; }
+        if (s.wins[i].anim_task != s.ANIM_NONE) {
+            dmg.dmg_taskbar();
+            s.deco_dirty = 1;
+            if (anim.active(s.wins[i].anim_task) == 0) { s.wins[i].anim_task = s.ANIM_NONE; }
+        }
+        if (moving == 1) {
+            // A geometry tween vacates its start rect, which the settled rect
+            // need not cover (shrinking out of a maximise).
+            if (s.wins[i].anim_geom != s.ANIM_NONE) {
+                dmg.dmg_add(s.wins[i].geom_fx, s.wins[i].geom_fy,
+                            s.wins[i].geom_fw + 2, s.wins[i].geom_fh + 20 + 2);
+            }
+            dmg.dmg_frame(i);
+            s.scene_dirty = 1;
+            // The frame that ends a tween still has to be sent, so slots are
+            // released only after this damage is queued.
+            if (s.wins[i].used == 0) {
+                s.wins[i].anim_open = s.ANIM_NONE;
+                s.wins[i].anim_close = s.ANIM_NONE;
+                s.wins[i].anim_focus = s.ANIM_NONE;
+            } else {
+                if (open_running(i) == 0)  { s.wins[i].anim_open = s.ANIM_NONE; }
+                if (close_running(i) == 0) { s.wins[i].anim_close = s.ANIM_NONE; }
+                if (geom_running(i) == 0)  { s.wins[i].anim_geom = s.ANIM_NONE; }
+                if (s.wins[i].anim_focus != s.ANIM_NONE
+                    && anim.active(s.wins[i].anim_focus) == 0) { s.wins[i].anim_focus = s.ANIM_NONE; }
+                s.deco_dirty = 1;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}

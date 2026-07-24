@@ -5,6 +5,7 @@ use "state.cst" as s;
 use "window.cst" as win;
 use "damage.cst" as dmg;
 use "client.cst" as cli;
+use "wanim.cst" as wan;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../../../Caustic/std/os/causticos.cst" as sys;
@@ -26,6 +27,92 @@ fn forward_mouse(i as i64, mtype as i64, a as i64) as void {
     return;
 }
 
+// ---- overlay chrome the compositor draws for us -------------------------
+// The WM owns WHERE these go and WHEN; the compositor owns how an outline
+// looks. Damage travels with them: an overlay is not a window, so nothing else
+// would repaint the rect it leaves behind.
+fn ovl_set(sl as i64, x as i64, y as i64, w as i64, h as i64) as void {
+    if (s.ovl_on[sl] == 1 && s.ovl_rect[sl*4+0] == x && s.ovl_rect[sl*4+1] == y
+        && s.ovl_rect[sl*4+2] == w && s.ovl_rect[sl*4+3] == h) { return; }
+    if (s.ovl_on[sl] == 1) {
+        dmg.dmg_add(s.ovl_rect[sl*4+0], s.ovl_rect[sl*4+1],
+                    s.ovl_rect[sl*4+2], s.ovl_rect[sl*4+3]);
+    }
+    s.ovl_on[sl] = 1;
+    s.ovl_rect[sl*4+0] = x; s.ovl_rect[sl*4+1] = y;
+    s.ovl_rect[sl*4+2] = w; s.ovl_rect[sl*4+3] = h;
+    s.ovl_dirty = 1;
+    dmg.dmg_add(x, y, w, h);
+    return;
+}
+
+fn ovl_clear(sl as i64) as void {
+    if (s.ovl_on[sl] == 0) { return; }
+    dmg.dmg_add(s.ovl_rect[sl*4+0], s.ovl_rect[sl*4+1],
+                s.ovl_rect[sl*4+2], s.ovl_rect[sl*4+3]);
+    s.ovl_on[sl] = 0;
+    s.ovl_dirty = 1;
+    return;
+}
+
+// snap_preview — while dragging near a screen edge, ghost the rect the window
+// WOULD take. Purely a preview: the drop still decides, and nothing here moves
+// a window.
+fn snap_preview(i as i64) as void {
+    let is i64 as halfw = s.scr_w / 2;
+    if (s.my <= s.SNAP_PX) {
+        ovl_set(cp.OVL_SNAP, 0, 0, s.scr_w, s.work_h); return;
+    }
+    if (s.mx <= s.SNAP_PX) {
+        ovl_set(cp.OVL_SNAP, 0, 0, halfw, s.work_h); return;
+    }
+    if (s.mx >= s.scr_w - s.SNAP_PX) {
+        ovl_set(cp.OVL_SNAP, halfw, 0, halfw, s.work_h); return;
+    }
+    ovl_clear(cp.OVL_SNAP);
+    return;
+}
+
+// ---- shake to minimise ---------------------------------------------------
+// Four samples of (x, t). Two direction reversals inside 800 ms with enough
+// travel in each leg is a shake; a normal drag never reverses twice that fast.
+fn shake_check(now as i64) as i64 {
+    let is i64 as oldest = s.shake_t[(s.shake_i + 1) % 4];
+    if (oldest == 0 || now - oldest > 800000000) { return 0; }
+    let is i64 as rev with mut = 0;
+    let is i64 as travel with mut = 0;
+    let is i64 as k with mut = 1;
+    let is i64 as prev_dir with mut = 0;
+    while (k < 4) {
+        let is i64 as a = s.shake_x[(s.shake_i + k) % 4];
+        let is i64 as b = s.shake_x[(s.shake_i + k + 1) % 4];
+        let is i64 as d = b - a;
+        travel = travel + wmp_abs(d);
+        let is i64 as dir with mut = 0;
+        if (d > 0) { dir = 1; }
+        if (d < 0) { dir = 0 - 1; }
+        if (dir != 0 && prev_dir != 0 && dir != prev_dir) { rev = rev + 1; }
+        if (dir != 0) { prev_dir = dir; }
+        k = k + 1;
+    }
+    if (rev >= 2 && travel >= 400) { return 1; }
+    return 0;
+}
+
+fn wmp_abs(v as i64) as i64 { if (v < 0) { return 0 - v; } return v; }
+
+fn minimize_all() as void {
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0
+            && s.wins[i].minimized == 0) {
+            win.win_minimize(i);
+        }
+        i = i + 1;
+    }
+    return;
+}
+
 fn titlebar_button_at(i as i64) as i64 {
     let is i64 as tb_y0 = s.wins[i].y + s.BORDER;
     if (s.my < tb_y0 || s.my >= tb_y0 + s.TITLE_H) { return 0; }
@@ -42,7 +129,7 @@ fn taskbar_window_at() as i64 {
     let is i64 as bx with mut = 4;
     let is i64 as i with mut = 0;
     while (i < s.MAX_WIN) {
-        if (s.wins[i].used == 1 && s.wins[i].state == 2) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0) {
             if (s.mx >= bx && s.mx < bx + s.TASK_W) { return i; }
             bx = bx + s.TASK_W + 4;
         }
@@ -68,7 +155,7 @@ fn press_at() as void {
     let is i64 as zi with mut = 0;
     while (zi < s.nz) {
         let is i64 as i = s.zord[zi];
-        if (s.wins[i].used == 1 && s.wins[i].state == 2) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0) {
             let is i64 as fx = s.wins[i].x;
             let is i64 as fy = s.wins[i].y;
             let is i64 as fw = s.wins[i].w + 2 * s.BORDER;
@@ -111,16 +198,45 @@ fn mouse_buttons(oldb as i64, newb as i64) as void {
     if (lp_old == 0 && lp_new == 1) { press_at(); return; }
     if (lp_old == 1 && lp_new == 0) {
         if (s.drag_mode == 1) {
-            if (s.my <= s.SNAP_PX) { win.win_maximize(s.drag_win); }
-            else if (s.mx <= s.SNAP_PX) { win.win_snap(s.drag_win, 0); }
-            else if (s.mx >= s.scr_w - s.SNAP_PX) { win.win_snap(s.drag_win, 1); }
+            let is i64 as dw = s.drag_win;
+            ovl_clear(cp.OVL_DRAG); ovl_clear(cp.OVL_SNAP);
+            if (s.my <= s.SNAP_PX) { win.win_maximize(dw); }
+            else if (s.mx <= s.SNAP_PX) { win.win_snap(dw, 0); }
+            else if (s.mx >= s.scr_w - s.SNAP_PX) { win.win_snap(dw, 1); }
+            else { fling(dw); }
             s.drag_mode = 0; return;
         }
-        if (s.drag_mode != 0) { s.drag_mode = 0; return; }
+        if (s.drag_mode != 0) {
+            ovl_clear(cp.OVL_DRAG); ovl_clear(cp.OVL_SNAP);
+            s.drag_mode = 0; return;
+        }
         if (s.nz > 0) { forward_mouse(s.zord[0], wmp.MSG_MOUSE_BTN, newb); }
         return;
     }
     if (s.nz > 0) { forward_mouse(s.zord[0], wmp.MSG_MOUSE_BTN, newb); }
+    return;
+}
+
+// fling — a drag released while still moving carries the window a little
+// further and eases to a stop, instead of stopping dead under the pointer. The
+// projected position is COMMITTED at once (so a click right after lands where
+// the window ends up) and only the drawn rect trails, reusing the geometry tween.
+fn fling(i as i64) as void {
+    let is i64 as vx = s.drag_vx;
+    let is i64 as vy = s.drag_vy;
+    if (wmp_abs(vx) < 6 && wmp_abs(vy) < 6) { return; }
+    let is i64 as fw = s.wins[i].w + 2 * s.BORDER;
+    let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
+    let is i64 as ox = s.wins[i].x; let is i64 as oy = s.wins[i].y;
+    let is i64 as nx with mut = ox + vx * 5;
+    let is i64 as ny with mut = oy + vy * 5;
+    if (nx < 0) { nx = 0; }
+    if (ny < 0) { ny = 0; }
+    if (nx + fw > s.scr_w) { nx = s.scr_w - fw; }
+    if (ny + fh > s.scr_h) { ny = s.scr_h - fh; }
+    if (nx == ox && ny == oy) { return; }
+    win.win_set_geom(i, nx, ny, s.wins[i].w, s.wins[i].h);
+    wan.geom_start_ms(i, sys.time_ns(), ox, oy, s.wins[i].w, s.wins[i].h, wan.fling_ms());
     return;
 }
 
@@ -138,6 +254,8 @@ fn start_move(i as i64) as void {
     }
     s.drag_mode = 1;
     s.drag_win = i;
+    s.drag_vx = 0; s.drag_vy = 0;
+    s.drag_px = s.mx; s.drag_py = s.my;
     s.drag_ax = s.mx; s.drag_ay = s.my;
     s.drag_ox = s.wins[i].x; s.drag_oy = s.wins[i].y;
     s.drag_ow = s.wins[i].w; s.drag_oh = s.wins[i].h;
@@ -148,6 +266,8 @@ fn start_resize(i as i64, dirs as i64) as void {
     s.drag_mode = 2;
     s.drag_win = i;
     s.drag_dirs = dirs;
+    s.drag_vx = 0; s.drag_vy = 0;
+    s.drag_px = s.mx; s.drag_py = s.my;
     s.drag_ax = s.mx; s.drag_ay = s.my;
     s.drag_ox = s.wins[i].x; s.drag_oy = s.wins[i].y;
     s.drag_ow = s.wins[i].w; s.drag_oh = s.wins[i].h;
@@ -172,7 +292,8 @@ fn cursor_shape_for() as i64 {
     let is i64 as zi with mut = 0;
     while (zi < s.nz) {
         let is i64 as i = s.zord[zi];
-        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0
+            && s.wins[i].closing == 0) {
             let is i64 as fx = s.wins[i].x; let is i64 as fy = s.wins[i].y;
             let is i64 as fw = s.wins[i].w + 2 * s.BORDER; let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
             if (s.mx >= fx && s.mx < fx + fw && s.my >= fy && s.my < fy + fh) {
@@ -194,12 +315,42 @@ fn cursor_shape_for() as i64 {
 // Apply the cursor move: drag geometry, then damage the old + new cursor box,
 // then re-evaluate the close-button hover, then refresh the cursor shape.
 fn mouse_apply_motion() as void {
+    let is i64 as now = sys.time_ns();
+    let is i64 as dx = s.mx - s.drag_px;
+    let is i64 as dy = s.my - s.drag_py;
+    s.drag_px = s.mx; s.drag_py = s.my;
+    if (s.drag_mode != 0) {
+        // Smoothed per-event velocity; with a steady hand it converges to the
+        // event delta, which is what the release fling projects forward.
+        s.drag_vx = (s.drag_vx + dx * 3) / 4;
+        s.drag_vy = (s.drag_vy + dy * 3) / 4;
+    }
+    s.shake_i = (s.shake_i + 1) % 4;
+    s.shake_x[s.shake_i] = s.mx;
+    s.shake_t[s.shake_i] = now;
+    if (shake_check(now) == 1) {
+        s.shake_t[0] = 0; s.shake_t[1] = 0; s.shake_t[2] = 0; s.shake_t[3] = 0;
+        if (s.drag_mode != 0) { ovl_clear(cp.OVL_DRAG); ovl_clear(cp.OVL_SNAP); }
+        s.drag_mode = 0;
+        minimize_all();
+        s.cur_shape = cursor_shape_for();
+        return;
+    }
     if (s.drag_mode == 1) {
         let is i64 as i = s.drag_win;
         let is i64 as fw = s.wins[i].w + 2 * s.BORDER;
         let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
-        let is i64 as nx2 with mut = s.drag_ox + (s.mx - s.drag_ax);
-        let is i64 as ny2 with mut = s.drag_oy + (s.my - s.drag_ay);
+        // The frame trails the pointer by up to 3px against the direction of
+        // travel. The cursor stays visibly ahead of the window, which is what
+        // reads as weight instead of the frame being glued to the hotspot.
+        let is i64 as lx with mut = dx;
+        if (lx > 3) { lx = 3; }
+        if (lx < 0 - 3) { lx = 0 - 3; }
+        let is i64 as ly with mut = dy;
+        if (ly > 3) { ly = 3; }
+        if (ly < 0 - 3) { ly = 0 - 3; }
+        let is i64 as nx2 with mut = s.drag_ox + (s.mx - s.drag_ax) - lx;
+        let is i64 as ny2 with mut = s.drag_oy + (s.my - s.drag_ay) - ly;
         if (nx2 < 0) { nx2 = 0; }
         if (ny2 < 0) { ny2 = 0; }
         if (nx2 + fw > s.scr_w) { nx2 = s.scr_w - fw; }
@@ -244,20 +395,46 @@ fn mouse_apply_motion() as void {
         }
     }
     dmg.dmg_add(s.mx - 13, s.my - 13, 28, 32);
-    let is i64 as hov with mut = 0 - 1;
-    if (s.nz > 0) {
-        let is i64 as f = s.zord[0];
-        let is i64 as right = s.wins[f].x + s.BORDER + s.wins[f].w;
-        let is i64 as tby = s.wins[f].y + s.BORDER;
-        if (s.mx >= right - s.BTN_W && s.mx < right && s.my >= tby && s.my < tby + s.TITLE_H) { hov = f; }
+
+    // Chrome that follows the drag: an outline round the window being moved or
+    // resized, plus a ghost of the edge-snap target it would land on.
+    if (s.drag_mode != 0) {
+        let is i64 as d = s.drag_win;
+        ovl_set(cp.OVL_DRAG, s.wins[d].x, s.wins[d].y,
+                s.wins[d].w + 2 * s.BORDER, s.wins[d].h + s.TITLE_H + 2 * s.BORDER);
+        if (s.drag_mode == 1) { snap_preview(d); } else { ovl_clear(cp.OVL_SNAP); }
     }
-    if (hov != s.close_hover_win) {
-        s.close_hover_win = hov;
+
+    // Titlebar button hover. The button keeps rendering while its highlight
+    // ramps back down, so hover_win is only cleared once that finishes (wanim).
+    let is i64 as hw with mut = 0 - 1;
+    let is i64 as hb with mut = 0;
+    if (s.nz > 0 && s.drag_mode == 0) {
+        let is i64 as f = s.zord[0];
+        if (s.wins[f].used == 1 && s.wins[f].state == 2 && s.wins[f].closing == 0
+            && s.wins[f].minimized == 0) {
+            let is i64 as b = titlebar_button_at(f);
+            if (b != 0) { hw = f; hb = b; }
+        }
+    }
+    let is i64 as on with mut = 0;
+    if (hw >= 0) { on = 1; }
+    if (hw != s.hover_win || hb != s.hover_btn || on != s.hover_on) {
+        let is i64 as from_v = wan.hover_v();
+        if (s.hover_win >= 0) {
+            dmg.dmg_add(s.wins[s.hover_win].x + s.BORDER, s.wins[s.hover_win].y + s.BORDER,
+                        s.wins[s.hover_win].w, s.TITLE_H);
+        }
+        if (hw >= 0) { s.hover_win = hw; s.hover_btn = hb; }
+        s.hover_on = on;
+        s.close_hover_win = hw;
+        let is i64 as to with mut = 0;
+        if (on == 1) { to = 256; }
+        wan.hover_start(now, from_v, to);
         s.deco_dirty = 1;
-        if (s.nz > 0) {
-            let is i64 as f2 = s.zord[0];
-            dmg.dmg_add(s.wins[f2].x + s.BORDER + s.wins[f2].w - 3 * s.BTN_W,
-                      s.wins[f2].y + s.BORDER, 3 * s.BTN_W, s.TITLE_H);
+        if (s.hover_win >= 0) {
+            dmg.dmg_add(s.wins[s.hover_win].x + s.BORDER, s.wins[s.hover_win].y + s.BORDER,
+                        s.wins[s.hover_win].w, s.TITLE_H);
         }
     }
     s.cur_shape = cursor_shape_for();

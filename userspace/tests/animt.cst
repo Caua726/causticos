@@ -1,0 +1,131 @@
+// animt — self-test for lib/anim. Checks the Bezier bake's invariants (ends
+// pinned, monotone, linear curve is the identity, ease-out leads / ease-in
+// lags a straight line) and the timeline pool (interpolation at a synthetic
+// clock, completion callback, slot reuse, exhaustion). Prints one line per
+// case and a final verdict, so it runs from the shell like any other program.
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/anim/bezier.cst" as bez;
+use "../lib/anim/anim.cst" as anim;
+
+let is i64 as fails with mut = 0;
+let is i64 as done_tag with mut = 0;
+
+fn on_finish(tag as i64) as void { done_tag = tag; return; }
+
+fn check(name as *u8, ok as i64, got as i64, want as i64) as void {
+    if (ok == 1) { prog.outs("  ok   "); } else { prog.outs("  FAIL "); fails = fails + 1; }
+    prog.outs(name);
+    prog.outs(" got="); prog.out_num(got);
+    prog.outs(" want="); prog.out_num(want);
+    prog.outs("\n");
+    return;
+}
+
+fn near(a as i64, b as i64, tol as i64) as i64 {
+    let is i64 as d with mut = a - b;
+    if (d < 0) { d = 0 - d; }
+    if (d <= tol) { return 1; }
+    return 0;
+}
+
+// Every curve must start at 0, end at 256, and never step backwards.
+fn check_curve(name as *u8, id as i64) as void {
+    let is i64 as y0 = bez.get_y(id, 0);
+    check(name, near(y0, 0, 0), y0, 0);
+    let is i64 as y1 = bez.get_y(id, 255);
+    check(name, near(y1, 256, 0), y1, 256);
+    let is i64 as mono with mut = 1;
+    let is i64 as prev with mut = 0;
+    let is i64 as x with mut = 0;
+    while (x < 256) {
+        let is i64 as y = bez.get_y(id, x);
+        if (y < prev) { mono = 0; }
+        prev = y;
+        x = x + 1;
+    }
+    check(name, mono, mono, 1);
+    return;
+}
+
+fn main() as i32 {
+    bez.init();
+    prog.outs("animt: bezier\n");
+
+    check_curve(cast(*u8, "linear   "), bez.LINEAR);
+    check_curve(cast(*u8, "ease     "), bez.EASE);
+    check_curve(cast(*u8, "ease-in  "), bez.EASE_IN);
+    check_curve(cast(*u8, "ease-out "), bez.EASE_OUT);
+    check_curve(cast(*u8, "ease-i-o "), bez.EASE_IN_OUT);
+
+    // linear is the identity: y(x) == x, within one LUT quantum.
+    let is i64 as lin_mid = bez.get_y(bez.LINEAR, 128);
+    check(cast(*u8, "linear mid"), near(lin_mid, 128, 2), lin_mid, 128);
+
+    // ease-out front-loads (above the line), ease-in trails it.
+    let is i64 as out_mid = bez.get_y(bez.EASE_OUT, 128);
+    check(cast(*u8, "ease-out>lin"), out_mid > lin_mid + 16, out_mid, lin_mid);
+    let is i64 as in_mid = bez.get_y(bez.EASE_IN, 128);
+    check(cast(*u8, "ease-in<lin"), in_mid < lin_mid - 16, in_mid, lin_mid);
+
+    // lerp rides the curve: half of 0..1000 on a linear curve is ~500.
+    let is i64 as lv = bez.lerp(0, 1000, lin_mid);
+    check(cast(*u8, "lerp mid"), near(lv, 500, 16), lv, 500);
+
+    // ---- timeline pool. The clock is synthetic: capture t0, then tick with
+    // t0+offset, so the run is deterministic and does not sleep.
+    prog.outs("animt: anim\n");
+    anim.init();
+    let is i64 as MS with imut = 1000000;
+    let is i64 as t0 = sys.time_ns();
+    let is i64 as a = anim.start_new(t0, 0, 1000, 1000, bez.LINEAR, 77);
+    check(cast(*u8, "start_new"), a >= 0, a, 0);
+    check(cast(*u8, "active@0"), anim.active(a), anim.active(a), 1);
+
+    anim.tick_all(t0 + 500 * MS);
+    let is i64 as mid = anim.value(a);
+    check(cast(*u8, "value@50%"), near(mid, 500, 20), mid, 500);
+    check(cast(*u8, "live@50%"), anim.count_active() == 1, anim.count_active(), 1);
+
+    // Completion snaps to the end value, clears the slot and fires on_done once.
+    done_tag = 0;
+    anim.set_done(a, cast(i64, fn_ptr(on_finish)));
+    anim.tick_all(t0 + 1000 * MS);
+    check(cast(*u8, "value@end"), anim.value(a) == 1000, anim.value(a), 1000);
+    check(cast(*u8, "idle@end"), anim.active(a) == 0, anim.active(a), 0);
+    check(cast(*u8, "on_done"), done_tag == 77, done_tag, 77);
+    check(cast(*u8, "live@end"), anim.count_active() == 0, anim.count_active(), 0);
+    done_tag = 0;
+    anim.tick_all(t0 + 2000 * MS);
+    check(cast(*u8, "on_done once"), done_tag == 0, done_tag, 0);
+
+    // A finished slot is reusable, and an eased slot leads a linear one.
+    let is i64 as t1 = sys.time_ns();
+    let is i64 as b = anim.start_new(t1, 0, 1000, 1000, bez.EASE_OUT, 1);
+    check(cast(*u8, "slot reuse"), b >= 0, b, 0);
+    let is i64 as c = anim.start_new(t1, 0, 1000, 1000, bez.LINEAR, 2);
+    anim.tick_all(t1 + 500 * MS);
+    check(cast(*u8, "ease-out leads"), anim.value(b) > anim.value(c) + 50,
+          anim.value(b), anim.value(c));
+
+    // A full pool refuses honestly instead of overwriting a live slot.
+    anim.init();
+    let is i64 as k with mut = 0;
+    let is i64 as got with mut = 0;
+    while (k < 64) {
+        if (anim.start_new(t0, 0, 1, 1000, bez.LINEAR, k) >= 0) { got = got + 1; }
+        k = k + 1;
+    }
+    check(cast(*u8, "pool fill"), got == 64, got, 64);
+    let is i64 as over = anim.start_new(t0, 0, 1, 1000, bez.LINEAR, 99);
+    check(cast(*u8, "pool full"), over == anim.NONE, over, anim.NONE);
+
+    // Zero duration is a snap, not a divide by zero.
+    anim.init();
+    let is i64 as z = anim.start_new(t0, 5, 9, 0, bez.LINEAR, 0);
+    check(cast(*u8, "zero dur"), anim.value(z) == 9 && anim.active(z) == 0, anim.value(z), 9);
+
+    if (fails == 0) { prog.outs("animt: PASS\n"); return cast(i32, 0); }
+    prog.outs("animt: FAIL n="); prog.out_num(fails); prog.outs("\n");
+    return cast(i32, 1);
+}

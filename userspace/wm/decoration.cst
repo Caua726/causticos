@@ -4,9 +4,23 @@
 
 use "state.cst" as s;
 use "damage.cst" as dmg;
+use "wanim.cst" as wan;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../../../Caustic/std/os/causticos.cst" as sys;
+
+// mix_rgb — src over dst at a in 0..256, per channel. The WM mixes its own
+// decoration colours because a cell grid carries finished RGB, not a blend
+// request: the compositor rasterises cells, it does not re-tint them.
+fn mix_rgb(dst as i64, src as i64, a as i64) as i64 {
+    let is i64 as dr = (dst >> 16) & 0xFF; let is i64 as dg = (dst >> 8) & 0xFF;
+    let is i64 as db = dst & 0xFF;
+    let is i64 as sr = (src >> 16) & 0xFF; let is i64 as sg = (src >> 8) & 0xFF;
+    let is i64 as sb = src & 0xFF;
+    return (((dr + (sr - dr) * a / 256) & 0xFF) << 16)
+         | (((dg + (sg - dg) * a / 256) & 0xFF) << 8)
+         |  ((db + (sb - db) * a / 256) & 0xFF);
+}
 
 fn dec_handoff(seg_fd as i64, win_id as i64, npages as i64, cols as i64, rows as i64) as i64 {
     let is i64 as tries with mut = 0;
@@ -52,19 +66,43 @@ fn titlebar_ensure(i as i64) as i64 {
     return 0;
 }
 
+// btn_cells — paint one titlebar button: `per` cells of background with the
+// glyph in the second, blended toward `hi` by the hover ramp when this button
+// (`which`) is the hovered one.
+fn btn_cells(i as i64, col0 as i64, glyph as i64, bg as i64, fg as i64,
+             per as i64, hi as i64, hv as i64, which as i64) as void {
+    if (col0 < 0) { return; }
+    let is i64 as b with mut = bg;
+    if (s.hover_win == i && s.hover_btn == which) { b = mix_rgb(bg, hi, hv); }
+    let is i64 as cc with mut = 0;
+    while (cc < per) {
+        let is *i64 as cl = dec_cell_ptr(s.wins[i].dec_base, col0 + cc);
+        let is i64 as ch with mut = 0;
+        if (cc == 1) { ch = glyph; }
+        cl[0] = cp.make_cell(ch, fg, b);
+        cc = cc + 1;
+    }
+    return;
+}
+
 fn render_titlebar(i as i64) as void {
     if (titlebar_ensure(i) != 0) { return; }
     let is i64 as cols = s.wins[i].w / 8;
     if (cols <= 0) { return; }
     let is i64 as focused with mut = 0;
     if (s.nz > 0 && s.zord[0] == i && s.wins[i].minimized == 0) { focused = 1; }
-    let is i64 as tcol with mut = s.COL_TITLE_U;
-    if (focused == 1) { tcol = s.COL_TITLE_F; }
+    // The titlebar rides the same focus ramp as the border, so decoration and
+    // frame brighten together instead of one snapping ahead of the other.
+    let is i64 as fset with mut = 0;
+    if (focused == 1) { fset = 255; }
+    let is i64 as fb = wan.focus_blend(i, fset);
+    let is i64 as tcol = mix_rgb(s.COL_TITLE_U, s.COL_TITLE_F, fb);
+    let is i64 as fgc = mix_rgb(s.COL_BAR_DIM, s.COL_TEXT, fb);
     dec_set_header(s.wins[i].dec_base, cols, 1);
     let is i64 as c with mut = 0;
     while (c < cols) {
         let is *i64 as cell = dec_cell_ptr(s.wins[i].dec_base, c);
-        cell[0] = cp.make_cell(0, s.COL_TEXT, tcol);
+        cell[0] = cp.make_cell(0, fgc, tcol);
         c = c + 1;
     }
     let is i64 as btn_cols = 3 * (s.BTN_W / 8);
@@ -75,7 +113,7 @@ fn render_titlebar(i as i64) as void {
         let is i64 as k with mut = 0;
         while (k < s.wins[i].title_len && k < title_max) {
             let is *i64 as cell = dec_cell_ptr(s.wins[i].dec_base, k);
-            cell[0] = cp.make_cell(cast(i64, tb[k]), s.COL_TEXT, tcol);
+            cell[0] = cp.make_cell(cast(i64, tb[k]), fgc, tcol);
             k = k + 1;
         }
     }
@@ -83,31 +121,13 @@ fn render_titlebar(i as i64) as void {
     let is i64 as close0 = cols - per;
     let is i64 as max0   = cols - 2 * per;
     let is i64 as min0   = cols - 3 * per;
-    let is i64 as tb_y = s.wins[i].y + s.BORDER;
-    let is i64 as right = s.wins[i].x + s.BORDER + s.wins[i].w;
-    let is i64 as cbx = right - s.BTN_W;
-    let is i64 as close_hover with mut = 0;
-    if (s.mx >= cbx && s.mx < right && s.my >= tb_y && s.my < tb_y + s.TITLE_H) { close_hover = 1; }
-    if (min0 >= 0) {
-        let is *i64 as cm = dec_cell_ptr(s.wins[i].dec_base, min0 + 1);
-        cm[0] = cp.make_cell(cast(i64, 95), s.COL_TEXT, tcol);
-    }
-    if (max0 >= 0) {
-        let is *i64 as cx2 = dec_cell_ptr(s.wins[i].dec_base, max0 + 1);
-        cx2[0] = cp.make_cell(cast(i64, 91), s.COL_TEXT, tcol);
-    }
-    if (close0 >= 0) {
-        let is i64 as cbg with mut = tcol;
-        if (close_hover == 1) { cbg = s.COL_CLOSE_H; }
-        let is i64 as cc with mut = 0;
-        while (cc < per) {
-            let is *i64 as cl = dec_cell_ptr(s.wins[i].dec_base, close0 + cc);
-            let is i64 as ch with mut = 0;
-            if (cc == 1) { ch = cast(i64, 120); }
-            cl[0] = cp.make_cell(ch, s.COL_TEXT, cbg);
-            cc = cc + 1;
-        }
-    }
+    // Each button's background ramps toward its highlight while hovered and
+    // back when the pointer leaves; mouse.cst owns which one that is.
+    let is i64 as hv with mut = 0;
+    if (s.hover_win == i) { hv = wan.hover_v(); }
+    btn_cells(i, min0, 95, tcol, fgc, per, s.COL_MIN_H, hv, 3);
+    btn_cells(i, max0, 91, tcol, fgc, per, s.COL_MAX_H, hv, 2);
+    btn_cells(i, close0, 120, tcol, fgc, per, s.COL_CLOSE_H, hv, 1);
     dmg.dmg_add(s.wins[i].x + s.BORDER, s.wins[i].y + s.BORDER, s.wins[i].w, s.TITLE_H);
     return;
 }
@@ -173,20 +193,25 @@ fn render_taskbar() as void {
     let is i64 as col with mut = 1;
     let is i64 as i with mut = 0;
     while (i < s.MAX_WIN) {
-        if (s.wins[i].used == 1 && s.wins[i].state == 2) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].closing == 0) {
             let is i64 as active with mut = 0;
             if (s.nz > 0 && s.zord[0] == i && s.wins[i].minimized == 0) { active = 1; }
-            let is i64 as bg with mut = s.COL_BAR_ITEM;
-            if (active == 1) { bg = s.COL_TITLE_F; }
+            let is i64 as bg0 with mut = s.COL_BAR_ITEM;
+            if (active == 1) { bg0 = s.COL_TITLE_F; }
             let is i64 as fg with mut = s.COL_TEXT;
             if (s.wins[i].minimized == 1) { fg = s.COL_BAR_DIM; }
+            // A new entry grows out of the bar and its colour rises from it,
+            // so windows do not pop into the taskbar fully formed.
+            let is i64 as tv = wan.task_v(i);
+            let is i64 as bg = mix_rgb(s.COL_BAR, bg0, tv);
+            let is i64 as shown = task_cols * tv / 256;
             let is i64 as bc with mut = 0;
-            while (bc < task_cols && col + bc < s.tb_cols) {
+            while (bc < shown && col + bc < s.tb_cols) {
                 let is *i64 as cell = dec_cell_ptr(s.tb_dec_base, col + bc);
                 cell[0] = cp.make_cell(0, fg, bg);
                 bc = bc + 1;
             }
-            if (s.wins[i].title_len > 0) {
+            if (s.wins[i].title_len > 0 && tv == 256) {
                 let is [16]u8 as tbn;
                 wmp.title_unpack(s.wins[i].t0, s.wins[i].t1, s.wins[i].title_len, cast(*u8, &tbn[0]));
                 let is i64 as ll with mut = s.wins[i].title_len;
@@ -210,7 +235,8 @@ fn render_all_decorations() as void {
     if (s.deco_dirty == 0) { return; }
     let is i64 as i with mut = 0;
     while (i < s.MAX_WIN) {
-        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 2 && s.wins[i].minimized == 0
+            && s.wins[i].closing == 0) {
             render_titlebar(i);
         }
         i = i + 1;

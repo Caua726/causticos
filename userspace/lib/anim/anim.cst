@@ -1,0 +1,152 @@
+// anim.cst — a fixed pool of running interpolations over bezier.cst curves.
+//
+// One Anim is "value from_v -> to_v over dur_ns, eased by curve". A slot id is
+// a plain index the owner keeps (a Win field, a compositor global); there is no
+// handle table and no allocation.
+//
+// The caller supplies `now` to both start() and tick_all(): a frame loop passes
+// the one timestamp it already read, so every value started or advanced in that
+// frame shares a clock instead of each reading its own and drifting apart. It
+// also keeps this module free of syscalls, and makes the tests deterministic.
+//
+// The tick does NOT damage anything: only the owner knows which pixels a value
+// maps to, so the owner reads value()/active() after tick_all and adds its own
+// damage. A completion callback exists because one case genuinely needs it —
+// a close animation must outlive the thing it animates and free it at the end.
+
+use "bezier.cst" as bez;
+
+let is i64 as CAP with imut = 64;
+let is i64 as NONE with imut = 0 - 1;      // "no slot" — what owners store when idle
+
+struct Anim {
+    active as i64;
+    from_v as i64;
+    to_v as i64;
+    cur as i64;
+    curve as i64;
+    start_ns as i64;
+    dur_ns as i64;
+    tag as i64;        // opaque owner cookie, handed back to on_done
+    on_done as i64;    // fn(tag) as void, 0 = none
+}
+
+let is [64]Anim as pool with mut;
+let is i64 as live with mut = 0;           // slots active as of the last tick_all
+
+fn init() as void {
+    bez.init();
+    let is i64 as i with mut = 0;
+    while (i < CAP) { pool[i].active = 0; pool[i].on_done = 0; i = i + 1; }
+    live = 0;
+    return;
+}
+
+fn alloc() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < CAP) {
+        if (pool[i].active == 0) { return i; }
+        i = i + 1;
+    }
+    return NONE;
+}
+
+// start — (re)arm slot `id`. Starting a live slot is how a retarget works: the
+// caller passes the current value as from_v so the motion never jumps.
+fn start(id as i64, now as i64, from_v as i64, to_v as i64, dur_ms as i64,
+         curve as i64, tag as i64) as i64 {
+    if (id < 0 || id >= CAP) { return NONE; }
+    pool[id].from_v = from_v;
+    pool[id].to_v = to_v;
+    pool[id].cur = from_v;
+    pool[id].curve = curve;
+    pool[id].start_ns = now;
+    pool[id].dur_ns = dur_ms * 1000000;
+    pool[id].tag = tag;
+    pool[id].on_done = 0;
+    if (dur_ms <= 0) { pool[id].cur = to_v; pool[id].active = 0; return id; }
+    pool[id].active = 1;
+    return id;
+}
+
+// start_new — alloc + start in one step. NONE when the pool is full; a caller
+// that gets NONE must fall back to the end value, never to a stuck animation.
+fn start_new(now as i64, from_v as i64, to_v as i64, dur_ms as i64, curve as i64, tag as i64) as i64 {
+    let is i64 as id = alloc();
+    if (id == NONE) { return NONE; }
+    return start(id, now, from_v, to_v, dur_ms, curve, tag);
+}
+
+// on_done fires once, after the slot goes idle at its end value.
+fn set_done(id as i64, fp as i64) as void {
+    if (id < 0 || id >= CAP) { return; }
+    pool[id].on_done = fp;
+    return;
+}
+
+fn active(id as i64) as i64 {
+    if (id < 0 || id >= CAP) { return 0; }
+    return pool[id].active;
+}
+
+fn value(id as i64) as i64 {
+    if (id < 0 || id >= CAP) { return 0; }
+    return pool[id].cur;
+}
+
+// cancel — stop without firing on_done and without touching cur, so a caller
+// that reads value() one last time still sees where the motion stopped.
+fn cancel(id as i64) as void {
+    if (id < 0 || id >= CAP) { return; }
+    pool[id].active = 0;
+    pool[id].on_done = 0;
+    return;
+}
+
+// finish — jump to the end value and fire on_done, as if time had run out.
+fn finish(id as i64) as void {
+    if (id < 0 || id >= CAP) { return; }
+    if (pool[id].active == 0) { return; }
+    pool[id].cur = pool[id].to_v;
+    pool[id].active = 0;
+    let is i64 as fp_raw = pool[id].on_done;
+    pool[id].on_done = 0;
+    if (fp_raw != 0) {
+        let is fn(i64) as void as fp = cast(fn(i64) as void, fp_raw);
+        call(fp, pool[id].tag);
+    }
+    return;
+}
+
+fn count_active() as i64 { return live; }
+
+// tick_all — advance every live slot against one clock. The slot is cleared
+// BEFORE its callback runs, so a callback is free to reuse the slot.
+fn tick_all(now as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < CAP) {
+        if (pool[i].active == 1) {
+            let is i64 as elapsed = now - pool[i].start_ns;
+            if (elapsed >= pool[i].dur_ns) {
+                pool[i].cur = pool[i].to_v;
+                pool[i].active = 0;
+                let is i64 as fp_raw = pool[i].on_done;
+                pool[i].on_done = 0;
+                if (fp_raw != 0) {
+                    let is fn(i64) as void as fp = cast(fn(i64) as void, fp_raw);
+                    call(fp, pool[i].tag);
+                }
+            } else {
+                let is i64 as x with mut = 0;
+                if (elapsed > 0) { x = elapsed * 255 / pool[i].dur_ns; }
+                pool[i].cur = bez.lerp(pool[i].from_v, pool[i].to_v,
+                                       bez.get_y(pool[i].curve, x));
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    live = n;
+    return n;
+}

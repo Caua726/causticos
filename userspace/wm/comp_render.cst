@@ -8,7 +8,32 @@ use "../lib/compo_proto/compo_proto.cst" as cp;
 
 fn iabs(v as i64) as i64 { if (v < 0) { return 0 - v; } return v; }
 
-fn cfill(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
+// mix — src over dst at a in 0..256, per channel. Callers that blend a whole
+// span inline the same arithmetic instead of calling this per pixel: a helper
+// call in the innermost pixel loop is what crashes the compiler's codegen.
+fn mix(dst as i64, src as i64, a as i64) as i64 {
+    let is i64 as dr = (dst >> 16) & 0xFF;
+    let is i64 as dg = (dst >> 8) & 0xFF;
+    let is i64 as db = dst & 0xFF;
+    let is i64 as sr = (src >> 16) & 0xFF;
+    let is i64 as sg = (src >> 8) & 0xFF;
+    let is i64 as sb = src & 0xFF;
+    return (((dr + (sr - dr) * a / 256) & 0xFF) << 16)
+         | (((dg + (sg - dg) * a / 256) & 0xFF) << 8)
+         |  ((db + (sb - db) * a / 256) & 0xFF);
+}
+
+// gam — push a colour through the night-light LUT. Applied once per fill or
+// glyph (not per pixel), which is why the LUT can be this cheap.
+fn gam(c as i64) as i64 {
+    if (s.gam_on == 0) { return c; }
+    return (s.gam_lut[(c >> 16) & 0xFF] << 16)
+         | (s.gam_lut[256 + ((c >> 8) & 0xFF)] << 8)
+         |  s.gam_lut[512 + (c & 0xFF)];
+}
+
+fn cfill(x as i64, y as i64, w as i64, h as i64, color_in as i64) as void {
+    let is i64 as color = gam(color_in);
     let is i64 as x0 with mut = x;
     let is i64 as y0 with mut = y;
     let is i64 as x1 with mut = x + w;
@@ -18,6 +43,30 @@ fn cfill(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
     if (x1 > s.clip_x1) { x1 = s.clip_x1; }
     if (y1 > s.clip_y1) { y1 = s.clip_y1; }
     if (x1 <= x0 || y1 <= y0) { return; }
+    let is i64 as a = s.draw_alpha;
+    if (a <= 0) { return; }
+    if (a < 256) {
+        let is i64 as sr = (color >> 16) & 0xFF;
+        let is i64 as sg = (color >> 8) & 0xFF;
+        let is i64 as sb = color & 0xFF;
+        let is i64 as by with mut = y0;
+        while (by < y1) {
+            let is *u32 as brow = cast(*u32, s.fb_base + by * s.scr_pitch);
+            let is i64 as bx with mut = x0;
+            while (bx < x1) {
+                let is i64 as d = cast(i64, brow[bx]);
+                let is i64 as dr = (d >> 16) & 0xFF;
+                let is i64 as dg = (d >> 8) & 0xFF;
+                let is i64 as db = d & 0xFF;
+                brow[bx] = cast(u32, (((dr + (sr - dr) * a / 256) & 0xFF) << 16)
+                                   | (((dg + (sg - dg) * a / 256) & 0xFF) << 8)
+                                   |  ((db + (sb - db) * a / 256) & 0xFF));
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+        return;
+    }
     let is i64 as yy with mut = y0;
     while (yy < y1) {
         let is *u32 as row = cast(*u32, s.fb_base + yy * s.scr_pitch);
@@ -28,8 +77,14 @@ fn cfill(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
     return;
 }
 
-fn cglyph(ch as i64, px as i64, py as i64, color as i64) as void {
+fn cglyph(ch as i64, px as i64, py as i64, color_in as i64) as void {
+    let is i64 as color = gam(color_in);
     let is *u8 as g = font.get_glyph(cast(i32, ch));
+    let is i64 as a = s.draw_alpha;
+    if (a <= 0) { return; }
+    let is i64 as sr = (color >> 16) & 0xFF;
+    let is i64 as sg = (color >> 8) & 0xFF;
+    let is i64 as sb = color & 0xFF;
     let is i64 as row with mut = 0;
     while (row < 16) {
         let is i64 as bits = cast(i64, g[row]);
@@ -40,7 +95,16 @@ fn cglyph(ch as i64, px as i64, py as i64, color as i64) as void {
                 let is i64 as yy = py + row;
                 if (xx >= s.clip_x0 && xx < s.clip_x1 && yy >= s.clip_y0 && yy < s.clip_y1) {
                     let is *u32 as p = cast(*u32, s.fb_base + yy * s.scr_pitch + xx * 4);
-                    p[0] = cast(u32, color);
+                    if (a >= 256) { p[0] = cast(u32, color); }
+                    else {
+                        let is i64 as d = cast(i64, p[0]);
+                        let is i64 as dr = (d >> 16) & 0xFF;
+                        let is i64 as dg = (d >> 8) & 0xFF;
+                        let is i64 as db = d & 0xFF;
+                        p[0] = cast(u32, (((dr + (sr - dr) * a / 256) & 0xFF) << 16)
+                                       | (((dg + (sg - dg) * a / 256) & 0xFF) << 8)
+                                       |  ((db + (sb - db) * a / 256) & 0xFF));
+                    }
                 }
             }
             col = col + 1;
@@ -55,6 +119,53 @@ fn cpix(x as i64, y as i64, color as i64) as void {
         let is *u32 as p = cast(*u32, s.fb_base + y * s.scr_pitch + x * 4);
         p[0] = cast(u32, color);
     }
+    return;
+}
+
+// draw_outline — 1px dashed rectangle, 4 on / 4 off. Drawn as spans rather
+// than pixels so the inner loop stays a fill call per dash.
+fn draw_outline(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
+    if (w <= 0 || h <= 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < w) {
+        let is i64 as run with mut = 4;
+        if (i + run > w) { run = w - i; }
+        cfill(x + i, y, run, 1, color);
+        cfill(x + i, y + h - 1, run, 1, color);
+        i = i + 8;
+    }
+    i = 0;
+    while (i < h) {
+        let is i64 as run with mut = 4;
+        if (i + run > h) { run = h - i; }
+        cfill(x, y + i, 1, run, color);
+        cfill(x + w - 1, y + i, 1, run, color);
+        i = i + 8;
+    }
+    return;
+}
+
+// draw_chamfer — fake rounded corners. With no anti-aliasing the honest trick
+// is to knock the four corner pixels back to the dim border colour, which reads
+// as a 2px bevel at normal viewing distance.
+fn draw_chamfer(x as i64, y as i64, w as i64, h as i64, c as i64) as void {
+    if (w < 4 || h < 4) { return; }
+    cfill(x, y, 2, 1, c);                 cfill(x, y + 1, 1, 1, c);
+    cfill(x + w - 2, y, 2, 1, c);         cfill(x + w - 1, y + 1, 1, 1, c);
+    cfill(x, y + h - 1, 2, 1, c);         cfill(x, y + h - 2, 1, 1, c);
+    cfill(x + w - 2, y + h - 1, 2, 1, c); cfill(x + w - 1, y + h - 2, 1, 1, c);
+    return;
+}
+
+// draw_shadow — four dim bars offset down-right of a frame, drawn through the
+// blend path so what is under them (wallpaper, a lower window) still shows.
+// Not real alpha compositing of a blurred sprite; just enough depth cue.
+fn draw_shadow(x as i64, y as i64, w as i64, h as i64) as void {
+    let is i64 as keep = s.draw_alpha;
+    s.draw_alpha = 72;
+    cfill(x + 4, y + h, w, 4, 0x00000000);
+    cfill(x + w, y + 4, 4, h - 4, 0x00000000);
+    s.draw_alpha = keep;
     return;
 }
 
@@ -145,13 +256,21 @@ fn cur_move(cx as i64, cy as i64) as void {
     cfill(cx - 9, cy - 1, 18, 2, s.CUR_WHITE); cfill(cx - 1, cy - 9, 2, 18, s.CUR_WHITE);
     tri_l(cx - 9, cy, 3, s.CUR_WHITE); tri_r(cx + 9, cy, 3, s.CUR_WHITE); tri_u(cx, cy - 9, 3, s.CUR_WHITE); tri_d(cx, cy + 9, 3, s.CUR_WHITE);
 }
+// The arrow's fill shimmers across three near-white shades at 4 Hz (comp_fx
+// owns the phase). Enough motion to read as alive, not enough to distract.
+fn cursor_white() as i64 {
+    if (s.cur_phase == 1) { return 0x00F0F4FF; }
+    if (s.cur_phase == 2) { return 0x00E2EAFA; }
+    return s.CUR_WHITE;
+}
 fn draw_arrow(cx as i64, cy as i64) as void {
+    let is i64 as wcol = cursor_white();
     let is i64 as r with mut = 0;
     while (r < s.CUR_H) {
         let is i64 as c with mut = 0;
         while (c < s.CUR_W) {
             let is i64 as bit = 1 << c;
-            if ((s.cur_f[r] & bit) != 0)      { cpix(cx + c, cy + r, s.CUR_WHITE); }
+            if ((s.cur_f[r] & bit) != 0)      { cpix(cx + c, cy + r, wcol); }
             else if ((s.cur_o[r] & bit) != 0) { cpix(cx + c, cy + r, s.CUR_BLACK); }
             c = c + 1;
         }

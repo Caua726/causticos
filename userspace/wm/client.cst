@@ -5,6 +5,7 @@
 use "state.cst" as s;
 use "window.cst" as win;
 use "damage.cst" as dmg;
+use "wanim.cst" as wan;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../../../Caustic/std/os/causticos.cst" as sys;
@@ -94,6 +95,7 @@ fn spawn_client_img(cimg as i64, clen as i64, cname as *u8, cnlen as i64) as voi
     s.wins[i].dec_base = 0;
     s.wins[i].dec_pages = 0;
     s.wins[i].dec_attached = 0;
+    wan.init_win(i);
     win.win_focus(i);
     return;
 }
@@ -118,10 +120,57 @@ fn spawn_named(name as *u8, nlen as i64) as void {
     return;
 }
 
-// Tear a window down. do_wait = the client exited (reap the zombie);
+// reap_window — start a window going away. A mapped window fades out first and
+// is torn down when the tween ends (reap_window_final, via the anim's
+// completion callback); everything else tears down at once. The fade needs the
+// window to stay drawable, which it is: its content segment is still mapped in
+// the compositor and its frame is still in the scene.
+//
+// Focus moves on immediately — the user should not wait out an animation to
+// type into the next window — and `closing` takes the fading window out of
+// hit-testing, the taskbar and its own message pump.
+fn reap_window(i as i64, do_wait as i64) as void {
+    if (s.wins[i].used == 0) { return; }
+    if (s.wins[i].closing == 1) { return; }
+    if (s.wins[i].state == 2 && s.wins[i].minimized == 0) {
+        s.wins[i].close_wait = do_wait;
+        if (wan.close_start(i, sys.time_ns(), cast(i64, fn_ptr(reap_window_deferred))) == 1) {
+            if (s.drag_mode != 0 && s.drag_win == i) { s.drag_mode = 0; }
+            if (s.close_hover_win == i) { s.close_hover_win = 0 - 1; }
+            let is i64 as k with mut = 0;
+            let is i64 as done with mut = 0;
+            while (k < s.nz && done == 0) {
+                let is i64 as cand = s.zord[k];
+                if (cand != i && s.wins[cand].used == 1 && s.wins[cand].state == 2
+                    && s.wins[cand].closing == 0 && s.wins[cand].minimized == 0) {
+                    win.win_focus(cand); done = 1;
+                }
+                k = k + 1;
+            }
+            dmg.dmg_taskbar();
+            s.scene_dirty = 1;
+            s.deco_dirty = 1;
+            return;
+        }
+        // Pool full — never strand a window half-closed.
+        s.wins[i].closing = 0;
+    }
+    reap_window_final(i, do_wait);
+    return;
+}
+
+// The anim completion callback: one arg, the window index.
+fn reap_window_deferred(i as i64) as void {
+    if (i < 0 || i >= s.MAX_WIN) { return; }
+    if (s.wins[i].used == 0) { return; }
+    reap_window_final(i, s.wins[i].close_wait);
+    return;
+}
+
+// Tear a window down for real. do_wait = the client exited (reap the zombie);
 // do_wait = 0 → the client is wedged, force-kill it (the spawn key is the
 // kill authority).
-fn reap_window(i as i64, do_wait as i64) as void {
+fn reap_window_final(i as i64, do_wait as i64) as void {
     if (s.wins[i].state == 2) {
         cp.msg_send(s.wc_fd, cp.MSG_WC_DETACH_SURFACE, i, 0, 0);
     }
@@ -143,6 +192,7 @@ fn reap_window(i as i64, do_wait as i64) as void {
     s.deco_dirty = 1;
     s.wins[i].used = 0;
     s.wins[i].state = 0;
+    s.wins[i].closing = 0;
     if (do_wait == 1) {
         let is i64 as st with mut = 0;
         sys.wait(s.wins[i].pid, &st);
@@ -189,6 +239,10 @@ fn handle_msg(i as i64, m as *i64) as void {
         s.wins[i].seg_fd = 0;
         s.wins[i].seg_base = 0;
         s.wins[i].state = 2;
+        // The window becomes visible exactly here — its surface just arrived —
+        // so this is where it grows and fades in.
+        wan.open_start(i, sys.time_ns());
+        wan.task_start(i, sys.time_ns());
         dmg.dmg_frame(i);
         dmg.dmg_taskbar();
         s.scene_dirty = 1;
@@ -269,7 +323,7 @@ fn service_win(i as i64, got as i64) as void {
 // Drain per-window control messages: CLOSE_REQ, RESIZE, FOCUS. Quota of 2 per
 // sweep per window.
 fn drain_pending(i as i64) as void {
-    if (s.wins[i].state != 2) { return; }
+    if (s.wins[i].state != 2 || s.wins[i].closing == 1) { return; }
     if (s.writable[i] == 0) { return; }
     if (s.wins[i].pend_close == 1 && s.quota[i] < 2) {
         wmp.msg_send(s.wins[i].chan, wmp.MSG_CLOSE_REQ, 0, 0, 0);

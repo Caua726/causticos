@@ -4,6 +4,7 @@
 use "comp_state.cst" as s;
 use "comp_render.cst" as r;
 use "comp_wallpaper.cst" as wp;
+use "comp_fx.cst" as fx;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
@@ -70,6 +71,30 @@ fn cblit_pixels(i as i64) as void {
     if (x1 > s.clip_x1) { x1 = s.clip_x1; }
     if (y1 > s.clip_y1) { y1 = s.clip_y1; }
     if (x1 <= x0 || y1 <= y0) { return; }
+    let is i64 as a = s.draw_alpha;
+    if (a <= 0) { return; }
+    if (a < 256) {
+        let is i64 as by with mut = y0;
+        while (by < y1) {
+            let is *u32 as drow = cast(*u32, s.fb_base + by * s.scr_pitch);
+            let is *u32 as srow = cast(*u32,
+                s.surfs[i].seg_base + (by - cy) * s.surfs[i].seg_stride);
+            let is i64 as bx with mut = x0;
+            while (bx < x1) {
+                let is i64 as sp = cast(i64, srow[bx - cx]);
+                let is i64 as d = cast(i64, drow[bx]);
+                let is i64 as dr = (d >> 16) & 0xFF;
+                let is i64 as dg = (d >> 8) & 0xFF;
+                let is i64 as db = d & 0xFF;
+                drow[bx] = cast(u32, (((dr + (((sp >> 16) & 0xFF) - dr) * a / 256) & 0xFF) << 16)
+                                   | (((dg + (((sp >> 8) & 0xFF) - dg) * a / 256) & 0xFF) << 8)
+                                   |  ((db + ((sp & 0xFF) - db) * a / 256) & 0xFF));
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+        return;
+    }
     let is i64 as nbytes = (x1 - x0) * 4;
     let is i64 as yy with mut = y0;
     while (yy < y1) {
@@ -91,10 +116,14 @@ fn cblit_content(i as i64) as void {
     return;
 }
 
-fn cblit_dec(seg_base as i64, ox as i64, oy as i64) as void {
+// maxw caps the strip at the width it is being drawn into. The WM rasterises a
+// titlebar for the window's SETTLED width; while a tween shrinks the frame the
+// strip must not spill past the narrower border.
+fn cblit_dec(seg_base as i64, ox as i64, oy as i64, maxw as i64) as void {
     let is *i64 as hdr = cast(*i64, seg_base);
-    let is i64 as cols = hdr[cp.DEC_H_COLS];
+    let is i64 as cols with mut = hdr[cp.DEC_H_COLS];
     let is i64 as rows = hdr[cp.DEC_H_ROWS];
+    if (maxw >= 0 && cols > maxw / 8) { cols = maxw / 8; }
     if (cols <= 0 || rows <= 0) { return; }
     let is *i64 as cells = cast(*i64, seg_base + cp.DEC_HDR_CELLS * 8);
     let is i64 as rr with mut = 0;
@@ -131,27 +160,62 @@ fn compose_rect(rx as i64, ry as i64, rw as i64, rh as i64) as void {
     let is i64 as zi with mut = 0;
     while (zi < s.comp_nz) {
         let is i64 as i = s.comp_z[zi];
-        if (s.cwins[i].used == 1 && (s.cwins[i].flags & 2) == 0) {
-            let is i64 as focused with mut = s.cwins[i].flags & 1;
-            let is i64 as bcol with mut = s.COL_BORDER_U;
-            let is i64 as tcol with mut = s.COL_TITLE_U;
-            if (focused == 1) { bcol = s.COL_BORDER_F; tcol = s.COL_TITLE_F; }
+        if (s.cwins[i].used == 1 && (s.cwins[i].flags & cp.ENTRY_MINIMIZED) == 0) {
+            // The WM sends how focused this window LOOKS (0..255), not just
+            // whether it is focused, so a focus change ramps instead of
+            // snapping. Mixing two palette entries stays the compositor's job.
+            let is i64 as fb = s.cwins[i].fblend;
+            let is i64 as bcol with mut = r.mix(s.COL_BORDER_U, s.COL_BORDER_F, fb);
+            let is i64 as tcol with mut = r.mix(s.COL_TITLE_U, s.COL_TITLE_F, fb);
+            // Everything this window paints blends at its opacity against what
+            // is already composed under it — painter's order makes that correct
+            // alpha without a scratch buffer.
+            s.draw_alpha = s.cwins[i].alpha;
+            r.draw_shadow(s.cwins[i].x, s.cwins[i].y,
+                          s.cwins[i].w + 2 * s.BORDER, s.cwins[i].h + s.TITLE_H + 2 * s.BORDER);
+            s.draw_alpha = s.cwins[i].alpha;
             r.cfill(s.cwins[i].x, s.cwins[i].y,
                     s.cwins[i].w + 2 * s.BORDER, s.cwins[i].h + s.TITLE_H + 2 * s.BORDER, bcol);
             r.cfill(s.cwins[i].x + s.BORDER, s.cwins[i].y + s.BORDER,
                     s.cwins[i].w, s.TITLE_H, tcol);
+            r.draw_chamfer(s.cwins[i].x, s.cwins[i].y,
+                           s.cwins[i].w + 2 * s.BORDER, s.cwins[i].h + s.TITLE_H + 2 * s.BORDER,
+                           s.COL_BORDER_U);
             cblit_content(i);
             if (s.decs[i].has == 1) {
                 cblit_dec(s.decs[i].seg_base,
-                          s.cwins[i].x + s.BORDER, s.cwins[i].y + s.BORDER + (s.TITLE_H - 16) / 2);
+                          s.cwins[i].x + s.BORDER, s.cwins[i].y + s.BORDER + (s.TITLE_H - 16) / 2,
+                          s.cwins[i].w);
             }
+            s.draw_alpha = 256;
         }
         zi = zi + 1;
+    }
+    // Overlay chrome sits above every window and below the taskbar/cursor.
+    let is i64 as ov with mut = 0;
+    while (ov < 2) {
+        if (s.ovl_on[ov] == 1) {
+            let is i64 as oc with mut = s.COL_BORDER_F;
+            if (ov == cp.OVL_SNAP) { oc = s.COL_TEXT; }
+            r.draw_outline(s.ovl_rect[ov*4+0], s.ovl_rect[ov*4+1],
+                           s.ovl_rect[ov*4+2], s.ovl_rect[ov*4+3], oc);
+        }
+        ov = ov + 1;
     }
     r.cfill(0, s.scr_h - s.BAR_H, s.scr_w, s.BAR_H, s.COL_BAR);
     r.cfill(0, s.scr_h - s.BAR_H, s.scr_w, 1, s.COL_BORDER_U);
     if (s.tb_dec.has == 1) {
-        cblit_dec(s.tb_dec.seg_base, 0, s.scr_h - s.BAR_H + (s.BAR_H - 16) / 2);
+        cblit_dec(s.tb_dec.seg_base, 0, s.scr_h - s.BAR_H + (s.BAR_H - 16) / 2, 0 - 1);
+    }
+    let is i64 as ea = fx.edge_alpha();
+    if (ea > 0) {
+        let is i64 as keep = s.draw_alpha;
+        s.draw_alpha = ea;
+        r.cfill(0, 0, s.scr_w, 2, s.COL_BORDER_F);
+        r.cfill(0, s.scr_h - 2, s.scr_w, 2, s.COL_BORDER_F);
+        r.cfill(0, 0, 2, s.scr_h, s.COL_BORDER_F);
+        r.cfill(s.scr_w - 2, 0, 2, s.scr_h, s.COL_BORDER_F);
+        s.draw_alpha = keep;
     }
     r.draw_cursor_at(s.mx, s.my);
     return;
