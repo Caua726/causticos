@@ -52,13 +52,33 @@ PAIR = re.compile(
 # device / implements blocks. Bare keys (bus: pci, irq: auto) have no dot.
 SPEC_REF = re.compile(r'^\s*[a-z_]+\s*:\s*([A-Za-z0-9_]+\.[A-Za-z0-9_]+)\s*$', re.M)
 
-# serial.print("...", N) / serial.println("...", N) / fb.print(...) — a literal
-# immediately followed by its own length. Only matches a plain literal: a
-# variable or an expression is not something this can check.
+# A string literal immediately followed by its own length, in any of the calls
+# that take a (pointer, length) pair. Only plain literals — a variable or an
+# expression is not something this can check — and only calls known to take a
+# length, since plenty of others take a literal followed by an unrelated number
+# (check("name", got, want) being the obvious one).
 SERIAL = re.compile(
-    r'(?P<call>(?:serial|fb)\.(?:print|println|print_scaled)\s*\(\s*)'
+    r'(?:serial|fb)\.(?:print|println|print_scaled)\s*\(\s*'
     r'(?:cast\(\*u8,\s*)?"(?P<text>(?:[^"\\]|\\.)*)"\)?'
     r'\s*,\s*(?P<len>\d+)'
+)
+
+# The userspace half. write_serial and prog.out take (ptr, len) directly;
+# send_data takes it as its last pair. Same class of bug, same silent failure:
+# a length one past the literal reads whatever follows it in rodata, and one
+# short truncates. This has now been the same mistake three times, twice in
+# kernel log lines and once in a protocol message where the OVER-count made a
+# daemon block forever waiting for a byte that was never sent.
+USERSPACE = re.compile(
+    r'(?:write_serial|prog\.out|out)\s*\(\s*'
+    r'(?:cast\(\*u8,\s*)?"(?P<text>(?:[^"\\]|\\.)*)"\)?'
+    r'\s*,\s*(?P<len>\d+)\s*\)'
+)
+
+SEND_DATA = re.compile(
+    r'send_data\s*\([^;]*?'
+    r'cast\(\*u8,\s*"(?P<text>(?:[^"\\]|\\.)*)"\)'
+    r'\s*,\s*(?P<len>\d+)\s*\)'
 )
 
 # Caustic string escapes, for counting what the literal actually becomes.
@@ -71,6 +91,13 @@ def literal_bytes(text: str) -> int:
     i = 0
     while i < len(text):
         if text[i] == '\\' and i + 1 < len(text):
+            # \xNN is one byte, not four characters. Counting it as written
+            # made this checker report a correct length as wrong, which is
+            # the failure mode a checker can least afford.
+            if text[i + 1] == 'x' and i + 3 < len(text):
+                out.append(chr(int(text[i + 2:i + 4], 16)))
+                i += 4
+                continue
             out.append(ESCAPES.get(text[i + 1], text[i + 1]))
             i += 2
         else:
@@ -85,7 +112,10 @@ def main() -> int:
     fixed = 0
     registered: dict[str, pathlib.Path] = {}
 
-    for path in sorted(ROOT.glob("kernel/**/*.cst")):
+    paths = sorted(ROOT.glob("kernel/**/*.cst"))
+    paths += sorted(p for p in ROOT.glob("userspace/**/*.cst")
+                    if "/build/" not in str(p))
+    for path in paths:
         text = path.read_text()
         out = []
         last = 0
@@ -96,12 +126,13 @@ def main() -> int:
             registered[name] = path
             edits.append((m.start("len"), m.end("len"), int(m.group("len")),
                           len(name.encode()), f'"{name}"'))
-        for m in SERIAL.finditer(text):
-            shown = m.group("text")
-            if len(shown) > 40:
-                shown = shown[:40] + "..."
-            edits.append((m.start("len"), m.end("len"), int(m.group("len")),
-                          literal_bytes(m.group("text")), f'"{shown}"'))
+        for rx in (SERIAL, USERSPACE, SEND_DATA):
+            for m in rx.finditer(text):
+                shown = m.group("text")
+                if len(shown) > 40:
+                    shown = shown[:40] + "..."
+                edits.append((m.start("len"), m.end("len"), int(m.group("len")),
+                              literal_bytes(m.group("text")), f'"{shown}"'))
         edits.sort()
 
         for (lo, hi, declared, actual, label) in edits:

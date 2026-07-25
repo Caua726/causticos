@@ -103,6 +103,34 @@ fn test_hello() as void {
     return;
 }
 
+// The address is not ours to assume: netd asks a DHCP server for it, and the
+// handshake takes a few round trips. Waiting for it is part of the test —
+// an ifinfo answered before the lease exists reports 0.0.0.0 truthfully.
+fn wait_for_address(ns as i64) as i64 {
+    let is [4]i64 as m;
+    let is i64 as deadline = sys.time_ns() + ns;
+    while (sys.time_ns() < deadline) {
+        np.send(ctl, np.REQ_IFINFO, 0, 0, 0);
+        if (await_type(np.EV_IFINFO, cast(*i64, &m[0]), 1000000000) == 1) {
+            if (m[2] != 0) { return m[2]; }
+        }
+        sys.sleep_ns(200000000);
+    }
+    return 0;
+}
+
+fn test_dhcp() as void {
+    say("dhcp:\n");
+    let is i64 as addr = wait_for_address(8000000000);
+    check(cast(*u8, "a lease was acquired"), addr != 0, 1);
+    if (addr == 0) { return; }
+    // SLIRP's pool starts at .15. Checking the exact address is checking the
+    // emulator, but checking that it is IN the subnet checks the client.
+    check(cast(*u8, "address is on the SLIRP subnet"),
+          ip.same_subnet(addr, ip.make_addr(10, 0, 2, 0), ip.prefix_mask(24)), 1);
+    return;
+}
+
 fn test_ifinfo() as void {
     say("interface:\n");
     let is [4]i64 as m;
@@ -110,7 +138,10 @@ fn test_ifinfo() as void {
     let is i64 as r with mut = await_type(np.EV_IFINFO, cast(*i64, &m[0]), 3000000000);
     check(cast(*u8, "answers ifinfo"), r, 1);
     if (r != 1) { return; }
-    check(cast(*u8, "has the SLIRP address"), m[2], ip.make_addr(10, 0, 2, 15));
+    check(cast(*u8, "reports the leased address"),
+          ip.same_subnet(m[2], ip.make_addr(10, 0, 2, 0), ip.prefix_mask(24)), 1);
+    check(cast(*u8, "and the mask it was given"), (m[3] >> 32) & 0xFFFFFFFF,
+          ip.prefix_mask(24));
     check(cast(*u8, "link is up"), m[3] & 1, 1);
     // Word 12..15 of net_info is the driver name, forwarded as the payload.
     check(cast(*u8, "names its driver"), cast(i64, buf[0]) != 0, 1);
@@ -224,6 +255,40 @@ fn test_udp() as void {
     return;
 }
 
+fn test_resolve() as void {
+    say("dns through netd:\n");
+    let is [4]i64 as m;
+
+    // A dotted quad resolves to itself without a query — asking a resolver
+    // about one either fails or succeeds against somebody's wildcard.
+    np.send_data(ctl, np.REQ_RESOLVE, 0, 0, 8, cast(*u8, "10.0.2.2"), 8);
+    let is i64 as r with mut = await_type(np.EV_RESOLVED, cast(*i64, &m[0]), 3000000000);
+    check(cast(*u8, "literal resolves to itself"), r, 1);
+    if (r == 1) { check(cast(*u8, "and to the right value"), m[2], ip.make_addr(10, 0, 2, 2)); }
+
+    // A real name, through the resolver DHCP told us about.
+    np.send_data(ctl, np.REQ_RESOLVE, 0, 0, 11, cast(*u8, "example.com"), 11);
+    r = await_type(np.EV_RESOLVED, cast(*i64, &m[0]), 6000000000);
+    check(cast(*u8, "example.com answered"), r, 1);
+    if (r == 1) { check(cast(*u8, "resolved to an address"), m[2] != 0, 1); }
+
+    // Again: this one must come from the cache, and must agree.
+    let is i64 as first = m[2];
+    np.send_data(ctl, np.REQ_RESOLVE, 0, 0, 11, cast(*u8, "example.com"), 11);
+    r = await_type(np.EV_RESOLVED, cast(*i64, &m[0]), 3000000000);
+    check(cast(*u8, "second lookup answered"), r, 1);
+    if (r == 1) { check(cast(*u8, "cache agrees with the wire"), m[2], first); }
+
+    // A name that does not exist must come back as a definite nothing rather
+    // than as a timeout — the caller can then fail fast.
+    np.send_data(ctl, np.REQ_RESOLVE, 0, 0, 23,
+                 cast(*u8, "nx.invalid.causticos.no"), 23);
+    r = await_type(np.EV_RESOLVED, cast(*i64, &m[0]), 6000000000);
+    check(cast(*u8, "nonexistent name answered"), r, 1);
+    if (r == 1) { check(cast(*u8, "and resolved to nothing"), m[2], 0); }
+    return;
+}
+
 fn main() as i32 {
     say("netdt: netd over a channel\n");
 
@@ -252,9 +317,11 @@ fn main() as i32 {
     sys.close(ch[1]);          // netd owns it now
 
     test_hello();
+    test_dhcp();
     test_ifinfo();
     test_ping();
     test_udp();
+    test_resolve();
 
     sys.kill(netd_pid);
     let is [1]i64 as st;

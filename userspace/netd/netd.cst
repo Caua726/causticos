@@ -31,6 +31,8 @@ use "../lib/netarp/netarp.cst" as arp;
 use "../lib/netip/netip.cst" as ip;
 use "../lib/netip/netip_reasm.cst" as reasm;
 use "../lib/netudp/netudp.cst" as udp;
+use "../lib/netdhcp/netdhcp.cst" as dhcp;
+use "../lib/netdns/netdns.cst" as dns;
 use "../lib/netproto/netproto.cst" as np;
 use "netd_if.cst" as nif;
 use "netd_sock.cst" as nsock;
@@ -59,6 +61,25 @@ let is [8]i64 as ping_ip with mut;
 let is [8]i64 as ping_seq with mut;
 let is [8]i64 as ping_t0 with mut;
 let is [8]i64 as ping_live with mut;
+
+// DHCP runs per interface, because each one gets its own lease from whoever
+// is handing them out on its link.
+let is [2]dhcp.Client as dhcp_cli with mut;
+let is [2]i64 as dhcp_on with mut;
+let is [600]u8 as dhcp_buf;
+
+// One resolver, shared: a name resolves to the same address whichever
+// interface asks, and a per-interface cache would just answer the same
+// question twice.
+let is dns.Cache as dns_cache;
+let is i64 as dns_server with mut = 0;
+let is i64 as dns_qid with mut = 0;
+let is i64 as dns_port with mut = 0;
+let is i64 as dns_client with mut = 0 - 1;   // who is waiting, -1 = nobody
+let is i64 as dns_deadline with mut = 0;
+let is i64 as dns_namelen with mut = 0;
+let is [256]u8 as dns_name;
+let is [600]u8 as dns_buf;
 
 let is i64 as verbose with mut = 0;
 
@@ -230,6 +251,11 @@ fn handle_icmp(idx as i64, m as *u8, mlen as i64, src as i64) as void {
 
 fn handle_udp(idx as i64, u as *u8, ulen as i64, src as i64, dst as i64) as void {
     if (udp.validate(u, ulen, src, dst) != udp.OK) { return; }
+    // The stack's own consumers get first refusal, ahead of the socket table:
+    // a client must not be able to bind port 68 and steal the DHCP lease, or
+    // bind our resolver port and answer our own query.
+    if (dhcp_input(idx, u, ulen) == 1) { return; }
+    if (dns_input(u, src) == 1) { return; }
     let is i64 as dport = udp.dst_port(u);
     let is i64 as sport = udp.src_port(u);
     let is *nsock.Sock as s = nsock.demux(np.SOCK_DGRAM, dst, dport, src, sport);
@@ -329,6 +355,177 @@ fn pump_iface(idx as i64) as i64 {
 }
 
 // ============================================================
+// DHCP
+// ============================================================
+
+// A DHCP message goes out as UDP 68 -> 67. During acquisition we have no
+// address, so it is sourced from 0.0.0.0 and sent to the limited broadcast —
+// which is the one case where a packet legitimately has neither a real source
+// nor a resolvable destination, and why send_ip's broadcast shortcut exists.
+fn dhcp_send(idx as i64, len as i64, unicast_to as i64) as i64 {
+    let is *nif.Iface as f = nif.at(idx);
+    let is i64 as src with mut = 0;
+    let is i64 as dst with mut = 0xFFFFFFFF;
+    if (unicast_to != 0) { src = f.ip; dst = unicast_to; }
+
+    nb.init(&txb);
+    let is *u8 as body = nb.append(&txb, udp.HDR_LEN + len);
+    if (cast(i64, body) == 0) { return 0 - 1; }
+    udp.build(body, dhcp.CLIENT_PORT, dhcp.SERVER_PORT, src, dst,
+              cast(*u8, &dhcp_buf[0]), len);
+    // Not through send_ip: that one routes, and routing needs an address we
+    // do not have yet. A broadcast on a specific interface is the whole point.
+    ip.push_header(&txb, src, dst, ip.PROTO_UDP, sys.random_u64() & 0xFFFF);
+    if (txb.err != 0) { return 0 - 1; }
+    if (unicast_to == 0) {
+        return nif.send_to_mac(idx, &txb, eth.broadcast(), eth.TYPE_IPV4);
+    }
+    let is [6]u8 as mac;
+    if (arp.lookup(nif.cache_at(idx), unicast_to, cast(*u8, &mac[0]),
+                   sys.time_ns()) != arp.LOOKUP_HIT) {
+        // Renewing to a server we cannot resolve: fall back to broadcast
+        // rather than dropping the renewal, since losing the lease is worse.
+        return nif.send_to_mac(idx, &txb, eth.broadcast(), eth.TYPE_IPV4);
+    }
+    return nif.send_to_mac(idx, &txb, cast(*u8, &mac[0]), eth.TYPE_IPV4);
+}
+
+fn dhcp_act(idx as i64, act as i64) as void {
+    let is *dhcp.Client as c = &dhcp_cli[idx];
+    let is *nif.Iface as f = nif.at(idx);
+    if (act == dhcp.ACT_DISCOVER) {
+        dhcp_send(idx, dhcp.build_discover(c, cast(*u8, &dhcp_buf[0])), 0);
+    } else if (act == dhcp.ACT_REQUEST) {
+        dhcp_send(idx, dhcp.build_request(c, cast(*u8, &dhcp_buf[0]), 0), 0);
+    } else if (act == dhcp.ACT_RENEW) {
+        dhcp_send(idx, dhcp.build_request(c, cast(*u8, &dhcp_buf[0]), 1), c.server_id);
+    } else if (act == dhcp.ACT_REBIND) {
+        dhcp_send(idx, dhcp.build_request(c, cast(*u8, &dhcp_buf[0]), 1), 0);
+    } else if (act == dhcp.ACT_BOUND) {
+        nif.configure(idx, c.my_ip, c.mask, c.router);
+        if (c.dns != 0 && dns_server == 0) { dns_server = c.dns; }
+        log("netd: dhcp bound "); log_ip(c.my_ip);
+        log(" mask "); log_ip(c.mask);
+        log(" gw "); log_ip(c.router);
+        if (c.dns != 0) { log(" dns "); log_ip(c.dns); }
+        log("\n");
+    } else if (act == dhcp.ACT_EXPIRED) {
+        // The address is no longer ours. Giving it up is not optional:
+        // keeping it collides with whoever the server hands it to next.
+        nif.configure(idx, 0, 0, 0);
+        log("netd: dhcp lease expired\n");
+    } else if (act == dhcp.ACT_FAILED) {
+        log("netd: dhcp got no answer\n");
+    }
+    return;
+}
+
+// A UDP datagram to port 68 that no socket claimed. Checked before the
+// socket demux so a client cannot bind 68 and steal the lease.
+fn dhcp_input(idx as i64, u as *u8, ulen as i64) as i64 {
+    if (dhcp_on[idx] == 0) { return 0; }
+    if (udp.dst_port(u) != dhcp.CLIENT_PORT) { return 0; }
+    let is *dhcp.Client as c = &dhcp_cli[idx];
+    let is i64 as act = dhcp.on_message(c, udp.payload(u), udp.payload_len(u),
+                                        sys.time_ns());
+    if (act != dhcp.ACT_NONE) { dhcp_act(idx, act); }
+    return 1;
+}
+
+// ============================================================
+// DNS
+// ============================================================
+
+fn dns_send_query(name as *u8, nlen as i64) as i64 {
+    if (dns_server == 0) { return 0 - 1; }
+    let is i64 as idx = nif.route(dns_server);
+    if (idx < 0) { return 0 - 1; }
+    let is *nif.Iface as f = nif.at(idx);
+
+    // Both the id and the source port are drawn from the kernel's entropy: a
+    // response is accepted on the strength of matching them, so guessable
+    // values are what makes off-path cache poisoning possible.
+    dns_qid = sys.random_u64() & 0xFFFF;
+    dns_port = udp.EPHEMERAL_LO
+             + (sys.random_u64() & 0x7FFFFFFF) % (udp.EPHEMERAL_HI - udp.EPHEMERAL_LO + 1);
+
+    let is i64 as qlen = dns.build_query(cast(*u8, &dns_buf[0]), dns_qid, name, nlen);
+    if (qlen < 0) { return 0 - 1; }
+
+    nb.init(&txb);
+    let is *u8 as body = nb.append(&txb, udp.HDR_LEN + qlen);
+    if (cast(i64, body) == 0) { return 0 - 1; }
+    udp.build(body, dns_port, dns.PORT, f.ip, dns_server,
+              cast(*u8, &dns_buf[0]), qlen);
+    return send_ip(idx, dns_server, ip.PROTO_UDP);
+}
+
+fn dns_answer(addr as i64) as void {
+    if (dns_client < 0) { return; }
+    np.send(client_fd[dns_client], np.EV_RESOLVED, 0, addr, 0);
+    dns_client = 0 - 1;
+    return;
+}
+
+fn do_resolve(c as i64, name as *u8, nlen as i64) as void {
+    let is i64 as now = sys.time_ns();
+
+    // A dotted quad is itself. Asking a resolver about one either fails or,
+    // worse, succeeds against somebody's wildcard.
+    let is i64 as lit = dns.parse_literal(name, nlen);
+    if (lit != 0) { np.send(client_fd[c], np.EV_RESOLVED, 0, lit, 0); return; }
+
+    let is i64 as hit = dns.cache_get(&dns_cache, name, nlen, now);
+    if (hit != 0) { np.send(client_fd[c], np.EV_RESOLVED, 0, hit, 0); return; }
+
+    if (dns_server == 0) { reply_err(c, 0, sys.E_NOENT); return; }
+    // One query in flight. A second caller waits for the next turn rather
+    // than racing; two outstanding queries would need per-query state that
+    // buys nothing at this scale.
+    if (dns_client >= 0) { reply_err(c, 0, sys.E_AGAIN); return; }
+
+    if (nlen > 255) { reply_err(c, 0, sys.E_INVAL); return; }
+    nb.copy(cast(*u8, &dns_name[0]), name, nlen);
+    dns_namelen = nlen;
+    dns_client = c;
+    dns_deadline = now + 3000000000;
+    if (dns_send_query(cast(*u8, &dns_name[0]), nlen) < 0) {
+        dns_client = 0 - 1;
+        reply_err(c, 0, sys.E_IO);
+    }
+    return;
+}
+
+// A datagram from the resolver, on the port we asked from. Verified against
+// the id AND the question — matching the id alone halves what an attacker
+// has to guess.
+fn dns_input(u as *u8, src as i64) as i64 {
+    if (dns_client < 0) { return 0; }
+    if (src != dns_server) { return 0; }
+    if (udp.dst_port(u) != dns_port) { return 0; }
+    if (udp.src_port(u) != dns.PORT) { return 0; }
+
+    let is [1]i64 as addr;
+    let is [1]i64 as ttl;
+    addr[0] = 0; ttl[0] = 0;
+    let is i64 as r = dns.parse_response(udp.payload(u), udp.payload_len(u),
+                                         dns_qid, cast(*u8, &dns_name[0]),
+                                         dns_namelen, cast(*i64, &addr[0]),
+                                         cast(*i64, &ttl[0]));
+    if (r == dns.R_NOTOURS) { return 0; }        // not an answer to our question
+    if (r == dns.R_OK) {
+        dns.cache_put(&dns_cache, cast(*u8, &dns_name[0]), dns_namelen,
+                      addr[0], ttl[0], sys.time_ns());
+        dns_answer(addr[0]);
+        return 1;
+    }
+    // A real negative answer is an answer: report it rather than making the
+    // caller wait out the timeout for a name that definitively does not exist.
+    dns_answer(0);
+    return 1;
+}
+
+// ============================================================
 // Timers
 // ============================================================
 
@@ -352,6 +549,23 @@ fn run_timers(now as i64) as i64 {
         }
         i = i + 1;
     }
+    // DHCP, per interface.
+    i = 0;
+    while (i < nif.count()) {
+        if (dhcp_on[i] == 1) {
+            let is i64 as act = dhcp.tick(&dhcp_cli[i], now, sys.random_u64());
+            if (act != dhcp.ACT_NONE) { dhcp_act(i, act); }
+            if (dhcp_cli[i].deadline > now && dhcp_cli[i].deadline < next) {
+                next = dhcp_cli[i].deadline;
+            }
+        }
+        i = i + 1;
+    }
+
+    // A DNS query that nobody answered. Reporting the failure is what keeps
+    // a caller from waiting forever on a resolver that has gone away.
+    if (dns_client >= 0 && now >= dns_deadline) { dns_answer(0); }
+
     // Ping timeouts.
     let is i64 as p with mut = 0;
     while (p < MAX_PINGS) {
@@ -503,6 +717,10 @@ fn serve_client(c as i64) as i64 {
         do_sendto(c, s, s.peer_ip, s.peer_port, cast(*u8, &payload[0]), b);
         return 1;
     }
+    if (t == np.REQ_RESOLVE) {
+        do_resolve(c, cast(*u8, &payload[0]), b);
+        return 1;
+    }
     if (t == np.REQ_CLOSE) {
         let is *nsock.Sock as s = nsock.find(c, sock);
         if (cast(i64, s) != 0) { nsock.close(s); }
@@ -531,6 +749,9 @@ fn drop_client(c as i64) as void {
 fn main(argc as i64, argv as *u8) as i32 {
     log("netd: starting\n");
     nsock.init();
+    dns.cache_init(&dns_cache);
+    let is i64 as di with mut = 0;
+    while (di < 2) { dhcp_on[di] = 0; di = di + 1; }
     let is i64 as i with mut = 0;
     while (i < MAX_CLIENTS) { client_fd[i] = 0 - 1; client_live[i] = 0; i = i + 1; }
     i = 0;
@@ -543,13 +764,13 @@ fn main(argc as i64, argv as *u8) as i32 {
     while (p < ports && nif.count() < 2) {
         let is i64 as idx = nif.open(p);
         if (idx >= 0) {
-            // Static addressing until DHCP lands. QEMU's SLIRP hands out
-            // 10.0.2.15/24 with a gateway at 10.0.2.2, and saying so here is
-            // honest about what this does and does not yet do.
-            nif.configure(idx, ip.make_addr(10, 0, 2, 15), ip.prefix_mask(24),
-                          ip.make_addr(10, 0, 2, 2));
-            log("netd: port "); log_num(p); log(" up as ");
-            log_ip(nif.at(idx).ip); log("\n");
+            // Ask, rather than assume. The address comes from whoever is
+            // handing them out; hard-coding SLIRP's numbers would make this a
+            // stack that works in one emulator.
+            dhcp.init(&dhcp_cli[idx], cast(*u8, &nif.at(idx).mac[0]), sys.time_ns());
+            dhcp_on[idx] = 1;
+            dhcp_act(idx, dhcp.start(&dhcp_cli[idx], sys.time_ns(), sys.random_u64()));
+            log("netd: port "); log_num(p); log(" discovering\n");
         }
         p = p + 1;
     }

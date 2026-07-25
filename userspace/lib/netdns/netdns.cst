@@ -1,0 +1,390 @@
+// netdns — turning a name into an address (RFC 1035).
+//
+// Two things about DNS over UDP make it different from every other request
+// this stack sends, and both are about an answer nobody can authenticate:
+//
+//   THE QUERY ID AND SOURCE PORT MUST BE UNGUESSABLE. A response is accepted
+//   on the strength of matching the query — id, port, question. An attacker
+//   who can guess both can answer before the real server does, and the victim
+//   caches the lie for as long as the forged TTL says. Both come from the
+//   kernel's entropy here; a counter would be cheaper and is precisely what
+//   makes the attack work.
+//
+//   AND THE QUESTION IS PART OF THE MATCH. A response whose question section
+//   does not echo what was asked is not an answer to it, whatever its id says.
+//   Checking the id alone halves the work an attacker has to do.
+//
+// COMPRESSION POINTERS ARE A HAZARD, NOT A FEATURE. A name in a response may
+// be a pointer to an earlier offset, and pointers may chain — including into
+// a loop. Every parser that follows them without a bound has a denial of
+// service in it. This one caps the jumps.
+
+use "../netbuf/netbuf.cst" as nb;
+use "../netip/netip.cst" as ip;
+
+let is i64 as PORT = 53;
+let is i64 as HDR_LEN = 12;
+
+// A DNS message over UDP is 512 bytes unless EDNS0 negotiates more, which we
+// do not — so anything larger is truncated and the TC bit says so.
+let is i64 as MAX_MSG = 512;
+let is i64 as MAX_NAME = 255;
+
+// Header flag bits.
+let is i64 as FLAG_QR = 0x8000;    // it is a response
+let is i64 as FLAG_AA = 0x0400;    // authoritative
+let is i64 as FLAG_TC = 0x0200;    // truncated: retry over TCP
+let is i64 as FLAG_RD = 0x0100;    // recursion desired
+let is i64 as FLAG_RA = 0x0080;    // recursion available
+
+let is i64 as RCODE_MASK     = 0x000F;
+let is i64 as RCODE_OK       = 0;
+let is i64 as RCODE_FORMERR  = 1;
+let is i64 as RCODE_SERVFAIL = 2;
+let is i64 as RCODE_NXDOMAIN = 3;
+let is i64 as RCODE_REFUSED  = 5;
+
+let is i64 as TYPE_A     = 1;
+let is i64 as TYPE_CNAME = 5;
+let is i64 as CLASS_IN   = 1;
+
+// How far a compression pointer chain may be followed. Any legal message
+// resolves in a handful; a longer one is malformed or hostile, and following
+// it forever is the whole attack.
+let is i64 as MAX_JUMPS = 16;
+
+// ---- encoding a name ----
+
+// "example.com" becomes 7"example" 3"com" 0. Returns bytes written, or -1
+// when the name is malformed — an empty label (".." or a leading dot) is not
+// encodable, and silently accepting one produces a query for a different name
+// than the caller asked about.
+fn encode_name(out as *u8, off as i64, name as *u8, nlen as i64) as i64 {
+    if (nlen == 0 || nlen > MAX_NAME) { return 0 - 1; }
+    let is i64 as o with mut = off;
+    let is i64 as i with mut = 0;
+    while (i < nlen) {
+        let is i64 as start = i;
+        while (i < nlen && name[i] != cast(u8, 46)) { i = i + 1; }   // '.'
+        let is i64 as l = i - start;
+        if (l == 0 || l > 63) { return 0 - 1; }
+        out[o] = cast(u8, l);
+        o = o + 1;
+        let is i64 as k with mut = 0;
+        while (k < l) { out[o + k] = name[start + k]; k = k + 1; }
+        o = o + l;
+        if (i < nlen) { i = i + 1; }         // skip the dot
+    }
+    out[o] = cast(u8, 0);
+    return o + 1 - off;
+}
+
+// Walk past a name in a message, returning the offset of what follows. A
+// compression pointer ends the name, so the return is the offset after the
+// two pointer bytes rather than after wherever it pointed.
+fn skip_name(p as *u8, len as i64, off as i64) as i64 {
+    let is i64 as o with mut = off;
+    let is i64 as guard with mut = 0;
+    while (o < len && guard < MAX_NAME) {
+        let is i64 as l = cast(i64, p[o]);
+        if (l == 0) { return o + 1; }
+        if ((l & 0xC0) == 0xC0) {
+            if (o + 1 >= len) { return 0 - 1; }
+            return o + 2;
+        }
+        if (l > 63) { return 0 - 1; }
+        o = o + 1 + l;
+        guard = guard + 1;
+    }
+    return 0 - 1;
+}
+
+// Compare a name in a message against a plain one, following compression
+// pointers with a bound. Case-insensitive, because DNS is (RFC 1035 §2.3.3)
+// and a server is free to answer "EXAMPLE.com" to a query for "example.com".
+fn lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn name_equals(p as *u8, len as i64, off as i64, name as *u8, nlen as i64) as i64 {
+    let is i64 as o with mut = off;
+    let is i64 as ni with mut = 0;
+    let is i64 as jumps with mut = 0;
+    while (o < len) {
+        let is i64 as l = cast(i64, p[o]);
+        if (l == 0) {
+            if (ni == nlen) { return 1; }
+            return 0;
+        }
+        if ((l & 0xC0) == 0xC0) {
+            if (o + 1 >= len) { return 0; }
+            jumps = jumps + 1;
+            if (jumps > MAX_JUMPS) { return 0; }        // a loop, or an attack
+            let is i64 as target = ((l & 0x3F) << 8) | cast(i64, p[o + 1]);
+            if (target >= len || target >= o) { return 0; }  // must point BACKWARDS
+            o = target;
+        } else {
+            if (l > 63) { return 0; }
+            if (o + 1 + l > len) { return 0; }
+            // A dot separates labels, except before the first.
+            if (ni > 0) {
+                if (ni >= nlen || name[ni] != cast(u8, 46)) { return 0; }
+                ni = ni + 1;
+            }
+            let is i64 as k with mut = 0;
+            while (k < l) {
+                if (ni + k >= nlen) { return 0; }
+                if (lower(cast(i64, p[o + 1 + k])) != lower(cast(i64, name[ni + k]))) {
+                    return 0;
+                }
+                k = k + 1;
+            }
+            ni = ni + l;
+            o = o + 1 + l;
+        }
+    }
+    return 0;
+}
+
+// ---- query ----
+
+// Build an A query. `id` and the source port are the caller's business and
+// must both come from real entropy.
+fn build_query(out as *u8, id as i64, name as *u8, nlen as i64) as i64 {
+    nb.put_be16(out, 0, id);
+    nb.put_be16(out, 2, FLAG_RD);
+    nb.put_be16(out, 4, 1);        // one question
+    nb.put_be16(out, 6, 0);
+    nb.put_be16(out, 8, 0);
+    nb.put_be16(out, 10, 0);
+    let is i64 as n = encode_name(out, HDR_LEN, name, nlen);
+    if (n < 0) { return 0 - 1; }
+    let is i64 as o with mut = HDR_LEN + n;
+    nb.put_be16(out, o, TYPE_A);   o = o + 2;
+    nb.put_be16(out, o, CLASS_IN); o = o + 2;
+    return o;
+}
+
+// ---- response ----
+
+fn id_of(p as *u8) as i64 { return nb.get_be16(p, 0); }
+fn flags_of(p as *u8) as i64 { return nb.get_be16(p, 2); }
+fn rcode_of(p as *u8) as i64 { return nb.get_be16(p, 2) & RCODE_MASK; }
+fn qdcount(p as *u8) as i64 { return nb.get_be16(p, 4); }
+fn ancount(p as *u8) as i64 { return nb.get_be16(p, 6); }
+
+fn is_response(p as *u8) as i64 {
+    if ((flags_of(p) & FLAG_QR) != 0) { return 1; }
+    return 0;
+}
+
+fn is_truncated(p as *u8) as i64 {
+    if ((flags_of(p) & FLAG_TC) != 0) { return 1; }
+    return 0;
+}
+
+let is i64 as R_OK       = 0;
+let is i64 as R_MALFORMED = 0 - 1;
+let is i64 as R_NOTOURS  = 0 - 2;   // id or question does not match
+let is i64 as R_NXDOMAIN = 0 - 3;
+let is i64 as R_SERVFAIL = 0 - 4;
+let is i64 as R_NOANSWER = 0 - 5;   // a response with no A record in it
+let is i64 as R_TRUNCATED = 0 - 6;
+
+// Pull the first A record for `name` out of a response, writing the address
+// to out_ip and its TTL to out_ttl.
+//
+// The question is verified, not just the id. A response that echoes a
+// different question is not an answer to ours however well its id matches,
+// and accepting it on the id alone halves what an off-path attacker needs.
+fn parse_response(p as *u8, len as i64, id as i64, name as *u8, nlen as i64,
+                  out_ip as *i64, out_ttl as *i64) as i64 {
+    if (len < HDR_LEN) { return R_MALFORMED; }
+    if (is_response(p) == 0) { return R_NOTOURS; }
+    if (id_of(p) != id) { return R_NOTOURS; }
+    if (qdcount(p) != 1) { return R_MALFORMED; }
+
+    let is i64 as o with mut = HDR_LEN;
+    if (name_equals(p, len, o, name, nlen) == 0) { return R_NOTOURS; }
+    o = skip_name(p, len, o);
+    if (o < 0 || o + 4 > len) { return R_MALFORMED; }
+    o = o + 4;                                   // qtype + qclass
+
+    let is i64 as rc = rcode_of(p);
+    if (rc == RCODE_NXDOMAIN) { return R_NXDOMAIN; }
+    if (rc != RCODE_OK) { return R_SERVFAIL; }
+    // Truncation is checked AFTER the question matched, so a truncated
+    // response to somebody else's query is not reported as ours.
+    if (is_truncated(p) == 1) { return R_TRUNCATED; }
+
+    // Walk the answers. A CNAME chain is followed by matching subsequent
+    // records against the name the CNAME pointed at — but the address in an
+    // A record is taken regardless of which name it is for, provided the
+    // chain led here, because that is what the chain means.
+    let is i64 as n = ancount(p);
+    let is i64 as i with mut = 0;
+    while (i < n && o < len) {
+        let is i64 as name_off = o;
+        o = skip_name(p, len, o);
+        if (o < 0 || o + 10 > len) { return R_MALFORMED; }
+        let is i64 as rtype = nb.get_be16(p, o);
+        let is i64 as rclass = nb.get_be16(p, o + 2);
+        let is i64 as ttl = nb.get_be32(p, o + 4);
+        let is i64 as rdlen = nb.get_be16(p, o + 8);
+        o = o + 10;
+        if (o + rdlen > len) { return R_MALFORMED; }
+        if (rtype == TYPE_A && rclass == CLASS_IN && rdlen == 4) {
+            out_ip[0] = nb.get_be32(p, o);
+            out_ttl[0] = ttl;
+            return R_OK;
+        }
+        o = o + rdlen;
+        i = i + 1;
+    }
+    return R_NOANSWER;
+}
+
+// ---- cache ----
+//
+// TTL is honoured rather than treated as advice. A resolver that caches
+// forever pins a name to an address that has moved, and the failure is
+// invisible from inside — everything works, at the wrong host.
+
+let is i64 as CACHE_SIZE = 8;
+let is i64 as MIN_TTL_NS = 1000000000;        // never cache for less than a second
+let is i64 as MAX_TTL_NS = 3600000000000;     // nor more than an hour, whatever it says
+
+struct Entry {
+    used    as i64;
+    expires as i64;
+    addr    as i64;
+    nlen    as i64;
+    name    as [256]u8;
+}
+
+struct Cache {
+    hits   as i64;
+    misses as i64;
+    e0 as Entry; e1 as Entry; e2 as Entry; e3 as Entry;
+    e4 as Entry; e5 as Entry; e6 as Entry; e7 as Entry;
+}
+
+fn at(c as *Cache, i as i64) as *Entry {
+    if (i == 0) { return &c.e0; }
+    if (i == 1) { return &c.e1; }
+    if (i == 2) { return &c.e2; }
+    if (i == 3) { return &c.e3; }
+    if (i == 4) { return &c.e4; }
+    if (i == 5) { return &c.e5; }
+    if (i == 6) { return &c.e6; }
+    return &c.e7;
+}
+
+fn cache_init(c as *Cache) as void {
+    c.hits = 0; c.misses = 0;
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) { at(c, i).used = 0; i = i + 1; }
+    return;
+}
+
+fn same_name(e as *Entry, name as *u8, nlen as i64) as i64 {
+    if (e.nlen != nlen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < nlen) {
+        if (lower(cast(i64, e.name[i])) != lower(cast(i64, name[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The cached address, or 0. An expired entry is dropped rather than returned.
+fn cache_get(c as *Cache, name as *u8, nlen as i64, now as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) {
+        let is *Entry as e = at(c, i);
+        if (e.used == 1 && same_name(e, name, nlen) == 1) {
+            if (now >= e.expires) { e.used = 0; c.misses = c.misses + 1; return 0; }
+            c.hits = c.hits + 1;
+            return e.addr;
+        }
+        i = i + 1;
+    }
+    c.misses = c.misses + 1;
+    return 0;
+}
+
+fn cache_put(c as *Cache, name as *u8, nlen as i64, addr as i64,
+             ttl_s as i64, now as i64) as void {
+    if (nlen <= 0 || nlen > 255) { return; }
+    let is i64 as ns with mut = ttl_s * 1000000000;
+    if (ns < MIN_TTL_NS) { ns = MIN_TTL_NS; }
+    if (ns > MAX_TTL_NS) { ns = MAX_TTL_NS; }
+
+    // Reuse the entry for this name, then a free slot, then the one closest
+    // to expiring.
+    let is *Entry as slot with mut = cast(*Entry, 0);
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) {
+        let is *Entry as e = at(c, i);
+        if (e.used == 1 && same_name(e, name, nlen) == 1) { slot = e; i = CACHE_SIZE; }
+        i = i + 1;
+    }
+    if (cast(i64, slot) == 0) {
+        i = 0;
+        while (i < CACHE_SIZE) {
+            let is *Entry as e = at(c, i);
+            if (e.used == 0) { slot = e; i = CACHE_SIZE; }
+            i = i + 1;
+        }
+    }
+    if (cast(i64, slot) == 0) {
+        slot = at(c, 0);
+        i = 1;
+        while (i < CACHE_SIZE) {
+            let is *Entry as e = at(c, i);
+            if (e.expires < slot.expires) { slot = e; }
+            i = i + 1;
+        }
+    }
+    slot.used = 1;
+    slot.addr = addr;
+    slot.expires = now + ns;
+    slot.nlen = nlen;
+    nb.copy(cast(*u8, &slot.name[0]), name, nlen);
+    return;
+}
+
+// A dotted quad parses as itself rather than being looked up. Asking a
+// resolver about "10.0.2.2" is a query that either fails or, worse, succeeds
+// against a wildcard someone configured.
+fn parse_literal(name as *u8, nlen as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as octet with mut = 0;
+    let is i64 as digits with mut = 0;
+    let is i64 as parts with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i <= nlen) {
+        let is i64 as c with mut = 0;
+        if (i < nlen) { c = cast(i64, name[i]); }
+        if (i == nlen || c == 46) {
+            if (digits == 0 || octet > 255) { return 0; }
+            v = (v << 8) | octet;
+            parts = parts + 1;
+            octet = 0; digits = 0;
+            if (i == nlen) {
+                if (parts != 4) { return 0; }
+                return v;
+            }
+            if (parts >= 4) { return 0; }
+        } else if (c >= 48 && c <= 57) {
+            octet = octet * 10 + (c - 48);
+            digits = digits + 1;
+            if (digits > 3) { return 0; }
+        } else {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
