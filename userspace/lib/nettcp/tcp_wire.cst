@@ -1,0 +1,369 @@
+// tcp_wire — the header, the options, and the arithmetic underneath both.
+//
+// Kept apart from the state machine on purpose: this half is pure functions
+// over bytes and integers, so it can be settled against known packets and
+// known sequence-number edge cases without a connection existing. The state
+// machine is where the hard thinking is; this is where the silent corruption
+// would be.
+//
+// SEQUENCE ARITHMETIC IS MOD 2^32 AND HAS NO ORDER. There is no "greater
+// than" on a 32-bit sequence space that wraps — there is only "within half a
+// window ahead", which is what comparing the SIGN of a 32-bit difference
+// gives you. Every comparison in TCP goes through seq_lt and friends, and a
+// single `a < b` written directly is a connection that corrupts itself once
+// every four gigabytes.
+
+use "../netbuf/netbuf.cst" as nb;
+use "../netip/netip.cst" as ip;
+
+let is i64 as HDR_MIN = 20;
+let is i64 as HDR_MAX = 60;         // 20 + 40 bytes of options, the field's ceiling
+
+// Flags, in the low six bits of the byte at offset 13.
+let is i64 as FIN = 0x01;
+let is i64 as SYN = 0x02;
+let is i64 as RST = 0x04;
+let is i64 as PSH = 0x08;
+let is i64 as ACK = 0x10;
+let is i64 as URG = 0x20;
+
+// Option kinds.
+let is i64 as OPT_END       = 0;
+let is i64 as OPT_NOP       = 1;
+let is i64 as OPT_MSS       = 2;    // len 4
+let is i64 as OPT_WSCALE    = 3;    // len 3   (RFC 7323)
+let is i64 as OPT_SACK_PERM = 4;    // len 2   (RFC 2018)
+let is i64 as OPT_SACK      = 5;    // len 2+8n
+let is i64 as OPT_TIMESTAMP = 8;    // len 10  (RFC 7323)
+
+// The largest window scale RFC 7323 allows. Beyond 14 the window could
+// exceed 2^30 and the sequence space stops being able to express "half a
+// window", which is what every comparison depends on.
+let is i64 as MAX_WSCALE = 14;
+
+let is i64 as MSS_DEFAULT = 536;    // what RFC 1122 requires when nothing says otherwise
+let is i64 as MSS_ETHERNET = 1460;  // 1500 MTU - 20 IP - 20 TCP
+
+let is i64 as SEQ_MASK = 0xFFFFFFFF;
+
+// ============================================================
+// Sequence arithmetic
+// ============================================================
+
+fn seq_add(a as i64, n as i64) as i64 {
+    return (a + n) & SEQ_MASK;
+}
+
+// a < b, in the only sense the sequence space has: the 32-bit difference is
+// negative. Correct across the wrap, meaningless at exactly 2^31 apart — and
+// a receive window is never allowed near 2^31 precisely so it cannot be.
+fn seq_lt(a as i64, b as i64) as i64 {
+    let is i32 as d = cast(i32, (a - b) & SEQ_MASK);
+    if (d < 0) { return 1; }
+    return 0;
+}
+
+fn seq_leq(a as i64, b as i64) as i64 {
+    if (a == b) { return 1; }
+    return seq_lt(a, b);
+}
+
+fn seq_gt(a as i64, b as i64) as i64 {
+    return seq_lt(b, a);
+}
+
+fn seq_geq(a as i64, b as i64) as i64 {
+    return seq_leq(b, a);
+}
+
+// b - a, as a count of bytes, when b is known to be at or after a.
+fn seq_diff(b as i64, a as i64) as i64 {
+    return (b - a) & SEQ_MASK;
+}
+
+// Is `s` inside [lo, hi)? Written once because the open/closed ends are
+// exactly where an off-by-one turns into an accepted duplicate or a rejected
+// valid segment.
+fn seq_between(s as i64, lo as i64, hi as i64) as i64 {
+    if (seq_geq(s, lo) == 1 && seq_lt(s, hi) == 1) { return 1; }
+    return 0;
+}
+
+// ============================================================
+// Header access
+// ============================================================
+
+fn src_port(p as *u8) as i64 { return nb.get_be16(p, 0); }
+fn dst_port(p as *u8) as i64 { return nb.get_be16(p, 2); }
+fn seq_of(p as *u8) as i64   { return nb.get_be32(p, 4); }
+fn ack_of(p as *u8) as i64   { return nb.get_be32(p, 8); }
+fn data_off(p as *u8) as i64 { return ((cast(i64, p[12]) >> 4) & 0x0F) * 4; }
+fn flags_of(p as *u8) as i64 { return cast(i64, p[13]) & 0x3F; }
+fn window_of(p as *u8) as i64 { return nb.get_be16(p, 14); }
+fn cksum_of(p as *u8) as i64 { return nb.get_be16(p, 16); }
+fn urg_of(p as *u8) as i64   { return nb.get_be16(p, 18); }
+
+fn has_flag(p as *u8, f as i64) as i64 {
+    if ((flags_of(p) & f) != 0) { return 1; }
+    return 0;
+}
+
+// The bytes of stream a segment occupies. SYN and FIN each consume one
+// sequence number even though neither carries a byte — which is what makes a
+// handshake and a close acknowledgeable at all, and what makes a length
+// calculation that forgets them off by one in exactly the places that matter.
+fn seg_len(p as *u8, total as i64) as i64 {
+    let is i64 as n with mut = total - data_off(p);
+    if (n < 0) { n = 0; }
+    if (has_flag(p, SYN) == 1) { n = n + 1; }
+    if (has_flag(p, FIN) == 1) { n = n + 1; }
+    return n;
+}
+
+fn payload_len(p as *u8, total as i64) as i64 {
+    let is i64 as n = total - data_off(p);
+    if (n < 0) { return 0; }
+    return n;
+}
+
+fn payload(p as *u8) as *u8 {
+    return cast(*u8, cast(i64, p) + data_off(p));
+}
+
+// ============================================================
+// Options
+// ============================================================
+
+// Everything a peer told us in its options. All-i64 so the mixed-width rule
+// is not in play.
+struct Opts {
+    mss        as i64;
+    wscale     as i64;      // -1 when absent, which is not the same as 0
+    sack_ok    as i64;
+    ts_val     as i64;      // the peer's clock
+    ts_ecr     as i64;      // the echo of ours
+    has_ts     as i64;
+    n_sack     as i64;      // SACK blocks present, 0..4
+    sack_lo0 as i64; sack_hi0 as i64;
+    sack_lo1 as i64; sack_hi1 as i64;
+    sack_lo2 as i64; sack_hi2 as i64;
+    sack_lo3 as i64; sack_hi3 as i64;
+}
+
+fn opts_clear(o as *Opts) as void {
+    o.mss = 0;
+    o.wscale = 0 - 1;
+    o.sack_ok = 0;
+    o.ts_val = 0; o.ts_ecr = 0; o.has_ts = 0;
+    o.n_sack = 0;
+    o.sack_lo0 = 0; o.sack_hi0 = 0;
+    o.sack_lo1 = 0; o.sack_hi1 = 0;
+    o.sack_lo2 = 0; o.sack_hi2 = 0;
+    o.sack_lo3 = 0; o.sack_hi3 = 0;
+    return;
+}
+
+fn set_sack(o as *Opts, i as i64, lo as i64, hi as i64) as void {
+    if (i == 0) { o.sack_lo0 = lo; o.sack_hi0 = hi; return; }
+    if (i == 1) { o.sack_lo1 = lo; o.sack_hi1 = hi; return; }
+    if (i == 2) { o.sack_lo2 = lo; o.sack_hi2 = hi; return; }
+    o.sack_lo3 = lo; o.sack_hi3 = hi;
+    return;
+}
+
+fn sack_lo(o as *Opts, i as i64) as i64 {
+    if (i == 0) { return o.sack_lo0; }
+    if (i == 1) { return o.sack_lo1; }
+    if (i == 2) { return o.sack_lo2; }
+    return o.sack_lo3;
+}
+
+fn sack_hi(o as *Opts, i as i64) as i64 {
+    if (i == 0) { return o.sack_hi0; }
+    if (i == 1) { return o.sack_hi1; }
+    if (i == 2) { return o.sack_hi2; }
+    return o.sack_hi3;
+}
+
+// Walk the option area. A length that does not fit, or a kind whose length is
+// wrong for it, stops the walk — a malformed option must not be able to send
+// the parser past the end of the segment, and "stop believing the rest" is
+// safer than guessing at what was meant.
+fn parse_opts(p as *u8, total as i64, o as *Opts) as void {
+    opts_clear(o);
+    let is i64 as end = data_off(p);
+    if (end > total) { return; }
+    let is i64 as i with mut = HDR_MIN;
+    while (i < end) {
+        let is i64 as kind = cast(i64, p[i]);
+        if (kind == OPT_END) { return; }
+        if (kind == OPT_NOP) { i = i + 1; }
+        else {
+            if (i + 1 >= end) { return; }
+            let is i64 as len = cast(i64, p[i + 1]);
+            if (len < 2 || i + len > end) { return; }
+            if (kind == OPT_MSS && len == 4) {
+                o.mss = nb.get_be16(p, i + 2);
+            } else if (kind == OPT_WSCALE && len == 3) {
+                let is i64 as w with mut = cast(i64, p[i + 2]);
+                // RFC 7323 §2.3: a shift past 14 is clamped, not rejected —
+                // the peer is allowed to ask and we are allowed to cap.
+                if (w > MAX_WSCALE) { w = MAX_WSCALE; }
+                o.wscale = w;
+            } else if (kind == OPT_SACK_PERM && len == 2) {
+                o.sack_ok = 1;
+            } else if (kind == OPT_TIMESTAMP && len == 10) {
+                o.ts_val = nb.get_be32(p, i + 2);
+                o.ts_ecr = nb.get_be32(p, i + 6);
+                o.has_ts = 1;
+            } else if (kind == OPT_SACK) {
+                let is i64 as blocks with mut = (len - 2) / 8;
+                if (blocks > 4) { blocks = 4; }
+                let is i64 as k with mut = 0;
+                while (k < blocks) {
+                    set_sack(o, k, nb.get_be32(p, i + 2 + k * 8),
+                             nb.get_be32(p, i + 6 + k * 8));
+                    k = k + 1;
+                }
+                o.n_sack = blocks;
+            }
+            i = i + len;
+        }
+    }
+    return;
+}
+
+// ============================================================
+// Building
+// ============================================================
+
+// Write the fixed header. Options and payload go after; `doff` is patched by
+// finish() once their length is known.
+fn put_header(out as *u8, sport as i64, dport as i64, seq as i64, ack as i64,
+              flags as i64, window as i64) as void {
+    nb.put_be16(out, 0, sport);
+    nb.put_be16(out, 2, dport);
+    nb.put_be32(out, 4, seq);
+    nb.put_be32(out, 8, ack);
+    out[12] = cast(u8, (HDR_MIN / 4) << 4);
+    out[13] = cast(u8, flags);
+    nb.put_be16(out, 14, window);
+    nb.put_be16(out, 16, 0);
+    nb.put_be16(out, 18, 0);
+    return;
+}
+
+fn put_mss(out as *u8, off as i64, mss as i64) as i64 {
+    out[off] = cast(u8, OPT_MSS);
+    out[off + 1] = cast(u8, 4);
+    nb.put_be16(out, off + 2, mss);
+    return off + 4;
+}
+
+fn put_wscale(out as *u8, off as i64, shift as i64) as i64 {
+    // A NOP first, so the three-byte option lands on a four-byte boundary
+    // when it follows MSS. Alignment is not required by the RFC but every
+    // implementation does it and some middleboxes have opinions.
+    out[off] = cast(u8, OPT_NOP);
+    out[off + 1] = cast(u8, OPT_WSCALE);
+    out[off + 2] = cast(u8, 3);
+    out[off + 3] = cast(u8, shift);
+    return off + 4;
+}
+
+fn put_sack_perm(out as *u8, off as i64) as i64 {
+    out[off] = cast(u8, OPT_NOP);
+    out[off + 1] = cast(u8, OPT_NOP);
+    out[off + 2] = cast(u8, OPT_SACK_PERM);
+    out[off + 3] = cast(u8, 2);
+    return off + 4;
+}
+
+fn put_timestamp(out as *u8, off as i64, tsval as i64, tsecr as i64) as i64 {
+    out[off] = cast(u8, OPT_NOP);
+    out[off + 1] = cast(u8, OPT_NOP);
+    out[off + 2] = cast(u8, OPT_TIMESTAMP);
+    out[off + 3] = cast(u8, 10);
+    nb.put_be32(out, off + 4, tsval);
+    nb.put_be32(out, off + 8, tsecr);
+    return off + 12;
+}
+
+// SACK blocks describing what we have received out of order. The receiver's
+// side of RFC 2018: without these, a sender that loses one segment
+// retransmits everything after it.
+fn put_sack(out as *u8, off as i64, o as *Opts) as i64 {
+    if (o.n_sack <= 0) { return off; }
+    let is i64 as n with mut = o.n_sack;
+    if (n > 3) { n = 3; }              // 3 blocks + timestamp fills the 40 bytes
+    out[off] = cast(u8, OPT_NOP);
+    out[off + 1] = cast(u8, OPT_NOP);
+    out[off + 2] = cast(u8, OPT_SACK);
+    out[off + 3] = cast(u8, 2 + n * 8);
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        nb.put_be32(out, off + 4 + k * 8, sack_lo(o, k));
+        nb.put_be32(out, off + 8 + k * 8, sack_hi(o, k));
+        k = k + 1;
+    }
+    return off + 4 + n * 8;
+}
+
+// Pad the option area to a four-byte boundary and set the data offset. The
+// padding is END followed by zeros, which is what a receiver expects.
+fn finish_opts(out as *u8, off as i64) as i64 {
+    let is i64 as o with mut = off;
+    while ((o & 3) != 0) { out[o] = cast(u8, OPT_END); o = o + 1; }
+    out[12] = cast(u8, (o / 4) << 4);
+    return o;
+}
+
+// The checksum, over the pseudo-header and the whole segment. Same shape as
+// UDP's and the same reason: it is what catches a segment delivered to the
+// wrong host. Unlike UDP, TCP's is mandatory and 0 is not a special value.
+fn checksum(seg as *u8, seglen as i64, src as i64, dst as i64) as i64 {
+    nb.put_be16(seg, 16, 0);
+    let is i64 as sum with mut = ip.pseudo_sum(src, dst, ip.PROTO_TCP, seglen);
+    sum = sum + nb.sum16(seg, seglen);
+    return nb.fold(sum);
+}
+
+fn finish(seg as *u8, seglen as i64, src as i64, dst as i64) as void {
+    nb.put_be16(seg, 16, checksum(seg, seglen, src, dst));
+    return;
+}
+
+let is i64 as OK        = 0;
+let is i64 as ERR_SHORT = 0 - 1;
+let is i64 as ERR_OFF   = 0 - 2;
+let is i64 as ERR_CKSUM = 0 - 3;
+
+fn validate(p as *u8, avail as i64, src as i64, dst as i64) as i64 {
+    if (avail < HDR_MIN) { return ERR_SHORT; }
+    let is i64 as off = data_off(p);
+    if (off < HDR_MIN || off > avail) { return ERR_OFF; }
+    let is i64 as sum with mut = ip.pseudo_sum(src, dst, ip.PROTO_TCP, avail);
+    sum = sum + nb.sum16(p, avail);
+    let is i64 as folded with mut = sum;
+    while ((folded >> 16) != 0) { folded = (folded & 0xFFFF) + (folded >> 16); }
+    if (folded != 0xFFFF) { return ERR_CKSUM; }
+    return OK;
+}
+
+// A window value, given the scale in effect. The scale multiplies, so the
+// advertised 16 bits can describe up to a gigabyte — which is the whole point
+// of RFC 7323 and the reason a link with any real bandwidth-delay product
+// needs it.
+fn scaled_window(raw as i64, shift as i64) as i64 {
+    if (shift <= 0) { return raw; }
+    return raw << shift;
+}
+
+// The reverse, for advertising: what to put in the 16-bit field.
+fn unscaled_window(win as i64, shift as i64) as i64 {
+    let is i64 as w with mut = win;
+    if (shift > 0) { w = w >> shift; }
+    if (w > 0xFFFF) { w = 0xFFFF; }
+    if (w < 0) { w = 0; }
+    return w;
+}

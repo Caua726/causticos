@@ -1,0 +1,246 @@
+// tcp_cc — how fast to send, and how to find out you were wrong.
+//
+// Two separate mechanisms live here and they are often confused:
+//
+//   THE RETRANSMISSION TIMER answers "when do I decide this segment is
+//   lost?". Too short and a healthy connection retransmits constantly; too
+//   long and a lost segment stalls everything behind it. RFC 6298's estimator
+//   tracks both the mean round trip and its VARIATION, because a link whose
+//   RTT swings between 10ms and 200ms needs a timeout the mean alone would
+//   never give.
+//
+//   CONGESTION CONTROL answers "how much may be in flight?". It is behind a
+//   vtable from the start — not because a second algorithm is planned as a
+//   feature, but because the boundary is where it belongs: NewReno and CUBIC
+//   differ only in how cwnd moves, and putting that behind an interface now
+//   costs nothing while retrofitting it later means untangling it from the
+//   send path.
+
+use "tcp_wire.cst" as w;
+
+// ============================================================
+// The RTO estimator (RFC 6298)
+// ============================================================
+
+// The bounds RFC 6298 §2 sets. The 1s floor is what stops a fast local link
+// from retransmitting on ordinary jitter; the 60s ceiling stops a black hole
+// from producing a timer that never fires again.
+let is i64 as RTO_MIN_NS = 1000000000;
+let is i64 as RTO_MAX_NS = 60000000000;
+let is i64 as RTO_INITIAL_NS = 1000000000;
+
+// Clock granularity, which the estimator adds so that RTO never collapses
+// below what can actually be measured.
+let is i64 as CLOCK_G_NS = 1000000;
+
+struct Rtt {
+    srtt    as i64;     // smoothed round trip
+    rttvar  as i64;     // its variation
+    rto     as i64;
+    have    as i64;     // 0 until the first measurement
+    backoff as i64;     // doublings applied by consecutive timeouts
+}
+
+fn rtt_init(r as *Rtt) as void {
+    r.srtt = 0;
+    r.rttvar = 0;
+    r.rto = RTO_INITIAL_NS;
+    r.have = 0;
+    r.backoff = 0;
+    return;
+}
+
+fn clamp_rto(v as i64) as i64 {
+    if (v < RTO_MIN_NS) { return RTO_MIN_NS; }
+    if (v > RTO_MAX_NS) { return RTO_MAX_NS; }
+    return v;
+}
+
+// Fold in one measurement. The first one seeds the estimator differently from
+// the rest (RFC 6298 §2.2): with no history, half the sample is the best
+// guess at its own variation.
+fn rtt_measure(r as *Rtt, sample as i64) as void {
+    if (sample <= 0) { return; }
+    if (r.have == 0) {
+        r.srtt = sample;
+        r.rttvar = sample / 2;
+        r.have = 1;
+    } else {
+        // RFC 6298: RTTVAR = 3/4 RTTVAR + 1/4 |SRTT - R|
+        //           SRTT   = 7/8 SRTT   + 1/8 R
+        let is i64 as d with mut = r.srtt - sample;
+        if (d < 0) { d = 0 - d; }
+        r.rttvar = (r.rttvar * 3 + d) / 4;
+        r.srtt = (r.srtt * 7 + sample) / 8;
+    }
+    let is i64 as v with mut = 4 * r.rttvar;
+    if (v < CLOCK_G_NS) { v = CLOCK_G_NS; }
+    r.rto = clamp_rto(r.srtt + v);
+    // A fresh measurement means the path is answering again, so the backoff
+    // from previous timeouts is over.
+    r.backoff = 0;
+    return;
+}
+
+// A timeout. The RFC says double, and doubling is what keeps a host from
+// hammering a path that is already in trouble — the single most important
+// thing TCP does for a congested network.
+fn rtt_timeout(r as *Rtt) as i64 {
+    r.backoff = r.backoff + 1;
+    r.rto = clamp_rto(r.rto * 2);
+    return r.rto;
+}
+
+fn rtt_current(r as *Rtt) as i64 {
+    return r.rto;
+}
+
+// ============================================================
+// Congestion control
+// ============================================================
+
+// State the algorithms share. cwnd and ssthresh are in BYTES, not segments:
+// segment counting is where implementations acquire rounding bugs that only
+// show up on paths with an unusual MSS.
+struct Cong {
+    cwnd        as i64;
+    ssthresh    as i64;
+    mss         as i64;
+    in_recovery as i64;
+    recover     as i64;      // the highest sequence sent when loss was detected
+    dupacks     as i64;
+    // PRR (RFC 6937) state — how much has been delivered and sent during
+    // this recovery, so the window is reduced smoothly rather than halved
+    // all at once and then stalled.
+    prr_out     as i64;
+    prr_delivered as i64;
+    prr_pipe    as i64;
+    algo        as i64;      // which algorithm is driving
+}
+
+let is i64 as ALGO_NEWRENO = 0;
+let is i64 as ALGO_CUBIC   = 1;
+
+// RFC 6928: an initial window of ten segments, which is what makes a short
+// transfer finish in one round trip instead of four. Capped so a large MSS
+// does not turn into an unreasonable burst.
+fn initial_cwnd(mss as i64) as i64 {
+    let is i64 as ten = 10 * mss;
+    let is i64 as two = 2 * mss;
+    let is i64 as cap with mut = 14600;
+    if (cap < two) { cap = two; }
+    if (ten < cap) { return ten; }
+    return cap;
+}
+
+fn cong_init(c as *Cong, mss as i64) as void {
+    c.mss = mss;
+    c.cwnd = initial_cwnd(mss);
+    // Start with no ceiling: slow start runs until something is lost or the
+    // receiver's window becomes the limit. A low initial ssthresh is a
+    // connection that never reaches the bandwidth it could have.
+    c.ssthresh = 0x7FFFFFFF;
+    c.in_recovery = 0;
+    c.recover = 0;
+    c.dupacks = 0;
+    c.prr_out = 0; c.prr_delivered = 0; c.prr_pipe = 0;
+    c.algo = ALGO_NEWRENO;
+    return;
+}
+
+fn in_slow_start(c as *Cong) as i64 {
+    if (c.cwnd < c.ssthresh) { return 1; }
+    return 0;
+}
+
+// An ACK covering new data. Slow start doubles per round trip; congestion
+// avoidance adds roughly one segment per round trip, which is the additive
+// increase half of AIMD.
+fn cong_on_ack(c as *Cong, acked as i64) as void {
+    if (c.in_recovery == 1) { return; }        // PRR owns cwnd during recovery
+    if (in_slow_start(c) == 1) {
+        c.cwnd = c.cwnd + acked;
+        if (c.cwnd > c.ssthresh) { c.cwnd = c.ssthresh; }
+    } else {
+        // cwnd += MSS * MSS / cwnd, accumulated in bytes so that a partial
+        // segment's worth of growth is not lost to integer division every
+        // time — which is what makes a naive implementation grow too slowly.
+        let is i64 as inc with mut = (c.mss * c.mss) / c.cwnd;
+        if (inc < 1) { inc = 1; }
+        c.cwnd = c.cwnd + inc;
+    }
+    return;
+}
+
+// Loss detected by duplicate ACKs. Halve, and enter recovery — this is the
+// multiplicative decrease, and it is deliberately less severe than a timeout
+// because dup ACKs prove packets are still arriving.
+fn cong_enter_recovery(c as *Cong, highest_sent as i64, pipe as i64) as void {
+    let is i64 as half with mut = c.cwnd / 2;
+    if (half < 2 * c.mss) { half = 2 * c.mss; }
+    c.ssthresh = half;
+    c.in_recovery = 1;
+    c.recover = highest_sent;
+    c.prr_out = 0;
+    c.prr_delivered = 0;
+    c.prr_pipe = pipe;
+    c.cwnd = half;
+    return;
+}
+
+// A timeout. Everything is suspect, so this is the severe response: one
+// segment, and slow start from there.
+fn cong_on_timeout(c as *Cong) as void {
+    let is i64 as half with mut = c.cwnd / 2;
+    if (half < 2 * c.mss) { half = 2 * c.mss; }
+    c.ssthresh = half;
+    c.cwnd = c.mss;
+    c.in_recovery = 0;
+    c.dupacks = 0;
+    return;
+}
+
+// Recovery ends when an ACK covers everything that was outstanding when it
+// began (RFC 6582's `recover`). Ending it on the first new ACK instead is the
+// classic NewReno mistake: it halves the window again for the next loss in
+// the same round trip.
+fn cong_recovery_done(c as *Cong, ack as i64) as i64 {
+    if (c.in_recovery == 0) { return 0; }
+    if (w.seq_geq(ack, c.recover) == 1) {
+        c.in_recovery = 0;
+        c.dupacks = 0;
+        c.cwnd = c.ssthresh;
+        return 1;
+    }
+    return 0;
+}
+
+// PRR (RFC 6937): how many bytes may go out now, given what this ACK
+// delivered. Rather than halving instantly and then waiting for the pipe to
+// drain, it releases data in proportion — which keeps the connection sending
+// through recovery instead of stalling and is strictly better than the
+// fast-recovery inflation it replaces.
+fn prr_allowed(c as *Cong, delivered as i64, pipe as i64) as i64 {
+    if (c.in_recovery == 0) { return c.cwnd; }
+    c.prr_delivered = c.prr_delivered + delivered;
+    let is i64 as allowed with mut = 0;
+    if (pipe > c.ssthresh) {
+        // Still above the target: release proportionally.
+        if (c.prr_pipe > 0) {
+            allowed = (c.prr_delivered * c.ssthresh) / c.prr_pipe - c.prr_out;
+        }
+    } else {
+        // At or below target: allow one more than was delivered, bounded by
+        // what is left to reach ssthresh.
+        let is i64 as limit = c.ssthresh - pipe;
+        allowed = c.prr_delivered - c.prr_out;
+        if (allowed > limit) { allowed = limit; }
+    }
+    if (allowed < 0) { allowed = 0; }
+    return allowed;
+}
+
+fn prr_sent(c as *Cong, n as i64) as void {
+    c.prr_out = c.prr_out + n;
+    return;
+}

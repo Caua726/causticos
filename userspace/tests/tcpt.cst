@@ -1,0 +1,370 @@
+// tcpt — TCP, settled without a network.
+//
+// The wire format and the arithmetic under it are pure functions, so their
+// bugs can be found in milliseconds against known values rather than in an
+// afternoon against a packet capture. And they are exactly the bugs worth
+// finding that way: a sequence comparison that is wrong across the wrap
+// corrupts a connection once every four gigabytes, which is a fault nobody
+// reproduces on purpose.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netbuf/netbuf.cst" as nb;
+use "../lib/netip/netip.cst" as ip;
+use "../lib/nettcp/tcp_wire.cst" as w;
+use "../lib/nettcp/tcp_cc.cst" as cc;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// ============================================================
+// Sequence arithmetic — where a wrong comparison corrupts a stream
+// ============================================================
+
+fn test_seq() as void {
+    say("sequence arithmetic:\n");
+    check(cast(*u8, "1 < 2"), w.seq_lt(1, 2), 1);
+    check(cast(*u8, "2 < 1"), w.seq_lt(2, 1), 0);
+    check(cast(*u8, "n < n"), w.seq_lt(5, 5), 0);
+    check(cast(*u8, "n <= n"), w.seq_leq(5, 5), 1);
+    check(cast(*u8, "2 > 1"), w.seq_gt(2, 1), 1);
+
+    // Across the wrap. This is the whole reason the comparison is not `<`.
+    let is i64 as near_end = 0xFFFFFFF0;
+    check(cast(*u8, "0xFFFFFFF0 < 16"), w.seq_lt(near_end, 16), 1);
+    check(cast(*u8, "16 < 0xFFFFFFF0"), w.seq_lt(16, near_end), 0);
+    check(cast(*u8, "add wraps"), w.seq_add(near_end, 32), 16);
+    check(cast(*u8, "diff across the wrap"), w.seq_diff(16, near_end), 32);
+
+    // A window that spans the wrap must still contain what is inside it.
+    check(cast(*u8, "0xFFFFFFF8 in [0xFFFFFFF0, 16)"),
+          w.seq_between(0xFFFFFFF8, near_end, 16), 1);
+    check(cast(*u8, "8 in [0xFFFFFFF0, 16)"),
+          w.seq_between(8, near_end, 16), 1);
+    check(cast(*u8, "32 not in [0xFFFFFFF0, 16)"),
+          w.seq_between(32, near_end, 16), 0);
+    // The low end is closed and the high end is open — an off-by-one here
+    // accepts a duplicate or rejects a valid segment.
+    check(cast(*u8, "lo is inside"), w.seq_between(near_end, near_end, 16), 1);
+    check(cast(*u8, "hi is outside"), w.seq_between(16, near_end, 16), 0);
+    return;
+}
+
+// ============================================================
+// The header, built and parsed
+// ============================================================
+
+let is [128]u8 as seg;
+
+fn test_header() as void {
+    say("header:\n");
+    let is *u8 as p = cast(*u8, &seg[0]);
+    nb.fill(p, 0, 128);
+    w.put_header(p, 12345, 80, 0x11223344, 0x55667788,
+                 w.SYN | w.ACK, 65535);
+    let is i64 as n = w.finish_opts(p, w.HDR_MIN);
+    check(cast(*u8, "no options is 20 bytes"), n, 20);
+    check(cast(*u8, "data offset"), w.data_off(p), 20);
+    check(cast(*u8, "source port"), w.src_port(p), 12345);
+    check(cast(*u8, "dest port"), w.dst_port(p), 80);
+    check(cast(*u8, "sequence"), w.seq_of(p), 0x11223344);
+    check(cast(*u8, "ack"), w.ack_of(p), 0x55667788);
+    check(cast(*u8, "SYN set"), w.has_flag(p, w.SYN), 1);
+    check(cast(*u8, "ACK set"), w.has_flag(p, w.ACK), 1);
+    check(cast(*u8, "FIN clear"), w.has_flag(p, w.FIN), 0);
+    check(cast(*u8, "window"), w.window_of(p), 65535);
+
+    // SYN and FIN each occupy one sequence number without carrying a byte,
+    // which is what makes a handshake acknowledgeable. Forgetting that is an
+    // off-by-one in exactly the places that matter most.
+    check(cast(*u8, "bare SYN spans 1"), w.seg_len(p, 20), 1);
+    p[13] = cast(u8, w.ACK);
+    check(cast(*u8, "bare ACK spans 0"), w.seg_len(p, 20), 0);
+    p[13] = cast(u8, w.ACK | w.FIN);
+    check(cast(*u8, "FIN spans 1"), w.seg_len(p, 20), 1);
+    p[13] = cast(u8, w.ACK);
+    check(cast(*u8, "100 bytes spans 100"), w.seg_len(p, 120), 100);
+    check(cast(*u8, "payload length"), w.payload_len(p, 120), 100);
+
+    // The checksum covers a pseudo-header, so the same bytes to a different
+    // host must not verify — which is what catches misdelivery.
+    let is i64 as SRC = ip.make_addr(10, 0, 2, 15);
+    let is i64 as DST = ip.make_addr(10, 0, 2, 2);
+    w.finish(p, 20, SRC, DST);
+    check(cast(*u8, "verifies for its addresses"), w.validate(p, 20, SRC, DST), w.OK);
+    check(cast(*u8, "fails for another destination"),
+          w.validate(p, 20, SRC, ip.make_addr(10, 0, 2, 3)), w.ERR_CKSUM);
+    // And a flipped bit anywhere fails.
+    p[8] = cast(u8, cast(i64, p[8]) ^ 1);
+    check(cast(*u8, "fails on a flipped bit"), w.validate(p, 20, SRC, DST), w.ERR_CKSUM);
+    return;
+}
+
+// ============================================================
+// Options
+// ============================================================
+
+let is w.Opts as o;
+
+fn test_options() as void {
+    say("options:\n");
+    let is *u8 as p = cast(*u8, &seg[0]);
+    nb.fill(p, 0, 128);
+    w.put_header(p, 1, 2, 0, 0, w.SYN, 65535);
+    let is i64 as off with mut = w.HDR_MIN;
+    off = w.put_mss(p, off, 1460);
+    off = w.put_wscale(p, off, 7);
+    off = w.put_sack_perm(p, off);
+    off = w.put_timestamp(p, off, 0xAABBCCDD, 0);
+    let is i64 as n = w.finish_opts(p, off);
+    check(cast(*u8, "option area is aligned"), n & 3, 0);
+    check(cast(*u8, "data offset covers them"), w.data_off(p), n);
+
+    w.parse_opts(p, n, &o);
+    check(cast(*u8, "mss round trips"), o.mss, 1460);
+    check(cast(*u8, "window scale round trips"), o.wscale, 7);
+    check(cast(*u8, "sack permitted"), o.sack_ok, 1);
+    check(cast(*u8, "timestamp present"), o.has_ts, 1);
+    check(cast(*u8, "timestamp value"), o.ts_val, 0xAABBCCDD);
+
+    // Absent is not zero. A peer that sent no window scale is not a peer that
+    // sent a scale of 0, and treating them alike disables scaling on
+    // connections that asked for it.
+    nb.fill(p, 0, 128);
+    w.put_header(p, 1, 2, 0, 0, w.SYN, 65535);
+    w.finish_opts(p, w.HDR_MIN);
+    w.parse_opts(p, 20, &o);
+    check(cast(*u8, "absent scale is -1"), o.wscale, 0 - 1);
+    check(cast(*u8, "absent sack is 0"), o.sack_ok, 0);
+    check(cast(*u8, "absent timestamp is 0"), o.has_ts, 0);
+
+    // A shift past the RFC 7323 maximum is clamped, not rejected: the peer
+    // may ask for more than is representable and we may cap it.
+    nb.fill(p, 0, 128);
+    w.put_header(p, 1, 2, 0, 0, w.SYN, 65535);
+    off = w.put_wscale(p, w.HDR_MIN, 30);
+    w.finish_opts(p, off);
+    w.parse_opts(p, w.data_off(p), &o);
+    check(cast(*u8, "excessive scale clamped to 14"), o.wscale, w.MAX_WSCALE);
+
+    // A malformed option must stop the walk rather than run off the end. Here
+    // the length byte claims more than the area holds.
+    nb.fill(p, 0, 128);
+    w.put_header(p, 1, 2, 0, 0, w.SYN, 65535);
+    p[w.HDR_MIN] = cast(u8, w.OPT_MSS);
+    p[w.HDR_MIN + 1] = cast(u8, 40);           // a length that does not fit
+    p[12] = cast(u8, (24 / 4) << 4);
+    w.parse_opts(p, 24, &o);
+    check(cast(*u8, "overlong option ignored"), o.mss, 0);
+
+    // SACK blocks, which is how a receiver tells a sender exactly what it is
+    // missing rather than only what it has in order.
+    nb.fill(p, 0, 128);
+    w.put_header(p, 1, 2, 0, 0, w.ACK, 65535);
+    let is w.Opts as tx;
+    w.opts_clear(&tx);
+    tx.n_sack = 2;
+    w.set_sack(&tx, 0, 1000, 2000);
+    w.set_sack(&tx, 1, 3000, 4000);
+    off = w.put_sack(p, w.HDR_MIN, &tx);
+    w.finish_opts(p, off);
+    w.parse_opts(p, w.data_off(p), &o);
+    check(cast(*u8, "two sack blocks"), o.n_sack, 2);
+    check(cast(*u8, "first block start"), w.sack_lo(&o, 0), 1000);
+    check(cast(*u8, "first block end"), w.sack_hi(&o, 0), 2000);
+    check(cast(*u8, "second block start"), w.sack_lo(&o, 1), 3000);
+    return;
+}
+
+fn test_window_scale() as void {
+    say("window scaling:\n");
+    check(cast(*u8, "no scale is identity"), w.scaled_window(65535, 0), 65535);
+    check(cast(*u8, "shift 7 multiplies"), w.scaled_window(1000, 7), 128000);
+    // Without scaling the window caps at 64 KiB, which throttles any path
+    // whose bandwidth-delay product exceeds it — the reason RFC 7323 exists.
+    check(cast(*u8, "shift 14 reaches a gigabyte"),
+          w.scaled_window(65535, 14), 1073725440);
+    check(cast(*u8, "advertising divides back"), w.unscaled_window(128000, 7), 1000);
+    check(cast(*u8, "advertised value fits 16 bits"),
+          w.unscaled_window(1073725440, 14), 65535);
+    // A window larger than the field can express is clamped rather than
+    // wrapping to a small number, which would stall the peer.
+    check(cast(*u8, "oversized clamps, never wraps"),
+          w.unscaled_window(999999999, 0), 65535);
+    return;
+}
+
+// ============================================================
+// The RTO estimator
+// ============================================================
+
+let is cc.Rtt as rtt;
+
+fn test_rto() as void {
+    say("retransmission timer (RFC 6298):\n");
+    cc.rtt_init(&rtt);
+    check(cast(*u8, "starts at 1s"), cc.rtt_current(&rtt), cc.RTO_INITIAL_NS);
+
+    // First measurement seeds differently: with no history, half the sample
+    // is the best guess at its own variation.
+    cc.rtt_measure(&rtt, 100000000);                  // 100 ms
+    check(cast(*u8, "srtt takes the sample"), rtt.srtt, 100000000);
+    check(cast(*u8, "rttvar is half of it"), rtt.rttvar, 50000000);
+    // srtt + 4*rttvar = 300ms, but the floor is 1s.
+    check(cast(*u8, "clamped up to the 1s floor"), cc.rtt_current(&rtt), cc.RTO_MIN_NS);
+
+    // A steady path drives variation down; the RTO follows and settles.
+    let is i64 as i with mut = 0;
+    while (i < 20) { cc.rtt_measure(&rtt, 100000000); i = i + 1; }
+    check(cast(*u8, "srtt converges on the truth"),
+          rtt.srtt > 99000000 && rtt.srtt < 101000000, 1);
+    check(cast(*u8, "variation collapses"), rtt.rttvar < 5000000, 1);
+
+    // A jittery path must widen the timeout, or a healthy connection
+    // retransmits on ordinary variation. This is what the mean alone misses.
+    cc.rtt_init(&rtt);
+    cc.rtt_measure(&rtt, 100000000);
+    let is i64 as steady_rto = rtt.srtt + 4 * rtt.rttvar;
+    cc.rtt_init(&rtt);
+    cc.rtt_measure(&rtt, 100000000);
+    i = 0;
+    while (i < 10) {
+        cc.rtt_measure(&rtt, 20000000);
+        cc.rtt_measure(&rtt, 400000000);
+        i = i + 1;
+    }
+    check(cast(*u8, "jitter widens the timeout"),
+          (rtt.srtt + 4 * rtt.rttvar) > steady_rto, 1);
+
+    // Backoff doubles, and is bounded. Without the doubling a host hammers a
+    // path that is already in trouble.
+    cc.rtt_init(&rtt);
+    cc.rtt_measure(&rtt, 2000000000);                 // 2s: past the floor
+    let is i64 as before = cc.rtt_current(&rtt);
+    let is i64 as after = cc.rtt_timeout(&rtt);
+    check(cast(*u8, "a timeout doubles it"), after, before * 2);
+    i = 0;
+    while (i < 20) { cc.rtt_timeout(&rtt); i = i + 1; }
+    check(cast(*u8, "backoff stops at 60s"), cc.rtt_current(&rtt), cc.RTO_MAX_NS);
+    // And a fresh measurement means the path answers again, so the backoff
+    // is over — carrying it forward would leave a recovered path slow.
+    cc.rtt_measure(&rtt, 50000000);
+    check(cast(*u8, "a measurement clears the backoff"), rtt.backoff, 0);
+    return;
+}
+
+// ============================================================
+// Congestion control
+// ============================================================
+
+let is cc.Cong as cg;
+
+fn test_cong() as void {
+    say("congestion control:\n");
+    cc.cong_init(&cg, 1460);
+    // RFC 6928: ten segments, so a short transfer finishes in one round trip
+    // rather than four.
+    check(cast(*u8, "initial window is 10 segments"), cg.cwnd, 14600);
+    check(cast(*u8, "starts in slow start"), cc.in_slow_start(&cg), 1);
+
+    // Slow start doubles per round trip: every acked byte adds one.
+    let is i64 as before with mut = cg.cwnd;
+    cc.cong_on_ack(&cg, 1460);
+    check(cast(*u8, "slow start adds what was acked"), cg.cwnd - before, 1460);
+
+    // Past ssthresh it becomes additive: about one segment per round trip.
+    cg.ssthresh = 20000;
+    cg.cwnd = 20000;
+    before = cg.cwnd;
+    cc.cong_on_ack(&cg, 1460);
+    check(cast(*u8, "congestion avoidance is gentle"),
+          cg.cwnd - before < 200, 1);
+    check(cast(*u8, "but always advances"), cg.cwnd > before, 1);
+
+    // Loss by duplicate ACKs: halve. Less severe than a timeout, because dup
+    // ACKs prove packets are still getting through.
+    cc.cong_init(&cg, 1460);
+    cg.cwnd = 40000;
+    cc.cong_enter_recovery(&cg, 5000, 40000);
+    check(cast(*u8, "dup-ack loss halves cwnd"), cg.cwnd, 20000);
+    check(cast(*u8, "ssthresh follows"), cg.ssthresh, 20000);
+    check(cast(*u8, "and we are in recovery"), cg.in_recovery, 1);
+
+    // Recovery ends only when everything outstanding at the time is acked.
+    // Ending on the first new ACK is the classic NewReno bug: it halves again
+    // for a second loss in the same round trip.
+    check(cast(*u8, "partial ack does not end it"),
+          cc.cong_recovery_done(&cg, 3000), 0);
+    check(cast(*u8, "still in recovery"), cg.in_recovery, 1);
+    check(cast(*u8, "full ack ends it"), cc.cong_recovery_done(&cg, 5000), 1);
+    check(cast(*u8, "cwnd settles at ssthresh"), cg.cwnd, 20000);
+
+    // A timeout is the severe response: back to one segment.
+    cc.cong_init(&cg, 1460);
+    cg.cwnd = 40000;
+    cc.cong_on_timeout(&cg);
+    check(cast(*u8, "timeout drops to one segment"), cg.cwnd, 1460);
+    check(cast(*u8, "and sets a ceiling to grow back to"), cg.ssthresh, 20000);
+    check(cast(*u8, "so it is in slow start again"), cc.in_slow_start(&cg), 1);
+
+    // cwnd never falls below two segments, whatever happens. A connection at
+    // one segment per round trip is barely alive.
+    cc.cong_init(&cg, 1460);
+    cg.cwnd = 2000;
+    cc.cong_enter_recovery(&cg, 100, 2000);
+    check(cast(*u8, "never below two segments"), cg.cwnd, 2920);
+
+    // PRR releases data in proportion during recovery instead of stalling
+    // until the pipe drains.
+    cc.cong_init(&cg, 1460);
+    cg.cwnd = 20000;
+    cc.cong_enter_recovery(&cg, 10000, 20000);
+    let is i64 as allowed = cc.prr_allowed(&cg, 1460, 20000);
+    check(cast(*u8, "prr allows sending during recovery"), allowed > 0, 1);
+    check(cast(*u8, "but less than was delivered"), allowed <= 1460, 1);
+    return;
+}
+
+fn main() as i32 {
+    say("tcpt: tcp wire format and control laws, no network required\n");
+    test_seq();
+    test_header();
+    test_options();
+    test_window_scale();
+    test_rto();
+    test_cong();
+    say("tcpt: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("tcpt: ALL PASS\n"); return cast(i32, 0); }
+    say("tcpt: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}
