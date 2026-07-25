@@ -1,0 +1,96 @@
+// linkt — watch a port's link state while the host pulls the cable.
+//
+// nd_link_up returning 0 is a path no test had ever taken: every boot so far
+// has had a link that was up before the driver looked and stayed up. A driver
+// that returns a plausible constant is indistinguishable from one that reads
+// STATUS, and the difference only shows up on the day someone is trying to
+// work out why a machine is not talking.
+//
+// So the host drives it. scripts/test-link.sh boots this with a QEMU monitor
+// attached, waits for the marker below, sends `set_link ... off`, then `on`,
+// and this reports what the register said. Neither side can fake the result:
+// the guest cannot know when the link was cut, and the host cannot see the
+// register.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as SAMPLE_NS = 100000000;      // 100 ms
+let is i64 as RUN_NS    = 9000000000;     // 9 s, comfortably past the host's script
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn main() as i32 {
+    let is i64 as fd = sys.dev_open(sys.DEV_NET, 0, 0);
+    if (fd < 0) { say("linkt: cannot open port 0\n"); return cast(i32, 1); }
+
+    let is [16]i64 as inf;
+    if (sys.net_info(fd, cast(*i64, &inf[0])) != 0) {
+        say("linkt: net_info failed\n");
+        sys.close(fd);
+        return cast(i32, 1);
+    }
+    if (inf[2] == 0) {
+        say("linkt: link already down at start FAIL\n");
+        sys.close(fd);
+        return cast(i32, 1);
+    }
+    // The host waits for this before touching the link, so the "up" it sees
+    // first is genuinely the initial state and not a race.
+    say("linkt: watching\n");
+
+    let is i64 as saw_down with mut = 0;
+    let is i64 as saw_up_again with mut = 0;
+    let is i64 as last with mut = 1;
+    let is i64 as transitions with mut = 0;
+    let is i64 as deadline = sys.time_ns() + RUN_NS;
+
+    while (sys.time_ns() < deadline) {
+        if (sys.net_info(fd, cast(*i64, &inf[0])) == 0) {
+            let is i64 as up = inf[2];
+            if (up != last) {
+                transitions = transitions + 1;
+                say("linkt: link ");
+                if (up != 0) { say("UP\n"); } else { say("DOWN\n"); }
+                // Speed must follow the link: reporting a rate on a dead
+                // link is a number that cannot be true.
+                if (up == 0) {
+                    saw_down = 1;
+                    if (inf[3] != 0) { say("linkt: speed reported while down FAIL\n"); }
+                } else if (saw_down == 1) {
+                    saw_up_again = 1;
+                }
+                last = up;
+            }
+        }
+        sys.sleep_ns(SAMPLE_NS);
+    }
+
+    sys.close(fd);
+    say("linkt: transitions="); say_num(transitions); say("\n");
+    if (saw_down == 1 && saw_up_again == 1) {
+        say("linkt: ALL PASS\n");
+        return cast(i32, 0);
+    }
+    if (saw_down == 0) { say("linkt: never saw the link go down FAIL\n"); }
+    else { say("linkt: link never came back FAIL\n"); }
+    return cast(i32, 1);
+}

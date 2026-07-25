@@ -49,5 +49,20 @@ for entry in "${TESTS[@]}"; do
     fi
 done
 
+# linkt needs the host to drive a QEMU monitor, so it has its own runner
+# rather than a line in the table above.
+if [ -z "$WANT" ] || [ "$WANT" = "linkt" ]; then
+    printf '%-8s ' "linkt"
+    if bash scripts/test-link.sh >/tmp/ut-linkt.log 2>&1; then
+        echo "PASS (host pulled the cable)"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-linkt.log)"
+        grep -E "FAIL|panic:" /tmp/ut-linkt.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED linkt"
+    fi
+fi
+
 echo "=== userspace: $PASS passed, $FAIL failed${FAILED:+ ($FAILED)} ==="
 [ "$FAIL" -eq 0 ]

@@ -69,6 +69,11 @@ let is i64 as CTRL_LRST   = 0x00000008;
 
 // STATUS bits
 let is i64 as STATUS_LU   = 0x00000002;       // link up
+// STATUS bits 7:6 report the negotiated speed. 11 is reserved on this part
+// and is read as gigabit, which is what the two encodings 10 and 11 both mean
+// in practice on the 8254x.
+let is i64 as STATUS_SPEED_MASK  = 0x000000C0;
+let is i64 as STATUS_SPEED_SHIFT = 6;
 
 // ICR / IMS bits
 let is i64 as INT_TXDW    = 0x00000001;
@@ -142,6 +147,7 @@ struct E1000Ctx {
     // ring to push into and the IRQ knows whom to drain.
     port_index as i64;
     bound as i64;
+    promisc as i64;
     mac as [8]u8;          // 6 used; padded so the struct stays i64-aligned
 }
 
@@ -573,6 +579,40 @@ fn nd_mtu(priv as *u8) as i64 {
     return 1500;
 }
 
+// The negotiated line rate, from STATUS bits 7:6. Reported rather than
+// assumed: a port that came up at 100 Mb because of a bad cable looks
+// identical to a gigabit one from every other angle, and that is exactly the
+// fault someone spends an afternoon on.
+fn nd_speed(priv as *u8) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0; }
+    let is i64 as st = read32(c, REG_STATUS);
+    if ((st & STATUS_LU) == 0) { return 0; }       // down: no rate to report
+    let is i64 as sp = (st & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT;
+    if (sp == 0) { return 10; }
+    if (sp == 1) { return 100; }
+    return 1000;
+}
+
+// Promiscuous mode, for real rather than as a permanent state. The receiver
+// comes up promiscuous because netd wants every frame, but leaving the knob
+// unimplemented and calling it "always on" is a claim that stops being true
+// the moment anything wants the opposite — a capture tool that should NOT be
+// seeing its neighbours' traffic, or a bridge that must.
+//
+// UPE is unicast-promiscuous and MPE multicast-promiscuous; broadcast (BAM)
+// stays on either way, because a host that cannot hear broadcast cannot ARP.
+fn nd_set_promisc(priv as *u8, on as i64) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0 - 2; }
+    let is i64 as rctl with mut = read32(c, REG_RCTL);
+    if (on != 0) { rctl = rctl | RCTL_UPE | RCTL_MPE; }
+    else { rctl = rctl & (0xFFFFFFFF - (RCTL_UPE | RCTL_MPE)); }
+    write32(c, REG_RCTL, rctl);
+    c.promisc = on;
+    return 0;
+}
+
 // ============================================================
 // IRQ handler — read ICR (clears most cause bits on read) and act
 // on the ones we care about. RXT0 wakes any thread blocked in the
@@ -642,6 +682,7 @@ fn e1000_bind(b as *spec.Binding) as i32 {
     c.regs = regs;
     c.binding = b;
     c.bound = 0;
+    c.promisc = 1;                 // init_rx brings the receiver up promiscuous
     c.tx_tail = 0;
     c.tx_clean = 0;
     c.rx_head = 0;
@@ -717,7 +758,8 @@ fn e1000_bind(b as *spec.Binding) as i32 {
     nd.mac         = fn_ptr(nd_mac);
     nd.link_up     = fn_ptr(nd_link_up);
     nd.mtu         = fn_ptr(nd_mtu);
-    nd.set_promisc = cast(fn(*u8, i64) as i64, 0);   // RCTL already UPE|MPE
+    nd.set_promisc = fn_ptr(nd_set_promisc);
+    nd.speed       = fn_ptr(nd_speed);
     nd.priv        = cast(*u8, c);
     nd.next        = cast(*netdev.NetDevice, 0);
     let is i64 as pi = netdev.register(nd, cast(i64, b.hardware));

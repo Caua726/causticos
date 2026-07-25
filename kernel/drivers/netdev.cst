@@ -125,8 +125,13 @@ struct NetDevice {
     mac         as fn(*u8, *u8) as i64;
     link_up     as fn(*u8) as i64;
     mtu         as fn(*u8) as i64;
-    // (priv, on) -> 0. Null means the device is always promiscuous, which is
-    // what both current drivers are; netd wants every frame anyway.
+    // (priv) -> negotiated line rate in Mb/s, 0 when the driver cannot know.
+    // Null is allowed and means the same as 0.
+    speed       as fn(*u8) as i64;
+    // (priv, on) -> 0, or negative. Null means the driver cannot change it and
+    // the device is permanently promiscuous — which is a real answer for a
+    // paravirtual NIC with no control queue, and a claim netdev reports
+    // honestly rather than papering over.
     set_promisc as fn(*u8, i64) as i64;
     priv        as *u8;
     next        as *NetDevice;
@@ -153,6 +158,7 @@ struct NetPort {
     tx_packets as i64;
     tx_errors  as i64;
     next_token as i64;
+    promisc    as i64;      // last value set through set_promisc
 }
 
 let is [4]NetPort as ports with mut;               // == NET_MAX_PORTS
@@ -217,6 +223,9 @@ fn register(dev as *NetDevice, hw as i64) as i64 {
     ports[pi].tx_packets = 0;
     ports[pi].tx_errors = 0;
     ports[pi].next_token = 0;
+    // Every driver here brings its receiver up promiscuous, because netd wants
+    // every frame; a driver that does otherwise sets this in its bind.
+    ports[pi].promisc = 1;
     ports[pi].in_use = 1;
     port_count = port_count + 1;
 
@@ -350,6 +359,21 @@ fn rx_pump(pi as i64, budget as i64) as i64 {
     let is i64 as got = call(dev.poll_rx, dev.priv, budget);
     lock.release_irq(&port_lk[pi], fl);
     return got;
+}
+
+// Turn promiscuous mode on or off for a port. E_NOSYS when the driver has no
+// knob, which is a true answer rather than a silent no-op: a caller that
+// needs the device to stop hearing its neighbours must find out that it
+// cannot, not believe that it did.
+fn set_promisc(priv as i64, on as i64) as i64 {
+    let is i64 as pi = net_port_of(priv);
+    if (pi < 0) { return abi.E_BADF; }
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    if (cast(i64, dev.set_promisc) == 0) { return abi.E_NOSYS; }
+    let is i64 as rc = call(dev.set_promisc, dev.priv, on);
+    if (rc < 0) { return abi.E_IO; }
+    ports[pi].promisc = on;
+    return abi.E_OK;
 }
 
 // A driver reporting that the CONTROLLER dropped frames — it ran out of
@@ -733,6 +757,61 @@ fn smoke_backpressure(pi as i64) as void {
     return;
 }
 
+// The reporting paths: link state, line rate, and the promiscuous knob.
+// None of these had ever executed — a driver that returns a plausible
+// constant looks identical to one that reads the register, right up until
+// somebody debugs a 100 Mb link for an afternoon.
+fn smoke_report(pi as i64) as void {
+    let is i64 as ko = net_acquire(ports[pi].hw);
+    if (ko == 0) { smoke_check(cast(*u8, "acquire (report)"), 16, 0, 1); return; }
+    let is i64 as priv = holder_of(ko);
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+
+    let is [16]i64 as inf;
+    smoke_check(cast(*u8, "net_info succeeds"), 17, port_info(priv, cast(*i64, &inf[0])), abi.E_OK);
+    smoke_check(cast(*u8, "mtu is 1500"), 11, inf[0], 1500);
+    smoke_check(cast(*u8, "frame_max is mtu+14"), 19, inf[1], 1514);
+    smoke_check(cast(*u8, "link is up"), 10, inf[2], 1);
+    smoke_check(cast(*u8, "broadcast flag set"), 18,
+                inf[5] & abi.NET_FLAG_BROADCAST, abi.NET_FLAG_BROADCAST);
+
+    // Speed: a driver that reads the register reports a real rate, one that
+    // cannot know reports 0. Both are answers; a made-up number is not.
+    if (cast(i64, dev.speed) != 0) {
+        // QEMU's e1000 negotiates gigabit. What matters is that it came from
+        // STATUS and not from a constant, so a value outside the three legal
+        // encodings fails here.
+        let is i64 as sp = inf[3];
+        let is i64 as legal with mut = 0;
+        if (sp == 10 || sp == 100 || sp == 1000) { legal = 1; }
+        smoke_check(cast(*u8, "speed is a real encoding"), 24, legal, 1);
+    } else {
+        smoke_check(cast(*u8, "no speed claimed when unknown"), 29, inf[3], 0);
+    }
+
+    // Promiscuous. A driver with the knob must actually move the bit; one
+    // without it must say E_NOSYS rather than pretend.
+    if (cast(i64, dev.set_promisc) != 0) {
+        smoke_check(cast(*u8, "starts promiscuous"), 18,
+                    inf[5] & abi.NET_FLAG_PROMISC, abi.NET_FLAG_PROMISC);
+        smoke_check(cast(*u8, "promisc off accepted"), 20, set_promisc(priv, 0), abi.E_OK);
+        port_info(priv, cast(*i64, &inf[0]));
+        smoke_check(cast(*u8, "and the flag cleared"), 20, inf[5] & abi.NET_FLAG_PROMISC, 0);
+        smoke_check(cast(*u8, "promisc back on"), 15, set_promisc(priv, 1), abi.E_OK);
+        port_info(priv, cast(*i64, &inf[0]));
+        smoke_check(cast(*u8, "and the flag returned"), 21,
+                    inf[5] & abi.NET_FLAG_PROMISC, abi.NET_FLAG_PROMISC);
+        // Leave it promiscuous: netd wants every frame, and the next smoke
+        // expects to receive one.
+    } else {
+        smoke_check(cast(*u8, "no knob says E_NOSYS"), 20, set_promisc(priv, 0), abi.E_NOSYS);
+        smoke_check(cast(*u8, "and reports permanently on"), 26,
+                    inf[5] & abi.NET_FLAG_PROMISC, abi.NET_FLAG_PROMISC);
+    }
+    kobject.ko_unref(ko);
+    return;
+}
+
 // Exclusivity: the second holder owns the port, the first goes quiet, and
 // closing the second hands it back. This is architecture.md §6 as a test.
 fn smoke_grab(pi as i64) as void {
@@ -791,6 +870,7 @@ fn smoke_thread() as void {
     // this catches was in only one of them.
     let is i64 as b with mut = 0;
     while (b < port_count) {
+        smoke_report(b);
         smoke_backpressure(b);
         b = b + 1;
     }
@@ -822,7 +902,7 @@ fn port_info(priv as i64, out as *i64) as i64 {
     // E_RANGE a programming error rather than a surprise.
     out[1] = mtu + 14;
     if (cast(i64, dev.link_up) != 0) { out[2] = call(dev.link_up, dev.priv); }
-    out[3] = 0;                                 // speed: no driver reports it yet
+    if (cast(i64, dev.speed) != 0) { out[3] = call(dev.speed, dev.priv); }
 
     let is [6]u8 as mac;
     let is i64 as z with mut = 0;
@@ -836,11 +916,12 @@ fn port_info(priv as i64, out as *i64) as i64 {
     }
     out[4] = packed;
 
-    // Both current drivers receive everything; set_promisc is null for them,
-    // which is the honest way to say "always on" rather than pretending the
-    // knob exists.
+    // A driver with no set_promisc cannot leave promiscuous mode, so the flag
+    // is permanently set for it; one that has the knob reports what the knob
+    // was last set to. Either way the bit means the same thing to a reader.
     out[5] = abi.NET_FLAG_BROADCAST;
     if (cast(i64, dev.set_promisc) == 0) { out[5] = out[5] | abi.NET_FLAG_PROMISC; }
+    else if (ports[pi].promisc != 0) { out[5] = out[5] | abi.NET_FLAG_PROMISC; }
 
     let is i64 as fl = lock.acquire_irq(&port_lk[pi]);
     out[6]  = ports[pi].rx_packets;
