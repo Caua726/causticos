@@ -1,0 +1,119 @@
+// pingt — the network, end to end, as a gate.
+//
+// nett proves the protocol libraries against a table of known packets, with no
+// hardware. This proves the other half, which no table can: that frames really
+// leave the machine, that something on the other side really answers, and that
+// what comes back is what was sent.
+//
+// It spawns the REAL ping binary rather than reimplementing its logic. A test
+// that reimplements what it tests can pass while the shipped program is
+// broken, and the two drift apart the moment one of them is fixed. So this
+// runs `ping -c N 10.0.2.2`, waits, and reads its exit status — which is
+// already the honest summary, since ping exits non-zero when nothing came
+// back.
+//
+// The gateway is QEMU's SLIRP at 10.0.2.2. It answers ARP and ICMP echo
+// synthetically and immediately, so a healthy run finishes in well under a
+// second and a failure is a real failure rather than a slow network.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+
+let is i64 as fails with mut = 0;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+fn wait_done(pid as i64) as i64 {
+    let is [1]i64 as st;
+    st[0] = 0;
+    let is i64 as r = sys.wait(pid, cast(*i64, &st[0]));
+    if (r < 0) { return r; }
+    return st[0];
+}
+
+// Run ping against `dst` from network port `port`, returning its exit status.
+// The child gets our stdout, so its output lands in the same log as ours —
+// what the round trip actually measured is worth seeing, not just whether it
+// happened.
+fn run_ping(img as i64, ilen as i64, port_str as *u8, dst as *u8, count as *u8) as i64 {
+    let is [12]i64 as av;
+    av[0] = cast(i64, "ping");  av[1] = 4;
+    av[2] = cast(i64, "-c");    av[3] = 2;
+    av[4] = cast(i64, count);   av[5] = prog.slen(count);
+    av[6] = cast(i64, "-i");    av[7] = 2;
+    av[8] = cast(i64, port_str); av[9] = prog.slen(port_str);
+    av[10] = cast(i64, dst);    av[11] = prog.slen(dst);
+    let is [2]i64 as fda;
+    fda[0] = 1; fda[1] = 1;                     // child fd 1 = our fd 1
+    let is i64 as pid = sys.spawn(cast(*u8, img), ilen, cast(*u8, &fda[0]), 1,
+                                  cast(*u8, &av[0]), 6);
+    if (pid < 0) { return pid; }
+    return wait_done(pid);
+}
+
+fn main() as i32 {
+    say("pingt: icmp round trip over real frames\n");
+
+    let is i64 as ilen with mut = 0;
+    let is i64 as img = fu.slurp("/ping.cse", &ilen);
+    if (ilen <= 0) {
+        say("pingt: /ping.cse not on disk\n");
+        return cast(i32, 1);
+    }
+
+    let is i64 as ports = sys.dev_count(sys.DEV_NET);
+    check(cast(*u8, "network ports present"), ports, 2);
+
+    // Both NICs. They are different drivers over different transports — the
+    // e1000's DMA rings and virtio's split queues — and a round trip that
+    // works on one proves nothing about the other.
+    check(cast(*u8, "e1000 reaches the gateway"),
+          run_ping(img, ilen, cast(*u8, "0"), cast(*u8, "10.0.2.2"), cast(*u8, "3")), 0);
+    check(cast(*u8, "virtio-net reaches the gateway"),
+          run_ping(img, ilen, cast(*u8, "1"), cast(*u8, "10.0.2.2"), cast(*u8, "3")), 0);
+
+    // The DNS server SLIRP runs. A second address proves the ARP cache is
+    // resolving rather than replaying one lucky answer.
+    check(cast(*u8, "reaches 10.0.2.3 too"),
+          run_ping(img, ilen, cast(*u8, "0"), cast(*u8, "10.0.2.3"), cast(*u8, "2")), 0);
+
+    // Nothing answers at .99. This must FAIL, and failing is the point: a
+    // ping that reports success for an address with nothing behind it is
+    // worse than no ping, and it is what happens when replies are matched
+    // loosely.
+    check(cast(*u8, "unused address times out"),
+          run_ping(img, ilen, cast(*u8, "0"), cast(*u8, "10.0.2.99"), cast(*u8, "1")), 1);
+
+    fu.unslurp(img, ilen);
+    if (fails == 0) { say("pingt: ALL PASS\n"); return cast(i32, 0); }
+    say("pingt: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

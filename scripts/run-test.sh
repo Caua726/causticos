@@ -52,9 +52,12 @@ if echo "$RAW" | grep -qE "panic:|EXCEPTION|#GP|#PF|kernel halted"; then
     echo "$RAW" | grep -E "panic:|EXCEPTION|#GP|#PF|kernel halted" | head -3
     exit 1
 fi
-if echo "$RAW" | grep -q "$PROG: ALL PASS"; then
+# Either verdict spelling counts: "nett: ALL PASS" and "kabi: PASS" both say
+# the same thing unambiguously, and a runner that dictates punctuation is a
+# runner that reports a passing test as broken.
+if echo "$RAW" | grep -qE "^$PROG: (ALL )?PASS"; then
     echo "=== $PROG: PASS ==="
     exit 0
 fi
-echo "=== $PROG: FAIL (no ALL PASS marker — timeout?) ==="
+echo "=== $PROG: FAIL (no PASS marker — timeout?) ==="
 exit 1

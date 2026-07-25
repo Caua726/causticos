@@ -1,0 +1,444 @@
+// ping — the first real round trip.
+//
+// Holds a network port itself rather than talking to a daemon, because no
+// daemon exists yet and because that is a legitimate way to use the machine:
+// DEV_NET is a preemptible exclusive device, so a program may take it, use it,
+// and hand it back. When netd lands, ping keeps working exactly like this and
+// gains the option of going through it instead.
+//
+// Everything below the ICMP echo is the library code nett already proves
+// without a network. What this adds is the part that cannot be proved that
+// way: that real frames go out, real frames come back, and the two match.
+//
+// The address is static. DHCP is a later phase, and QEMU's SLIRP hands out
+// 10.0.2.15/24 with a gateway at 10.0.2.2, so those are the defaults — stated
+// here rather than discovered, and overridable, which is honest about what
+// this does and does not yet do.
+//
+//   ping 10.0.2.2              — four echoes
+//   ping -c 10 10.0.2.2        — ten
+//   ping -i 1 10.0.2.2         — from port index 1 (the second NIC)
+//   ping -s 10.0.2.42 10.0.2.3 — a different source address
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netbuf/netbuf.cst" as nb;
+use "../lib/neteth/neteth.cst" as eth;
+use "../lib/netarp/netarp.cst" as arp;
+use "../lib/netip/netip.cst" as ip;
+
+let is i64 as DEFAULT_SRC = 0x0A00020F;     // 10.0.2.15
+let is i64 as DEFAULT_GW  = 0x0A000202;     // 10.0.2.2
+let is i64 as DEFAULT_MASK_BITS = 24;
+
+let is i64 as ARP_WAIT_NS  = 2000000000;
+let is i64 as ECHO_WAIT_NS = 2000000000;
+let is i64 as GAP_NS       = 1000000000;
+
+let is i64 as net_fd with mut = 0 - 1;
+let is [6]u8 as our_mac;
+let is i64 as our_ip with mut = 0;
+let is i64 as our_mask with mut = 0;
+let is i64 as gw_ip with mut = 0;
+let is i64 as frame_max with mut = 1514;
+
+let is arp.Cache as cache;
+let is nb.Pbuf as tx;
+let is [2048]u8 as rxbuf;
+let is [64]u8 as scratch;
+
+// Stats
+let is i64 as sent with mut = 0;
+let is i64 as recvd with mut = 0;
+let is i64 as rtt_min with mut = 0;
+let is i64 as rtt_max with mut = 0;
+let is i64 as rtt_sum with mut = 0;
+
+fn print_ip(v as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (i > 0) { prog.outs("."); }
+        prog.out_num(ip.addr_octet(v, i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Milliseconds with three decimals, from nanoseconds. Integer arithmetic
+// throughout — a round trip on a virtual link is tens of microseconds, and
+// printing it as "0 ms" would hide exactly the number being measured.
+fn print_ms(ns as i64) as void {
+    let is i64 as us = ns / 1000;
+    prog.out_num(us / 1000);
+    prog.outs(".");
+    let is i64 as frac = us % 1000;
+    if (frac < 100) { prog.outs("0"); }
+    if (frac < 10) { prog.outs("0"); }
+    prog.out_num(frac);
+    prog.outs(" ms");
+    return;
+}
+
+// --- transmit ---
+
+fn send_frame(f as *u8, n as i64) as i64 {
+    return sys.write(net_fd, f, n);
+}
+
+// Frame and send whatever is in `tx` to a link-layer destination.
+fn send_to_mac(dst_mac as *u8, etype as i64) as i64 {
+    eth.push_header(&tx, dst_mac, cast(*u8, &our_mac[0]), etype);
+    if (tx.err != 0) { return 0 - 1; }
+    return send_frame(nb.ptr(&tx), nb.len(&tx));
+}
+
+fn send_arp_request(target as i64) as i64 {
+    nb.init(&tx);
+    let is *u8 as body = nb.append(&tx, arp.PKT_LEN);
+    if (cast(i64, body) == 0) { return 0 - 1; }
+    arp.build(body, arp.OP_REQUEST, cast(*u8, &our_mac[0]), our_ip,
+              cast(*u8, 0), target);
+    return send_to_mac(eth.broadcast(), eth.TYPE_ARP);
+}
+
+// --- receive ---
+
+// One frame, or 0 if the deadline passed. Uses poll so the wait costs nothing
+// while nothing is arriving.
+fn recv_frame(deadline as i64) as i64 {
+    while (1 == 1) {
+        let is i64 as now = sys.time_ns();
+        if (now >= deadline) { return 0; }
+        let is [3]i64 as pe;
+        pe[0] = net_fd;
+        pe[1] = sys.POLL_READABLE;
+        pe[2] = 0;
+        sys.poll(cast(*i64, &pe[0]), 1, deadline - now);
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            let is i64 as n = sys.read(net_fd, cast(*u8, &rxbuf[0]), 2048);
+            if (n > 0) { return n; }
+            // E_RANGE means a frame arrived that did not fit. It cannot with a
+            // 2 KB buffer against a 1514-byte frame_max, but reporting rather
+            // than looping silently is the difference between a bug you see
+            // and one you do not.
+            if (n < 0 && n != sys.E_AGAIN) { return n; }
+        }
+    }
+    return 0;
+}
+
+// Feed a received frame to the ARP layer. Answers requests for our address —
+// a host that only asks and never answers is invisible to everyone else —
+// and records what replies teach us.
+fn handle_arp(a as *u8, alen as i64, from_mac as *u8) as void {
+    if (arp.is_valid(a, alen) == 0) { return; }
+    let is i64 as sip = arp.sender_ip_of(a);
+    let is i64 as top = arp.target_ip_of(a);
+    let is i64 as op = arp.op_of(a);
+
+    // Learn from anything that names itself, solicited only if it is a reply
+    // addressed to us — an unsolicited announcement proves the sender exists,
+    // not that it can hear us.
+    let is i64 as solicited with mut = 0;
+    if (op == arp.OP_REPLY && top == our_ip) { solicited = 1; }
+    if (sip != 0) {
+        arp.learn(&cache, sip, arp.sender_mac_of(a), solicited, sys.time_ns());
+    }
+
+    if (op == arp.OP_REQUEST && top == our_ip && our_ip != 0) {
+        nb.init(&tx);
+        let is *u8 as body = nb.append(&tx, arp.PKT_LEN);
+        if (cast(i64, body) == 0) { return; }
+        arp.build(body, arp.OP_REPLY, cast(*u8, &our_mac[0]), our_ip,
+                  arp.sender_mac_of(a), sip);
+        send_to_mac(from_mac, eth.TYPE_ARP);
+    }
+    return;
+}
+
+// Resolve a next-hop address, answering ARP traffic while waiting. Returns 1
+// with the address in out_mac, 0 on timeout.
+fn resolve(target as i64, out_mac as *u8) as i64 {
+    let is i64 as now = sys.time_ns();
+    if (arp.lookup(&cache, target, out_mac, now) == arp.LOOKUP_HIT) { return 1; }
+
+    arp.start_resolve(&cache, target, cast(*u8, 0), 0, now);
+    let is i64 as srq = send_arp_request(target);
+    if (srq < 0) {
+        prog.outs("ping: ARP request failed (");
+        prog.out_num(srq);
+        prog.outs(")\n");
+        return 0;
+    }
+
+    let is i64 as deadline = now + ARP_WAIT_NS;
+    let is i64 as next_retry with mut = now + arp.RETRY_NS;
+    while (sys.time_ns() < deadline) {
+        let is i64 as n = recv_frame(next_retry);
+        if (n >= 14) {
+            let is *u8 as f = cast(*u8, &rxbuf[0]);
+            if (eth.is_for_us(f, cast(*u8, &our_mac[0])) == 1
+                && eth.ethertype(f) == eth.TYPE_ARP) {
+                handle_arp(cast(*u8, cast(i64, f) + 14), n - 14, eth.src(f));
+            }
+        }
+        if (arp.lookup(&cache, target, out_mac, sys.time_ns()) == arp.LOOKUP_HIT) {
+            return 1;
+        }
+        if (sys.time_ns() >= next_retry) {
+            send_arp_request(target);
+            next_retry = sys.time_ns() + arp.RETRY_NS;
+        }
+    }
+    return 0;
+}
+
+// One echo. Returns the round trip in ns, 0 on timeout, negative on error.
+fn one_ping(dst as i64, dst_mac as *u8, id as i64, seq as i64, payload_len as i64) as i64 {
+    nb.init(&tx);
+    let is i64 as total = ip.ICMP_HDR_LEN + payload_len;
+    let is *u8 as body = nb.append(&tx, total);
+    if (cast(i64, body) == 0) { return 0 - 1; }
+
+    // A recognisable payload: the classic ping fill, so a capture shows at a
+    // glance whether the bytes came back unchanged.
+    let is i64 as i with mut = 0;
+    while (i < payload_len) { scratch[i] = cast(u8, 0x61 + (i % 23)); i = i + 1; }
+    ip.icmp_build(body, ip.ICMP_ECHO_REQUEST, 0, id, seq,
+                  cast(*u8, &scratch[0]), payload_len);
+    ip.push_header(&tx, our_ip, dst, ip.PROTO_ICMP, seq);
+
+    let is i64 as t0 = sys.time_ns();
+    if (send_to_mac(dst_mac, eth.TYPE_IPV4) < 0) { return 0 - 1; }
+    sent = sent + 1;
+
+    let is i64 as deadline = t0 + ECHO_WAIT_NS;
+    while (sys.time_ns() < deadline) {
+        let is i64 as n = recv_frame(deadline);
+        if (n < 14) { return 0; }
+        let is *u8 as f = cast(*u8, &rxbuf[0]);
+        if (eth.is_for_us(f, cast(*u8, &our_mac[0])) == 0) { continue; }
+        let is i64 as et = eth.ethertype(f);
+        if (et == eth.TYPE_ARP) {
+            handle_arp(cast(*u8, cast(i64, f) + 14), n - 14, eth.src(f));
+            continue;
+        }
+        if (et != eth.TYPE_IPV4) { continue; }
+
+        let is *u8 as h = cast(*u8, cast(i64, f) + 14);
+        if (ip.validate(h, n - 14) != ip.OK) { continue; }
+        if (ip.protocol(h) != ip.PROTO_ICMP) { continue; }
+        if (ip.src_addr(h) != dst) { continue; }
+        // A fragmented echo reply is possible in principle; this stack does
+        // not reassemble yet, so skip rather than misread the first fragment
+        // as a whole message.
+        if (ip.is_fragment(h) == 1) { continue; }
+
+        let is i64 as hl = ip.ihl(h);
+        let is i64 as icmp_len = ip.total_len(h) - hl;
+        let is *u8 as m = cast(*u8, cast(i64, h) + hl);
+        if (ip.icmp_verify(m, icmp_len) == 0) { continue; }
+        if (ip.icmp_type(m) != ip.ICMP_ECHO_REPLY) { continue; }
+        // Match on both id and seq: another ping on the same host would
+        // otherwise have its replies counted here.
+        if (ip.icmp_id(m) != id) { continue; }
+        if (ip.icmp_seq(m) != seq) { continue; }
+
+        let is i64 as rtt = sys.time_ns() - t0;
+        prog.out_num(icmp_len);
+        prog.outs(" bytes from ");
+        print_ip(dst);
+        prog.outs(": icmp_seq=");
+        prog.out_num(seq);
+        prog.outs(" ttl=");
+        prog.out_num(ip.ttl(h));
+        prog.outs(" time=");
+        print_ms(rtt);
+        prog.outs("\n");
+        return rtt;
+    }
+    return 0;
+}
+
+// --- argument parsing ---
+
+fn is_digit(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+fn parse_num(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) {
+        if (is_digit(cast(i64, s[i])) == 0) { return 0 - 1; }
+        v = v * 10 + (cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    if (i == 0) { return 0 - 1; }
+    return v;
+}
+
+// Dotted quad to host-order address, or -1. Rejects anything malformed rather
+// than accepting a partial parse: "10.0.2" silently becoming 10.0.2.0 is the
+// kind of helpfulness that hides a typo.
+fn parse_ip(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as octet with mut = 0;
+    let is i64 as digits with mut = 0;
+    let is i64 as parts with mut = 0;
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c == 0 || c == 46) {                      // NUL or '.'
+            if (digits == 0) { return 0 - 1; }
+            if (octet > 255) { return 0 - 1; }
+            v = (v << 8) | octet;
+            parts = parts + 1;
+            octet = 0;
+            digits = 0;
+            if (c == 0) {
+                if (parts != 4) { return 0 - 1; }
+                return v;
+            }
+            if (parts >= 4) { return 0 - 1; }
+        } else if (is_digit(c) == 1) {
+            octet = octet * 10 + (c - 48);
+            digits = digits + 1;
+            if (digits > 3) { return 0 - 1; }
+        } else {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn usage() as void {
+    prog.outs("usage: ping [-c count] [-i port] [-s src] [-g gateway] <dest>\n");
+    return;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as count with mut = 4;
+    let is i64 as port with mut = 0;
+    let is i64 as dst with mut = 0;
+    our_ip = DEFAULT_SRC;
+    gw_ip = DEFAULT_GW;
+    our_mask = ip.prefix_mask(DEFAULT_MASK_BITS);
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as a = prog.arg(argv, ai);
+        if (a[0] == cast(u8, 45)) {                   // '-'
+            if (ai + 1 >= argc) { usage(); return cast(i32, 1); }
+            let is *u8 as v = prog.arg(argv, ai + 1);
+            if (a[1] == cast(u8, 99)) { count = parse_num(v); }        // -c
+            else if (a[1] == cast(u8, 105)) { port = parse_num(v); }   // -i
+            else if (a[1] == cast(u8, 115)) { our_ip = parse_ip(v); }  // -s
+            else if (a[1] == cast(u8, 103)) { gw_ip = parse_ip(v); }   // -g
+            else { usage(); return cast(i32, 1); }
+            ai = ai + 2;
+        } else {
+            dst = parse_ip(a);
+            ai = ai + 1;
+        }
+    }
+    if (dst <= 0 || count <= 0 || port < 0 || our_ip <= 0 || gw_ip <= 0) {
+        usage();
+        return cast(i32, 1);
+    }
+
+    net_fd = sys.dev_open(sys.DEV_NET, port, 0);
+    if (net_fd < 0) {
+        prog.outs("ping: cannot open network port ");
+        prog.out_num(port);
+        prog.outs("\n");
+        return cast(i32, 1);
+    }
+
+    let is [16]i64 as inf;
+    if (sys.net_info(net_fd, cast(*i64, &inf[0])) != 0) {
+        prog.outs("ping: net_info failed\n");
+        sys.close(net_fd);
+        return cast(i32, 1);
+    }
+    let is i64 as i with mut = 0;
+    while (i < 6) { our_mac[i] = cast(u8, sys.net_mac_byte(inf[4], i)); i = i + 1; }
+    frame_max = inf[1];
+    if (inf[2] == 0) {
+        prog.outs("ping: link is down\n");
+        sys.close(net_fd);
+        return cast(i32, 1);
+    }
+
+    arp.cache_init(&cache);
+
+    // Where the first hop is: the destination itself if it shares our link,
+    // otherwise the gateway.
+    let is i64 as hop = ip.next_hop(dst, our_ip, our_mask, gw_ip);
+    if (hop == 0) {
+        prog.outs("ping: no route to host\n");
+        sys.close(net_fd);
+        return cast(i32, 1);
+    }
+
+    prog.outs("PING ");
+    print_ip(dst);
+    prog.outs(" from ");
+    print_ip(our_ip);
+    prog.outs(" via ");
+    print_ip(hop);
+    prog.outs("\n");
+
+    let is [6]u8 as hop_mac;
+    if (resolve(hop, cast(*u8, &hop_mac[0])) == 0) {
+        prog.outs("ping: no ARP reply from ");
+        print_ip(hop);
+        prog.outs("\n");
+        sys.close(net_fd);
+        return cast(i32, 1);
+    }
+
+    // An id that is ours rather than a constant, so two pings running at once
+    // do not read each other's replies.
+    let is i64 as id with mut = sys.random_u64() & 0xFFFF;
+    if (id == 0) { id = 1; }
+
+    let is i64 as seq with mut = 1;
+    while (seq <= count) {
+        let is i64 as rtt = one_ping(dst, cast(*u8, &hop_mac[0]), id, seq, 56);
+        if (rtt > 0) {
+            recvd = recvd + 1;
+            rtt_sum = rtt_sum + rtt;
+            if (rtt_min == 0 || rtt < rtt_min) { rtt_min = rtt; }
+            if (rtt > rtt_max) { rtt_max = rtt; }
+        } else if (rtt == 0) {
+            prog.outs("Request timeout for icmp_seq=");
+            prog.out_num(seq);
+            prog.outs("\n");
+        }
+        if (seq < count) { sys.sleep_ns(GAP_NS); }
+        seq = seq + 1;
+    }
+
+    prog.outs("\n--- ");
+    print_ip(dst);
+    prog.outs(" ping statistics ---\n");
+    prog.out_num(sent);
+    prog.outs(" transmitted, ");
+    prog.out_num(recvd);
+    prog.outs(" received, ");
+    prog.out_num(((sent - recvd) * 100) / sent);
+    prog.outs("% loss\n");
+    if (recvd > 0) {
+        prog.outs("rtt min/avg/max = ");
+        print_ms(rtt_min); prog.outs(" / ");
+        print_ms(rtt_sum / recvd); prog.outs(" / ");
+        print_ms(rtt_max); prog.outs("\n");
+    }
+
+    sys.close(net_fd);
+    if (recvd == 0) { return cast(i32, 1); }
+    return cast(i32, 0);
+}

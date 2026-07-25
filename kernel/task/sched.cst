@@ -1507,7 +1507,26 @@ fn kernel_cpu_ns() as i64 {
     return sum;
 }
 
-fn poll_park(deadline as i64) as void {
+// Bumped by every poll_wake. A poller reads it BEFORE asking whether its fds
+// are ready and hands the value back to poll_park, which refuses to sleep if
+// the count moved in between.
+//
+// Without it there is a window with a name: a thread sweeps its fds, finds
+// nothing, and is still RUNNING when the interrupt arrives. poll_wake looks
+// for parked threads, sees none, and the wakeup is lost — the thread then
+// parks and sleeps out the full POLL_PARK_CAP_NS. That cap exists precisely
+// as the backstop for this, so nothing hangs, but 50 ms of latency on a link
+// whose round trip is 0.1 ms is not a backstop anyone should be hitting: ping
+// measured 52 ms on three runs in five, and TCP would pay it per round trip.
+let is i64 as poll_seq with mut = 0;
+
+fn poll_seq_read() as i64 {
+    return lock.load_word(&poll_seq);
+}
+
+// `seq` is what poll_seq_read returned before the caller checked readiness.
+// Passing 0 opts out of the check (nothing to have missed).
+fn poll_park_seq(deadline as i64, seq as i64) as void {
     let is i64 as tid = current_tid();
     if (tid < 0) { return; }
     let is i64 as now = timer.current_time_ns();
@@ -1515,6 +1534,13 @@ fn poll_park(deadline as i64) as void {
     if (deadline > 0 && deadline < wake_at) { wake_at = deadline; }
     let is i64 as cpu = thr_home_cpu(tid);
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    // Under the lock, with interrupts off: an event that arrived any time
+    // since the caller's check has already moved the counter, so going to
+    // sleep now would be sleeping through news we have already been told.
+    if (seq != 0 && lock.load_word(&poll_seq) != seq) {
+        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        return;
+    }
     if (thr_state(tid) != THREAD_RUNNING) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
@@ -1529,6 +1555,11 @@ fn poll_park(deadline as i64) as void {
     thr_set(tid, THR_POLL_PARKED, 0);
 }
 
+// Legacy shape, for callers with no readiness check to have raced.
+fn poll_park(deadline as i64) as void {
+    poll_park_seq(deadline, 0);
+}
+
 // poll_wake — something happened that a poll could be waiting on: bytes into a
 // channel, an event posted, a device ring filled, an endpoint closed. Wakes
 // every parked poller; they re-ask and go back to sleep if it was not theirs.
@@ -1539,6 +1570,10 @@ fn poll_park(deadline as i64) as void {
 // with acquire_irq, and a cpu holding that lock runs with interrupts off, so
 // the handler cannot have preempted a holder on this cpu.
 fn poll_wake() as void {
+    // Bump FIRST, wake second. A thread between its readiness check and its
+    // park is not findable by the sweep below — it is still RUNNING — and the
+    // counter is what it notices instead of sleeping through this.
+    lock.atomic_add(&poll_seq, 1);
     let is i64 as ntid = next_tid;
     let is i64 as tid with mut = 0;
     while (tid < ntid) {
