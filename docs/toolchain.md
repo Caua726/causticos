@@ -68,16 +68,16 @@ the converged compiler, not to trust a host cross-build.
 
 ## Build and seed
 
-- **Kernel.** `scripts/run.sh` builds `build/causticos.iso` (Limine + kernel).
-- **Userspace.** `userspace/build.sh` compiles every program in `PROGS` to
-  `userspace/build/<name>.cse`. No `--stack-size`: the compiler grows recursive
-  programs' stacks on demand (dynamic-stack), and non-recursive ones get an
-  exact computed stack.
-- **Disk.** `run-wm.sh` makes a FAT32 image, installs the window manager as
-  `/init.cse`, adds the clients and tools, and — if a converged
-  `build/caustic.cse` exists — the compiler plus its whole source tree, so the
-  booted system comes with a working compiler. `HEADLESS=1` swaps the display
-  for a QEMU monitor socket (screendump/sendkey automation).
+Building and booting is [docs/build-and-run.md](build-and-run.md) — one command,
+`caustic-mk run build`. What matters here is the compiler-facing half:
+
+- **No `--stack-size`.** The compiler grows recursive programs' stacks on demand
+  (dynamic-stack), and non-recursive ones get an exact computed stack.
+- **The kernel is a staged target.** Its Caustic source compiles to one object,
+  three hand-written `.s` sources assemble to three more, and `caustic-ld` links
+  all four with `--strip`. The one-shot compile path links exactly one object and
+  rejects linker-only flags, so this shape is what `asm` + `ldflags` in the
+  `Causticfile` exist for.
 
 ## Running the toolchain on causticos
 
@@ -98,7 +98,7 @@ caustic-ld --target=caustic-x86_64 hello.cst.s.o -o /hello.cse
 
 This staged path is proven on-device: `caustic-as` and `caustic-ld` run as
 ring-3 programs, the object and the executable land on the FAT32 disk, and the
-resulting `.cse` runs. Build the standalone tools with `scripts/build-tools.sh`
+resulting `.cse` runs. Build the standalone tools with `caustic-mk build caustic-as-cse` and `caustic-mk build caustic-ld-cse`
 (the canonical build is on the VM, with the converged compiler — see above).
 
 Paths are absolute — causticos has no cwd. A program's "own path" is just the
@@ -106,18 +106,25 @@ argv[0] its spawner chose; the kernel never resolves it.
 
 ## Adding a userspace program
 
-1. Write `userspace/<name>.cst`. The shape is tiny: `use` the `prog` and `sys`
-   facades, `fn main(argc, argv)`, write to fd 1, read argv with `prog.arg`.
-   File and text tools share `userspace/futil.cst` (a buffered reader, a
-   whole-file `slurp`, and small parse helpers).
-2. Add `<name>` to `PROGS` in `userspace/build.sh`.
-3. Seed it onto the disk (the loop in `run-wm.sh`).
-4. Build and boot: `./run-wm.sh` (or `HEADLESS=1 ./run-wm.sh` for automation).
+1. Write `userspace/<category>/<name>.cst`. The shape is tiny: `use` the `prog`
+   and `sys` facades, `fn main(argc, argv)`, write to fd 1, read argv with
+   `prog.arg`. File and text tools share `userspace/lib/futil.cst` (a buffered
+   reader, a whole-file `slurp`, and small parse helpers).
+2. Add a `target` block to `userspace/Causticfile` naming its `src` and `out`.
+   That file is the build — `caustic-mk build all` compiles every target in it.
+3. Add a `bin <name>` line to whichever `profiles/*.profile` should ship it.
+4. `caustic-mk run build && caustic-mk run run`.
+
+There is no third list to update. A `bin` naming something that is not a target
+fails the build by name, and `caustic-mk run doctor` checks every profile against
+the manifest before you get that far.
 
 ## Validating
 
-`scripts/verify.sh` reuses the ISO, copies the disk, and boots `-smp 1/2/4 × 20`,
-killing QEMU on a success marker — the whole sweep in ~a minute, the standing
-gate for kernel changes. The strongest check for anything touching the toolchain
-is the four-round bootstrap above: if it still converges byte-identically, the
-OS still builds itself.
+`caustic-mk run verify` boots the shipped kernel `1/2/4 cpus x 20 runs` through
+two gates — the live ISO with no disk, and a scratch disk with the FAT32 write
+suite — and reports which markers were missing when one fails. It works entirely
+under `build/verify/`, so it is safe to run while a VM holds `build/disk.img`.
+
+The strongest check for anything touching the toolchain is still the four-round
+bootstrap above: if it converges byte-identically, the OS still builds itself.

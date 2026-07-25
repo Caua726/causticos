@@ -18,45 +18,60 @@ Around 21k lines of Caustic across ~40 modules. x86_64 only.
 
 ## What works
 
-- **Boot** — Limine, long mode, higher-half kernel at `0xFFFFFFFF80000000`.
+- **Boot** — Limine, long mode, higher-half kernel at `0xFFFFFFFF80000000`. The ISO carries its own root volume, so it boots a complete desktop with no disk attached.
 - **SMP** — AP bring-up, per-CPU state, ticket locks. Validated at `-smp 1/2/4`.
-- **Memory** — buddy physical allocator, slab/`kmalloc` heap, 4-level paging, per-address-space VMA and file-descriptor tables.
+- **Memory** — buddy physical allocator, binned heap, 4-level paging, a single kernel-VA mapper, strict reserve+commit (no demand paging), per-address-space VMA and file-descriptor tables.
 - **Scheduler** — EEVDF across QoS bands plus a deadline class (EDF + CBS), preemptive, backed by red-black trees.
-- **Time** — PIT, LAPIC timer (calibrated against the HPET), HPET nanosecond clock. ACPI table discovery (RSDP/XSDT/MADT/MCFG/HPET) and IOAPIC routing.
-- **Drivers** — a declarative framework where devices are described in `.cdvrspec` files, over PCI, with shared-IRQ chaining.
-- **Storage** — AHCI (SATA), a FAT32 implementation (read, write, create, unlink, rename, mkdir), and a POSIX-shaped VFS on top.
-- **Network** — an e1000 NIC driver: TX/RX rings, interrupts, ARP.
-- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, a small v0 syscall ABI, and loaders for both ELF64 and CSE. It loads a real toolchain-built `.cse` and runs it to completion.
+- **Time** — PIT, LAPIC timer (calibrated against the HPET), HPET nanosecond clock, RTC wall clock. ACPI discovery (RSDP/XSDT/MADT/MCFG/HPET) and IOAPIC routing.
+- **Drivers** — a declarative framework where devices are described in `.cdvrspec` files, over PCI, with shared-IRQ chaining. PS/2 keyboard and mouse, virtio-tablet, e1000 and virtio-net.
+- **Storage** — AHCI (SATA) and a RAM-backed live root, behind one block-device registry; a FAT32 implementation (read, write, create, unlink, rename, mkdir) and a POSIX-shaped VFS on top.
+- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, process spawn with fd handoff, channels, shared segments, eventfds, surfaces. 75 programs: a shell, ~45 coreutils, monitors (`ps`, `top`, `btop`, `htop`, `df`, `free`), editors (`vic`, `pager`, `hexedit`).
+- **Desktop** — a compositor that owns the framebuffer and input, a window manager with tags, layouts and a config file, a terminal emulator, and a launcher.
+- **Self-hosting** — the Caustic compiler compiles itself *on* causticos, four rounds, byte-identical.
 
 ## What's not there yet
 
-- The syscall ABI is 7 calls: kernel info, monotonic time, sleep, exit, getpid, yield, write-to-console. There's no file I/O, `mmap`, or process spawning from userspace — fd-based read/write, user `mmap`, and `spawn` arrive with the capability layer.
-- No IPC, no signals.
-- The NIC driver exists, but there is no TCP/IP stack.
+- The NIC drivers exist, but there is no TCP/IP stack.
+- No installer: the live system is volatile by design, and `--persist` is how you get a persistent root.
+- One FAT32 volume at a time — the driver keeps its scratch buffers and FAT cache in module globals, so a second concurrent mount is not yet safe.
 - No ASLR, no KPTI (single-trust for now). x86_64 only.
 
 ## Requirements
 
-The Caustic toolchain (`caustic`, `caustic-as`, `caustic-ld`) on your `PATH`, plus:
+The Caustic toolchain (`caustic`, `caustic-as`, `caustic-ld`, `caustic-mk`) on your `PATH`, plus:
 
 - [Limine](https://github.com/limine-bootloader/limine), installed under `/usr/share/limine`
 - `xorriso` and `qemu-system-x86_64`
-- `mkfs.fat`, `qemu-img`, `python3` — only to seed the test FAT32 disk
+- `python3` 3.8+
+
+`caustic-mk run doctor` checks all of it and prints a fix for anything missing.
 
 ## Build and run
 
 ```sh
-bash scripts/run.sh            # compile, assemble, link, build the ISO, seed a disk, boot QEMU
-bash scripts/run.sh -smp 4     # trailing arguments pass straight through to QEMU
+caustic-mk run doctor     # check the prerequisites
+caustic-mk run build      # kernel + userspace + a live ISO
+caustic-mk run run        # boot it
 ```
 
-The serial console is wired to stdout. To run many boots without watching each one — `verify.sh` reuses the ISO, reseeds the disk per run, and kills QEMU on the success marker:
+That is the whole loop. `caustic-mk run run` boots **with no disk attached** — the root volume travels inside the ISO as a sparse container the kernel expands into RAM. Write to it freely; it is volatile, and the boot says so.
 
 ```sh
-bash scripts/verify.sh 4 20    # -smp 4, 20 runs
+caustic-mk run run -- --headless          # serial only, no window
+caustic-mk run run -- --smp 4 -m 1G       # more cpus, more memory
+caustic-mk run build -- --profile shell   # a shell instead of the desktop
+caustic-mk run run -- --persist           # attach a disk and boot from it instead
+caustic-mk run profiles                   # what a profile actually ships
+caustic-mk run verify                     # the regression sweep, both gates
 ```
 
-> The kernel must be linked with `--strip`, or Limine page-faults it in early boot (it reads embedded section headers when they're present). `scripts/run.sh` does this; the `caustic-mk` / `Causticfile` path does not, so use the script.
+Writing the ISO to a USB stick gives you the same system on real hardware, BIOS or UEFI, with no other storage:
+
+```sh
+caustic-mk run usb -- /dev/sdX
+```
+
+[docs/build-and-run.md](docs/build-and-run.md) covers every command and flag, the profile format, and the on-disk layout of the ISO.
 
 ## Layout
 
@@ -72,7 +87,9 @@ kernel/
   syscall, syscall_entry.s, syshandlers, abi             syscall entry, dispatch, ABI
   userspace, elf, cse, process, kbd                      ring-3 entry, ELF/CSE loaders
 font/font8x8.cst                                         8x8 bitmap font
-scripts/                                                 run.sh, verify.sh, FAT32 fixtures
+  ramvol, cmdline                                        live root, kernel command line
+scripts/                                                 build helpers (FAT32, CSVI, ISO, QEMU)
+profiles/                                                what each root image ships
 docs/                                                    overview, executables, CSE_FORMAT spec
 ```
 

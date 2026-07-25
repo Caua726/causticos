@@ -233,8 +233,12 @@ userspace programs.
   loud — never a silent hang) and runs it in ring 3. `init` is an ordinary file on the
   disk, not embedded: drop the terminal in as `/init.cse` and it launches, no kernel
   change. The terminal then `dev_open`s the surface + keyboard and spawns the shell with
-  a console channel. A fullscreen app may run with no terminal at all. (A stub `/init.cse`
-  proves the handoff today — it writes a ring-3 serial marker.)
+  a console channel. A fullscreen app may run with no terminal at all.
+
+  `/init.cse` is the compositor today, loaded from the root volume like any other
+  file. The root itself is a block device the kernel builds from a bootloader
+  module when one is present (mechanism); *which* programs are on it is a build
+  profile (policy). Nothing about "init" is special-cased in the kernel.
 
 Contrast with Unix: the Unix TTY subsystem (line discipline, termios, sessions, job
 control, the controlling terminal) is a large *intrinsic kernel* thing. causticos

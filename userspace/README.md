@@ -19,8 +19,9 @@ from the **sibling Caustic compiler repo** (`../../Caustic/std/…`) — that st
 the compiler's, entangled with its portable `io`/`os` facades, so it stays there.
 
 ```sh
-./build.sh                 # -> build/<name>.cse  (init.cse = the shell)
-CAUSTIC_DIR=/path/to/Caustic ./build.sh    # if Caustic isn't the sibling dir
+caustic-mk build all       # -> build/<name>.cse, every target in ./Causticfile
+caustic-mk build wterm     # just one
+CAUSTIC_DIR=/path/to/Caustic caustic-mk build all   # if Caustic isn't the sibling dir
 ```
 
-Then boot it: `../run-shell.sh` (needs `build/causticos.iso` from `scripts/run.sh`).
+Then boot it: `caustic-mk run build -- --profile shell && caustic-mk run run` from the repository root.
