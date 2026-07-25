@@ -89,6 +89,19 @@ leaf_ext "DNS:ec.causticos" > ecleaf.ext
 q openssl x509 -req -in ecleaf.csr -CA ecroot.pem -CAkey ecroot.key -out ecleaf.pem \
     -days 800 -extfile ecleaf.ext -sha256 -set_serial 10
 
+# ---- The certificate the local TLS server presents ----
+# SLIRP shows the host to the guest as 10.0.2.2, so the guest asks for an
+# ADDRESS and not a name. RFC 6125 §6.4 says an address must match an
+# iPAddress SAN — a dNSName that happens to read "10.0.2.2" is not a
+# certificate for that address — so the SAN carries both kinds and the guest
+# picks the right one.
+q openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj "/CN=causticos test server"
+leaf_ext "IP:10.0.2.2,DNS:localhost" > srv.ext
+q openssl x509 -req -in srv.csr -CA int.pem -CAkey int.key -out srv.pem \
+    -days 800 -extfile srv.ext -sha256 -set_serial 11
+# The server sends leaf + intermediate; the root is what the guest already has.
+cat srv.pem int.pem > srvchain.pem
+
 # ---- DER for the guest, PEM for the trust store ----
 for n in root int leaf wild expired future rogue under notca ecroot ecleaf; do
     openssl x509 -in "$n.pem" -outform DER -out "$n.der" 2>/dev/null

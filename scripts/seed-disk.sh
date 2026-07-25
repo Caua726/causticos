@@ -62,6 +62,16 @@ else
     INITNAME="shell (type 'btop', 'ls', 'help' ...)"
 fi
 for p in $PROGS; do addf "$p.cse" "$p.cse"; done
+
+# The trust store. https is refused outright without it, which is the right
+# answer: a client that cannot check a certificate and connects anyway is worse
+# than plain http, because plain http does not claim to be secure. CA_PEM lets
+# a test seed its own anchors instead of the machine's.
+CA_PEM="${CA_PEM:-/etc/ssl/certs/ca-certificates.crt}"
+if [ -f "$CA_PEM" ]; then
+    python3 scripts/fat32_add_file.py build/disk.img mkdir etc >/dev/null 2>&1 || true
+    python3 scripts/fat32_add_file.py build/disk.img addfilebin etc/ca.pem "$CA_PEM" >/dev/null
+fi
 python3 scripts/fat32_add_file.py build/disk.img addfile hello.txt \
     "ola do CausticOS! este arquivo veio do disco FAT32 via cat." >/dev/null
 echo "seeded build/disk.img -> /init = $INITNAME"

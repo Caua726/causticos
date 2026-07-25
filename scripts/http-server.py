@@ -15,18 +15,27 @@ so the guest can verify what it received without the file having to be shipped
 to it. A checksum would prove the bytes are consistent; this proves they are
 the RIGHT bytes, in the right order, with none missing from the middle.
 
-    scripts/http-server.py [port] [seconds]
+    scripts/http-server.py [port] [seconds] [certchain.pem keyfile.pem]
+
+With the last two arguments it speaks TLS 1.3 instead, using OpenSSL's server
+side — which is the point of testing against it. Two implementations that agree
+with each other prove they agree with each other; a handshake against OpenSSL
+proves the key schedule, the transcript and the record layer are what the RFC
+says, because OpenSSL will simply refuse anything else.
 
 Exits on its own after the timeout so a stuck test cannot leave it running.
 """
 
 import socket
 import socketserver
+import ssl
 import sys
 import time
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 17780
 TIMEOUT = float(sys.argv[2]) if len(sys.argv) > 2 else 120.0
+CERT = sys.argv[3] if len(sys.argv) > 3 else None
+KEY = sys.argv[4] if len(sys.argv) > 4 else None
 
 BLOB_LEN = 65536
 CHUNKED_LEN = 5000
@@ -173,11 +182,33 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def get_request(self):
+        # socketserver swallows an OSError from accept(), and for a TLS socket
+        # accept() is where the handshake happens — so a client whose hello is
+        # rejected sees a closed connection and the server says nothing at all.
+        # That silence is useless to whoever is debugging the client, which is
+        # the entire reason this server exists.
+        try:
+            return super().get_request()
+        except OSError as e:
+            print(f"handshake rejected: {e}", flush=True)
+            raise
+
 
 def main():
     srv = Server(("127.0.0.1", PORT), Handler)
     srv.timeout = 0.5
-    print(f"http server on 127.0.0.1:{PORT} for {TIMEOUT}s", flush=True)
+    kind = "http"
+    if CERT:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # TLS 1.3 and nothing else, so a client that quietly fell back to 1.2
+        # fails here rather than passing a test it should not have.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(CERT, KEY)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        kind = "https"
+    print(f"{kind} server on 127.0.0.1:{PORT} for {TIMEOUT}s", flush=True)
     end = time.monotonic() + TIMEOUT
     try:
         while time.monotonic() < end:

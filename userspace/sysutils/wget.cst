@@ -24,6 +24,8 @@ use "../lib/netcli/netcli.cst" as nc;
 use "../lib/netcli/conn.cst" as cn;
 use "../lib/http/url.cst" as url;
 use "../lib/http/http.cst" as http;
+use "../lib/tls/tls13.cst" as tls;
+use "../lib/x509/trust.cst" as trust;
 
 let is i64 as MAX_REDIRECT = 5;
 let is i64 as ADDR_WAIT_NS = 10000000000;
@@ -39,7 +41,10 @@ let is [2048]u8 as reqbuf;
 let is [4096]u8 as body;
 let is [1024]u8 as outname;
 let is http.Resp as resp;
-let is cn.Conn as conn;
+let is cn.Conn as conn with mut;   // what HTTP talks to: the socket, or TLS over it
+let is cn.Conn as raw with mut;    // the socket, when TLS is in between
+let is tls.Tls as tlsctx;
+let is *u8 as CA_PATH with imut = "/etc/ca.pem";
 
 let is i64 as quiet with mut = 0;
 
@@ -159,6 +164,22 @@ fn derive_name() as void {
     return;
 }
 
+// The port the scheme implies, which decides whether it belongs in the Host
+// header at all (RFC 7230 5.4).
+fn def_port() as i64 {
+    if (scheme == url.HTTPS) { return url.PORT_HTTPS; }
+    return url.PORT_HTTP;
+}
+
+// One teardown for both cases. Over TLS this sends close_notify first, which
+// is what lets the peer tell a finished stream from a truncated one; skipping
+// it turns every clean end into an ambiguous one.
+fn done(s as i64) as void {
+    if (scheme == url.HTTPS) { cn.close(&conn); }
+    nc.close(s);
+    return;
+}
+
 // One request/response. Returns the status, or a negative error. The body,
 // when there is one to keep, goes to `fd`.
 fn fetch(fd as i64, out_bytes as *i64) as i64 {
@@ -175,25 +196,52 @@ fn fetch(fd as i64, out_bytes as *i64) as i64 {
     say_num(port);
     say("\n");
 
-    let is i64 as s = nc.dial(ip, port, &conn);
+    let is i64 as s = nc.dial(ip, port, &raw);
     if (s < 0) {
         err("wget: connection failed\n");
         return 0 - 1;
     }
 
+    // The one line the Conn abstraction was written for. Everything below is
+    // identical either way: HTTP is handed a Conn and never learns whether
+    // there is a TLS session inside it.
+    if (scheme == url.HTTPS) {
+        let is i64 as tr = tls.client(&tlsctx, &raw,
+                                      cast(*u8, &host[0]), hostlen, &conn);
+        if (tr != tls.OK) {
+            err("wget: tls failed (");
+            prog.out_num(tr);
+            err(", detail ");
+            prog.out_num(tls.error_of(&tlsctx));
+            if (tls.alert_of(&tlsctx) != 0) {
+                err(", peer alert ");
+                prog.out_num(tls.alert_of(&tlsctx));
+            }
+            err(")\n");
+            // The socket directly, NOT through done(): the handshake failed
+            // before the Conn was ever initialised, so closing through it
+            // would call a vtable that was never filled in.
+            nc.close(s);
+            return 0 - 1;
+        }
+        say("tls up\n");
+    } else {
+        conn = raw;
+    }
+
     let is i64 as rlen = http.build_request(cast(*u8, &reqbuf[0]), 2048,
                                             cast(*u8, "GET"),
                                             cast(*u8, &host[0]), hostlen,
-                                            port, url.PORT_HTTP,
+                                            port, def_port(),
                                             cast(*u8, &path[0]), pathlen);
     if (rlen <= 0) {
         err("wget: url too long for a request\n");
-        nc.close(s);
+        done(s);
         return 0 - 1;
     }
     if (cn.write_all(&conn, cast(*u8, &reqbuf[0]), rlen) != rlen) {
         err("wget: could not send the request\n");
-        nc.close(s);
+        done(s);
         return 0 - 1;
     }
 
@@ -202,7 +250,7 @@ fn fetch(fd as i64, out_bytes as *i64) as i64 {
         err("wget: bad response (");
         prog.out_num(st);
         err(")\n");
-        nc.close(s);
+        done(s);
         return 0 - 1;
     }
     say("HTTP ");
@@ -213,12 +261,12 @@ fn fetch(fd as i64, out_bytes as *i64) as i64 {
 
     if (http.is_redirect(&resp) == 1) {
         http.drain(&resp, &conn);
-        nc.close(s);
+        done(s);
         return st;
     }
     if (st != 200) {
         http.drain(&resp, &conn);
-        nc.close(s);
+        done(s);
         return st;
     }
 
@@ -229,19 +277,19 @@ fn fetch(fd as i64, out_bytes as *i64) as i64 {
             err("wget: transfer failed after ");
             prog.out_num(total);
             err(" bytes\n");
-            nc.close(s);
+            done(s);
             return 0 - 1;
         }
         if (n == 0) { break; }
         let is i64 as w = sys.write(fd, cast(*u8, &body[0]), n);
         if (w != n) {
             err("wget: write failed\n");
-            nc.close(s);
+            done(s);
             return 0 - 1;
         }
         total = total + n;
     }
-    nc.close(s);
+    done(s);
     out_bytes[0] = total;
     return st;
 }
@@ -289,12 +337,6 @@ fn main(argc as i64, argv as *u8) as i32 {
         return cast(i32, 1);
     }
     if (adopt(&u) != 0) { err("wget: url too long\n"); return cast(i32, 1); }
-    if (scheme == url.HTTPS) {
-        // Said plainly rather than quietly fetched over plain HTTP, which
-        // would give the user a file they believe was encrypted in transit.
-        err("wget: https is not supported yet — TLS is the next phase\n");
-        return cast(i32, 1);
-    }
     if (have_out == 0) { derive_name(); }
 
     let is i64 as ar = nc.attach(np.NET_FD);
@@ -307,6 +349,18 @@ fn main(argc as i64, argv as *u8) as i32 {
     if (nc.wait_address(ADDR_WAIT_NS) == 0) {
         err("wget: no address (dhcp did not answer)\n");
         return cast(i32, 1);
+    }
+
+    if (scheme == url.HTTPS) {
+        // No anchors, no https. Continuing without them would mean accepting
+        // whatever certificate arrived, which is worse than plain HTTP —
+        // plain HTTP at least does not claim to be secure.
+        let is i64 as na = trust.load(cast(*u8, CA_PATH));
+        if (na <= 0) {
+            err("wget: no trust store at /etc/ca.pem — refusing https\n");
+            return cast(i32, 1);
+        }
+        say("trust: "); say_num(na); say(" anchors\n");
     }
 
     let is i64 as fd = sys.open_write(cast(*u8, &outname[0]));

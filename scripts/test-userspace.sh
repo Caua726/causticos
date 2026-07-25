@@ -25,14 +25,18 @@ TESTS=(
     "pingt:60:userspace/build/ping.cse"
     "netdt:70:userspace/build/netd.cse"
     "httpt:150:userspace/build/netd.cse userspace/build/wget.cse"
+    "tlst:180:userspace/build/netd.cse build/certs/ca.pem build/certs/empty.pem"
 )
 
 # The certificate fixtures are generated rather than committed. A certificate
 # has an expiry date in it, and one checked into a repository is a test that
 # starts failing on a day nobody picked.
-if [ ! -f build/certs/leaf.der ]; then
+if [ ! -f build/certs/srv.pem ]; then
     bash scripts/make-test-certs.sh >/dev/null
 fi
+# An empty trust store, so a test can prove that a perfect chain with
+# nothing to anchor it in is refused.
+: > build/certs/empty.pem
 
 WANT="${1:-}"
 PASS=0
@@ -61,6 +65,16 @@ for entry in "${TESTS[@]}"; do
         python3 scripts/http-server.py 17780 "$tout" >/dev/null 2>&1 &
         HELPER_PID=$!
         sleep 0.3
+    fi
+    if [ "$name" = "tlst" ]; then
+        # OpenSSL's server side, pinned to TLS 1.3. Two implementations by one
+        # author agree with each other; this one refuses anything that is not
+        # what the RFC says, and refuses without explaining, which is exactly
+        # the check that is worth having.
+        python3 scripts/http-server.py 17782 "$tout" \
+            build/certs/srvchain.pem build/certs/srv.key >/dev/null 2>&1 &
+        HELPER_PID=$!
+        sleep 0.5
     fi
     if bash scripts/run-test.sh "$name" "$tout" $extra >/tmp/ut-$name.log 2>&1; then
         # Echo the count so a test that silently stopped checking things is

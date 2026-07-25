@@ -1,0 +1,221 @@
+// tlst — a TLS 1.3 handshake against OpenSSL.
+//
+// The peer is Python's ssl module, which is OpenSSL, pinned to TLS 1.3 and
+// nothing else. That is the entire point of the test. Two implementations by
+// the same author agree with each other and prove nothing; OpenSSL will refuse
+// a handshake whose key schedule, transcript hash or record framing is off by
+// one byte anywhere, and it refuses without saying where. Passing it means
+// every one of those is what RFC 8446 says.
+//
+// Then the refusals, which are the half that matters:
+//
+//   wrong hostname       the certificate is real, valid, and for someone
+//                        else. This is what a man in the middle holding a
+//                        legitimate certificate for his own domain looks
+//                        like, and the connection must not open.
+//   no trust store       every anchor removed. The chain is unchanged and
+//                        still perfect; there is simply nothing to anchor it
+//                        in, and accepting it anyway would be the failure
+//                        mode that makes TLS decorative.
+//
+// The plaintext is checked too — end to end, through the record layer — so a
+// handshake that completes and then decrypts to garbage cannot pass.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/netsvc.cst" as netsvc;
+use "../lib/netcli/conn.cst" as cn;
+use "../lib/http/url.cst" as url;
+use "../lib/http/http.cst" as http;
+use "../lib/tls/tls13.cst" as tls;
+use "../lib/x509/x509v.cst" as x;
+use "../lib/x509/trust.cst" as trust;
+
+let is i64 as SERVER_IP = 0x0A000202;        // 10.0.2.2, the host per SLIRP
+let is i64 as SERVER_PORT = 17782;
+let is i64 as BLOB_LEN = 65536;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+
+let is cn.Conn as raw with mut;
+let is cn.Conn as sec with mut;
+let is tls.Tls as tc;
+let is http.Resp as resp;
+let is [2048]u8 as reqbuf;
+let is [4096]u8 as bodybuf;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as y with mut = v;
+    if (y < 0) { sys.write_serial(cast(*u8, "-"), 1); y = 0 - y; }
+    if (y == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (y > 0) { i = i - 1; b[i] = cast(u8, 48 + (y % 10)); y = y / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+fn expect_byte(i as i64) as i64 { return (i * 31 + 7) & 0xFF; }
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+// Dial, wrap in TLS, and hand back the socket so it can be closed. Returns the
+// socket index on success or a negative error.
+fn dial_tls(host as *u8, hlen as i64) as i64 {
+    let is i64 as s = nc.dial(SERVER_IP, SERVER_PORT, &raw);
+    if (s < 0) { return s; }
+    let is i64 as r = tls.client(&tc, &raw, host, hlen, &sec);
+    if (r != tls.OK) {
+        nc.close(s);
+        return r;
+    }
+    return s;
+}
+
+fn t_handshake() as void {
+    say("handshake against openssl:\n");
+    let is i64 as s = dial_tls(cast(*u8, "10.0.2.2"), 8);
+    check(cast(*u8, "the handshake completed"), s >= 0, 1);
+    if (s < 0) {
+        say("    tls error "); say_num(s);
+        say(", detail "); say_num(tls.error_of(&tc)); say("\n");
+        return;
+    }
+    // Which suite the server chose. Any of the three is fine; that it is one
+    // of them at all proves the negotiation was understood on both sides.
+    check(cast(*u8, "a suite was negotiated"), tc.suite > 0, 1);
+    say("    suite=0x"); say_num(tc.suite); say("\n");
+
+    // A real request, through the record layer, and the answer checked byte
+    // for byte. A handshake that completes and then decrypts to noise would
+    // otherwise pass.
+    let is i64 as n = http.build_request(cast(*u8, &reqbuf[0]), 2048,
+                                         cast(*u8, "GET"),
+                                         cast(*u8, "10.0.2.2"), 8,
+                                         SERVER_PORT, url.PORT_HTTPS,
+                                         cast(*u8, "/f.bin"), 6);
+    check(cast(*u8, "request built"), n > 0, 1);
+    check(cast(*u8, "request sent through tls"),
+          cn.write_all(&sec, cast(*u8, &reqbuf[0]), n), n);
+
+    let is i64 as st = http.read_head(&resp, &sec, 0);
+    check(cast(*u8, "https answers 200"), st, 200);
+    if (st == 200) {
+        check(cast(*u8, "content-length announced"), resp.clen, BLOB_LEN);
+        let is i64 as total with mut = 0;
+        let is i64 as bad with mut = 0 - 1;
+        while (1 == 1) {
+            let is i64 as got = http.read_body(&resp, &sec, cast(*u8, &bodybuf[0]), 4096);
+            if (got <= 0) { break; }
+            let is i64 as i with mut = 0;
+            while (i < got) {
+                if (cast(i64, bodybuf[i]) != expect_byte(total + i)) {
+                    if (bad < 0) { bad = total + i; }
+                    i = got;
+                }
+                i = i + 1;
+            }
+            total = total + got;
+        }
+        check(cast(*u8, "every byte of 64 KiB, decrypted"), total, BLOB_LEN);
+        check(cast(*u8, "and every one correct"), bad, 0 - 1);
+    }
+    cn.close(&sec);
+    nc.close(s);
+    return;
+}
+
+fn t_hostname() as void {
+    say("a certificate for somebody else:\n");
+    // The server's certificate is real and valid; it just does not name this
+    // host. The connection must not open.
+    let is i64 as s = dial_tls(cast(*u8, "10.0.2.9"), 8);
+    check(cast(*u8, "wrong host is refused"), s < 0, 1);
+    if (s < 0) {
+        check(cast(*u8, "and refused for the certificate"), s, tls.E_CERT);
+        check(cast(*u8, "specifically the hostname"),
+              tls.error_of(&tc), x.E_HOSTNAME);
+    } else {
+        cn.close(&sec);
+        nc.close(s);
+    }
+    return;
+}
+
+fn t_no_anchors() as void {
+    say("with nothing to trust:\n");
+    // An empty store. The chain the server sends is unchanged and still
+    // perfect; there is simply nothing to anchor it in.
+    trust.load(cast(*u8, "/empty.pem"));
+    check(cast(*u8, "the store is empty"), trust.count(), 0);
+    let is i64 as s = dial_tls(cast(*u8, "10.0.2.2"), 8);
+    check(cast(*u8, "an unanchored chain is refused"), s, tls.E_CERT);
+    if (s >= 0) { cn.close(&sec); nc.close(s); }
+
+    // And it works again the moment the anchors come back, which proves the
+    // refusal was about trust and not about something else breaking.
+    let is i64 as na = trust.load(cast(*u8, "/ca.pem"));
+    check(cast(*u8, "anchors restored"), na > 0, 1);
+    let is i64 as s2 = dial_tls(cast(*u8, "10.0.2.2"), 8);
+    check(cast(*u8, "and the handshake works again"), s2 >= 0, 1);
+    if (s2 >= 0) { cn.close(&sec); nc.close(s2); }
+    return;
+}
+
+fn main() as i32 {
+    say("tlst: tls 1.3 against a peer that is not our code\n");
+
+    check(cast(*u8, "netd starts"), netsvc.attach_or_start(1), 0);
+    check(cast(*u8, "an address was leased"), nc.wait_address(10000000000) != 0, 1);
+
+    let is [8]i64 as w;
+    sys.time_wall(cast(*i64, &w[0]));
+    check(cast(*u8, "the machine knows the time"),
+          x.stamp_from_wall(cast(*i64, &w[0])) > 0, 1);
+
+    let is i64 as na = trust.load(cast(*u8, "/ca.pem"));
+    check(cast(*u8, "anchors loaded"), na, 2);
+
+    t_handshake();
+    t_hostname();
+    t_no_anchors();
+
+    let is i64 as pid = netsvc.pid();
+    if (pid > 0) {
+        sys.kill(pid);
+        let is [1]i64 as st;
+        sys.wait(pid, cast(*i64, &st[0]));
+    }
+
+    say("tlst: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("tlst: ALL PASS\n"); return cast(i32, 0); }
+    say("tlst: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}
