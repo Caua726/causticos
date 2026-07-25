@@ -1,0 +1,179 @@
+// conn — a byte stream, behind a vtable.
+//
+// HTTP wants to read and write bytes. It does not want to know whether those
+// bytes go out over a TCP socket, through a TLS record layer, or into an array
+// in memory that a test is checking. So it does not: it gets a Conn, and a
+// Conn is four function pointers and an opaque context.
+//
+// THIS EXISTS NOW RATHER THAN LATER ON PURPOSE. TLS is a Conn that wraps
+// another Conn — encrypt on the way out, decrypt on the way in — and if HTTP
+// were written against a socket id, adding TLS would mean going back through
+// HTTP and threading a flag into every call. Written this way, `https://`
+// changes exactly one line in wget: which Conn it hands to the HTTP code.
+//
+// It also makes the protocols testable without a network. A mock Conn backed
+// by a byte array replays a captured server response, which is how a header
+// parser gets debugged in milliseconds instead of by rebooting a VM.
+//
+// EVERY FIELD IS i64, INCLUDING THE POINTERS. Structs with mixed field widths
+// have miscompiled in this project before; an all-i64 struct cannot. The cast
+// back to a typed function pointer happens in the four dispatchers below and
+// nowhere else, which is also the only place a wrong signature could hide.
+
+// What `state` reports.
+let is i64 as OPEN   with imut = 0;   // usable
+let is i64 as EOF    with imut = 1;   // the peer will send no more
+let is i64 as CLOSED with imut = 2;   // we closed it
+let is i64 as ERROR  with imut = 3;   // an I/O error happened
+
+// The backend contract. Each takes the opaque ctx first:
+//   read : fn(ctx, buf, len) as i64   >0 = bytes, 0 = EOF, <0 = -errno
+//   write: fn(ctx, buf, len) as i64   >0 = bytes taken, <0 = -errno
+//   close: fn(ctx) as i64             0 = ok
+//   state: fn(ctx) as i64             one of the codes above
+struct Conn {
+    ctx   as i64;
+    read  as i64;
+    write as i64;
+    close as i64;
+    state as i64;
+}
+
+fn init(c as *Conn, ctx as i64, rd as i64, wr as i64, cl as i64, st as i64) as void {
+    c.ctx = ctx;
+    c.read = rd;
+    c.write = wr;
+    c.close = cl;
+    c.state = st;
+    return;
+}
+
+fn read(c as *Conn, buf as *u8, len as i64) as i64 {
+    let is fn(i64, *u8, i64) as i64 as f = cast(fn(i64, *u8, i64) as i64, c.read);
+    return call(f, c.ctx, buf, len);
+}
+
+fn write(c as *Conn, buf as *u8, len as i64) as i64 {
+    let is fn(i64, *u8, i64) as i64 as f = cast(fn(i64, *u8, i64) as i64, c.write);
+    return call(f, c.ctx, buf, len);
+}
+
+fn close(c as *Conn) as i64 {
+    let is fn(i64) as i64 as f = cast(fn(i64) as i64, c.close);
+    return call(f, c.ctx);
+}
+
+fn state(c as *Conn) as i64 {
+    let is fn(i64) as i64 as f = cast(fn(i64) as i64, c.state);
+    return call(f, c.ctx);
+}
+
+// Write every byte or fail. A short write is normal — the send buffer filled —
+// and a caller that treated it as success would send a truncated request and
+// then wait forever for a response to a message the server never finished
+// reading.
+fn write_all(c as *Conn, buf as *u8, len as i64) as i64 {
+    let is i64 as sent with mut = 0;
+    while (sent < len) {
+        let is i64 as n = write(c, cast(*u8, cast(i64, buf) + sent), len - sent);
+        if (n < 0) { return n; }
+        if (n == 0) { return 0 - 1; }
+        sent = sent + n;
+    }
+    return sent;
+}
+
+// Read exactly len bytes, or fewer if the peer closes first. Returns what it
+// got, so a caller can tell a clean end from a short one.
+fn read_exact(c as *Conn, buf as *u8, len as i64) as i64 {
+    let is i64 as got with mut = 0;
+    while (got < len) {
+        let is i64 as n = read(c, cast(*u8, cast(i64, buf) + got), len - got);
+        if (n < 0) { return n; }
+        if (n == 0) { return got; }
+        got = got + n;
+    }
+    return got;
+}
+
+// ============================================================
+// A Conn over a byte array
+// ============================================================
+//
+// Reads come out of a fixed buffer and writes go into another one. This is
+// what makes the HTTP parser testable without a network: hand it a recorded
+// server response and check what it makes of it, deterministically, with no
+// timing and no emulator in the way.
+
+struct Mock {
+    rd_at   as i64;
+    rd_len  as i64;
+    rd_base as i64;
+    wr_at   as i64;
+    wr_cap  as i64;
+    wr_base as i64;
+    st      as i64;
+    // How many bytes a single read may return, so a test can force the
+    // fragmentation a real network produces: a parser that only works when a
+    // whole header arrives in one read is a parser that fails on the wire.
+    chunk   as i64;
+}
+
+fn mock_init(m as *Mock, rd as *u8, rdlen as i64, wr as *u8, wrcap as i64) as void {
+    m.rd_at = 0;
+    m.rd_len = rdlen;
+    m.rd_base = cast(i64, rd);
+    m.wr_at = 0;
+    m.wr_cap = wrcap;
+    m.wr_base = cast(i64, wr);
+    m.st = OPEN;
+    m.chunk = 0;                  // 0 = as much as asked for
+    return;
+}
+
+fn mock_read(ctx as i64, buf as *u8, len as i64) as i64 {
+    let is *Mock as m = cast(*Mock, ctx);
+    if (m.st == ERROR) { return 0 - 1; }
+    let is i64 as left = m.rd_len - m.rd_at;
+    if (left <= 0) { m.st = EOF; return 0; }
+    let is i64 as n with mut = len;
+    if (n > left) { n = left; }
+    if (m.chunk > 0 && n > m.chunk) { n = m.chunk; }
+    let is i64 as i with mut = 0;
+    let is *u8 as src = cast(*u8, m.rd_base + m.rd_at);
+    while (i < n) { buf[i] = src[i]; i = i + 1; }
+    m.rd_at = m.rd_at + n;
+    return n;
+}
+
+fn mock_write(ctx as i64, buf as *u8, len as i64) as i64 {
+    let is *Mock as m = cast(*Mock, ctx);
+    if (m.st == ERROR) { return 0 - 1; }
+    let is i64 as room = m.wr_cap - m.wr_at;
+    if (room <= 0) { return 0 - 1; }
+    let is i64 as n with mut = len;
+    if (n > room) { n = room; }
+    let is i64 as i with mut = 0;
+    let is *u8 as dst = cast(*u8, m.wr_base + m.wr_at);
+    while (i < n) { dst[i] = buf[i]; i = i + 1; }
+    m.wr_at = m.wr_at + n;
+    return n;
+}
+
+fn mock_close(ctx as i64) as i64 {
+    let is *Mock as m = cast(*Mock, ctx);
+    m.st = CLOSED;
+    return 0;
+}
+
+fn mock_state(ctx as i64) as i64 {
+    let is *Mock as m = cast(*Mock, ctx);
+    return m.st;
+}
+
+fn mock_conn(c as *Conn, m as *Mock) as void {
+    init(c, cast(i64, m),
+         cast(i64, fn_ptr(mock_read)), cast(i64, fn_ptr(mock_write)),
+         cast(i64, fn_ptr(mock_close)), cast(i64, fn_ptr(mock_state)));
+    return;
+}

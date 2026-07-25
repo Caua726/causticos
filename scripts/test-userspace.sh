@@ -22,6 +22,7 @@ TESTS=(
     "kabi:30:"
     "pingt:60:userspace/build/ping.cse"
     "netdt:70:userspace/build/netd.cse"
+    "httpt:150:userspace/build/netd.cse userspace/build/wget.cse"
 )
 
 WANT="${1:-}"
@@ -37,14 +38,19 @@ for entry in "${TESTS[@]}"; do
     [ -n "$WANT" ] && [ "$WANT" != "$name" ] && continue
 
     printf '%-8s ' "$name"
-    # netdt's TCP test needs a peer that is NOT our code — a loopback of two
-    # of our own connections proves they agree with each other, not that they
-    # agree with anyone else. SLIRP presents the host as 10.0.2.2, so a
+    # netdt and httpt both need a peer that is NOT our code — a loopback of
+    # two of our own connections proves they agree with each other, not that
+    # they agree with anyone else. SLIRP presents the host as 10.0.2.2, so a
     # listener here is what the guest dials.
-    ECHO_PID=""
+    HELPER_PID=""
     if [ "$name" = "netdt" ]; then
         python3 scripts/echo-server.py 17777 "$tout" >/dev/null 2>&1 &
-        ECHO_PID=$!
+        HELPER_PID=$!
+        sleep 0.3
+    fi
+    if [ "$name" = "httpt" ]; then
+        python3 scripts/http-server.py 17780 "$tout" >/dev/null 2>&1 &
+        HELPER_PID=$!
         sleep 0.3
     fi
     if bash scripts/run-test.sh "$name" "$tout" $extra >/tmp/ut-$name.log 2>&1; then
@@ -61,9 +67,9 @@ for entry in "${TESTS[@]}"; do
     fi
     # `[ -n ... ] && ...` would abort the whole script under set -e whenever
     # the variable is empty, which silently dropped every test after this one.
-    if [ -n "$ECHO_PID" ]; then
-        kill $ECHO_PID 2>/dev/null || true
-        wait $ECHO_PID 2>/dev/null || true
+    if [ -n "$HELPER_PID" ]; then
+        kill $HELPER_PID 2>/dev/null || true
+        wait $HELPER_PID 2>/dev/null || true
     fi
 done
 

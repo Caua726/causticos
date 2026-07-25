@@ -1,0 +1,509 @@
+// http — HTTP/1.1, over a Conn.
+//
+// It never learns whether the Conn under it is a TCP socket or a TLS session.
+// That is the whole point of the Conn being there: `https://` will be the same
+// code with a different Conn, and if this module knew about sockets it would
+// have to be edited to find that out.
+//
+// THE BODY IS STREAMED, NOT BUFFERED. A response can be larger than memory,
+// and a client that reads it into a buffer before handing it over is a client
+// that cannot download a file bigger than RAM. read_body hands out whatever
+// has arrived, and the caller decides where it goes.
+//
+// THREE WAYS A BODY ENDS, and getting the precedence wrong is the classic
+// HTTP bug (RFC 7230 §3.3.3):
+//   chunked        — the framing is in the body; Content-Length is IGNORED
+//                    when it is also present, because a proxy that disagrees
+//                    with itself is how request smuggling works.
+//   Content-Length — exactly that many bytes.
+//   neither        — until the connection closes. Only meaningful with
+//                    Connection: close, which is why this asks for it.
+// A 1xx, 204 or 304 has no body at all whatever the headers say, and neither
+// does any response to HEAD.
+//
+// ONE ARRAY, THREE REGIONS. Resp keeps its scratch in a single trailing byte
+// array rather than three: structs whose scalar fields have mixed widths have
+// miscompiled in this project, and one array after the i64s is the shape that
+// is known to be safe.
+
+use "../netcli/conn.cst" as cn;
+
+let is i64 as LOC_OFF  with imut = 0;
+let is i64 as LOC_CAP  with imut = 512;
+let is i64 as LINE_OFF with imut = 512;
+let is i64 as LINE_CAP with imut = 512;
+let is i64 as HB_OFF   with imut = 1024;
+let is i64 as HB_CAP   with imut = 4096;
+let is i64 as RAW_CAP  with imut = 5120;
+
+// How a body is delimited.
+let is i64 as BODY_LENGTH with imut = 0;
+let is i64 as BODY_CHUNKED with imut = 1;
+let is i64 as BODY_EOF with imut = 2;
+let is i64 as BODY_NONE with imut = 3;
+
+// Errors. Distinct values because "the response was malformed" and "the
+// connection died" call for different things from a caller.
+let is i64 as E_PROTO with imut = 0 - 100;   // not an HTTP response
+let is i64 as E_LONG  with imut = 0 - 101;   // a header line beyond LINE_CAP
+let is i64 as E_CONN  with imut = 0 - 102;   // the Conn failed or ended early
+
+struct Resp {
+    status     as i64;
+    clen       as i64;      // -1 when no Content-Length was sent
+    body_kind  as i64;
+    keepalive  as i64;
+    loclen     as i64;
+    hb_head    as i64;      // pushback: unread bytes at raw[HB_OFF + head..tail]
+    hb_tail    as i64;
+    chunk_left as i64;      // bytes left in the current chunk
+    done       as i64;      // the body has ended
+    got        as i64;      // body bytes handed to the caller
+    nhdr       as i64;      // header lines seen, so a caller can sanity check
+    raw        as [5120]u8;
+}
+
+fn raw_at(r as *Resp, off as i64) as *u8 {
+    return cast(*u8, cast(i64, &r.raw[0]) + off);
+}
+
+fn lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+// ============================================================
+// Building a request
+// ============================================================
+
+fn put(out as *u8, cap as i64, at as i64, s as *u8, n as i64) as i64 {
+    if (at < 0) { return at; }
+    if (at + n > cap) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { out[at + i] = s[i]; i = i + 1; }
+    return at + n;
+}
+
+fn put_s(out as *u8, cap as i64, at as i64, s as *u8) as i64 {
+    return put(out, cap, at, s, slen(s));
+}
+
+fn put_num(out as *u8, cap as i64, at as i64, v as i64) as i64 {
+    if (at < 0) { return at; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    let is i64 as x with mut = v;
+    if (x == 0) { i = 23; b[23] = cast(u8, 48); }
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    return put(out, cap, at, cast(*u8, &b[i]), 24 - i);
+}
+
+// The request, whole, into the caller's buffer. Built in one piece and sent in
+// one write rather than a header at a time: every separate write is a separate
+// message to netd and, past Nagle, a separate segment on the wire.
+//
+// `port` goes in the Host header only when it is not the scheme's default,
+// which RFC 7230 §5.4 requires and which name-based virtual hosts match on
+// literally — send ":80" and a server that expects "example.com" sees a host
+// it does not have.
+fn build_request(out as *u8, cap as i64, method as *u8,
+                 host as *u8, hostlen as i64, port as i64, default_port as i64,
+                 path as *u8, pathlen as i64) as i64 {
+    let is i64 as at with mut = 0;
+    at = put_s(out, cap, at, method);
+    at = put_s(out, cap, at, " ");
+    if (pathlen > 0) { at = put(out, cap, at, path, pathlen); }
+    else { at = put_s(out, cap, at, "/"); }
+    at = put_s(out, cap, at, " HTTP/1.1\r\nHost: ");
+    at = put(out, cap, at, host, hostlen);
+    if (port != default_port) {
+        at = put_s(out, cap, at, ":");
+        at = put_num(out, cap, at, port);
+    }
+    at = put_s(out, cap, at, "\r\nUser-Agent: causticos/1\r\nAccept: */*\r\n");
+    // Connection: close is what makes a body with no Content-Length and no
+    // chunking readable at all — without it, "until the connection ends"
+    // never ends. A persistent connection is a later optimisation, and
+    // asking for one this client cannot reuse would be a lie to the server.
+    at = put_s(out, cap, at, "Connection: close\r\n\r\n");
+    return at;
+}
+
+// ============================================================
+// Reading a response
+// ============================================================
+
+fn init(r as *Resp) as void {
+    r.status = 0;
+    r.clen = 0 - 1;
+    r.body_kind = BODY_EOF;
+    r.keepalive = 0;
+    r.loclen = 0;
+    r.hb_head = 0;
+    r.hb_tail = 0;
+    r.chunk_left = 0;
+    r.done = 0;
+    r.got = 0;
+    r.nhdr = 0;
+    return;
+}
+
+// Refill the pushback buffer. Returns bytes available, 0 at EOF, <0 on error.
+fn fill(r as *Resp, c as *cn.Conn) as i64 {
+    if (r.hb_tail > r.hb_head) { return r.hb_tail - r.hb_head; }
+    r.hb_head = 0;
+    r.hb_tail = 0;
+    let is i64 as n = cn.read(c, raw_at(r, HB_OFF), HB_CAP);
+    if (n <= 0) { return n; }
+    r.hb_tail = n;
+    return n;
+}
+
+fn get_byte(r as *Resp, c as *cn.Conn) as i64 {
+    let is i64 as n = fill(r, c);
+    if (n <= 0) { return 0 - 1; }
+    let is *u8 as p = raw_at(r, HB_OFF);
+    let is i64 as v = cast(i64, p[r.hb_head]);
+    r.hb_head = r.hb_head + 1;
+    return v;
+}
+
+// One CRLF-terminated line into the scratch region, without its terminator.
+// A bare LF is accepted because servers send it; a line longer than the
+// buffer is an error rather than a truncation, since a truncated header is
+// one that will be misread rather than noticed.
+fn read_line(r as *Resp, c as *cn.Conn) as i64 {
+    let is *u8 as line = raw_at(r, LINE_OFF);
+    let is i64 as n with mut = 0;
+    while (1 == 1) {
+        let is i64 as ch = get_byte(r, c);
+        if (ch < 0) { return E_CONN; }
+        if (ch == 10) {
+            if (n > 0 && line[n-1] == cast(u8, 13)) { n = n - 1; }
+            return n;
+        }
+        if (n >= LINE_CAP) { return E_LONG; }
+        line[n] = cast(u8, ch);
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn line_is(r as *Resp, n as i64, lit as *u8, litlen as i64) as i64 {
+    if (n < litlen) { return 0; }
+    let is *u8 as line = raw_at(r, LINE_OFF);
+    let is i64 as i with mut = 0;
+    while (i < litlen) {
+        if (lower(cast(i64, line[i])) != lower(cast(i64, lit[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// A header line whose NAME is exactly this literal. The colon has to be
+// there: prefix matching alone would make "Content-Length-Hint" set the
+// content length, and a wrong length is a truncated or hung download.
+fn hdr_is(r as *Resp, n as i64, lit as *u8, litlen as i64) as i64 {
+    if (line_is(r, n, lit, litlen) == 0) { return 0; }
+    if (n <= litlen) { return 0; }
+    let is *u8 as line = raw_at(r, LINE_OFF);
+    if (line[litlen] != cast(u8, 58)) { return 0; }             // ':'
+    return 1;
+}
+
+// Where a header's value starts: past the colon and the optional whitespace
+// after it. Leading spaces are not part of a value (RFC 7230 §3.2.4).
+fn value_at(r as *Resp, n as i64, namelen as i64) as i64 {
+    let is *u8 as line = raw_at(r, LINE_OFF);
+    let is i64 as i with mut = namelen;
+    if (i < n && line[i] == cast(u8, 58)) { i = i + 1; }        // ':'
+    while (i < n && (line[i] == cast(u8, 32) || line[i] == cast(u8, 9))) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn parse_dec(p as *u8, at as i64, n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as digits with mut = 0;
+    let is i64 as i with mut = at;
+    while (i < n) {
+        let is i64 as ch = cast(i64, p[i]);
+        if (ch < 48 || ch > 57) { break; }
+        v = v * 10 + (ch - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if (digits == 0) { return 0 - 1; }
+    return v;
+}
+
+fn parse_hex(p as *u8, at as i64, n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as digits with mut = 0;
+    let is i64 as i with mut = at;
+    while (i < n) {
+        let is i64 as ch = lower(cast(i64, p[i]));
+        let is i64 as d with mut = 0 - 1;
+        if (ch >= 48 && ch <= 57) { d = ch - 48; }
+        if (ch >= 97 && ch <= 102) { d = ch - 87; }
+        if (d < 0) { break; }
+        v = v * 16 + d;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if (digits == 0) { return 0 - 1; }
+    return v;
+}
+
+// Does a value contain this token, case-insensitively? Used for
+// `Transfer-Encoding: gzip, chunked` and `Connection: keep-alive, foo`, where
+// the header is a list and matching the whole value would miss it.
+fn value_has(r as *Resp, n as i64, at as i64, tok as *u8, toklen as i64) as i64 {
+    let is *u8 as line = raw_at(r, LINE_OFF);
+    let is i64 as i with mut = at;
+    while (i + toklen <= n) {
+        let is i64 as k with mut = 0;
+        let is i64 as ok with mut = 1;
+        while (k < toklen) {
+            if (lower(cast(i64, line[i + k])) != lower(cast(i64, tok[k]))) {
+                ok = 0;
+                k = toklen;
+            } else { k = k + 1; }
+        }
+        if (ok == 1) {
+            // A token must not be a fragment of a longer word: "chunked" in
+            // "unchunkedx" is not chunked encoding.
+            let is i64 as before with mut = 1;
+            if (i > at) {
+                let is i64 as pc = cast(i64, line[i-1]);
+                if ((pc >= 97 && pc <= 122) || (pc >= 65 && pc <= 90)) { before = 0; }
+            }
+            let is i64 as after with mut = 1;
+            if (i + toklen < n) {
+                let is i64 as nc = cast(i64, line[i + toklen]);
+                if ((nc >= 97 && nc <= 122) || (nc >= 65 && nc <= 90)) { after = 0; }
+            }
+            if (before == 1 && after == 1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Status line and headers. `is_head` tells it the request was HEAD, which has
+// no body no matter what the headers promise.
+fn read_head(r as *Resp, c as *cn.Conn, is_head as i64) as i64 {
+    init(r);
+    let is *u8 as line = raw_at(r, LINE_OFF);
+
+    // 1xx is informational: the real response follows it, and a client that
+    // stopped at the first status line would report "100 Continue" as the
+    // answer to its request.
+    let is i64 as tries with mut = 0;
+    let is i64 as chunked with mut = 0;
+    while (tries < 8) {
+        let is i64 as n = read_line(r, c);
+        if (n < 0) { return n; }
+        if (line_is(r, n, cast(*u8, "HTTP/1."), 7) == 0) { return E_PROTO; }
+        // "HTTP/1.x SSS ..." — the code starts at 9.
+        let is i64 as st = parse_dec(line, 9, n);
+        if (st < 100 || st > 599) { return E_PROTO; }
+        r.status = st;
+        if (st >= 200) { break; }
+        // Skip the informational response's own headers.
+        while (1 == 1) {
+            let is i64 as m = read_line(r, c);
+            if (m < 0) { return m; }
+            if (m == 0) { break; }
+        }
+        tries = tries + 1;
+    }
+    if (r.status < 200) { return E_PROTO; }
+
+    while (1 == 1) {
+        let is i64 as n = read_line(r, c);
+        if (n < 0) { return n; }
+        if (n == 0) { break; }
+        r.nhdr = r.nhdr + 1;
+        if (hdr_is(r, n, cast(*u8, "content-length"), 14) == 1) {
+            let is i64 as v = parse_dec(line, value_at(r, n, 14), n);
+            if (v >= 0) { r.clen = v; }
+        }
+        if (hdr_is(r, n, cast(*u8, "transfer-encoding"), 17) == 1) {
+            if (value_has(r, n, value_at(r, n, 17), cast(*u8, "chunked"), 7) == 1) {
+                chunked = 1;
+            }
+        }
+        if (hdr_is(r, n, cast(*u8, "connection"), 10) == 1) {
+            if (value_has(r, n, value_at(r, n, 10), cast(*u8, "keep-alive"), 10) == 1) {
+                r.keepalive = 1;
+            }
+        }
+        if (hdr_is(r, n, cast(*u8, "location"), 8) == 1) {
+            let is i64 as at = value_at(r, n, 8);
+            let is i64 as m with mut = n - at;
+            if (m > LOC_CAP - 1) { m = LOC_CAP - 1; }
+            let is *u8 as loc = raw_at(r, LOC_OFF);
+            let is i64 as i with mut = 0;
+            while (i < m) { loc[i] = line[at + i]; i = i + 1; }
+            loc[m] = cast(u8, 0);
+            r.loclen = m;
+        }
+    }
+
+    // Which of the three endings applies. Chunked wins over Content-Length
+    // deliberately: when both are present they can disagree, and taking the
+    // framing that is IN the body is the only one that cannot be lied about
+    // by an intermediary.
+    if (r.status == 204 || r.status == 304 || is_head == 1) {
+        r.body_kind = BODY_NONE;
+        r.done = 1;
+    } else {
+        if (chunked == 1) {
+            r.body_kind = BODY_CHUNKED;
+            r.chunk_left = 0 - 1;              // -1 = a size line is due
+            r.clen = 0 - 1;
+        } else {
+            if (r.clen >= 0) {
+                r.body_kind = BODY_LENGTH;
+                if (r.clen == 0) { r.done = 1; }
+            } else {
+                r.body_kind = BODY_EOF;
+            }
+        }
+    }
+    return r.status;
+}
+
+// Take bytes out of the pushback buffer, then straight off the Conn. Reading
+// the tail directly rather than through the buffer is what keeps a large
+// download from being copied twice.
+fn raw_read(r as *Resp, c as *cn.Conn, out as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    let is i64 as have = r.hb_tail - r.hb_head;
+    if (have > 0) {
+        let is i64 as k with mut = n;
+        if (k > have) { k = have; }
+        let is *u8 as p = raw_at(r, HB_OFF);
+        let is i64 as i with mut = 0;
+        while (i < k) { out[i] = p[r.hb_head + i]; i = i + 1; }
+        r.hb_head = r.hb_head + k;
+        return k;
+    }
+    return cn.read(c, out, n);
+}
+
+// The CRLF that follows a chunk's data. A server that omits it has framed the
+// body wrong and everything after would be read as chunk sizes.
+fn eat_crlf(r as *Resp, c as *cn.Conn) as i64 {
+    let is i64 as a = get_byte(r, c);
+    if (a < 0) { return E_CONN; }
+    if (a == 13) {
+        let is i64 as b = get_byte(r, c);
+        if (b != 10) { return E_PROTO; }
+        return 0;
+    }
+    if (a == 10) { return 0; }
+    return E_PROTO;
+}
+
+// Body bytes. >0 = that many, 0 = the body ended, <0 = error. The caller loops
+// until 0; there is no "read it all" because there may be more of it than
+// there is memory.
+fn read_body(r as *Resp, c as *cn.Conn, out as *u8, n as i64) as i64 {
+    if (r.done == 1) { return 0; }
+    if (n <= 0) { return 0; }
+
+    if (r.body_kind == BODY_NONE) { r.done = 1; return 0; }
+
+    if (r.body_kind == BODY_LENGTH) {
+        let is i64 as left = r.clen - r.got;
+        if (left <= 0) { r.done = 1; return 0; }
+        let is i64 as want with mut = n;
+        if (want > left) { want = left; }
+        let is i64 as k = raw_read(r, c, out, want);
+        if (k < 0) { return E_CONN; }
+        // A Content-Length that was not delivered is a truncated file, and a
+        // caller that saw a clean end would keep the truncation.
+        if (k == 0) { return E_CONN; }
+        r.got = r.got + k;
+        if (r.got >= r.clen) { r.done = 1; }
+        return k;
+    }
+
+    if (r.body_kind == BODY_EOF) {
+        let is i64 as k = raw_read(r, c, out, n);
+        if (k < 0) { return E_CONN; }
+        if (k == 0) { r.done = 1; return 0; }
+        r.got = r.got + k;
+        return k;
+    }
+
+    // Chunked.
+    while (1 == 1) {
+        if (r.chunk_left < 0) {
+            let is i64 as m = read_line(r, c);
+            if (m < 0) { return m; }
+            // A chunk size may carry extensions after a ';'; parse_hex stops
+            // at the first character that is not a hex digit, which handles
+            // both that and the trailing whitespace some servers add.
+            let is i64 as sz = parse_hex(raw_at(r, LINE_OFF), 0, m);
+            if (sz < 0) { return E_PROTO; }
+            if (sz == 0) {
+                // The last chunk, then trailers, then a blank line.
+                while (1 == 1) {
+                    let is i64 as t = read_line(r, c);
+                    if (t < 0) { return t; }
+                    if (t == 0) { break; }
+                }
+                r.done = 1;
+                return 0;
+            }
+            r.chunk_left = sz;
+        }
+        let is i64 as want with mut = n;
+        if (want > r.chunk_left) { want = r.chunk_left; }
+        let is i64 as k = raw_read(r, c, out, want);
+        if (k <= 0) { return E_CONN; }
+        r.chunk_left = r.chunk_left - k;
+        r.got = r.got + k;
+        if (r.chunk_left == 0) {
+            let is i64 as e = eat_crlf(r, c);
+            if (e < 0) { return e; }
+            r.chunk_left = 0 - 1;
+        }
+        return k;
+    }
+    return 0;
+}
+
+// Discard whatever is left of a body. A redirect's body is not wanted, but it
+// has to come off the connection anyway when the connection is being reused.
+fn drain(r as *Resp, c as *cn.Conn) as i64 {
+    let is [512]u8 as sink;
+    let is i64 as total with mut = 0;
+    while (r.done == 0) {
+        let is i64 as k = read_body(r, c, cast(*u8, &sink[0]), 512);
+        if (k <= 0) { break; }
+        total = total + k;
+    }
+    return total;
+}
+
+fn location(r as *Resp) as *u8 { return raw_at(r, LOC_OFF); }
+
+// Whether this status means "look somewhere else", and the response carried a
+// place to look.
+fn is_redirect(r as *Resp) as i64 {
+    if (r.loclen == 0) { return 0; }
+    if (r.status == 301 || r.status == 302 || r.status == 303) { return 1; }
+    if (r.status == 307 || r.status == 308) { return 1; }
+    return 0;
+}

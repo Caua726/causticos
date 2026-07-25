@@ -81,6 +81,27 @@ SEND_DATA = re.compile(
     r'\s*,\s*(?P<len>\d+)\s*\)'
 )
 
+# Calls that take a (literal, length) pair somewhere in their arguments,
+# listed BY NAME rather than matched structurally. A structural match — any
+# literal followed by a number — would flag every check("thing", got, 1) in
+# every test file, and a checker that cries wolf is a checker that gets
+# ignored. Add a name here when a new function takes a counted string.
+LITLEN = re.compile(
+    r'\b(?:url\.parse|url\.matches|matches|nc\.resolve|resolve'
+    r'|line_is|hdr_is|value_has|build_request|put|mock_start)\s*\('
+    r'[^;]{0,200}?'
+    r'cast\(\*u8,\s*"(?P<text>(?:[^"\\]|\\.)*)"\)\s*,\s*(?P<len>\d+)'
+)
+
+# An argv pair on its way to SYS_SPAWN: the kernel copies exactly `len` bytes
+# onto the child's stack, so an over-count hands the child whatever follows
+# the literal in rodata as part of its own argument.
+ARGV = re.compile(
+    r'(?P<arr>[A-Za-z0-9_]+)\[(?P<i>\d+)\]\s*=\s*cast\(i64,\s*'
+    r'"(?P<text>(?:[^"\\]|\\.)*)"\)\s*;'
+    r'\s*(?P=arr)\[(?P<j>\d+)\]\s*=\s*(?P<len>\d+)\s*;'
+)
+
 # Caustic string escapes, for counting what the literal actually becomes.
 ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0', '\\': '\\', '"': '"'}
 
@@ -126,7 +147,7 @@ def main() -> int:
             registered[name] = path
             edits.append((m.start("len"), m.end("len"), int(m.group("len")),
                           len(name.encode()), f'"{name}"'))
-        for rx in (SERIAL, USERSPACE, SEND_DATA):
+        for rx in (SERIAL, USERSPACE, SEND_DATA, LITLEN, ARGV):
             for m in rx.finditer(text):
                 shown = m.group("text")
                 if len(shown) > 40:

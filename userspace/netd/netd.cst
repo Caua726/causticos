@@ -556,6 +556,20 @@ fn tcp_flush(ci as i64) as void {
     return;
 }
 
+// A send that was accepted short leaves the client owed the rest. Telling it
+// when room appears is what keeps it from polling: it asked to send 8 KiB,
+// got 2 taken, and now learns the moment the other 6 will fit.
+fn tcp_credit(s as *nsock.Sock) as void {
+    if (s.want_write == 0) { return; }
+    if (s.conn < 0) { return; }
+    let is *tc.Conn as c = nsock.conn_at(s.conn);
+    let is i64 as room = tc.conn_writable(c);
+    if (room <= 0) { return; }
+    s.want_write = 0;
+    np.send(client_fd[s.client], np.EV_WRITABLE, s.id, room, 0);
+    return;
+}
+
 // Tell a client what changed about its connection. Called after every input,
 // because a segment can deliver data, complete a handshake and close a
 // connection all at once.
@@ -585,13 +599,14 @@ fn tcp_notify(s as *nsock.Sock, was as i64) as void {
 
     // A FIN means the peer will send no more. The client is told once; it may
     // still write, because a half-close is not a shutdown of both directions.
-    if (c.fin_rcvd == 1 && s.backlog == 0) {
-        s.backlog = 1;                          // reuse: "closed already told"
+    if (c.fin_rcvd == 1 && s.told_closed == 0) {
+        s.told_closed = 1;
         np.send(client_fd[s.client], np.EV_CLOSED, s.id, 0, 0);
     }
     if (now == tc.CLOSED && c.error != 0) {
         np.send(client_fd[s.client], np.EV_ERROR, s.id, sys.E_PIPE, 0);
     }
+    tcp_credit(s);
     return;
 }
 
@@ -709,7 +724,13 @@ fn run_timers(now as i64) as i64 {
             tc.conn_tick(c, now);
             tcp_flush(ci);
             let is *nsock.Sock as s = nsock.find_by_conn(ci);
-            if (cast(i64, s) != 0 && tc.conn_state(c) != was) { tcp_notify(s, was); }
+            if (cast(i64, s) != 0) {
+                if (tc.conn_state(c) != was) { tcp_notify(s, was); }
+                // A retransmission that finally got through frees send buffer
+                // without any state change, so credit is checked every tick
+                // rather than only when something else happened.
+                else { tcp_credit(s); }
+            }
             // A connection with anything pending wants waking sooner than the
             // idle heartbeat.
             if (c.rto_at != 0 && c.rto_at > now && c.rto_at < next) { next = c.rto_at; }
@@ -827,6 +848,40 @@ fn serve_client(c as i64) as i64 {
         np.send(client_fd[c], np.EV_HELLO, 0, np.VERSION, nif.count());
         return 1;
     }
+    if (t == np.REQ_NEW_CLIENT) {
+        // A client asks for a second endpoint, to hand to a program it is
+        // about to spawn. There is no service namespace to look netd up in
+        // (architecture.md §2.2), so this is the only way a channel reaches a
+        // process that netd did not already know about: someone who has one
+        // mints another and passes it on. That is not an escalation — a
+        // client that can ask for one could equally have been handed one by
+        // whoever spawned it.
+        let is i64 as k with mut = 0;
+        while (k < MAX_CLIENTS && client_live[k] == 1) { k = k + 1; }
+        if (k >= MAX_CLIENTS) { reply_err(c, 0, sys.E_AGAIN); return 1; }
+        let is [2]i64 as ch;
+        if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
+            reply_err(c, 0, sys.E_NOMEM);
+            return 1;
+        }
+        // The far end goes out first and the announcement second, the order
+        // the compositor already uses for segment handoff: by the time the
+        // asker sees EV_OK the fd is waiting for it, so it never has to poll
+        // for something that may not have been sent yet.
+        if (sys.fd_send(client_fd[c], ch[1]) != 0) {
+            sys.close(ch[0]);
+            sys.close(ch[1]);
+            reply_err(c, 0, sys.E_IO);
+            return 1;
+        }
+        sys.close(ch[1]);                     // the asker owns it now
+        client_fd[k] = ch[0];
+        client_live[k] = 1;
+        n_clients = n_clients + 1;
+        np.send(client_fd[c], np.EV_OK, 0, k, 0);
+        log("netd: client "); log_num(k); log(" minted\n");
+        return 1;
+    }
     if (t == np.REQ_PING) {
         do_ping(c, a, np.unpack_port(b), np.unpack_len(b));
         return 1;
@@ -935,6 +990,9 @@ fn serve_client(c as i64) as i64 {
             tcp_flush(s.conn);
             // Report what was actually taken: a short accept is real
             // backpressure and a client that assumes otherwise loses data.
+            // What is left over is a debt, paid with EV_WRITABLE when the
+            // send buffer drains, so the client waits instead of polling.
+            if (took < b) { s.want_write = 1; }
             np.send(client_fd[c], np.EV_OK, sock, took, 0);
             return 1;
         }
@@ -1040,13 +1098,24 @@ fn main(argc as i64, argv as *u8) as i32 {
             n = n + 1;
             k = k + 1;
         }
+        // Which client each poll slot belongs to, recorded rather than
+        // recomputed. Recomputing it after the poll walks the live set a
+        // second time — and REQ_NEW_CLIENT makes a slot live during that
+        // walk, so the second pass finds one more client than the first and
+        // reads a poll entry that was never filled in. Acting on the garbage
+        // in it means calling serve_client on a channel with nothing in it,
+        // and the blocking read that follows takes the whole daemon down.
         let is i64 as first_client = n;
+        let is [8]i64 as polled;
+        let is i64 as npolled with mut = 0;
         k = 0;
         while (k < MAX_CLIENTS) {
             if (client_live[k] == 1) {
                 pe[n*3+0] = client_fd[k];
                 pe[n*3+1] = sys.POLL_READABLE;
                 pe[n*3+2] = 0;
+                polled[npolled] = k;
+                npolled = npolled + 1;
                 n = n + 1;
             }
             k = k + 1;
@@ -1067,16 +1136,19 @@ fn main(argc as i64, argv as *u8) as i32 {
             k = k + 1;
         }
 
-        let is i64 as slot with mut = first_client;
-        k = 0;
-        while (k < MAX_CLIENTS) {
-            if (client_live[k] == 1) {
-                if ((pe[slot*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
-                    if (serve_client(k) == 0) { drop_client(k); }
+        // Only the slots that were actually polled, and only clients still
+        // live: serving one can mint another and dropping one can retire it,
+        // and both happen inside this loop.
+        let is i64 as j with mut = 0;
+        while (j < npolled) {
+            let is i64 as who = polled[j];
+            if (client_live[who] == 1) {
+                let is i64 as ev = pe[(first_client + j)*3+2];
+                if ((ev & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                    if (serve_client(who) == 0) { drop_client(who); }
                 }
-                slot = slot + 1;
             }
-            k = k + 1;
+            j = j + 1;
         }
     }
     return cast(i32, 0);

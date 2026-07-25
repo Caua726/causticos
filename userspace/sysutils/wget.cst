@@ -1,0 +1,362 @@
+// wget — fetch a URL to a file.
+//
+// The first program that uses the whole stack at once: DHCP gave it an
+// address, DNS turned a name into one, TCP carried the bytes, and HTTP framed
+// them. Everything below is somebody else's module; what is here is argument
+// handling, redirects, and putting bytes on disk.
+//
+// It talks to netd rather than holding a port itself. ping does the opposite —
+// it takes DEV_NET directly — and both are legitimate: ping is one ICMP
+// exchange and needs no connection state, while TCP is a pile of it that has
+// to live somewhere a program can crash without losing. That somewhere is
+// netd, and this reaches it on fd 3, handed over at spawn. There is no service
+// namespace to look it up in (architecture.md §2.2): a program is given the
+// key or it does not have it.
+//
+//   wget http://10.0.2.2:8000/f.bin
+//   wget -O out.bin http://example.com/thing
+//   wget -q http://host/quiet
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/conn.cst" as cn;
+use "../lib/http/url.cst" as url;
+use "../lib/http/http.cst" as http;
+
+let is i64 as MAX_REDIRECT = 5;
+let is i64 as ADDR_WAIT_NS = 10000000000;
+
+let is [512]u8 as host;
+let is i64 as hostlen with mut = 0;
+let is i64 as port with mut = 80;
+let is i64 as scheme with mut = 0;
+let is [1024]u8 as path;
+let is i64 as pathlen with mut = 0;
+
+let is [2048]u8 as reqbuf;
+let is [4096]u8 as body;
+let is [1024]u8 as outname;
+let is http.Resp as resp;
+let is cn.Conn as conn;
+
+let is i64 as quiet with mut = 0;
+
+fn say(s as *u8) as void { if (quiet == 0) { prog.outs(s); } return; }
+fn say_num(v as i64) as void { if (quiet == 0) { prog.out_num(v); } return; }
+
+fn err(s as *u8) as void { prog.outs(s); return; }
+
+fn print_ip(v as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (i > 0) { say("."); }
+        say_num((v >> (24 - i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return;
+}
+
+fn usage() as void {
+    prog.outs("usage: wget [-O file] [-q] <url>\n");
+    prog.outs("  -O file   write here instead of the name in the url\n");
+    prog.outs("  -q        no progress output\n");
+    return;
+}
+
+// Take a parsed URL into the current target. Copying rather than pointing:
+// the source buffer for a redirect is inside the response, which the next
+// request overwrites.
+fn adopt(u as *url.Url) as i64 {
+    if (u.hostlen <= 0 || u.hostlen >= 512) { return 0 - 1; }
+    let is *u8 as h = url.host_ptr(u);
+    let is i64 as i with mut = 0;
+    while (i < u.hostlen) { host[i] = h[i]; i = i + 1; }
+    host[u.hostlen] = cast(u8, 0);
+    hostlen = u.hostlen;
+    port = u.port;
+    scheme = u.scheme;
+    pathlen = 0;
+    if (u.pathlen > 0) {
+        if (u.pathlen >= 1024) { return 0 - 1; }
+        let is *u8 as p = url.path_ptr(u);
+        i = 0;
+        while (i < u.pathlen) { path[i] = p[i]; i = i + 1; }
+        pathlen = u.pathlen;
+    }
+    return 0;
+}
+
+// A Location header, which may be absolute, rooted, or relative to the path
+// we asked for. All three are legal (RFC 7231 §7.1.2) and a client that only
+// handles the absolute form fails on about half the redirects in the world.
+fn adopt_location(loc as *u8, loclen as i64) as i64 {
+    if (loclen <= 0) { return 0 - 1; }
+    if (loc[0] == cast(u8, 47)) {                        // "/rooted"
+        if (loclen >= 1024) { return 0 - 1; }
+        let is i64 as i with mut = 0;
+        while (i < loclen) { path[i] = loc[i]; i = i + 1; }
+        pathlen = loclen;
+        return 0;
+    }
+    let is url.Url as u;
+    if (url.parse(loc, loclen, &u) == 0 && u.hostlen > 0) {
+        // Only treat it as absolute when it really carried an authority; the
+        // parser accepts a bare host, and "other.html" is not one.
+        let is i64 as has_scheme with mut = 0;
+        if (loclen > 7 && url.matches(loc, loclen, 0, cast(*u8, "http://"), 7) == 1) {
+            has_scheme = 1;
+        }
+        if (loclen > 8 && url.matches(loc, loclen, 0, cast(*u8, "https://"), 8) == 1) {
+            has_scheme = 1;
+        }
+        if (has_scheme == 1) { return adopt(&u); }
+    }
+    // Relative: replace the last path segment.
+    let is i64 as cut with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < pathlen) {
+        if (path[i] == cast(u8, 47)) { cut = i + 1; }
+        i = i + 1;
+    }
+    if (cut + loclen >= 1024) { return 0 - 1; }
+    i = 0;
+    while (i < loclen) { path[cut + i] = loc[i]; i = i + 1; }
+    pathlen = cut + loclen;
+    return 0;
+}
+
+// The file name a URL implies: its last path segment, or index.html when it
+// has none. A name with a slash in it would write outside where the user
+// asked, so anything odd falls back rather than being obeyed.
+fn derive_name() as void {
+    let is i64 as start with mut = 0;
+    let is i64 as end with mut = pathlen;
+    let is i64 as i with mut = 0;
+    while (i < pathlen) {
+        if (path[i] == cast(u8, 63)) { end = i; i = pathlen; }      // '?'
+        else { i = i + 1; }
+    }
+    i = 0;
+    while (i < end) {
+        if (path[i] == cast(u8, 47)) { start = i + 1; }
+        i = i + 1;
+    }
+    let is i64 as n = end - start;
+    if (n <= 0 || n >= 1024) {
+        outname[0] = cast(u8, 105); outname[1] = cast(u8, 110);
+        outname[2] = cast(u8, 100); outname[3] = cast(u8, 101);
+        outname[4] = cast(u8, 120); outname[5] = cast(u8, 46);
+        outname[6] = cast(u8, 104); outname[7] = cast(u8, 116);
+        outname[8] = cast(u8, 109); outname[9] = cast(u8, 108);
+        outname[10] = cast(u8, 0);
+        return;
+    }
+    i = 0;
+    while (i < n) { outname[i] = path[start + i]; i = i + 1; }
+    outname[n] = cast(u8, 0);
+    return;
+}
+
+// One request/response. Returns the status, or a negative error. The body,
+// when there is one to keep, goes to `fd`.
+fn fetch(fd as i64, out_bytes as *i64) as i64 {
+    let is i64 as ip = nc.resolve(cast(*u8, &host[0]), hostlen);
+    if (ip == 0) {
+        err("wget: cannot resolve ");
+        prog.out(cast(*u8, &host[0]), hostlen);
+        err("\n");
+        return 0 - 1;
+    }
+    say("connecting to ");
+    print_ip(ip);
+    say(":");
+    say_num(port);
+    say("\n");
+
+    let is i64 as s = nc.dial(ip, port, &conn);
+    if (s < 0) {
+        err("wget: connection failed\n");
+        return 0 - 1;
+    }
+
+    let is i64 as rlen = http.build_request(cast(*u8, &reqbuf[0]), 2048,
+                                            cast(*u8, "GET"),
+                                            cast(*u8, &host[0]), hostlen,
+                                            port, url.PORT_HTTP,
+                                            cast(*u8, &path[0]), pathlen);
+    if (rlen <= 0) {
+        err("wget: url too long for a request\n");
+        nc.close(s);
+        return 0 - 1;
+    }
+    if (cn.write_all(&conn, cast(*u8, &reqbuf[0]), rlen) != rlen) {
+        err("wget: could not send the request\n");
+        nc.close(s);
+        return 0 - 1;
+    }
+
+    let is i64 as st = http.read_head(&resp, &conn, 0);
+    if (st < 0) {
+        err("wget: bad response (");
+        prog.out_num(st);
+        err(")\n");
+        nc.close(s);
+        return 0 - 1;
+    }
+    say("HTTP ");
+    say_num(st);
+    if (resp.clen >= 0) { say(", "); say_num(resp.clen); say(" bytes"); }
+    if (resp.body_kind == http.BODY_CHUNKED) { say(", chunked"); }
+    say("\n");
+
+    if (http.is_redirect(&resp) == 1) {
+        http.drain(&resp, &conn);
+        nc.close(s);
+        return st;
+    }
+    if (st != 200) {
+        http.drain(&resp, &conn);
+        nc.close(s);
+        return st;
+    }
+
+    let is i64 as total with mut = 0;
+    while (1 == 1) {
+        let is i64 as n = http.read_body(&resp, &conn, cast(*u8, &body[0]), 4096);
+        if (n < 0) {
+            err("wget: transfer failed after ");
+            prog.out_num(total);
+            err(" bytes\n");
+            nc.close(s);
+            return 0 - 1;
+        }
+        if (n == 0) { break; }
+        let is i64 as w = sys.write(fd, cast(*u8, &body[0]), n);
+        if (w != n) {
+            err("wget: write failed\n");
+            nc.close(s);
+            return 0 - 1;
+        }
+        total = total + n;
+    }
+    nc.close(s);
+    out_bytes[0] = total;
+    return st;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as have_out with mut = 0;
+    let is i64 as target with mut = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as a = prog.arg(argv, ai);
+        if (a[0] == cast(u8, 45) && a[1] != cast(u8, 0)) {           // '-'
+            if (a[1] == cast(u8, 113)) { quiet = 1; ai = ai + 1; }   // -q
+            else {
+                if (a[1] == cast(u8, 79)) {                          // -O
+                    if (ai + 1 >= argc) { usage(); return cast(i32, 1); }
+                    let is *u8 as v = prog.arg(argv, ai + 1);
+                    let is i64 as n with mut = 0;
+                    while (v[n] != cast(u8, 0) && n < 1023) {
+                        outname[n] = v[n];
+                        n = n + 1;
+                    }
+                    outname[n] = cast(u8, 0);
+                    have_out = 1;
+                    ai = ai + 2;
+                } else { usage(); return cast(i32, 1); }
+            }
+        } else {
+            target = cast(i64, a);
+            ai = ai + 1;
+        }
+    }
+    if (target == 0) { usage(); return cast(i32, 1); }
+
+    let is *u8 as t = cast(*u8, target);
+    let is i64 as tlen with mut = 0;
+    while (t[tlen] != cast(u8, 0)) { tlen = tlen + 1; }
+
+    let is url.Url as u;
+    let is i64 as pr = url.parse(t, tlen, &u);
+    if (pr != 0) {
+        err("wget: cannot parse that url (");
+        prog.out_num(pr);
+        err(")\n");
+        return cast(i32, 1);
+    }
+    if (adopt(&u) != 0) { err("wget: url too long\n"); return cast(i32, 1); }
+    if (scheme == url.HTTPS) {
+        // Said plainly rather than quietly fetched over plain HTTP, which
+        // would give the user a file they believe was encrypted in transit.
+        err("wget: https is not supported yet — TLS is the next phase\n");
+        return cast(i32, 1);
+    }
+    if (have_out == 0) { derive_name(); }
+
+    let is i64 as ar = nc.attach(np.NET_FD);
+    if (ar != 0) {
+        err("wget: no netd on fd 3 (");
+        prog.out_num(ar);
+        err(") — nothing spawned this with a network channel\n");
+        return cast(i32, 1);
+    }
+    if (nc.wait_address(ADDR_WAIT_NS) == 0) {
+        err("wget: no address (dhcp did not answer)\n");
+        return cast(i32, 1);
+    }
+
+    let is i64 as fd = sys.open_write(cast(*u8, &outname[0]));
+    if (fd < 0) {
+        err("wget: cannot create ");
+        prog.outs(cast(*u8, &outname[0]));
+        err("\n");
+        return cast(i32, 1);
+    }
+
+    let is [1]i64 as got;
+    got[0] = 0;
+    let is i64 as t0 = sys.time_ns();
+    let is i64 as hops with mut = 0;
+    let is i64 as st with mut = 0;
+    while (hops <= MAX_REDIRECT) {
+        st = fetch(fd, cast(*i64, &got[0]));
+        if (st < 0) { sys.close(fd); return cast(i32, 1); }
+        if (http.is_redirect(&resp) == 0) { break; }
+        if (adopt_location(http.location(&resp), resp.loclen) != 0) {
+            err("wget: bad redirect target\n");
+            sys.close(fd);
+            return cast(i32, 1);
+        }
+        say("redirected to ");
+        if (quiet == 0) { prog.out(cast(*u8, &path[0]), pathlen); }
+        say("\n");
+        hops = hops + 1;
+        st = 0 - 2;                        // not finished yet
+    }
+    sys.close(fd);
+
+    if (st == 0 - 2) {
+        err("wget: too many redirects\n");
+        return cast(i32, 1);
+    }
+    if (st != 200) {
+        err("wget: server said ");
+        prog.out_num(st);
+        err("\n");
+        return cast(i32, 1);
+    }
+
+    let is i64 as dt = sys.time_ns() - t0;
+    say("saved ");
+    say_num(got[0]);
+    say(" bytes to ");
+    if (quiet == 0) { prog.outs(cast(*u8, &outname[0])); }
+    say(" in ");
+    say_num(dt / 1000000);
+    say(" ms\n");
+    return cast(i32, 0);
+}
