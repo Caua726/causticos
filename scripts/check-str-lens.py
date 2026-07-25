@@ -88,7 +88,8 @@ SEND_DATA = re.compile(
 # ignored. Add a name here when a new function takes a counted string.
 LITLEN = re.compile(
     r'\b(?:url\.parse|url\.matches|matches|nc\.resolve|resolve'
-    r'|line_is|hdr_is|value_has|build_request|put|mock_start)\s*\('
+    r'|line_is|hdr_is|value_has|build_request|put|mock_start'
+    r'|hex_decode|eq_hex|hkdf_extract|hkdf_expand)\s*\('
     r'[^;]{0,200}?'
     r'cast\(\*u8,\s*"(?P<text>(?:[^"\\]|\\.)*)"\)\s*,\s*(?P<len>\d+)'
 )

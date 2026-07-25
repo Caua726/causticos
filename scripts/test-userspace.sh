@@ -20,6 +20,7 @@ TESTS=(
     "nett:40:"
     "tcpt:60:"
     "kabi:30:"
+    "cryptot:60:"
     "pingt:60:userspace/build/ping.cse"
     "netdt:70:userspace/build/netd.cse"
     "httpt:150:userspace/build/netd.cse userspace/build/wget.cse"
