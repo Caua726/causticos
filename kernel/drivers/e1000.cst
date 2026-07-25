@@ -6,8 +6,9 @@
 // that misleads every reader after the one who wrote it.
 //
 // Match (vendor 0x8086, device 0x100E) + capability lifecycle live in
-// kernel/drivers/e1000.cdvrspec; this file provides the bind / IRQ / send /
-// recv functions and the static state used by all of them.
+// kernel/drivers/e1000.cdvrspec; this file provides the bind and IRQ
+// callbacks, the netdev.NetDevice vtable that makes the port reachable from
+// userspace, and the static state behind both.
 //
 // Rings: legacy 16-byte TX/RX descriptors, 32 entries each, 2 KiB
 // buffers per slot (well above MTU for QEMU's user-mode netdev). All
@@ -25,6 +26,7 @@ use "heap.cst" as heap;
 use "lock.cst" as lock;
 use "sched.cst" as sched;
 use "timer.cst" as timer;
+use "netdev.cst" as netdev;
 
 // ============================================================
 // Register offsets (from Intel 8254x family software dev manual)
@@ -124,7 +126,8 @@ struct E1000Ctx {
 
     tx_ring as *driver.DmaBuffer;
     tx_bufs as *driver.DmaBuffer;
-    tx_tail as i64;                       // local copy of TDT
+    tx_tail as i64;                       // local copy of TDT: next slot to fill
+    tx_clean as i64;                       // next slot to reap
     tx_lock as lock.TicketLock;
 
     rx_ring as *driver.DmaBuffer;
@@ -135,9 +138,9 @@ struct E1000Ctx {
     tx_packets as i64;
     rx_packets as i64;
 
-    // tid of a thread blocked in the smoke test waiting for any
-    // RX packet. Set to -1 when nobody is waiting.
-    rx_waiter_tid as i64;
+    // Index handed back by netdev.register, so poll_rx knows which port's
+    // ring to push into and the IRQ knows whom to drain.
+    port_index as i64;
 }
 
 let is E1000Ctx as ctx;
@@ -145,16 +148,12 @@ let is i32 as ctx_bound with mut = 0;
 
 let is [6]u8 as e1000_mac_buf;
 
-// Phase 4 slice 1+2: the "NetworkController" interface IS the vtable.
-// Caustic has no `interface` construct — this is documentation only. The
-// vtable is built and looked up at runtime from e1000.cdvrspec's
-// `implements NetworkController { ... }` block (by name; see spec.cst),
-// so nothing references this as a Caustic type. For the record, the
-// declaration/ABI order must match that implements block:
-//   NetworkController:
-//     send as fn(*u8, i64) as i32;
-//     recv as fn(*u8, i64) as i32;
-//     mac  as fn() as *u8;
+// The netdev.NetDevice this controller registers. A real vtable resolved at
+// compile time, replacing the `implements NetworkController` block the spec
+// used to carry: that mechanism resolved method names positionally, by their
+// order in the spec TEXT, with no type checking anywhere — and nothing ever
+// called it. netdev.cst is where a NIC becomes reachable now.
+let is netdev.NetDevice as nd;
 
 // ============================================================
 // MMIO helpers
@@ -429,19 +428,51 @@ fn init_rx() as i32 {
 // the DMA buffer alloc API.
 // ============================================================
 
-fn e1000_send(packet as *u8, len as i64) as i32 {
-    if (ctx_bound == 0) { return driver.NOT_SUPPORTED; }
-    if (len < 14) { return driver.INVALID_ARGUMENT; }
-    if (len > PKT_BUF_SIZE) { return driver.INVALID_ARGUMENT; }
+// Reap every transmit descriptor the controller has finished with, so the
+// slots come back. Caller holds tx_lock. One vacant slot is always kept so
+// tx_tail == tx_clean means empty and can never also mean full.
+fn tx_reclaim_locked() as i64 {
+    while (ctx.tx_clean != ctx.tx_tail) {
+        let is *u8 as d = desc_addr(cast(i64, ctx.tx_ring.virt), ctx.tx_clean);
+        if ((read_u8_at(d, 12) & DESC_STATUS_DD) == 0) { return tx_free_locked(); }
+        write_u8_at(d, 12, 0);
+        let is i64 as nx with mut = ctx.tx_clean + 1;
+        if (nx >= RING_LEN) { nx = 0; }
+        ctx.tx_clean = nx;
+    }
+    return tx_free_locked();
+}
+
+fn tx_free_locked() as i64 {
+    let is i64 as inflight with mut = ctx.tx_tail - ctx.tx_clean;
+    if (inflight < 0) { inflight = inflight + RING_LEN; }
+    return RING_LEN - 1 - inflight;
+}
+
+// netdev vtable: transmit one frame. Never blocks and never waits on the
+// wire — it stages the frame, rings the doorbell and returns.
+//
+// It used to wait synchronously for this descriptor's DD bit with a one
+// second budget, which capped the interface at one frame per descriptor
+// writeback round trip: fine for a smoke test sending one ARP, useless for
+// a TCP stack. Waiting is netdev's business now (net_write blocks when the
+// ring is full), and reporting fullness honestly is this function's.
+fn nd_send(priv as *u8, frame as *u8, len as i64) as i64 {
+    if (ctx_bound == 0) { return 0 - 2; }
+    if (len < 14 || len > PKT_BUF_SIZE) { return 0 - 3; }
 
     let is i64 as flags = lock.acquire_irq(&ctx.tx_lock);
+    if (tx_reclaim_locked() <= 0) {
+        lock.release_irq(&ctx.tx_lock, flags);
+        return netdev.NET_TX_BUSY;
+    }
     let is i64 as slot = ctx.tx_tail;
     let is *u8 as bbuf = buf_virt(ctx.tx_bufs, slot);
     let is i64 as bphys = buf_phys(ctx.tx_bufs, slot);
 
     let is i64 as i with mut = 0;
     while (i < len) {
-        bbuf[i] = packet[i];
+        bbuf[i] = frame[i];
         i = i + 1;
     }
 
@@ -454,76 +485,69 @@ fn e1000_send(packet as *u8, len as i64) as i32 {
     write_u8_at(d, 13, 0);
     write_u16(d, 14, 0);
 
-    let is i64 as next = slot + 1;
-    let is i64 as next_mod with mut = next;
+    let is i64 as next_mod with mut = slot + 1;
     if (next_mod >= RING_LEN) { next_mod = 0; }
     ctx.tx_tail = next_mod;
     write32(REG_TDT, next_mod);
+    ctx.tx_packets = ctx.tx_packets + 1;
     lock.release_irq(&ctx.tx_lock, flags);
+    return len;
+}
 
-    // Synchronous wait for DD with a 1s budget. send() callers are
-    // typically smoke threads doing one packet at a time; queue-mode
-    // senders should poll DD on their own slot instead.
-    let is i64 as bail_at = timer.current_time_ns() + 1000000000;
-    while (timer.current_time_ns() < bail_at) {
+fn nd_tx_free(priv as *u8) as i64 {
+    if (ctx_bound == 0) { return 0; }
+    let is i64 as flags = lock.acquire_irq(&ctx.tx_lock);
+    let is i64 as n = tx_reclaim_locked();
+    lock.release_irq(&ctx.tx_lock, flags);
+    return n;
+}
+
+// netdev vtable: move up to `budget` received frames into the port's ring.
+// Runs from the IRQ handler and from a reader about to sleep; netdev holds
+// the port lock across the call, which is what serialises the ring, so this
+// takes no lock of its own.
+fn nd_poll_rx(priv as *u8, budget as i64) as i64 {
+    if (ctx_bound == 0) { return 0; }
+    let is i64 as taken with mut = 0;
+    while (taken < budget) {
+        let is i64 as slot = ctx.rx_head;
+        let is *u8 as d = desc_addr(cast(i64, ctx.rx_ring.virt), slot);
         let is i64 as st = read_u8_at(d, 12);
-        if ((st & DESC_STATUS_DD) != 0) {
-            ctx.tx_packets = ctx.tx_packets + 1;
-            return cast(i32, 0);
-        }
-        sched.sleep_for_ns(1000000);   // 1 ms
+        if ((st & DESC_STATUS_DD) == 0) { return taken; }
+        let is i64 as len = read_u16(d, 8);
+        netdev.rx_push(ctx.port_index, cast(i64, buf_virt(ctx.rx_bufs, slot)), len);
+
+        // Hand the descriptor back: clear status/length/errors, leave
+        // buffer_addr alone, then publish the slot to the controller.
+        write_u16(d, 8, 0);
+        write_u16(d, 10, 0);
+        write_u8_at(d, 12, 0);
+        write_u8_at(d, 13, 0);
+        write_u16(d, 14, 0);
+        write32(REG_RDT, slot);
+        let is i64 as next with mut = slot + 1;
+        if (next >= RING_LEN) { next = 0; }
+        ctx.rx_head = next;
+        ctx.rx_packets = ctx.rx_packets + 1;
+        taken = taken + 1;
     }
-    return cast(i32, 0 - 1);            // TX timeout
+    return taken;
 }
 
-// ============================================================
-// recv() — non-blocking dequeue. Returns -1 if no packet is ready,
-// otherwise the byte length copied into `packet` (capped by
-// max_len). Pumps RDT forward so the descriptor is recycled.
-// ============================================================
-
-fn e1000_recv(packet as *u8, max_len as i64) as i32 {
-    if (ctx_bound == 0) { return driver.NOT_SUPPORTED; }
-
-    let is i64 as flags = lock.acquire_irq(&ctx.rx_lock);
-    let is i64 as slot = ctx.rx_head;
-    let is *u8 as d = desc_addr(cast(i64, ctx.rx_ring.virt), slot);
-    let is i64 as st = read_u8_at(d, 12);
-    if ((st & DESC_STATUS_DD) == 0) {
-        lock.release_irq(&ctx.rx_lock, flags);
-        return cast(i32, 0 - 1);
-    }
-    let is i64 as len = read_u16(d, 8);
-    let is *u8 as src = buf_virt(ctx.rx_bufs, slot);
-    let is i64 as copy_len with mut = len;
-    if (copy_len > max_len) { copy_len = max_len; }
+fn nd_mac(priv as *u8, out6 as *u8) as i64 {
     let is i64 as i with mut = 0;
-    while (i < copy_len) {
-        packet[i] = src[i];
-        i = i + 1;
-    }
-
-    // Reset descriptor for HW reuse: clear status, length, errors.
-    // buffer_addr stays put.
-    write_u16(d, 8, 0);
-    write_u16(d, 10, 0);
-    write_u8_at(d, 12, 0);
-    write_u8_at(d, 13, 0);
-    write_u16(d, 14, 0);
-
-    // Advance RDT to the slot we just consumed (HW will own it
-    // again once we publish), then bump our local rx_head.
-    write32(REG_RDT, slot);
-    let is i64 as next with mut = slot + 1;
-    if (next >= RING_LEN) { next = 0; }
-    ctx.rx_head = next;
-    ctx.rx_packets = ctx.rx_packets + 1;
-    lock.release_irq(&ctx.rx_lock, flags);
-    return cast(i32, copy_len);
+    while (i < 6) { out6[i] = e1000_mac_buf[i]; i = i + 1; }
+    return 0;
 }
 
-fn e1000_mac() as *u8 {
-    return &e1000_mac_buf[0];
+fn nd_link_up(priv as *u8) as i64 {
+    if (ctx_bound == 0) { return 0; }
+    if ((read32(REG_STATUS) & STATUS_LU) != 0) { return 1; }
+    return 0;
+}
+
+fn nd_mtu(priv as *u8) as i64 {
+    return 1500;
 }
 
 // ============================================================
@@ -545,125 +569,22 @@ fn e1000_irq(hw as *driver.Hardware, context as *u8) as i32 {
         serial.println("", 0);
     }
 
-    if ((cause & INT_RXT0) != 0) {
-        // Wake any thread blocked on RX. Guard against the no-waiter
-        // case (rx_waiter_tid==-1 between smoke runs) — wakeup_thread
-        // on -1 would still acquire cpu 0's sched_lock just to find
-        // an absent thread, and that's pointless work in IRQ context
-        // when packets arrive with no consumer.
-        let is i64 as t = ctx.rx_waiter_tid;
-        if (t > 0) { sched.wakeup_thread(t); }
+    if ((cause & INT_RXO) != 0) {
+        // The controller ran out of descriptors and dropped frames. Nothing
+        // to do in-handler, but it is real information about a ring that is
+        // too small or a consumer that is too slow, so it gets counted rather
+        // than ignored.
+        netdev.note_hw_drop(ctx.port_index);
+    }
+
+    if ((cause & (INT_RXT0 | INT_RXO)) != 0) {
+        // Drain a bounded batch into the port ring and wake any reader. The
+        // budget is what keeps time-at-interrupt bounded; a reader that misses
+        // this wakeup still makes progress because net_read pumps before it
+        // sleeps.
+        netdev.irq_drain(ctx.port_index);
     }
     return 0;
-}
-
-// ============================================================
-// Smoke thread — once link is up, push an ARP request for the QEMU
-// SLIRP gateway (10.0.2.2) and wait for the reply. SLIRP synthesises
-// the answer, so on a healthy build we always see an ARP reply
-// within tens of milliseconds.
-// ============================================================
-
-fn e1000_wait_link(timeout_ns as i64) as i32 {
-    let is i64 as deadline = timer.current_time_ns() + timeout_ns;
-    while (timer.current_time_ns() < deadline) {
-        if ((read32(REG_STATUS) & STATUS_LU) != 0) { return 0; }
-        sched.sleep_for_ns(50000000);          // 50 ms
-    }
-    return cast(i32, 0 - 1);
-}
-
-fn store_be16(p as *u8, off as i64, v as i64) as void {
-    p[off]     = cast(u8, (v >> 8) & 0xFF);
-    p[off + 1] = cast(u8, v & 0xFF);
-}
-
-fn build_arp_request(out as *u8) as i64 {
-    // dst MAC = ff:ff:ff:ff:ff:ff
-    let is i64 as i with mut = 0;
-    while (i < 6) { out[i] = cast(u8, 0xFF); i = i + 1; }
-    // src MAC
-    let is i64 as j with mut = 0;
-    while (j < 6) { out[6 + j] = e1000_mac_buf[j]; j = j + 1; }
-    store_be16(out, 12, 0x0806);                // ethertype = ARP
-    store_be16(out, 14, 0x0001);                // htype = ethernet
-    store_be16(out, 16, 0x0800);                // ptype = ipv4
-    out[18] = cast(u8, 6);                      // hlen
-    out[19] = cast(u8, 4);                      // plen
-    store_be16(out, 20, 0x0001);                // oper = request
-    let is i64 as k with mut = 0;
-    while (k < 6) { out[22 + k] = e1000_mac_buf[k]; k = k + 1; }
-    out[28] = cast(u8, 10);                     // sender IP 10.0.2.15
-    out[29] = cast(u8, 0);
-    out[30] = cast(u8, 2);
-    out[31] = cast(u8, 15);
-    let is i64 as l with mut = 0;
-    while (l < 6) { out[32 + l] = cast(u8, 0); l = l + 1; }
-    out[38] = cast(u8, 10);                     // target IP 10.0.2.2
-    out[39] = cast(u8, 0);
-    out[40] = cast(u8, 2);
-    out[41] = cast(u8, 2);
-    return 42;
-}
-
-fn print_hex_bytes(p as *u8, n as i64) as void {
-    let is i64 as i with mut = 0;
-    while (i < n) {
-        print_byte_hex(cast(i64, p[i]));
-        if (i < n - 1) { serial.putc(58); }
-        i = i + 1;
-    }
-}
-
-fn run_smoke() as void {
-    serial.println("e1000.smoke: waiting for link", 29);
-    if (e1000_wait_link(5000000000) != 0) {
-        serial.println("e1000.smoke: link did not come up in 5s", 39);
-        return;
-    }
-    serial.println("e1000.smoke: link up", 20);
-
-    let is [64]u8 as arp;
-    let is i64 as arp_len = build_arp_request(&arp[0]);
-    let is i32 as src = e1000_send(&arp[0], arp_len);
-    serial.print("e1000.smoke: send rc=", 21);
-    util.print_num(cast(i64, src));
-    serial.println("", 0);
-    if (src != 0) { return; }
-
-    // Poll for any incoming frame. SLIRP synthesises an ARP reply
-    // for 10.0.2.2 immediately, so this normally lands in the first
-    // sleep window. recv() is non-blocking; the IRQ handler also
-    // wakes rx_waiter_tid for non-polling consumers.
-    ctx.rx_waiter_tid = sched.current_tid();
-    let is [128]u8 as rxbuf;
-    let is i64 as deadline = timer.current_time_ns() + 2000000000;
-    while (timer.current_time_ns() < deadline) {
-        let is i32 as rrc = e1000_recv(&rxbuf[0], 128);
-        if (rrc > 0) {
-            serial.print("e1000.smoke: rx ", 16);
-            util.print_num(cast(i64, rrc));
-            serial.print("B src=", 6);
-            print_hex_bytes(&rxbuf[6], 6);
-            serial.print(" type=", 6);
-            print_hex_bytes(&rxbuf[12], 2);
-            serial.println("", 0);
-            ctx.rx_waiter_tid = cast(i64, 0 - 1);
-            serial.println("e1000.smoke: PASS", 17);
-            return;
-        }
-        sched.sleep_for_ns(20000000);          // 20 ms
-    }
-    ctx.rx_waiter_tid = cast(i64, 0 - 1);
-    serial.println("e1000.smoke: no reply in 2s — FAIL", 33);
-}
-
-fn e1000_smoke_thread() as void {
-    if (ctx_bound == 0) {
-        serial.println("e1000.smoke: driver not bound", 29);
-        return;
-    }
-    run_smoke();
 }
 
 // ============================================================
@@ -684,10 +605,11 @@ fn e1000_bind(b as *spec.Binding) as i32 {
     ctx.regs = regs;
     ctx.binding = b;
     ctx.tx_tail = 0;
+    ctx.tx_clean = 0;
     ctx.rx_head = 0;
     ctx.tx_packets = 0;
     ctx.rx_packets = 0;
-    ctx.rx_waiter_tid = cast(i64, 0 - 1);
+    ctx.port_index = cast(i64, 0 - 1);
 
     // PCI bus master + memory space — DMA fails silently otherwise.
     pci.pci_enable_bus_master(b.hardware);
@@ -725,14 +647,15 @@ fn e1000_bind(b as *spec.Binding) as i32 {
 
     enable_link();
 
-    // Drain any latched ICR bits the reset might have left, then
-    // unmask only the causes we actually consume — RX-packet-timer
-    // and link-status changes. TX completion is harvested
-    // synchronously inside send(), so TXDW would just spam the
-    // shared IRQ dispatcher; RXO/RXDMT0 fire when we'd already be
-    // dropping packets and reacting in-handler doesn't help.
+    // Drain any latched ICR bits the reset might have left, then unmask only
+    // the causes we consume: RX-packet-timer, receive overrun, and link
+    // status. TXDW stays masked because transmit completions are reaped
+    // lazily on the next send — reaping them at interrupt would add a wakeup
+    // per packet and buy nothing. RXO is new: it means the controller itself
+    // dropped frames, which is worth counting even though nothing can be done
+    // about it in the handler.
     read32(REG_ICR);
-    write32(REG_IMS, INT_RXT0 | INT_LSC);
+    write32(REG_IMS, INT_RXT0 | INT_RXO | INT_LSC);
 
     let is i64 as st = read32(REG_STATUS);
     serial.print("e1000: status=", 14);
@@ -742,24 +665,42 @@ fn e1000_bind(b as *spec.Binding) as i32 {
     serial.println("", 0);
 
     ctx_bound = 1;
-    // Run the smoke test inline so we exercise TX + RX + IRQ once
-    // before bind returns. Polling-based; IRQ wakeups are still wired
-    // for future consumers but the smoke doesn't depend on them.
-    run_smoke();
+
+    // Publish the port. Until this returns, poll_rx has no ring to push into
+    // and the IRQ has nobody to drain, so it happens before the first frame
+    // can arrive — the controller's receiver was only just enabled and the
+    // interrupt is still the one we unmasked above.
+    nd.name[0] = cast(u8, 101); nd.name[1] = cast(u8, 49);      // "e1000"
+    nd.name[2] = cast(u8, 48);  nd.name[3] = cast(u8, 48);
+    nd.name[4] = cast(u8, 48);  nd.name[5] = cast(u8, 0);
+    nd.send        = fn_ptr(nd_send);
+    nd.poll_rx     = fn_ptr(nd_poll_rx);
+    nd.tx_free     = fn_ptr(nd_tx_free);
+    nd.mac         = fn_ptr(nd_mac);
+    nd.link_up     = fn_ptr(nd_link_up);
+    nd.mtu         = fn_ptr(nd_mtu);
+    nd.set_promisc = cast(fn(*u8, i64) as i64, 0);   // RCTL already UPE|MPE
+    nd.priv        = cast(*u8, &ctx);
+    nd.next        = cast(*netdev.NetDevice, 0);
+    let is i64 as pi = netdev.register(&nd, cast(i64, b.hardware));
+    if (pi < 0) {
+        serial.println("e1000: netdev.register failed", 28);
+        return cast(i32, 0 - 5);
+    }
+    ctx.port_index = pi;
     return driver.OK;
 }
 
 // ============================================================
-// ksym registration — names match the lifecycle / implements blocks
-// in e1000.cdvrspec verbatim.
+// ksym registration — names match the lifecycle block in e1000.cdvrspec
+// verbatim. Only bind and irq are published now: send/recv/mac used to be
+// here for the `implements NetworkController` block, which resolved them by
+// position in the spec text and which nothing ever called. They reach the
+// system through netdev.NetDevice instead, as a checked vtable.
 // ============================================================
 
 let is ksym.KSym as ksym_e1000_bind;
 let is ksym.KSym as ksym_e1000_irq;
-let is ksym.KSym as ksym_e1000_send;
-let is ksym.KSym as ksym_e1000_recv;
-let is ksym.KSym as ksym_e1000_mac;
-let is ksym.KSym as ksym_e1000_smoke;
 
 fn register() as void {
     ksym_e1000_bind.name_ptr = cast(*u8, "e1000.e1000_bind");
@@ -773,28 +714,4 @@ fn register() as void {
     ksym_e1000_irq.addr     = cast(i64, fn_ptr(e1000_irq));
     ksym_e1000_irq.kind     = ksym.KIND_FUNC;
     ksym.register(&ksym_e1000_irq);
-
-    ksym_e1000_send.name_ptr = cast(*u8, "e1000.e1000_send");
-    ksym_e1000_send.name_len = 16;
-    ksym_e1000_send.addr     = cast(i64, fn_ptr(e1000_send));
-    ksym_e1000_send.kind     = ksym.KIND_FUNC;
-    ksym.register(&ksym_e1000_send);
-
-    ksym_e1000_recv.name_ptr = cast(*u8, "e1000.e1000_recv");
-    ksym_e1000_recv.name_len = 16;
-    ksym_e1000_recv.addr     = cast(i64, fn_ptr(e1000_recv));
-    ksym_e1000_recv.kind     = ksym.KIND_FUNC;
-    ksym.register(&ksym_e1000_recv);
-
-    ksym_e1000_mac.name_ptr = cast(*u8, "e1000.e1000_mac");
-    ksym_e1000_mac.name_len = 15;
-    ksym_e1000_mac.addr     = cast(i64, fn_ptr(e1000_mac));
-    ksym_e1000_mac.kind     = ksym.KIND_FUNC;
-    ksym.register(&ksym_e1000_mac);
-
-    ksym_e1000_smoke.name_ptr = cast(*u8, "e1000.e1000_smoke_thread");
-    ksym_e1000_smoke.name_len = 24;
-    ksym_e1000_smoke.addr     = cast(i64, fn_ptr(e1000_smoke_thread));
-    ksym_e1000_smoke.kind     = ksym.KIND_FUNC;
-    ksym.register(&ksym_e1000_smoke);
 }

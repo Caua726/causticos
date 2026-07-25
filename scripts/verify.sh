@@ -41,13 +41,24 @@ for i in $(seq 1 "$RUNS"); do
     -serial stdio -display none \
     > "$TMPLOG" 2>&1 &
   QPID=$!
-  # Poll the serial for a terminal marker, with a hard deadline of TOUT
-  # seconds. Strip NULs before grep — the kernel's serial output
-  # interleaves NUL bytes and a raw grep misses the marker, which used to
-  # leave every run spinning to the deadline (and mis-report it).
+  # Poll the serial until EVERY smoke has reported, or something fails, with a
+  # hard deadline of TOUT seconds. Strip NULs before grep — the kernel's serial
+  # output interleaves NUL bytes and a raw grep misses the marker, which used
+  # to leave every run spinning to the deadline (and mis-report it).
+  #
+  # Stopping at the FIRST marker is what this used to do, and it silently
+  # became wrong the moment a second smoke existed: the fat32 gauntlet finishes
+  # first, qemu was killed, and the network smoke's verdict was cut off
+  # mid-boot and read as absent. Every marker added below must also be added
+  # to the pass criteria further down.
   DEADLINE=$((SECONDS + TOUT))
   while kill -0 $QPID 2>/dev/null; do
-    if tr -d '\000' < "$TMPLOG" | grep -qE "ALL PHASE-6 TESTS PASS|vfs\.test: ALL PASS|EXCEPTION|panic:|kernel halted"; then
+    OUT=$(tr -d '\000' < "$TMPLOG")
+    if echo "$OUT" | grep -qE "EXCEPTION|panic:|kernel halted"; then
+      break
+    fi
+    if echo "$OUT" | grep -qE "ALL PHASE-6 TESTS PASS|vfs\.test: ALL PASS" \
+       && echo "$OUT" | grep -qE "netdev_smoke: (PASS|FAIL)"; then
       break
     fi
     if [ "$SECONDS" -ge "$DEADLINE" ]; then
@@ -66,12 +77,18 @@ for i in $(seq 1 "$RUNS"); do
     REASON=$(echo "$RAW" | grep -E "EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted" | head -1)
     echo "  smp=$SMP run=$i: FAIL $REASON"
   elif echo "$RAW" | grep -q "ALL PHASE-6 TESTS PASS"; then
-    if echo "$RAW" | grep -q "vfs: mounted /"; then
-      PASS=$((PASS+1))
-      echo "  smp=$SMP run=$i: PASS"
-    else
+    # Every marker is required, not any one of them. A smoke that stops
+    # printing because it stopped running would otherwise leave the sweep
+    # green, which is worse than having no smoke at all.
+    if ! echo "$RAW" | grep -q "vfs: mounted /"; then
       FAIL=$((FAIL+1))
       echo "  smp=$SMP run=$i: FAIL no-vfs"
+    elif ! echo "$RAW" | grep -q "netdev_smoke: PASS"; then
+      FAIL=$((FAIL+1))
+      echo "  smp=$SMP run=$i: FAIL no-netdev"
+    else
+      PASS=$((PASS+1))
+      echo "  smp=$SMP run=$i: PASS"
     fi
   else
     FAIL=$((FAIL+1))

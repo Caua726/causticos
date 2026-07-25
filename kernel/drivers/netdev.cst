@@ -1,0 +1,744 @@
+// netdev.cst — the network port: what a NIC looks like from userspace.
+//
+// Two NIC drivers already moved frames (e1000 and vnet), and neither was
+// reachable from a program: no device class, no KObject, no way to hold one.
+// This is the layer that closes that, and it is deliberately the ONLY layer —
+// the drivers below it move bytes on and off the wire and know nothing else.
+//
+// WHAT THE KERNEL DOES, AND WHERE IT STOPS (architecture.md §2.1)
+//
+// A frame in, a frame out, and who owns the port. That is the whole mechanism.
+// ARP, IPv4, routing, TCP, DHCP, DNS — every one of those is a decision, and
+// decisions are userspace. There is no socket here and there will not be one;
+// netd holds the port and serves N clients over channels, the same shape the
+// compositor already uses for the framebuffer.
+//
+// ONE READ IS ONE FRAME
+//
+// architecture.md §5 says "stream in the kernel, framing in the app", but that
+// sentence is written about the CHANNEL, the IPC primitive. The precedent that
+// governs a device is the mouse and the tablet: "reads drain fixed N-byte
+// records, whole records only" (abi.cst). A network port follows the device
+// precedent, for a substantive reason: the frame boundary is a fact of the
+// hardware, not a policy of the app. The PHY creates and destroys the framing
+// (preamble, IFG, FCS); by the time a frame reaches a descriptor it already IS
+// a record. Flattening it into a byte stream would force the kernel to INVENT
+// a length prefix — which is exactly the framing-in-the-kernel §5 forbids —
+// and would make loss undetectable, since two frames run together are
+// indistinguishable from one large one. A channel honestly is a sequence of
+// bytes. A NIC honestly is not.
+//
+// A read whose buffer is smaller than the frame returns E_RANGE and DROPS the
+// frame. The alternatives are worse: truncating silently is a lie, and holding
+// the frame lets one caller with a small buffer wedge the ring forever. The
+// drop is honest, bounded and self-correcting — and SYS_NET_INFO reports
+// frame_max before the first read, so a correct caller never sees it.
+//
+// LIVENESS DOES NOT DEPEND ON THE INTERRUPT
+//
+// Frames are pulled from the hardware by rx_pump, which runs in two places:
+// from the driver's IRQ handler with a small budget (the NAPI shape — a known
+// ceiling on time spent at interrupt), and again from net_read just before it
+// sleeps. The second one is the important one. On a shared INTx line, behind
+// an aggressive coalescing setting, or after a handler that returned early,
+// the interrupt is an OPTIMISATION and the consumer still makes progress. On
+// real hardware that is the difference between "works" and "wedges every few
+// hours".
+
+use "driver.cst" as driver;
+use "spec.cst" as spec;
+use "kobject.cst" as kobject;
+use "lock.cst" as lock;
+use "grab.cst" as grab;
+use "sched.cst" as sched;
+use "timer.cst" as timer;
+use "heap.cst" as heap;
+use "abi.cst" as abi;
+use "ksym.cst" as ksym;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+// ============================================================
+// Contract constants
+// ============================================================
+
+let is i64 as NET_MAX_PORTS = 4;
+
+// 14-byte ethernet header + 1500 MTU + 4 FCS. Both drivers strip the FCS
+// before handing a frame over, so a delivered frame is at most 1514 — the
+// extra four keep a jumbo-curious driver from silently overrunning.
+let is i64 as NET_FRAME_MAX = 1518;
+let is i64 as NET_FRAME_MIN = 14;         // a header and nothing else
+let is i64 as NET_MTU_DEFAULT = 1500;
+
+// Per-port receive ring, heap-allocated at registration so an absent NIC costs
+// nothing. 16 KiB absorbs a burst of ~10 full-MTU frames or ~250 bare ACKs
+// between one interrupt and netd's next turn through its poll loop. Whether
+// that is enough is not a guess to be defended: rx_dropped counts every frame
+// this ring could not take and SYS_NET_INFO reports it, so the number can be
+// raised on evidence.
+let is i64 as NET_RX_CAP = 16384;
+
+// Frames pulled per pump. The IRQ budget bounds time at interrupt (16 frames x
+// ~200ns of copy is a few microseconds); the read budget is larger because it
+// runs on a thread that is allowed to take its time.
+let is i64 as NET_RXBUDGET_IRQ  = 16;
+let is i64 as NET_RXBUDGET_READ = 32;
+
+// Driver send() return codes. >= 0 is bytes accepted; NET_TX_BUSY means the
+// ring is full and the caller should retry; anything else below zero is a real
+// error. Distinguishing "full" from "broken" is what lets net_write block
+// instead of failing, and what keeps a genuine fault from looping forever.
+let is i64 as NET_TX_BUSY = 0 - 1;
+
+// A blocked reader parks with a ceiling rather than sleeping outright: if a
+// wakeup is ever lost between the emptiness check and the park, progress
+// resumes on its own instead of hanging.
+let is i64 as NET_PARK_NS = 20000000;      // 20 ms
+let is i64 as NET_QUIET_NS = 2000000;      // 2 ms — a preempted holder's idle
+
+// ============================================================
+// The driver vtable
+//
+// Shape copied exactly from storage.StorageDevice, which has carried AHCI and
+// FAT32 in production: a name array, then function pointers, then pointers.
+// No scalar i64 fields here — every counter lives in NetPort, which is all
+// i64. That is the mixed-width rule being obeyed by reusing a proven layout
+// instead of inventing one (userspace/tests/u64t.cst asserts both shapes).
+//
+// Every method takes priv first, so two of the same card are two registrations
+// and never a singleton with a global.
+// ============================================================
+
+struct NetDevice {
+    name        as [32]u8;
+    // (priv, frame, len) -> len accepted | NET_TX_BUSY | negative error.
+    // Must not block: net_write owns the waiting.
+    send        as fn(*u8, *u8, i64) as i64;
+    // (priv, budget) -> frames handed to rx_push. Called from IRQ context and
+    // from a thread; must be safe in both, and must call netdev.rx_push (not
+    // touch the ring itself) for each frame, at most `budget` times.
+    poll_rx     as fn(*u8, i64) as i64;
+    // (priv) -> free transmit slots, reclaiming completed ones first.
+    tx_free     as fn(*u8) as i64;
+    // (priv, out6) -> 0. Writes six bytes.
+    mac         as fn(*u8, *u8) as i64;
+    link_up     as fn(*u8) as i64;
+    mtu         as fn(*u8) as i64;
+    // (priv, on) -> 0. Null means the device is always promiscuous, which is
+    // what both current drivers are; netd wants every frame anyway.
+    set_promisc as fn(*u8, i64) as i64;
+    priv        as *u8;
+    next        as *NetDevice;
+}
+
+// ============================================================
+// Port state — all i64, no arrays (the ring is heap memory addressed through
+// rx_buf). Counters are honest and per-port; they are what SYS_NET_INFO
+// reports and what makes a dropped frame visible instead of mysterious.
+// ============================================================
+
+struct NetPort {
+    dev        as i64;      // *NetDevice
+    hw         as i64;      // *Hardware — what net_acquire matches on
+    in_use     as i64;
+    rx_buf     as i64;      // NET_RX_CAP bytes from the heap
+    rx_head    as i64;
+    rx_tail    as i64;
+    rx_used    as i64;      // bytes occupied, including the 2-byte headers
+    rx_frames  as i64;      // whole frames queued
+    rx_packets as i64;
+    rx_dropped as i64;      // ring was full
+    rx_toobig  as i64;      // a read arrived with too small a buffer
+    tx_packets as i64;
+    tx_errors  as i64;
+    next_token as i64;
+}
+
+let is [4]NetPort as ports with mut;               // == NET_MAX_PORTS
+// Lock and grab stack stay in their own module arrays rather than nested in
+// NetPort: grab.GrabStack already contains a TicketLock, and a lock nested two
+// deep inside a struct has no proven precedent in this tree.
+let is [4]lock.TicketLock as port_lk;
+let is [4]grab.GrabStack as port_gs;
+
+let is i64 as port_count with mut = 0;
+let is kobject.KObjectOps as NET_OPS with mut;
+
+let is ksym.KSym as ksym_acquire;
+
+// ============================================================
+// priv encoding
+//
+// The KObject's priv is (port_index << 40) | token. Packed rather than
+// allocated: net_port_of finds the port with no heap and no free path to get
+// wrong, and the same value serves as the grab-stack token, unique per open
+// and already carrying the port it belongs to.
+// ============================================================
+
+fn net_priv_make(pi as i64, token as i64) as i64 {
+    return (pi << 40) | token;
+}
+
+fn net_port_of(priv as i64) as i64 {
+    let is i64 as pi = (priv >> 40) & 0xFF;
+    if (pi < 0 || pi >= NET_MAX_PORTS) { return 0 - 1; }
+    if (ports[pi].in_use == 0) { return 0 - 1; }
+    return pi;
+}
+
+// ============================================================
+// Registry
+// ============================================================
+
+// Register one port. Returns its index (>= 0), or negative on failure.
+// The driver keeps the index and hands it back to rx_push from poll_rx.
+fn register(dev as *NetDevice, hw as i64) as i64 {
+    if (cast(i64, dev) == 0)         { return 0 - 1; }
+    if (cast(i64, dev.send) == 0)    { return 0 - 2; }
+    if (cast(i64, dev.poll_rx) == 0) { return 0 - 2; }
+    if (cast(i64, dev.mac) == 0)     { return 0 - 2; }
+    if (port_count >= NET_MAX_PORTS) { return 0 - 3; }
+
+    let is i64 as pi = port_count;
+    let is i64 as buf = heap.kmalloc(NET_RX_CAP, cast(i32, 0));
+    if (buf == 0) { return 0 - 4; }
+
+    ports[pi].dev = cast(i64, dev);
+    ports[pi].hw = hw;
+    ports[pi].rx_buf = buf;
+    ports[pi].rx_head = 0;
+    ports[pi].rx_tail = 0;
+    ports[pi].rx_used = 0;
+    ports[pi].rx_frames = 0;
+    ports[pi].rx_packets = 0;
+    ports[pi].rx_dropped = 0;
+    ports[pi].rx_toobig = 0;
+    ports[pi].tx_packets = 0;
+    ports[pi].tx_errors = 0;
+    ports[pi].next_token = 0;
+    ports[pi].in_use = 1;
+    port_count = port_count + 1;
+
+    serial.print("netdev: port ", 13);
+    util.print_num(pi);
+    serial.print(" = ", 3);
+    let is i64 as i with mut = 0;
+    while (i < 32) {
+        if (dev.name[i] == cast(u8, 0)) { i = 32; }
+        else { serial.putc(cast(i64, dev.name[i])); i = i + 1; }
+    }
+    serial.println("", 0);
+    return pi;
+}
+
+fn count() as i64 {
+    return port_count;
+}
+
+fn port_dev(pi as i64) as *NetDevice {
+    return cast(*NetDevice, ports[pi].dev);
+}
+
+fn port_by_hw(hw as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < port_count) {
+        if (ports[i].in_use != 0 && ports[i].hw == hw) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================
+// The receive ring — a RECORD ring
+//
+// Each frame is stored as [len_lo][len_hi][payload], and a push is all-or-
+// nothing: a frame that does not fit is dropped whole and counted, never
+// written partially. That invariant is what lets a pop trust the two length
+// bytes it reads.
+// ============================================================
+
+fn rx_byte_at(pi as i64, idx as i64) as *u8 {
+    return cast(*u8, ports[pi].rx_buf + idx);
+}
+
+fn rx_ring_clear(pi as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&port_lk[pi]);
+    ports[pi].rx_head = 0;
+    ports[pi].rx_tail = 0;
+    ports[pi].rx_used = 0;
+    ports[pi].rx_frames = 0;
+    lock.release_irq(&port_lk[pi], fl);
+    return;
+}
+
+// Push one received frame. CALLED BY THE DRIVER, only from inside its own
+// poll_rx: rx_pump holds port_lk[pi] across the call, so this must not take it
+// again (the ticket lock is not reentrant). Returns 1 if queued, 0 if dropped.
+fn rx_push(pi as i64, src as i64, len as i64) as i64 {
+    if (len < NET_FRAME_MIN || len > NET_FRAME_MAX) {
+        ports[pi].rx_dropped = ports[pi].rx_dropped + 1;
+        return 0;
+    }
+    if (ports[pi].rx_used + 2 + len > NET_RX_CAP) {
+        ports[pi].rx_dropped = ports[pi].rx_dropped + 1;
+        return 0;
+    }
+    let is i64 as t with mut = ports[pi].rx_tail;
+    let is *u8 as h0 = rx_byte_at(pi, t);
+    h0[0] = cast(u8, len & 0xFF);
+    t = t + 1; if (t >= NET_RX_CAP) { t = 0; }
+    let is *u8 as h1 = rx_byte_at(pi, t);
+    h1[0] = cast(u8, (len >> 8) & 0xFF);
+    t = t + 1; if (t >= NET_RX_CAP) { t = 0; }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is *u8 as d = rx_byte_at(pi, t);
+        let is *u8 as s = cast(*u8, src + i);
+        d[0] = s[0];
+        t = t + 1; if (t >= NET_RX_CAP) { t = 0; }
+        i = i + 1;
+    }
+    ports[pi].rx_tail = t;
+    ports[pi].rx_used = ports[pi].rx_used + 2 + len;
+    ports[pi].rx_frames = ports[pi].rx_frames + 1;
+    ports[pi].rx_packets = ports[pi].rx_packets + 1;
+    return 1;
+}
+
+// Length of the frame at the head, without consuming it. Caller holds the lock
+// and has checked rx_frames > 0.
+fn rx_peek_len(pi as i64) as i64 {
+    let is i64 as h = ports[pi].rx_head;
+    let is *u8 as b0 = rx_byte_at(pi, h);
+    let is i64 as h1 with mut = h + 1;
+    if (h1 >= NET_RX_CAP) { h1 = 0; }
+    let is *u8 as b1 = rx_byte_at(pi, h1);
+    return cast(i64, b0[0]) | (cast(i64, b1[0]) << 8);
+}
+
+// Consume the head frame, copying it to `dst` when dst != 0. Caller holds the
+// lock and has checked rx_frames > 0. Returns the frame length.
+fn rx_pop(pi as i64, dst as i64) as i64 {
+    let is i64 as len = rx_peek_len(pi);
+    let is i64 as h with mut = ports[pi].rx_head;
+    h = h + 2; if (h >= NET_RX_CAP) { h = h - NET_RX_CAP; }
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (dst != 0) {
+            let is *u8 as s = rx_byte_at(pi, h);
+            let is *u8 as d = cast(*u8, dst + i);
+            d[0] = s[0];
+        }
+        h = h + 1; if (h >= NET_RX_CAP) { h = 0; }
+        i = i + 1;
+    }
+    ports[pi].rx_head = h;
+    ports[pi].rx_used = ports[pi].rx_used - 2 - len;
+    ports[pi].rx_frames = ports[pi].rx_frames - 1;
+    return len;
+}
+
+// Pull up to `budget` frames out of the hardware and into the ring. Safe from
+// IRQ context. Returns how many were taken.
+fn rx_pump(pi as i64, budget as i64) as i64 {
+    if (pi < 0 || pi >= NET_MAX_PORTS) { return 0; }
+    if (ports[pi].in_use == 0) { return 0; }
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    if (cast(i64, dev) == 0) { return 0; }
+    let is i64 as fl = lock.acquire_irq(&port_lk[pi]);
+    let is i64 as got = call(dev.poll_rx, dev.priv, budget);
+    lock.release_irq(&port_lk[pi], fl);
+    return got;
+}
+
+// A driver reporting that the CONTROLLER dropped frames — it ran out of
+// receive descriptors before software got to them. Counted in the same place
+// as a ring-full drop, because from a program's point of view they are the
+// same event with the same fix; SYS_NET_INFO reports the total.
+fn note_hw_drop(pi as i64) as void {
+    if (pi < 0 || pi >= NET_MAX_PORTS) { return; }
+    ports[pi].rx_dropped = ports[pi].rx_dropped + 1;
+    return;
+}
+
+// What a driver's IRQ handler calls once it has acknowledged its own device:
+// drain a bounded batch and wake anyone waiting. Both halves are safe at
+// interrupt — poll_wake does not sleep, and the pump is bounded by budget.
+fn irq_drain(pi as i64) as i64 {
+    let is i64 as got = rx_pump(pi, NET_RXBUDGET_IRQ);
+    if (got > 0) { sched.poll_wake(); }
+    return got;
+}
+
+// ============================================================
+// The KObject ops
+// ============================================================
+
+fn net_init() as void {
+    NET_OPS.read  = fn_ptr(net_read);
+    NET_OPS.write = fn_ptr(net_write);
+    NET_OPS.close = fn_ptr(net_close);
+    NET_OPS.poll  = fn_ptr(net_poll);
+    // mmap/present/lseek/readdir stay null. A port is not a mappable buffer
+    // and it has no cursor; those return honest errnos through the null slot.
+    return;
+}
+
+// One read is one whole frame. Blocks while the ring is empty AND this holder
+// owns the port; a holder that has been preempted off the top of the grab
+// stack is quiet, exactly like the keyboard and the tablet.
+fn net_read(priv as i64, buf as i64, n as i64) as i64 {
+    let is i64 as pi = net_port_of(priv);
+    if (pi < 0) { return abi.E_BADF; }
+    if (n <= 0) { return abi.E_INVAL; }
+
+    let is i64 as done with mut = 0;
+    let is i64 as result with mut = 0;
+    while (done == 0) {
+        if (grab.top(&port_gs[pi]) != priv) {
+            sched.sleep_for_ns(NET_QUIET_NS);
+        } else {
+            // Pump before looking: the interrupt is an optimisation, not the
+            // thing correctness rests on.
+            rx_pump(pi, NET_RXBUDGET_READ);
+            let is i64 as fl = lock.acquire_irq(&port_lk[pi]);
+            if (ports[pi].rx_frames > 0) {
+                let is i64 as flen = rx_peek_len(pi);
+                if (flen > n) {
+                    // Too small a buffer: drop the frame rather than truncate
+                    // it (a lie) or keep it (a wedge). Counted, and callers
+                    // know frame_max up front.
+                    rx_pop(pi, 0);
+                    ports[pi].rx_toobig = ports[pi].rx_toobig + 1;
+                    lock.release_irq(&port_lk[pi], fl);
+                    return abi.E_RANGE;
+                }
+                result = rx_pop(pi, buf);
+                done = 1;
+            }
+            lock.release_irq(&port_lk[pi], fl);
+            if (done == 0) {
+                sched.poll_park(timer.current_time_ns() + NET_PARK_NS);
+            }
+        }
+    }
+    return result;
+}
+
+// One write is one whole frame. Blocks while the transmit ring is full, the
+// same discipline chan_write uses; a driver reporting a real fault fails the
+// call instead of looping.
+fn net_write(priv as i64, buf as i64, n as i64) as i64 {
+    let is i64 as pi = net_port_of(priv);
+    if (pi < 0) { return abi.E_BADF; }
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    if (n < NET_FRAME_MIN) { return abi.E_INVAL; }
+    let is i64 as mtu with mut = NET_MTU_DEFAULT;
+    if (cast(i64, dev.mtu) != 0) { mtu = call(dev.mtu, dev.priv); }
+    if (n > mtu + 14) { return abi.E_INVAL; }
+
+    while (1 == 1) {
+        if (grab.top(&port_gs[pi]) != priv) {
+            sched.sleep_for_ns(NET_QUIET_NS);
+        } else {
+            let is i64 as rc = call(dev.send, dev.priv, cast(*u8, buf), n);
+            if (rc >= 0) {
+                let is i64 as fl = lock.acquire_irq(&port_lk[pi]);
+                ports[pi].tx_packets = ports[pi].tx_packets + 1;
+                lock.release_irq(&port_lk[pi], fl);
+                return n;
+            }
+            if (rc != NET_TX_BUSY) {
+                let is i64 as fl2 = lock.acquire_irq(&port_lk[pi]);
+                ports[pi].tx_errors = ports[pi].tx_errors + 1;
+                lock.release_irq(&port_lk[pi], fl2);
+                return abi.E_IO;
+            }
+            // Ring full. Draining it is the device's job and it is doing it;
+            // give the wire a moment rather than spinning on the doorbell.
+            sched.sleep_for_ns(NET_QUIET_NS);
+        }
+    }
+    return abi.E_IO;
+}
+
+// READABLE with a whole frame queued, WRITABLE with a transmit slot free.
+// Never CLOSED: a NIC has no peer that can hang up. A holder below the top of
+// the grab stack reports nothing at all — being preempted mutes it, it does
+// not break it.
+fn net_poll(priv as i64) as i64 {
+    let is i64 as pi = net_port_of(priv);
+    if (pi < 0) { return abi.POLL_ERROR; }
+    if (grab.top(&port_gs[pi]) != priv) { return 0; }
+
+    // Same reason as in net_read: readiness must not be a story the interrupt
+    // alone tells. A poll that pumps is a poll that cannot report "nothing"
+    // while frames sit in a descriptor ring.
+    rx_pump(pi, NET_RXBUDGET_READ);
+
+    let is i64 as ev with mut = 0;
+    let is i64 as fl = lock.acquire_irq(&port_lk[pi]);
+    if (ports[pi].rx_frames > 0) { ev = ev | abi.POLL_READABLE; }
+    lock.release_irq(&port_lk[pi], fl);
+
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    if (cast(i64, dev.tx_free) != 0) {
+        if (call(dev.tx_free, dev.priv) > 0) { ev = ev | abi.POLL_WRITABLE; }
+    } else {
+        ev = ev | abi.POLL_WRITABLE;
+    }
+    return ev;
+}
+
+fn net_close(priv as i64) as i64 {
+    let is i64 as pi = net_port_of(priv);
+    if (pi < 0) { return abi.E_OK; }
+    let is i64 as newtop = grab.remove(&port_gs[pi], priv);
+    // Whoever surfaces gets a clean ring: frames captured while someone else
+    // owned the port are not theirs to read.
+    if (newtop != 0) { rx_ring_clear(pi); }
+    return abi.E_OK;
+}
+
+// dev_open lands here. ctx is the *Hardware node the framework registered the
+// instance with (spec.cst bind_all), which is what identifies the port.
+fn net_acquire(ctx as i64) as i64 {
+    let is i64 as pi = port_by_hw(ctx);
+    if (pi < 0) { return 0; }
+    ports[pi].next_token = ports[pi].next_token + 1;
+    let is i64 as priv = net_priv_make(pi, ports[pi].next_token);
+    if (grab.push(&port_gs[pi], priv) != 0) { return 0; }
+    rx_ring_clear(pi);
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &NET_OPS, priv);
+    if (ko == 0) { grab.remove(&port_gs[pi], priv); return 0; }
+    return ko;
+}
+
+// Type test for the syscall layer. KOBJ_DEVICE is shared with the keyboard,
+// the mouse and the tablet, so the discriminator is the vtable identity: an
+// object built from NET_OPS is a network port and nothing else can be. The
+// syscall layer therefore needs no knowledge of this module's layout, and
+// every future KOBJ_DEVICE subtype that wants an info call exports the same
+// one-function test.
+fn holder_of(ko as i64) as i64 {
+    if (ko == 0) { return 0; }
+    let is *kobject.KObject as k = cast(*kobject.KObject, ko);
+    if (k.otype != kobject.KOBJ_DEVICE) { return 0; }
+    if (cast(i64, k.ops) != cast(i64, &NET_OPS)) { return 0; }
+    return k.priv;
+}
+
+// ============================================================
+// Boot smoke
+//
+// Replaces the two inline ARP smokes that used to run inside each driver's
+// on_bind. Those proved a driver could move a frame; this proves the CONTRACT
+// — the class, the exclusivity, the record boundary, the error a caller sees
+// when their buffer is too small — through the same KObject a program gets.
+// It also stops costing up to two seconds of boot per NIC.
+// ============================================================
+
+let is [64]u8 as smoke_arp;
+let is [2048]u8 as smoke_rx;
+let is i64 as smoke_fails with mut = 0;
+
+fn smoke_check(name as *u8, nlen as i64, got as i64, want as i64) as void {
+    if (got == want) { serial.print("  ok   ", 7); }
+    else { serial.print("  FAIL ", 7); smoke_fails = smoke_fails + 1; }
+    serial.print(name, nlen);
+    serial.print(" got=", 5);
+    util.print_num(got);
+    serial.print(" want=", 6);
+    util.print_num(want);
+    serial.println("", 0);
+    return;
+}
+
+fn smoke_be16(p as *u8, off as i64, v as i64) as void {
+    p[off] = cast(u8, (v >> 8) & 0xFF);
+    p[off + 1] = cast(u8, v & 0xFF);
+    return;
+}
+
+fn smoke_get_be16(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 8) | cast(i64, p[off + 1]);
+}
+
+// An ARP request for the SLIRP gateway. QEMU's user-mode network answers it
+// synthetically and immediately, which makes it the cheapest round trip that
+// proves transmit, receive, the interrupt and the ring all at once.
+fn smoke_build_arp(out as *u8, mac as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 6) { out[i] = cast(u8, 0xFF); i = i + 1; }      // broadcast
+    let is i64 as j with mut = 0;
+    while (j < 6) { out[6 + j] = mac[j]; j = j + 1; }
+    smoke_be16(out, 12, 0x0806);          // ethertype ARP
+    smoke_be16(out, 14, 0x0001);          // htype ethernet
+    smoke_be16(out, 16, 0x0800);          // ptype ipv4
+    out[18] = cast(u8, 6);
+    out[19] = cast(u8, 4);
+    smoke_be16(out, 20, 0x0001);          // oper request
+    let is i64 as k with mut = 0;
+    while (k < 6) { out[22 + k] = mac[k]; k = k + 1; }
+    out[28] = cast(u8, 10); out[29] = cast(u8, 0);             // 10.0.2.15
+    out[30] = cast(u8, 2);  out[31] = cast(u8, 15);
+    let is i64 as l with mut = 0;
+    while (l < 6) { out[32 + l] = cast(u8, 0); l = l + 1; }
+    out[38] = cast(u8, 10); out[39] = cast(u8, 0);             // 10.0.2.2
+    out[40] = cast(u8, 2);  out[41] = cast(u8, 2);
+    return 42;
+}
+
+// Round trip on one port, through the KObject a program would hold.
+fn smoke_port(pi as i64) as void {
+    let is i64 as ko = net_acquire(ports[pi].hw);
+    if (ko == 0) { smoke_check(cast(*u8, "acquire"), 7, 0, 1); return; }
+    let is i64 as priv = holder_of(ko);
+    smoke_check(cast(*u8, "holder_of identifies the port"), 29, net_port_of(priv), pi);
+
+    let is [6]u8 as mac;
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    call(dev.mac, dev.priv, cast(*u8, &mac[0]));
+    let is i64 as alen = smoke_build_arp(cast(*u8, &smoke_arp[0]), cast(*u8, &mac[0]));
+
+    // A frame below the ethernet header size is not a frame.
+    smoke_check(cast(*u8, "write of 8 bytes refused"), 24,
+                net_write(priv, cast(i64, &smoke_arp[0]), 8), abi.E_INVAL);
+    // As is one past the MTU.
+    smoke_check(cast(*u8, "write past mtu refused"), 22,
+                net_write(priv, cast(i64, &smoke_arp[0]), 4000), abi.E_INVAL);
+
+    smoke_check(cast(*u8, "write returns frame length"), 26,
+                net_write(priv, cast(i64, &smoke_arp[0]), alen), alen);
+
+    // The reply. net_read blocks, and its own pump means this does not depend
+    // on the interrupt having fired.
+    let is i64 as got = net_read(priv, cast(i64, &smoke_rx[0]), 2048);
+    if (got <= 0) {
+        smoke_check(cast(*u8, "read returns a frame"), 20, got, 42);
+        kobject.ko_unref(ko);
+        return;
+    }
+    smoke_check(cast(*u8, "reply is ARP"), 12,
+                smoke_get_be16(cast(*u8, &smoke_rx[0]), 12), 0x0806);
+    smoke_check(cast(*u8, "reply is a reply"), 16,
+                smoke_get_be16(cast(*u8, &smoke_rx[0]), 20), 2);
+    // Addressed to us, which proves the frame was not mangled on the way in.
+    let is i64 as m with mut = 0;
+    let is i64 as mine with mut = 1;
+    while (m < 6) {
+        if (smoke_rx[m] != mac[m]) { mine = 0; }
+        m = m + 1;
+    }
+    smoke_check(cast(*u8, "reply addressed to our mac"), 25, mine, 1);
+
+    kobject.ko_unref(ko);
+    return;
+}
+
+// A read whose buffer cannot hold the pending frame: E_RANGE, the frame is
+// gone, and the drop is counted. Provoked deliberately, because the failure
+// this rules out — silent truncation — is invisible from the outside.
+fn smoke_toobig(pi as i64) as void {
+    let is i64 as ko = net_acquire(ports[pi].hw);
+    if (ko == 0) { smoke_check(cast(*u8, "acquire (toobig)"), 16, 0, 1); return; }
+    let is i64 as priv = holder_of(ko);
+    let is [6]u8 as mac;
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    call(dev.mac, dev.priv, cast(*u8, &mac[0]));
+    let is i64 as alen = smoke_build_arp(cast(*u8, &smoke_arp[0]), cast(*u8, &mac[0]));
+    net_write(priv, cast(i64, &smoke_arp[0]), alen);
+
+    let is i64 as before = ports[pi].rx_toobig;
+    // Wait for the reply to be queued, then read it into 8 bytes.
+    let is i64 as deadline = timer.current_time_ns() + 2000000000;
+    let is i64 as rc with mut = 0;
+    while (timer.current_time_ns() < deadline && rc == 0) {
+        rx_pump(pi, NET_RXBUDGET_READ);
+        if (ports[pi].rx_frames > 0) {
+            rc = net_read(priv, cast(i64, &smoke_rx[0]), 8);
+        } else {
+            sched.sleep_for_ns(2000000);
+        }
+    }
+    smoke_check(cast(*u8, "short buffer gives E_RANGE"), 26, rc, abi.E_RANGE);
+    smoke_check(cast(*u8, "the frame was dropped, counted"), 30,
+                ports[pi].rx_toobig - before, 1);
+    kobject.ko_unref(ko);
+    return;
+}
+
+// Exclusivity: the second holder owns the port, the first goes quiet, and
+// closing the second hands it back. This is architecture.md §6 as a test.
+fn smoke_grab(pi as i64) as void {
+    let is i64 as ko_a = net_acquire(ports[pi].hw);
+    let is i64 as priv_a = holder_of(ko_a);
+    let is i64 as ko_b = net_acquire(ports[pi].hw);
+    let is i64 as priv_b = holder_of(ko_b);
+    if (ko_a == 0 || ko_b == 0) { smoke_check(cast(*u8, "two acquires"), 12, 0, 1); return; }
+
+    smoke_check(cast(*u8, "second holder owns the port"), 27,
+                grab.top(&port_gs[pi]), priv_b);
+    // The displaced holder is muted, not broken: its poll reports nothing.
+    smoke_check(cast(*u8, "displaced holder polls quiet"), 28, net_poll(priv_a), 0);
+
+    kobject.ko_unref(ko_b);
+    smoke_check(cast(*u8, "close hands the port back"), 25,
+                grab.top(&port_gs[pi]), priv_a);
+    kobject.ko_unref(ko_a);
+    smoke_check(cast(*u8, "last close leaves it free"), 25,
+                grab.top(&port_gs[pi]), 0);
+    return;
+}
+
+fn smoke_thread() as void {
+    // Wait for phase 2 to FINISH, not for the first port to appear. Waiting on
+    // port_count > 0 raced the second NIC's bind: the loop below would walk a
+    // machine that was still being discovered and report PASS having tested
+    // one card out of two. Deadline anyway, so a build where nothing binds
+    // fails the smoke instead of hanging the boot.
+    let is i64 as deadline = timer.current_time_ns() + 5000000000;
+    while (spec.phase2_done == 0 && timer.current_time_ns() < deadline) {
+        sched.sleep_for_ns(20000000);
+    }
+    serial.println("netdev_smoke: start", 19);
+    if (port_count == 0) {
+        serial.println("netdev_smoke: no ports bound FAIL", 33);
+        return;
+    }
+    smoke_check(cast(*u8, "dev_count(DEV_NET)"), 18,
+                driver.device_count(abi.DEV_NET), port_count);
+    // An index past the end is nothing, never a silent alias of port 0.
+    smoke_check(cast(*u8, "index 99 is not a port"), 22,
+                driver.device_open(abi.DEV_NET, 99), 0);
+
+    let is i64 as i with mut = 0;
+    while (i < port_count) {
+        serial.print("netdev_smoke: port ", 19);
+        util.print_num(i);
+        serial.println("", 0);
+        smoke_port(i);
+        i = i + 1;
+    }
+    smoke_toobig(0);
+    smoke_grab(0);
+
+    if (smoke_fails == 0) { serial.println("netdev_smoke: PASS", 18); }
+    else {
+        serial.print("netdev_smoke: FAIL n=", 21);
+        util.print_num(smoke_fails);
+        serial.println("", 0);
+    }
+    return;
+}
+
+fn register_ksyms() as void {
+    ksym_acquire.name_ptr = cast(*u8, "netdev.net_acquire");
+    ksym_acquire.name_len = 18;
+    ksym_acquire.addr     = cast(i64, fn_ptr(net_acquire));
+    ksym_acquire.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_acquire);
+    serial.println("netdev: registered", 18);
+    return;
+}
