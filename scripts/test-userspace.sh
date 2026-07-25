@@ -26,6 +26,7 @@ TESTS=(
     "netdt:70:userspace/build/netd.cse"
     "httpt:150:userspace/build/netd.cse userspace/build/wget.cse"
     "tlst:180:userspace/build/netd.cse build/certs/ca.pem build/certs/empty.pem"
+    "appt:150:userspace/build/netd.cse userspace/build/netsnoop.cse"
 )
 
 # The certificate fixtures are generated rather than committed. A certificate
@@ -56,7 +57,7 @@ for entry in "${TESTS[@]}"; do
     # they agree with anyone else. SLIRP presents the host as 10.0.2.2, so a
     # listener here is what the guest dials.
     HELPER_PID=""
-    if [ "$name" = "netdt" ]; then
+    if [ "$name" = "netdt" ] || [ "$name" = "appt" ]; then
         python3 scripts/echo-server.py 17777 "$tout" >/dev/null 2>&1 &
         HELPER_PID=$!
         sleep 0.3
@@ -108,6 +109,21 @@ if [ -z "$WANT" ] || [ "$WANT" = "linkt" ]; then
         grep -E "FAIL|panic:" /tmp/ut-linkt.log | head -5 || true
         FAIL=$((FAIL+1))
         FAILED="$FAILED linkt"
+    fi
+fi
+
+# httpd is the only thing here that LISTENS, so its client has to come from
+# outside — curl on the host, reaching in through QEMU's port forward.
+if [ -z "$WANT" ] || [ "$WANT" = "httpd" ]; then
+    printf '%-8s ' "httpd"
+    if bash scripts/test-httpd.sh >/tmp/ut-httpd.log 2>&1; then
+        echo "PASS (host fetched from the guest)"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-httpd.log)"
+        grep -E "FAIL|panic:" /tmp/ut-httpd.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED httpd"
     fi
 fi
 

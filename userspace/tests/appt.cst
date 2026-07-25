@@ -1,0 +1,227 @@
+// appt — the three things the network apps do that nothing else does.
+//
+//   (LISTEN and ACCEPT belong to httpd, and they need a client on the other
+//   side. That lives in scripts/test-httpd.sh, where the host can actually
+//   dial in through QEMU's port forward — a server test with no external
+//   client is a test of nothing.)
+//
+//   HALF-CLOSE. Every other client sends a request and reads a response, which
+//   never needs the two directions to end at different times. shutdown does,
+//   and until now it was a request the protocol declared and netd answered
+//   with E_NOSYS.
+//
+//   PREEMPTING A LIVE STACK. netsnoop opens DEV_NET while netd is holding it
+//   and using it. The grab stack has been exercised for the framebuffer and
+//   the keyboard for a long time; this is the first time for a network port,
+//   and the interesting part is what happens to netd — which must go quiet,
+//   lose nothing, and resume when the port comes back.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/netsvc.cst" as netsvc;
+use "../lib/netip/netip.cst" as ip;
+use "../lib/netarp/netarp.cst" as arp;
+
+let is i64 as SERVER_IP = 0x0A000202;      // 10.0.2.2, the host per SLIRP
+let is i64 as ECHO_PORT = 17777;
+let is i64 as HTTPD_PORT = 8080;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+let is [4096]u8 as buf;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// ============================================================
+// Half-close
+// ============================================================
+
+// The echo server on the host reads until end-of-stream. Sending without a
+// shutdown leaves it reading forever; a full close would tear down the socket
+// before the echo comes back. Only a half-close does what is wanted, and this
+// is the first thing in the project that needs one.
+fn t_halfclose() as void {
+    say("half-close:\n");
+    let is i64 as s = nc.open(np.SOCK_STREAM);
+    check(cast(*u8, "stream socket"), s >= 0, 1);
+    if (s < 0) { return; }
+    check(cast(*u8, "connected to the echo server"),
+          nc.connect(s, SERVER_IP, ECHO_PORT), 0);
+
+    let is *u8 as msg = "half-closed hello";
+    check(cast(*u8, "sent"), nc.send_all(s, msg, 17), 17);
+    check(cast(*u8, "write side shut down"), nc.shutdown_write(s), 0);
+
+    // The echo still has to arrive: shutting down the write side must not
+    // have touched the read side.
+    let is i64 as got = nc.recv(s, cast(*u8, &buf[0]), 4096);
+    check(cast(*u8, "the echo still came back"), got, 17);
+    if (got == 17) {
+        let is i64 as same with mut = 1;
+        let is i64 as i with mut = 0;
+        while (i < 17) {
+            if (buf[i] != msg[i]) { same = 0; }
+            i = i + 1;
+        }
+        check(cast(*u8, "and it is what was sent"), same, 1);
+    }
+    nc.close(s);
+    return;
+}
+
+// ============================================================
+// The ARP cache, which the protocol declared and netd never answered
+// ============================================================
+
+fn t_arpdump() as void {
+    say("arp cache:\n");
+    check(cast(*u8, "netd takes the request"),
+          np.send(nc.ctl_fd(), np.REQ_ARPDUMP, 0, 0, 0) > 0, 1);
+
+    let is i64 as entries with mut = 0;
+    let is i64 as with_mac with mut = 0;
+    let is i64 as saw_gw with mut = 0;
+    let is i64 as deadline = sys.time_ns() + 3000000000;
+    while (1 == 1) {
+        let is i64 as t = nc.pump(deadline);
+        if (t <= 0) { break; }
+        if (t == np.EV_ARP_END) {
+            check(cast(*u8, "the count matches the entries"), nc.last_word(2), entries);
+            break;
+        }
+        if (t != np.EV_ARP) { continue; }
+        entries = entries + 1;
+        // Having an address is the claim worth checking. REACHABLE is not:
+        // it decays to STALE after thirty seconds and STALE is a perfectly
+        // healthy state — the entry is still usable and gets re-verified in
+        // the background next time it is needed. Asserting REACHABLE would
+        // be asserting that the test ran quickly.
+        if ((nc.last_word(3) & 0xFFFFFFFFFFFF) != 0) { with_mac = with_mac + 1; }
+        // The gateway has been spoken to — every packet so far went through
+        // it — so it must be in the cache with a hardware address.
+        if (nc.last_word(2) == SERVER_IP) {
+            saw_gw = 1;
+            check(cast(*u8, "the gateway has a hardware address"),
+                  (nc.last_word(3) & 0xFFFFFFFFFFFF) != 0, 1);
+        }
+    }
+    check(cast(*u8, "the cache is not empty"), entries > 0, 1);
+    check(cast(*u8, "and something in it is resolved"), with_mac > 0, 1);
+    check(cast(*u8, "the gateway is in it"), saw_gw, 1);
+    return;
+}
+
+// ============================================================
+// netsnoop preempting a live netd
+// ============================================================
+
+fn t_preempt() as void {
+    say("preempting the stack:\n");
+
+    // Before: netd is working.
+    let is i64 as before = nc.resolve(cast(*u8, "10.0.2.2"), 8);
+    check(cast(*u8, "netd answers before"), before, SERVER_IP);
+
+    let is i64 as ilen with mut = 0;
+    let is i64 as img = fu.slurp(cast(*u8, "/netsnoop.cse"), &ilen);
+    if (ilen <= 0) { check(cast(*u8, "/netsnoop.cse on disk"), 0, 1); return; }
+
+    let is [8]i64 as av;
+    av[0] = cast(i64, "netsnoop"); av[1] = 8;
+    av[2] = cast(i64, "-c");       av[3] = 2;
+    av[4] = cast(i64, "3");        av[5] = 1;
+    // No netd endpoint on purpose: netsnoop holds the device itself, which is
+    // the whole point.
+    let is i64 as pid = sys.spawn(cast(*u8, img), ilen, cast(*u8, 0), 0,
+                                  cast(*u8, &av[0]), 3);
+    fu.unslurp(img, ilen);
+    check(cast(*u8, "netsnoop spawned"), pid > 0, 1);
+    if (pid <= 0) { return; }
+
+    // While it holds the port, netd cannot receive: its reads go to the
+    // displaced holder, which gets nothing. A resolve must therefore time out
+    // rather than answer — and must not crash anything.
+    sys.sleep_ns(300000000);
+    let is i64 as during = nc.resolve(cast(*u8, "example.com"), 11);
+    check(cast(*u8, "netd is quiet while displaced"), during, 0);
+
+    // netsnoop needs three frames to exit. ARP traffic from netd's own
+    // retries will supply them; a ping does too and is faster.
+    np.send(nc.ctl_fd(), np.REQ_PING, 0, SERVER_IP, np.pack_port_len(1, 1));
+
+    let is [1]i64 as st;
+    st[0] = 0 - 1;
+    let is i64 as wdeadline = sys.time_ns() + 20000000000;
+    let is i64 as reaped with mut = 0;
+    while (sys.time_ns() < wdeadline) {
+        if (sys.wait(pid, cast(*i64, &st[0])) >= 0) { reaped = 1; break; }
+        sys.sleep_ns(200000000);
+    }
+    if (reaped == 0) {
+        sys.kill(pid);
+        sys.wait(pid, cast(*i64, &st[0]));
+    }
+
+    // And afterwards, netd has the port back — without having been told
+    // anything happened.
+    let is i64 as after = nc.resolve(cast(*u8, "10.0.2.2"), 8);
+    check(cast(*u8, "netd has the port back"), after, SERVER_IP);
+
+    let is i64 as again = nc.resolve(cast(*u8, "example.com"), 11);
+    check(cast(*u8, "and resolves again for real"), again != 0, 1);
+    return;
+}
+
+fn main() as i32 {
+    say("appt: listen, half-close, and taking the port away\n");
+
+    check(cast(*u8, "netd starts"), netsvc.attach_or_start(1), 0);
+    check(cast(*u8, "an address was leased"), nc.wait_address(10000000000) != 0, 1);
+
+    t_halfclose();
+    t_arpdump();
+    t_preempt();
+
+    let is i64 as pid = netsvc.pid();
+    if (pid > 0) {
+        sys.kill(pid);
+        let is [1]i64 as st;
+        sys.wait(pid, cast(*i64, &st[0]));
+    }
+
+    say("appt: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("appt: ALL PASS\n"); return cast(i32, 0); }
+    say("appt: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

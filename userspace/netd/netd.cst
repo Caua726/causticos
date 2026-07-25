@@ -82,6 +82,7 @@ let is i64 as dns_server with mut = 0;
 let is i64 as dns_qid with mut = 0;
 let is i64 as dns_port with mut = 0;
 let is i64 as dns_client with mut = 0 - 1;   // who is waiting, -1 = nobody
+let is i64 as dns_token with mut = 0;        // and which request of theirs
 let is i64 as dns_deadline with mut = 0;
 let is i64 as dns_namelen with mut = 0;
 let is [256]u8 as dns_name;
@@ -469,21 +470,21 @@ fn dns_send_query(name as *u8, nlen as i64) as i64 {
 
 fn dns_answer(addr as i64) as void {
     if (dns_client < 0) { return; }
-    np.send(client_fd[dns_client], np.EV_RESOLVED, 0, addr, 0);
+    np.send(client_fd[dns_client], np.EV_RESOLVED, 0, addr, dns_token);
     dns_client = 0 - 1;
     return;
 }
 
-fn do_resolve(c as i64, name as *u8, nlen as i64) as void {
+fn do_resolve(c as i64, name as *u8, nlen as i64, token as i64) as void {
     let is i64 as now = sys.time_ns();
 
     // A dotted quad is itself. Asking a resolver about one either fails or,
     // worse, succeeds against somebody's wildcard.
     let is i64 as lit = dns.parse_literal(name, nlen);
-    if (lit != 0) { np.send(client_fd[c], np.EV_RESOLVED, 0, lit, 0); return; }
+    if (lit != 0) { np.send(client_fd[c], np.EV_RESOLVED, 0, lit, token); return; }
 
     let is i64 as hit = dns.cache_get(&dns_cache, name, nlen, now);
-    if (hit != 0) { np.send(client_fd[c], np.EV_RESOLVED, 0, hit, 0); return; }
+    if (hit != 0) { np.send(client_fd[c], np.EV_RESOLVED, 0, hit, token); return; }
 
     if (dns_server == 0) { reply_err(c, 0, sys.E_NOENT); return; }
     // One query in flight. A second caller waits for the next turn rather
@@ -495,6 +496,7 @@ fn do_resolve(c as i64, name as *u8, nlen as i64) as void {
     nb.copy(cast(*u8, &dns_name[0]), name, nlen);
     dns_namelen = nlen;
     dns_client = c;
+    dns_token = token;
     dns_deadline = now + 3000000000;
     if (dns_send_query(cast(*u8, &dns_name[0]), nlen) < 0) {
         dns_client = 0 - 1;
@@ -975,6 +977,20 @@ fn serve_client(c as i64) as i64 {
         ns.local_port = cn.local_port;
         l.pending = 0 - 1;
         np.send(client_fd[c], np.EV_OK, a, cn.peer_port, 0);
+
+        // WHATEVER ALREADY ARRIVED, NOW. A client is told about a connection
+        // when the SYN lands, and it takes a round trip to answer with an
+        // accept — during which the peer's first request usually arrives.
+        // Those bytes go into the connection with no socket yet pointing at
+        // it, so the notify that would have delivered them finds nobody and
+        // skips. Nothing sends them afterwards either: delivery only happens
+        // on an input event, and the peer has said everything it intends to.
+        //
+        // The result was a server that answered every request exactly when
+        // the client gave up and sent its FIN — ten seconds later, to a curl
+        // that had already stopped listening. Only a real client could show
+        // it: our own tests always accept before they send.
+        tcp_notify(ns, tc.conn_state(cn));
         return 1;
     }
     if (t == np.REQ_SENDTO) {
@@ -1005,7 +1021,54 @@ fn serve_client(c as i64) as i64 {
         return 1;
     }
     if (t == np.REQ_RESOLVE) {
-        do_resolve(c, cast(*u8, &payload[0]), b);
+        do_resolve(c, cast(*u8, &payload[0]), b, a);
+        return 1;
+    }
+    if (t == np.REQ_ARPDUMP) {
+        // What the stack believes about its neighbours, one entry per
+        // message. Declared in the protocol since the beginning and answered
+        // with E_NOSYS until now, which is the same kind of lie a comment
+        // that describes unwritten code tells.
+        let is i64 as sent with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < nif.count()) {
+            let is *arp.Cache as ac = nif.cache_at(k);
+            let is i64 as i with mut = 0;
+            while (i < arp.CACHE_SIZE) {
+                let is *arp.Entry as e = arp.at(ac, i);
+                if (e.state != arp.ST_FREE) {
+                    let is i64 as mac48 with mut = 0;
+                    let is i64 as m with mut = 0;
+                    while (m < 6) {
+                        mac48 = (mac48 << 8) | cast(i64, e.mac[m]);
+                        m = m + 1;
+                    }
+                    np.send(client_fd[c], np.EV_ARP, k, e.ip,
+                            (e.state << 48) | mac48);
+                    sent = sent + 1;
+                }
+                i = i + 1;
+            }
+            k = k + 1;
+        }
+        np.send(client_fd[c], np.EV_ARP_END, 0, sent, 0);
+        return 1;
+    }
+    if (t == np.REQ_SHUTDOWN) {
+        let is *nsock.Sock as s = nsock.find(c, sock);
+        if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
+        if (s.proto != np.SOCK_STREAM || s.conn < 0) {
+            reply_err(c, sock, sys.E_INVAL);
+            return 1;
+        }
+        // A FIN, and nothing else. The socket stays: the peer may still be
+        // sending, and half-close exists precisely so that "I am done talking"
+        // and "I am done listening" can be said separately. Closing here
+        // instead would throw away whatever the peer had left to say.
+        let is *tc.Conn as cn2 = nsock.conn_at(s.conn);
+        tc.conn_close(cn2, sys.time_ns());
+        tcp_flush(s.conn);
+        np.send(client_fd[c], np.EV_OK, sock, 0, 0);
         return 1;
     }
     if (t == np.REQ_CLOSE) {

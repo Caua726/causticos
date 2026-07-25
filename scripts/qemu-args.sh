@@ -46,7 +46,12 @@ QEMU_ARGS=(
 
     # NIC 0 — Intel 82540EM. Real silicon QEMU emulates faithfully, so the
     # same driver runs on metal.
-    -netdev user,id=net0
+    # hostfwd is the only way in. SLIRP lets the guest dial out freely and
+    # lets nothing dial in, which is right for everything except a server:
+    # httpd listens inside, and without a forward there is no client anywhere
+    # that could reach it. QEMU_HTTPD_PORT lets a test pick its own so two
+    # runs do not fight over one number.
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${QEMU_HTTPD_PORT:-18080}-:8080"
     -device e1000,netdev=net0,mac=52:54:00:12:34:56
 
     # NIC 1 — modern virtio-net. disable-legacy/disable-modern pin the device
