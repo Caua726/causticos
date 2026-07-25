@@ -31,6 +31,11 @@ qemu-img create -f raw build/disk.img 64M >/dev/null
 mkfs.fat -F 32 -n CAUSTICOS build/disk.img >/dev/null
 addf() { [ -f "$B/$2" ] && python3 scripts/fat32_add_file.py build/disk.img addfilebin "$1" "$B/$2" >/dev/null; }
 
+# /netd.cse is not just another tool in the list below: whichever program is
+# /init opens it BY THAT NAME at startup and spawns it, and everything the
+# session runs gets a channel to it. A disk without it boots to a working
+# machine with no network, which is a legitimate state and is reported as one.
+
 if [ "$MODE" = "wm" ]; then
     # /init = the compositor (the launcher); it opens the devices and spawns
     # /wm.cse, handing the device fds down via fdacts. Both must be on the disk.
@@ -46,12 +51,14 @@ if [ "$MODE" = "wm" ]; then
     PROGS="wmpat wterm newterm btop echo cat ls uptime sysinfo vic guess \
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
            touch mkdir rmdir rm mv cp stat du tree find clear \
-           ps free df top pager hexedit date poweroff reboot"
+           ps free df top pager hexedit date poweroff reboot \
+           netd ifconfig ping wget"
     INITNAME="compositor (launches the window manager — Super+Enter opens a window, Alt+Tab cycles, Super+Q closes)"
 else
     addf init.cse shell.cse
     PROGS="echo cat ls uptime sysinfo vic btop ps top free df \
-           grep wc sort head tail rev tac cut uniq"
+           grep wc sort head tail rev tac cut uniq \
+           netd ifconfig ping wget"
     INITNAME="shell (type 'btop', 'ls', 'help' ...)"
 fi
 for p in $PROGS; do addf "$p.cse" "$p.cse"; done

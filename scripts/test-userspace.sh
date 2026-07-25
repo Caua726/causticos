@@ -88,5 +88,21 @@ if [ -z "$WANT" ] || [ "$WANT" = "linkt" ]; then
     fi
 fi
 
+# shellnet types at the real prompt, so it needs the monitor too — and it is
+# the only test that proves the machine you BOOT is wired up rather than the
+# one a test assembled for itself.
+if [ -z "$WANT" ] || [ "$WANT" = "shellnet" ]; then
+    printf '%-8s ' "shellnet"
+    if bash scripts/test-shell-net.sh >/tmp/ut-shellnet.log 2>&1; then
+        echo "PASS (wget typed at the prompt)"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-shellnet.log)"
+        grep -E "FAIL|panic:" /tmp/ut-shellnet.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED shellnet"
+    fi
+fi
+
 echo "=== userspace: $PASS passed, $FAIL failed${FAILED:+ ($FAILED)} ==="
 [ "$FAIL" -eq 0 ]
