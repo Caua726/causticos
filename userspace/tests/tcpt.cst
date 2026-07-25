@@ -13,6 +13,7 @@ use "../lib/netbuf/netbuf.cst" as nb;
 use "../lib/netip/netip.cst" as ip;
 use "../lib/nettcp/tcp_wire.cst" as w;
 use "../lib/nettcp/tcp_cc.cst" as cc;
+use "../lib/nettcp/tcp_conn.cst" as tc;
 
 let is i64 as fails with mut = 0;
 let is i64 as checks with mut = 0;
@@ -355,6 +356,268 @@ fn test_cong() as void {
     return;
 }
 
+// ============================================================
+// Two connections, wired to each other
+//
+// This is the part that cannot be tested any other way. A handshake, a
+// transfer, loss, retransmission and a close — all of it driven by a clock
+// the test controls, in microseconds, with no hardware and no timing.
+//
+// A stack tested only against a real peer is a stack whose retransmission
+// path has never run: a healthy link does not lose packets on demand.
+// ============================================================
+
+let is tc.Conn as A;
+let is tc.Conn as B;
+let is [2048]u8 as wire;
+let is [4096]u8 as rdbuf;
+
+let is i64 as clock with mut = 0;
+let is i64 as drop_next with mut = 0;      // drop the next N segments A sends
+let is i64 as dropped with mut = 0;
+let is i64 as delivered with mut = 0;
+
+let is i64 as IP_A = 0x0A00020F;
+let is i64 as IP_B = 0x0A000202;
+
+// Move one segment from `from` to `to`, if there is one. Returns 1 if a
+// segment moved (or was deliberately dropped).
+fn pump(from as *tc.Conn, to as *tc.Conn, may_drop as i64) as i64 {
+    let is i64 as n = tc.conn_output(from, cast(*u8, &wire[0]), clock, clock / 1000000);
+    if (n <= 0) { return 0; }
+    if (may_drop == 1 && drop_next > 0) {
+        drop_next = drop_next - 1;
+        dropped = dropped + 1;
+        return 1;                    // it left, and vanished
+    }
+    delivered = delivered + 1;
+    tc.conn_input(to, cast(*u8, &wire[0]), n, clock);
+    return 1;
+}
+
+// Run both ends until neither has anything to say, or the budget runs out.
+// Time advances a little each turn so timers can fire.
+fn settle(rounds as i64, step_ns as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < rounds) {
+        let is i64 as moved with mut = 0;
+        moved = moved + pump(&A, &B, 1);
+        moved = moved + pump(&B, &A, 0);
+        tc.conn_tick(&A, clock);
+        tc.conn_tick(&B, clock);
+        clock = clock + step_ns;
+        if (moved == 0) { i = i + 1; }
+    }
+    return;
+}
+
+fn handshake() as void {
+    clock = 1000000000;
+    drop_next = 0; dropped = 0; delivered = 0;
+    tc.conn_init(&A);
+    tc.conn_init(&B);
+    tc.conn_listen(&B, IP_B, 80, 0x20000000);
+    B.peer_ip = IP_A;
+    let is i64 as n = tc.conn_connect(&A, IP_A, 40000, IP_B, 80,
+                                      0x10000000, cast(*u8, &wire[0]),
+                                      clock, clock / 1000000);
+    tc.conn_input(&B, cast(*u8, &wire[0]), n, clock);
+    settle(40, 1000000);
+    return;
+}
+
+fn test_handshake() as void {
+    say("handshake:\n");
+    handshake();
+    check(cast(*u8, "client established"), tc.conn_state(&A), tc.ESTABLISHED);
+    check(cast(*u8, "server established"), tc.conn_state(&B), tc.ESTABLISHED);
+    // Each side's next expected byte is the other's first, which is what the
+    // SYN consuming a sequence number arranges.
+    check(cast(*u8, "sequence spaces line up"), A.rcv_nxt, w.seq_add(B.iss, 1));
+    check(cast(*u8, "and the other way"), B.rcv_nxt, w.seq_add(A.iss, 1));
+    // Options negotiated on the SYN exchange.
+    check(cast(*u8, "window scaling agreed"), A.snd_wscale > 0, 1);
+    check(cast(*u8, "sack agreed"), A.sack_ok, 1);
+    check(cast(*u8, "timestamps agreed"), A.ts_ok, 1);
+    check(cast(*u8, "mss negotiated"), A.mss > 0, 1);
+    // The handshake gave the first RTT sample; without it the first real
+    // timeout would be a guess.
+    check(cast(*u8, "first rtt measured"), A.rtt.have, 1);
+    return;
+}
+
+fn test_transfer() as void {
+    say("transfer:\n");
+    handshake();
+    A.nodelay = 1;                      // request/response shape, not bulk
+
+    let is [200]u8 as msg;
+    let is i64 as i with mut = 0;
+    while (i < 200) { msg[i] = cast(u8, 65 + (i % 26)); i = i + 1; }
+    check(cast(*u8, "write accepted"), tc.conn_write(&A, cast(*u8, &msg[0]), 200), 200);
+    settle(40, 1000000);
+    check(cast(*u8, "arrived whole"), tc.conn_readable(&B), 200);
+
+    let is i64 as got = tc.conn_read(&B, cast(*u8, &rdbuf[0]), 4096);
+    check(cast(*u8, "read back"), got, 200);
+    let is i64 as same with mut = 1;
+    i = 0;
+    while (i < 200) {
+        if (rdbuf[i] != msg[i]) { same = 0; }
+        i = i + 1;
+    }
+    check(cast(*u8, "bytes are unchanged"), same, 1);
+
+    // Both directions, because a half-implemented stack often works one way.
+    check(cast(*u8, "reply accepted"), tc.conn_write(&B, cast(*u8, &msg[0]), 50), 50);
+    settle(40, 1000000);
+    check(cast(*u8, "reply arrived"), tc.conn_readable(&A), 50);
+    return;
+}
+
+fn test_large_transfer() as void {
+    say("bulk transfer:\n");
+    handshake();
+    let is i64 as TOTAL = 40000;              // several windows' worth
+    let is [40000]u8 as big;
+    let is i64 as i with mut = 0;
+    while (i < TOTAL) { big[i] = cast(u8, i & 0xFF); i = i + 1; }
+
+    let is i64 as sent with mut = 0;
+    let is i64 as recvd with mut = 0;
+    let is i64 as guard with mut = 0;
+    while (recvd < TOTAL && guard < 4000) {
+        if (sent < TOTAL) {
+            let is i64 as n = tc.conn_write(&A, cast(*u8, cast(i64, &big[0]) + sent),
+                                            TOTAL - sent);
+            if (n > 0) { sent = sent + n; }
+        }
+        pump(&A, &B, 1);
+        pump(&B, &A, 0);
+        let is i64 as r = tc.conn_read(&B, cast(*u8, &rdbuf[0]), 4096);
+        if (r > 0) {
+            // Verify as it arrives: a stream that is complete but reordered
+            // would otherwise pass a length check.
+            let is i64 as k with mut = 0;
+            while (k < r) {
+                if (rdbuf[k] != cast(u8, (recvd + k) & 0xFF)) { guard = 99999; }
+                k = k + 1;
+            }
+            recvd = recvd + r;
+        }
+        tc.conn_tick(&A, clock);
+        tc.conn_tick(&B, clock);
+        clock = clock + 200000;
+        guard = guard + 1;
+    }
+    check(cast(*u8, "all 40000 bytes arrived"), recvd, TOTAL);
+    check(cast(*u8, "in the right order"), guard < 99999, 1);
+    // Slow start should have grown the window well past its initial value.
+    check(cast(*u8, "cwnd grew during the transfer"), A.cong.cwnd > 14600, 1);
+    return;
+}
+
+fn test_loss() as void {
+    say("loss and retransmission:\n");
+    handshake();
+    A.nodelay = 1;
+
+    let is [1000]u8 as msg;
+    let is i64 as i with mut = 0;
+    while (i < 1000) { msg[i] = cast(u8, i & 0xFF); i = i + 1; }
+    tc.conn_write(&A, cast(*u8, &msg[0]), 1000);
+
+    // Swallow the first segment. Nothing else is lost, so the only way the
+    // data arrives is if it is retransmitted — which is the path a healthy
+    // link never exercises.
+    drop_next = 1;
+    dropped = 0;
+    let is i64 as guard with mut = 0;
+    while (tc.conn_readable(&B) < 1000 && guard < 8000) {
+        pump(&A, &B, 1);
+        pump(&B, &A, 0);
+        tc.conn_tick(&A, clock);
+        tc.conn_tick(&B, clock);
+        clock = clock + 1000000;
+        guard = guard + 1;
+    }
+    check(cast(*u8, "a segment was really dropped"), dropped, 1);
+    check(cast(*u8, "the data arrived anyway"), tc.conn_readable(&B), 1000);
+
+    let is i64 as got = tc.conn_read(&B, cast(*u8, &rdbuf[0]), 4096);
+    let is i64 as same with mut = 1;
+    i = 0;
+    while (i < got) {
+        if (rdbuf[i] != cast(u8, i & 0xFF)) { same = 0; }
+        i = i + 1;
+    }
+    check(cast(*u8, "and it is correct"), same, 1);
+    // A timeout must have cost the sender its window.
+    check(cast(*u8, "loss reduced the window"), A.cong.ssthresh < 0x7FFFFFFF, 1);
+    return;
+}
+
+fn test_close() as void {
+    say("close:\n");
+    handshake();
+    A.nodelay = 1;
+    tc.conn_write(&A, cast(*u8, "bye"), 3);
+    settle(40, 1000000);
+
+    tc.conn_close(&A, clock);
+    check(cast(*u8, "closer enters FIN_WAIT_1"), tc.conn_state(&A), tc.FIN_WAIT_1);
+    settle(60, 1000000);
+    // The peer saw the FIN and is in CLOSE_WAIT: its application may still
+    // send, which is what a half-close means.
+    check(cast(*u8, "peer enters CLOSE_WAIT"), tc.conn_state(&B), tc.CLOSE_WAIT);
+    check(cast(*u8, "closer reaches FIN_WAIT_2"), tc.conn_state(&A), tc.FIN_WAIT_2);
+    // Data sent after the peer's FIN still arrives — half-close is not a
+    // shutdown of both directions.
+    check(cast(*u8, "half-closed peer can still send"),
+          tc.conn_write(&B, cast(*u8, "ok"), 2), 2);
+    settle(40, 1000000);
+    // Two bytes, not five: the "bye" went the OTHER way and is still sitting
+    // unread in B. A only ever receives B's reply.
+    check(cast(*u8, "and it arrives"), tc.conn_readable(&A), 2);
+
+    tc.conn_close(&B, clock);
+    settle(60, 1000000);
+    check(cast(*u8, "peer reaches CLOSED"), tc.conn_state(&B), tc.CLOSED);
+    // TIME_WAIT, not CLOSED: a delayed segment from this connection must not
+    // be accepted by its successor on the same four-tuple.
+    check(cast(*u8, "closer sits in TIME_WAIT"), tc.conn_state(&A), tc.TIME_WAIT);
+
+    // And it leaves after 2*MSL, not before.
+    clock = clock + tc.MSL_NS;
+    tc.conn_tick(&A, clock);
+    check(cast(*u8, "still waiting at 1 MSL"), tc.conn_state(&A), tc.TIME_WAIT);
+    clock = clock + tc.MSL_NS + 1000000;
+    tc.conn_tick(&A, clock);
+    check(cast(*u8, "gone after 2 MSL"), tc.conn_state(&A), tc.CLOSED);
+    return;
+}
+
+fn test_reset() as void {
+    say("reset:\n");
+    handshake();
+    // RFC 5961: only a RST at exactly rcv_nxt is acted on. One merely inside
+    // the window gets a challenge ACK, because accepting it would let an
+    // off-path attacker tear down a connection by guessing anywhere in the
+    // window instead of exactly.
+    let is i64 as n with mut = tc.build_rst(cast(*u8, &wire[0]), IP_B, IP_A, 80, 40000,
+                                            w.seq_add(A.rcv_nxt, 100), 0, 0);
+    let is i64 as r with mut = tc.conn_input(&A, cast(*u8, &wire[0]), n, clock);
+    check(cast(*u8, "in-window RST is challenged"), r, tc.IN_DROP);
+    check(cast(*u8, "connection survives it"), tc.conn_state(&A), tc.ESTABLISHED);
+
+    // Exactly at rcv_nxt, it is real.
+    n = tc.build_rst(cast(*u8, &wire[0]), IP_B, IP_A, 80, 40000, A.rcv_nxt, 0, 0);
+    r = tc.conn_input(&A, cast(*u8, &wire[0]), n, clock);
+    check(cast(*u8, "exact RST is accepted"), r, tc.IN_RESET);
+    check(cast(*u8, "and closes the connection"), tc.conn_state(&A), tc.CLOSED);
+    return;
+}
+
 fn main() as i32 {
     say("tcpt: tcp wire format and control laws, no network required\n");
     test_seq();
@@ -363,6 +626,12 @@ fn main() as i32 {
     test_window_scale();
     test_rto();
     test_cong();
+    test_handshake();
+    test_transfer();
+    test_large_transfer();
+    test_loss();
+    test_close();
+    test_reset();
     say("tcpt: "); say_num(checks); say(" checks\n");
     if (fails == 0) { say("tcpt: ALL PASS\n"); return cast(i32, 0); }
     say("tcpt: FAIL n="); say_num(fails); say("\n");

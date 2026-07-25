@@ -18,6 +18,7 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 TESTS=(
     "u64t:30:"
     "nett:40:"
+    "tcpt:60:"
     "kabi:30:"
     "pingt:60:userspace/build/ping.cse"
     "netdt:70:userspace/build/netd.cse"
