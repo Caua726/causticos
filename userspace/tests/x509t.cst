@@ -1,0 +1,277 @@
+// x509t — certificate validation, against certificates OpenSSL made.
+//
+// The positive cases are the easy half and they are not what this is for. A
+// validator that accepts every good chain and has never been shown a bad one
+// has not been tested: the whole job is refusing things, and every refusal here
+// is a way a real attack works.
+//
+//   expired / not yet valid   a certificate that was revoked by time
+//   wrong hostname            a valid certificate for somebody else's site
+//   unknown root              a chain that is internally perfect and anchored
+//                             in a CA nobody trusts — what a self-signed
+//                             man in the middle looks like
+//   issuer that is not a CA   a signature that verifies, from a key that was
+//                             never allowed to sign certificates. This is the
+//                             one that turns any web server's certificate into
+//                             a certificate for a bank, and the only thing
+//                             stopping it is basicConstraints.
+//
+// The wildcard cases pin RFC 6125 §6.4.3, which is the rule everybody gets
+// wrong: '*' is the whole leftmost label and matches exactly one label.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/x509/x509v.cst" as x;
+use "../lib/x509/trust.cst" as trust;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x2 with mut = v;
+    if (x2 < 0) { sys.write_serial(cast(*u8, "-"), 1); x2 = 0 - x2; }
+    if (x2 == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x2 > 0) { i = i - 1; b[i] = cast(u8, 48 + (x2 % 10)); x2 = x2 / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// Every fixture, loaded once and kept: a certificate is a few hundred bytes
+// and reloading one per case would test the filesystem instead.
+let is i64 as MAX_FIX with imut = 12;
+let is [12]i64 as fx_va with mut;
+let is [12]i64 as fx_len with mut;
+let is i64 as n_fx with mut = 0;
+
+fn load(path as *u8) as i64 {
+    if (n_fx >= MAX_FIX) { return 0 - 1; }
+    let is i64 as len with mut = 0;
+    let is i64 as va = fu.slurp(path, &len);
+    if (len <= 0) { return 0 - 1; }
+    fx_va[n_fx] = va;
+    fx_len[n_fx] = len;
+    n_fx = n_fx + 1;
+    return n_fx - 1;
+}
+
+let is i64 as I_ROOT with mut = 0;
+let is i64 as I_INT with mut = 0;
+let is i64 as I_LEAF with mut = 0;
+let is i64 as I_WILD with mut = 0;
+let is i64 as I_EXPIRED with mut = 0;
+let is i64 as I_FUTURE with mut = 0;
+let is i64 as I_ROGUE with mut = 0;
+let is i64 as I_UNDER with mut = 0;
+let is i64 as I_NOTCA with mut = 0;
+let is i64 as I_ECROOT with mut = 0;
+let is i64 as I_ECLEAF with mut = 0;
+
+let is i64 as NOW with mut = 0;
+
+// A chain, as TLS presents one: leaf first, then whatever the server sent
+// with it. Flat pairs of (pointer, length).
+let is [16]i64 as chain with mut;
+
+fn chain1(a as i64) as i64 {
+    chain[0] = fx_va[a]; chain[1] = fx_len[a];
+    return 1;
+}
+fn chain2(a as i64, b as i64) as i64 {
+    chain[0] = fx_va[a]; chain[1] = fx_len[a];
+    chain[2] = fx_va[b]; chain[3] = fx_len[b];
+    return 2;
+}
+
+fn vfy(n as i64, host as *u8, hlen as i64) as i64 {
+    return trust.verify_chain(cast(*i64, &chain[0]), n, host, hlen, NOW);
+}
+
+fn t_parse() as void {
+    say("parsing:\n");
+    let is x.Cert as c;
+    check(cast(*u8, "a leaf parses"),
+          x.parse(cast(*u8, fx_va[I_LEAF]), fx_len[I_LEAF], &c), x.OK);
+    check(cast(*u8, "  rsa public key"), c.pk_alg, x.PK_RSA);
+    check(cast(*u8, "  signed with rsa-sha256"), c.sigalg, x.SIG_RSA_SHA256);
+    check(cast(*u8, "  has a subjectAltName"), c.has_san, 1);
+    check(cast(*u8, "  is not a CA"), c.is_ca, 0);
+    // notBefore is in the past and notAfter in the future, as a number the
+    // clock can be compared against directly.
+    check(cast(*u8, "  validity is ordered"), c.not_before < c.not_after, 1);
+
+    let is x.Cert as r;
+    check(cast(*u8, "a root parses"),
+          x.parse(cast(*u8, fx_va[I_ROOT]), fx_len[I_ROOT], &r), x.OK);
+    check(cast(*u8, "  is a CA"), r.is_ca, 1);
+    check(cast(*u8, "  may sign certificates"), x.may_sign_certs(&r), x.OK);
+    check(cast(*u8, "  a leaf may not"), x.may_sign_certs(&c), x.E_NOT_A_CA);
+
+    let is x.Cert as e;
+    check(cast(*u8, "an ec leaf parses"),
+          x.parse(cast(*u8, fx_va[I_ECLEAF]), fx_len[I_ECLEAF], &e), x.OK);
+    check(cast(*u8, "  p-256 public key"), e.pk_alg, x.PK_P256);
+    check(cast(*u8, "  signed with ecdsa-sha256"), e.sigalg, x.SIG_ECDSA_SHA256);
+
+    // Garbage in, refusal out — never a read past the end of the buffer.
+    let is [8]u8 as junk;
+    let is i64 as i with mut = 0;
+    while (i < 8) { junk[i] = cast(u8, 0xFF); i = i + 1; }
+    check(cast(*u8, "garbage is refused"),
+          x.parse(cast(*u8, &junk[0]), 8, &c), x.E_PARSE);
+    // A truncated certificate is the interesting one: every length inside it
+    // is real and every one of them now points past the end.
+    check(cast(*u8, "a truncated cert is refused"),
+          x.parse(cast(*u8, fx_va[I_LEAF]), fx_len[I_LEAF] / 2, &c), x.E_PARSE);
+    return;
+}
+
+fn t_hostname() as void {
+    say("hostname:\n");
+    let is x.Cert as c;
+    x.parse(cast(*u8, fx_va[I_LEAF]), fx_len[I_LEAF], &c);
+    let is *u8 as b = cast(*u8, fx_va[I_LEAF]);
+    let is i64 as l = fx_len[I_LEAF];
+
+    check(cast(*u8, "exact name matches"),
+          x.matches_host(b, l, &c, cast(*u8, "host.causticos"), 14), 1);
+    check(cast(*u8, "the second SAN matches too"),
+          x.matches_host(b, l, &c, cast(*u8, "alt.causticos"), 13), 1);
+    check(cast(*u8, "case is ignored"),
+          x.matches_host(b, l, &c, cast(*u8, "HOST.causticos"), 14), 1);
+    check(cast(*u8, "another host does not"),
+          x.matches_host(b, l, &c, cast(*u8, "evil.causticos"), 14), 0);
+    // A prefix must not match: "host.causticos.evil.com" is a different host
+    // and a length-blind compare would accept it.
+    check(cast(*u8, "a longer name does not"),
+          x.matches_host(b, l, &c, cast(*u8, "host.causticos.evil"), 19), 0);
+
+    let is x.Cert as w;
+    x.parse(cast(*u8, fx_va[I_WILD]), fx_len[I_WILD], &w);
+    let is *u8 as wb = cast(*u8, fx_va[I_WILD]);
+    let is i64 as wl = fx_len[I_WILD];
+    check(cast(*u8, "*.causticos covers one label"),
+          x.matches_host(wb, wl, &w, cast(*u8, "any.causticos"), 13), 1);
+    // The two rules everyone breaks.
+    check(cast(*u8, "and not two"),
+          x.matches_host(wb, wl, &w, cast(*u8, "a.b.causticos"), 13), 0);
+    check(cast(*u8, "and not the bare domain"),
+          x.matches_host(wb, wl, &w, cast(*u8, "causticos"), 9), 0);
+    check(cast(*u8, "and not another domain"),
+          x.matches_host(wb, wl, &w, cast(*u8, "any.evil.com"), 12), 0);
+    return;
+}
+
+fn t_chain() as void {
+    say("chains:\n");
+    check(cast(*u8, "the trust store loaded"), trust.count() > 0, 1);
+
+    check(cast(*u8, "leaf + intermediate to a known root"),
+          vfy(chain2(I_LEAF, I_INT), cast(*u8, "host.causticos"), 14), x.OK);
+
+    // Same chain, wrong host. The signatures are all fine; the certificate is
+    // simply not for the site being visited.
+    check(cast(*u8, "wrong hostname is refused"),
+          vfy(chain2(I_LEAF, I_INT), cast(*u8, "evil.causticos"), 14), x.E_HOSTNAME);
+
+    // No intermediate: the server did not send it, so the chain cannot be
+    // built even though the leaf itself is perfectly good.
+    check(cast(*u8, "a missing intermediate breaks it"),
+          vfy(chain1(I_LEAF), cast(*u8, "host.causticos"), 14), x.E_UNTRUSTED);
+
+    check(cast(*u8, "an expired leaf is refused"),
+          vfy(chain2(I_EXPIRED, I_INT), cast(*u8, "host.causticos"), 14), x.E_EXPIRED);
+    check(cast(*u8, "a not-yet-valid leaf is refused"),
+          vfy(chain2(I_FUTURE, I_INT), cast(*u8, "host.causticos"), 14),
+          x.E_NOT_YET_VALID);
+
+    // Internally perfect, anchored nowhere. This is what a man in the middle
+    // with his own CA looks like, and it must fail on the anchor and not on
+    // anything else.
+    check(cast(*u8, "an untrusted root is refused"),
+          vfy(chain1(I_ROGUE), cast(*u8, "host.causticos"), 14), x.E_UNTRUSTED);
+
+    // The signature on `under` verifies against `notca`'s key. What is wrong
+    // is that notca is a leaf certificate: it was never allowed to sign.
+    chain[0] = fx_va[I_UNDER]; chain[1] = fx_len[I_UNDER];
+    chain[2] = fx_va[I_NOTCA]; chain[3] = fx_len[I_NOTCA];
+    chain[4] = fx_va[I_INT];   chain[5] = fx_len[I_INT];
+    check(cast(*u8, "a non-CA issuer is refused"),
+          vfy(3, cast(*u8, "under.causticos"), 15), x.E_NOT_A_CA);
+
+    // The other signature algorithm, end to end.
+    check(cast(*u8, "an ecdsa chain verifies"),
+          vfy(chain1(I_ECLEAF), cast(*u8, "ec.causticos"), 12), x.OK);
+
+    // One flipped byte in the leaf's signature. Everything else about the
+    // chain is untouched, so this isolates the verification itself.
+    let is *u8 as lb = cast(*u8, fx_va[I_LEAF]);
+    let is x.Cert as c;
+    x.parse(lb, fx_len[I_LEAF], &c);
+    lb[c.sig_off] = cast(u8, cast(i64, lb[c.sig_off]) ^ 1);
+    check(cast(*u8, "a tampered signature is refused"),
+          vfy(chain2(I_LEAF, I_INT), cast(*u8, "host.causticos"), 14), x.E_SIGNATURE);
+    lb[c.sig_off] = cast(u8, cast(i64, lb[c.sig_off]) ^ 1);
+    check(cast(*u8, "and putting it back restores trust"),
+          vfy(chain2(I_LEAF, I_INT), cast(*u8, "host.causticos"), 14), x.OK);
+    return;
+}
+
+fn main() as i32 {
+    say("x509t: certificates, and the reasons to refuse them\n");
+
+    I_ROOT = load(cast(*u8, "/root.der"));
+    I_INT = load(cast(*u8, "/int.der"));
+    I_LEAF = load(cast(*u8, "/leaf.der"));
+    I_WILD = load(cast(*u8, "/wild.der"));
+    I_EXPIRED = load(cast(*u8, "/expired.der"));
+    I_FUTURE = load(cast(*u8, "/future.der"));
+    I_ROGUE = load(cast(*u8, "/rogue.der"));
+    I_UNDER = load(cast(*u8, "/under.der"));
+    I_NOTCA = load(cast(*u8, "/notca.der"));
+    I_ECROOT = load(cast(*u8, "/ecroot.der"));
+    I_ECLEAF = load(cast(*u8, "/ecleaf.der"));
+    if (I_ECLEAF < 0) {
+        say("x509t: fixtures missing from the disk\n");
+        return cast(i32, 1);
+    }
+
+    let is [8]i64 as w;
+    sys.time_wall(cast(*i64, &w[0]));
+    NOW = x.stamp_from_wall(cast(*i64, &w[0]));
+    say("clock: "); say_num(NOW); say("\n");
+    check(cast(*u8, "the machine knows the time"), NOW > 0, 1);
+
+    let is i64 as n = trust.load(cast(*u8, "/ca.pem"));
+    check(cast(*u8, "anchors loaded from PEM"), n, 2);
+
+    t_parse();
+    t_hostname();
+    t_chain();
+
+    say("x509t: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("x509t: ALL PASS\n"); return cast(i32, 0); }
+    say("x509t: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

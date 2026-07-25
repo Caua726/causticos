@@ -21,10 +21,18 @@ TESTS=(
     "tcpt:60:"
     "kabi:30:"
     "cryptot:60:"
+    "x509t:90:build/certs/root.der build/certs/int.der build/certs/leaf.der build/certs/wild.der build/certs/expired.der build/certs/future.der build/certs/rogue.der build/certs/under.der build/certs/notca.der build/certs/ecroot.der build/certs/ecleaf.der build/certs/ca.pem"
     "pingt:60:userspace/build/ping.cse"
     "netdt:70:userspace/build/netd.cse"
     "httpt:150:userspace/build/netd.cse userspace/build/wget.cse"
 )
+
+# The certificate fixtures are generated rather than committed. A certificate
+# has an expiry date in it, and one checked into a repository is a test that
+# starts failing on a day nobody picked.
+if [ ! -f build/certs/leaf.der ]; then
+    bash scripts/make-test-certs.sh >/dev/null
+fi
 
 WANT="${1:-}"
 PASS=0

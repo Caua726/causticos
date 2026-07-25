@@ -1,0 +1,633 @@
+// x509v — deciding whether to believe a certificate.
+//
+// caustic-crypto parses one certificate and checks one signature. That is the
+// mechanism, and its own header says the chain and the hostname do not live
+// there. This is the other half, and it is the half that decides things:
+//
+//   Is this certificate for the host I asked for?
+//   Is it valid now?
+//   Was it signed by something I already trust, through issuers that were
+//   themselves allowed to sign certificates?
+//
+// A TLS client that skips any of these encrypts perfectly well to whoever
+// answered. That is the failure this file exists to prevent, and it is a
+// failure that looks exactly like success.
+//
+// SAN ONLY, NEVER CN. RFC 6125 §6.4.4 deprecated matching the Common Name and
+// every browser dropped it years ago; a certificate without a subjectAltName
+// simply does not name any host. Falling back to CN is how a certificate for
+// "CN=*" gets accepted for everything, and the fallback is exactly the code an
+// attacker aims at. Stated here rather than left as a gap: this REFUSES such a
+// certificate, and that is the intended behaviour.
+//
+// THE PARSER IS THE ATTACK SURFACE. Every length in a certificate is attacker
+// controlled. Nothing here indexes the buffer on a number it read; every step
+// goes through der_read, which bounds-checks the content against the buffer it
+// was handed. A length that does not fit is a parse failure, never a read.
+
+use "../../../../caustic-crypto/asn1/der.cst" as der;
+use "../../../../caustic-crypto/hash/sha2.cst" as sha2;
+use "../../../../caustic-crypto/pk/rsa.cst" as rsa;
+use "../../../../caustic-crypto/pk/p256.cst" as p256;
+use "../../../../caustic-crypto/bigint/bigint.cst" as bi;
+
+// Signature algorithms. Anything not here is refused rather than guessed —
+// an unknown algorithm that returns "valid" is the worst possible default.
+let is i64 as SIG_UNKNOWN     with imut = 0;
+let is i64 as SIG_RSA_SHA256  with imut = 1;
+let is i64 as SIG_RSA_SHA384  with imut = 2;
+let is i64 as SIG_RSA_SHA512  with imut = 3;
+let is i64 as SIG_ECDSA_SHA256 with imut = 4;
+let is i64 as SIG_ECDSA_SHA384 with imut = 5;
+let is i64 as SIG_RSA_PSS_SHA256 with imut = 6;
+
+// Public key types we can verify with.
+let is i64 as PK_UNKNOWN with imut = 0;
+let is i64 as PK_RSA     with imut = 1;
+let is i64 as PK_P256    with imut = 2;
+
+// keyUsage bits, numbered from the most significant bit of the first content
+// byte the way a DER BIT STRING is.
+let is i64 as KU_DIGITAL_SIGNATURE with imut = 0x80;
+let is i64 as KU_KEY_ENCIPHERMENT  with imut = 0x20;
+let is i64 as KU_KEY_CERT_SIGN     with imut = 0x04;
+
+// Why a certificate was refused. A single boolean would make every failure
+// look like every other one, and "it did not work" is not a thing anyone can
+// act on.
+let is i64 as OK              with imut = 0;
+let is i64 as E_PARSE         with imut = 0 - 1;
+let is i64 as E_EXPIRED       with imut = 0 - 2;
+let is i64 as E_NOT_YET_VALID with imut = 0 - 3;
+let is i64 as E_HOSTNAME      with imut = 0 - 4;
+let is i64 as E_SIGNATURE     with imut = 0 - 5;
+let is i64 as E_UNTRUSTED     with imut = 0 - 6;
+let is i64 as E_NOT_A_CA      with imut = 0 - 7;
+let is i64 as E_PATH_LEN      with imut = 0 - 8;
+let is i64 as E_ALGORITHM     with imut = 0 - 9;
+let is i64 as E_CHAIN_LOOP    with imut = 0 - 10;
+
+// Every field an i64, and the byte ranges are offsets into the caller's DER
+// rather than copies: a certificate is already in memory and a second copy of
+// it is a second thing to keep in step.
+struct Cert {
+    ok          as i64;
+    tbs_off     as i64; tbs_len as i64;
+    sigalg      as i64;
+    sig_off     as i64; sig_len as i64;
+    pk_alg      as i64;
+    n_off       as i64; n_len as i64;      // RSA modulus
+    e_off       as i64; e_len as i64;      // RSA exponent
+    ec_off      as i64;                    // uncompressed EC point, 0x04||X||Y
+    issuer_off  as i64; issuer_len as i64; // the whole Name TLV, for matching
+    subject_off as i64; subject_len as i64;
+    not_before  as i64;                    // YYYYMMDDhhmmss as one number
+    not_after   as i64;
+    has_bc      as i64;
+    is_ca       as i64;
+    path_len    as i64;                    // -1 = unconstrained
+    has_ku      as i64;
+    ku          as i64;
+    has_san     as i64;
+    san_off     as i64; san_len as i64;    // contents of the GeneralNames SEQUENCE
+}
+
+// ---- OID bodies, as DER content bytes ----
+let is *u8 as OID_RSA_SHA256   with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b";
+let is *u8 as OID_RSA_SHA384   with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c";
+let is *u8 as OID_RSA_SHA512   with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d";
+let is *u8 as OID_RSA_PSS      with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
+let is *u8 as OID_ECDSA_SHA256 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x02";
+let is *u8 as OID_ECDSA_SHA384 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x03";
+let is *u8 as OID_RSA_ENC      with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
+let is *u8 as OID_EC_PUBKEY    with imut = "\x2a\x86\x48\xce\x3d\x02\x01";
+let is *u8 as OID_PRIME256V1   with imut = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
+let is *u8 as OID_EXT_SAN      with imut = "\x55\x1d\x11";
+let is *u8 as OID_EXT_BC       with imut = "\x55\x1d\x13";
+let is *u8 as OID_EXT_KU       with imut = "\x55\x1d\x0f";
+
+// DigestInfo prefixes for PKCS#1 v1.5.
+let is *u8 as DI_SHA256 with imut = "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20";
+let is *u8 as DI_SHA384 with imut = "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30";
+let is *u8 as DI_SHA512 with imut = "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40";
+
+fn oid_is(buf as *u8, off as i64, len as i64, want as *u8, wlen as i64) as i64 {
+    return der.der_oid_eq(buf, off, len, want, wlen);
+}
+
+fn sigalg_of(buf as *u8, off as i64, len as i64) as i64 {
+    if (oid_is(buf, off, len, OID_RSA_SHA256, 9) == 1) { return SIG_RSA_SHA256; }
+    if (oid_is(buf, off, len, OID_RSA_SHA384, 9) == 1) { return SIG_RSA_SHA384; }
+    if (oid_is(buf, off, len, OID_RSA_SHA512, 9) == 1) { return SIG_RSA_SHA512; }
+    if (oid_is(buf, off, len, OID_RSA_PSS, 9) == 1) { return SIG_RSA_PSS_SHA256; }
+    if (oid_is(buf, off, len, OID_ECDSA_SHA256, 8) == 1) { return SIG_ECDSA_SHA256; }
+    if (oid_is(buf, off, len, OID_ECDSA_SHA384, 8) == 1) { return SIG_ECDSA_SHA384; }
+    return SIG_UNKNOWN;
+}
+
+fn skip(buf as *u8, len as i64, off as i64) as i64 {
+    let is i64 as t; let is i64 as co; let is i64 as cl;
+    return der.der_read(buf, len, off, &t, &co, &cl);
+}
+
+// ============================================================
+// Time
+// ============================================================
+
+fn digit2(buf as *u8, off as i64) as i64 {
+    let is i64 as a = cast(i64, buf[off]) - 48;
+    let is i64 as b = cast(i64, buf[off + 1]) - 48;
+    if (a < 0 || a > 9 || b < 0 || b > 9) { return 0 - 1; }
+    return a * 10 + b;
+}
+
+// A Time as one comparable number, YYYYMMDDhhmmss. Not an epoch: an epoch
+// needs a calendar and every calendar has a leap-year bug in it somewhere,
+// and nothing here needs to know how many seconds apart two dates are — only
+// which came first. Ordering is all that is asked, so ordering is all that is
+// computed.
+//
+// UTCTime's two-digit year follows RFC 5280 §4.1.2.5.1: 00..49 is 20xx,
+// 50..99 is 19xx. GeneralizedTime carries all four.
+let is i64 as TAG_UTCTIME with imut = 0x17;
+let is i64 as TAG_GENTIME with imut = 0x18;
+
+fn parse_time(buf as *u8, tag as i64, off as i64, len as i64) as i64 {
+    let is i64 as year with mut = 0;
+    let is i64 as p with mut = off;
+    if (tag == TAG_UTCTIME) {
+        if (len < 11) { return 0 - 1; }
+        let is i64 as yy = digit2(buf, p);
+        if (yy < 0) { return 0 - 1; }
+        if (yy < 50) { year = 2000 + yy; } else { year = 1900 + yy; }
+        p = p + 2;
+    } else {
+        if (tag != TAG_GENTIME || len < 13) { return 0 - 1; }
+        let is i64 as c = digit2(buf, p);
+        let is i64 as y = digit2(buf, p + 2);
+        if (c < 0 || y < 0) { return 0 - 1; }
+        year = c * 100 + y;
+        p = p + 4;
+    }
+    let is i64 as mon = digit2(buf, p);
+    let is i64 as day = digit2(buf, p + 2);
+    let is i64 as hh = digit2(buf, p + 4);
+    let is i64 as mm = digit2(buf, p + 6);
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) { return 0 - 1; }
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) { return 0 - 1; }
+    // Seconds are optional in UTCTime; absent means zero, and a certificate
+    // is not going to hinge on one second.
+    let is i64 as ss with mut = 0;
+    if (p + 10 <= off + len) {
+        let is i64 as v = digit2(buf, p + 8);
+        if (v >= 0 && v <= 60) { ss = v; }
+    }
+    return ((((year * 100 + mon) * 100 + day) * 100 + hh) * 100 + mm) * 100 + ss;
+}
+
+// The same number, from the wall clock. A machine with no clock reports year
+// zero, and a certificate check against year zero would reject everything —
+// so the caller is given the chance to say "I do not know what time it is"
+// rather than being handed a wrong answer.
+fn stamp_from_wall(w as *i64) as i64 {
+    if (w[0] < 1980) { return 0; }
+    return ((((w[0] * 100 + w[1]) * 100 + w[2]) * 100 + w[3]) * 100 + w[4]) * 100 + w[5];
+}
+
+// ============================================================
+// Parsing
+// ============================================================
+
+fn parse_validity(buf as *u8, len as i64, off as i64, c as *Cert) as i64 {
+    let is i64 as vin; let is i64 as vlen;
+    if (der.der_enter(buf, len, off, der.TAG_SEQUENCE, &vin, &vlen) < 0) { return 0; }
+    let is i64 as t; let is i64 as co; let is i64 as cl;
+    let is i64 as p with mut = der.der_read(buf, len, vin, &t, &co, &cl);
+    if (p < 0) { return 0; }
+    c.not_before = parse_time(buf, t, co, cl);
+    if (der.der_read(buf, len, p, &t, &co, &cl) < 0) { return 0; }
+    c.not_after = parse_time(buf, t, co, cl);
+    if (c.not_before < 0 || c.not_after < 0) { return 0; }
+    return 1;
+}
+
+fn parse_spki(buf as *u8, len as i64, off as i64, c as *Cert) as i64 {
+    let is i64 as spki_in; let is i64 as spki_len;
+    if (der.der_enter(buf, len, off, der.TAG_SEQUENCE, &spki_in, &spki_len) < 0) { return 0; }
+
+    // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY }
+    let is i64 as alg_in; let is i64 as alg_len;
+    let is i64 as after_alg = der.der_enter(buf, len, spki_in, der.TAG_SEQUENCE,
+                                            &alg_in, &alg_len);
+    if (after_alg < 0) { return 0; }
+    let is i64 as t; let is i64 as co; let is i64 as cl;
+    let is i64 as after_oid = der.der_read(buf, len, alg_in, &t, &co, &cl);
+    if (after_oid < 0 || t != der.TAG_OID) { return 0; }
+
+    c.pk_alg = PK_UNKNOWN;
+    if (oid_is(buf, co, cl, OID_RSA_ENC, 9) == 1) { c.pk_alg = PK_RSA; }
+    if (oid_is(buf, co, cl, OID_EC_PUBKEY, 7) == 1) {
+        // Which curve, from the parameters. An EC key on a curve we cannot do
+        // must not be mistaken for one we can.
+        if (der.der_read(buf, len, after_oid, &t, &co, &cl) >= 0 && t == der.TAG_OID) {
+            if (oid_is(buf, co, cl, OID_PRIME256V1, 8) == 1) { c.pk_alg = PK_P256; }
+        }
+    }
+
+    // subjectPublicKey BIT STRING
+    if (der.der_read(buf, len, after_alg, &t, &co, &cl) < 0) { return 0; }
+    if (t != der.TAG_BITSTRING || cl < 2) { return 0; }
+    let is i64 as key_off = co + 1;              // past the unused-bits byte
+    let is i64 as key_len = cl - 1;
+
+    if (c.pk_alg == PK_RSA) {
+        let is i64 as rin; let is i64 as rlen;
+        if (der.der_enter(buf, key_off + key_len, key_off, der.TAG_SEQUENCE,
+                          &rin, &rlen) < 0) { return 0; }
+        let is i64 as after_n = der.der_read(buf, len, rin, &t, &co, &cl);
+        if (after_n < 0 || t != der.TAG_INTEGER) { return 0; }
+        der.der_uint(buf, co, cl, &c.n_off, &c.n_len);
+        if (der.der_read(buf, len, after_n, &t, &co, &cl) < 0 || t != der.TAG_INTEGER) {
+            return 0;
+        }
+        der.der_uint(buf, co, cl, &c.e_off, &c.e_len);
+        return 1;
+    }
+    if (c.pk_alg == PK_P256) {
+        // Uncompressed point only. Compressed points need a square root and
+        // are vanishingly rare in certificates; refusing one is honest, and
+        // guessing at it would not be.
+        if (key_len != 65) { return 0; }
+        if (buf[key_off] != cast(u8, 4)) { return 0; }
+        c.ec_off = key_off;
+        return 1;
+    }
+    return 0;
+}
+
+fn parse_extensions(buf as *u8, len as i64, off as i64, endoff as i64, c as *Cert) as i64 {
+    // [3] EXPLICIT Extensions. The explicit tag wraps a SEQUENCE.
+    let is i64 as t; let is i64 as co; let is i64 as cl;
+    if (der.der_read(buf, len, off, &t, &co, &cl) < 0) { return 0; }
+    if (t != 0xA3) { return 1; }                  // no extensions: legal, nothing to read
+    let is i64 as seq_in; let is i64 as seq_len;
+    if (der.der_enter(buf, len, co, der.TAG_SEQUENCE, &seq_in, &seq_len) < 0) { return 0; }
+
+    let is i64 as p with mut = seq_in;
+    let is i64 as end = seq_in + seq_len;
+    while (p < end) {
+        let is i64 as ext_in; let is i64 as ext_len;
+        let is i64 as nxt = der.der_enter(buf, len, p, der.TAG_SEQUENCE, &ext_in, &ext_len);
+        if (nxt < 0) { return 0; }
+        p = nxt;
+
+        let is i64 as q with mut = der.der_read(buf, len, ext_in, &t, &co, &cl);
+        if (q < 0 || t != der.TAG_OID) { return 0; }
+        let is i64 as oid_off = co;
+        let is i64 as oid_len = cl;
+
+        // The optional critical BOOLEAN sits between the OID and the value.
+        if (der.der_read(buf, len, q, &t, &co, &cl) < 0) { return 0; }
+        if (t == 0x01) {
+            q = der.der_read(buf, len, q, &t, &co, &cl);
+            if (q < 0) { return 0; }
+            if (der.der_read(buf, len, q, &t, &co, &cl) < 0) { return 0; }
+        }
+        if (t != der.TAG_OCTETSTRING) { return 0; }
+        let is i64 as val_off = co;
+        let is i64 as val_len = cl;
+
+        if (oid_is(buf, oid_off, oid_len, OID_EXT_SAN, 3) == 1) {
+            let is i64 as sin; let is i64 as slen;
+            if (der.der_enter(buf, val_off + val_len, val_off, der.TAG_SEQUENCE,
+                              &sin, &slen) >= 0) {
+                c.has_san = 1;
+                c.san_off = sin;
+                c.san_len = slen;
+            }
+        }
+        if (oid_is(buf, oid_off, oid_len, OID_EXT_BC, 3) == 1) {
+            c.has_bc = 1;
+            let is i64 as bin; let is i64 as blen;
+            if (der.der_enter(buf, val_off + val_len, val_off, der.TAG_SEQUENCE,
+                              &bin, &blen) >= 0) {
+                let is i64 as r with mut = bin;
+                let is i64 as bend = bin + blen;
+                if (r < bend) {
+                    if (der.der_read(buf, len, r, &t, &co, &cl) >= 0 && t == 0x01) {
+                        if (cl >= 1 && buf[co] != cast(u8, 0)) { c.is_ca = 1; }
+                        r = co + cl;
+                    }
+                }
+                if (r < bend) {
+                    if (der.der_read(buf, len, r, &t, &co, &cl) >= 0
+                        && t == der.TAG_INTEGER && cl >= 1 && cl <= 4) {
+                        let is i64 as v with mut = 0;
+                        let is i64 as i with mut = 0;
+                        while (i < cl) { v = (v << 8) | cast(i64, buf[co + i]); i = i + 1; }
+                        c.path_len = v;
+                    }
+                }
+            }
+        }
+        if (oid_is(buf, oid_off, oid_len, OID_EXT_KU, 3) == 1) {
+            if (der.der_read(buf, len, val_off, &t, &co, &cl) >= 0
+                && t == der.TAG_BITSTRING && cl >= 2) {
+                c.has_ku = 1;
+                c.ku = cast(i64, buf[co + 1]);
+            }
+        }
+    }
+    return 1;
+}
+
+fn init(c as *Cert) as void {
+    c.ok = 0;
+    c.tbs_off = 0; c.tbs_len = 0;
+    c.sigalg = SIG_UNKNOWN;
+    c.sig_off = 0; c.sig_len = 0;
+    c.pk_alg = PK_UNKNOWN;
+    c.n_off = 0; c.n_len = 0; c.e_off = 0; c.e_len = 0;
+    c.ec_off = 0;
+    c.issuer_off = 0; c.issuer_len = 0;
+    c.subject_off = 0; c.subject_len = 0;
+    c.not_before = 0; c.not_after = 0;
+    c.has_bc = 0; c.is_ca = 0; c.path_len = 0 - 1;
+    c.has_ku = 0; c.ku = 0;
+    c.has_san = 0; c.san_off = 0; c.san_len = 0;
+    return;
+}
+
+// Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+fn parse(buf as *u8, len as i64, c as *Cert) as i64 {
+    init(c);
+    let is i64 as t; let is i64 as co; let is i64 as cl;
+
+    let is i64 as cert_in; let is i64 as cert_len;
+    if (der.der_enter(buf, len, 0, der.TAG_SEQUENCE, &cert_in, &cert_len) < 0) {
+        return E_PARSE;
+    }
+
+    let is i64 as after_tbs = der.der_read(buf, len, cert_in, &t, &co, &cl);
+    if (after_tbs < 0 || t != der.TAG_SEQUENCE) { return E_PARSE; }
+    c.tbs_off = cert_in;
+    c.tbs_len = after_tbs - cert_in;
+    let is i64 as tbs_in = co;
+    let is i64 as tbs_end = co + cl;
+
+    let is i64 as sa_in; let is i64 as sa_len;
+    let is i64 as after_sa = der.der_enter(buf, len, after_tbs, der.TAG_SEQUENCE,
+                                           &sa_in, &sa_len);
+    if (after_sa < 0) { return E_PARSE; }
+    if (der.der_read(buf, len, sa_in, &t, &co, &cl) < 0 || t != der.TAG_OID) {
+        return E_PARSE;
+    }
+    c.sigalg = sigalg_of(buf, co, cl);
+
+    if (der.der_read(buf, len, after_sa, &t, &co, &cl) < 0 || t != der.TAG_BITSTRING) {
+        return E_PARSE;
+    }
+    if (cl < 2) { return E_PARSE; }
+    c.sig_off = co + 1;
+    c.sig_len = cl - 1;
+
+    // --- inside tbsCertificate ---
+    let is i64 as p with mut = tbs_in;
+    if (der.der_read(buf, len, p, &t, &co, &cl) < 0) { return E_PARSE; }
+    if (t == 0xA0) { p = co + cl; }                     // version [0]
+    p = skip(buf, len, p);                              // serialNumber
+    if (p < 0) { return E_PARSE; }
+    p = skip(buf, len, p);                              // signature (repeats sigalg)
+    if (p < 0) { return E_PARSE; }
+
+    let is i64 as issuer_start = p;
+    p = skip(buf, len, p);                              // issuer
+    if (p < 0) { return E_PARSE; }
+    c.issuer_off = issuer_start;
+    c.issuer_len = p - issuer_start;
+
+    if (parse_validity(buf, len, p, c) == 0) { return E_PARSE; }
+    p = skip(buf, len, p);
+    if (p < 0) { return E_PARSE; }
+
+    let is i64 as subject_start = p;
+    p = skip(buf, len, p);                              // subject
+    if (p < 0) { return E_PARSE; }
+    c.subject_off = subject_start;
+    c.subject_len = p - subject_start;
+
+    if (parse_spki(buf, len, p, c) == 0) { return E_PARSE; }
+    p = skip(buf, len, p);
+    if (p < 0) { return E_PARSE; }
+
+    // issuerUniqueID [1] and subjectUniqueID [2] are ancient and optional.
+    while (p < tbs_end) {
+        if (der.der_read(buf, len, p, &t, &co, &cl) < 0) { return E_PARSE; }
+        if (t == 0xA1 || t == 0xA2) { p = co + cl; } else { break; }
+    }
+    if (p < tbs_end) {
+        if (parse_extensions(buf, len, p, tbs_end, c) == 0) { return E_PARSE; }
+    }
+    c.ok = 1;
+    return OK;
+}
+
+// ============================================================
+// Hostname
+// ============================================================
+
+fn lower(ch as i64) as i64 {
+    if (ch >= 65 && ch <= 90) { return ch + 32; }
+    return ch;
+}
+
+// One dNSName against the host, with the wildcard rule everyone gets wrong.
+// RFC 6125 §6.4.3: a '*' is only allowed as the ENTIRE leftmost label, and it
+// matches exactly one label. So "*.example.com" covers "a.example.com" and
+// does NOT cover "example.com" or "a.b.example.com". Anything looser turns one
+// stolen certificate into every subdomain a registrar will sell.
+fn name_matches(buf as *u8, noff as i64, nlen as i64,
+                host as *u8, hlen as i64) as i64 {
+    if (nlen <= 0 || hlen <= 0) { return 0; }
+
+    let is i64 as wild with mut = 0;
+    if (nlen >= 2) {
+        if (buf[noff] == cast(u8, 42) && buf[noff + 1] == cast(u8, 46)) { wild = 1; }
+    }
+
+    if (wild == 0) {
+        if (nlen != hlen) { return 0; }
+        let is i64 as i with mut = 0;
+        while (i < nlen) {
+            if (lower(cast(i64, buf[noff + i])) != lower(cast(i64, host[i]))) { return 0; }
+            i = i + 1;
+        }
+        return 1;
+    }
+
+    // Wildcard: the host must have a leftmost label, and the rest must match
+    // the pattern after "*." exactly.
+    let is i64 as dot with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (k < hlen) {
+        if (host[k] == cast(u8, 46)) { dot = k; k = hlen; } else { k = k + 1; }
+    }
+    if (dot <= 0) { return 0; }                    // no label to consume
+    let is i64 as rest = hlen - (dot + 1);
+    if (rest != nlen - 2) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < rest) {
+        if (lower(cast(i64, buf[noff + 2 + i])) != lower(cast(i64, host[dot + 1 + i]))) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    // And the wildcard must not swallow a dot: "*.example.com" is not
+    // "a.b.example.com".
+    return 1;
+}
+
+// GeneralName dNSName is [2] IMPLICIT IA5String, so tag 0x82. Other kinds of
+// name (email, URI, IP) are skipped rather than matched: a certificate that
+// says it is for an email address is not a certificate for a web host.
+fn matches_host(buf as *u8, len as i64, c as *Cert, host as *u8, hlen as i64) as i64 {
+    if (c.has_san == 0) { return 0; }
+    let is i64 as p with mut = c.san_off;
+    let is i64 as end = c.san_off + c.san_len;
+    while (p < end) {
+        let is i64 as t; let is i64 as co; let is i64 as cl;
+        let is i64 as nxt = der.der_read(buf, len, p, &t, &co, &cl);
+        if (nxt < 0) { return 0; }
+        if (t == 0x82) {
+            if (name_matches(buf, co, cl, host, hlen) == 1) { return 1; }
+        }
+        p = nxt;
+    }
+    return 0;
+}
+
+// ============================================================
+// Signatures
+// ============================================================
+
+fn same_bytes(a as *u8, aoff as i64, alen as i64,
+              b as *u8, boff as i64, blen as i64) as i64 {
+    if (alen != blen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < alen) {
+        if (a[aoff + i] != b[boff + i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Is `child` signed by `parent`? The parent's key does the verifying and the
+// child's own key is not consulted, which is the entire point — a certificate
+// that vouches for itself vouches for nothing.
+fn signed_by(cbuf as *u8, clen as i64, child as *Cert,
+             pbuf as *u8, plen as i64, parent as *Cert) as i64 {
+    if (child.sigalg == SIG_UNKNOWN) { return E_ALGORITHM; }
+
+    let is [64]u8 as digest;
+    let is i64 as dlen with mut = 0;
+    let is *u8 as tbs = cast(*u8, cast(i64, cbuf) + child.tbs_off);
+    if (child.sigalg == SIG_RSA_SHA256 || child.sigalg == SIG_ECDSA_SHA256
+        || child.sigalg == SIG_RSA_PSS_SHA256) {
+        sha2.sha256(tbs, child.tbs_len, cast(*u8, &digest[0]));
+        dlen = 32;
+    } else {
+        if (child.sigalg == SIG_RSA_SHA384 || child.sigalg == SIG_ECDSA_SHA384) {
+            sha2.sha384(tbs, child.tbs_len, cast(*u8, &digest[0]));
+            dlen = 48;
+        } else {
+            sha2.sha512(tbs, child.tbs_len, cast(*u8, &digest[0]));
+            dlen = 64;
+        }
+    }
+
+    if (child.sigalg == SIG_ECDSA_SHA256 || child.sigalg == SIG_ECDSA_SHA384) {
+        if (parent.pk_alg != PK_P256) { return E_ALGORITHM; }
+        let is bi.Big as qx = bi.big_from_bytes_be(
+            cast(*u8, cast(i64, pbuf) + parent.ec_off + 1), 32);
+        let is bi.Big as qy = bi.big_from_bytes_be(
+            cast(*u8, cast(i64, pbuf) + parent.ec_off + 33), 32);
+        // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+        let is i64 as sin; let is i64 as slen;
+        if (der.der_enter(cbuf, clen, child.sig_off, der.TAG_SEQUENCE, &sin, &slen) < 0) {
+            bi.big_free(&qx); bi.big_free(&qy);
+            return E_SIGNATURE;
+        }
+        let is i64 as t; let is i64 as co; let is i64 as cl;
+        let is i64 as after_r = der.der_read(cbuf, clen, sin, &t, &co, &cl);
+        if (after_r < 0 || t != der.TAG_INTEGER) {
+            bi.big_free(&qx); bi.big_free(&qy);
+            return E_SIGNATURE;
+        }
+        let is i64 as roff; let is i64 as rlen;
+        der.der_uint(cbuf, co, cl, &roff, &rlen);
+        if (der.der_read(cbuf, clen, after_r, &t, &co, &cl) < 0 || t != der.TAG_INTEGER) {
+            bi.big_free(&qx); bi.big_free(&qy);
+            return E_SIGNATURE;
+        }
+        let is i64 as soff; let is i64 as slen2;
+        der.der_uint(cbuf, co, cl, &soff, &slen2);
+        let is bi.Big as r = bi.big_from_bytes_be(cast(*u8, cast(i64, cbuf) + roff), rlen);
+        let is bi.Big as s = bi.big_from_bytes_be(cast(*u8, cast(i64, cbuf) + soff), slen2);
+        // ECDSA takes the leftmost bits of the digest; for P-256 with SHA-256
+        // that is all of it, and with SHA-384 it is the first 32 bytes.
+        let is bi.Big as z = bi.big_from_bytes_be(cast(*u8, &digest[0]), 32);
+        let is i64 as v = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s);
+        bi.big_free(&qx); bi.big_free(&qy);
+        bi.big_free(&r); bi.big_free(&s); bi.big_free(&z);
+        if (v == 1) { return OK; }
+        return E_SIGNATURE;
+    }
+
+    if (parent.pk_alg != PK_RSA) { return E_ALGORITHM; }
+    let is rsa.RsaPub as pub;
+    rsa.rsa_pub_from_bytes(&pub,
+        cast(*u8, cast(i64, pbuf) + parent.n_off), parent.n_len,
+        cast(*u8, cast(i64, pbuf) + parent.e_off), parent.e_len);
+
+    if (child.sigalg == SIG_RSA_PSS_SHA256) {
+        let is i64 as v = rsa.rsa_pss_sha256_verify(&pub, tbs, child.tbs_len,
+                                                    cast(*u8, cast(i64, cbuf) + child.sig_off));
+        if (v == 1) { return OK; }
+        return E_SIGNATURE;
+    }
+
+    let is *u8 as di with mut = DI_SHA256;
+    let is i64 as dilen with mut = 19;
+    if (child.sigalg == SIG_RSA_SHA384) { di = DI_SHA384; dilen = 19; }
+    if (child.sigalg == SIG_RSA_SHA512) { di = DI_SHA512; dilen = 19; }
+    let is i64 as v = rsa.rsa_pkcs1v15_verify(&pub, di, dilen,
+                                              cast(*u8, &digest[0]), dlen,
+                                              cast(*u8, cast(i64, cbuf) + child.sig_off));
+    if (v == 1) { return OK; }
+    return E_SIGNATURE;
+}
+
+// ============================================================
+// The checks a leaf must pass on its own
+// ============================================================
+
+fn time_ok(c as *Cert, now as i64) as i64 {
+    // A machine that does not know the time cannot judge validity. Saying so
+    // is better than either silently accepting an expired certificate or
+    // rejecting every valid one because the RTC read zero.
+    if (now == 0) { return OK; }
+    if (now < c.not_before) { return E_NOT_YET_VALID; }
+    if (now > c.not_after) { return E_EXPIRED; }
+    return OK;
+}
+
+// Whether this certificate is allowed to have signed another one. Both halves
+// matter: a leaf certificate for a web server can be bought by anyone, and
+// without this check anyone who owns one could sign a certificate for a bank.
+fn may_sign_certs(c as *Cert) as i64 {
+    if (c.has_bc == 0 || c.is_ca == 0) { return E_NOT_A_CA; }
+    if (c.has_ku == 1) {
+        if ((c.ku & KU_KEY_CERT_SIGN) == 0) { return E_NOT_A_CA; }
+    }
+    return OK;
+}
