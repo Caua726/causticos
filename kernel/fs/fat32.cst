@@ -13,6 +13,8 @@
 // table. Adding more mounts means promoting to a linked list.
 
 use "storage.cst" as storage;
+use "ramvol.cst"  as ramvol;
+use "cmdline.cst" as cmdline;
 use "serial.cst"  as serial;
 use "util.cst"    as util;
 use "pmm.cst"     as pmm;
@@ -2580,20 +2582,68 @@ let is i64 as MOUNT_WAIT_NS = 5000000000;
 
 fn mount_thread() as void {
     let is i64 as deadline = timer.current_time_ns() + MOUNT_WAIT_NS;
-    let is *storage.StorageDevice as d with mut = storage.head();
+
+    // Which device backs "/" is a decision, not an accident. `root=` on the
+    // kernel command line wins outright; otherwise storage.root_pick() ranks
+    // the candidates by declared priority, so the live root beats a disk that
+    // merely happens to be plugged in. The old code took storage.head() — the
+    // most recently registered device — which is a race, not a policy.
+    let is *u8 as want = cmdline.root_name();
+    let is i64 as want_len = cmdline.root_name_len();
+
+    let is *storage.StorageDevice as d with mut = cast(*storage.StorageDevice, 0);
+    if (want_len > 0) { d = storage.find(want, want_len); }
+    else              { d = storage.root_pick(); }
+
     while (cast(i64, d) == 0 && timer.current_time_ns() < deadline) {
         // sleep_for_ns instead of yield_cpu — see vfs.self_test_thread
         // for the rationale (avoid same-band starvation of A/B).
         sched.sleep_for_ns(1000000);   // 1 ms
-        d = storage.head();
+        if (want_len > 0) { d = storage.find(want, want_len); }
+        else              { d = storage.root_pick(); }
     }
     if (cast(i64, d) == 0) {
-        serial.println("fat32: no storage device after 5s", 33);
+        // Say what was actually seen. "It waited and gave up" is not a
+        // diagnosis; "there were 2 devices and none of them was ram0" is.
+        if (want_len > 0) {
+            serial.print("fat32: root=", 12);
+            let is i64 as wi with mut = 0;
+            while (wi < want_len) { serial.putc(cast(i64, want[wi])); wi = wi + 1; }
+            serial.print(" not found after 5s (", 21);
+        } else {
+            serial.print("fat32: no root volume after 5s (", 32);
+        }
+        util.print_num(storage.count());
+        serial.print(" storage devices, live root=", 28);
+        util.print_num(ramvol.present());
+        serial.println(")", 1);
         return;
     }
     let is *Fat32Volume as v = mount(d);
     if (cast(i64, v) == 0) { return; }
-    self_test_read(v);
+
+    // Say which volume the system is actually running on, and whether anything
+    // written to it will survive a reboot. A live root is volatile by design;
+    // that has to be stated, not discovered.
+    // One message, one lock hold. Composed from several calls, this line came
+    // out as "0r0a0m000" whenever another cpu printed at the same moment.
+    let is i64 as sf = serial.begin();
+    serial.print_raw(cast(*u8, "root: "), 6);
+    serial.print_cstr_raw(cast(*u8, &d.name[0]), 32);
+    if (d.boot_prio == storage.PRIO_LIVE_ROOT) {
+        serial.print_raw(cast(*u8, " (live, volatile)"), 17);
+    } else {
+        serial.print_raw(cast(*u8, " (disk, persistent)"), 19);
+    }
+    serial.endln(sf);
+
+    // The phase-6 gauntlet WRITES to the volume it is handed: it creates
+    // /data, renames over files, removes directories. On a production boot
+    // that is scribbling on the user's root, so it is opt-in via the command
+    // line rather than something every boot does.
+    if (cmdline.selftest() != 0) {
+        self_test_read(v);
+    }
 
     // Publish the FAT32 volume through the VFS at "/". Done after the
     // FS self-tests so any failures there don't point the VFS at a

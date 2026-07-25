@@ -1,0 +1,398 @@
+// ramvol.cst — the live root: a block device whose sectors are RAM.
+//
+// The bootloader hands us the root volume as a module: a CSVI sparse container
+// (docs/build-and-run.md documents the format byte for byte). We take a zeroed
+// window from kvmap, blit the container's sector records into it, and publish
+// the result as ONE StorageDevice named "ram0". That is the whole mechanism —
+// no new filesystem code, no second FAT32 implementation, and no early-root-
+// then-real-root dance. The existing FAT32 driver mounts it exactly as it
+// mounts a disk, because as far as it can tell, it is one.
+//
+// The volume is fully writable and volatile. A live system is a system, not a
+// preview of one: you can create files, the window manager can save its layout,
+// the compiler can write its output. All of it disappears at poweroff, and the
+// boot says so out loud rather than letting anyone find out later.
+//
+// Mechanism, not policy. WHICH volume the VFS mounts at "/" is
+// storage.root_pick()'s answer, not this file's — ramvol only declares that it
+// would like to be considered.
+
+use "limine.cst"  as limine;
+use "pmm.cst"     as pmm;
+use "vmm.cst"     as vmm;
+use "storage.cst" as storage;
+use "serial.cst"  as serial;
+use "util.cst"    as util;
+
+// ============================================================
+// CSVI v1 — offsets mirror docs/build-and-run.md exactly.
+// ============================================================
+
+let is i64 as CSVI_MAGIC      = 0x49565343;   // "CSVI" as a little-endian u32
+let is i64 as CSVI_VERSION    = 1;
+let is i64 as CSVI_HDR_BYTES  = 64;
+let is i64 as CSVI_FLAG_FAT32 = 1;
+let is i64 as CSVI_SECTOR     = 512;
+let is i64 as CSVI_REC_BYTES  = 520;          // 8-byte lba + 512-byte payload
+
+let is i64 as CSVI_OFF_MAGIC    = 0;
+let is i64 as CSVI_OFF_VERSION  = 4;
+let is i64 as CSVI_OFF_VOLBYTES = 8;
+let is i64 as CSVI_OFF_VOLSECS  = 16;
+let is i64 as CSVI_OFF_SECSIZE  = 24;
+let is i64 as CSVI_OFF_FLAGS    = 28;
+let is i64 as CSVI_OFF_RECCNT   = 32;
+let is i64 as CSVI_OFF_RECOFF   = 40;
+let is i64 as CSVI_OFF_CKSUM    = 48;
+
+let is i64 as FNV_OFFSET = 0x811C9DC5;
+let is i64 as FNV_PRIME  = 0x01000193;
+
+// ============================================================
+// State — flat i64 globals rather than a struct, so the mixed-width struct
+// miscompile never enters the picture. The StorageDevice (which carries a
+// [32]u8 name) stays a separate global, the same shape ahci.cst uses.
+// ============================================================
+
+let is storage.StorageDevice as ramdev;
+let is i64 as rv_base   with mut = 0;   // kernel VA of sector 0
+let is i64 as rv_bytes  with mut = 0;
+let is i64 as rv_secsz  with mut = 0;
+let is i64 as rv_seccnt with mut = 0;
+let is i64 as rv_ready  with mut = 0;
+
+// ============================================================
+// Little-endian scalar reads off a possibly-unaligned *u8 view.
+// ============================================================
+
+fn rd_u32(p as *u8, off as i64) as i64 {
+    let is i64 as b0 = cast(i64, p[off + 0]) & 0xFF;
+    let is i64 as b1 = cast(i64, p[off + 1]) & 0xFF;
+    let is i64 as b2 = cast(i64, p[off + 2]) & 0xFF;
+    let is i64 as b3 = cast(i64, p[off + 3]) & 0xFF;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn rd_u64(p as *u8, off as i64) as i64 {
+    let is i64 as lo = rd_u32(p, off);
+    let is i64 as hi = rd_u32(p, off + 4);
+    return lo | (hi << 32);
+}
+
+// FNV-1a 32 over n bytes. Catches the two failure modes that actually happen
+// to a file the bootloader read off optical media: truncation and garbling.
+fn fnv1a32(p as *u8, n as i64) as i64 {
+    let is i64 as h with mut = FNV_OFFSET;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = h ^ (cast(i64, p[i]) & 0xFF);
+        h = (h * FNV_PRIME) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+// 8 bytes at a time, then the tail. The expander moves a couple of megabytes
+// and every read_lba moves at least a sector, so a byte-at-a-time loop is a
+// measurable tax for nothing.
+fn bcopy(dst as *u8, src as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as n8 = n & ~cast(i64, 7);
+    while (i < n8) {
+        let is *i64 as d = cast(*i64, cast(i64, dst) + i);
+        let is *i64 as s = cast(*i64, cast(i64, src) + i);
+        *d = *s;
+        i = i + 8;
+    }
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+// Limine hands back higher-half (HHDM-offset) pointers for its pointer-typed
+// response fields — confirmed on this hardware: the module arrived at
+// 0xffff80001fcc0000, an HHDM address, and its first bytes read as "CSVI".
+// The check is kept anyway because being wrong here is a #PF on the first byte
+// of the root, and disambiguation is exact rather than a guess: the HHDM base
+// is 0xffff800000000000-class, so no physical address can be >= it.
+fn hhdm_normalize(a as i64) as i64 {
+    if (a == 0) { return 0; }
+    if (a >= pmm.hhdm) { return a; }
+    return a + pmm.hhdm;
+}
+
+// The first module whose payload begins with "CSVI". Matched by CONTENT, not by
+// path: how the bootloader spells a `boot():/boot/...` path back to us is its
+// business, and a second module added later must not shift an index out from
+// under this.
+fn find_module() as *u8 {
+    let is i64 as n = limine.module_count();
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as f = limine.module_at(i);
+        let is i64 as a = hhdm_normalize(limine.file_address(f));
+        if (a != 0) {
+            // is_hhdm_MAPPED, not is_hhdm_valid: the bootloader places modules
+            // in memory the map calls reserved, so the usable-RAM test rejects
+            // a module that is mapped and readable.
+            if (pmm.is_hhdm_mapped(a) != 0) {
+                if (limine.file_size(f) >= CSVI_HDR_BYTES) {
+                    if (rd_u32(cast(*u8, a), CSVI_OFF_MAGIC) == CSVI_MAGIC) {
+                        return f;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return cast(*u8, 0);
+}
+
+// ============================================================
+// expand — validate the container, take the window, blit the records.
+// 0 on success. Every failure prints what it saw AND what it wanted: a boot
+// that refuses to come up should say why in one line, not leave someone
+// bisecting.
+// ============================================================
+
+fn expand(img as *u8, img_len as i64) as i32 {
+    if (img_len < CSVI_HDR_BYTES) {
+        serial.print("csvi: truncated header, ", 24);
+        util.print_num(img_len);
+        serial.print(" bytes < ", 9);
+        util.print_num(CSVI_HDR_BYTES);
+        serial.println("", 0);
+        return cast(i32, 0 - 1);
+    }
+
+    let is i64 as ver = rd_u32(img, CSVI_OFF_VERSION);
+    if (ver != CSVI_VERSION) {
+        serial.print("csvi: version ", 14);
+        util.print_num(ver);
+        serial.print(", this kernel speaks ", 21);
+        util.print_num(CSVI_VERSION);
+        serial.println("", 0);
+        return cast(i32, 0 - 2);
+    }
+
+    let is i64 as secsz = rd_u32(img, CSVI_OFF_SECSIZE);
+    if (secsz != CSVI_SECTOR) {
+        serial.print("csvi: sector_size ", 18);
+        util.print_num(secsz);
+        serial.print(", v1 accepts only ", 18);
+        util.print_num(CSVI_SECTOR);
+        serial.println("", 0);
+        return cast(i32, 0 - 3);
+    }
+
+    let is i64 as volsecs  = rd_u64(img, CSVI_OFF_VOLSECS);
+    let is i64 as volbytes = rd_u64(img, CSVI_OFF_VOLBYTES);
+    if (volsecs <= 0 || volbytes != volsecs * secsz) {
+        serial.print("csvi: volume_bytes ", 19);
+        util.print_num(volbytes);
+        serial.print(" != volume_sectors ", 19);
+        util.print_num(volsecs);
+        serial.print(" * ", 3);
+        util.print_num(secsz);
+        serial.println("", 0);
+        return cast(i32, 0 - 4);
+    }
+
+    let is i64 as recoff = rd_u64(img, CSVI_OFF_RECOFF);
+    let is i64 as reccnt = rd_u64(img, CSVI_OFF_RECCNT);
+    if (recoff != CSVI_HDR_BYTES || reccnt < 0) {
+        serial.print("csvi: records_offset ", 21);
+        util.print_num(recoff);
+        serial.print(", v1 requires ", 14);
+        util.print_num(CSVI_HDR_BYTES);
+        serial.println("", 0);
+        return cast(i32, 0 - 5);
+    }
+
+    // Exact, no slack. This is the cheapest integrity check there is and it
+    // catches a truncated read before anything is allocated.
+    let is i64 as want_len = recoff + reccnt * CSVI_REC_BYTES;
+    if (img_len != want_len) {
+        serial.print("csvi: module is ", 16);
+        util.print_num(img_len);
+        serial.print(" bytes, header describes ", 25);
+        util.print_num(want_len);
+        serial.println("", 0);
+        return cast(i32, 0 - 6);
+    }
+
+    let is i64 as stored = rd_u32(img, CSVI_OFF_CKSUM);
+    let is i64 as actual = fnv1a32(cast(*u8, cast(i64, img) + recoff), reccnt * CSVI_REC_BYTES);
+    if (stored != actual) {
+        serial.print("csvi: checksum mismatch, stored 0x", 34);
+        util.print_hex(stored);
+        serial.print(" computed 0x", 12);
+        util.print_hex(actual);
+        serial.println("", 0);
+        return cast(i32, 0 - 7);
+    }
+
+    // The single largest allocation of the boot. kvmap(KV_DATA) zeroes what it
+    // hands back, which is exactly the semantic the format relies on: any
+    // sector no record names is already zero, so the expander never clears.
+    let is i64 as base = vmm.kvmap(volbytes, vmm.KV_DATA, 0, 0);
+    if (base == 0) {
+        serial.print("ramvol: kvmap failed for ", 25);
+        util.print_num(volbytes);
+        serial.print(" bytes; free RAM is ", 20);
+        util.print_num(cast(i64, pmm.free_total) * 4096);
+        serial.println(" bytes — boot with more memory", 30);
+        return cast(i32, 0 - 8);
+    }
+
+    let is i64 as prev with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < reccnt) {
+        let is i64 as rec = cast(i64, img) + recoff + i * CSVI_REC_BYTES;
+        let is i64 as lba = rd_u64(cast(*u8, rec), 0);
+        // Strictly ascending: one comparison rejects a corrupt container and a
+        // hostile one alike, and makes the blit below provably in bounds.
+        if (lba <= prev) {
+            serial.print("csvi: record ", 13);
+            util.print_num(i);
+            serial.print(" lba ", 5);
+            util.print_num(lba);
+            serial.print(" not greater than previous ", 27);
+            util.print_num(prev);
+            serial.println("", 0);
+            return cast(i32, 0 - 9);
+        }
+        if (lba >= volsecs) {
+            serial.print("csvi: record ", 13);
+            util.print_num(i);
+            serial.print(" lba ", 5);
+            util.print_num(lba);
+            serial.print(" outside a ", 11);
+            util.print_num(volsecs);
+            serial.println("-sector volume", 14);
+            return cast(i32, 0 - 10);
+        }
+        prev = lba;
+        bcopy(cast(*u8, base + lba * secsz), cast(*u8, rec + 8), secsz);
+        i = i + 1;
+    }
+
+    rv_base   = base;
+    rv_bytes  = volbytes;
+    rv_secsz  = secsz;
+    rv_seccnt = volsecs;
+    rv_ready  = 1;
+    return cast(i32, 0);
+}
+
+// ============================================================
+// StorageDevice vtable — mirrors ahci.cst's stor_* adapters.
+// ============================================================
+
+fn stor_read(priv as *u8, lba as i64, count as i64, buf as *u8) as i32 {
+    if (rv_ready == 0)           { return cast(i32, 0 - 1); }
+    if (lba < 0 || count <= 0)   { return cast(i32, 0 - 2); }
+    if (lba + count > rv_seccnt) { return cast(i32, 0 - 3); }
+    bcopy(buf, cast(*u8, rv_base + lba * rv_secsz), count * rv_secsz);
+    return cast(i32, 0);
+}
+
+fn stor_write(priv as *u8, lba as i64, count as i64, buf as *u8) as i32 {
+    if (rv_ready == 0)           { return cast(i32, 0 - 1); }
+    if (lba < 0 || count <= 0)   { return cast(i32, 0 - 2); }
+    if (lba + count > rv_seccnt) { return cast(i32, 0 - 3); }
+    bcopy(cast(*u8, rv_base + lba * rv_secsz), buf, count * rv_secsz);
+    return cast(i32, 0);
+}
+
+// Nothing to drain. For a RAM volume the write IS the commit, and pretending
+// otherwise would make flush a call that silently means nothing. The
+// volatility is stated once, loudly, at mount time instead.
+fn stor_flush(priv as *u8) as i32 {
+    return cast(i32, 0);
+}
+
+fn stor_sector_size(priv as *u8) as i64 {
+    return rv_secsz;
+}
+
+fn stor_sector_count(priv as *u8) as i64 {
+    return rv_seccnt;
+}
+
+// ============================================================
+// init — find the module, expand it, register the device.
+// Returns 0 when the live root is up, non-zero otherwise. A kernel with no
+// module is not an error: that is a disk boot, and the AHCI path handles it.
+// ============================================================
+
+fn init() as i32 {
+    let is *u8 as m = find_module();
+    if (cast(i64, m) == 0) {
+        if (limine.module_count() == 0) {
+            serial.println("ramvol: no modules — no live root (disk boot)", 45);
+        } else {
+            serial.println("ramvol: no CSVI module among the modules loaded", 47);
+        }
+        return cast(i32, 0 - 1);
+    }
+
+    let is i64 as addr = hhdm_normalize(limine.file_address(m));
+    let is i64 as len  = limine.file_size(m);
+
+    let is i64 as mf = serial.begin();
+    serial.print_raw(cast(*u8, "ramvol: module "), 15);
+    serial.print_cstr_raw(limine.file_path(m), 128);
+    serial.print_raw(cast(*u8, " "), 1);
+    serial.print_num_raw(len);
+    serial.print_raw(cast(*u8, "B"), 1);
+    serial.endln(mf);
+
+    let is i32 as rc = expand(cast(*u8, addr), len);
+    if (rc != 0) {
+        serial.print("ramvol: expand failed rc=", 25);
+        util.print_num(cast(i64, rc));
+        serial.println("", 0);
+        return rc;
+    }
+
+    ramdev.name[0] = cast(u8, 114);   // 'r'
+    ramdev.name[1] = cast(u8, 97);    // 'a'
+    ramdev.name[2] = cast(u8, 109);   // 'm'
+    ramdev.name[3] = cast(u8, 48);    // '0'
+    ramdev.name[4] = cast(u8, 0);
+    ramdev.read_lba     = fn_ptr(stor_read);
+    ramdev.write_lba    = fn_ptr(stor_write);
+    ramdev.flush        = fn_ptr(stor_flush);
+    ramdev.sector_size  = fn_ptr(stor_sector_size);
+    ramdev.sector_count = fn_ptr(stor_sector_count);
+    ramdev.priv         = cast(*u8, 0);
+    ramdev.next         = cast(*storage.StorageDevice, 0);
+    ramdev.boot_prio    = storage.PRIO_LIVE_ROOT;
+
+    let is i32 as sr = storage.register(&ramdev);
+    if (sr != 0) {
+        serial.print("ramvol: storage.register failed rc=", 35);
+        util.print_num(cast(i64, sr));
+        serial.println("", 0);
+        return sr;
+    }
+
+    let is i64 as rf = serial.begin();
+    serial.print_raw(cast(*u8, "ramvol: live root ready (ram0, "), 31);
+    serial.print_num_raw(rv_seccnt);
+    serial.print_raw(cast(*u8, " sectors x "), 11);
+    serial.print_num_raw(rv_secsz);
+    serial.print_raw(cast(*u8, "B, volatile)"), 12);
+    serial.endln(rf);
+    return cast(i32, 0);
+}
+
+fn present() as i64 {
+    return rv_ready;
+}
+
+fn volume_bytes() as i64 {
+    return rv_bytes;
+}

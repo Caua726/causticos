@@ -29,7 +29,26 @@ struct StorageDevice {
     sector_count as fn(*u8) as i64;
     priv         as *u8;
     next         as *StorageDevice;
+    // How strongly this device wants to be the volume mounted at "/".
+    // Appended at the end so every existing field keeps its offset.
+    boot_prio    as i64;
 }
+
+// ============================================================
+// Boot priority — which volume the filesystem layer should mount as "/"
+// when more than one block device exists.
+//
+// Registration order is an accident of probe timing: the live root registers
+// before the scheduler even starts, while AHCI binds later on the driver
+// thread — and `register` PREPENDS, so "whoever registered last wins" is not
+// a policy at all, it is a race that happened to favour the disk. Every
+// driver declares its intent instead, and the answer is the same on every
+// boot.
+// ============================================================
+
+let is i64 as PRIO_NONE      = 0;     // never a root candidate
+let is i64 as PRIO_DISK      = 10;    // a real disk some driver found
+let is i64 as PRIO_LIVE_ROOT = 100;   // the live root shipped inside the ISO
 
 // ============================================================
 // Registry
@@ -50,22 +69,51 @@ fn register(dev as *StorageDevice) as i32 {
     device_count = device_count + 1;
     sched.preempt_enable();
 
-    serial.print("storage: registered ", 20);
-    let is i64 as i with mut = 0;
-    while (i < 32) {
-        if (dev.name[i] == cast(u8, 0)) { i = 32; }
-        else { serial.putc(cast(i64, dev.name[i])); i = i + 1; }
-    }
-    serial.print(" (", 2);
-    util.print_num(call(dev.sector_count, dev.priv));
-    serial.print(" sectors x ", 11);
-    util.print_num(call(dev.sector_size, dev.priv));
-    serial.println("B)", 2);
+    // One lock hold for the whole line — see serial.begin(). Composed from a
+    // print + a putc loop + more prints, this line interleaved with other cpus.
+    let is i64 as sf = serial.begin();
+    serial.print_raw(cast(*u8, "storage: registered "), 20);
+    serial.print_cstr_raw(cast(*u8, &dev.name[0]), 32);
+    serial.print_raw(cast(*u8, " ("), 2);
+    serial.print_num_raw(call(dev.sector_count, dev.priv));
+    serial.print_raw(cast(*u8, " sectors x "), 11);
+    serial.print_num_raw(call(dev.sector_size, dev.priv));
+    serial.print_raw(cast(*u8, "B, prio "), 8);
+    serial.print_num_raw(dev.boot_prio);
+    serial.print_raw(cast(*u8, ")"), 1);
+    serial.endln(sf);
     return 0;
 }
 
 fn head() as *StorageDevice {
     return cast(*StorageDevice, devices);
+}
+
+// The device that should back "/". Highest boot_prio wins; a tie breaks toward
+// the EARLIEST registration, so two SATA ports give the same answer every time.
+// `devices` is a prepend list, so this walk sees newest-first — using >= lets
+// the last equal-priority device seen, which is the oldest, win.
+//
+// Returns null when nothing has declared itself a candidate yet, which is the
+// normal state during the window before the disk driver has bound.
+fn root_pick() as *StorageDevice {
+    let is *StorageDevice as best with mut = cast(*StorageDevice, 0);
+    let is i64 as best_prio with mut = 0;
+    let is *StorageDevice as d with mut = cast(*StorageDevice, devices);
+    while (cast(i64, d) != 0) {
+        if (d.boot_prio > 0 && d.boot_prio >= best_prio) {
+            best = d;
+            best_prio = d.boot_prio;
+        }
+        d = d.next;
+    }
+    return best;
+}
+
+// Look a device up by name, for `root=` on the kernel command line. Names are
+// short and few, so a linear walk is the whole implementation.
+fn find_named(name as *u8, name_len as i64) as *StorageDevice {
+    return find(name, name_len);
 }
 
 fn count() as i64 {

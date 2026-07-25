@@ -1,6 +1,8 @@
 // main.cst — causticos kernel entry point
 
 use "limine.cst" as limine;
+use "cmdline.cst" as cmdline;
+use "ramvol.cst" as ramvol;
 use "fb.cst" as fb;
 use "surface.cst" as surface;
 use "channel.cst" as channel;
@@ -93,11 +95,15 @@ let is i64 as fn_addr_vfs_test with mut = 0;
 let is i64 as fn_addr_userspace_smoke with mut = 0;
 let is i64 as fn_addr_init_thread with mut = 0;
 
-// Boot flavour. 0 = clean boot: hardware → mount → launch /init.cse (production,
-// run.sh, the self-host bootstrap). 1 = smoke boot: run the kernel/userspace
-// smokes + VFS self-test instead of launching /init (regression, verify.sh).
-// The two never interleave — a single explicit switch, no disk sentinel.
-let is i64 as RUN_SMOKE_INIT with imut = 0;
+// Boot behaviour is chosen at RUNTIME, from the kernel command line
+// (kernel/sys/cmdline.cst), not by a compile-time switch. With a switch, the
+// kernel that ran the regression suite was a different binary from the kernel
+// that shipped — so the suite never tested what anyone actually boots.
+//
+//   (no cmdline)  clean boot: mount the root, launch /init.cse
+//   smoke         run the in-kernel smoke gauntlet + VFS self-test instead
+//   selftest      also run the FAT32 write gauntlet against the root
+//   root=<name>   mount that named device instead of letting priority decide
 
 fn _kernel_start() as void {
     if (limine.fb_req_response == 0) {
@@ -116,6 +122,7 @@ fn _kernel_start() as void {
 
     serial.init();
     serial.println("causticos v0.0.2", 16);
+
     gdt.init();
     // Install BSP's GS base immediately after GDT so the IDT stubs
     // that probe per-cpu need_resched via gs:[0x50] have a valid
@@ -228,6 +235,20 @@ fn _kernel_start() as void {
     syshandlers.install_fn_addr = sysc.dispatch_set_ptr();
     syshandlers.install_all();
 
+    // The live root. The bootloader loaded a CSVI volume image beside the
+    // kernel; take a zeroed kvmap window, expand the sparse records into it,
+    // and register it as "ram0" so fat32.mount_thread finds a root on its FIRST
+    // look instead of polling for five seconds.
+    //
+    // Deliberately late: this is the single largest allocation of the boot, so
+    // it happens after SMP has claimed its per-cpu pages. A machine too small
+    // for the volume then fails HERE, naming the bytes it wanted and the bytes
+    // there were, instead of failing obscurely somewhere downstream.
+    //
+    // No module is not an error — that is a disk boot, and the AHCI path below
+    // still works exactly as it did.
+    ramvol.init();
+
     sched.init();
 
     asm("lea rax, [rip+test_preempt_a]\n");
@@ -254,7 +275,7 @@ fn _kernel_start() as void {
     // they only run when no I/O thread is runnable.
     sched.create_thread(fn_addr_driver_init, sched.QOS_ACTIVE);
     sched.create_thread(fn_addr_fat32_mount, sched.QOS_ACTIVE);
-    if (RUN_SMOKE_INIT == 1) {
+    if (cmdline.smoke() != 0) {
         // Smoke boot (verify.sh): VFS self-test + the userspace smoke gauntlet.
         // No /init — the smokes are the workload, and the A/B preempt spinners
         // ride along so context-switching is exercised under load.
