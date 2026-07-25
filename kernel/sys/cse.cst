@@ -75,10 +75,48 @@ let is i64 as PERM_R = 1;
 let is i64 as PERM_W = 2;
 let is i64 as PERM_X = 4;
 
-// Polyglot mini-header ("CST*") at 0x40.
+// Polyglot mini-header ("CST*") at 0x40, written by caustic-ld's
+// write_cse_combine_ape. It sits inside the shell-quoted region of the APE
+// header, so v2 stores both numbers as 12-digit zero-padded ASCII decimal:
+// the v1 raw-u64 encoding could place a 0x27 (') there, close the quote early
+// and make /bin/sh execute the binary payload as script.
+//   0x40 4  "CST*"   0x44 2 version   0x46 2 reserved
+//   0x48 12 body offset (ASCII)       0x54 12 body size (ASCII)
+// Arch codes in the CST_ header at 0x06, matching src/codegen/target.cst's
+// ARCH_* constants. CSE_ARCH_NATIVE is the one this kernel build can execute;
+// __target_is_aarch64 is the compiler's own parse-time target literal, so the
+// kernel always compares against the machine it was compiled for.
+// CST_ v4 multi-arch container (see cse_writer.cst:write_cse_fat).
+//   0x06 1 image_count   0x08 4 index_off
+//   index entry, 8 bytes: +0x00 arch, +0x04 image_off
+let is i64 as FAT_COUNT      = 0x06;
+let is i64 as FAT_INDEX_OFF  = 0x08;
+let is i64 as FAT_ENTRY      = 8;
+let is i64 as FAT_MAX        = 8;
+
+let is i64 as CSE_ARCH_X86_64  = 1;
+let is i64 as CSE_ARCH_AARCH64 = 2;
+let is i64 as CSE_ARCH_NATIVE  = 1 * __target_is_x86_64 + 2 * __target_is_aarch64;
+
 let is i64 as MINI_OFF        = 0x40;
-let is i64 as MINI_OFF_BODY   = 0x48;     // u64: file offset of CST image
-let is i64 as MINI_OFF_BODYSZ = 0x50;     // u64: size of CST image
+let is i64 as MINI_OFF_VER    = 0x44;     // u16: mini-header version
+let is i64 as MINI_OFF_BODY   = 0x48;     // 12 ASCII digits: file offset of CST image
+let is i64 as MINI_OFF_BODYSZ = 0x54;     // 12 ASCII digits: size of CST image
+let is i64 as MINI_FIELD_LEN  = 12;
+let is i64 as MINI_VERSION    = 2;
+
+// Parse `len` ASCII decimal digits at `off`. Returns -1 on any non-digit.
+fn read_ascii_num(buf as *u8, off as i64, len as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is i64 as c = cast(i64, buf[off + i]);
+        if (c < 48 || c > 57) { return cast(i64, 0 - 1); }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
 
 fn page_align_up(x as i64) as i64 {
     return (x + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
@@ -119,9 +157,11 @@ fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32
             || cast(i64, buf[MINI_OFF + 2]) != 0x54 || cast(i64, buf[MINI_OFF + 3]) != 0x2A) {
             return cast(i32, 0 - 3);
         }
-        let is i64 as body_off = elf.read_u64_le(buf, MINI_OFF_BODY);
-        let is i64 as body_sz with mut = elf.read_u64_le(buf, MINI_OFF_BODYSZ);
-        if (body_off < 0) { return cast(i32, 0 - 4); }
+        let is i64 as mini_ver = elf.read_u16_le(buf, MINI_OFF_VER);
+        if (mini_ver != MINI_VERSION) { return cast(i32, 0 - 3); }
+        let is i64 as body_off = read_ascii_num(buf, MINI_OFF_BODY, MINI_FIELD_LEN);
+        let is i64 as body_sz with mut = read_ascii_num(buf, MINI_OFF_BODYSZ, MINI_FIELD_LEN);
+        if (body_off < 0 || body_sz < 0) { return cast(i32, 0 - 4); }
         if (body_sz < H_SIZE) { body_sz = size - body_off; }   // fallback if size absent
         if (body_off + body_sz > size) { return cast(i32, 0 - 5); }
         *out_off = body_off;
@@ -153,12 +193,46 @@ fn load_cse_image(a as *vma.Aspace, buf as *u8, size as i64,
         return lrc;
     }
 
-    let is *u8 as img = cast(*u8, &buf[cst_off]);
+    let is *u8 as img with mut = cast(*u8, &buf[cst_off]);
     if (cast(i64, img[0]) != 0x43 || cast(i64, img[1]) != 0x53
         || cast(i64, img[2]) != 0x54 || cast(i64, img[3]) != 0x5F) {
         return cast(i32, 0 - 7);
     }
-    let is i64 as cse_ver = elf.read_u16_le(img, H_VERSION);
+    let is i64 as cse_ver with mut = elf.read_u16_le(img, H_VERSION);
+
+    // v4 = multi-arch container: a 16-byte header plus an 8-byte index entry per
+    // embedded image. Select the entry matching this machine and fall through to
+    // the v3 path on the image it points at — the payloads are ordinary v3
+    // images, byte-identical to a single-target link, so nothing below changes.
+    if (cse_ver == 4) {
+        let is i64 as img_count = cast(i64, img[FAT_COUNT]);
+        let is i64 as index_off = elf.read_u32_le(img, FAT_INDEX_OFF);
+        if (img_count <= 0 || img_count > FAT_MAX) { return cast(i32, 0 - 17); }
+        if (index_off + img_count * FAT_ENTRY > cst_size) { return cast(i32, 0 - 18); }
+        let is i64 as picked with mut = 0 - 1;
+        let is i64 as k with mut = 0;
+        while (k < img_count) {
+            let is i64 as e = index_off + k * FAT_ENTRY;
+            if (cast(i64, img[e]) == CSE_ARCH_NATIVE) {
+                picked = elf.read_u32_le(img, e + 4);
+                k = img_count;
+            } else { k = k + 1; }
+        }
+        if (picked < 0) {
+            serial.println("cse: fat image has no slice for this arch", 41);
+            return cast(i32, 0 - 19);
+        }
+        if (picked + H_SIZE > cst_size) { return cast(i32, 0 - 20); }
+        // Re-base onto the selected slice; every offset below is image-relative.
+        cst_off = cst_off + picked;
+        cst_size = cst_size - picked;
+        img = cast(*u8, &buf[cst_off]);
+        if (cast(i64, img[0]) != 0x43 || cast(i64, img[1]) != 0x53
+            || cast(i64, img[2]) != 0x54 || cast(i64, img[3]) != 0x5F) {
+            return cast(i32, 0 - 21);
+        }
+        cse_ver = elf.read_u16_le(img, H_VERSION);
+    }
     // v2 = compact 32-byte header; v3 = 48-byte header (adds import-table fields
     // the kernel ignores — it loads static segments, not dynamic imports). The
     // toolchain emits v3 for every .cse; the hand-built smokes use v2.
@@ -170,7 +244,10 @@ fn load_cse_image(a as *vma.Aspace, buf as *u8, size as i64,
     }
     let is i64 as hsize with mut = H_SIZE;      // v2 header = 0x20
     if (cse_ver == 3) { hsize = 0x30; }         // v3 header = 0x30 (32 + 16 import-field bytes)
-    if (cast(i64, img[H_ARCH]) != 1) { return cast(i32, 0 - 9); }
+    // Arch byte: 1 = x86_64, 2 = aarch64. The writer used to hardcode 1, so this
+    // compared against a literal; it now checks the image against the machine we
+    // are actually running on, which is what makes a multi-arch container safe.
+    if (cast(i64, img[H_ARCH]) != CSE_ARCH_NATIVE) { return cast(i32, 0 - 9); }
 
     // v3 declares its worst-case user-stack at 0x2C (computed by the toolchain
     // from the call graph, or set with --stack-size for recursive programs). The
