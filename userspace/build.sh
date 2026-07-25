@@ -32,7 +32,7 @@ PROGS="$PROGS touch mkdir rmdir rm mv cp stat du tree find clear"
 #   ("kill" is Ctrl+C in the terminal — the wterm is the job's parent and holds
 #   the kill authority; CausticOS has no ambient pid namespace for a standalone
 #   kill tool to use.)
-PROGS="$PROGS ps free df top btop htop lscpu"
+PROGS="$PROGS ps free df top btop htop lscpu ifconfig"
 #   compiler front-ends (category F): spawn the embedded /caustic.cse. run +
 #   cc + make compile; objdump inspects a .cse. (caustic-as / caustic-ld are
 #   built separately by scripts/build-tools.sh.)

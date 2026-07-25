@@ -1,4 +1,23 @@
-// serial.cst — COM1 serial output for debug logging
+// serial.cst — COM1 serial output for debug logging.
+//
+// Output is buffered per cpu and emitted one whole line at a time. That is
+// not a performance choice; it is what makes the log readable and greppable
+// under SMP.
+//
+// The lock below has always existed and has always been too small. It covers
+// one CALL, but a line of output is several: print("fat32: mounted ") then
+// print_num(n) then println(""). Between them another cpu takes the lock and
+// writes its own line, and the two come out shredded together:
+//
+//     spec: irq line=fat32: mounted 1C1A sharing vector=U4S9T
+//
+// That was a real boot, working perfectly. Only the log was a lie. It also
+// made every test marker a lottery — verify.sh would report "no-vfs" for a
+// healthy boot whose "vfs: mounted /" happened to be interleaved — and the
+// odds got worse with every thread added that talks.
+//
+// So each cpu accumulates into its own buffer and the UART only ever sees
+// complete lines, written under the lock in one go. Callers change nothing.
 
 use "port.cst" as port;
 use "lock.cst" as lock;
@@ -9,15 +28,38 @@ let is i64 as COM1 = 0x3F8;
 let is i64 as CR = 13;
 let is i64 as LF = 10;
 
-// Serial output lock. Under SMP, two cpus racing through putc each
-// burn-wait on the UART LSR bit then both `outb` their byte — the
-// second write often lands before the first byte has latched, so
-// lines get interleaved byte-wise. Beyond garbled logs, a partially-
-// buffered fault message makes remote debugging impossible. The lock
-// serialises the whole line in print/println so one cpu owns the
-// UART end-to-end. putc (single-byte) grabs the same lock so ad-hoc
-// callers can't bypass.
+// Serial output lock. Under SMP two cpus racing through putc each burn-wait
+// on the UART LSR bit then both `outb` their byte, and the second write often
+// lands before the first has latched. The lock now guards a whole line rather
+// than a single byte.
 let is lock.TicketLock as serial_lock with mut;
+
+// Per-cpu line buffers. A line longer than LINE_CAP flushes early and may
+// interleave — 240 bytes is far past anything the kernel prints, and the
+// degraded case is exactly today's behaviour, so overflow costs nothing that
+// was not already being paid.
+let is i64 as LINE_CAP = 240;
+let is i64 as MAX_LINE_CPUS = 16;      // == smp.MAX_CPUS
+let is [16]i64 as line_len with mut;
+let is [3840]u8 as line_buf with mut;   // MAX_LINE_CPUS * LINE_CAP
+
+// Which cpu is speaking. Injected rather than imported: smp.cst logs through
+// this module, so a `use` here would be a cycle, and serial.init() runs before
+// the per-cpu areas exist anyway. Until main.cst wires it up, everything is
+// cpu 0 — which is true, because only the BSP is running by then.
+let is i64 as cpu_id_fn with mut = 0;
+
+fn set_cpu_id_fn(f as i64) as void {
+    cpu_id_fn = f;
+    return;
+}
+
+fn which_cpu() as i64 {
+    if (cpu_id_fn == 0) { return 0; }
+    let is i64 as c = call(cast(fn() as i64, cpu_id_fn));
+    if (c < 0 || c >= MAX_LINE_CPUS) { return 0; }
+    return c;
+}
 
 fn init() as void {
     port.outb(COM1 + 1, 0);    // disable interrupts
@@ -27,10 +69,11 @@ fn init() as void {
     port.outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit
     port.outb(COM1 + 2, 0xC7); // enable FIFO, clear, 14-byte threshold
     port.outb(COM1 + 4, 0x0B); // MCR: DTR + RTS + OUT2
+    let is i64 as i with mut = 0;
+    while (i < MAX_LINE_CPUS) { line_len[i] = 0; i = i + 1; }
 }
 
-// Raw byte emitter — no lock. Callers that own serial_lock use this
-// directly; putc/print/println wrap the locked path.
+// Raw byte emitter — no lock, no buffer. The caller owns serial_lock.
 fn putc_raw(ch as i64) as void {
     let is i64 as tx_ready with mut = 0;
     while (tx_ready == 0) {
@@ -39,30 +82,89 @@ fn putc_raw(ch as i64) as void {
     port.outb(COM1, ch);
 }
 
-fn putc(ch as i64) as void {
+// Push one cpu's buffer to the UART. Caller holds serial_lock.
+fn flush_locked(c as i64) as void {
+    let is i64 as n = line_len[c];
+    let is i64 as base = c * LINE_CAP;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        putc_raw(cast(i64, line_buf[base + i]));
+        i = i + 1;
+    }
+    line_len[c] = 0;
+    return;
+}
+
+// Append one byte, flushing on newline or when the buffer is full. Runs with
+// interrupts off: an IRQ handler that logs would otherwise land in the middle
+// of the line this cpu is building.
+fn emit(ch as i64) as void {
     let is i64 as flags = lock.acquire_irq(&serial_lock);
-    putc_raw(ch);
+    let is i64 as c = which_cpu();
+    if (ch == LF) {
+        // Normalise to CRLF at the boundary, so callers keep writing '\n'.
+        if (line_len[c] < LINE_CAP) {
+            line_buf[c * LINE_CAP + line_len[c]] = cast(u8, CR);
+            line_len[c] = line_len[c] + 1;
+        }
+        if (line_len[c] < LINE_CAP) {
+            line_buf[c * LINE_CAP + line_len[c]] = cast(u8, LF);
+            line_len[c] = line_len[c] + 1;
+        }
+        flush_locked(c);
+    } else if (ch != CR) {
+        line_buf[c * LINE_CAP + line_len[c]] = cast(u8, ch);
+        line_len[c] = line_len[c] + 1;
+        if (line_len[c] >= LINE_CAP) { flush_locked(c); }
+    }
     lock.release_irq(&serial_lock, flags);
+    return;
+}
+
+fn putc(ch as i64) as void {
+    emit(ch);
 }
 
 fn print(str as *u8, len as i64) as void {
-    let is i64 as flags = lock.acquire_irq(&serial_lock);
     let is i64 as i with mut = 0;
     while (i < len) {
-        putc_raw(cast(i64, str[i]));
+        emit(cast(i64, str[i]));
         i = i + 1;
     }
-    lock.release_irq(&serial_lock, flags);
 }
 
 fn println(str as *u8, len as i64) as void {
-    let is i64 as flags = lock.acquire_irq(&serial_lock);
     let is i64 as i with mut = 0;
     while (i < len) {
-        putc_raw(cast(i64, str[i]));
+        emit(cast(i64, str[i]));
         i = i + 1;
     }
-    putc_raw(CR);
-    putc_raw(LF);
+    emit(LF);
+}
+
+// Push whatever this cpu has half-written. A panic must call this: the most
+// important line the kernel ever prints is the one it dies on, and it would
+// otherwise sit in a buffer nobody flushes.
+fn flush() as void {
+    let is i64 as flags = lock.acquire_irq(&serial_lock);
+    flush_locked(which_cpu());
     lock.release_irq(&serial_lock, flags);
+    return;
+}
+
+// Panic path: dump every cpu's partial line, not just this one. Whatever the
+// other cpus were saying when the world stopped is evidence.
+fn flush_all() as void {
+    let is i64 as flags = lock.acquire_irq(&serial_lock);
+    let is i64 as i with mut = 0;
+    while (i < MAX_LINE_CPUS) {
+        if (line_len[i] > 0) {
+            flush_locked(i);
+            putc_raw(CR);
+            putc_raw(LF);
+        }
+        i = i + 1;
+    }
+    lock.release_irq(&serial_lock, flags);
+    return;
 }
