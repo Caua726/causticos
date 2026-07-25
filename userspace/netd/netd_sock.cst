@@ -1,0 +1,172 @@
+// netd_sock — the socket table, and the demultiplex it exists for.
+//
+// A socket here is (client, id, protocol, local, remote). The CLIENT is part
+// of the key: two programs may both call their socket 1, and they must not
+// see each other's datagrams. Keying on id alone is the bug that makes a
+// stack work perfectly until a second program uses it.
+//
+// Ephemeral ports come from the kernel's entropy rather than a counter.
+// Predictable source ports are half of what an off-path attacker needs to
+// forge a reply; the other half is the DNS query id, which is drawn the same
+// way. A counter is cheaper and is exactly the thing being avoided.
+
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netudp/netudp.cst" as udp;
+
+let is i64 as MAX_SOCK = 32;
+
+let is i64 as ST_FREE   = 0;
+let is i64 as ST_OPEN   = 1;   // created, no address yet
+let is i64 as ST_BOUND  = 2;   // has a local port
+let is i64 as ST_CONN   = 3;   // has a peer too
+
+struct Sock {
+    state     as i64;
+    client    as i64;      // which client channel owns it
+    id        as i64;      // the id THAT CLIENT chose
+    proto     as i64;      // netproto.SOCK_*
+    local_ip  as i64;
+    local_port as i64;
+    peer_ip   as i64;
+    peer_port as i64;
+    rx_drops  as i64;      // datagrams dropped because the client was behind
+}
+
+let is [32]Sock as socks with mut;
+
+// &array[i] with a variable index, the way netdev.cst indexes its ports.
+// Deliberately NOT hand-computed pointer arithmetic over a struct size: that
+// silently breaks the day a field is added, and the breakage is a socket that
+// reads another socket's state.
+fn at(i as i64) as *Sock {
+    return &socks[i];
+}
+
+fn init() as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        s.state = ST_FREE;
+        s.client = 0; s.id = 0; s.proto = 0;
+        s.local_ip = 0; s.local_port = 0;
+        s.peer_ip = 0; s.peer_port = 0;
+        s.rx_drops = 0;
+        i = i + 1;
+    }
+    return;
+}
+
+// Find a client's socket by the id that client chose.
+fn find(client as i64, id as i64) as *Sock {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state != ST_FREE && s.client == client && s.id == id) { return s; }
+        i = i + 1;
+    }
+    return cast(*Sock, 0);
+}
+
+fn create(client as i64, id as i64, proto as i64) as *Sock {
+    // A duplicate id is refused rather than rebound: the client believes it
+    // has two sockets, and silently making them one is a bug that surfaces as
+    // traffic arriving on the wrong one.
+    if (cast(i64, find(client, id)) != 0) { return cast(*Sock, 0); }
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state == ST_FREE) {
+            s.state = ST_OPEN;
+            s.client = client;
+            s.id = id;
+            s.proto = proto;
+            s.local_ip = 0; s.local_port = 0;
+            s.peer_ip = 0; s.peer_port = 0;
+            s.rx_drops = 0;
+            return s;
+        }
+        i = i + 1;
+    }
+    return cast(*Sock, 0);
+}
+
+fn is_port_taken(proto as i64, port as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state >= ST_BOUND && s.proto == proto && s.local_port == port) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// An unused ephemeral port, drawn at random. Bounded retries then give up
+// rather than scanning, because a scan that finds "the next free port" is
+// exactly the predictability this is avoiding.
+fn pick_port(proto as i64) as i64 {
+    let is i64 as span = udp.EPHEMERAL_HI - udp.EPHEMERAL_LO + 1;
+    let is i64 as tries with mut = 0;
+    while (tries < 64) {
+        let is i64 as p = udp.EPHEMERAL_LO + (sys.random_u64() & 0x7FFFFFFF) % span;
+        if (is_port_taken(proto, p) == 0) { return p; }
+        tries = tries + 1;
+    }
+    return 0;
+}
+
+fn bind(s as *Sock, addr as i64, port as i64) as i64 {
+    let is i64 as p with mut = port;
+    if (p == 0) { p = pick_port(s.proto); }
+    if (p == 0) { return 0 - 1; }
+    if (is_port_taken(s.proto, p) == 1) { return 0 - 2; }
+    s.local_ip = addr;
+    s.local_port = p;
+    s.state = ST_BOUND;
+    return p;
+}
+
+fn close(s as *Sock) as void {
+    s.state = ST_FREE;
+    s.client = 0;
+    s.id = 0;
+    return;
+}
+
+// Drop every socket a client owned. Called when its channel closes: a
+// disconnected client's ports must come back, or a program that crashes in a
+// loop exhausts the table.
+fn close_client(client as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state != ST_FREE && s.client == client) {
+            close(s);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Which socket should receive a datagram. An exact peer match wins over a
+// wildcard bind, so a connected socket takes its own traffic even when
+// another socket is listening on the same port for anyone.
+fn demux(proto as i64, dst_ip as i64, dst_port as i64,
+         src_ip as i64, src_port as i64) as *Sock {
+    let is *Sock as wild with mut = cast(*Sock, 0);
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state >= ST_BOUND && s.proto == proto && s.local_port == dst_port) {
+            if (s.local_ip == 0 || s.local_ip == dst_ip) {
+                if (s.state == ST_CONN && s.peer_ip == src_ip && s.peer_port == src_port) {
+                    return s;
+                }
+                if (s.state == ST_BOUND && cast(i64, wild) == 0) { wild = s; }
+            }
+        }
+        i = i + 1;
+    }
+    return wild;
+}

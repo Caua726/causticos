@@ -1,0 +1,622 @@
+// netd — the network stack, as a program.
+//
+// The kernel hands out ethernet frames and stops there, because everything
+// above a frame is a decision and decisions are userspace (architecture.md
+// §2.1). So this holds the port and does the deciding: ARP, IP, ICMP, UDP,
+// and TCP after them. Programs reach it over channels.
+//
+// It is the same shape as the compositor, deliberately. One holder of an
+// exclusive device, N clients that each want a slice, a protocol over a
+// channel, and SYS_POLL waiting on all of them at once. That shape was
+// already proven by the framebuffer and this is the same problem wearing
+// different clothes.
+//
+// SINGLE THREADED, ON PURPOSE. Every packet, every timer and every client
+// request is handled on one thread between poll() calls. A network stack is
+// mostly a pile of shared mutable state — the ARP cache, the socket table,
+// reassembly — and the usual way to get that wrong is to protect it with
+// locks and then find the deadlock at three in the morning. There is nothing
+// to lock here. The cost is that a slow client blocks the others, which is
+// bounded because every write is to a channel that never blocks for long.
+//
+// THE POLL LOOP NEVER SPINS. Its timeout is the nearest timer deadline, so an
+// idle stack costs nothing and a stack with an ARP retransmission pending
+// wakes exactly when it is due.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netbuf/netbuf.cst" as nb;
+use "../lib/neteth/neteth.cst" as eth;
+use "../lib/netarp/netarp.cst" as arp;
+use "../lib/netip/netip.cst" as ip;
+use "../lib/netip/netip_reasm.cst" as reasm;
+use "../lib/netudp/netudp.cst" as udp;
+use "../lib/netproto/netproto.cst" as np;
+use "netd_if.cst" as nif;
+use "netd_sock.cst" as nsock;
+
+let is i64 as MAX_CLIENTS = 8;
+let is i64 as POLL_CAP_NS = 250000000;      // 250 ms: the idle heartbeat
+let is i64 as ICMP_ID_BASE = 0x4E44;        // "ND"
+
+// Client channels. Slot 0 is the control channel handed to us at spawn; the
+// rest are minted on REQ_NEW_CLIENT.
+let is [8]i64 as client_fd with mut;
+let is [8]i64 as client_live with mut;
+let is i64 as n_clients with mut = 0;
+
+let is [2048]u8 as rxbuf;
+let is [2048]u8 as payload;
+let is [8192]u8 as reasm_out;
+let is nb.Pbuf as txb;
+
+// Outstanding pings, so a reply can be matched to the client that asked and
+// the round trip measured. Small and fixed: a client that floods gets its
+// oldest request forgotten rather than the table growing.
+let is i64 as MAX_PINGS = 8;
+let is [8]i64 as ping_client with mut;
+let is [8]i64 as ping_ip with mut;
+let is [8]i64 as ping_seq with mut;
+let is [8]i64 as ping_t0 with mut;
+let is [8]i64 as ping_live with mut;
+
+let is i64 as verbose with mut = 0;
+
+fn log(t as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn log_num(v as i64) as void {
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn log_ip(v as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (i > 0) { log("."); }
+        log_num(ip.addr_octet(v, i));
+        i = i + 1;
+    }
+    return;
+}
+
+// ============================================================
+// Transmit
+// ============================================================
+
+// Send an IP packet whose payload is already in txb. Resolves the next hop,
+// queueing the packet on the ARP entry when the address is not yet known —
+// which is the RFC 1122 SHOULD that keeps a new connection from paying a
+// retransmission timeout for something that costs a millisecond.
+fn send_ip(idx as i64, dst as i64, proto as i64) as i64 {
+    let is *nif.Iface as f = nif.at(idx);
+    let is i64 as hop = ip.next_hop(dst, f.ip, f.mask, f.gw);
+    if (hop == 0) {
+        f.tx_noroute = f.tx_noroute + 1;
+        return 0 - 1;
+    }
+    ip.push_header(&txb, f.ip, dst, proto, sys.random_u64() & 0xFFFF);
+    if (txb.err != 0) { return 0 - 1; }
+
+    // Broadcast and multicast do not need resolving.
+    if (dst == 0xFFFFFFFF || ip.is_multicast(dst) == 1) {
+        return nif.send_to_mac(idx, &txb, eth.broadcast(), eth.TYPE_IPV4);
+    }
+
+    let is [6]u8 as mac;
+    let is i64 as now = sys.time_ns();
+    let is i64 as r = arp.lookup(nif.cache_at(idx), hop, cast(*u8, &mac[0]), now);
+    if (r == arp.LOOKUP_HIT) {
+        return nif.send_to_mac(idx, &txb, cast(*u8, &mac[0]), eth.TYPE_IPV4);
+    }
+
+    // Not resolved. Hold the packet on the ARP entry and ask; it goes out
+    // when the reply lands.
+    if (r == arp.LOOKUP_MISS) {
+        arp.start_resolve(nif.cache_at(idx), hop, nb.ptr(&txb), nb.len(&txb), now);
+        nif.send_arp_request(idx, hop);
+    } else {
+        // Already resolving: replace the held packet with this one, which is
+        // what RFC 1122 asks for (keep the LATEST).
+        let is *arp.Entry as e = arp.find(nif.cache_at(idx), hop);
+        if (cast(i64, e) != 0) {
+            arp.start_resolve(nif.cache_at(idx), hop, nb.ptr(&txb), nb.len(&txb), now);
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+// Receive
+// ============================================================
+
+fn handle_arp(idx as i64, a as *u8, alen as i64, from_mac as *u8) as void {
+    if (arp.is_valid(a, alen) == 0) { return; }
+    let is *nif.Iface as f = nif.at(idx);
+    let is i64 as sip = arp.sender_ip_of(a);
+    let is i64 as tip = arp.target_ip_of(a);
+    let is i64 as op = arp.op_of(a);
+    let is i64 as now = sys.time_ns();
+
+    let is i64 as solicited with mut = 0;
+    if (op == arp.OP_REPLY && tip == f.ip) { solicited = 1; }
+    if (sip != 0 && sip != f.ip) {
+        let is *arp.Entry as e = arp.learn(nif.cache_at(idx), sip,
+                                           arp.sender_mac_of(a), solicited, now);
+        // Whatever was waiting on this address goes out now.
+        let is i64 as held = arp.take_pending(e, cast(*u8, &rxbuf[0]));
+        if (held > 0) {
+            let is nb.Pbuf as hb;
+            nb.init(&hb);
+            nb.append_bytes(&hb, cast(*u8, &rxbuf[0]), held);
+            nif.send_to_mac(idx, &hb, arp.sender_mac_of(a), eth.TYPE_IPV4);
+        }
+    }
+
+    // Answer requests for our address. A host that only asks and never
+    // answers is unreachable from everyone else, however well it can send.
+    if (op == arp.OP_REQUEST && tip == f.ip && f.ip != 0) {
+        nif.send_arp_reply(idx, arp.sender_mac_of(a), sip);
+    }
+    return;
+}
+
+fn find_ping(seq as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_PINGS) {
+        if (ping_live[i] == 1 && ping_seq[i] == seq) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn handle_icmp(idx as i64, m as *u8, mlen as i64, src as i64) as void {
+    if (ip.icmp_verify(m, mlen) == 0) { return; }
+    let is i64 as t = ip.icmp_type(m);
+    let is *nif.Iface as f = nif.at(idx);
+
+    if (t == ip.ICMP_ECHO_REQUEST) {
+        // Answer it. Being pingable is not a courtesy, it is how anyone else
+        // establishes that this machine is alive.
+        nb.init(&txb);
+        let is i64 as plen = mlen - ip.ICMP_HDR_LEN;
+        let is *u8 as body = nb.append(&txb, mlen);
+        if (cast(i64, body) == 0) { return; }
+        ip.icmp_build(body, ip.ICMP_ECHO_REPLY, 0, ip.icmp_id(m), ip.icmp_seq(m),
+                      cast(*u8, cast(i64, m) + ip.ICMP_HDR_LEN), plen);
+        send_ip(idx, src, ip.PROTO_ICMP);
+        return;
+    }
+
+    if (t == ip.ICMP_ECHO_REPLY) {
+        let is i64 as k = find_ping(ip.icmp_seq(m));
+        if (k < 0) { return; }
+        if (ping_ip[k] != src) { return; }
+        let is i64 as rtt = sys.time_ns() - ping_t0[k];
+        ping_live[k] = 0;
+        np.send(client_fd[ping_client[k]], np.EV_PONG, 0, rtt,
+                np.pack_port_len(ip.icmp_id(m), ip.icmp_seq(m)));
+        return;
+    }
+
+    if (t == ip.ICMP_DEST_UNREACH) {
+        // Tell whoever is listening. Frag-needed also carries the next-hop
+        // MTU, which is the only way path MTU discovery learns anything —
+        // ignoring it turns a smaller link into a black hole.
+        let is i64 as code = ip.icmp_code(m);
+        if (code == ip.UNREACH_FRAG_NEEDED) {
+            let is i64 as next_mtu = ip.icmp_next_mtu(m);
+            if (next_mtu >= ip.MIN_MTU && next_mtu < f.mtu) { f.mtu = next_mtu; }
+        }
+        let is i64 as c with mut = 0;
+        while (c < MAX_CLIENTS) {
+            if (client_live[c] == 1) { np.send(client_fd[c], np.EV_UNREACH, 0, src, code); }
+            c = c + 1;
+        }
+        return;
+    }
+    return;
+}
+
+fn handle_udp(idx as i64, u as *u8, ulen as i64, src as i64, dst as i64) as void {
+    if (udp.validate(u, ulen, src, dst) != udp.OK) { return; }
+    let is i64 as dport = udp.dst_port(u);
+    let is i64 as sport = udp.src_port(u);
+    let is *nsock.Sock as s = nsock.demux(np.SOCK_DGRAM, dst, dport, src, sport);
+    if (cast(i64, s) == 0) {
+        // Nothing is listening. RFC 1122 says answer with a port-unreachable,
+        // and it is what lets a sender find out immediately rather than by
+        // timing out — which is the difference between "connection refused"
+        // and a program that hangs.
+        nb.init(&txb);
+        let is i64 as quote with mut = 28;              // IP header + 8 bytes
+        let is *u8 as body = nb.append(&txb, ip.ICMP_HDR_LEN + quote);
+        if (cast(i64, body) == 0) { return; }
+        ip.icmp_build(body, ip.ICMP_DEST_UNREACH, ip.UNREACH_PORT, 0, 0,
+                      cast(*u8, &rxbuf[14]), quote);
+        send_ip(idx, src, ip.PROTO_ICMP);
+        return;
+    }
+    let is i64 as plen with mut = udp.payload_len(u);
+    if (plen > np.MAX_PAYLOAD) { plen = np.MAX_PAYLOAD; }
+    np.send_data(client_fd[s.client], np.EV_RECVFROM, s.id, src,
+                 np.pack_port_len(sport, plen), udp.payload(u), plen);
+    return;
+}
+
+fn handle_ip(idx as i64, h as *u8, avail as i64) as void {
+    let is *nif.Iface as f = nif.at(idx);
+    if (ip.validate(h, avail) != ip.OK) {
+        f.rx_badip = f.rx_badip + 1;
+        return;
+    }
+    if (ip.is_for_us(ip.dst_addr(h), f.ip, f.mask) == 0) { return; }
+
+    // A fragment is not a packet yet. Reassembly hands back the payload of
+    // the whole datagram, or says it needs more.
+    if (ip.is_fragment(h) == 1) {
+        let is [1]i64 as rlen;
+        let is i64 as r = reasm.offer(nif.reasm_at(idx), h, cast(*u8, &reasm_out[0]),
+                                      cast(*i64, &rlen[0]), sys.time_ns());
+        if (r != reasm.R_DONE) { return; }
+        // The reassembled bytes are the transport payload; the header we
+        // already validated describes it.
+        let is i64 as proto = ip.protocol(h);
+        if (proto == ip.PROTO_ICMP) {
+            handle_icmp(idx, cast(*u8, &reasm_out[0]), rlen[0], ip.src_addr(h));
+        } else if (proto == ip.PROTO_UDP) {
+            handle_udp(idx, cast(*u8, &reasm_out[0]), rlen[0],
+                       ip.src_addr(h), ip.dst_addr(h));
+        }
+        return;
+    }
+
+    let is i64 as hl = ip.ihl(h);
+    let is *u8 as body = cast(*u8, cast(i64, h) + hl);
+    let is i64 as blen = ip.total_len(h) - hl;
+    let is i64 as proto = ip.protocol(h);
+    if (proto == ip.PROTO_ICMP) { handle_icmp(idx, body, blen, ip.src_addr(h)); }
+    else if (proto == ip.PROTO_UDP) { handle_udp(idx, body, blen, ip.src_addr(h), ip.dst_addr(h)); }
+    return;
+}
+
+// One frame, if one is there. The check is not optional: a read on a network
+// port BLOCKS until a frame arrives, so draining "until empty" by reading
+// until it stops returning frames blocks forever on the read that finds the
+// ring empty — and takes the whole daemon down with it, since this is the
+// thread that also serves clients and runs timers.
+//
+// That is exactly what happened: the first version drained up to 32 frames
+// per poll and wedged on the second read of a single-frame burst. Everything
+// afterwards — the ping timeout, the next client request — simply never ran.
+fn pump_iface(idx as i64) as i64 {
+    let is *nif.Iface as f = nif.at(idx);
+    let is [3]i64 as pe;
+    pe[0] = f.fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+    sys.poll(cast(*i64, &pe[0]), 1, 0);            // 0 = ask, never wait
+    if ((pe[2] & sys.POLL_READABLE) == 0) { return 0; }
+    let is i64 as n = sys.read(f.fd, cast(*u8, &rxbuf[0]), 2048);
+    if (n < 14) { return 0; }
+    f.rx_frames = f.rx_frames + 1;
+    let is *u8 as fr = cast(*u8, &rxbuf[0]);
+    if (eth.is_for_us(fr, cast(*u8, &f.mac[0])) == 0) {
+        // We run promiscuous so netd can be a capture point later; frames for
+        // other hosts are counted and dropped rather than processed.
+        f.rx_notus = f.rx_notus + 1;
+        return 1;
+    }
+    let is i64 as et = eth.ethertype(fr);
+    if (et == eth.TYPE_ARP) {
+        f.rx_arp = f.rx_arp + 1;
+        handle_arp(idx, cast(*u8, cast(i64, fr) + 14), n - 14, eth.src(fr));
+    } else if (et == eth.TYPE_IPV4) {
+        f.rx_ip = f.rx_ip + 1;
+        handle_ip(idx, cast(*u8, cast(i64, fr) + 14), n - 14);
+    } else {
+        f.rx_other = f.rx_other + 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// Timers
+// ============================================================
+
+// Drive the ARP state machine and report the next deadline, which becomes
+// the poll timeout. Returning a deadline rather than sleeping is what keeps
+// the loop from either spinning or oversleeping.
+fn run_timers(now as i64) as i64 {
+    let is i64 as next with mut = now + POLL_CAP_NS;
+    let is i64 as i with mut = 0;
+    while (i < nif.count()) {
+        let is [1]i64 as tip;
+        let is [6]u8 as tmac;
+        let is i64 as k with mut = 0;
+        while (k < arp.CACHE_SIZE) {
+            let is i64 as act = arp.tick(nif.cache_at(i), k, now,
+                                         cast(*i64, &tip[0]), cast(*u8, &tmac[0]));
+            if (act == arp.TICK_RETRY) { nif.send_arp_request(i, tip[0]); }
+            else if (act == arp.TICK_PROBE) { nif.send_arp_request(i, tip[0]); }
+            else if (act == arp.TICK_EXPIRED) { nif.at(i).tx_noarp = nif.at(i).tx_noarp + 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // Ping timeouts.
+    let is i64 as p with mut = 0;
+    while (p < MAX_PINGS) {
+        if (ping_live[p] == 1 && now - ping_t0[p] > 2000000000) {
+            ping_live[p] = 0;
+            np.send(client_fd[ping_client[p]], np.EV_ERROR, 0, sys.E_AGAIN, 0);
+        }
+        p = p + 1;
+    }
+    return next;
+}
+
+// ============================================================
+// Client requests
+// ============================================================
+
+fn reply_err(c as i64, sock as i64, err as i64) as void {
+    np.send(client_fd[c], np.EV_ERROR, sock, err, 0);
+    return;
+}
+
+fn do_ping(c as i64, dst as i64, id as i64, seq as i64) as void {
+    let is i64 as idx = nif.route(dst);
+    if (idx < 0) { reply_err(c, 0, sys.E_NOENT); return; }
+    let is i64 as k with mut = 0;
+    while (k < MAX_PINGS && ping_live[k] == 1) { k = k + 1; }
+    if (k >= MAX_PINGS) { reply_err(c, 0, sys.E_AGAIN); return; }
+
+    nb.init(&txb);
+    let is i64 as plen = 56;
+    let is *u8 as body = nb.append(&txb, ip.ICMP_HDR_LEN + plen);
+    if (cast(i64, body) == 0) { reply_err(c, 0, sys.E_NOMEM); return; }
+    let is i64 as i with mut = 0;
+    while (i < plen) { payload[i] = cast(u8, 0x61 + (i % 23)); i = i + 1; }
+    ip.icmp_build(body, ip.ICMP_ECHO_REQUEST, 0, id, seq, cast(*u8, &payload[0]), plen);
+
+    ping_client[k] = c;
+    ping_ip[k] = dst;
+    ping_seq[k] = seq;
+    ping_t0[k] = sys.time_ns();
+    ping_live[k] = 1;
+    if (send_ip(idx, dst, ip.PROTO_ICMP) < 0) {
+        ping_live[k] = 0;
+        reply_err(c, 0, sys.E_IO);
+    }
+    return;
+}
+
+fn do_sendto(c as i64, s as *nsock.Sock, dst as i64, dport as i64,
+             data as *u8, dlen as i64) as void {
+    if (s.local_port == 0) {
+        if (nsock.bind(s, 0, 0) < 0) { reply_err(c, s.id, sys.E_AGAIN); return; }
+    }
+    let is i64 as idx = nif.route(dst);
+    if (idx < 0) { reply_err(c, s.id, sys.E_NOENT); return; }
+    let is *nif.Iface as f = nif.at(idx);
+
+    nb.init(&txb);
+    let is *u8 as body = nb.append(&txb, udp.HDR_LEN + dlen);
+    if (cast(i64, body) == 0) { reply_err(c, s.id, sys.E_NOMEM); return; }
+    udp.build(body, s.local_port, dport, f.ip, dst, data, dlen);
+    if (send_ip(idx, dst, ip.PROTO_UDP) < 0) { reply_err(c, s.id, sys.E_IO); return; }
+    np.send(client_fd[c], np.EV_OK, s.id, dlen, 0);
+    return;
+}
+
+fn do_ifinfo(c as i64, which as i64) as void {
+    if (which < 0 || which >= nif.count()) { reply_err(c, 0, sys.E_NOENT); return; }
+    let is *nif.Iface as f = nif.at(which);
+    nif.refresh(which);
+    let is [32]u8 as name;
+    nb.fill(cast(*u8, &name[0]), 0, 32);
+    let is [16]i64 as inf;
+    if (sys.net_info(f.fd, cast(*i64, &inf[0])) == 0) {
+        nb.copy(cast(*u8, &name[0]), cast(*u8, &inf[12]), 32);
+    }
+    np.send_data(client_fd[c], np.EV_IFINFO, which, f.ip,
+                 (f.mask << 32) | f.up, cast(*u8, &name[0]), 32);
+    return;
+}
+
+// One client message. Returns 0 when the client is gone.
+fn serve_client(c as i64) as i64 {
+    let is [4]i64 as m;
+    if (np.recv(client_fd[c], cast(*i64, &m[0])) < 0) { return 0; }
+    let is i64 as t = m[0];
+    let is i64 as sock = m[1];
+    let is i64 as a = m[2];
+    let is i64 as b = m[3];
+
+    // Payload first, always, even for a request that will be rejected: the
+    // bytes are already in the channel and leaving them there desynchronises
+    // every message after it.
+    let is i64 as plen = np.payload_of(t, a, b);
+    if (plen > 0) {
+        if (plen > 2048) { return 0; }             // beyond anything legal: drop the client
+        if (np.read_all(client_fd[c], cast(*u8, &payload[0]), plen) < 0) { return 0; }
+    }
+
+    if (t == np.REQ_HELLO) {
+        np.send(client_fd[c], np.EV_HELLO, 0, np.VERSION, nif.count());
+        return 1;
+    }
+    if (t == np.REQ_PING) {
+        do_ping(c, a, np.unpack_port(b), np.unpack_len(b));
+        return 1;
+    }
+    if (t == np.REQ_IFINFO) {
+        do_ifinfo(c, a);
+        return 1;
+    }
+    if (t == np.REQ_SOCKET) {
+        if (a != np.SOCK_DGRAM) { reply_err(c, sock, sys.E_INVAL); return 1; }
+        let is *nsock.Sock as s = nsock.create(c, sock, a);
+        if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_EXIST); return 1; }
+        np.send(client_fd[c], np.EV_OK, sock, 0, 0);
+        return 1;
+    }
+    if (t == np.REQ_BIND) {
+        let is *nsock.Sock as s = nsock.find(c, sock);
+        if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
+        let is i64 as p = nsock.bind(s, a, b);
+        if (p < 0) { reply_err(c, sock, sys.E_EXIST); return 1; }
+        np.send(client_fd[c], np.EV_OK, sock, p, 0);
+        return 1;
+    }
+    if (t == np.REQ_CONNECT) {
+        let is *nsock.Sock as s = nsock.find(c, sock);
+        if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
+        if (s.local_port == 0) {
+            if (nsock.bind(s, 0, 0) < 0) { reply_err(c, sock, sys.E_AGAIN); return 1; }
+        }
+        s.peer_ip = a;
+        s.peer_port = b;
+        s.state = nsock.ST_CONN;
+        np.send(client_fd[c], np.EV_OK, sock, s.local_port, 0);
+        return 1;
+    }
+    if (t == np.REQ_SENDTO) {
+        let is *nsock.Sock as s = nsock.find(c, sock);
+        if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
+        do_sendto(c, s, a, np.unpack_port(b), cast(*u8, &payload[0]), np.unpack_len(b));
+        return 1;
+    }
+    if (t == np.REQ_SEND) {
+        let is *nsock.Sock as s = nsock.find(c, sock);
+        if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
+        if (s.state != nsock.ST_CONN) { reply_err(c, sock, sys.E_INVAL); return 1; }
+        do_sendto(c, s, s.peer_ip, s.peer_port, cast(*u8, &payload[0]), b);
+        return 1;
+    }
+    if (t == np.REQ_CLOSE) {
+        let is *nsock.Sock as s = nsock.find(c, sock);
+        if (cast(i64, s) != 0) { nsock.close(s); }
+        np.send(client_fd[c], np.EV_OK, sock, 0, 0);
+        return 1;
+    }
+
+    reply_err(c, sock, sys.E_NOSYS);
+    return 1;
+}
+
+fn drop_client(c as i64) as void {
+    let is i64 as n = nsock.close_client(c);
+    sys.close(client_fd[c]);
+    client_live[c] = 0;
+    client_fd[c] = 0 - 1;
+    if (verbose == 1) {
+        log("netd: client "); log_num(c);
+        log(" gone, "); log_num(n); log(" sockets freed\n");
+    }
+    return;
+}
+
+// ============================================================
+
+fn main(argc as i64, argv as *u8) as i32 {
+    log("netd: starting\n");
+    nsock.init();
+    let is i64 as i with mut = 0;
+    while (i < MAX_CLIENTS) { client_fd[i] = 0 - 1; client_live[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < MAX_PINGS) { ping_live[i] = 0; i = i + 1; }
+
+    // Take every port the machine has.
+    let is i64 as ports = sys.dev_count(sys.DEV_NET);
+    if (ports <= 0) { log("netd: no network ports\n"); return cast(i32, 1); }
+    let is i64 as p with mut = 0;
+    while (p < ports && nif.count() < 2) {
+        let is i64 as idx = nif.open(p);
+        if (idx >= 0) {
+            // Static addressing until DHCP lands. QEMU's SLIRP hands out
+            // 10.0.2.15/24 with a gateway at 10.0.2.2, and saying so here is
+            // honest about what this does and does not yet do.
+            nif.configure(idx, ip.make_addr(10, 0, 2, 15), ip.prefix_mask(24),
+                          ip.make_addr(10, 0, 2, 2));
+            log("netd: port "); log_num(p); log(" up as ");
+            log_ip(nif.at(idx).ip); log("\n");
+        }
+        p = p + 1;
+    }
+    if (nif.count() == 0) { log("netd: no port could be opened\n"); return cast(i32, 1); }
+
+    // The control channel arrives on fd 3, the way a compositor client finds
+    // the framebuffer. Without it netd still runs and serves nobody, which is
+    // useful for a boot that only wants the stack answering pings.
+    client_fd[0] = np.NET_FD;
+    client_live[0] = 1;
+    n_clients = 1;
+    log("netd: ready\n");
+
+    while (1 == 1) {
+        let is i64 as now = sys.time_ns();
+        let is i64 as next = run_timers(now);
+
+        // Watch every interface and every live client at once. The timeout is
+        // the nearest deadline, so an idle stack costs nothing.
+        let is [30]i64 as pe;
+        let is i64 as n with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < nif.count()) {
+            pe[n*3+0] = nif.at(k).fd;
+            pe[n*3+1] = sys.POLL_READABLE;
+            pe[n*3+2] = 0;
+            n = n + 1;
+            k = k + 1;
+        }
+        let is i64 as first_client = n;
+        k = 0;
+        while (k < MAX_CLIENTS) {
+            if (client_live[k] == 1) {
+                pe[n*3+0] = client_fd[k];
+                pe[n*3+1] = sys.POLL_READABLE;
+                pe[n*3+2] = 0;
+                n = n + 1;
+            }
+            k = k + 1;
+        }
+
+        let is i64 as tmo with mut = next - sys.time_ns();
+        if (tmo < 0) { tmo = 0; }
+        sys.poll(cast(*i64, &pe[0]), n, tmo);
+
+        k = 0;
+        while (k < nif.count()) {
+            if ((pe[k*3+2] & sys.POLL_READABLE) != 0) {
+                // Drain rather than take one: a burst arrives between polls
+                // and leaving frames queued costs another loop each.
+                let is i64 as budget with mut = 0;
+                while (budget < 32 && pump_iface(k) == 1) { budget = budget + 1; }
+            }
+            k = k + 1;
+        }
+
+        let is i64 as slot with mut = first_client;
+        k = 0;
+        while (k < MAX_CLIENTS) {
+            if (client_live[k] == 1) {
+                if ((pe[slot*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                    if (serve_client(k) == 0) { drop_client(k); }
+                }
+                slot = slot + 1;
+            }
+            k = k + 1;
+        }
+    }
+    return cast(i32, 0);
+}

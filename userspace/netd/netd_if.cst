@@ -1,0 +1,165 @@
+// netd_if — one network interface: its addresses, its neighbours, and the
+// path a frame takes in and out.
+//
+// Everything here is per-port state. netd can hold more than one, and the
+// routing decision picks between them — which is the whole reason address and
+// mask live beside the port rather than in a global.
+
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netbuf/netbuf.cst" as nb;
+use "../lib/neteth/neteth.cst" as eth;
+use "../lib/netarp/netarp.cst" as arp;
+use "../lib/netip/netip.cst" as ip;
+use "../lib/netip/netip_reasm.cst" as reasm;
+
+let is i64 as MAX_IF = 2;
+
+struct Iface {
+    up        as i64;
+    fd        as i64;      // the DEV_NET fd we hold
+    port      as i64;      // device index
+    ip        as i64;      // host byte order, 0 until configured
+    mask      as i64;
+    gw        as i64;
+    mtu       as i64;
+    frame_max as i64;
+    // Counters netd owns, distinct from the port's own: these count what the
+    // STACK did with a frame, not what the wire delivered.
+    rx_frames as i64;
+    rx_arp    as i64;
+    rx_ip     as i64;
+    rx_other  as i64;      // an ethertype we do not speak
+    rx_notus  as i64;      // addressed elsewhere (we run promiscuous)
+    rx_badip  as i64;      // failed ip.validate
+    tx_frames as i64;
+    tx_noroute as i64;
+    tx_noarp  as i64;      // resolution never completed
+    mac       as [8]u8;
+}
+
+let is [2]Iface as ifaces with mut;
+let is [2]arp.Cache as caches with mut;
+let is [2]reasm.Table as reasms with mut;
+let is i64 as n_if with mut = 0;
+
+fn at(i as i64) as *Iface {
+    if (i == 0) { return &ifaces[0]; }
+    return &ifaces[1];
+}
+
+fn cache_at(i as i64) as *arp.Cache {
+    if (i == 0) { return &caches[0]; }
+    return &caches[1];
+}
+
+fn reasm_at(i as i64) as *reasm.Table {
+    if (i == 0) { return &reasms[0]; }
+    return &reasms[1];
+}
+
+fn count() as i64 { return n_if; }
+
+// Take a port and make an interface of it. The address is not discovered
+// here — DHCP is a client of this, not a part of it — so a fresh interface
+// has no address and cannot route until something gives it one.
+fn open(port as i64) as i64 {
+    if (n_if >= MAX_IF) { return 0 - 1; }
+    let is i64 as fd = sys.dev_open(sys.DEV_NET, port, 0);
+    if (fd < 0) { return 0 - 1; }
+    let is [16]i64 as inf;
+    if (sys.net_info(fd, cast(*i64, &inf[0])) != 0) {
+        sys.close(fd);
+        return 0 - 1;
+    }
+    let is i64 as idx = n_if;
+    let is *Iface as f = at(idx);
+    f.fd = fd;
+    f.port = port;
+    f.mtu = inf[0];
+    f.frame_max = inf[1];
+    f.up = inf[2];
+    f.ip = 0; f.mask = 0; f.gw = 0;
+    f.rx_frames = 0; f.rx_arp = 0; f.rx_ip = 0; f.rx_other = 0;
+    f.rx_notus = 0; f.rx_badip = 0;
+    f.tx_frames = 0; f.tx_noroute = 0; f.tx_noarp = 0;
+    let is i64 as i with mut = 0;
+    while (i < 6) { f.mac[i] = cast(u8, sys.net_mac_byte(inf[4], i)); i = i + 1; }
+    arp.cache_init(cache_at(idx));
+    reasm.init(reasm_at(idx));
+    n_if = n_if + 1;
+    return idx;
+}
+
+fn configure(idx as i64, addr as i64, mask as i64, gw as i64) as void {
+    let is *Iface as f = at(idx);
+    f.ip = addr;
+    f.mask = mask;
+    f.gw = gw;
+    return;
+}
+
+// Refresh what the driver reports. Link state changes under us and a stack
+// that caches it sends into a dead port.
+fn refresh(idx as i64) as void {
+    let is *Iface as f = at(idx);
+    let is [16]i64 as inf;
+    if (sys.net_info(f.fd, cast(*i64, &inf[0])) == 0) { f.up = inf[2]; }
+    return;
+}
+
+// Which interface should carry a packet to `dst`. On-link wins over the
+// default route, and an interface with no address cannot carry anything.
+fn route(dst as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n_if) {
+        let is *Iface as f = at(i);
+        if (f.ip != 0 && f.up != 0) {
+            if (ip.same_subnet(dst, f.ip, f.mask) == 1) { return i; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n_if) {
+        let is *Iface as f = at(i);
+        if (f.ip != 0 && f.up != 0 && f.gw != 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Put a framed packet on the wire. `pb` already holds the ethernet header.
+fn send_frame(idx as i64, p as *u8, n as i64) as i64 {
+    let is *Iface as f = at(idx);
+    let is i64 as r = sys.write(f.fd, p, n);
+    if (r > 0) { f.tx_frames = f.tx_frames + 1; }
+    return r;
+}
+
+// Frame and send. Returns bytes on the wire, or negative.
+fn send_to_mac(idx as i64, pb as *nb.Pbuf, dst_mac as *u8, etype as i64) as i64 {
+    let is *Iface as f = at(idx);
+    eth.push_header(pb, dst_mac, cast(*u8, &f.mac[0]), etype);
+    if (pb.err != 0) { return 0 - 1; }
+    return send_frame(idx, nb.ptr(pb), nb.len(pb));
+}
+
+// An ARP request for `target`, broadcast.
+fn send_arp_request(idx as i64, target as i64) as i64 {
+    let is *Iface as f = at(idx);
+    let is nb.Pbuf as pb;
+    nb.init(&pb);
+    let is *u8 as body = nb.append(&pb, arp.PKT_LEN);
+    if (cast(i64, body) == 0) { return 0 - 1; }
+    arp.build(body, arp.OP_REQUEST, cast(*u8, &f.mac[0]), f.ip, cast(*u8, 0), target);
+    return send_to_mac(idx, &pb, eth.broadcast(), eth.TYPE_ARP);
+}
+
+fn send_arp_reply(idx as i64, to_mac as *u8, to_ip as i64) as i64 {
+    let is *Iface as f = at(idx);
+    let is nb.Pbuf as pb;
+    nb.init(&pb);
+    let is *u8 as body = nb.append(&pb, arp.PKT_LEN);
+    if (cast(i64, body) == 0) { return 0 - 1; }
+    arp.build(body, arp.OP_REPLY, cast(*u8, &f.mac[0]), f.ip, to_mac, to_ip);
+    return send_to_mac(idx, &pb, to_mac, eth.TYPE_ARP);
+}

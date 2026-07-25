@@ -1,0 +1,154 @@
+// netproto — the wire between a program and netd.
+//
+// netd holds the network port and everything above the frame lives in it:
+// ARP, IP, ICMP, UDP, and TCP after them. Programs reach it over a channel,
+// the same shape the compositor already uses for the framebuffer, because it
+// is the same problem — one holder of an exclusive device, N clients that
+// each want a slice of it, and a kernel that stays out of the policy.
+//
+// FRAMING. A channel is a byte stream and the kernel does not frame it
+// (architecture.md §5: framing is the app's business). So every message is a
+// fixed 32-byte header of four i64 — {mtype, sock, a, b} — optionally
+// followed by `b` bytes of payload when the type says so. Fixed-size headers
+// rather than length-prefixed variable ones because a reader can then always
+// ask for exactly what it needs and never has to parse to find out how much
+// to read.
+//
+// A header never splits: abi.POLL_WRITE_UNIT guarantees 64 bytes go through a
+// writable channel without blocking or tearing, and 32 is half that.
+//
+// SOCKET IDs ARE THE CLIENT'S. The client picks them, not netd. That removes
+// the round trip a server-assigned handle would need before the first send,
+// and it removes an entire class of confusion where a reply arrives for a
+// socket the client has already closed and reopened — the ids simply are not
+// the same. netd rejects a duplicate rather than silently rebinding.
+
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as HDR_WORDS = 4;
+let is i64 as HDR_BYTES = 32;
+
+// The fd a spawned client finds its netd channel on, the way the compositor's
+// clients find the framebuffer on fd 3. There is no ambient service namespace
+// (architecture.md §2.2): you are handed the key or you do not have it, and a
+// program whose fd 3 is not a netd channel finds out on its first message
+// rather than by consulting a registry that could lie.
+let is i64 as NET_FD with imut = 3;
+
+// ---- client -> netd ----
+let is i64 as REQ_HELLO      with imut = 1;   // a=version; netd replies EV_HELLO
+let is i64 as REQ_NEW_CLIENT with imut = 2;   // control channel only: mint an endpoint
+let is i64 as REQ_SOCKET     with imut = 3;   // sock=id, a=SOCK_*
+let is i64 as REQ_BIND       with imut = 4;   // sock, a=ip (0 = any), b=port (0 = pick)
+let is i64 as REQ_CONNECT    with imut = 5;   // sock, a=ip, b=port
+let is i64 as REQ_SENDTO     with imut = 6;   // sock, a=ip, b=(port<<32)|len, + len bytes
+let is i64 as REQ_SEND       with imut = 7;   // sock, b=len, + len bytes
+let is i64 as REQ_CLOSE      with imut = 8;   // sock
+let is i64 as REQ_PING       with imut = 9;   // a=ip, b=(id<<32)|seq
+let is i64 as REQ_IFINFO     with imut = 10;  // a=port index
+let is i64 as REQ_ARPDUMP    with imut = 11;
+let is i64 as REQ_RESOLVE    with imut = 12;  // b=len, + name bytes
+let is i64 as REQ_LISTEN     with imut = 13;  // sock, a=backlog
+let is i64 as REQ_ACCEPT     with imut = 14;  // sock
+let is i64 as REQ_SHUTDOWN   with imut = 15;  // sock, a=how
+
+// ---- netd -> client ----
+let is i64 as EV_HELLO       with imut = 64;  // a=version, b=port count
+let is i64 as EV_OK          with imut = 65;  // sock, a=detail
+let is i64 as EV_ERROR       with imut = 66;  // sock, a=errno
+let is i64 as EV_DATA        with imut = 67;  // sock, b=len, + len bytes
+let is i64 as EV_RECVFROM    with imut = 68;  // sock, a=ip, b=(port<<32)|len, + bytes
+let is i64 as EV_CLOSED      with imut = 69;  // sock
+let is i64 as EV_PONG        with imut = 70;  // a=rtt_ns, b=(id<<32)|seq
+let is i64 as EV_UNREACH     with imut = 71;  // a=ip, b=icmp code
+let is i64 as EV_IFINFO      with imut = 72;  // a=ip, b=(mask<<32)|up, then 32B of name
+let is i64 as EV_RESOLVED    with imut = 73;  // a=ip (0 = not found)
+let is i64 as EV_ACCEPTED    with imut = 74;  // sock=new, a=peer ip, b=peer port
+let is i64 as EV_WRITABLE    with imut = 75;  // sock, a=bytes of credit
+
+let is i64 as SOCK_DGRAM  with imut = 1;
+let is i64 as SOCK_STREAM with imut = 2;
+
+let is i64 as VERSION with imut = 1;
+
+// Payload cap per message. A channel carries 8 KiB per direction, and a
+// message must fit inside one so a reader never blocks holding a half-read
+// header. 1472 is the largest UDP payload that fits an unfragmented datagram
+// on a 1500-byte MTU, which is the number that actually matters.
+let is i64 as MAX_PAYLOAD with imut = 1472;
+
+// ---- framing ----
+
+// Write exactly n bytes, or fail. A channel write can be short when the far
+// end is slow, and a message that goes out in pieces without finishing is a
+// stream both sides have to resynchronise — so a partial write loops rather
+// than being reported as success.
+fn write_all(fd as i64, p as *u8, n as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = sys.write(fd, cast(*u8, cast(i64, p) + done), n - done);
+        if (r <= 0) { return 0 - 1; }
+        done = done + r;
+    }
+    return done;
+}
+
+fn read_all(fd as i64, p as *u8, n as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = sys.read(fd, cast(*u8, cast(i64, p) + done), n - done);
+        if (r <= 0) { return 0 - 1; }
+        done = done + r;
+    }
+    return done;
+}
+
+fn send(fd as i64, mtype as i64, sock as i64, a as i64, b as i64) as i64 {
+    let is [4]i64 as m;
+    m[0] = mtype; m[1] = sock; m[2] = a; m[3] = b;
+    return write_all(fd, cast(*u8, &m[0]), HDR_BYTES);
+}
+
+// Header then payload, as one logical message. The two writes cannot be
+// separated by another sender's message because a channel has exactly one
+// writer at each end.
+fn send_data(fd as i64, mtype as i64, sock as i64, a as i64, b as i64,
+             data as *u8, dlen as i64) as i64 {
+    let is [4]i64 as m;
+    m[0] = mtype; m[1] = sock; m[2] = a; m[3] = b;
+    if (write_all(fd, cast(*u8, &m[0]), HDR_BYTES) < 0) { return 0 - 1; }
+    if (dlen > 0) {
+        if (write_all(fd, data, dlen) < 0) { return 0 - 1; }
+    }
+    return HDR_BYTES + dlen;
+}
+
+// Blocking read of one header. Returns 1, or -1 when the peer is gone.
+fn recv(fd as i64, out as *i64) as i64 {
+    let is [4]i64 as m;
+    if (read_all(fd, cast(*u8, &m[0]), HDR_BYTES) < 0) { return 0 - 1; }
+    out[0] = m[0]; out[1] = m[1]; out[2] = m[2]; out[3] = m[3];
+    return 1;
+}
+
+// The payload length a message carries, from its type and header. One place
+// that knows, so a reader that has just taken a header always knows exactly
+// how many bytes follow — and a type this does not recognise carries none,
+// which keeps an unknown message from desynchronising the stream.
+fn payload_of(mtype as i64, a as i64, b as i64) as i64 {
+    if (mtype == REQ_SEND) { return b; }
+    if (mtype == REQ_SENDTO) { return b & 0xFFFFFFFF; }
+    if (mtype == REQ_RESOLVE) { return b; }
+    if (mtype == EV_DATA) { return b; }
+    if (mtype == EV_RECVFROM) { return b & 0xFFFFFFFF; }
+    if (mtype == EV_IFINFO) { return 32; }
+    return 0;
+}
+
+// Pack a port and a length into one word, which is what SENDTO and RECVFROM
+// need since their address takes the other one.
+fn pack_port_len(port as i64, len as i64) as i64 {
+    return (port << 32) | (len & 0xFFFFFFFF);
+}
+fn unpack_port(v as i64) as i64 { return (v >> 32) & 0xFFFF; }
+fn unpack_len(v as i64) as i64 { return v & 0xFFFFFFFF; }

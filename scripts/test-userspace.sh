@@ -20,6 +20,7 @@ TESTS=(
     "nett:40:"
     "kabi:30:"
     "pingt:60:userspace/build/ping.cse"
+    "netdt:70:userspace/build/netd.cse"
 )
 
 WANT="${1:-}"

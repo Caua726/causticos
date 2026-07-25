@@ -1,0 +1,267 @@
+// netdt — netd, from the other side of a channel.
+//
+// Spawns the real netd, hands it one end of a channel, and drives it the way
+// any program would: ask what interfaces exist, ping through it, open a UDP
+// socket, and send a datagram that a real server on the other side answers.
+//
+// Spawning the actual binary rather than linking its logic is the same
+// discipline pingt uses. A test that reimplements what it tests can pass
+// while the shipped program is broken, and they drift apart the moment
+// either is fixed.
+//
+// The far end is QEMU's SLIRP: it answers ARP and ICMP, and it runs a DNS
+// server on 10.0.2.3 that will answer a real query — which is what makes the
+// UDP round trip a round trip rather than a send into the dark.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netbuf/netbuf.cst" as nb;
+use "../lib/netip/netip.cst" as ip;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+let is i64 as netd_pid with mut = 0;
+let is i64 as ctl with mut = 0 - 1;
+let is [2048]u8 as buf;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// Wait for one message, with a deadline: a netd that never answers must fail
+// the test rather than hang it.
+fn await(out as *i64, deadline as i64) as i64 {
+    while (sys.time_ns() < deadline) {
+        let is [3]i64 as pe;
+        pe[0] = ctl; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        let is i64 as tmo = deadline - sys.time_ns();
+        sys.poll(cast(*i64, &pe[0]), 1, tmo);
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            if (np.recv(ctl, out) < 0) { return 0 - 1; }
+            let is i64 as plen = np.payload_of(out[0], out[2], out[3]);
+            if (plen > 0) {
+                if (plen > 2048) { return 0 - 1; }
+                if (np.read_all(ctl, cast(*u8, &buf[0]), plen) < 0) { return 0 - 1; }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Await a specific message type, letting anything else pass. netd is allowed
+// to volunteer events (an unreachable, a datagram) and a test that treated
+// those as failures would be testing its own impatience.
+fn await_type(want as i64, out as *i64, ns as i64) as i64 {
+    let is i64 as deadline = sys.time_ns() + ns;
+    while (1 == 1) {
+        let is i64 as r = await(out, deadline);
+        if (r <= 0) { return r; }
+        if (out[0] == want) { return 1; }
+        if (out[0] == np.EV_ERROR) { return 0 - 2; }
+    }
+    return 0;
+}
+
+fn test_hello() as void {
+    say("handshake:\n");
+    let is [4]i64 as m;
+    np.send(ctl, np.REQ_HELLO, 0, np.VERSION, 0);
+    let is i64 as r = await_type(np.EV_HELLO, cast(*i64, &m[0]), 3000000000);
+    check(cast(*u8, "netd answers hello"), r, 1);
+    if (r != 1) { return; }
+    check(cast(*u8, "protocol version matches"), m[2], np.VERSION);
+    check(cast(*u8, "reports its interfaces"), m[3] > 0, 1);
+    return;
+}
+
+fn test_ifinfo() as void {
+    say("interface:\n");
+    let is [4]i64 as m;
+    np.send(ctl, np.REQ_IFINFO, 0, 0, 0);
+    let is i64 as r with mut = await_type(np.EV_IFINFO, cast(*i64, &m[0]), 3000000000);
+    check(cast(*u8, "answers ifinfo"), r, 1);
+    if (r != 1) { return; }
+    check(cast(*u8, "has the SLIRP address"), m[2], ip.make_addr(10, 0, 2, 15));
+    check(cast(*u8, "link is up"), m[3] & 1, 1);
+    // Word 12..15 of net_info is the driver name, forwarded as the payload.
+    check(cast(*u8, "names its driver"), cast(i64, buf[0]) != 0, 1);
+
+    // An interface that does not exist is E_NOENT, not silently interface 0.
+    np.send(ctl, np.REQ_IFINFO, 0, 99, 0);
+    r = await_type(np.EV_IFINFO, cast(*i64, &m[0]), 2000000000);
+    check(cast(*u8, "index 99 refused"), r, 0 - 2);
+    return;
+}
+
+fn test_ping() as void {
+    say("ping through netd:\n");
+    let is [4]i64 as m;
+    np.send(ctl, np.REQ_PING, 0, ip.make_addr(10, 0, 2, 2), np.pack_port_len(1, 1));
+    let is i64 as r with mut = await_type(np.EV_PONG, cast(*i64, &m[0]), 4000000000);
+    check(cast(*u8, "gateway answers"), r, 1);
+    if (r != 1) { return; }
+    check(cast(*u8, "round trip is positive"), m[2] > 0, 1);
+    // A virtual link answers in microseconds; anything past a second means
+    // the reply was matched to the wrong request or the clock is wrong.
+    check(cast(*u8, "round trip is plausible"), m[2] < 1000000000, 1);
+    check(cast(*u8, "sequence echoed back"), np.unpack_len(m[3]), 1);
+
+    // An address with nothing behind it must TIME OUT. A ping that reports
+    // success for a dead address is worse than no ping at all.
+    np.send(ctl, np.REQ_PING, 0, ip.make_addr(10, 0, 2, 99), np.pack_port_len(1, 2));
+    r = await_type(np.EV_PONG, cast(*i64, &m[0]), 4000000000);
+    check(cast(*u8, "dead address does not answer"), r, 0 - 2);
+    return;
+}
+
+// A real DNS query for example.com, sent over UDP to the resolver SLIRP runs
+// at 10.0.2.3. It answers, which makes this a genuine round trip through
+// socket, bind, sendto and the receive demux.
+fn build_dns_query(out as *u8, id as i64) as i64 {
+    nb.put_be16(out, 0, id);
+    nb.put_be16(out, 2, 0x0100);        // standard query, recursion desired
+    nb.put_be16(out, 4, 1);             // one question
+    nb.put_be16(out, 6, 0);
+    nb.put_be16(out, 8, 0);
+    nb.put_be16(out, 10, 0);
+    // QNAME: length-prefixed labels, terminated by a zero length.
+    let is i64 as o with mut = 12;
+    out[o] = cast(u8, 7); o = o + 1;
+    out[o] = cast(u8, 101); out[o+1] = cast(u8, 120); out[o+2] = cast(u8, 97);
+    out[o+3] = cast(u8, 109); out[o+4] = cast(u8, 112); out[o+5] = cast(u8, 108);
+    out[o+6] = cast(u8, 101);                                   // "example"
+    o = o + 7;
+    out[o] = cast(u8, 3); o = o + 1;
+    out[o] = cast(u8, 99); out[o+1] = cast(u8, 111); out[o+2] = cast(u8, 109); // "com"
+    o = o + 3;
+    out[o] = cast(u8, 0); o = o + 1;
+    nb.put_be16(out, o, 1); o = o + 2;   // QTYPE A
+    nb.put_be16(out, o, 1); o = o + 2;   // QCLASS IN
+    return o;
+}
+
+fn test_udp() as void {
+    say("udp round trip (real DNS query):\n");
+    let is [4]i64 as m;
+    let is i64 as SOCK = 7;
+
+    np.send(ctl, np.REQ_SOCKET, SOCK, np.SOCK_DGRAM, 0);
+    let is i64 as r with mut = await_type(np.EV_OK, cast(*i64, &m[0]), 2000000000);
+    check(cast(*u8, "socket created"), r, 1);
+    if (r != 1) { return; }
+
+    // A second socket with the same id must be refused: the client believes
+    // it has two, and silently making them one delivers traffic to the wrong.
+    np.send(ctl, np.REQ_SOCKET, SOCK, np.SOCK_DGRAM, 0);
+    r = await_type(np.EV_OK, cast(*i64, &m[0]), 2000000000);
+    check(cast(*u8, "duplicate id refused"), r, 0 - 2);
+
+    np.send(ctl, np.REQ_BIND, SOCK, 0, 0);
+    r = await_type(np.EV_OK, cast(*i64, &m[0]), 2000000000);
+    check(cast(*u8, "bound to a port"), r, 1);
+    if (r != 1) { return; }
+    // An ephemeral port, drawn at random rather than counted up: predictable
+    // source ports are half of what forging a reply needs.
+    check(cast(*u8, "port is ephemeral"), m[2] >= 49152 && m[2] <= 65535, 1);
+
+    let is [64]u8 as q;
+    let is i64 as qid = 0x1234;
+    let is i64 as qlen = build_dns_query(cast(*u8, &q[0]), qid);
+    np.send_data(ctl, np.REQ_SENDTO, SOCK, ip.make_addr(10, 0, 2, 3),
+                 np.pack_port_len(53, qlen), cast(*u8, &q[0]), qlen);
+    r = await_type(np.EV_OK, cast(*i64, &m[0]), 2000000000);
+    check(cast(*u8, "datagram accepted"), r, 1);
+
+    r = await_type(np.EV_RECVFROM, cast(*i64, &m[0]), 5000000000);
+    check(cast(*u8, "resolver answers"), r, 1);
+    if (r != 1) { return; }
+    check(cast(*u8, "from the resolver"), m[2], ip.make_addr(10, 0, 2, 3));
+    check(cast(*u8, "from port 53"), np.unpack_port(m[3]), 53);
+    let is i64 as alen = np.unpack_len(m[3]);
+    check(cast(*u8, "answer is a dns message"), alen >= 12, 1);
+    if (alen < 12) { return; }
+    // The id must come back, which is what proves this is OUR answer and not
+    // a stray datagram that happened to arrive.
+    check(cast(*u8, "query id echoed"), nb.get_be16(cast(*u8, &buf[0]), 0), qid);
+    // QR bit set = it is a response, and the answer count is above zero.
+    check(cast(*u8, "it is a response"),
+          (nb.get_be16(cast(*u8, &buf[0]), 2) >> 15) & 1, 1);
+    check(cast(*u8, "carries an answer"),
+          nb.get_be16(cast(*u8, &buf[0]), 6) > 0, 1);
+
+    np.send(ctl, np.REQ_CLOSE, SOCK, 0, 0);
+    r = await_type(np.EV_OK, cast(*i64, &m[0]), 2000000000);
+    check(cast(*u8, "socket closed"), r, 1);
+    return;
+}
+
+fn main() as i32 {
+    say("netdt: netd over a channel\n");
+
+    let is i64 as ilen with mut = 0;
+    let is i64 as img = fu.slurp("/netd.cse", &ilen);
+    if (ilen <= 0) { say("netdt: /netd.cse not on disk\n"); return cast(i32, 1); }
+
+    // A channel pair: we keep one end, netd gets the other as its fd 3 —
+    // the same handover the compositor uses, and the only way netd can be
+    // reached, since there is no service namespace to look it up in.
+    let is [2]i64 as ch;
+    if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
+        say("netdt: channel_create failed\n");
+        return cast(i32, 1);
+    }
+    ctl = ch[0];
+
+    let is [2]i64 as fda;
+    fda[0] = np.NET_FD; fda[1] = ch[1];
+    let is [2]i64 as av;
+    av[0] = cast(i64, "netd"); av[1] = 4;
+    netd_pid = sys.spawn(cast(*u8, img), ilen, cast(*u8, &fda[0]), 1,
+                         cast(*u8, &av[0]), 1);
+    fu.unslurp(img, ilen);
+    if (netd_pid < 0) { say("netdt: cannot spawn netd\n"); return cast(i32, 1); }
+    sys.close(ch[1]);          // netd owns it now
+
+    test_hello();
+    test_ifinfo();
+    test_ping();
+    test_udp();
+
+    sys.kill(netd_pid);
+    let is [1]i64 as st;
+    sys.wait(netd_pid, cast(*i64, &st[0]));
+
+    say("netdt: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("netdt: ALL PASS\n"); return cast(i32, 0); }
+    say("netdt: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

@@ -32,7 +32,7 @@ PROGS="$PROGS touch mkdir rmdir rm mv cp stat du tree find clear"
 #   ("kill" is Ctrl+C in the terminal — the wterm is the job's parent and holds
 #   the kill authority; CausticOS has no ambient pid namespace for a standalone
 #   kill tool to use.)
-PROGS="$PROGS ps free df top btop htop lscpu ifconfig ping"
+PROGS="$PROGS ps free df top btop htop lscpu ifconfig ping netd"
 #   compiler front-ends (category F): spawn the embedded /caustic.cse. run +
 #   cc + make compile; objdump inspects a .cse. (caustic-as / caustic-ld are
 #   built separately by scripts/build-tools.sh.)
@@ -42,7 +42,7 @@ PROGS="$PROGS run cc make objdump"
 PROGS="$PROGS pager hexedit"
 #   lib self-tests: run in the shell, print PASS/FAIL. Building them here keeps
 #   a library honest even before its first consumer lands.
-PROGS="$PROGS animt kabi u64t nett pingt linkt"
+PROGS="$PROGS animt kabi u64t nett pingt linkt netdt"
 for p in $PROGS; do
     # programs live in subfolders (coreutils/ sysutils/ wm/ ...); find by name.
     src=$(find "$HERE" -name "$p.cst" -not -path '*/build/*' | head -1)
