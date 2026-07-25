@@ -673,6 +673,66 @@ fn smoke_toobig(pi as i64) as void {
     return;
 }
 
+// Transmit backpressure. Both drivers have a NET_TX_BUSY path that had never
+// once executed: the e1000's descriptor reclaim, and vnet's in-flight
+// accounting — which is where the overwrite bug was, the one that let it
+// scribble over a descriptor the device was still reading after qsize sends.
+// A ring is only wrapped by sending more than fits, so nothing short of this
+// reaches that code.
+//
+// Both rings are smaller than this burst (e1000 has 32 descriptors, vnet 16),
+// so every send past the ring size must either wait for a slot or report the
+// ring full and be retried. What must NOT happen is a send that claims success
+// having overwritten something.
+fn smoke_backpressure(pi as i64) as void {
+    let is i64 as ko = net_acquire(ports[pi].hw);
+    if (ko == 0) { smoke_check(cast(*u8, "acquire (backpressure)"), 22, 0, 1); return; }
+    let is i64 as priv = holder_of(ko);
+    let is [6]u8 as mac;
+    let is *NetDevice as dev = cast(*NetDevice, ports[pi].dev);
+    call(dev.mac, dev.priv, cast(*u8, &mac[0]));
+    let is i64 as alen = smoke_build_arp(cast(*u8, &smoke_arp[0]), cast(*u8, &mac[0]));
+
+    let is i64 as before = ports[pi].tx_packets;
+    let is i64 as BURST = 40;
+    let is i64 as i with mut = 0;
+    let is i64 as short_writes with mut = 0;
+    while (i < BURST) {
+        // net_write blocks rather than failing when the ring is full, so a
+        // short or negative return here means something other than fullness
+        // went wrong.
+        if (net_write(priv, cast(i64, &smoke_arp[0]), alen) != alen) {
+            short_writes = short_writes + 1;
+        }
+        i = i + 1;
+    }
+    smoke_check(cast(*u8, "burst past ring size all accepted"), 33, short_writes, 0);
+    smoke_check(cast(*u8, "and all counted"), 15,
+                ports[pi].tx_packets - before, BURST);
+
+    // The port must still work afterwards. A ring left inconsistent by the
+    // wrap would show up here and nowhere earlier.
+    let is i64 as got = net_read(priv, cast(i64, &smoke_rx[0]), 2048);
+    smoke_check(cast(*u8, "port still receives after wrap"), 29,
+                smoke_get_be16(cast(*u8, &smoke_rx[0]), 12), 0x0806);
+    if (got <= 0) { smoke_check(cast(*u8, "read after wrap"), 15, got, 42); }
+
+    // And transmit is genuinely drained rather than merely quiet: free slots
+    // come back once the device has consumed what it was given.
+    if (cast(i64, dev.tx_free) != 0) {
+        let is i64 as deadline = timer.current_time_ns() + 1000000000;
+        let is i64 as free with mut = 0;
+        while (free <= 0 && timer.current_time_ns() < deadline) {
+            free = call(dev.tx_free, dev.priv);
+            if (free <= 0) { sched.sleep_for_ns(2000000); }
+        }
+        smoke_check(cast(*u8, "transmit slots came back"), 24, free > 0, 1);
+    }
+
+    kobject.ko_unref(ko);
+    return;
+}
+
 // Exclusivity: the second holder owns the port, the first goes quiet, and
 // closing the second hands it back. This is architecture.md §6 as a test.
 fn smoke_grab(pi as i64) as void {
@@ -727,6 +787,13 @@ fn smoke_thread() as void {
     }
     smoke_toobig(0);
     smoke_grab(0);
+    // Every port: the two drivers wrap their rings differently and the bug
+    // this catches was in only one of them.
+    let is i64 as b with mut = 0;
+    while (b < port_count) {
+        smoke_backpressure(b);
+        b = b + 1;
+    }
 
     if (smoke_fails == 0) { serial.println("netdev_smoke: PASS", 18); }
     else {

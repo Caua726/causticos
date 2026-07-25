@@ -16,6 +16,7 @@ use "../lib/netbuf/netbuf.cst" as nb;
 use "../lib/neteth/neteth.cst" as eth;
 use "../lib/netarp/netarp.cst" as arp;
 use "../lib/netip/netip.cst" as ip;
+use "../lib/netip/netip_reasm.cst" as reasm;
 
 let is i64 as fails with mut = 0;
 let is i64 as checks with mut = 0;
@@ -479,6 +480,166 @@ fn test_wire() as void {
     return;
 }
 
+// ============================================================
+// Fragment reassembly — including the cases that are attacks
+// ============================================================
+
+let is reasm.Table as rt;
+let is [2048]u8 as frag;
+let is [8192]u8 as asm_out;
+
+// Build one fragment of a datagram: `off` bytes in, `n` bytes of payload,
+// `more` set if others follow. Payload byte at datagram offset k is k&0xFF,
+// so the reassembled result can be checked position by position.
+fn make_frag(id as i64, off as i64, n as i64, more as i64) as i64 {
+    let is i64 as SRC = ip.make_addr(10, 0, 2, 2);
+    let is i64 as DST = ip.make_addr(10, 0, 2, 15);
+    let is *u8 as p = cast(*u8, &frag[0]);
+    nb.fill(p, 0, 20);
+    p[0] = cast(u8, 0x45);
+    nb.put_be16(p, 2, 20 + n);
+    nb.put_be16(p, 4, id);
+    let is i64 as ff with mut = off / 8;
+    if (more != 0) { ff = ff | ip.FLAG_MF; }
+    nb.put_be16(p, 6, ff);
+    p[8] = cast(u8, 64);
+    p[9] = cast(u8, ip.PROTO_UDP);
+    nb.put_be32(p, 12, SRC);
+    nb.put_be32(p, 16, DST);
+    nb.put_be16(p, 10, nb.checksum(p, 20));
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        frag[20 + k] = cast(u8, (off + k) & 0xFF);
+        k = k + 1;
+    }
+    return 20 + n;
+}
+
+fn test_reasm() as void {
+    say("fragment reassembly:\n");
+    let is [1]i64 as olen;
+    let is i64 as now with mut = 1000000000;
+    reasm.init(&rt);
+
+    // Three fragments, in order: 0..799, 800..1599, 1600..1999.
+    make_frag(0x1000, 0, 800, 1);
+    check(cast(*u8, "first fragment: need more"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    make_frag(0x1000, 800, 800, 1);
+    check(cast(*u8, "second: still need more"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    make_frag(0x1000, 1600, 400, 0);
+    check(cast(*u8, "last fragment completes it"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DONE);
+    check(cast(*u8, "reassembled length"), olen[0], 2000);
+
+    // Every byte, not just the first: an off-by-one in the hole arithmetic
+    // shows up as one wrong byte in the middle and nowhere else.
+    let is i64 as bad with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 2000) {
+        if (cast(i64, asm_out[i]) != (i & 0xFF)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    check(cast(*u8, "every byte in place"), bad, 0);
+    check(cast(*u8, "slot released"), reasm.pending(&rt), 0);
+
+    // Out of order, which is the normal case on a real path — fragments take
+    // different routes and arrive however they arrive.
+    reasm.init(&rt);
+    make_frag(0x2000, 1600, 400, 0);        // last first
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x2000, 800, 800, 1);         // middle
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x2000, 0, 800, 1);           // first last
+    check(cast(*u8, "out of order completes"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DONE);
+    check(cast(*u8, "out of order length"), olen[0], 2000);
+
+    // A duplicate that AGREES is ordinary — retransmission — and must be
+    // absorbed silently rather than treated as an attack.
+    reasm.init(&rt);
+    make_frag(0x3000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x3000, 0, 800, 1);
+    check(cast(*u8, "identical duplicate accepted"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    make_frag(0x3000, 800, 200, 0);
+    check(cast(*u8, "and it still completes"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DONE);
+
+    // An overlap that DISAGREES is the teardrop family: two versions of the
+    // same bytes, betting the target picks differently from whoever is
+    // inspecting. Refusing is the only answer that cannot be played.
+    reasm.init(&rt);
+    make_frag(0x4000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x4000, 0, 800, 1);
+    frag[20 + 100] = cast(u8, 0xFF);         // one byte contradicts
+    check(cast(*u8, "contradictory overlap refused"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DROP);
+    check(cast(*u8, "and the whole datagram dropped"), reasm.pending(&rt), 0);
+    check(cast(*u8, "counted as an overlap"), rt.overlaps, 1);
+
+    // A non-final fragment must be a multiple of 8: the offset field counts
+    // 8-byte units and cannot express anything else, so such a datagram is
+    // unreassemblable by anyone.
+    reasm.init(&rt);
+    make_frag(0x5000, 0, 803, 1);
+    check(cast(*u8, "misaligned fragment refused"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DROP);
+
+    // An incomplete datagram must not pin memory forever.
+    reasm.init(&rt);
+    make_frag(0x6000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    check(cast(*u8, "slot held while waiting"), reasm.pending(&rt), 1);
+    now = now + reasm.TIMEOUT_NS + 1;
+    make_frag(0x7000, 0, 8, 0);              // any arrival drives expiry
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    check(cast(*u8, "abandoned slot expired"), rt.timeouts, 1);
+
+    // Two senders may pick the same id. Keying on id alone would splice their
+    // bytes into one datagram that is corrupt and checksums correctly.
+    reasm.init(&rt);
+    now = 1000000000;
+    make_frag(0x8000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x8000, 800, 200, 0);
+    nb.put_be32(cast(*u8, &frag[0]), 12, ip.make_addr(10, 0, 2, 99));   // other sender
+    nb.put_be16(cast(*u8, &frag[0]), 10, 0);
+    nb.put_be16(cast(*u8, &frag[0]), 10, nb.checksum(cast(*u8, &frag[0]), 20));
+    check(cast(*u8, "same id, other sender is separate"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    check(cast(*u8, "two reassemblies in flight"), reasm.pending(&rt), 2);
+
+    // A datagram claiming more than the buffer holds is refused rather than
+    // half-collected.
+    reasm.init(&rt);
+    make_frag(0x9000, 8184, 800, 0);
+    check(cast(*u8, "oversized datagram refused"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DROP);
+    check(cast(*u8, "counted as too long"), rt.toolong, 1);
+    return;
+}
+
 fn main() as i32 {
     say("nett: network libraries, no network required\n");
     setup_macs();
@@ -488,6 +649,7 @@ fn main() as i32 {
     test_arp();
     test_ip();
     test_icmp();
+    test_reasm();
     test_wire();
     say("nett: "); say_num(checks); say(" checks\n");
     if (fails == 0) { say("nett: ALL PASS\n"); return cast(i32, 0); }

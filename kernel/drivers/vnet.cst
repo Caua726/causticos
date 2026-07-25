@@ -3,9 +3,9 @@
 // on a one-queue input device, this proves it on a two-queue DMA device:
 // a receiveq the device fills with incoming frames and a transmitq the
 // driver fills with outgoing ones, each frame prefixed by a 12-byte
-// virtio_net_hdr. Same NetworkController interface the e1000 implements, so
-// it is a drop-in alternative NIC — the framework wires whichever device the
-// hardware presents.
+// virtio_net_hdr. Same netdev.NetDevice vtable the e1000 fills, so it is a
+// drop-in alternative NIC — the framework wires whichever devices the machine
+// presents, and up to four of them.
 //
 // Modern-only (VERSION_1 negotiated in virtio.cst). We do NOT negotiate
 // MRG_RXBUF or CSUM/GSO offloads, so the header is the plain 12-byte form
@@ -37,21 +37,40 @@ let is i64 as NQ = 16;                 // ring slots we drive per queue (<= devi
 // device config offsets (struct virtio_net_config): mac[6] then status le16
 let is i64 as CFG_MAC = 0;
 
-let is virtio.VirtioDev as vdev;
-let is virtio.VirtQueue as rxq;
-let is virtio.VirtQueue as txq;
-let is i64 as vnet_present with mut = 0;
-let is [6]u8 as vnet_mac with mut;
+// Up to four adapters. Same reasoning as e1000: a static array, no free path,
+// and two of the same device stops being a case the driver refuses. It used to
+// be one set of globals plus a `vnet_present` flag, and vnet_bind turned the
+// second card away.
+let is i64 as MAX_NICS = 4;
 
-let is lock.TicketLock as tx_lock;
-// Transmit descriptors handed to the device and not yet reclaimed. This is
-// the accounting that keeps nd_send from overwriting a slot the device is
-// still reading; without it the ring silently wraps after qsize frames.
-let is i64 as tx_inflight with mut = 0;
-// Index handed back by netdev.register.
-let is i64 as port_index with mut = 0 - 1;
-let is netdev.NetDevice as nd;
+struct VnetCtx {
+    present     as i64;
+    tx_inflight as i64;      // posted to the device, not yet reclaimed
+    port_index  as i64;      // handed back by netdev.register
+    vdev as virtio.VirtioDev;
+    rxq  as virtio.VirtQueue;
+    txq  as virtio.VirtQueue;
+    lk   as lock.TicketLock;
+    mac  as [8]u8;           // 6 used
+}
 
+let is [4]VnetCtx as ctxs with mut;
+let is [4]netdev.NetDevice as nds with mut;
+let is i64 as nctx with mut = 0;
+
+fn ctx_at(i as i64) as *VnetCtx {
+    if (i == 0) { return &ctxs[0]; }
+    if (i == 1) { return &ctxs[1]; }
+    if (i == 2) { return &ctxs[2]; }
+    return &ctxs[3];
+}
+
+fn nd_at(i as i64) as *netdev.NetDevice {
+    if (i == 0) { return &nds[0]; }
+    if (i == 1) { return &nds[1]; }
+    if (i == 2) { return &nds[2]; }
+    return &nds[3];
+}
 let is ksym.KSym as ksym_bind;
 let is ksym.KSym as ksym_irq;
 
@@ -67,17 +86,18 @@ let is ksym.KSym as ksym_irq;
 // the device has finished, and report a full ring honestly instead of
 // scribbling over it.
 fn nd_send(priv as *u8, frame as *u8, len as i64) as i64 {
-    if (vnet_present == 0) { return 0 - 2; }
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    if (c.present == 0) { return 0 - 2; }
     if (len < 14) { return 0 - 3; }
     if (len + HDR > SLOT_SZ) { return 0 - 3; }
-    let is i64 as fl = lock.acquire_irq(&tx_lock);
-    tx_reclaim_locked();
-    if (tx_inflight >= txq.qsize) {
-        lock.release_irq(&tx_lock, fl);
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    tx_reclaim_locked(c);
+    if (c.tx_inflight >= c.txq.qsize) {
+        lock.release_irq(&c.lk, fl);
         return netdev.NET_TX_BUSY;
     }
-    let is i64 as slot = txq.avail_shadow - (txq.avail_shadow / txq.qsize) * txq.qsize;
-    let is i64 as base = txq.buf_va + slot * SLOT_SZ;
+    let is i64 as slot = c.txq.avail_shadow - (c.txq.avail_shadow / c.txq.qsize) * c.txq.qsize;
+    let is i64 as base = c.txq.buf_va + slot * SLOT_SZ;
     let is i64 as z with mut = 0;
     while (z < HDR) { let is *u8 as h = cast(*u8, base + z); h[0] = cast(u8, 0); z = z + 1; }
     let is i64 as i with mut = 0;
@@ -87,37 +107,38 @@ fn nd_send(priv as *u8, frame as *u8, len as i64) as i64 {
         i = i + 1;
     }
     // Describe a DEVICE-READABLE buffer (no WRITE flag) of hdr+len bytes.
-    let is i64 as desc = txq.desc + slot * 16;
-    virtio.wr64(desc, txq.buf_phys + slot * SLOT_SZ);
+    let is i64 as desc = c.txq.desc + slot * 16;
+    virtio.wr64(desc, c.txq.buf_phys + slot * SLOT_SZ);
     virtio.wr32(desc + 8, HDR + len);
     virtio.wr16(desc + 12, 0);              // flags 0 = device reads
     virtio.wr16(desc + 14, 0);
-    let is i64 as ring_slot = txq.avail_shadow - (txq.avail_shadow / txq.qsize) * txq.qsize;
-    virtio.wr16(txq.avail + 4 + ring_slot * 2, slot);
-    txq.avail_shadow = txq.avail_shadow + 1;
-    tx_inflight = tx_inflight + 1;
-    virtio.vio_publish(&vdev, &txq, 1);
-    lock.release_irq(&tx_lock, fl);
+    let is i64 as ring_slot = c.txq.avail_shadow - (c.txq.avail_shadow / c.txq.qsize) * c.txq.qsize;
+    virtio.wr16(c.txq.avail + 4 + ring_slot * 2, slot);
+    c.txq.avail_shadow = c.txq.avail_shadow + 1;
+    c.tx_inflight = c.tx_inflight + 1;
+    virtio.vio_publish(&c.vdev, &c.txq, 1);
+    lock.release_irq(&c.lk, fl);
     return len;
 }
 
 // Take back every transmit descriptor the device has finished with. Caller
-// holds tx_lock.
-fn tx_reclaim_locked() as void {
+// holds the adapter's lock.
+fn tx_reclaim_locked(c as *VnetCtx) as void {
     let is i64 as r with mut = 0;
     while (r >= 0) {
-        r = virtio.vio_next_used(&txq);
-        if (r >= 0 && tx_inflight > 0) { tx_inflight = tx_inflight - 1; }
+        r = virtio.vio_next_used(&c.txq);
+        if (r >= 0 && c.tx_inflight > 0) { c.tx_inflight = c.tx_inflight - 1; }
     }
     return;
 }
 
 fn nd_tx_free(priv as *u8) as i64 {
-    if (vnet_present == 0) { return 0; }
-    let is i64 as fl = lock.acquire_irq(&tx_lock);
-    tx_reclaim_locked();
-    let is i64 as free with mut = txq.qsize - tx_inflight;
-    lock.release_irq(&tx_lock, fl);
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    if (c.present == 0) { return 0; }
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    tx_reclaim_locked(c);
+    let is i64 as free with mut = c.txq.qsize - c.tx_inflight;
+    lock.release_irq(&c.lk, fl);
     if (free < 0) { free = 0; }
     return free;
 }
@@ -126,33 +147,35 @@ fn nd_tx_free(priv as *u8) as i64 {
 // port lock across this call; the rx queue itself is only ever touched from
 // here, so no second lock is taken.
 fn nd_poll_rx(priv as *u8, budget as i64) as i64 {
-    if (vnet_present == 0) { return 0; }
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    if (c.present == 0) { return 0; }
     let is i64 as taken with mut = 0;
     let is i64 as refilled with mut = 0;
     while (taken < budget) {
-        let is i64 as id = virtio.vio_next_used(&rxq);
+        let is i64 as id = virtio.vio_next_used(&c.rxq);
         if (id < 0) {
-            if (refilled > 0) { virtio.vio_publish(&vdev, &rxq, 0); }
+            if (refilled > 0) { virtio.vio_publish(&c.vdev, &c.rxq, 0); }
             return taken;
         }
         // The device wrote a 12-byte virtio_net_hdr and then the frame;
         // used_len covers both, so the frame is what is left.
-        let is i64 as flen with mut = rxq.last_used_len - HDR;
+        let is i64 as flen with mut = c.rxq.last_used_len - HDR;
         if (flen < 0) { flen = 0; }
         if (flen > 0) {
-            netdev.rx_push(port_index, rxq.buf_va + id * SLOT_SZ + HDR, flen);
+            netdev.rx_push(c.port_index, c.rxq.buf_va + id * SLOT_SZ + HDR, flen);
         }
-        virtio.vio_repost(&rxq, id);
+        virtio.vio_repost(&c.rxq, id);
         refilled = refilled + 1;
         taken = taken + 1;
     }
-    if (refilled > 0) { virtio.vio_publish(&vdev, &rxq, 0); }
+    if (refilled > 0) { virtio.vio_publish(&c.vdev, &c.rxq, 0); }
     return taken;
 }
 
 fn nd_mac(priv as *u8, out6 as *u8) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
     let is i64 as i with mut = 0;
-    while (i < 6) { out6[i] = vnet_mac[i]; i = i + 1; }
+    while (i < 6) { out6[i] = c.mac[i]; i = i + 1; }
     return 0;
 }
 
@@ -161,7 +184,8 @@ fn nd_mac(priv as *u8, out6 as *u8) as i64 {
 // do not negotiate it — reporting a fact we did not ask for would be a
 // guess dressed as a reading.
 fn nd_link_up(priv as *u8) as i64 {
-    return vnet_present;
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    return c.present;
 }
 
 fn nd_mtu(priv as *u8) as i64 {
@@ -170,58 +194,70 @@ fn nd_mtu(priv as *u8) as i64 {
 
 // IRQ handler: read-clear the ISR, then drain a bounded batch into the port
 // ring and wake any reader.
+//
+// The framework hands this the *Binding as context, and the binding carries
+// our per-adapter state. With a global it would have read card 0's ISR while
+// card 1 kept its INTx line asserted — and on a shared line that is a wedge,
+// not a slowdown.
 fn vnet_irq(hw as *driver.Hardware, ctx as *u8) as i32 {
-    if (vnet_present == 0) { return 0; }
-    let is i64 as isr = virtio.vio_isr_read(&vdev);
+    let is *spec.Binding as b = cast(*spec.Binding, ctx);
+    if (cast(i64, b) == 0) { return 0; }
+    let is *VnetCtx as c = cast(*VnetCtx, b.private);
+    if (cast(i64, c) == 0) { return 0; }
+    if (c.present == 0) { return 0; }
+    let is i64 as isr = virtio.vio_isr_read(&c.vdev);
     if ((isr & 1) == 0) { return 0; }          // not ours (shared INTx)
-    netdev.irq_drain(port_index);
+    netdev.irq_drain(c.port_index);
     return 0;
 }
 
 // ---- bind ----
 fn vnet_bind(b as *spec.Binding) as i32 {
-    if (vnet_present != 0) {
-        serial.println("vnet: skipping 2nd nic", 22);
+    if (nctx >= MAX_NICS) {
+        serial.println("vnet: no free instance slot", 27);
         return cast(i32, 0 - 99);
     }
+    let is *VnetCtx as c = ctx_at(nctx);
+    let is *netdev.NetDevice as nd = nd_at(nctx);
+    b.private = cast(*u8, c);
     let is i64 as hw = cast(i64, b.hardware);
-    if (virtio.vio_setup(hw, &vdev) != 0) {
+    if (virtio.vio_setup(hw, &c.vdev) != 0) {
         serial.println("vnet: no modern virtio caps", 27);
         return 1;
     }
-    if (virtio.vio_negotiate(&vdev) != 0) {
+    if (virtio.vio_negotiate(&c.vdev) != 0) {
         serial.println("vnet: feature negotiation FAIL", 30);
         return 1;
     }
     // rx = queue 0, tx = queue 1
-    if (virtio.vio_queue_setup(&vdev, 0, NQ, SLOT_SZ, &rxq) != 0) {
+    if (virtio.vio_queue_setup(&c.vdev, 0, NQ, SLOT_SZ, &c.rxq) != 0) {
         serial.println("vnet: rxq setup FAIL", 20);
         return 1;
     }
-    if (virtio.vio_queue_setup(&vdev, 1, NQ, SLOT_SZ, &txq) != 0) {
+    if (virtio.vio_queue_setup(&c.vdev, 1, NQ, SLOT_SZ, &c.txq) != 0) {
         serial.println("vnet: txq setup FAIL", 20);
         return 1;
     }
     // hand every rx buffer to the device (device-WRITABLE)
     let is i64 as i with mut = 0;
-    while (i < rxq.qsize) {
-        virtio.vio_post(&rxq, i, SLOT_SZ);
+    while (i < c.rxq.qsize) {
+        virtio.vio_post(&c.rxq, i, SLOT_SZ);
         i = i + 1;
     }
     // read the MAC from device config
-    if (vdev.devcfg != 0) {
+    if (c.vdev.devcfg != 0) {
         let is i64 as m with mut = 0;
         while (m < 6) {
-            vnet_mac[m] = cast(u8, virtio.rd8(vdev.devcfg + CFG_MAC + m) & 0xFF);
+            c.mac[m] = cast(u8, virtio.rd8(c.vdev.devcfg + CFG_MAC + m) & 0xFF);
             m = m + 1;
         }
     }
-    tx_inflight = 0;
-    virtio.vio_driver_ok(&vdev);
-    virtio.vio_publish(&vdev, &rxq, 0);
-    vnet_present = 1;
+    c.tx_inflight = 0;
+    c.present = 1;
+    virtio.vio_driver_ok(&c.vdev);
+    virtio.vio_publish(&c.vdev, &c.rxq, 0);
     serial.print("vnet: virtio-net up mac=", 24);
-    print_mac();
+    print_mac(c);
     serial.println("", 0);
 
     nd.name[0] = cast(u8, 118); nd.name[1] = cast(u8, 110);     // "vnet"
@@ -234,22 +270,23 @@ fn vnet_bind(b as *spec.Binding) as i32 {
     nd.link_up     = fn_ptr(nd_link_up);
     nd.mtu         = fn_ptr(nd_mtu);
     nd.set_promisc = cast(fn(*u8, i64) as i64, 0);
-    nd.priv        = cast(*u8, 0);
+    nd.priv        = cast(*u8, c);
     nd.next        = cast(*netdev.NetDevice, 0);
-    let is i64 as pi = netdev.register(&nd, hw);
+    let is i64 as pi = netdev.register(nd, hw);
     if (pi < 0) {
         serial.println("vnet: netdev.register failed", 28);
         return cast(i32, 0 - 5);
     }
-    port_index = pi;
+    c.port_index = pi;
+    nctx = nctx + 1;
     return 0;
 }
 
-fn print_mac() as void {
+fn print_mac(c as *VnetCtx) as void {
     let is i64 as i with mut = 0;
     while (i < 6) {
         if (i > 0) { serial.putc(58); }
-        util.print_hex(cast(i64, vnet_mac[i]));
+        util.print_hex(cast(i64, c.mac[i]));
         i = i + 1;
     }
     return;
