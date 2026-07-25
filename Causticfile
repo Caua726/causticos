@@ -2,26 +2,129 @@ name "causticos"
 version "0.0.2"
 author "Caua"
 
+// causticos — build, boot and test surface.
+//
+//   caustic-mk run doctor          check that everything a build needs is here
+//   caustic-mk run build           kernel + userspace + live ISO
+//   caustic-mk run run             boot it (no disk: the root is in the ISO)
+//   caustic-mk run verify          the regression sweep
+//   caustic-mk run profiles        what each profile would ship
+//
+// Anything past `--` reaches the script as its own arguments:
+//   caustic-mk run run -- --headless --smp 4
+//   caustic-mk run build -- --profile shell
+//
+// The userspace lives in its own Causticfile (userspace/Causticfile, 75
+// targets); this one owns the kernel and everything around it.
+
+// The default userspace profile — which programs a root image carries. Override
+// per invocation with `-- --profile shell`, or in the environment.
+env_default "COS_PROFILE" "desktop"
+env_default "LIMINE_DIR" "/usr/share/limine"
+
+// ── Targets ──────────────────────────────────────────────────────────
+
+// The kernel is a staged build: the Caustic source compiles to one object, the
+// three hand-written .s sources assemble to three more, and caustic-ld links all
+// four. The compiler's one-shot mode links exactly one object and rejects
+// linker-only flags, so `asm` + `ldflags` are what make this expressible at all.
+//
+// Objects reach the linker in declaration order, main source first — the order
+// below is the order the kernel has always been linked in.
+//
+// --strip is load-bearing, not cosmetic: Limine inspects section headers when
+// they are present and the resulting load behaviour diverges from
+// program-header-only mode. Non-stripped kernels page-fault inside sched.init.
+// The bug is in Limine's handling of an embedded symtab/strtab rather than in
+// caustic-ld's section layout, so kernels stay stripped by policy.
+//
+// cdvrspec_data.s .incbin's the driver .cdvrspec text blobs. The staged pipeline
+// re-assembles every `asm` on every build, so editing a driver's spec always
+// reaches the kernel — a stale .s.o can never silently run the old specs.
 target "kernel" {
     src "kernel/main.cst"
     out "build/kernel.elf"
-    flags "--freestanding --entry=_kernel_start --base=0xFFFFFFFF80000000"
+    flags "--path kernel --path kernel/arch --path kernel/time --path kernel/mm --path kernel/task --path kernel/drivers --path kernel/fs --path kernel/ipc --path kernel/sys --path kernel/lib --path kernel/test --path font"
+    asm "kernel/cdvrspec_data.s"
+    asm "kernel/smp_asm.s"
+    asm "kernel/syscall_entry.s"
+    ldflags "--strip --freestanding --entry=_kernel_start --base=0xFFFFFFFF80000000"
 }
 
+// The standalone assembler and linker, cross-built for CausticOS so the `dev`
+// profile can ship the whole toolchain. The CANONICAL binaries come out of the
+// on-device bootstrap; these are the development shortcut.
+target "caustic-as-cse" {
+    src "${CAUSTIC_DIR}/caustic-assembler/main.cst"
+    out "build/caustic-as.cse"
+    flags "--target=caustic-x86_64"
+}
+
+target "caustic-ld-cse" {
+    src "${CAUSTIC_DIR}/caustic-linker/main.cst"
+    out "build/caustic-ld.cse"
+    flags "--target=caustic-x86_64"
+}
+
+// ── Scripts ──────────────────────────────────────────────────────────
+
+script "doctor" {
+    "bash scripts/doctor.sh"
+}
+
+// Everything, in dependency order. The userspace is its own project, so it gets
+// its own caustic-mk invocation rather than being duplicated here.
+script "build" {
+    "caustic-mk build kernel"
+    "cd userspace && caustic-mk build all"
+    "bash scripts/mkiso.sh $@"
+}
+
+// Just the ISO, assuming the kernel and userspace are already built. This is the
+// loop for changing what SHIPS rather than what the code does — a profile edit
+// repacks in well under a second and recompiles nothing.
 script "iso" {
-    "mkdir -p build/iso/boot/limine build/iso/EFI/BOOT"
-    "cp build/kernel.elf build/iso/boot/"
-    "cp limine.conf build/iso/boot/limine/"
-    "cp /usr/share/limine/limine-bios.sys build/iso/boot/limine/"
-    "cp /usr/share/limine/limine-bios-cd.bin build/iso/boot/limine/"
-    "cp /usr/share/limine/limine-uefi-cd.bin build/iso/boot/limine/"
-    "cp /usr/share/limine/BOOTX64.EFI build/iso/EFI/BOOT/"
-    "xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image --protective-msdos-label build/iso -o build/causticos.iso"
-    "limine bios-install build/causticos.iso"
+    "bash scripts/mkiso.sh $@"
 }
 
 script "run" {
-    "qemu-system-x86_64 -cdrom build/causticos.iso -m 128M -serial file:build/serial.log"
-    "echo '==> Serial output:'"
-    "cat build/serial.log"
+    "bash scripts/qemu.sh $@"
+}
+
+script "verify" {
+    "bash scripts/verify.sh $@"
+}
+
+// What a profile actually resolves to. "What is on the ISO" should be one
+// command, not an archaeology exercise across a pile of shell scripts.
+script "profiles" {
+    "python3 scripts/mkroot.py --profile ${COS_PROFILE} --list $@"
+}
+
+// Just the root volume, as a raw image and a container — handy when the question
+// is about the image itself rather than about booting it.
+script "root" {
+    "python3 scripts/mkroot.py --profile ${COS_PROFILE} --img build/rootfs.img --csvi build/rootfs.csvi $@"
+}
+
+script "clean" {
+    "rm -rf build/iso build/*.img build/*.csvi build/kernel.elf build/causticos.iso"
+    "rm -rf userspace/build .caustic userspace/.caustic"
+    "echo 'clean: build artifacts removed (sources and the self-hosted caustic.cse kept)'"
+}
+
+// Deep clean: also the generated assembly and objects that no build regenerates
+// and nothing ever removed. The discriminator is exact — compiler output always
+// ends in .cst.s, so the four hand-written .s sources the kernel needs are never
+// touched.
+script "distclean" {
+    "caustic-mk run clean"
+    "find . -name '*.cst.s' -delete"
+    "find . -name '*.s.o' -delete"
+    "rm -rf scripts/__pycache__"
+    "echo 'distclean: generated assembly and objects removed too'"
+}
+
+script "usb" {
+    "bash scripts/usb.sh $@"
 }
