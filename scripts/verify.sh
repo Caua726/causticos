@@ -1,9 +1,18 @@
 #!/bin/bash
 set +e
-cd /home/caua/Documentos/Projetos-Pessoais/causticos
+# Relative to THIS script, never an absolute path: verify.sh is run from git
+# worktrees, and a hardcoded path silently validated the main checkout instead
+# of the tree you were editing.
+cd "$(cd "$(dirname "$0")/.." && pwd)"
 SMP="${1:-4}"
 RUNS="${2:-20}"
 TOUT="${3:-8}"
+
+# KVM makes a 20-run sweep take seconds instead of minutes; it has been usable
+# since the SYSRET/SS-RPL fix (iretq under KVM #GP'd when SS came back RPL 0).
+QEMU_KVM=1
+QEMU_SMP="$SMP"
+source scripts/qemu-args.sh
 
 if [ ! -f /tmp/disk.pristine.img ] || [ build/causticos.iso -nt /tmp/disk.pristine.img ]; then
   qemu-img create -f raw /tmp/disk.pristine.img 64M >/dev/null 2>&1
@@ -28,11 +37,8 @@ for i in $(seq 1 "$RUNS"); do
   # kept build/disk.img locked and made the *next* run fail to boot (a
   # spurious "no-phase6 (timeout?)"). We enforce the hard deadline here.
   qemu-system-x86_64 \
-    -cdrom build/causticos.iso -m 128M -machine q35 -enable-kvm -cpu host \
-    -drive id=disk,file=build/disk.img,if=none,format=raw \
-    -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
-    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 -device virtio-tablet-pci -netdev user,id=net1 -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off \
-    -boot d -serial stdio -display none -no-reboot -smp "$SMP" \
+    "${QEMU_ARGS[@]}" \
+    -serial stdio -display none \
     > "$TMPLOG" 2>&1 &
   QPID=$!
   # Poll the serial for a terminal marker, with a hard deadline of TOUT

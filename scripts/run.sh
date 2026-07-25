@@ -74,22 +74,20 @@ if [ "${RESEED_DISK:-1}" = "1" ]; then
     python3 scripts/fat32_add_file.py build/disk.img addfilebin init.cse build/init.cse >/dev/null
 fi
 
+# NOBOOT=1 stops after producing build/causticos.iso — what verify.sh consumes,
+# and what you want when the next step is a 20-run sweep rather than one boot.
+if [ "${NOBOOT:-0}" = "1" ]; then
+    echo "==> Built build/causticos.iso (NOBOOT=1, not booting)"
+    exit 0
+fi
+
 echo "==> Booting in QEMU..."
-# -boot d forces the CD first — the 64MB FAT32 image has a valid MBR
-# and BIOS would otherwise try to boot from it before the CD.
+# The machine itself (disks, NICs, pointer) is defined once in qemu-args.sh.
+# PCAP=<file> on the command line dumps net0 traffic for Wireshark.
+QEMU_PCAP="${PCAP:-}"
+source scripts/qemu-args.sh
 qemu-system-x86_64 \
-    -cdrom build/causticos.iso \
-    -m 128M \
-    -machine q35 \
-    -drive id=disk,file=build/disk.img,if=none,format=raw \
-    -device ahci,id=ahci \
-    -device ide-hd,drive=disk,bus=ahci.0 \
-    -netdev user,id=net0 \
-    -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-    -device virtio-tablet-pci \
-    -netdev user,id=net1 -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off \
-    -boot d \
+    "${QEMU_ARGS[@]}" \
     -serial stdio \
     -display none \
-    -no-reboot \
     "$@"
