@@ -12,6 +12,7 @@
 
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/netudp/netudp.cst" as udp;
+use "../lib/nettcp/tcp_conn.cst" as tc;
 
 let is i64 as MAX_SOCK = 32;
 
@@ -19,6 +20,7 @@ let is i64 as ST_FREE   = 0;
 let is i64 as ST_OPEN   = 1;   // created, no address yet
 let is i64 as ST_BOUND  = 2;   // has a local port
 let is i64 as ST_CONN   = 3;   // has a peer too
+let is i64 as ST_LISTEN = 4;   // a stream socket accepting connections
 
 struct Sock {
     state     as i64;
@@ -30,9 +32,48 @@ struct Sock {
     peer_ip   as i64;
     peer_port as i64;
     rx_drops  as i64;      // datagrams dropped because the client was behind
+    // For a stream socket, which connection in the pool is behind it. -1 for
+    // a datagram socket. The pool is separate from the socket table because a
+    // Conn is large and most sockets are not streams — one array of the
+    // expensive thing, indexed by the ones that need it.
+    conn      as i64;
+    // A listening socket hands its accepted connections to the client as new
+    // sockets; this is where one waits until the client asks for it.
+    pending   as i64;      // conn index of an accepted connection, -1 if none
+    backlog   as i64;
 }
 
 let is [32]Sock as socks with mut;
+
+// The stream pool. Four, because a Conn carries its own send and receive
+// buffers and this is a machine with 128 MiB — a pool sized to the socket
+// table would be several megabytes of mostly-idle memory.
+let is i64 as MAX_CONN = 4;
+let is [4]tc.Conn as conns with mut;
+let is [4]i64 as conn_used with mut;
+
+fn conn_at(i as i64) as *tc.Conn {
+    return &conns[i];
+}
+
+fn conn_alloc() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CONN) {
+        if (conn_used[i] == 0) {
+            conn_used[i] = 1;
+            tc.conn_init(conn_at(i));
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn conn_free(i as i64) as void {
+    if (i < 0 || i >= MAX_CONN) { return; }
+    conn_used[i] = 0;
+    return;
+}
 
 // &array[i] with a variable index, the way netdev.cst indexes its ports.
 // Deliberately NOT hand-computed pointer arithmetic over a struct size: that
@@ -51,8 +92,13 @@ fn init() as void {
         s.local_ip = 0; s.local_port = 0;
         s.peer_ip = 0; s.peer_port = 0;
         s.rx_drops = 0;
+        s.conn = 0 - 1;
+        s.pending = 0 - 1;
+        s.backlog = 0;
         i = i + 1;
     }
+    i = 0;
+    while (i < MAX_CONN) { conn_used[i] = 0; i = i + 1; }
     return;
 }
 
@@ -83,6 +129,9 @@ fn create(client as i64, id as i64, proto as i64) as *Sock {
             s.local_ip = 0; s.local_port = 0;
             s.peer_ip = 0; s.peer_port = 0;
             s.rx_drops = 0;
+            s.conn = 0 - 1;
+            s.pending = 0 - 1;
+            s.backlog = 0;
             return s;
         }
         i = i + 1;
@@ -126,10 +175,37 @@ fn bind(s as *Sock, addr as i64, port as i64) as i64 {
 }
 
 fn close(s as *Sock) as void {
+    // The connection goes back to the pool with the socket. A stream socket
+    // that is closed while its Conn stays allocated leaks the expensive half
+    // of the pair, and the pool is four deep.
+    if (s.conn >= 0) { conn_free(s.conn); s.conn = 0 - 1; }
+    if (s.pending >= 0) { conn_free(s.pending); s.pending = 0 - 1; }
     s.state = ST_FREE;
     s.client = 0;
     s.id = 0;
     return;
+}
+
+// Which stream socket owns a given connection.
+fn find_by_conn(ci as i64) as *Sock {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state != ST_FREE && s.conn == ci) { return s; }
+        i = i + 1;
+    }
+    return cast(*Sock, 0);
+}
+
+// The listening socket for a port, if any.
+fn find_listener(port as i64) as *Sock {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        let is *Sock as s = at(i);
+        if (s.state == ST_LISTEN && s.local_port == port) { return s; }
+        i = i + 1;
+    }
+    return cast(*Sock, 0);
 }
 
 // Drop every socket a client owned. Called when its channel closes: a
