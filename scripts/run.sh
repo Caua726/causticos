@@ -20,6 +20,7 @@ caustic-as kernel/main.cst.s
 caustic-as kernel/cdvrspec_data.s
 caustic-as kernel/smp_asm.s
 caustic-as kernel/syscall_entry.s
+caustic-as kernel/random_asm.s
 
 echo "==> Linking (freestanding, higher-half)..."
 mkdir -p build
@@ -33,7 +34,7 @@ mkdir -p build
 caustic-ld --strip --freestanding --entry=_kernel_start \
     --base=0xFFFFFFFF80000000 \
     kernel/main.cst.s.o kernel/cdvrspec_data.s.o kernel/smp_asm.s.o \
-    kernel/syscall_entry.s.o \
+    kernel/syscall_entry.s.o kernel/random_asm.s.o \
     -o build/kernel.elf
 
 echo "==> Creating ISO..."

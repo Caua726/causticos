@@ -1,0 +1,265 @@
+// random.cst — unpredictable bytes, as a kernel mechanism.
+//
+// Three things about to be built need numbers an observer cannot guess, and
+// each fails quietly rather than loudly when they are guessable:
+//
+//   - TCP initial sequence numbers (RFC 6528). A predictable ISN lets an
+//     off-path attacker inject into a connection. Nothing breaks; data is
+//     just occasionally not what was sent.
+//   - DNS query IDs and source ports. Predictable ones are cache poisoning,
+//     and the symptom is a wrong answer that looks like a right one.
+//   - TLS client randoms and ephemeral keys, later. Predictable ones mean
+//     the session was never private, and it still completes normally.
+//
+// So this is a kernel service, not something each program invents. The kernel
+// is where the hardware TRNG is, where interrupt timing is, and where the
+// answer can be the same quality for everyone.
+//
+// WHAT THIS IS AND IS NOT
+//
+// When the CPU has RDSEED or RDRAND, that is the source, used directly.
+// RDSEED reads the raw entropy source behind Intel's on-die generator;
+// RDRAND is the NIST SP 800-90A DRBG fed by it. Both are hardware, both are
+// suitable for keys, and neither needs a software DRBG in front to be sound.
+//
+// When it has neither — pre-2012 silicon, and some hypervisors — the fallback
+// is a pool stirred from interrupt timing, which IS a real entropy source but
+// a weak and slow one. Rather than fail the boot (leaving an old machine with
+// no networking at all) or pretend (returning jitter as if it were a TRNG),
+// the quality is REPORTED. TCP and DNS are content with the pool; TLS will
+// check quality() and refuse. The caller decides, having been told the truth.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "lock.cst" as lock;
+use "abi.cst" as abi;
+
+// Declared in kernel/random_asm.s.
+fn random_cpuid_into(leaf as i64, subleaf as i64, out as *i64) as void {
+    asm("call random_cpuid_into\n");
+}
+fn random_rdseed_into(out as *i64, ok as *i64) as void {
+    asm("call random_rdseed_into\n");
+}
+fn random_rdrand_into(out as *i64, ok as *i64) as void {
+    asm("call random_rdrand_into\n");
+}
+fn random_rdtsc_into(out as *i64) as void {
+    asm("call random_rdtsc_into\n");
+}
+
+let is i64 as QUALITY_NONE   = 0;   // not initialised
+let is i64 as QUALITY_JITTER = 1;   // interrupt-timing pool; fine for ISNs, not for keys
+let is i64 as QUALITY_HW     = 2;   // on-die TRNG
+
+let is i64 as have_rdseed with mut = 0;
+let is i64 as have_rdrand with mut = 0;
+let is i64 as qual with mut = 0;
+
+// The jitter pool. One 64-bit word stirred by SplitMix64, which has a full
+// 2^64 period and passes BigCrush — it is a good MIXING function, and mixing
+// is all it is asked to be. It contributes no entropy of its own; every bit
+// of that comes from the timestamps fed in through mix().
+let is i64 as pool with mut = 0;
+let is i64 as stirs with mut = 0;
+let is lock.TicketLock as pool_lk;
+
+// SplitMix64 finaliser (Steele/Lea/Flood). Avalanches a counter into a value
+// where every output bit depends on every input bit.
+fn splitmix(x as i64) as i64 {
+    let is u64 as z with mut = cast(u64, x) + cast(u64, 0x9E3779B97F4A7C15);
+    z = (z ^ (z >> cast(u64, 30))) * cast(u64, 0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> cast(u64, 27))) * cast(u64, 0x94D049BB133111EB);
+    z = z ^ (z >> cast(u64, 31));
+    return cast(i64, z);
+}
+
+// Stir a value into the pool. Safe from an interrupt handler: it takes the
+// lock with interrupts off and does a handful of arithmetic. Drivers call it
+// with the timestamp of an event whose exact timing nobody controls.
+fn mix(v as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&pool_lk);
+    pool = splitmix(pool ^ v);
+    stirs = stirs + 1;
+    lock.release_irq(&pool_lk, fl);
+    return;
+}
+
+// Stir in the current timestamp. What drivers actually call.
+fn mix_now() as void {
+    let is i64 as t with mut = 0;
+    random_rdtsc_into(&t);
+    mix(t);
+    return;
+}
+
+fn quality() as i64 {
+    return qual;
+}
+
+// One unpredictable word. Hardware first, with a bounded retry — RDSEED
+// legitimately fails when its pool is drained, and a caller that gives up on
+// the first failure gets a lot less randomness than the chip can give.
+fn u64() as i64 {
+    let is i64 as v with mut = 0;
+    if (have_rdseed != 0) {
+        let is i64 as ok with mut = 0;
+        let is i64 as tries with mut = 0;
+        while (tries < 32) {
+            random_rdseed_into(&v, &ok);
+            if (ok == 1) { return v; }
+            tries = tries + 1;
+        }
+    }
+    if (have_rdrand != 0) {
+        let is i64 as ok2 with mut = 0;
+        let is i64 as t2 with mut = 0;
+        while (t2 < 32) {
+            random_rdrand_into(&v, &ok2);
+            if (ok2 == 1) { return v; }
+            t2 = t2 + 1;
+        }
+    }
+    // Pool path. Advance on every draw so two calls never agree, and fold in
+    // a fresh timestamp: even here, successive calls are separated by real
+    // elapsed time that nothing outside can observe exactly.
+    let is i64 as t with mut = 0;
+    random_rdtsc_into(&t);
+    let is i64 as fl = lock.acquire_irq(&pool_lk);
+    pool = splitmix(pool ^ t);
+    let is i64 as out = splitmix(pool);
+    lock.release_irq(&pool_lk, fl);
+    return out;
+}
+
+// Fill n bytes. Whole words are drawn and the tail takes what it needs.
+fn bytes(dst as i64, n as i64) as i64 {
+    if (n < 0) { return abi.E_INVAL; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as w = u64();
+        let is i64 as k with mut = 0;
+        while (k < 8 && i < n) {
+            let is *u8 as p = cast(*u8, dst + i);
+            p[0] = cast(u8, (w >> (8 * k)) & 0xFF);
+            k = k + 1;
+            i = i + 1;
+        }
+    }
+    return n;
+}
+
+// A value in [0, bound). Rejection sampling, not modulo: `u64() % bound`
+// biases toward small values whenever bound does not divide 2^64, and for the
+// small bounds this gets used with (a port range, a backoff slot) that bias is
+// measurable. Bounded retries, then accept the tiny residual bias rather than
+// loop forever on a pathological bound.
+fn below(bound as i64) as i64 {
+    if (bound <= 0) { return 0; }
+    let is u64 as b = cast(u64, bound);
+    let is u64 as limit = (cast(u64, 0) - b) % b;      // 2^64 mod b
+    let is i64 as tries with mut = 0;
+    while (tries < 64) {
+        let is u64 as r = cast(u64, u64());
+        if (r >= limit) { return cast(i64, r % b); }
+        tries = tries + 1;
+    }
+    return cast(i64, cast(u64, u64()) % b);
+}
+
+fn init() as void {
+    let is [4]i64 as regs;
+
+    // Leaf 1, ECX bit 30 — RDRAND.
+    random_cpuid_into(1, 0, cast(*i64, &regs[0]));
+    if ((regs[2] & 0x40000000) != 0) { have_rdrand = 1; }
+
+    // Leaf 7 subleaf 0, EBX bit 18 — RDSEED. Only ask if leaf 7 exists;
+    // on a CPU whose max leaf is below 7, cpuid returns the highest leaf's
+    // values instead and the bit would be read out of unrelated data.
+    random_cpuid_into(0, 0, cast(*i64, &regs[0]));
+    if (regs[0] >= 7) {
+        random_cpuid_into(7, 0, cast(*i64, &regs[0]));
+        if ((regs[1] & 0x00040000) != 0) { have_rdseed = 1; }
+    }
+
+    if (have_rdseed != 0 || have_rdrand != 0) {
+        qual = QUALITY_HW;
+    } else {
+        qual = QUALITY_JITTER;
+    }
+
+    // Seed the pool regardless. On a hardware machine it is never consulted,
+    // but it costs nothing and means the fallback is not starting from zero
+    // if the TRNG ever refuses every retry.
+    let is i64 as t with mut = 0;
+    random_rdtsc_into(&t);
+    pool = splitmix(t);
+    let is i64 as i with mut = 0;
+    while (i < 16) {
+        random_rdtsc_into(&t);
+        pool = splitmix(pool ^ t);
+        i = i + 1;
+    }
+
+    serial.print("random: ", 8);
+    if (qual == QUALITY_HW) {
+        if (have_rdseed != 0) { serial.print("rdseed ", 7); }
+        if (have_rdrand != 0) { serial.print("rdrand ", 7); }
+        serial.println("(hardware)", 10);
+    } else {
+        // Loud, because it is a real limitation and a silent one otherwise:
+        // TCP and DNS will work, TLS should not trust this.
+        serial.println("NO RDSEED/RDRAND — jitter pool only, NOT key-grade", 52);
+    }
+    return;
+}
+
+// Boot smoke. Cannot test randomness — that is not a property of a sample —
+// but it can catch the failure that actually happens: a generator wired up
+// wrong, returning a constant or zero. An assembler that dropped one of the
+// instructions in random_asm.s would land here.
+fn smoke() as void {
+    let is i64 as a = u64();
+    let is i64 as b = u64();
+    let is i64 as c = u64();
+    let is i64 as fails with mut = 0;
+    if (a == 0 && b == 0 && c == 0) { fails = fails + 1; }
+    if (a == b || b == c) { fails = fails + 1; }
+
+    // Every bit position should vary across a modest sample. A source stuck
+    // in any single bit shows up immediately.
+    let is i64 as ones with mut = 0;
+    let is i64 as zeros with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        let is i64 as w = u64();
+        ones = ones | w;
+        zeros = zeros | (0 - 1 - w);
+        i = i + 1;
+    }
+    if (ones != (0 - 1)) { fails = fails + 1; }      // some bit never set
+    if (zeros != (0 - 1)) { fails = fails + 1; }     // some bit never clear
+
+    // below() must respect its bound and reach both ends of a small range.
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = 0;
+    let is i64 as bad with mut = 0;
+    let is i64 as j with mut = 0;
+    while (j < 200) {
+        let is i64 as v = below(4);
+        if (v < 0 || v > 3) { bad = 1; }
+        if (v == 0) { lo = 1; }
+        if (v == 3) { hi = 1; }
+        j = j + 1;
+    }
+    if (bad != 0 || lo == 0 || hi == 0) { fails = fails + 1; }
+
+    if (fails == 0) { serial.println("random_smoke: PASS", 18); }
+    else {
+        serial.print("random_smoke: FAIL n=", 21);
+        util.print_num(fails);
+        serial.println("", 0);
+    }
+    return;
+}
