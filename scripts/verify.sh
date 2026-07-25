@@ -86,6 +86,9 @@ for i in $(seq 1 "$RUNS"); do
     elif ! echo "$RAW" | grep -q "netdev_smoke: PASS"; then
       FAIL=$((FAIL+1))
       echo "  smp=$SMP run=$i: FAIL no-netdev"
+    elif ! echo "$RAW" | grep -q "virtio_chain_smoke: PASS"; then
+      FAIL=$((FAIL+1))
+      echo "  smp=$SMP run=$i: FAIL no-virtio-chain"
     else
       PASS=$((PASS+1))
       echo "  smp=$SMP run=$i: PASS"
