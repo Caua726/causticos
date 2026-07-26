@@ -1,11 +1,10 @@
 # Installing what causticos needs
 
-Three commands once the tools are here:
+Two commands once the tools are here:
 
 ```sh
 caustic-mk run doctor     # is everything installed?
-caustic-mk run build      # kernel + userspace + a bootable ISO
-caustic-mk run run        # boot it
+caustic-mk run run        # build kernel + userspace + a bootable ISO, then boot it
 ```
 
 `doctor` is the source of truth. It checks every tool, prints the resolved path
@@ -73,11 +72,12 @@ Then:
 ```sh
 git clone https://github.com/Caua726/causticos && cd causticos
 caustic-mk run doctor
-caustic-mk run build
 caustic-mk run run
 ```
 
-A window opens with the desktop in it. Move the mouse, click, `Super+Enter`
+`run` builds the kernel, the userspace and the ISO before booting — about two
+seconds — so that second command is the whole loop from here on. A window opens
+with the desktop in it. Move the mouse, click, `Super+Enter`
 opens a terminal.
 
 ---
@@ -131,11 +131,10 @@ way to get one; MSYS2 works the same way.
 6. **The Caustic toolchain** — `caustic-x86_64-windows.zip` from the releases,
    unpacked, with `install.ps1` or the `bin` directory added to `PATH`.
 
-Then the same three commands:
+Then the same two commands:
 
 ```sh
 caustic-mk run doctor
-caustic-mk run build
 caustic-mk run run
 ```
 
@@ -168,6 +167,20 @@ ok    display server         wayland (wayland-1), X11 (:0)
 
 A `warn` on either line means the boot will work and the window will not — use
 `--headless` until it is fixed.
+
+**Or skip QEMU's window entirely.** On a Wayland desktop the GTK backend is the
+part most likely to disappoint, and libvirt's SPICE console is not:
+
+```sh
+sudo pacman -S libvirt virt-viewer          # Arch; apt/dnf spell it the same
+systemctl --user start virtqemud.socket
+caustic-mk run libvirt
+```
+
+Same machine, same devices, defined as a domain on `qemu:///session` — as your
+own user, no root. The window it opens is virt-viewer's, the mouse needs no grab,
+and the VM keeps running when you close the terminal. Details and flags in
+[build-and-run.md](build-and-run.md#libvirt).
 
 **Headless is not a lesser mode.** The serial console carries the whole boot
 log, and everything the regression suite checks it reads from there:

@@ -113,7 +113,7 @@ argv[0] its spawner chose; the kernel never resolves it.
 2. Add a `target` block to `userspace/Causticfile` naming its `src` and `out`.
    That file is the build — `caustic-mk build all` compiles every target in it.
 3. Add a `bin <name>` line to whichever `profiles/*.profile` should ship it.
-4. `caustic-mk run build && caustic-mk run run`.
+4. `caustic-mk run run` — it builds first, so that is the whole step.
 
 There is no third list to update. A `bin` naming something that is not a target
 fails the build by name, and `caustic-mk run doctor` checks every profile against

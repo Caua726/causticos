@@ -6,16 +6,24 @@ targets and the commands, and `caustic-mk run <name>` runs them.
 
 ```sh
 caustic-mk run doctor     # is everything this needs installed?
-caustic-mk run build      # kernel + userspace + a live ISO
-caustic-mk run run        # boot it, no disk required
+caustic-mk run run        # build kernel + userspace + live ISO, then boot it
+caustic-mk run build      # just the build, no boot
 ```
 
 Arguments after `--` reach the command as its own:
 
 ```sh
 caustic-mk run run -- --headless --smp 4
-caustic-mk run build -- --profile shell
+caustic-mk run run -- --profile shell
 ```
+
+**`run` and `libvirt` build before they boot.** Everything downstream of an
+edited source file is stale by definition, and a boot that silently shows the
+previous build is the most expensive kind of wrong answer — you end up debugging
+the symptom of a fix you did not actually run. The build is incremental and costs
+about two seconds when nothing changed. `--no-build` boots what is already there,
+and `--iso PATH` implies it. `scripts/rebuild.sh` is the one definition both
+share.
 
 ## Requirements
 
@@ -32,6 +40,10 @@ caustic-mk run build -- --profile shell
 `/dev/kvm` is optional. Without it everything still runs under TCG, roughly ten
 times slower, and the tools say which one they used rather than leaving you to
 infer it from the boot time.
+
+`libvirt` and `virt-viewer` are optional too, and only `caustic-mk run libvirt`
+wants them — worth having on a Wayland desktop, where QEMU's own window does not
+open and the SPICE console does.
 
 Notably **not** required: `mkfs.fat` and `qemu-img`. `scripts/fat32.py` formats
 its own volumes, which is the only way to guarantee the geometry satisfies every
@@ -52,19 +64,93 @@ Kernel, then userspace, then the ISO.
 
 ### `run`
 
+Builds kernel, userspace and ISO, then boots it.
+
 | Flag | Meaning |
 |---|---|
+| `--no-build` | skip the build; boot the ISO that is already there |
+| `--profile NAME` | which programs the root image ships (default `desktop`) |
+| `--cmdline "..."` | bake a kernel command line into the ISO |
 | `--headless` | no window; serial on stdout |
 | `--kvm` / `--no-kvm` | override the automatic choice |
-| `-m SIZE`, `--smp N` | memory (default `512M`) and cpu count (default 2) |
+| `-m SIZE`, `--smp N` | memory (default `64M`) and cpu count (default 2) |
 | `--persist[=PATH]` | attach a FAT32 disk and boot from **it** instead of the live root; created from the current profile if absent |
-| `--iso PATH` | boot a different ISO |
+| `--iso PATH` | boot a different ISO; implies `--no-build` |
 | `--monitor` | headless, with the QEMU monitor on `/tmp/cos-mon` and QMP on `/tmp/cos-qmp` |
 
-The kernel command line is **not** set here. QEMU's `-append` only reaches a
-kernel loaded with `-kernel`, and this one is loaded by Limine off the ISO — so
-the command line is baked in at ISO build time with `run iso -- --cmdline "..."`.
+The kernel command line does **not** go on a QEMU argument. `-append` only
+reaches a kernel loaded with `-kernel`, and this one is loaded by Limine off the
+ISO — so it is baked into the ISO at build time, which is what `--cmdline` does.
 Passing `-append` with a bootloader in the picture silently does nothing.
+
+### `libvirt`
+
+The same build and the same machine, hosted by libvirtd instead of a bare QEMU
+process — a domain you drive from virt-manager, `virsh`, or the viewer this opens
+for you.
+
+```sh
+caustic-mk run libvirt                    # build, define, start, open the viewer
+caustic-mk run libvirt -- --console       # serial on this terminal instead
+caustic-mk run libvirt -- --persist       # with a disk on SATA port 0
+caustic-mk run libvirt -- --stop          # destroy the running domain
+```
+
+Two things it buys over `run`, and they are the whole reason it exists:
+
+- **SPICE.** QEMU's own GTK window does not open under native Wayland; the
+  virt-viewer console does, and the guest's absolute pointer (virtio-tablet)
+  needs no grab there — so the window manager is usable with a mouse.
+- **A VM that outlives the shell.** Close the terminal and the guest keeps
+  running. Reattach with virt-manager whenever.
+
+| Flag | Meaning |
+|---|---|
+| `--no-build` | skip the build; boot the ISO that is already there |
+| `--profile NAME` | which programs the root image ships (default `desktop`) |
+| `--cmdline "..."` | bake a kernel command line into the ISO |
+| `--persist[=PATH]` | attach a FAT32 disk on SATA port 0 (default `build/disk.img`, created from the current profile if absent) |
+| `--reseed` | rebuild that disk from the current profile even if it exists |
+| `-m SIZE`, `--smp N` | memory (default `64M`) and cpu count (default 2) |
+| `--kvm` / `--no-kvm` | domain type `kvm` instead of `qemu`/TCG |
+| `--iso PATH` | boot a different ISO; implies `--no-build` |
+| `--name NAME` | domain name (default `causticos`) |
+| `--console` | serial on this terminal (`virsh console`) instead of a window |
+| `--no-viewer` | start it and return; attach later |
+| `--define-only` | build and define the domain, do not start it |
+| `--stop` | destroy the running domain and exit (builds nothing) |
+
+The order is load-bearing: **build, stop, define, start.** Build first because a
+failed build must leave the VM you are looking at alone rather than killing it
+for nothing. Stop before touching `build/disk.img`, because a running domain
+holds a write lock on it and `--reseed` underneath one would either fail or hand
+the guest a volume that changed while it was mounted.
+
+The connection is `qemu:///session`, not `qemu:///system`: the session daemon
+runs as you and reads `build/` with no permission or AppArmor argument, and needs
+no root. Override with `LIBVIRT_DEFAULT_URI`. If it cannot connect, the fix is
+almost always `systemctl --user start virtqemud.socket`.
+
+**The domain is redefined on every invocation, and a running one is stopped
+first.** A running domain pins the ISO *file* it was started with, so a fresh
+build alone would not reach it — the boot would cheerfully show you the previous
+one. It also means anything you change by hand in virt-manager is overwritten the
+next time you run it: change `causticos.libvirt.xml` instead.
+
+`causticos.libvirt.xml` in the repository root is a **template**, not a domain
+you can define by hand: the script substitutes the paths, memory, cpu count and
+accelerator into it and writes `build/causticos.libvirt.xml`, which is what
+libvirt actually gets. Absolute paths are the reason — libvirt resolves nothing
+relative to a working directory, so a checked-in XML with a `$HOME` baked into it
+boots on exactly one machine.
+
+Its device set mirrors `scripts/qemu-args.sh` down to the MAC addresses: the same
+e1000 and virtio-net, virtio-tablet, virtio-sound, PS/2 keyboard, stdvga, q35.
+When you add a device to one, add it to the other — a driver that enumerates
+under `run` and is missing under virt-manager is a bug found at the worst
+possible moment. The one deliberate difference: `qemu-args.sh`'s `hostfwd` for
+`httpd` has no libvirt equivalent on the SLIRP backend, so a test that dials
+*into* the guest belongs under `run`.
 
 ### `verify`
 
@@ -250,7 +336,9 @@ python3 scripts/fat32.py out.img ls
 | `scripts/csvi.py` | pack, expand and validate CSVI containers |
 | `scripts/mkroot.py` | resolve a profile into a volume image and a container |
 | `scripts/mkiso.sh` | assemble the ISO, generate `limine.conf` |
-| `scripts/qemu.sh` | boot it |
+| `scripts/qemu.sh` | build it and boot it |
+| `scripts/libvirt.sh` | build it and boot it as a libvirt domain, from `causticos.libvirt.xml` |
+| `scripts/rebuild.sh` | the build-before-boot policy both of those share |
 | `scripts/verify.sh` | the regression sweep |
 | `scripts/doctor.sh` | prerequisites |
 | `scripts/usb.sh` | write to a removable device |

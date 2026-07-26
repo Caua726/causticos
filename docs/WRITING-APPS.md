@@ -19,7 +19,7 @@ target "hello" {
 ```
 
 ```sh
-caustic-mk run build && caustic-mk run run
+caustic-mk run run          # builds kernel + userspace + ISO, then boots it
 ```
 
 There is no third list. A `bin` naming something that is not a target fails the

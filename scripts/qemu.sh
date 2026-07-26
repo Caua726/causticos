@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/portable.sh"
-# qemu.sh — boot build/causticos.iso.
+# qemu.sh — build the system and boot it.
+#
+# ONE command from an edited source file to a running desktop: kernel, userspace,
+# ISO, boot. See scripts/rebuild.sh for why booting rebuilds at all; --no-build
+# is how you say "boot what is already there".
 #
 # Default is the live ISO with no disk at all: the root travels inside the image.
 # --persist attaches a FAT32 disk and makes it the root instead, which is the
@@ -17,6 +21,11 @@ MEM=64M
 SMP=2
 PERSIST=""
 ISO="build/causticos.iso"
+ISO_GIVEN=0
+BUILD=1
+BUILD_GIVEN=0
+PROFILE="${COS_PROFILE:-desktop}"
+CMDLINE=""
 MONITOR=0
 EXTRA=()
 
@@ -24,6 +33,11 @@ usage() {
     cat <<'EOF'
 usage: caustic-mk run run -- [options] [-- <extra qemu args>]
 
+Builds kernel + userspace + ISO, then boots it.
+
+  --no-build          skip the build; boot the ISO that is already there
+  --profile NAME      which programs the root image ships (default desktop)
+  --cmdline "..."     bake a kernel command line into the ISO
   --headless          no window; serial on stdio (default is a window)
   --gui               force a window
   --kvm               use hardware virtualisation when the host has it
@@ -32,19 +46,24 @@ usage: caustic-mk run run -- [options] [-- <extra qemu args>]
   --smp N             cpu count (default 2)
   --persist[=PATH]    attach a FAT32 disk and boot from it instead of the live root
                       (created from the current profile if PATH does not exist)
-  --iso PATH          boot a different ISO (default build/causticos.iso)
+  --iso PATH          boot a different ISO; implies --no-build
   --monitor           headless + QEMU monitor on /tmp/cos-mon and QMP on /tmp/cos-qmp
 
-The kernel command line is NOT set here. QEMU's -append only reaches a kernel
-loaded with -kernel, and this one is loaded by Limine off the ISO — so the
-command line is baked in at ISO build time:
+The kernel command line does NOT go on a QEMU argument. -append only reaches a
+kernel loaded with -kernel, and this one is loaded by Limine off the ISO — so it
+is baked in at ISO build time, which is what --cmdline above does:
 
-  caustic-mk run iso -- --cmdline "smoke root=sata0"
+  caustic-mk run run -- --cmdline "smoke root=sata0"
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --no-build) BUILD=0; BUILD_GIVEN=1; shift ;;
+        --build) BUILD=1; BUILD_GIVEN=1; shift ;;
+        --profile) PROFILE="$2"; shift 2 ;;
+        --profile=*) PROFILE="${1#*=}"; shift ;;
+        --cmdline) CMDLINE="$2"; shift 2 ;;
         --headless) DISPLAY_MODE=headless; shift ;;
         --gui) DISPLAY_MODE=gui; shift ;;
         --kvm) ACCEL_WANT=auto; shift ;;
@@ -53,13 +72,24 @@ while [ $# -gt 0 ]; do
         --smp) SMP="$2"; shift 2 ;;
         --persist) PERSIST="build/disk.img"; shift ;;
         --persist=*) PERSIST="${1#*=}"; shift ;;
-        --iso) ISO="$2"; shift 2 ;;
+        --iso) ISO="$2"; ISO_GIVEN=1; shift 2 ;;
         --monitor) MONITOR=1; DISPLAY_MODE=headless; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; EXTRA=("$@"); break ;;
         *) echo "run: unknown option '$1' (try --help)" >&2; exit 1 ;;
     esac
 done
+
+# Naming an ISO means booting THAT file, so building one over it would be the
+# opposite of what was asked. Explicit --build still wins.
+if [ "$ISO_GIVEN" = 1 ] && [ "$BUILD_GIVEN" = 0 ]; then
+    BUILD=0
+fi
+
+if [ "$BUILD" = 1 ]; then
+    source "$(dirname "$0")/rebuild.sh"
+    cos_rebuild "$PROFILE" "$CMDLINE"
+fi
 
 [ -f "$ISO" ] || { echo "run: $ISO missing — run 'caustic-mk run iso'" >&2; exit 1; }
 
@@ -83,8 +113,8 @@ fi
 # The disk. Only attached when asked for: the live root is the default, and a
 # stray disk on the bus is one more thing to explain when a boot misbehaves.
 if [ -n "$PERSIST" ] && [ ! -f "$PERSIST" ]; then
-    echo "run: $PERSIST does not exist — creating it from profile ${COS_PROFILE:-desktop}"
-    "$PY" scripts/mkroot.py --profile "${COS_PROFILE:-desktop}" --img "$PERSIST" -q
+    echo "run: $PERSIST does not exist — creating it from profile $PROFILE"
+    "$PY" scripts/mkroot.py --profile "$PROFILE" --img "$PERSIST" -q
 fi
 
 # The machine is defined in exactly one place. This script decides POLICY (which

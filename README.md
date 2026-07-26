@@ -11,13 +11,14 @@ into a desktop.
 
 ```sh
 caustic-mk run doctor     # is everything installed?
-caustic-mk run build      # kernel + userspace + a bootable ISO
-caustic-mk run run        # boot it
+caustic-mk run run        # build the kernel, the userspace and the ISO, then boot it
+caustic-mk run build      # just the build, no boot
 ```
 
-That is the whole loop, and it is the same on Linux, WSL and Windows. A full
-build is about two seconds; the machine it boots needs 64 MB of RAM and no
-hardware virtualisation.
+That is the whole loop, and it is the same on Linux, WSL and Windows. **`run`
+builds first**, so an edited source file is on the screen one command later and
+a boot never quietly shows you the previous build. A full build is about two
+seconds; the machine it boots needs 64 MB of RAM and no hardware virtualisation.
 
 - **[docs/INSTALL.md](docs/INSTALL.md)** — what to install, per operating system
 - **[docs/WRITING-APPS.md](docs/WRITING-APPS.md)** — writing a program: terminal, window, network, audio
@@ -71,15 +72,22 @@ The three commands at the top are the whole loop, and the flags worth knowing:
 caustic-mk run run -- --headless          # serial only, no window
 caustic-mk run run -- --smp 4 -m 256M     # more cpus, more memory
 caustic-mk run run -- --kvm               # use the host accelerator (default is TCG)
-caustic-mk run build -- --profile shell   # a shell instead of the desktop
+caustic-mk run run -- --profile shell     # a shell instead of the desktop
 caustic-mk run run -- --persist           # attach a disk and boot from that instead
+caustic-mk run run -- --no-build          # boot the ISO that is already there
 caustic-mk run profiles                   # what a profile actually ships
 caustic-mk run verify                     # the regression sweep, both gates, ~15s
+caustic-mk run libvirt                    # build, then boot it as a libvirt domain
 ```
 
 `run` boots **with no disk attached** — the root travels inside the ISO as a
 sparse container the kernel expands into RAM. Write to it freely; it is
 volatile, and the boot says so.
+
+`caustic-mk run libvirt` does the same build and boots the same machine as a
+libvirt domain instead, on `qemu:///session` and with no root. Worth it on a
+Wayland desktop, where QEMU's own window does not open and the SPICE console
+does — and the VM outlives the shell that started it.
 
 Writing the ISO to a USB stick gives the same system on real hardware, BIOS or
 UEFI, with nothing else installed:

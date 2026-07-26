@@ -1,11 +1,39 @@
-<domain type='qemu'>
-  <name>causticos</name>
-  <!-- 512 MiB: the live root is a 64 MiB RAM volume expanded from the ISO's
-       CSVI module, and it is the largest single allocation of the boot. A
-       128 MiB guest fails inside ramvol.init with the byte counts on serial. -->
-  <memory unit='MiB'>512</memory>
-  <currentMemory unit='MiB'>512</currentMemory>
-  <vcpu>2</vcpu>
+<!-- causticos.libvirt.xml — the machine, expressed for libvirt.
+
+     This is a TEMPLATE, not a domain you can define by hand: scripts/libvirt.sh
+     substitutes the @NAME@ placeholders (paths, memory, cpu count, accelerator)
+     and writes the result to build/causticos.libvirt.xml, which is what actually
+     gets defined. Absolute paths are the reason — libvirt resolves nothing
+     relative to a working directory, and a checked-in XML with someone's $HOME
+     baked into it boots on exactly one machine.
+
+         caustic-mk run libvirt              define it, start it, open the viewer
+         caustic-mk run libvirt then `help`  the flags
+
+     Flags are named WITHOUT their leading dashes throughout this file. An XML
+     comment may not contain a double hyphen at all, so `persist` below means the
+     `persist` flag, and libvirt rejects the document outright if you write it
+     the other way.
+
+     The device set MIRRORS scripts/qemu-args.sh, down to the MAC addresses, so
+     the guest cannot tell which of the two launched it. When you add a device
+     there, add it here — a driver that enumerates under `run` and is missing
+     under virt-manager is a bug found at the worst possible moment.
+
+     What is deliberately NOT mirrored: qemu-args.sh's `hostfwd` for httpd.
+     libvirt's SLIRP backend has no equivalent knob, so a test that dials into
+     the guest belongs under `caustic-mk run run`, not here. -->
+<domain type='@DOMTYPE@'>
+  <name>@NAME@</name>
+  @UUID@
+  <!-- 64 MiB is the measured default, the same one `run` and the regression
+       sweep boot: the ISO's root is a sparse container the kernel expands into
+       a 45 MiB RAM volume, and that expansion is the largest allocation of the
+       boot. Give it more with `m 256M`; below ~56 MiB ramvol.init prints the
+       byte counts it could not get on serial and stops. -->
+  <memory unit='MiB'>@MEM@</memory>
+  <currentMemory unit='MiB'>@MEM@</currentMemory>
+  <vcpu>@SMP@</vcpu>
   <os>
     <type arch='x86_64' machine='q35'>hvm</type>
     <boot dev='cdrom'/>
@@ -15,43 +43,79 @@
     <apic/>
   </features>
   <clock offset='utc'/>
+  <!-- destroy on both, matching qemu-args.sh's `no-reboot`: a triple fault
+       should leave a stopped VM to look at, not a boot loop that erases the
+       evidence. -->
   <on_poweroff>destroy</on_poweroff>
   <on_reboot>destroy</on_reboot>
+  <on_crash>destroy</on_crash>
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
-    <!-- OPTIONAL. The ISO below carries its own root, so this VM boots a
-         complete desktop with no disk at all — delete this block and it still
-         works. Keep it to exercise the AHCI driver and persistent writes: the
-         live root outranks a disk (PRIO_LIVE_ROOT beats PRIO_DISK), so with
-         both present the system still boots live and this is just a second
-         volume the kernel saw. To boot FROM it, build the ISO with
-         `caustic-mk run iso -- --no-live`.
-
-         Create it with:
-           python3 scripts/mkroot.py --profile desktop --img build/disk.img
+    <!-- @DISK_BEGIN@ — present only with the `persist` flag; scripts/libvirt.sh
+         strips this block otherwise. The live root outranks a disk (storage's
+         PRIO_LIVE_ROOT beats PRIO_DISK), so attaching one to a live ISO gives
+         the guest a second volume rather than a different root. To boot FROM
+         it, build the ISO with `caustic-mk run iso` and its `no-live` flag.
 
          SATA port 0 by convention — the AHCI driver takes the first live port. -->
     <disk type='file' device='disk'>
       <driver name='qemu' type='raw'/>
-      <source file='/home/caua/Documentos/Projetos-Pessoais/causticos/build/disk.img'/>
+      <source file='@DISK@'/>
       <target dev='sda' bus='sata'/>
       <address type='drive' controller='0' bus='0' target='0' unit='0'/>
     </disk>
-    <!-- boot ISO (Limine) on SATA port 1 — the firmware boots it regardless of
-         port; the kernel ignores it (ATAPI on a non-first port). -->
+    <!-- @DISK_END@ -->
+    <!-- The boot ISO on SATA port 1. The firmware boots it from any port. The
+         kernel's AHCI driver does see it, fails IDENTIFY on it (it is ATAPI,
+         which the driver does not speak) and says so with `on_bind failed` —
+         exactly what `caustic-mk run run` prints for the same reason. It costs
+         a line of serial and nothing else. -->
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
-      <source file='/home/caua/Documentos/Projetos-Pessoais/causticos/build/causticos.iso'/>
+      <source file='@ISO@'/>
       <target dev='sdb' bus='sata'/>
       <address type='drive' controller='0' bus='0' target='0' unit='1'/>
       <readonly/>
     </disk>
+
+    <!-- NIC 0 — Intel 82540EM, the silicon QEMU emulates faithfully enough that
+         the same driver runs on metal. -->
     <interface type='user'>
+      <mac address='52:54:00:12:34:56'/>
       <model type='e1000'/>
     </interface>
+    <!-- NIC 1 — virtio-net. On q35 libvirt places it behind a PCIe root port,
+         which is what pins it to the modern (1.1) transport kernel/drivers/
+         virtio.cst speaks; on a plain PCI slot QEMU offers a transitional device
+         and feature negotiation fails. -->
+    <interface type='user'>
+      <mac address='52:54:00:12:34:57'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- Keyboard on i8042 — the kernel's PS/2 driver is what reads it. -->
+    <input type='keyboard' bus='ps2'/>
+    <!-- Absolute pointer. The guest's PS/2 mouse is relative, so tracking it
+         would need a host pointer grab, and the SPICE viewer under Wayland will
+         not do one. virtio-tablet reports absolute coordinates and needs none —
+         without this the window manager is usable only by keyboard. -->
+    <input type='tablet' bus='virtio'/>
+
+    <!-- virtio-sound. `spice` routes the guest's PCM to the viewer, so `aplay`
+         is audible in the window rather than merely not crashing. -->
+    <sound model='virtio'>
+      <audio id='1'/>
+    </sound>
+    <audio id='1' type='spice'/>
+
+    <!-- Serial on a pty: `virsh console @NAME@` is the kernel log, and the
+         `console` flag opens it for you. -->
     <serial type='pty'><target port='0'/></serial>
     <console type='pty'><target type='serial' port='0'/></console>
-    <input type='keyboard' bus='ps2'/>
+
+    <!-- stdvga, because Limine sets the mode and hands the kernel a linear
+         framebuffer; SPICE because QEMU's own GTK window does not open under
+         native Wayland and this one does. -->
     <graphics type='spice' autoport='yes'>
       <listen type='none'/>
       <gl enable='no'/>
