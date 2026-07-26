@@ -24,6 +24,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 PORT=17781
 TLS_PORT=17784
 GOT=/tmp/shellnet-got.bin
@@ -40,11 +42,11 @@ GOT=/tmp/shellnet-got.bin
 # of it. A guest that accepted it anyway would be the bug.
 DISK=build/disk-shell-net.img
 CA_PEM=build/certs/ca.pem SEED_DISK="$DISK" \
-    bash scripts/seed-disk.sh shell --no-build >/dev/null
+    "$PY" scripts/mkroot.py --profile shell --img "$DISK" -q
 
-python3 scripts/http-server.py "$PORT" 200 >/tmp/shellnet-srv.log 2>&1 &
+"$PY" scripts/http-server.py "$PORT" 200 >/tmp/shellnet-srv.log 2>&1 &
 SRV=$!
-python3 scripts/http-server.py "$TLS_PORT" 200 \
+"$PY" scripts/http-server.py "$TLS_PORT" 200 \
     build/certs/srvchain.pem build/certs/srv.key >/tmp/shellnet-tls.log 2>&1 &
 SRV_TLS=$!
 
@@ -124,7 +126,7 @@ wait_for_file() {
     # to say so is most of what made this suite too slow to run.
     for (( i=0; i<100; i++ )); do
         sleep 0.2
-        if python3 scripts/fat32_get.py "$DISK" "$name" "$GOT" >/dev/null 2>&1; then
+        if "$PY" scripts/fat32_get.py "$DISK" "$name" "$GOT" >/dev/null 2>&1; then
             if [ "$(stat -c%s "$GOT" 2>/dev/null || echo 0)" = "$want" ]; then return 0; fi
         fi
         kill -0 $QPID 2>/dev/null || return 1
@@ -133,7 +135,7 @@ wait_for_file() {
 }
 
 check_blob() {
-    python3 - "$GOT" "$1" <<'PY'
+    "$PY" - "$GOT" "$1" <<'PY'
 import sys
 got = open(sys.argv[1], 'rb').read()
 want = bytes(((i * 31 + 7) & 0xFF) for i in range(65536))

@@ -49,6 +49,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 FREQ=1000
 SECS=3
 PORT=17790
@@ -61,18 +63,18 @@ SERVED=build/streamed.wav
 
 # Mono, which aplay widens to stereo on the way in — so the device still plays
 # exactly the format it opened with, and the test covers that conversion too.
-python3 scripts/make-tone-wav.py "$SERVED" --freq "$FREQ" --seconds "$SECS" \
+"$PY" scripts/make-tone-wav.py "$SERVED" --freq "$FREQ" --seconds "$SECS" \
     --rate 48000 --channels 1 --amplitude 0.50
 
 # Its own image, so this test can run beside the others rather than
 # fighting them for build/disk.img.
 DISK=build/disk-stream.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q
 
 # The server is on THIS machine. SLIRP presents the host as 10.0.2.2, which is
 # the only address the guest can reach without a forward — and the point of the
 # test is that the audio crosses a real socket, not a pipe.
-python3 scripts/http-server.py "$PORT" 120 >/tmp/stream-server.log 2>&1 &
+"$PY" scripts/http-server.py "$PORT" 120 >/tmp/stream-server.log 2>&1 &
 SRV=$!
 sleep 0.4
 
@@ -151,7 +153,7 @@ kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
 # anywhere between the server's socket and the converter shows up here, and a
 # guest that fetched the file first and played it afterwards would still have
 # to have played it without holes.
-python3 scripts/check-wav.py "$WAV" \
+"$PY" scripts/check-wav.py "$WAV" \
     --freq "$FREQ" --seconds "$SECS" --rate 48000 \
     --tolerance-hz 20 --min-amplitude 0.35 --max-gap-ms 30
 

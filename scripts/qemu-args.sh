@@ -1,13 +1,10 @@
 # qemu-args.sh — the ONE definition of the virtual machine causticos boots on.
 #
-# Sourced by scripts/run.sh, scripts/verify.sh, run-wm.sh and run-shell.sh.
-# Before this file existed the same device line was copy-pasted into four
-# scripts and had already drifted (verify ran under KVM, run.sh under TCG,
-# nobody meant that). A driver that only enumerates in three of the four is a
-# bug you find at the worst moment, so the machine is defined here once.
-#
-# Not sourced by run-bootstrap.sh: the self-host round deliberately boots a
-# bare machine (no NIC, no tablet) and its own memory/disk sizing.
+# Sourced by scripts/qemu.sh (which `caustic-mk run run` drives) and by every
+# scripts/test-*.sh. Before this file existed the same device line was
+# copy-pasted into four scripts and had already drifted — verify ran under KVM
+# and run.sh under TCG, which nobody meant. A driver that only enumerates in
+# three of the four is a bug you find at the worst possible moment.
 #
 # Usage — set the knobs, source, then splice the array in:
 #
@@ -16,13 +13,24 @@
 #
 # Knobs, all read at source time:
 #
-#   QEMU_ISO    boot ISO                            (default build/causticos.iso)
-#   QEMU_DISK   FAT32 image handed to AHCI          (default build/disk.img)
-#   QEMU_MEM    guest RAM                           (default 128M)
-#   QEMU_KVM    1 → -enable-kvm -cpu host           (default 0)
-#   QEMU_SMP    CPU count, "" → let qemu default    (default "")
+#   QEMU_ISO    boot ISO                             (default build/causticos.iso)
+#   QEMU_DISK   FAT32 image for AHCI, "" → no disk   (default "")
+#   QEMU_MEM    guest RAM                            (default 64M)
+#   QEMU_ACCEL  kvm|whpx|hvf|tcg                     (default tcg)
+#   QEMU_KVM    legacy: 1 means the same as QEMU_ACCEL=kvm
+#   QEMU_SMP    CPU count, "" → let qemu default     (default "")
 #   QEMU_PCAP   file to dump net0 traffic to, "" off (default "")
 #   QEMU_WAV    file to record guest audio into, "" off (default "")
+#
+# The disk defaults to NONE because the ISO carries its own root now. Attaching
+# one is something a test asks for when the disk is what it is testing.
+#
+# 64M is measured, not assumed. The ISO is ~7 MB, but the root inside it is a
+# SPARSE container (~2.3 MB of non-zero sectors) that the kernel expands into a
+# full FAT32 in RAM — the EXPANDED volume, not the ISO, is what costs memory.
+# At the 45 MiB mkroot defaults to, the whole desktop comes up in a 64M machine.
+# (FAT32 needs 65525 clusters to be FAT32 at all, so ~32.5 MiB is the floor
+# below which the kernel refuses the volume, and says so.)
 #
 # QEMU_PCAP is the highest-leverage debugging knob in the tree: when a packet
 # doesn't arrive, open the pcap in Wireshark and read the wrong byte instead of
@@ -33,10 +41,16 @@
 # to a file, and scripts/check-wav.py measures the frequency and the amplitude
 # that came out. Without it "the driver works" would mean "it did not crash".
 
+# Sourced directly by the test scripts too, so it pulls in the host
+# differences itself rather than trusting every caller to have done it.
+. "$(dirname "${BASH_SOURCE[0]}")/portable.sh"
+
 QEMU_ISO="${QEMU_ISO:-build/causticos.iso}"
-QEMU_DISK="${QEMU_DISK:-build/disk.img}"
-QEMU_MEM="${QEMU_MEM:-128M}"
-QEMU_KVM="${QEMU_KVM:-0}"
+QEMU_DISK="${QEMU_DISK:-}"
+QEMU_MEM="${QEMU_MEM:-64M}"
+# QEMU_KVM=1 is the older spelling and still means kvm.
+if [ "${QEMU_KVM:-0}" = "1" ]; then QEMU_ACCEL="${QEMU_ACCEL:-kvm}"; fi
+QEMU_ACCEL="${QEMU_ACCEL:-tcg}"
 QEMU_SMP="${QEMU_SMP:-}"
 QEMU_PCAP="${QEMU_PCAP:-}"
 QEMU_WAV="${QEMU_WAV:-}"
@@ -71,11 +85,6 @@ QEMU_ARGS=(
     -m "$QEMU_MEM"
     -machine q35
 
-    # Storage: one AHCI controller, one SATA disk carrying the FAT32 root.
-    -drive "id=disk,file=$QEMU_DISK,if=none,format=raw"
-    -device ahci,id=ahci
-    -device ide-hd,drive=disk,bus=ahci.0
-
     # NIC 0 — Intel 82540EM. Real silicon QEMU emulates faithfully, so the
     # same driver runs on metal.
     # hostfwd is the only way in. SLIRP lets the guest dial out freely and
@@ -107,8 +116,23 @@ QEMU_ARGS=(
     -no-reboot
 )
 
-if [ "$QEMU_KVM" = "1" ]; then
-    QEMU_ARGS+=(-enable-kvm -cpu host)
+# Storage: one AHCI controller and one SATA disk, only when a disk was asked
+# for. Note the live root outranks a disk (storage.PRIO_LIVE_ROOT beats
+# PRIO_DISK), so attaching one to a live ISO gives the guest a second volume,
+# not a different root — booting FROM the disk means an ISO built --no-live.
+if [ -n "$QEMU_DISK" ]; then
+    QEMU_ARGS+=(
+        -drive "id=disk,file=$QEMU_DISK,if=none,format=raw"
+        -device ahci,id=ahci
+        -device ide-hd,drive=disk,bus=ahci.0
+    )
+fi
+
+# The accelerator by name — kvm on Linux, whpx on Windows, hvf on macOS, tcg
+# anywhere. -enable-kvm is not a portable spelling of "go fast": on a host
+# without KVM it is a startup error, not a fallback.
+if [ "$QEMU_ACCEL" != "tcg" ]; then
+    QEMU_ARGS+=(-accel "$QEMU_ACCEL" -cpu host)
 fi
 
 if [ -n "$QEMU_SMP" ]; then

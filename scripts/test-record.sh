@@ -24,6 +24,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 SECS=1
 GOT=/tmp/causticos-recorded.wav
 
@@ -33,7 +35,7 @@ GOT=/tmp/causticos-recorded.wav
 # Its own image, so this test can run beside the others rather than
 # fighting them for build/disk.img.
 DISK=build/disk-record.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q
 
 MON=/tmp/causticos-rec-mon.$$
 LOG=/tmp/causticos-rec.log
@@ -90,9 +92,9 @@ mon "quit"
 for _ in $(seq 1 50); do kill -0 $QPID 2>/dev/null || break; sleep 0.1; done
 kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
 
-python3 scripts/fat32_add_file.py "$DISK" readfile rec.wav "$GOT"
+"$PY" scripts/fat32.py "$DISK" get /rec.wav "$GOT"
 
-python3 - "$GOT" "$SECS" <<'PY'
+"$PY" - "$GOT" "$SECS" <<'PY'
 import struct, sys
 path, secs = sys.argv[1], int(sys.argv[2])
 d = open(path, 'rb').read()

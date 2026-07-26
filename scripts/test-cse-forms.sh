@@ -22,6 +22,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 CAUSTIC="${CAUSTIC:-$HOME/.local/bin/caustic}"
 [ -x "$CAUSTIC" ] || { echo "no caustic at $CAUSTIC"; exit 1; }
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
@@ -78,10 +80,8 @@ BUNDLE=$(build_form bundle --mode=bundle)
 # Its own image, so this test can run beside the others rather than
 # fighting them for build/disk.img.
 DISK=build/disk-cse-forms.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin fpure.cse   "$PURE"   >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin fcompat.cse "$COMPAT" >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin fbundle.cse "$BUNDLE" >/dev/null
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q \
+    --add "$PURE:/fpure.cse" --add "$COMPAT:/fcompat.cse" --add "$BUNDLE:/fbundle.cse"
 
 MON=/tmp/causticos-cseforms-mon.$$
 LOG=/tmp/causticos-cseforms.log

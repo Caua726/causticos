@@ -19,6 +19,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 FWD=18081
 GOT=/tmp/httpd-got.bin
 
@@ -26,7 +28,7 @@ GOT=/tmp/httpd-got.bin
 [ -f userspace/build/httpd.cse ] || { echo "userspace not built"; exit 1; }
 
 # A file to serve, with content the host can check byte for byte.
-python3 - <<'PY'
+"$PY" - <<'PY'
 import pathlib
 pathlib.Path('build/httpd-payload.bin').write_bytes(
     bytes(((i * 31 + 7) & 0xFF) for i in range(4096)))
@@ -35,9 +37,8 @@ PY
 # Its own image, so this test can run beside the others rather than
 # fighting them for build/disk.img.
 DISK=build/disk-httpd.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin served.bin \
-    build/httpd-payload.bin >/dev/null
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q \
+    --add "build/httpd-payload.bin:/served.bin"
 
 MON=/tmp/causticos-httpd-mon.$$
 LOG=$(mktemp)
@@ -119,7 +120,7 @@ if [ "$CODE" != "200" ]; then
     exit 1
 fi
 
-python3 - "$GOT" <<'PY'
+"$PY" - "$GOT" <<'PY'
 import sys
 got = open(sys.argv[1], 'rb').read()
 want = bytes(((i * 31 + 7) & 0xFF) for i in range(4096))

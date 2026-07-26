@@ -19,14 +19,14 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 CSE=userspace/build/linkt.cse
-[ -f "$CSE" ] || { echo "$CSE missing — run userspace/build.sh"; exit 1; }
+[ -f "$CSE" ] || { echo "$CSE missing — run: (cd userspace && caustic-mk build all)"; exit 1; }
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
 
 IMG=build/test-link.img
-qemu-img create -f raw "$IMG" 64M >/dev/null 2>&1
-mkfs.fat -F 32 -n CAUSTICOS "$IMG" >/dev/null 2>&1
-python3 scripts/fat32_add_file.py "$IMG" addfilebin init.cse "$CSE" >/dev/null
+"$PY" scripts/mkroot.py --profile base --init linkt --img "$IMG" -q
 
 MON=/tmp/causticos-link-mon.$$
 LOG=$(mktemp)

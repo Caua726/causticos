@@ -32,6 +32,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 WAV=/tmp/causticos-soundd.wav
 LOG=/tmp/causticos-soundd.log
 MIXHZ=1000
@@ -42,20 +44,18 @@ SECS=2
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
 [ -f userspace/build/soundd.cse ] || { echo "soundd not built"; exit 1; }
 
-python3 scripts/make-tone-wav.py build/mix.wav --freq "$MIXHZ" --seconds "$SECS" \
+"$PY" scripts/make-tone-wav.py build/mix.wav --freq "$MIXHZ" --seconds "$SECS" \
     --rate 48000 --channels 2 --amplitude 0.30
-python3 scripts/make-tone-wav.py build/mix2.wav --freq "$MIXHZ2" --seconds "$SECS" \
+"$PY" scripts/make-tone-wav.py build/mix2.wav --freq "$MIXHZ2" --seconds "$SECS" \
     --rate 48000 --channels 2 --amplitude 0.30
-python3 scripts/make-tone-wav.py build/low.wav --freq "$PREEMPTHZ" --seconds 1 \
+"$PY" scripts/make-tone-wav.py build/low.wav --freq "$PREEMPTHZ" --seconds 1 \
     --rate 48000 --channels 2 --amplitude 0.60
 
 # Its own image, so this test can run beside the others rather than
 # fighting them for build/disk.img.
 DISK=build/disk-soundd.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin mix.wav build/mix.wav >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin mix2.wav build/mix2.wav >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin low.wav build/low.wav >/dev/null
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q \
+    --add build/mix.wav --add build/mix2.wav --add build/low.wav
 
 MON=/tmp/causticos-soundd-mon.$$
 rm -f "$WAV"
@@ -127,7 +127,7 @@ kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
 
 [ -f "$WAV" ] || { echo "FAIL: qemu wrote no wav"; exit 1; }
 
-python3 - "$WAV" "$MIXHZ" "$MIXHZ2" "$PREEMPTHZ" <<'PY'
+"$PY" - "$WAV" "$MIXHZ" "$MIXHZ2" "$PREEMPTHZ" <<'PY'
 import math, struct, sys
 path = sys.argv[1]
 mixhz, mixhz2, lowhz = (float(a) for a in sys.argv[2:5])

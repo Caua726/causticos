@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(dirname "$0")/portable.sh"
 # mkiso.sh — assemble build/causticos.iso: kernel + bootloader + the live root.
 #
 # The ISO is self-contained. It carries the root volume as a Limine module (a
@@ -16,6 +17,7 @@ LIVE=1
 LIMINE_DIR="${LIMINE_DIR:-/usr/share/limine}"
 OUT="build/causticos.iso"
 CMDLINE=""
+ROOT_ARGS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -24,6 +26,13 @@ while [ $# -gt 0 ]; do
         --no-live) LIVE=0; shift ;;
         --out) OUT="$2"; shift 2 ;;
         --cmdline) CMDLINE="$2"; shift 2 ;;
+        # Passed straight to mkroot: "this profile, but /init is that, and these
+        # files are on it". A test harness wants a whole system with itself as
+        # init, which is one ISO rather than a disk to attach — and since the
+        # live root outranks a disk, attaching one would not even be read.
+        --init) ROOT_ARGS+=(--init "$2"); shift 2 ;;
+        --add) ROOT_ARGS+=(--add "$2"); shift 2 ;;
+        --size) ROOT_ARGS+=(--size "$2"); shift 2 ;;
         *) echo "mkiso: unknown option '$1'" >&2; exit 1 ;;
     esac
 done
@@ -47,7 +56,8 @@ cp "$LIMINE_DIR/BOOTX64.EFI"         build/iso/EFI/BOOT/
 # mismatch that costs an hour to notice.
 MODULE_LINE=""
 if [ "$LIVE" = 1 ]; then
-    python3 scripts/mkroot.py --profile "$PROFILE" --csvi build/iso/boot/rootfs.csvi -q
+    "$PY" scripts/mkroot.py --profile "$PROFILE" \
+        ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} --csvi build/iso/boot/rootfs.csvi -q
     ROOT_CSVI="build/iso/boot/rootfs.csvi"
     MODULE_LINE="    module_path: boot():/boot/rootfs.csvi"
 fi

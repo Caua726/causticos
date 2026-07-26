@@ -44,7 +44,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import csvi
 import fat32
 
-DEFAULT_SIZE = 64 * 1024 * 1024
+# 45 MiB, not 64: the sparse container on the ISO is the SAME size either way
+# (it only stores non-zero sectors), so the difference is purely guest RAM at
+# boot — and 45 MiB is what lets the whole system come up in a 64 MB machine.
+# The floor is ~32.5 MiB, below which FAT32 is not FAT32 and the kernel says so.
+DEFAULT_SIZE = 45 * 1024 * 1024
 SECTOR = 512
 
 
@@ -293,6 +297,10 @@ def main():
     ap.add_argument("--csvi", help="write the CSVI container here")
     ap.add_argument("--size", help="volume size (default 64M, or the profile's `size`)")
     ap.add_argument("--label", default="CAUSTICOS")
+    ap.add_argument("--init", metavar="TARGET",
+                    help="override the profile's /init.cse (for one-off test images)")
+    ap.add_argument("--add", action="append", metavar="HOST[:GUEST]",
+                    help="add a host file; guest path defaults to /<basename>. Repeatable.")
     ap.add_argument("--list", action="store_true",
                     help="resolve and print what would ship, build nothing")
     ap.add_argument("-q", "--quiet", action="store_true")
@@ -307,6 +315,18 @@ def main():
     r = Resolver(root, targets, env)
     try:
         r.load(a.profile)
+        # Command-line overrides, applied after the profile so they win. These
+        # exist for the one-off images the test scripts need — "this profile,
+        # but /init is the harness and these three files are on it" — which is
+        # not worth a profile each and used to be a hand-rolled mkfs.fat plus a
+        # loop of one-file-per-process seeding in every script that wanted one.
+        for spec in a.add or []:
+            host, sep, guest = spec.partition(":")
+            if not sep:
+                host, guest = spec, "/" + os.path.basename(spec)
+            r._directive('file "{}" "{}"'.format(host, guest), ())
+        if a.init:
+            r._directive("init " + a.init, ())
     except ValueError as e:
         sys.exit("mkroot: {}".format(e))
 

@@ -24,6 +24,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 TOUT="${TOUT:-120}"
 START=$SECONDS
 IMG=build/selftests.img
@@ -35,11 +37,10 @@ LOG=$(mktemp)
 if [ ! -f build/certs/srv.pem ]; then bash scripts/make-test-certs.sh >/dev/null; fi
 : > build/certs/empty.pem
 
-qemu-img create -f raw "$IMG" 64M >/dev/null 2>&1
-mkfs.fat -F 32 -n CAUSTICOS "$IMG" >/dev/null 2>&1
-add() { python3 scripts/fat32_add_file.py "$IMG" addfilebin "$(basename "$2")" "$2" >/dev/null; }
-
-python3 scripts/fat32_add_file.py "$IMG" addfilebin init.cse userspace/build/runall.cse >/dev/null
+# One image, one process. Everything the harnesses reach for goes on with
+# --add; /init is the runner itself.
+ADD=(--init runall)
+add() { ADD+=(--add "$2"); }
 for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst; do
     [ -f "userspace/build/$t.cse" ] && add x "userspace/build/$t.cse"
 done
@@ -59,11 +60,13 @@ done
 
 # One set of peers for the whole boot. Different ports, so they coexist; the
 # guest dials them one at a time.
-python3 scripts/echo-server.py 17777 "$TOUT" >/dev/null 2>&1 & E1=$!
-python3 scripts/http-server.py 17780 "$TOUT" >/dev/null 2>&1 & E2=$!
-python3 scripts/http-server.py 17782 "$TOUT" \
+"$PY" scripts/echo-server.py 17777 "$TOUT" >/dev/null 2>&1 & E1=$!
+"$PY" scripts/http-server.py 17780 "$TOUT" >/dev/null 2>&1 & E2=$!
+"$PY" scripts/http-server.py 17782 "$TOUT" \
     build/certs/srvchain.pem build/certs/srv.key >/dev/null 2>&1 & E3=$!
 sleep 0.4
+
+"$PY" scripts/mkroot.py --profile base "${ADD[@]}" --img "$IMG" -q
 
 QEMU_DISK="$IMG"
 QEMU_KVM=1

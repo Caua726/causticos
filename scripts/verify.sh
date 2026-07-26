@@ -33,22 +33,29 @@ set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$(dirname "$0")")"
 
+source "$(dirname "$0")/portable.sh"
+
 SMPS="1,2,4"
-RUNS=20
+RUNS=1
 TOUT=25
 GATES="live persist"
 KEEP=0
+USE_ACCEL=0
 
 usage() {
     cat <<'EOF'
 usage: caustic-mk run verify -- [options]
 
   --smp 1,2,4      cpu counts to sweep (default 1,2,4)
-  --runs N         boots per cpu count (default 20)
+  --runs N         boots per cpu count (default 1 — raise it to hunt an
+                   intermittent; the default answers 'is it broken', which
+                   one boot per configuration already does)
   --timeout S      per-boot deadline in seconds (default 25)
   --live-only      only the live gate (no disk)
   --persist-only   only the persist gate (AHCI + FAT32 writes)
   --keep-logs      leave the serial logs in build/verify/ for inspection
+  --kvm            use the host accelerator (default: TCG, so the sweep is
+                   identical on every machine)
 EOF
 }
 
@@ -60,6 +67,7 @@ while [ $# -gt 0 ]; do
         --live-only) GATES="live"; shift ;;
         --persist-only) GATES="persist"; shift ;;
         --keep-logs) KEEP=1; shift ;;
+        --kvm) USE_ACCEL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "verify: unknown option '$1' (try --help)" >&2; exit 1 ;;
     esac
@@ -68,14 +76,13 @@ done
 WORK=build/verify
 rm -rf "$WORK"; mkdir -p "$WORK"
 
+# TCG by default, like `run`: the sweep then means the same thing on every
+# machine that runs it. --kvm opts into the host's accelerator when it has one.
 ACCEL=()
-if [ -w /dev/kvm ]; then
-    ACCEL=(-enable-kvm -cpu host)
-    ACCEL_NAME=kvm
-else
-    ACCEL_NAME=tcg
-    TOUT=$((TOUT * 4))       # TCG is roughly an order of magnitude slower
-    echo "verify: no KVM — running under TCG with a ${TOUT}s deadline per boot"
+ACCEL_NAME=tcg
+if [ "$USE_ACCEL" = 1 ]; then
+    A="$(qemu_accel)"
+    if [ "$A" != tcg ]; then ACCEL=(-accel "$A" -cpu host); ACCEL_NAME="$A"; fi
 fi
 
 FAIL_PATTERN='EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted'
@@ -113,7 +120,7 @@ case " $GATES " in *" persist "*)
     # what "the disk path works end to end" actually means. No root= either —
     # letting root_pick choose is the behaviour under test.
     bash scripts/mkiso.sh --no-live --cmdline "selftest" --out "$WORK/persist.iso" >/dev/null
-    python3 scripts/mkroot.py --profile verify --img "$WORK/pristine.img" -q ;;
+    "$PY" scripts/mkroot.py --profile verify --img "$WORK/pristine.img" -q ;;
 esac
 
 TOTAL_PASS=0
@@ -122,22 +129,32 @@ TOTAL_FAIL=0
 run_one() {   # run_one <gate> <smp> <index>
     local gate="$1" smp="$2" idx="$3"
     local log="$WORK/$gate-smp$smp-$idx.log"
-    local args=(-m 512M -machine q35 -smp "$smp" "${ACCEL[@]}"
-                -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56
-                -device virtio-tablet-pci
-                -netdev user,id=net1
-                -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off
-                -boot d -serial stdio -display none -no-reboot)
-
-    if [ "$gate" = live ]; then
-        args=(-cdrom "$WORK/live.iso" "${args[@]}")
-    else
-        local disk="$WORK/disk-smp$smp-$idx.img"
+    # The machine comes from qemu-args.sh like everywhere else. Building it here
+    # by hand made this the THIRD copy of the device line, and it had already
+    # drifted from the other two: memory hardcoded at 512M long after the default
+    # became 64M, and no sound card at all — so the audio driver was exercised by
+    # `run` and by the test scripts, and silently not by the gate.
+    local disk=""
+    if [ "$gate" != live ]; then
+        disk="$WORK/disk-smp$smp-$idx.img"
         cp "$WORK/pristine.img" "$disk"
-        args=(-cdrom "$WORK/persist.iso" "${args[@]}"
-              -drive "id=disk,file=$disk,if=none,format=raw"
-              -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0)
     fi
+    local iso="$WORK/live.iso"
+    [ "$gate" = live ] || iso="$WORK/persist.iso"
+
+    # A port per run. The machine forwards a host port to the guest's httpd, and
+    # twenty boots at once all asked for 18080 — nineteen of them died at startup
+    # with "Could not set up host forwarding rule" and were reported as a kernel
+    # that printed no markers. Concurrency turned a fixed port into a bug.
+    local port=$((18100 + smp * 1000 + idx))
+
+    local args
+    mapfile -t args < <(
+        QEMU_ISO="$iso" QEMU_DISK="$disk" QEMU_SMP="$smp" QEMU_ACCEL="$ACCEL_NAME" \
+        QEMU_HTTPD_PORT="$port" \
+        bash -c 'source scripts/qemu-args.sh; printf "%s\n" "${QEMU_ARGS[@]}"'
+    )
+    args+=(-serial stdio -display none)
 
     qemu-system-x86_64 "${args[@]}" > "$log" 2>&1 &
     local qpid=$!
@@ -186,13 +203,38 @@ run_one() {   # run_one <gate> <smp> <index>
     return 0
 }
 
+# Boots are independent, so they run concurrently — bounded by cores, minus a
+# couple so the host stays usable. Serially, a sweep spent almost all of its
+# wall time with the machine idle: a boot reaches its last marker in about 1.3
+# seconds, and everything after that is waiting for the next one to start.
+JOBS="${JOBS:-$(( $(nproc 2>/dev/null || echo 4) - 2 ))}"
+[ "$JOBS" -lt 1 ] && JOBS=1
+
+RESULTS="$WORK/results"
+mkdir -p "$RESULTS"
+
 for gate in $GATES; do
     echo
-    echo "=== gate: $gate ($ACCEL_NAME) ==="
+    echo "=== gate: $gate ($ACCEL_NAME, $JOBS at a time) ==="
     for smp in ${SMPS//,/ }; do
+        running=0
+        for i in $(seq 1 "$RUNS"); do
+            {
+                if run_one "$gate" "$smp" "$i" > "$RESULTS/$gate-$smp-$i.out" 2>&1
+                    then echo pass > "$RESULTS/$gate-$smp-$i.rc"
+                    else echo fail > "$RESULTS/$gate-$smp-$i.rc"
+                fi
+            } &
+            running=$((running+1))
+            if [ "$running" -ge "$JOBS" ]; then wait -n 2>/dev/null || wait; running=$((running-1)); fi
+        done
+        wait
         pass=0; fail=0
         for i in $(seq 1 "$RUNS"); do
-            if run_one "$gate" "$smp" "$i"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+            if [ "$(cat "$RESULTS/$gate-$smp-$i.rc" 2>/dev/null)" = pass ]
+                then pass=$((pass+1))
+                else fail=$((fail+1)); cat "$RESULTS/$gate-$smp-$i.out" 2>/dev/null
+            fi
         done
         echo "  smp=$smp: $pass/$((pass+fail))"
         TOTAL_PASS=$((TOTAL_PASS+pass)); TOTAL_FAIL=$((TOTAL_FAIL+fail))

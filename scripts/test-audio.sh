@@ -22,6 +22,8 @@
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+source "$(dirname "$0")/portable.sh"
+
 FREQ=1000
 SECONDS_OF_TONE=2
 WAV=/tmp/causticos-audio.wav
@@ -30,14 +32,13 @@ TONE=build/tone.wav
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
 [ -f userspace/build/aplay.cse ] || { echo "aplay not built"; exit 1; }
 
-python3 scripts/make-tone-wav.py "$TONE" --freq "$FREQ" \
+"$PY" scripts/make-tone-wav.py "$TONE" --freq "$FREQ" \
     --seconds "$SECONDS_OF_TONE" --rate 48000 --channels 2
 
 # Its own image, so this test can run beside the others rather than
 # fighting them for build/disk.img.
 DISK=build/disk-audio.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py "$DISK" addfilebin tone.wav "$TONE" >/dev/null
+"$PY" scripts/mkroot.py --profile shell --add "$TONE:/tone.wav" --img "$DISK" -q
 
 MON=/tmp/causticos-audio-mon.$$
 LOG=/tmp/causticos-audio.log
@@ -130,7 +131,7 @@ echo "recorded: $(stat -c%s "$WAV") bytes"
 
 # The tolerance on frequency is tight — 20 Hz on 1000 — because every way this
 # can go wrong moves the pitch by a factor, not by a percent.
-python3 scripts/check-wav.py "$WAV" \
+"$PY" scripts/check-wav.py "$WAV" \
     --freq "$FREQ" --seconds "$SECONDS_OF_TONE" --rate 48000 \
     --tolerance-hz 20 --min-amplitude 0.2 --max-gap-ms 30
 
