@@ -131,6 +131,39 @@ for p in profiles/*.profile; do
     fi
 done
 
+# And the same question from the other side. The check above catches a profile
+# naming a program that does not exist; this one catches a program no profile
+# ships — built by every `caustic-mk build all` and reachable from no ISO, which
+# is a line someone forgot to add rather than a decision anyone made. It found
+# kabi (whose eleven siblings were all listed), animt and guess.
+#
+# A warn, not a FAIL: a target can legitimately be built and not shipped for a
+# while. The point is that it says so out loud instead of nobody noticing.
+ORPHANS="$("$PY" - <<'PY'
+import re, glob
+targets = []
+for line in open("userspace/Causticfile"):
+    m = re.match(r'target\s+"([^"]+)"', line.split("//")[0].strip())
+    if m:
+        targets.append(m.group(1))
+shipped = set()
+for p in glob.glob("profiles/*.profile"):
+    for line in open(p):
+        line = line.split("#")[0].strip()
+        if line.startswith("opt "):
+            line = line[4:].strip()
+        m = re.match(r'(?:bin|init)\s+(\S+)', line)
+        if m:
+            shipped.add(m.group(1))
+print(" ".join(t for t in targets if t not in shipped))
+PY
+)"
+if [ -z "$ORPHANS" ]; then
+    ok "profile coverage" "every target ships in at least one profile"
+else
+    warn "profile coverage" "built but in no profile:$(echo " $ORPHANS")"
+fi
+
 echo
 if [ "$FAIL" = 0 ]; then
     echo "doctor: everything needed is here."

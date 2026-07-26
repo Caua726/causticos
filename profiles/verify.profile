@@ -42,3 +42,16 @@ bin tlst
 bin appt
 
 bin u64t
+# kabi belongs to the list above — scripts/test-userspace.sh runs it alongside
+# u64t, nett and the rest — and was the one name missing from it. animt is the
+# same shape: a lib self-test that prints PASS/FAIL and runs from a terminal.
+# Both were built by every `caustic-mk build all` and shipped by no profile at
+# all, which means they were compiled a hundred times and run zero.
+bin kabi
+bin animt
+
+# guess is a game, and it is here for what it proves rather than for the game:
+# it reads keystrokes from fd 0 one byte at a time, so it is the end-to-end
+# check on the terminal's stdin path. Nothing else in the tree exercises that
+# from a program's side.
+bin guess
