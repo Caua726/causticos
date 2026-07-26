@@ -1,0 +1,196 @@
+// arecord — capture from DEV_AUDIO_IN into a WAV file.
+//
+// The mirror of aplay, and the reason capture is a device class rather than a
+// flag on playback: the mechanism is symmetric all the way down. One ring, one
+// control page, two monotonic cursors — the only thing that changes is which
+// side of them the hardware is on. Leaving it out would have been more code to
+// write, not less, and it would have been the kind of deferral the project's
+// rules exist to prevent.
+//
+// WHAT A RECORDING PROVES, AND WHAT IT DOES NOT. The frame count, the rate and
+// the timing are the guest's own doing and are checked. The CONTENT is
+// whatever the machine's input actually carries: under QEMU's automatable
+// backends that is digital silence, because none of them has an input side —
+// the `wav` backend can only write. So a silent recording here is a CORRECT
+// recording of what was offered, and the test says so rather than pretending
+// otherwise. Point it at a backend with a real source (-audiodev pipewire) and
+// the same program records what you play into it.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/wav/wav.cst" as wav;
+
+let is i64 as CHUNK_FRAMES = 2048;
+let is [8192]u8 as pcm;             // CHUNK_FRAMES * 4
+let is [64]u8 as hdr;
+
+let is [24]u8 as numbuf;
+
+fn num(v as i64) as *u8 {
+    let is i64 as x with mut = v;
+    let is i64 as i with mut = 23;
+    numbuf[23] = cast(u8, 0);
+    if (x == 0) { i = 22; numbuf[22] = cast(u8, 48); }
+    while (x > 0 && i > 0) {
+        i = i - 1;
+        numbuf[i] = cast(u8, 48 + (x % 10));
+        x = x / 10;
+    }
+    return cast(*u8, &numbuf[i]);
+}
+
+// Terminal and serial both, for the same reason aplay does it: the host-side
+// test has no other way to read the verdict.
+fn report(msg as *u8) as void {
+    prog.outs(msg);
+    let is i64 as n with mut = 0;
+    while (msg[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(msg, n);
+    return;
+}
+
+fn die(msg as *u8) as i32 {
+    report("arecord: ");
+    report(msg);
+    report("\n");
+    return cast(i32, 1);
+}
+
+fn usage() as i32 {
+    prog.outs("usage: arecord [-d INDEX] [-t SECONDS] FILE.wav\n");
+    prog.outs("  -d INDEX     capture device (default 0)\n");
+    prog.outs("  -t SECONDS   how long to record (default 2)\n");
+    return cast(i32, 2);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as dev with mut = 0;
+    let is i64 as secs with mut = 2;
+    let is *u8 as path with mut = cast(*u8, 0);
+
+    let is i64 as i with mut = 1;
+    while (i < argc) {
+        let is *u8 as a = prog.arg(argv, i);
+        if (a[0] == cast(u8, 45) && a[1] == cast(u8, 100) && a[2] == cast(u8, 0)) {
+            i = i + 1;
+            if (i >= argc) { return usage(); }
+            let is *u8 as v = prog.arg(argv, i);
+            dev = fu.parse_uint(v, prog.slen(v));
+        } else if (a[0] == cast(u8, 45) && a[1] == cast(u8, 116) && a[2] == cast(u8, 0)) {
+            i = i + 1;
+            if (i >= argc) { return usage(); }
+            let is *u8 as v = prog.arg(argv, i);
+            secs = fu.parse_uint(v, prog.slen(v));
+        } else if (a[0] == cast(u8, 45)) {
+            return usage();
+        } else {
+            path = a;
+        }
+        i = i + 1;
+    }
+    if (cast(i64, path) == 0) { return usage(); }
+    if (secs <= 0) { return die("a recording of no seconds is not a recording"); }
+
+    // THE FILE FIRST, THE DEVICE LAST. A capture stream is a clock: it starts
+    // the moment it is acquired and the ring fills whether or not anyone is
+    // reading. Creating a file on FAT32 is not instant — an allocation, a
+    // directory entry, a header write — and doing it with the device already
+    // open means arriving at the first read a long way behind, having lost
+    // everything the ring wrapped over. aplay learned the same lesson from the
+    // other end, where the cost was silence at the front of the recording.
+    //
+    // The rate is needed before the device is open, so it comes from a probe
+    // of the class rather than from the stream: dev_open then immediately
+    // audio_info would put the slow part back inside the window.
+    let is i64 as out = sys.open_write(path);
+    if (out < 0) { return die("cannot create that file"); }
+
+    let is i64 as probe = sys.dev_open(sys.DEV_AUDIO_IN, dev, 0);
+    if (probe < 0) { sys.close(out); return die("no capture device"); }
+    let is [20]i64 as info;
+    if (sys.audio_info(probe, cast(*i64, &info[0])) != 0) {
+        sys.close(probe); sys.close(out);
+        return die("the device would not describe itself");
+    }
+    sys.close(probe);
+    let is i64 as rate = info[0];
+    let is i64 as channels = info[1];
+    let is i64 as frame_bytes = info[3];
+    if (info[8] != sys.AUDIO_DIR_IN) {
+        sys.close(out);
+        return die("that device is not a capture stream");
+    }
+
+    // The header goes down for the length this run intends. If the capture
+    // ends short it gets rewritten below — a header claiming more than the
+    // file holds is the most common broken WAV there is, and every player
+    // copes with it differently.
+    let is i64 as want = rate * secs;
+    let is i64 as hn = wav.build_header(cast(*u8, &hdr[0]), rate, channels, want);
+    if (sys.write(out, cast(*u8, &hdr[0]), hn) != hn) {
+        sys.close(out);
+        return die("cannot write to that file");
+    }
+
+    // Now, with nothing left to do but read.
+    let is i64 as fd = sys.dev_open(sys.DEV_AUDIO_IN, dev, 0);
+    if (fd < 0) { sys.close(out); return die("no capture device"); }
+
+    // read() blocks until the frames exist, so the loop runs at the speed of
+    // the hardware clock and needs no timer of its own — the same pacing
+    // aplay's write() gets, from the other direction.
+    let is i64 as got with mut = 0;
+    let is i64 as failed with mut = 0;
+    while (got < want && failed == 0) {
+        let is i64 as take with mut = want - got;
+        if (take > CHUNK_FRAMES) { take = CHUNK_FRAMES; }
+        let is i64 as n = sys.read(fd, cast(*u8, &pcm[0]), take * frame_bytes);
+        if (n <= 0) { failed = 1; }
+        else {
+            let is i64 as frames = n / frame_bytes;
+            if (sys.write(out, cast(*u8, &pcm[0]), frames * frame_bytes)
+                    != frames * frame_bytes) {
+                failed = 1;
+            }
+            got = got + frames;
+        }
+    }
+
+    let is [20]i64 as fin;
+    let is i64 as xruns with mut = 0;
+    if (sys.audio_info(fd, cast(*i64, &fin[0])) == 0) { xruns = fin[13]; }
+    sys.close(fd);
+
+    // Ended short: correct the two lengths rather than leave the file lying
+    // about its own size.
+    if (got != want) {
+        wav.build_header(cast(*u8, &hdr[0]), rate, channels, got);
+        if (sys.lseek(out, 0, cast(i32, sys.SEEK_SET)) < 0
+            || sys.write(out, cast(*u8, &hdr[0]), hn) != hn) {
+            sys.close(out);
+            return die("the recording ended early and the header could not be fixed");
+        }
+    }
+    sys.close(out);
+
+    if (failed != 0 && got == 0) { return die("the device produced nothing"); }
+
+    report("arecord: captured ");
+    report(num(got));
+    report(" frames at ");
+    report(num(rate));
+    report(" Hz x");
+    report(num(channels));
+    // An overrun means samples reached the ring and were overwritten before
+    // this program collected them — audio that existed and is now gone. Worth
+    // saying out loud; a recorder that drops a tenth of a second silently is
+    // worse than one that fails.
+    if (xruns > 0) {
+        report(", ");
+        report(num(xruns));
+        report(" overruns");
+    }
+    report("\n");
+    return cast(i32, 0);
+}

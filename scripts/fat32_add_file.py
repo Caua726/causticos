@@ -325,8 +325,8 @@ def mkdir(f, bpb, name, parent_cluster):
 
 def dir_find(f, bpb, dir_cluster, name):
     """Find `name` (case-insensitive) among dir_cluster's entries. Returns
-    (first_cluster, attr) or None. Reads the LFN run when present, so a name
-    that does not fit 8.3 is matched by its real spelling."""
+    (first_cluster, attr, size) or None. Reads the LFN run when present, so a
+    name that does not fit 8.3 is matched by its real spelling."""
     cluster_bytes = bpb["bps"] * bpb["spc"]
     want = name.upper()
     cluster = dir_cluster
@@ -353,11 +353,51 @@ def dir_find(f, bpb, dir_cluster, name):
             short = base + ("." + ext if ext else "")
             if long_name.upper() == want or short.upper() == want:
                 clus = struct.unpack_from("<H", e, 26)[0] | (struct.unpack_from("<H", e, 20)[0] << 16)
-                return (clus, e[11])
+                size = struct.unpack_from("<I", e, 28)[0]
+                return (clus, e[11], size)
         nxt = read_fat_entry(f, bpb, cluster)
         if nxt >= 0x0FFFFFF8:
             return None
         cluster = nxt
+
+
+def readfile(f, bpb, path):
+    """Pull a file back out of the image. The counterpart of addfilebin, and
+    the only way a host-side test can check what the guest WROTE — a recorder
+    or a downloader is not proved by the fact that it printed a number.
+
+    Follows the cluster chain and truncates to the directory entry's size: the
+    last cluster is almost never full, and returning its padding would make
+    every byte-for-byte comparison fail on a correct file."""
+    parts = [p for p in path.strip("/").split("/") if p]
+    cluster = bpb["root_clus"]
+    for comp in parts[:-1]:
+        found = dir_find(f, bpb, cluster, comp)
+        if not found or not (found[1] & 0x10):
+            raise SystemExit(f"readfile: no directory {comp} in {path}")
+        cluster = found[0]
+    found = dir_find(f, bpb, cluster, parts[-1])
+    if not found:
+        raise SystemExit(f"readfile: {path} not found")
+    first, attr, size = found
+    if attr & 0x10:
+        raise SystemExit(f"readfile: {path} is a directory")
+
+    cluster_bytes = bpb["bps"] * bpb["spc"]
+    out = bytearray()
+    c = first
+    # A chain that loops would otherwise read for ever; the image is finite and
+    # so is the bound.
+    guard = 0
+    max_clusters = (size + cluster_bytes - 1) // cluster_bytes + 2
+    while c < 0x0FFFFFF8 and c >= 2 and len(out) < size and guard <= max_clusters:
+        f.seek(cluster_to_offset(bpb, c))
+        out += f.read(cluster_bytes)
+        c = read_fat_entry(f, bpb, c)
+        guard += 1
+    if len(out) < size:
+        raise SystemExit(f"readfile: {path} claims {size} bytes, chain holds {len(out)}")
+    return bytes(out[:size])
 
 
 def resolve_path(f, bpb, path, make_dirs):
@@ -421,6 +461,14 @@ def main():
                 parent, name = resolve_path(f, bpb, path, make_dirs=True)
             c = addfile(f, bpb, name, content, parent)
             print(f"file {path} cluster={c} ({len(content)} bytes, binary)")
+        elif op == "readfile":
+            if len(sys.argv) < 5:
+                print("readfile <name> <hostpath>", file=sys.stderr)
+                sys.exit(1)
+            data = readfile(f, bpb, sys.argv[3])
+            with open(sys.argv[4], "wb") as dst:
+                dst.write(data)
+            print(f"readfile {sys.argv[3]} -> {sys.argv[4]} ({len(data)} bytes)")
         elif op == "mkdir":
             path = sys.argv[3]
             if len(sys.argv) > 4:

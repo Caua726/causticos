@@ -160,6 +160,23 @@ if [ -z "$WANT" ] || [ "$WANT" = "audio" ]; then
     fi
 fi
 
+# record is the other half of audio, and it needs the OPPOSITE machine: the wav
+# backend that lets test-audio measure playback has no input side at all, so
+# capture runs on the ordinary full-duplex one and is checked by reading the
+# file the guest wrote back off the disk.
+if [ -z "$WANT" ] || [ "$WANT" = "record" ]; then
+    printf '%-8s ' "record"
+    if bash scripts/test-record.sh >/tmp/ut-record.log 2>&1; then
+        echo "PASS ($(grep -oE '[0-9]+ frames' /tmp/ut-record.log | head -1))"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-record.log)"
+        grep -E "FAIL|panic:" /tmp/ut-record.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED record"
+    fi
+fi
+
 # shellnet types at the real prompt, so it needs the monitor too — and it is
 # the only test that proves the machine you BOOT is wired up rather than the
 # one a test assembled for itself.
