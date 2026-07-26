@@ -1,43 +1,68 @@
-// aplay — play a WAV file straight at the hardware.
+// aplay — play a WAV, from a file or from the network.
 //
-// The DIRECT path, on purpose. aplay opens DEV_AUDIO_OUT itself and writes
-// PCM into it; it does not talk to soundd and it does not want to. Two things
-// come out of that:
+// Two sources and two destinations, and the interesting part is that neither
+// pair knows about the other:
 //
-//   - It proves the write() half of the audio ABI, which is the half a
-//     program can use without mapping anything or thinking about cursors.
-//   - It proves the grab stack on a new device class. While aplay runs,
-//     whatever was holding the stream goes quiet; when it exits, that holder
-//     gets the stream back without ever having been told anything happened.
-//     That is architecture.md §6 as a program you can run.
+//   SOURCE        a file on disk, or an http:// or https:// URL. The network
+//                 one reads through the same Conn vtable wget uses, so TLS is
+//                 one line and the streaming loop above it never learns
+//                 whether there is a session inside the connection.
 //
-// WHAT IT WILL NOT DO. If the file's sample rate is not the rate the device
-// opened at, aplay refuses and says so. Resampling is a decision with quality
-// trade-offs — which filter, how much aliasing, how much latency — and
-// decisions are policy. soundd is where that lives. A player that silently
-// resampled would be making that choice for everyone, badly, and hiding it.
+//   DESTINATION   the device itself, or soundd. Direct means aplay holds
+//                 DEV_AUDIO_OUT and everything else goes quiet until it exits
+//                 — the grab stack, as a program you can run. Through soundd
+//                 (-m) it is one voice among several.
 //
-// Mono files ARE widened to stereo, because duplicating a channel is not a
-// decision: it is exact, it loses nothing, and there is no other sensible
-// answer.
+// STREAMING IS NOT DOWNLOAD-THEN-PLAY. Samples reach the converter while the
+// rest of the file is still on the wire, and the interesting consequence is
+// what happens when they arrive faster than 48000 a second: the write blocks,
+// nothing is read from the socket, the receive window closes, and the SERVER
+// stops sending. The hardware clock ends up pacing a TCP connection across
+// the network, with no rate limiter anywhere and nothing negotiating it.
+//
+// WHAT IT WILL NOT DO. If the audio's sample rate is not the device's, aplay
+// refuses and says so. Resampling is a decision with trade-offs — which
+// filter, how much aliasing, how much latency — and decisions are policy.
+// Mono IS widened to stereo, because duplicating a channel is exact and
+// loses nothing.
 
 use "../../../Caustic/std/causticos/prog.cst" as prog;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
 use "../lib/wav/wav.cst" as wav;
 use "../lib/sndcli/sndcli.cst" as snd;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/conn.cst" as cn;
+use "../lib/netcli/netsvc.cst" as netsvc;
+use "../lib/http/url.cst" as url;
+use "../lib/http/http.cst" as http;
+use "../lib/tls/tls13.cst" as tls;
+use "../lib/x509/trust.cst" as trust;
 
-// One period at 48 kHz stereo is 2 KiB; this is a comfortable multiple and
-// keeps the syscall count down without making any single write long enough
-// to matter.
-let is i64 as CHUNK_FRAMES = 2048;
-let is [8192]u8 as stereo;          // CHUNK_FRAMES * 4 bytes, for the mono widen
+let is i64 as CHUNK_FRAMES = 1024;
+let is [4096]u8 as stereo;            // CHUNK_FRAMES * 4
+let is [24]u8 as numbuf;
 
-// The one line a machine reads. It goes to the terminal for the person and to
-// the serial port for scripts/test-audio.sh, which is on the host and has no
-// other way to learn what happened in here — the same reason httpd announces
-// "listening" on the serial line. One line, at the end, saying what the
-// program did or why it did not.
+// The stream's first bytes, held until the RIFF header is complete. A WAV is a
+// chunk list, so `data` is not at a fixed offset and how much has to arrive
+// before playback can start is not known in advance.
+let is i64 as HDRBUF_CAP = 8192;
+let is [8192]u8 as hdrbuf;
+
+// One transfer's worth of body at a time. Big, because every read is a round
+// trip through netd's channel and the per-message cost dominates a small one:
+// the network is what has to keep ahead of a converter that never waits.
+let is i64 as NETBUF_CAP = 65536;
+let is [65536]u8 as netbuf;
+
+// Network plumbing, all of it wget's shape.
+let is cn.Conn as conn with mut;
+let is cn.Conn as raw with mut;
+let is tls.Tls as tlsctx with mut;
+let is http.Resp as resp with mut;
+let is [2048]u8 as reqbuf;
+let is [1024]u8 as urlbuf;
+
 fn report(msg as *u8) as void {
     prog.outs(msg);
     let is i64 as n with mut = 0;
@@ -45,8 +70,6 @@ fn report(msg as *u8) as void {
     sys.write_serial(msg, n);
     return;
 }
-
-let is [24]u8 as numbuf;
 
 fn num(v as i64) as *u8 {
     let is i64 as x with mut = v;
@@ -69,65 +92,425 @@ fn die(msg as *u8) as i32 {
 }
 
 fn usage() as i32 {
-    prog.outs("usage: aplay [-d INDEX] [-m] FILE.wav\n");
+    prog.outs("usage: aplay [-d INDEX] [-m] FILE.wav | URL\n");
     prog.outs("  -d INDEX   playback device (default 0)\n");
     prog.outs("  -m         through soundd, so others stay audible\n");
-    prog.outs("             (without it, aplay takes the stream and everything\n");
-    prog.outs("              else goes quiet until it exits)\n");
+    prog.outs("  URL        http:// or https:// — played while it arrives\n");
     return cast(i32, 2);
 }
 
-// Through the mixer. The whole difference from the direct path is who owns the
-// stream: here soundd does, this is one of several voices in it, and the
-// hardware clock reaches back through a blocking channel write instead of a
-// blocking device write. The pacing is identical and neither loop has a timer.
-fn play_mixed(src as i64, w as *wav.Wav) as i32 {
-    if (snd.adopt() != 0) { return die("no soundd on this channel"); }
-    if (w.rate != snd.rate()) {
-        report("aplay: the file is ");
+// ============================================================
+// The destination
+//
+// One pair of calls whichever it is, so the two sources below are written once
+// rather than twice. The difference is only who owns the stream.
+// ============================================================
+
+let is i64 as sink_mixed with mut = 0;
+let is i64 as sink_fd with mut = 0 - 1;
+let is i64 as sink_rate with mut = 0;
+let is i64 as sink_channels with mut = 0;
+let is i64 as sink_frame_bytes with mut = 0;
+let is i64 as sink_period with mut = 0;
+let is i64 as sink_written with mut = 0;
+// Time spent INSIDE the network read, and the bytes it produced. Reported
+// separately from the wall clock because they answer different questions: the
+// wall clock says whether the stream kept up, and this says whether the source
+// could have. Mixing them made a source running at 49 KiB/s look like 95.
+let is i64 as net_ns with mut = 0;
+let is i64 as net_bytes with mut = 0;
+
+fn sink_open(mixed as i64, dev as i64) as i64 {
+    sink_mixed = mixed;
+    sink_written = 0;
+    if (mixed == 1) {
+        if (snd.adopt() != 0) { return 0 - 1; }
+        sink_rate = snd.rate();
+        sink_channels = snd.channels();
+        sink_frame_bytes = snd.frame_bytes();
+        sink_period = 0;
+        if (snd.open(1) != 0) { return 0 - 2; }
+        return 0;
+    }
+    sink_fd = sys.dev_open(sys.DEV_AUDIO_OUT, dev, 0);
+    if (sink_fd < 0) { return 0 - 1; }
+    let is [20]i64 as info;
+    if (sys.audio_info(sink_fd, cast(*i64, &info[0])) != 0) { return 0 - 2; }
+    sink_rate = info[0];
+    sink_channels = info[1];
+    sink_frame_bytes = info[3];
+    sink_period = info[4];
+    return 0;
+}
+
+// Frames of room in the destination, without writing anything.
+//
+// This is what makes streaming possible at all. A blocking write paces a file
+// player perfectly — it is the hardware clock and there is nothing better to
+// wait on — but in a network player it is a disaster: while the write blocks,
+// nothing is read from the socket, so the source and the sink take turns
+// instead of running at once. Source and sink each managed about 94 KiB/s here
+// and taking turns made that 47, so three seconds of audio arrived over six
+// and the converter spent half of them playing silence.
+//
+// Knowing the room turns the write into something that never blocks, and the
+// two halves overlap.
+fn sink_room() as i64 {
+    if (sink_mixed == 1) { return CHUNK_FRAMES; }   // soundd's channel does the blocking
+    let is [20]i64 as now;
+    if (sys.audio_info(sink_fd, cast(*i64, &now[0])) != 0) { return 0; }
+    let is i64 as ahead = now[12] - now[11];        // app_ptr - hw_ptr
+    let is i64 as room = now[6] - ahead;            // buffer_frames - what is queued
+    if (room < 0) { return 0; }
+    return room;
+}
+
+// Blocks at the speed of the hardware clock, whichever destination this is:
+// directly on the device's ring, or on a channel soundd has stopped reading.
+fn sink_write(pcm as *u8, bytes as i64) as i64 {
+    if (sink_mixed == 1) {
+        if (snd.write(1, pcm, bytes) < 0) { return 0 - 1; }
+    } else {
+        if (sys.write(sink_fd, pcm, bytes) != bytes) { return 0 - 1; }
+    }
+    sink_written = sink_written + bytes / sink_frame_bytes;
+    return bytes;
+}
+
+// Finish on a period boundary and wait for the tail to actually come out.
+// Closing early would stop the engine with up to a ring of audio unplayed.
+fn sink_finish() as i64 {
+    if (sink_mixed == 1) {
+        snd.drain(1, 10000000000);
+        snd.close(1);
+        return 0;
+    }
+    // A file whose length is not a whole number of periods leaves the last one
+    // partly written, and the hardware plays the hole at the end of it.
+    // Writing the silence deliberately says "this is the end" rather than
+    // leaving it to look like the program was late.
+    let is i64 as pad = (sink_period - (sink_written % sink_period)) % sink_period;
+    if (pad > 0 && pad * sink_frame_bytes <= 4096) {
+        let is i64 as z with mut = 0;
+        while (z < pad * sink_frame_bytes) { stereo[z] = cast(u8, 0); z = z + 1; }
+        sys.write(sink_fd, cast(*u8, &stereo[0]), pad * sink_frame_bytes);
+        sink_written = sink_written + pad;
+    }
+    // There is no drain verb because there does not need to be one: the stream
+    // is finished when the hardware cursor reaches the application cursor, and
+    // audio_info reports both. This is the one thing a write-mode program
+    // cannot see any other way, since it never maps the control page.
+    let is [20]i64 as now;
+    let is i64 as deadline = sys.time_ns() + 10000000000;
+    let is i64 as draining with mut = 1;
+    while (draining == 1 && sys.time_ns() < deadline) {
+        if (sys.audio_info(sink_fd, cast(*i64, &now[0])) != 0) { draining = 0; }
+        else if (now[11] >= now[12]) { draining = 0; }
+        else { sys.sleep_ns(2000000); }
+    }
+    let is i64 as xruns = now[13];
+    sys.close(sink_fd);
+    sink_fd = 0 - 1;
+    return xruns;
+}
+
+fn sink_accepts(w as *wav.Wav) as i32 {
+    if (w.rate != sink_rate) {
+        report("aplay: the audio is ");
         report(num(w.rate));
-        report(" Hz and soundd is mixing at ");
-        report(num(snd.rate()));
+        report(" Hz and the output is ");
+        report(num(sink_rate));
         report(" Hz\n");
+        report("aplay: resampling is soundd's job, not this program's\n");
         return cast(i32, 1);
     }
-    if (snd.channels() != 2) { return die("soundd is not mixing in stereo"); }
-    if (snd.open(1) != 0) { return die("soundd refused the stream"); }
+    if (sink_channels != 2 || sink_frame_bytes != 4) {
+        return die("this output is not 16-bit stereo");
+    }
+    return cast(i32, 0);
+}
 
-    let is i64 as left with mut = w.frames;
+// Hand `frames` of the source's PCM to the destination, widening mono on the
+// way through.
+fn feed(src as i64, frames as i64, w as *wav.Wav) as i64 {
     let is i64 as done with mut = 0;
-    while (left > 0) {
-        let is i64 as take with mut = left;
+    while (done < frames) {
+        let is i64 as take with mut = frames - done;
         if (take > CHUNK_FRAMES) { take = CHUNK_FRAMES; }
         let is i64 as rc with mut = 0;
         if (w.channels == 1) {
             wav.mono_to_stereo(cast(*u8, src + done * 2), cast(*u8, &stereo[0]), take);
-            rc = snd.write(1, cast(*u8, &stereo[0]), take * 4);
+            rc = sink_write(cast(*u8, &stereo[0]), take * 4);
         } else {
-            rc = snd.write(1, cast(*u8, src + done * w.frame_bytes),
-                           take * w.frame_bytes);
+            rc = sink_write(cast(*u8, src + done * w.frame_bytes),
+                            take * w.frame_bytes);
         }
-        if (rc < 0) { snd.close(1); return die("soundd stopped listening"); }
+        if (rc < 0) { return 0 - 1; }
         done = done + take;
-        left = left - take;
     }
-    // soundd says when the samples are mixed out; the converter's own buffer
-    // still follows, and only soundd knows how deep that is — so it is asked
-    // rather than guessed at.
-    snd.drain(1, 5000000000);
-    snd.close(1);
+    return done;
+}
+
+// ============================================================
+// Source: a file
+// ============================================================
+
+fn play_file(path as *u8, mixed as i64, dev as i64) as i32 {
+    // The file BEFORE the device. A stream is a clock: it starts when it is
+    // acquired and plays silence until something feeds it, so every
+    // millisecond spent reading with the device already open is silence at the
+    // front of what comes out.
+    let is i64 as flen with mut = 0;
+    let is i64 as img = fu.slurp(path, &flen);
+    if (img == 0 || flen <= 0) { return die("cannot read that file"); }
+
+    let is wav.Wav as w;
+    let is i64 as rc = wav.parse(cast(*u8, img), flen, &w);
+    if (rc != wav.WAV_OK) { fu.unslurp(img, flen); return die(wav.reason(rc)); }
+
+    if (sink_open(mixed, dev) != 0) {
+        fu.unslurp(img, flen);
+        if (mixed == 1) { return die("no soundd on this channel"); }
+        return die("no playback device");
+    }
+    let is i32 as arc = sink_accepts(&w);
+    if (arc != cast(i32, 0)) { fu.unslurp(img, flen); return arc; }
+
+    let is i64 as got = feed(img + w.data_off, w.frames, &w);
+    fu.unslurp(img, flen);
+    if (got < 0) { return die("the output stopped accepting samples"); }
+
+    let is i64 as xruns = sink_finish();
     report("aplay: played ");
-    report(num(done));
-    report(" frames through soundd at ");
-    report(num(snd.rate()));
+    report(num(sink_written));
+    report(" frames at ");
+    report(num(sink_rate));
     report(" Hz\n");
+    if (xruns > 1) {
+        report("aplay: ");
+        report(num(xruns - 1));
+        report(" underruns\n");
+    }
     return cast(i32, 0);
 }
+
+// ============================================================
+// Source: the network
+// ============================================================
+
+fn net_close(s as i64) as void {
+    cn.close(&conn);
+    if (s >= 0) { nc.close(s); }
+    return;
+}
+
+fn play_url(u as *u8, mixed as i64, dev as i64) as i32 {
+    let is url.Url as parsed;
+    if (url.parse(u, prog.slen(u), &parsed) != 0) {
+        return die("that is not a url I can fetch");
+    }
+    if (netsvc.adopt() != 0) { return die("no network on this channel"); }
+
+    let is i64 as ip = nc.resolve(url.host_ptr(&parsed), parsed.hostlen);
+    if (ip == 0) { return die("cannot resolve that host"); }
+    let is i64 as s = nc.dial(ip, parsed.port, &raw);
+    if (s < 0) { return die("connection failed"); }
+
+    // The one line the Conn abstraction exists for: everything below is
+    // identical either way, and the streaming loop never learns whether there
+    // is a TLS session inside the connection.
+    if (parsed.scheme == url.HTTPS) {
+        if (tls.client(&tlsctx, &raw, url.host_ptr(&parsed),
+                       parsed.hostlen, &conn) != tls.OK) {
+            nc.close(s);
+            return die("tls handshake failed");
+        }
+    } else {
+        conn = raw;
+    }
+
+    // The default port is passed as the port itself when it IS the default, so
+    // build_request omits it from the Host header — RFC 7230 §5.4, and virtual
+    // hosts that match on the literal string break when it is sent anyway.
+    let is i64 as defport with mut = parsed.port;
+    if (url.port_is_default(&parsed) == 0) { defport = 0 - 1; }
+    let is i64 as rlen = http.build_request(cast(*u8, &reqbuf[0]), 2048,
+                                            cast(*u8, "GET"),
+                                            url.host_ptr(&parsed), parsed.hostlen,
+                                            parsed.port, defport,
+                                            url.path_ptr(&parsed), parsed.pathlen);
+    if (rlen <= 0) { net_close(s); return die("url too long for a request"); }
+    if (cn.write_all(&conn, cast(*u8, &reqbuf[0]), rlen) != rlen) {
+        net_close(s);
+        return die("could not send the request");
+    }
+    let is i64 as st = http.read_head(&resp, &conn, 0);
+    if (st < 0) { net_close(s); return die("bad response"); }
+    if (st != 200) {
+        report("aplay: the server said ");
+        report(num(st));
+        report("\n");
+        net_close(s);
+        return cast(i32, 1);
+    }
+
+    // ACCUMULATE UNTIL THE HEADER IS WHOLE. A WAV is a chunk list, so how many
+    // bytes have to arrive before the samples begin is not known in advance —
+    // it depends on what the encoder put in front of them. Reading until parse
+    // succeeds is the only way that does not assume a layout.
+    let is i64 as have with mut = 0;
+    let is wav.Wav as w;
+    let is i64 as parsed_ok with mut = 0;
+    while (parsed_ok == 0 && have < HDRBUF_CAP) {
+        let is i64 as n = http.read_body(&resp, &conn,
+                                         cast(*u8, &hdrbuf[have]), HDRBUF_CAP - have);
+        if (n <= 0) { break; }
+        have = have + n;
+        if (wav.parse(cast(*u8, &hdrbuf[0]), have, &w) == wav.WAV_OK) { parsed_ok = 1; }
+    }
+    if (parsed_ok == 0) { net_close(s); return die("that url is not a WAV I can play"); }
+
+    if (sink_open(mixed, dev) != 0) {
+        net_close(s);
+        if (mixed == 1) { return die("no soundd on this channel"); }
+        return die("no playback device");
+    }
+    let is i32 as arc = sink_accepts(&w);
+    if (arc != cast(i32, 0)) { net_close(s); return arc; }
+
+    report("aplay: streaming ");
+    report(num(w.rate));
+    report(" Hz x");
+    report(num(w.channels));
+    report("\n");
+    let is i64 as t_start = sys.time_ns();
+
+    // A BUFFER OF ITS OWN, and a head start before the first sample plays.
+    //
+    // The source arrives at about the rate the converter consumes, so there is
+    // no margin: one slow read and the ring is empty. Every player that has
+    // ever streamed anything solves this the same way — get some audio in hand
+    // first, then keep topping it up — and the only thing that makes it
+    // STREAMING rather than downloading is that playback starts while the rest
+    // is still on the wire.
+    let is i64 as bufcap = 1048576;
+    let is i64 as buf = sys.mmap(cast(i64, 0), bufcap, sys.PROT_READ | sys.PROT_WRITE);
+    if (buf < 0) { net_close(s); return die("cannot allocate a stream buffer"); }
+    let is i64 as head with mut = 0;        // bytes consumed
+    let is i64 as tail with mut = 0;        // bytes held
+
+    // Whatever arrived with the header is already PCM.
+    let is i64 as lead = have - w.data_off;
+    if (lead > 0) {
+        let is i64 as k with mut = 0;
+        while (k < lead) {
+            let is *u8 as d = cast(*u8, buf + k);
+            d[0] = hdrbuf[w.data_off + k];
+            k = k + 1;
+        }
+        tail = lead;
+    }
+
+    let is i64 as prebuffer = w.rate * w.frame_bytes / 2;   // half a second
+    let is i64 as eof with mut = 0;
+    let is i64 as failed with mut = 0;
+
+    while (failed == 0 && (eof == 0 || tail > head)) {
+        // Top up, unless the buffer is full or the source has ended.
+        if (eof == 0 && tail < bufcap) {
+            if (head > 0 && bufcap - tail < NETBUF_CAP) {
+                // Slide what is left down rather than stopping: a stream is
+                // longer than any buffer somebody picked.
+                let is i64 as k with mut = 0;
+                while (head + k < tail) {
+                    let is *u8 as d = cast(*u8, buf + k);
+                    let is *u8 as sq = cast(*u8, buf + head + k);
+                    d[0] = sq[0];
+                    k = k + 1;
+                }
+                tail = tail - head;
+                head = 0;
+            }
+            // Small reads, deliberately. A read is the one thing in this loop
+            // that blocks, and the converter drains for as long as it lasts:
+            // 64 KiB at the rate this link manages is seven tenths of a
+            // second against a ring that holds 149 ms. Eight is about 85 ms,
+            // which the ring covers with room to spare.
+            let is i64 as want with mut = bufcap - tail;
+            if (want > 8192) { want = 8192; }
+            if (want > 0) {
+                let is i64 as t0 = sys.time_ns();
+                let is i64 as n = http.read_body(&resp, &conn, cast(*u8, buf + tail), want);
+                net_ns = net_ns + (sys.time_ns() - t0);
+                if (n <= 0) { eof = 1; }
+                else { tail = tail + n; net_bytes = net_bytes + n; }
+            }
+        }
+        // Play what fits, without waiting: the read above is what the ring is
+        // covering for.
+        if (tail - head >= prebuffer || eof == 1) {
+            let is i64 as room with mut = sink_room();
+            let is i64 as avail = (tail - head) / w.frame_bytes;
+            // As much as the destination will take, not a fixed chunk. The
+            // point of every pass is to leave the ring as full as it can be
+            // before blocking on the socket again.
+            let is i64 as take with mut = avail;
+            if (take > room) { take = room; }
+            if (take > 0) {
+                if (feed(buf + head, take, &w) < 0) { failed = 1; }
+                head = head + take * w.frame_bytes;
+            } else if (eof == 1 && avail == 0) {
+                failed = 2;
+            } else {
+                // Nothing to do but let the converter catch up. poll is the
+                // "wait for the next period" primitive an audio fd exists to
+                // provide; without it this would spin.
+                if (sink_mixed == 0) {
+                    let is [3]i64 as pe;
+                    pe[0] = sink_fd; pe[1] = sys.POLL_WRITABLE; pe[2] = 0;
+                    sys.poll(cast(*i64, &pe[0]), 1, 20000000);
+                }
+            }
+        }
+    }
+    sys.munmap(buf, bufcap);
+    net_close(s);
+    if (failed == 1) { return die("the output stopped accepting samples"); }
+
+    let is i64 as elapsed = sys.time_ns() - t_start;
+    let is i64 as xruns = sink_finish();
+    report("aplay: streamed ");
+    report(num(sink_written));
+    report(" frames at ");
+    report(num(sink_rate));
+    report(" Hz in ");
+    report(num(elapsed / 1000000));
+    report(" ms (");
+    // The rate the SOURCE managed, which is the number that decides whether a
+    // stream can play in real time at all. Below the audio's own bitrate, the
+    // converter is waiting on the network and no buffer can fix it.
+    let is i64 as kbs with mut = 0;
+    if (net_ns > 1000000) { kbs = net_bytes * 1000 / (net_ns / 1000000) / 1024; }
+    report(num(kbs));
+    report(" KiB/s from the network, ");
+    report(num(net_ns / 1000000));
+    report(" ms of it)\n");
+    // An underrun here is the network having failed to keep up with the
+    // converter, which is the one thing worth knowing about a stream.
+    if (xruns > 1) {
+        report("aplay: ");
+        report(num(xruns - 1));
+        report(" underruns\n");
+    }
+    return cast(i32, 0);
+}
+
+// ============================================================
 
 fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as dev with mut = 0;
     let is i64 as mixed with mut = 0;
-    let is *u8 as path with mut = cast(*u8, 0);
+    let is *u8 as target with mut = cast(*u8, 0);
 
     let is i64 as i with mut = 1;
     while (i < argc) {
@@ -142,157 +525,25 @@ fn main(argc as i64, argv as *u8) as i32 {
         } else if (a[0] == cast(u8, 45)) {
             return usage();
         } else {
-            path = a;
+            target = a;
         }
         i = i + 1;
     }
-    if (cast(i64, path) == 0) { return usage(); }
+    if (cast(i64, target) == 0) { return usage(); }
 
-    // Read the file BEFORE opening the device. The stream is a clock: it
-    // starts the moment it is acquired and plays silence until something
-    // feeds it, so every millisecond spent reading a file with the device
-    // already open is a millisecond of silence at the front of the recording.
-    let is i64 as flen with mut = 0;
-    let is i64 as img = fu.slurp(path, &flen);
-    if (img == 0 || flen <= 0) { return die("cannot read that file"); }
-
-    let is wav.Wav as w;
-    let is i64 as rc = wav.parse(cast(*u8, img), flen, &w);
-    if (rc != wav.WAV_OK) {
-        fu.unslurp(img, flen);
-        return die(wav.reason(rc));
+    // A URL or a path, told apart by the scheme rather than by guessing.
+    let is i64 as tlen = prog.slen(target);
+    if (tlen > 6 && target[0] == cast(u8, 104) && target[1] == cast(u8, 116)
+        && target[2] == cast(u8, 116) && target[3] == cast(u8, 112)) {
+        let is i64 as k with mut = 0;
+        while (k < tlen && k < 1023) { urlbuf[k] = target[k]; k = k + 1; }
+        urlbuf[k] = cast(u8, 0);
+        // https refuses outright without a trust store, which is the right
+        // answer: a client that cannot check a certificate and connects anyway
+        // is worse than plain http, because plain http does not claim to be
+        // secure.
+        trust.load(cast(*u8, "/etc/ca.pem"));
+        return play_url(cast(*u8, &urlbuf[0]), mixed, dev);
     }
-
-    if (mixed == 1) {
-        let is i32 as mrc = play_mixed(img + w.data_off, &w);
-        fu.unslurp(img, flen);
-        return mrc;
-    }
-
-    let is i64 as fd = sys.dev_open(sys.DEV_AUDIO_OUT, dev, 0);
-    if (fd < 0) {
-        fu.unslurp(img, flen);
-        return die("no playback device");
-    }
-
-    // AUDIO_INFO_WORDS, exactly. The kernel writes all of them, so a shorter
-    // array here is 32 bytes of somebody else's stack overwritten on every
-    // call — silently, and only sometimes fatally, which is the worst kind.
-    let is [20]i64 as info;
-    if (sys.audio_info(fd, cast(*i64, &info[0])) != 0) {
-        sys.close(fd);
-        fu.unslurp(img, flen);
-        return die("the device would not describe itself");
-    }
-    let is i64 as dev_rate = info[0];
-    let is i64 as dev_channels = info[1];
-    let is i64 as dev_frame_bytes = info[3];
-
-    if (w.rate != dev_rate) {
-        report("aplay: the file is ");
-        report(num(w.rate));
-        report(" Hz and the device is ");
-        report(num(dev_rate));
-        report(" Hz\n");
-        report("aplay: resampling is soundd's job, not this program's\n");
-        sys.close(fd);
-        fu.unslurp(img, flen);
-        return cast(i32, 1);
-    }
-    if (dev_channels != 2 || dev_frame_bytes != 4) {
-        sys.close(fd);
-        fu.unslurp(img, flen);
-        return die("this device is not 16-bit stereo");
-    }
-
-    // Feed it. write() blocks while the ring is full, which is exactly the
-    // pacing this wants: the loop runs at the speed of the hardware clock and
-    // needs no timer of its own.
-    let is i64 as src = img + w.data_off;
-    let is i64 as left with mut = w.frames;
-    let is i64 as done with mut = 0;
-    let is i64 as failed with mut = 0;
-    while (left > 0 && failed == 0) {
-        let is i64 as take with mut = left;
-        if (take > CHUNK_FRAMES) { take = CHUNK_FRAMES; }
-        let is i64 as wrote with mut = 0;
-        if (w.channels == 1) {
-            wav.mono_to_stereo(cast(*u8, src + done * 2), cast(*u8, &stereo[0]), take);
-            wrote = sys.write(fd, cast(*u8, &stereo[0]), take * 4);
-        } else {
-            wrote = sys.write(fd, cast(*u8, src + done * w.frame_bytes),
-                              take * w.frame_bytes);
-        }
-        if (wrote <= 0) { failed = 1; }
-        else {
-            let is i64 as got = wrote / dev_frame_bytes;
-            done = done + got;
-            left = left - got;
-        }
-    }
-    fu.unslurp(img, flen);
-
-    if (failed != 0) {
-        sys.close(fd);
-        return die("the device stopped accepting samples");
-    }
-
-    // Finish on a period boundary. A file whose length is not a whole number
-    // of periods leaves the last one partly written, and the hardware enters
-    // it with a hole at the end — a real underrun, of a few hundred inaudible
-    // samples, counted like any other. Writing the silence deliberately says
-    // "this is the end of the file" instead of leaving it to look like the
-    // program was late.
-    let is i64 as pf = info[4];
-    let is i64 as pad = (pf - (done % pf)) % pf;
-    if (pad > 0) {
-        let is i64 as z with mut = 0;
-        while (z < pad * dev_frame_bytes) { stereo[z] = cast(u8, 0); z = z + 1; }
-        if (sys.write(fd, cast(*u8, &stereo[0]), pad * dev_frame_bytes) > 0) {
-            done = done + pad;
-        }
-    }
-
-    // Drain. Closing straight after the last write would stop the engine with
-    // up to a buffer of audio — 149 ms — still sitting in the ring unplayed,
-    // and the file would simply end early with nothing to explain it.
-    //
-    // There is no drain verb because there does not need to be one: the
-    // stream is finished when the hardware cursor reaches the application
-    // cursor, and audio_info reports both. This is the one thing a
-    // write-mode program cannot see any other way, since it never maps the
-    // control page.
-    let is [20]i64 as now;
-    let is i64 as deadline = sys.time_ns() + 5000000000;
-    let is i64 as drained with mut = 0;
-    while (drained == 0 && sys.time_ns() < deadline) {
-        if (sys.audio_info(fd, cast(*i64, &now[0])) != 0) { drained = 1; }
-        else if (now[11] >= now[12]) { drained = 1; }
-        else { sys.sleep_ns(2000000); }
-    }
-
-    let is i64 as xruns = now[13];
-    sys.close(fd);
-    report("aplay: played ");
-    report(num(done));
-    report(" frames at ");
-    report(num(dev_rate));
-    report(" Hz");
-    // Reported, not hidden. An underrun is audible — it is the click in the
-    // middle — and a player that knew and said nothing would leave the person
-    // listening to guess whether their file or their machine was at fault.
-    //
-    // One is the end of the file. The engine runs until the fd closes, so it
-    // always enters one period past the last sample with nothing in it; a
-    // program that maps the ring declares AUDIO_APP_DRAINING and avoids even
-    // that, but this one writes and has no page to declare it on. Printing
-    // that one every single time would teach everybody to ignore the line,
-    // which is exactly how a real underrun goes unnoticed.
-    if (xruns > 1) {
-        report(", ");
-        report(num(xruns - 1));
-        report(" underruns");
-    }
-    report("\n");
-    return cast(i32, 0);
+    return play_file(target, mixed, dev);
 }

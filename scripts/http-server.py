@@ -27,6 +27,7 @@ Exits on its own after the timeout so a stuck test cannot leave it running.
 """
 
 import socket
+import os
 import socketserver
 import ssl
 import sys
@@ -36,6 +37,11 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 17780
 TIMEOUT = float(sys.argv[2]) if len(sys.argv) > 2 else 120.0
 CERT = sys.argv[3] if len(sys.argv) > 3 else None
 KEY = sys.argv[4] if len(sys.argv) > 4 else None
+# A directory of REAL files to serve, for tests whose subject is the content
+# rather than the protocol — the audio stream needs a WAV the host generated
+# and the guest has never seen. Synthetic paths still win, so nothing that
+# already depends on this server changes.
+SERVE_DIR = sys.argv[5] if len(sys.argv) > 5 else "build"
 
 BLOB_LEN = 65536
 CHUNKED_LEN = 5000
@@ -166,10 +172,21 @@ class Handler(socketserver.StreamRequestHandler):
                 self.wfile.write(body)
 
         else:
-            body = b"unknown path\n"
-            self.wfile.write(self.head(404, "Not Found", body_len=len(body)))
-            if not is_head:
-                self.wfile.write(body)
+            # A real file, if there is one by that name. basename only: this is
+            # a test server, but a test server that can be talked out of its
+            # own directory is a bad habit to leave lying around.
+            name = os.path.basename(path.lstrip("/"))
+            full = os.path.join(SERVE_DIR, name) if name else ""
+            if full and os.path.isfile(full):
+                data = open(full, "rb").read()
+                self.wfile.write(self.head(200, "OK", body_len=len(data)))
+                if not is_head:
+                    self.wfile.write(data)
+            else:
+                body = b"unknown path\n"
+                self.wfile.write(self.head(404, "Not Found", body_len=len(body)))
+                if not is_head:
+                    self.wfile.write(body)
 
         try:
             self.wfile.flush()

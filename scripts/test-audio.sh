@@ -91,7 +91,10 @@ type_line "aplay /tone.wav"
 
 DONE=0
 for _ in $(seq 1 400); do
-    if tr -d '\000' < "$LOG" | grep -qE "aplay: (played|.*)"; then DONE=1; break; fi
+    # The outcomes, not any line at all: (played|.*) matches everything.
+    if tr -d '\000' < "$LOG" | grep -qE "^aplay: played |^aplay: [a-z].*(failed|cannot|not |no )"; then
+        DONE=1; break
+    fi
     kill -0 $QPID 2>/dev/null || break
     sleep 0.1
 done
