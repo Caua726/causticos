@@ -139,50 +139,57 @@ DRIVEN=(
 )
 
 # AT THE SAME TIME. They are separate machines with separate disk images and
-# separate port forwards, so nothing about them is sequential except that they
-# used to be — and eight boots in a row was most of the wall clock. The cap is
-# a core each, less two for the host.
+# separate port forwards, so nothing about them was ever sequential except that
+# they used to be — eight boots in a row was most of the wall clock.
+#
+# xargs does the pooling. A hand-rolled one built on `wait -n` looked right and
+# did not finish: the driven set took longer under it than run one at a time,
+# for reasons not worth chasing when the tool that does this correctly has
+# been in every unix for thirty years.
 NJOBS="${JOBS:-}"
 if [ -z "$NJOBS" ]; then
-    NJOBS=$(( $(nproc 2>/dev/null || echo 4) - 2 ))
+    NJOBS=$(( $(nproc 2>/dev/null || echo 4) / 2 ))
     [ "$NJOBS" -lt 2 ] && NJOBS=2
     [ "$NJOBS" -gt 6 ] && NJOBS=6
 fi
 RES=$(mktemp -d)
-
-run_driven() {
-    local name="$1" script="$2" note="$3" port="$4"
-    local t0=$SECONDS rc=0
-    QEMU_HTTPD_PORT="$port" bash "$script" >/tmp/ut-$name.log 2>&1 || rc=1
-    local label="$note"
-    case "$note" in
-        @*) label=$(eval "${note#@}" < /tmp/ut-$name.log | head -1 || true) ;;
-    esac
-    printf '%s|%s|%s\n' "$rc" "$label" "$((SECONDS-t0))" > "$RES/$name"
-}
+PLAN=$(mktemp)
 
 PORT=18120
 for entry in "${DRIVEN[@]}"; do
     name="${entry%%|*}"; rest="${entry#*|}"
-    script="${rest%%|*}"; note="${rest#*|}"
+    script="${rest%%|*}"
     PORT=$((PORT+1))
-    while [ "$(jobs -rp | wc -l)" -ge "$NJOBS" ]; do wait -n 2>/dev/null || break; done
-    run_driven "$name" "$script" "$note" "$PORT" &
+    printf '%s %s %s\n' "$PORT" "$name" "$script" >> "$PLAN"
 done
-wait
+
+RES="$RES" xargs -P "$NJOBS" -L 1 bash -c '
+    t0=$SECONDS
+    rc=0
+    QEMU_HTTPD_PORT=$0 bash "$2" >/tmp/ut-$1.log 2>&1 || rc=1
+    printf "%s|%s\n" "$rc" "$((SECONDS-t0))" > "$RES/$1"
+' < "$PLAN"
+rm -f "$PLAN"
 
 # Reported in list order, not completion order: a suite whose output shuffles
 # between runs cannot be diffed against the last one.
 for entry in "${DRIVEN[@]}"; do
-    name="${entry%%|*}"
+    name="${entry%%|*}"; rest="${entry#*|}"; note="${rest#*|}"
     printf '%-9s ' "$name"
     if [ ! -f "$RES/$name" ]; then
         echo "FAIL  (never reported)"
         FAIL=$((FAIL+1)); FAILED="$FAILED $name"
         continue
     fi
-    IFS='|' read -r rc label secs < "$RES/$name"
+    IFS='|' read -r rc secs < "$RES/$name"
     if [ "$rc" = 0 ]; then
+        label="$note"
+        # A note beginning with @ pulls the number out of the log, so a test
+        # reports what it MEASURED rather than a fixed sentence that stays true
+        # after the measuring stops happening.
+        case "$note" in
+            @*) label=$(eval "${note#@}" < /tmp/ut-$name.log | head -1 || true) ;;
+        esac
         echo "PASS ($label, ${secs}s)"
         PASS=$((PASS+1))
     else
