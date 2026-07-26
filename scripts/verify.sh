@@ -58,7 +58,8 @@ for i in $(seq 1 "$RUNS"); do
       break
     fi
     if echo "$OUT" | grep -qE "ALL PHASE-6 TESTS PASS|vfs\.test: ALL PASS" \
-       && echo "$OUT" | grep -qE "netdev_smoke: (PASS|FAIL)"; then
+       && echo "$OUT" | grep -qE "netdev_smoke: (PASS|FAIL)" \
+       && echo "$OUT" | grep -qE "audio_smoke: (PASS|FAIL)"; then
       break
     fi
     if [ "$SECONDS" -ge "$DEADLINE" ]; then
@@ -72,30 +73,45 @@ for i in $(seq 1 "$RUNS"); do
   RAW=$(tr -d '\000' < "$TMPLOG")
   rm -f "$TMPLOG"
 
-  if echo "$RAW" | grep -qE "EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted"; then
+  # Keep the serial log of anything that did not pass. A sweep that reports
+  # one failure in twenty and then deletes the only evidence of it makes that
+  # failure unfalsifiable: you get to guess, re-run, and watch it not happen.
+  KEEP="/tmp/verify-fail-smp$SMP-run$i.log"
+  rm -f "$KEEP"
+  fail() {
     FAIL=$((FAIL+1))
-    REASON=$(echo "$RAW" | grep -E "EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted" | head -1)
-    echo "  smp=$SMP run=$i: FAIL $REASON"
+    printf '%s' "$RAW" > "$KEEP"
+    echo "  smp=$SMP run=$i: FAIL $1  (log: $KEEP)"
+  }
+
+  if echo "$RAW" | grep -qE "EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted"; then
+    fail "$(echo "$RAW" | grep -E "EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted" | head -1)"
   elif echo "$RAW" | grep -q "ALL PHASE-6 TESTS PASS"; then
     # Every marker is required, not any one of them. A smoke that stops
     # printing because it stopped running would otherwise leave the sweep
     # green, which is worse than having no smoke at all.
+    #
+    # "did not report PASS" and "reported FAIL" are told apart, because they
+    # send you to opposite places: one is a smoke that ran out of time or died,
+    # the other is a smoke that ran and found something.
     if ! echo "$RAW" | grep -q "vfs: mounted /"; then
-      FAIL=$((FAIL+1))
-      echo "  smp=$SMP run=$i: FAIL no-vfs"
+      fail no-vfs
+    elif echo "$RAW" | grep -q "netdev_smoke: FAIL"; then
+      fail "netdev-smoke-failed"
     elif ! echo "$RAW" | grep -q "netdev_smoke: PASS"; then
-      FAIL=$((FAIL+1))
-      echo "  smp=$SMP run=$i: FAIL no-netdev"
+      fail no-netdev
     elif ! echo "$RAW" | grep -q "virtio_chain_smoke: PASS"; then
-      FAIL=$((FAIL+1))
-      echo "  smp=$SMP run=$i: FAIL no-virtio-chain"
+      fail no-virtio-chain
+    elif echo "$RAW" | grep -q "audio_smoke: FAIL"; then
+      fail "audio-smoke-failed"
+    elif ! echo "$RAW" | grep -q "audio_smoke: PASS"; then
+      fail no-audio
     else
       PASS=$((PASS+1))
       echo "  smp=$SMP run=$i: PASS"
     fi
   else
-    FAIL=$((FAIL+1))
-    echo "  smp=$SMP run=$i: FAIL no-phase6 (timeout?)"
+    fail "no-phase6 (timeout?)"
   fi
 done
 echo "=== -smp $SMP: $PASS/$((PASS+FAIL)) PASS ==="

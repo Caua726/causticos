@@ -1,0 +1,1181 @@
+// audio.cst — an audio stream: a ring of PCM and the clock that drains it.
+//
+// The same shape netdev.cst gives a NIC, for the same reason. The drivers
+// below this move samples between a ring and a DAC and know nothing else;
+// mixing, gain, resampling, format conversion and who-gets-to-be-loud are
+// decisions, and decisions are userspace (architecture.md §2.1). soundd holds
+// the stream and serves clients, exactly as the compositor holds the
+// framebuffer and netd holds the port.
+//
+// THE STREAM IS A CLOCK, NOT A QUEUE
+//
+// There is no start verb and no stop verb. The engine runs from the moment a
+// program acquires the stream until it closes the fd, and silence is what it
+// gets by not feeding it. Two reasons, and the second is the real one:
+//
+//   - A start/stop pair is an ioctl in disguise, and there is no ioctl here.
+//   - It would be a lie about the hardware. A DMA engine feeding a converter
+//     is a clock: the samples leave at 48000 a second whether or not anyone
+//     wrote them. Pretending it can be paused would let a program believe its
+//     stream stood still while the world did not, and every timing bug in
+//     audio starts exactly there.
+//
+// Drain is not a verb either: a program that wants to hear its last sample
+// polls until hw_ptr reaches its app_ptr, and it has both numbers in front of
+// it. Volume is not a verb: it is a multiply, and it belongs to whoever owns
+// the policy.
+//
+// ONE FD, ONE MODE
+//
+// mmap and write both move PCM into the same ring, and both advance app_ptr.
+// Allowing both on one fd would put two writers on that word — the program
+// storing it directly and the kernel storing it inside a syscall — with no
+// lock a program could take. So the first data operation fixes the mode and
+// the other one answers E_PERM from then on: not E_INVAL, because nothing
+// about the arguments is wrong, the operation simply is not available on this
+// object any more.
+//
+// A BUFFER PER HOLDER
+//
+// The grab stack (architecture.md §6) says a displaced holder goes quiet and
+// is not broken. For a keyboard that is easy — stop delivering events. For
+// audio it is not, because a holder that has mmap'd the ring can still store
+// into it, and the kernel cannot take that back. If the ring were shared, the
+// muted program's samples would mix into the audible program's output: the
+// exact opposite of quiet.
+//
+// So each holder acquires its own DMA ring and the hardware is pointed at
+// whichever one is on top. A displaced program writes into a buffer nobody
+// plays. Its hw_ptr stops advancing, so it FREEZES rather than falling behind,
+// and when it surfaces again it resumes where it was.
+//
+// The buffers are allocated on first use of a slot and never freed. A close
+// does not take back the mapping the program still holds — VMA_FILE pages are
+// unmapped when the address space dies, not when the fd does — and handing
+// DMA-live physical memory back to the page allocator while a stale mapping
+// still points at it is a fault nobody would ever find. The slot keeps its
+// buffer; it is bounded (AUDIO_HOLDERS_PER_STREAM per stream) and it can only
+// ever be an audio ring of that one stream.
+
+use "driver.cst" as driver;
+use "spec.cst" as spec;
+use "kobject.cst" as kobject;
+use "lock.cst" as lock;
+use "grab.cst" as grab;
+use "sched.cst" as sched;
+use "timer.cst" as timer;
+use "vma.cst" as vma;
+use "abi.cst" as abi;
+use "serial.cst" as serial;
+use "util.cst" as util;
+
+// ============================================================
+// Geometry
+//
+// 512 frames a period at 48 kHz is 10.67 ms — short enough that a program
+// woken by the period interrupt has a comfortable margin, long enough that
+// the interrupt costs nothing measurable.
+//
+// 14 periods rather than a rounder 16 for one concrete reason: the mapping is
+// [4096 control][14 * 512 * 4 ring] = 32768 bytes, which is exactly eight
+// pages and exactly one buddy block. Sixteen periods would ask for nine pages,
+// the allocator would round to sixteen, and every holder would carry 28 KiB of
+// slack forever. The buffer is 149 ms deep either way.
+// ============================================================
+
+let is i64 as AUDIO_MAX_STREAMS         = 4;
+let is i64 as AUDIO_HOLDERS_PER_STREAM  = 4;
+let is i64 as AUDIO_MAX_HOLDERS         = 16;   // == STREAMS * HOLDERS_PER_STREAM
+
+let is i64 as AUDIO_PERIOD_FRAMES = 512;
+let is i64 as AUDIO_PERIOD_COUNT  = 14;
+
+// A blocked writer parks with a ceiling, the same discipline net_read uses: if
+// a wakeup is ever lost between the room check and the park, progress resumes
+// on its own instead of hanging. One period is the natural cap here — that is
+// how often the answer can change.
+let is i64 as AUDIO_PARK_NS  = 10000000;    // 10 ms
+let is i64 as AUDIO_QUIET_NS = 2000000;     // 2 ms — a preempted holder's idle
+
+// ============================================================
+// The driver vtable
+//
+// Shape copied from storage.StorageDevice and netdev.NetDevice: a name array,
+// then function pointers, then pointers. No scalar i64 fields — the mixed-
+// width rule obeyed by reusing a layout that has carried AHCI in production.
+// Every method takes priv first, so two cards are two registrations.
+// ============================================================
+
+struct AudioDevice {
+    name       as [32]u8;
+    // (priv, ring_phys, ring_bytes, period_bytes) -> 0 | negative.
+    // Point the DMA engine at a ring. Called with the engine stopped, and
+    // called again every time the top of the grab stack changes.
+    set_buffer as fn(*u8, i64, i64, i64) as i64;
+    // (priv) -> 0 | negative. Begin at ring position ZERO. Every engine this
+    // layer drives restarts at the top of its descriptor list, which is why
+    // stop() rounds the frame counter up to a buffer boundary.
+    start      as fn(*u8) as i64;
+    stop       as fn(*u8) as i64;
+    priv       as *u8;
+}
+
+// ============================================================
+// Stream and holder state — all i64.
+// ============================================================
+
+struct AudioStream {
+    dev           as i64;      // *AudioDevice
+    hw            as i64;      // *Hardware — what the acquire fns match on
+    in_use        as i64;
+    direction     as i64;
+    rate          as i64;
+    channels      as i64;
+    format        as i64;
+    frame_bytes   as i64;
+    period_frames as i64;
+    period_count  as i64;
+    buffer_frames as i64;
+    ring_bytes    as i64;
+    map_bytes     as i64;
+    map_pages     as i64;
+    next_token    as i64;
+    active        as i64;      // token of the holder the engine is playing, 0 = idle
+    busy          as i64;      // a handover is in progress; see enter()
+}
+
+struct AudioHolder {
+    in_use  as i64;
+    stream  as i64;
+    token   as i64;
+    virt    as i64;      // kernel address of the control page (the ring follows)
+    phys    as i64;
+    mode    as i64;      // AUDIO_MODE_*
+    hw_ptr  as i64;      // this holder's own frame counter; frozen while displaced
+    xruns   as i64;
+    irq_seq as i64;
+}
+
+let is i64 as AUDIO_MODE_NONE   = 0;
+let is i64 as AUDIO_MODE_MMAP   = 1;
+let is i64 as AUDIO_MODE_STREAM = 2;
+
+let is [4]AudioStream as streams with mut;        // == AUDIO_MAX_STREAMS
+let is [16]AudioHolder as holders with mut;       // == AUDIO_MAX_HOLDERS
+let is [4]lock.TicketLock as stream_lk;
+let is [4]grab.GrabStack as stream_gs;
+
+let is i64 as stream_count with mut = 0;
+let is kobject.KObjectOps as AUDIO_OPS with mut;
+
+// ============================================================
+// priv encoding — (holder_index << 40) | token, the netdev pattern.
+//
+// Packed rather than a pointer so a stale priv is a lookup that fails instead
+// of a use-after-free: the index finds the slot, the token proves it is still
+// the same holder.
+// ============================================================
+
+fn priv_make(hi as i64, token as i64) as i64 {
+    return (hi << 40) | token;
+}
+
+fn holder_index(priv as i64) as i64 {
+    if (priv == 0) { return 0 - 1; }
+    let is i64 as hi = (priv >> 40) & 0xFF;
+    if (hi < 0 || hi >= AUDIO_MAX_HOLDERS) { return 0 - 1; }
+    if (holders[hi].in_use == 0) { return 0 - 1; }
+    if (holders[hi].token != priv) { return 0 - 1; }
+    return hi;
+}
+
+// ============================================================
+// The control page
+//
+// Read and written a word at a time through a freshly derived pointer. That
+// is not style: Caustic has no volatile, and a base address kept in a local
+// across a wait is a value the compiler may keep in a register while the
+// other side changes memory. virtio.rd32 is correct for the same reason.
+// ============================================================
+
+fn ctl_get(base as i64, w as i64) as i64 {
+    let is *i64 as p = cast(*i64, base + w * 8);
+    return p[0];
+}
+
+fn ctl_set(base as i64, w as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, base + w * 8);
+    p[0] = v;
+    return;
+}
+
+// Order the samples ahead of the pointer that advertises them. x86-TSO would
+// not reorder the stores; the compiler might move them, and a fence is the
+// only thing in this language that says it must not.
+fn publish(base as i64, w as i64, v as i64) as void {
+    asm("mfence\n");
+    let is *i64 as p = cast(*i64, base + w * 8);
+    p[0] = v;
+    return;
+}
+
+// ============================================================
+// Registry
+// ============================================================
+
+// Register one stream. Returns its index (>= 0), or negative. The driver keeps
+// the index and hands it back to irq_period from its interrupt handler.
+//
+// The device_register calls happen HERE rather than through the .cdvrspec
+// `device { class; acquire }` block, which is what the NICs use. That block
+// binds one class to one bind, and one audio controller is two streams in two
+// different classes — a codec with more converters would be more. The number
+// of instances a bind provides is a fact the driver knows and the spec cannot
+// state, so the registry that counts them does the registering.
+fn register(dev as *AudioDevice, hw as i64, direction as i64,
+            rate as i64, channels as i64, format as i64) as i64 {
+    if (cast(i64, dev) == 0)            { return 0 - 1; }
+    if (cast(i64, dev.set_buffer) == 0) { return 0 - 2; }
+    if (cast(i64, dev.start) == 0)      { return 0 - 2; }
+    if (cast(i64, dev.stop) == 0)       { return 0 - 2; }
+    if (rate <= 0 || channels <= 0)     { return 0 - 3; }
+    if (stream_count >= AUDIO_MAX_STREAMS) { return 0 - 4; }
+
+    let is i64 as si = stream_count;
+    streams[si].dev = cast(i64, dev);
+    streams[si].hw = hw;
+    streams[si].direction = direction;
+    streams[si].rate = rate;
+    streams[si].channels = channels;
+    streams[si].format = format;
+    // S16_LE is the only format v0 opens with, and the only one the enum
+    // names. Two bytes a sample, one sample per channel per frame.
+    streams[si].frame_bytes = channels * 2;
+    streams[si].period_frames = AUDIO_PERIOD_FRAMES;
+    streams[si].period_count = AUDIO_PERIOD_COUNT;
+    streams[si].buffer_frames = AUDIO_PERIOD_FRAMES * AUDIO_PERIOD_COUNT;
+    streams[si].ring_bytes = streams[si].buffer_frames * streams[si].frame_bytes;
+    streams[si].map_bytes = abi.AUDIO_CTL_BYTES + streams[si].ring_bytes;
+    streams[si].map_pages = (streams[si].map_bytes + 4095) / 4096;
+    streams[si].next_token = 0;
+    streams[si].active = 0;
+    streams[si].in_use = 1;
+    stream_count = stream_count + 1;
+
+    let is i64 as cls with mut = abi.DEV_AUDIO_OUT;
+    let is i64 as acq with mut = cast(i64, fn_ptr(acquire_out));
+    if (direction == abi.AUDIO_DIR_IN) {
+        cls = abi.DEV_AUDIO_IN;
+        acq = cast(i64, fn_ptr(acquire_in));
+    }
+    driver.device_register(cls, acq, hw, hw);
+
+    serial.print("audio: stream ", 14);
+    util.print_num(si);
+    serial.print(" = ", 3);
+    let is i64 as i with mut = 0;
+    while (i < 32) {
+        if (dev.name[i] == cast(u8, 0)) { i = 32; }
+        else { serial.putc(cast(i64, dev.name[i])); i = i + 1; }
+    }
+    if (direction == abi.AUDIO_DIR_IN) { serial.print(" in ", 4); }
+    else { serial.print(" out ", 5); }
+    util.print_num(rate);
+    serial.print("Hz x", 4);
+    util.print_num(channels);
+    serial.println("", 0);
+    return si;
+}
+
+fn count() as i64 {
+    return stream_count;
+}
+
+fn stream_by_hw(hw as i64, direction as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < stream_count) {
+        if (streams[i].in_use != 0 && streams[i].hw == hw
+            && streams[i].direction == direction) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================
+// The ring
+// ============================================================
+
+fn ring_base(hi as i64) as i64 {
+    return holders[hi].virt + abi.AUDIO_CTL_BYTES;
+}
+
+// Byte address of a frame counter's position in the ring. The counter is
+// monotonic and the ring is not, which is the whole point of the modulo: it
+// lives here, once, instead of in every caller's arithmetic.
+fn frame_addr(hi as i64, frame as i64) as i64 {
+    let is i64 as si = holders[hi].stream;
+    let is i64 as pos = frame % streams[si].buffer_frames;
+    return ring_base(hi) + pos * streams[si].frame_bytes;
+}
+
+// Zero the frames in [from, to). Split at the wrap so each run is contiguous.
+fn ring_zero(hi as i64, from as i64, to as i64) as void {
+    let is i64 as si = holders[hi].stream;
+    let is i64 as fb = streams[si].frame_bytes;
+    let is i64 as f with mut = from;
+    while (f < to) {
+        let is i64 as pos = f % streams[si].buffer_frames;
+        let is i64 as run with mut = streams[si].buffer_frames - pos;
+        if (run > to - f) { run = to - f; }
+        let is i64 as addr = ring_base(hi) + pos * fb;
+        let is i64 as bytes = run * fb;
+        let is i64 as w with mut = 0;
+        while (w + 8 <= bytes) {
+            let is *i64 as p = cast(*i64, addr + w);
+            p[0] = 0;
+            w = w + 8;
+        }
+        while (w < bytes) {
+            let is *u8 as q = cast(*u8, addr + w);
+            q[0] = cast(u8, 0);
+            w = w + 1;
+        }
+        f = f + run;
+    }
+    return;
+}
+
+// Copy frames between the ring and a flat kernel buffer. dir 0 = buf -> ring
+// (playback), 1 = ring -> buf (capture).
+fn ring_copy(hi as i64, frame as i64, buf as i64, frames as i64, dir as i64) as void {
+    let is i64 as si = holders[hi].stream;
+    let is i64 as fb = streams[si].frame_bytes;
+    let is i64 as done with mut = 0;
+    while (done < frames) {
+        let is i64 as pos = (frame + done) % streams[si].buffer_frames;
+        let is i64 as run with mut = streams[si].buffer_frames - pos;
+        if (run > frames - done) { run = frames - done; }
+        let is i64 as ra = ring_base(hi) + pos * fb;
+        let is i64 as ba = buf + done * fb;
+        let is i64 as bytes = run * fb;
+        let is i64 as w with mut = 0;
+        while (w + 8 <= bytes) {
+            let is *i64 as d = cast(*i64, ra + w);
+            let is *i64 as s = cast(*i64, ba + w);
+            if (dir == 0) { d[0] = s[0]; } else { s[0] = d[0]; }
+            w = w + 8;
+        }
+        while (w < bytes) {
+            let is *u8 as dq = cast(*u8, ra + w);
+            let is *u8 as sq = cast(*u8, ba + w);
+            if (dir == 0) { dq[0] = sq[0]; } else { sq[0] = dq[0]; }
+            w = w + 1;
+        }
+        done = done + run;
+    }
+    return;
+}
+
+// The application's cursor, read the way a kernel must read a word a program
+// owns: fresh, and never trusted. In MMAP mode anything at all can be in that
+// word; the clamp is what stops a bad number from becoming a bad index or a
+// negative length. A program that clamps here is not punished — it is simply
+// treated as having said the nearest sane thing.
+fn app_ptr_of(hi as i64) as i64 {
+    let is i64 as si = holders[hi].stream;
+    let is i64 as ap = ctl_get(holders[hi].virt, abi.AUDIO_W_APP_PTR);
+    let is i64 as hp = holders[hi].hw_ptr;
+    if (streams[si].direction == abi.AUDIO_DIR_IN) {
+        // Capture: the program consumes behind the hardware.
+        if (ap > hp) { return hp; }
+        if (ap < hp - streams[si].buffer_frames) { return hp - streams[si].buffer_frames; }
+        return ap;
+    }
+    if (ap < hp) { return hp; }
+    if (ap > hp + streams[si].buffer_frames) { return hp + streams[si].buffer_frames; }
+    return ap;
+}
+
+// ============================================================
+// Ownership: pointing the engine at the top of the grab stack
+//
+// THE HANDOVER MUST NOT RUN UNDER THE SPINLOCK. Stopping and starting an
+// engine can mean talking to the device and waiting for it to answer —
+// virtio-sound's control queue is a round trip, and a driver that has to
+// sleep for a reply cannot do it holding a ticket lock with interrupts off.
+// So the transition is serialised by a flag instead: enter() waits by
+// sleeping, the spinlock is taken only for the fields the period interrupt
+// reads, and the driver is called with nothing held.
+//
+// `active` is cleared before the old engine is stopped and set only after the
+// new one has started, so an interrupt arriving mid-handover finds no owner
+// and does nothing — which is exactly right, because during that window there
+// is none.
+// ============================================================
+
+fn holder_by_token(token as i64) as i64 {
+    return holder_index(token);
+}
+
+// A sleeping mutex built out of the spinlock. Only acquire and close contend
+// for it, and only ever from thread context.
+fn enter(si as i64) as void {
+    while (1 == 1) {
+        let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+        if (streams[si].busy == 0) {
+            streams[si].busy = 1;
+            lock.release_irq(&stream_lk[si], fl);
+            return;
+        }
+        lock.release_irq(&stream_lk[si], fl);
+        sched.sleep_for_ns(AUDIO_QUIET_NS);
+    }
+    return;
+}
+
+fn leave(si as i64) as void {
+    let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+    streams[si].busy = 0;
+    lock.release_irq(&stream_lk[si], fl);
+    return;
+}
+
+// Point the engine at whoever is on top of the grab stack. Call with enter()
+// held and no spinlock.
+fn transition(si as i64) as void {
+    let is i64 as top = grab.top(&stream_gs[si]);
+    let is i64 as fl0 = lock.acquire_irq(&stream_lk[si]);
+    let is i64 as old = streams[si].active;
+    if (top == old) { lock.release_irq(&stream_lk[si], fl0); return; }
+    streams[si].active = 0;
+    lock.release_irq(&stream_lk[si], fl0);
+
+    let is *AudioDevice as dev = cast(*AudioDevice, streams[si].dev);
+    if (old != 0) {
+        call(dev.stop, dev.priv);
+        let is i64 as oh = holder_by_token(old);
+        if (oh >= 0) {
+            // Every engine here restarts at ring position zero, so the frame
+            // counter has to land on a buffer boundary for (ptr %
+            // buffer_frames) to keep meaning what it says. Rounding up is the
+            // honest bookkeeping: the frames between here and the boundary
+            // are ones this holder will never hear, and saying so is what
+            // lets it notice — the same way it notices an underrun.
+            let is i64 as fl1 = lock.acquire_irq(&stream_lk[si]);
+            let is i64 as bf = streams[si].buffer_frames;
+            let is i64 as r = holders[oh].hw_ptr % bf;
+            if (r != 0) { holders[oh].hw_ptr = holders[oh].hw_ptr + (bf - r); }
+            ctl_set(holders[oh].virt, abi.AUDIO_W_RUNNING, 0);
+            publish(holders[oh].virt, abi.AUDIO_W_HW_PTR, holders[oh].hw_ptr);
+            lock.release_irq(&stream_lk[si], fl1);
+        }
+    }
+    if (top == 0) { return; }
+    let is i64 as hi = holder_by_token(top);
+    if (hi < 0) { return; }
+    let is i64 as ring_phys = holders[hi].phys + abi.AUDIO_CTL_BYTES;
+    let is i64 as period_bytes = streams[si].period_frames * streams[si].frame_bytes;
+    if (call(dev.set_buffer, dev.priv, ring_phys, streams[si].ring_bytes, period_bytes) < 0) {
+        return;
+    }
+    if (call(dev.start, dev.priv) < 0) { return; }
+    let is i64 as fl2 = lock.acquire_irq(&stream_lk[si]);
+    streams[si].active = top;
+    ctl_set(holders[hi].virt, abi.AUDIO_W_RUNNING, 1);
+    lock.release_irq(&stream_lk[si], fl2);
+    return;
+}
+
+// ============================================================
+// The period interrupt
+//
+// What a driver calls once it has acknowledged its own device: one period has
+// gone by. This is where hw_ptr comes from — the interrupt COUNT, not a
+// position register, because the count is exact and a position register is a
+// sample of something moving.
+// ============================================================
+
+fn irq_period(si as i64) as void {
+    if (si < 0 || si >= AUDIO_MAX_STREAMS) { return; }
+    if (streams[si].in_use == 0) { return; }
+    let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+    let is i64 as tok = streams[si].active;
+    if (tok == 0) { lock.release_irq(&stream_lk[si], fl); return; }
+    let is i64 as hi = holder_by_token(tok);
+    if (hi < 0) { lock.release_irq(&stream_lk[si], fl); return; }
+
+    let is i64 as pf = streams[si].period_frames;
+    holders[hi].hw_ptr = holders[hi].hw_ptr + pf;
+    holders[hi].irq_seq = holders[hi].irq_seq + 1;
+    let is i64 as hp = holders[hi].hw_ptr;
+    let is i64 as ap = app_ptr_of(hi);
+
+    if (streams[si].direction == abi.AUDIO_DIR_OUT) {
+        // The hardware is inside [hp, hp+pf) and will enter [hp+pf, hp+2pf)
+        // next. Whatever of that the program has not written by now it is not
+        // going to write in time, so it becomes silence — deliberately, from
+        // max(app_ptr, hp+pf) up, which never touches a frame the program did
+        // write. An underrun that plays silence is a click; an underrun that
+        // replays the buffer is the sound of a bug.
+        if (ap < hp + 2 * pf) {
+            let is i64 as from with mut = hp + pf;
+            if (ap > from) { from = ap; }
+            ring_zero(hi, from, hp + 2 * pf);
+        }
+        // COUNTED SEPARATELY FROM ZEROED, and on a stricter test. Silence has
+        // to be written a period AHEAD — by the time the hardware is inside a
+        // period it is too late to fix it — but "the next period is not full
+        // yet" is a margin running low, not a fault. Counting it made a
+        // program that deliberately keeps one period buffered, which is a
+        // legitimate low-latency choice, look like it was failing constantly.
+        //
+        // An underrun is the hardware ENTERING a period nobody filled. That
+        // is the thing that is audible, and it is what this counts.
+        if (ap < hp + pf) {
+            // A program that said it is finishing is not underrunning, it is
+            // finishing. Counting that would make every clean exit look like
+            // a fault and teach everyone to ignore the counter.
+            let is i64 as af = ctl_get(holders[hi].virt, abi.AUDIO_W_APP_FLAGS);
+            if ((af & abi.AUDIO_APP_DRAINING) == 0) {
+                holders[hi].xruns = holders[hi].xruns + 1;
+            }
+        }
+    } else {
+        // Capture: the hardware has just filled a period. If the program is
+        // more than a buffer behind, the hardware is about to overwrite frames
+        // it never collected. Nothing to repair — the samples are gone — but
+        // it is counted so a program can tell "I lost audio" from "it was
+        // quiet".
+        if (hp - ap > streams[si].buffer_frames - pf) {
+            holders[hi].xruns = holders[hi].xruns + 1;
+        }
+    }
+
+    ctl_set(holders[hi].virt, abi.AUDIO_W_XRUNS, holders[hi].xruns);
+    ctl_set(holders[hi].virt, abi.AUDIO_W_IRQ_SEQ, holders[hi].irq_seq);
+    // Last, and fenced: hw_ptr is what a program watches, and it must not be
+    // seen ahead of the silence that was just written or the samples that
+    // were just captured.
+    publish(holders[hi].virt, abi.AUDIO_W_HW_PTR, hp);
+    lock.release_irq(&stream_lk[si], fl);
+    sched.poll_wake();
+    return;
+}
+
+// ============================================================
+// Acquire
+// ============================================================
+
+fn holder_alloc(si as i64) as i64 {
+    let is i64 as first = si * AUDIO_HOLDERS_PER_STREAM;
+    let is i64 as i with mut = first;
+    while (i < first + AUDIO_HOLDERS_PER_STREAM) {
+        if (holders[i].in_use == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The DMA buffer is allocated once per slot and kept. See the header: a close
+// cannot revoke a mapping, so returning these pages to the allocator would
+// hand DMA-live memory to whatever asked for RAM next.
+fn holder_buffer(si as i64, hi as i64) as i64 {
+    if (holders[hi].virt != 0) { return 0; }
+    let is *driver.DmaBuffer as buf with mut = cast(*driver.DmaBuffer, 0);
+    let is i32 as rc = driver.dma_alloc(cast(*driver.Hardware, streams[si].hw),
+                                        cast(u64, streams[si].map_bytes),
+                                        cast(u64, 4096), cast(u32, 1), &buf);
+    if (rc != driver.OK) { return 0 - 1; }
+    holders[hi].virt = cast(i64, buf.virt);
+    holders[hi].phys = buf.phys;
+    return 0;
+}
+
+fn acquire_dir(hw as i64, direction as i64) as i64 {
+    let is i64 as si = stream_by_hw(hw, direction);
+    if (si < 0) { return 0; }
+
+    // enter() serialises every acquire and close on this stream, which is
+    // what makes the setup below safe without a spinlock: the slot is not
+    // reachable (in_use is still 0) and the DMA allocation underneath
+    // holder_buffer takes the page allocator's own locks, which is not
+    // something to do with interrupts off.
+    enter(si);
+    let is i64 as hi = holder_alloc(si);
+    if (hi < 0) { leave(si); return 0; }
+    if (holder_buffer(si, hi) < 0) { leave(si); return 0; }
+
+    streams[si].next_token = streams[si].next_token + 1;
+    let is i64 as priv = priv_make(hi, streams[si].next_token);
+    holders[hi].stream = si;
+    // Token before in_use: holder_index checks in_use and then the token, so
+    // this order means a lookup racing the setup fails cleanly instead of
+    // finding a slot that is live with somebody else's number in it.
+    holders[hi].token = priv;
+    holders[hi].mode = AUDIO_MODE_NONE;
+    holders[hi].hw_ptr = 0;
+    holders[hi].xruns = 0;
+    holders[hi].irq_seq = 0;
+    holders[hi].in_use = 1;
+
+    // A fresh ring is silence, not whatever the last holder of this slot left
+    // in it. Cheap, and the alternative is a program hearing someone else's
+    // audio for one buffer.
+    ring_zero(hi, 0, streams[si].buffer_frames);
+
+    let is i64 as base = holders[hi].virt;
+    ctl_set(base, abi.AUDIO_W_MAGIC, abi.AUDIO_CTL_MAGIC);
+    ctl_set(base, abi.AUDIO_W_VERSION, abi.AUDIO_CTL_VERSION);
+    ctl_set(base, abi.AUDIO_W_RATE, streams[si].rate);
+    ctl_set(base, abi.AUDIO_W_CHANNELS, streams[si].channels);
+    ctl_set(base, abi.AUDIO_W_FORMAT, streams[si].format);
+    ctl_set(base, abi.AUDIO_W_FRAME_BYTES, streams[si].frame_bytes);
+    ctl_set(base, abi.AUDIO_W_PERIOD_FRAMES, streams[si].period_frames);
+    ctl_set(base, abi.AUDIO_W_PERIOD_COUNT, streams[si].period_count);
+    ctl_set(base, abi.AUDIO_W_BUFFER_FRAMES, streams[si].buffer_frames);
+    ctl_set(base, abi.AUDIO_W_DATA_OFFSET, abi.AUDIO_CTL_BYTES);
+    ctl_set(base, abi.AUDIO_W_DIRECTION, streams[si].direction);
+    ctl_set(base, abi.AUDIO_W_HW_PTR, 0);
+    ctl_set(base, abi.AUDIO_W_XRUNS, 0);
+    ctl_set(base, abi.AUDIO_W_IRQ_SEQ, 0);
+    ctl_set(base, abi.AUDIO_W_RUNNING, 0);
+    ctl_set(base, abi.AUDIO_W_APP_PTR, 0);
+    ctl_set(base, abi.AUDIO_W_APP_FLAGS, 0);
+
+    if (grab.push(&stream_gs[si], priv) != 0) {
+        holders[hi].in_use = 0;
+        leave(si);
+        return 0;
+    }
+    transition(si);
+    leave(si);
+
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &AUDIO_OPS, priv);
+    if (ko == 0) {
+        enter(si);
+        grab.remove(&stream_gs[si], priv);
+        holders[hi].in_use = 0;
+        transition(si);
+        leave(si);
+        return 0;
+    }
+    return ko;
+}
+
+fn acquire_out(ctx as i64) as i64 {
+    return acquire_dir(ctx, abi.AUDIO_DIR_OUT);
+}
+
+fn acquire_in(ctx as i64) as i64 {
+    return acquire_dir(ctx, abi.AUDIO_DIR_IN);
+}
+
+// ============================================================
+// The KObject ops
+// ============================================================
+
+fn audio_init() as void {
+    AUDIO_OPS.read  = fn_ptr(audio_read);
+    AUDIO_OPS.write = fn_ptr(audio_write);
+    AUDIO_OPS.close = fn_ptr(audio_close);
+    AUDIO_OPS.poll  = fn_ptr(audio_poll);
+    AUDIO_OPS.mmap  = fn_ptr(audio_mmap);
+    // present/lseek/readdir stay null: a stream is not a surface and it has no
+    // cursor a program can move. The null slot answers honestly.
+    return;
+}
+
+// Fix the fd's mode, or refuse. E_PERM rather than E_INVAL: the arguments are
+// fine, the operation is the thing that is no longer available.
+fn mode_take(hi as i64, want as i64) as i64 {
+    if (holders[hi].mode == AUDIO_MODE_NONE) {
+        holders[hi].mode = want;
+        return abi.E_OK;
+    }
+    if (holders[hi].mode == want) { return abi.E_OK; }
+    return abi.E_PERM;
+}
+
+// Map the control page and the ring into the holder's address space, as one
+// contiguous window. The program reads the geometry out of the first page and
+// finds the samples at data_offset — no second syscall, and no chance of the
+// two disagreeing.
+fn audio_mmap(priv as i64, aspace as i64, hint as i64, prot as i64) as i64 {
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { return abi.E_BADF; }
+    if (aspace == 0) { return abi.E_INVAL; }
+    let is i64 as si = holders[hi].stream;
+    let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+    let is i64 as mrc = mode_take(hi, AUDIO_MODE_MMAP);
+    lock.release_irq(&stream_lk[si], fl);
+    if (mrc != abi.E_OK) { return mrc; }
+
+    let is i64 as va = vma.mmap_phys(cast(*vma.Aspace, aspace), holders[hi].phys,
+                                     streams[si].map_pages, prot, priv);
+    if (va < 0) { return abi.E_NOMEM; }
+    return va;
+}
+
+// One write is PCM into the ring, blocking until all of it is in. The kernel
+// owns app_ptr in this mode, which is exactly what makes the mode exclusive:
+// there is one writer of that word and it is this function.
+fn audio_write(priv as i64, buf as i64, n as i64) as i64 {
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { return abi.E_BADF; }
+    let is i64 as si = holders[hi].stream;
+    // A capture stream has nothing to write to. Not E_NOSYS: the op exists on
+    // this class, it just does not exist in this direction.
+    if (streams[si].direction != abi.AUDIO_DIR_OUT) { return abi.E_INVAL; }
+    if (n <= 0) { return abi.E_INVAL; }
+    // PCM arrives in frames. A partial frame is not a small write, it is a
+    // caller who has the sample size wrong, and letting it through would shift
+    // every channel by one sample from there on.
+    if (n % streams[si].frame_bytes != 0) { return abi.E_INVAL; }
+
+    let is i64 as fl0 = lock.acquire_irq(&stream_lk[si]);
+    let is i64 as mrc = mode_take(hi, AUDIO_MODE_STREAM);
+    lock.release_irq(&stream_lk[si], fl0);
+    if (mrc != abi.E_OK) { return mrc; }
+
+    let is i64 as want = n / streams[si].frame_bytes;
+    let is i64 as done with mut = 0;
+    while (done < want) {
+        if (grab.top(&stream_gs[si]) != priv) {
+            sched.sleep_for_ns(AUDIO_QUIET_NS);
+        } else {
+            let is i64 as seq = sched.poll_seq_read();
+            let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+            let is i64 as hp = holders[hi].hw_ptr;
+            let is i64 as ap with mut = ctl_get(holders[hi].virt, abi.AUDIO_W_APP_PTR);
+            // The kernel owns app_ptr here, but the hardware moved underneath
+            // it: if hw_ptr has passed it, those frames are gone and writing
+            // them would put samples behind the playback point, where they
+            // are heard a whole buffer late. Catching up is the recovery, and
+            // the xrun was already counted at the interrupt that caused it.
+            if (ap < hp) { ap = hp; }
+            let is i64 as room = streams[si].buffer_frames - (ap - hp);
+            let is i64 as take with mut = want - done;
+            if (take > room) { take = room; }
+            if (take > 0) {
+                ring_copy(hi, ap, buf + done * streams[si].frame_bytes, take, 0);
+                publish(holders[hi].virt, abi.AUDIO_W_APP_PTR, ap + take);
+                done = done + take;
+            }
+            lock.release_irq(&stream_lk[si], fl);
+            if (take <= 0) {
+                sched.poll_park_seq(timer.current_time_ns() + AUDIO_PARK_NS, seq);
+            }
+        }
+    }
+    return n;
+}
+
+// One read is captured PCM out of the ring, blocking until all of it is
+// there. The mirror of audio_write, and the reason capture is a class rather
+// than a flag: the mechanism is symmetric, and leaving half of it out would
+// be the deferral the project's rules forbid.
+fn audio_read(priv as i64, buf as i64, n as i64) as i64 {
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { return abi.E_BADF; }
+    let is i64 as si = holders[hi].stream;
+    if (streams[si].direction != abi.AUDIO_DIR_IN) { return abi.E_INVAL; }
+    if (n <= 0) { return abi.E_INVAL; }
+    if (n % streams[si].frame_bytes != 0) { return abi.E_INVAL; }
+
+    let is i64 as fl0 = lock.acquire_irq(&stream_lk[si]);
+    let is i64 as mrc = mode_take(hi, AUDIO_MODE_STREAM);
+    lock.release_irq(&stream_lk[si], fl0);
+    if (mrc != abi.E_OK) { return mrc; }
+
+    let is i64 as want = n / streams[si].frame_bytes;
+    let is i64 as done with mut = 0;
+    while (done < want) {
+        if (grab.top(&stream_gs[si]) != priv) {
+            sched.sleep_for_ns(AUDIO_QUIET_NS);
+        } else {
+            let is i64 as seq = sched.poll_seq_read();
+            let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+            let is i64 as hp = holders[hi].hw_ptr;
+            let is i64 as ap with mut = ctl_get(holders[hi].virt, abi.AUDIO_W_APP_PTR);
+            // Overrun: the hardware wrapped past what was never collected.
+            // Skip to the oldest frame that still exists rather than reading
+            // a buffer of samples that are one buffer old.
+            if (hp - ap > streams[si].buffer_frames) { ap = hp - streams[si].buffer_frames; }
+            let is i64 as avail = hp - ap;
+            let is i64 as take with mut = want - done;
+            if (take > avail) { take = avail; }
+            if (take > 0) {
+                ring_copy(hi, ap, buf + done * streams[si].frame_bytes, take, 1);
+                publish(holders[hi].virt, abi.AUDIO_W_APP_PTR, ap + take);
+                done = done + take;
+            }
+            lock.release_irq(&stream_lk[si], fl);
+            if (take <= 0) {
+                sched.poll_park_seq(timer.current_time_ns() + AUDIO_PARK_NS, seq);
+            }
+        }
+    }
+    return n;
+}
+
+// WRITABLE with a period of room on a playback stream, READABLE with a period
+// of samples on a capture stream. Never CLOSED: a converter has no peer that
+// can hang up.
+//
+// This is the ONLY way an mmap-mode program can block. It makes no syscall on
+// the data path, so without poll it would have to spin on hw_ptr; with it,
+// "wait for the next period" is one call and the scheduler gets the cpu back.
+fn audio_poll(priv as i64) as i64 {
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { return abi.POLL_ERROR; }
+    let is i64 as si = holders[hi].stream;
+    if (grab.top(&stream_gs[si]) != priv) { return 0; }
+
+    let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+    let is i64 as hp = holders[hi].hw_ptr;
+    let is i64 as ap = app_ptr_of(hi);
+    let is i64 as pf = streams[si].period_frames;
+    let is i64 as ev with mut = 0;
+    if (streams[si].direction == abi.AUDIO_DIR_OUT) {
+        if (streams[si].buffer_frames - (ap - hp) >= pf) { ev = abi.POLL_WRITABLE; }
+    } else {
+        if (hp - ap >= pf) { ev = abi.POLL_READABLE; }
+    }
+    lock.release_irq(&stream_lk[si], fl);
+    return ev;
+}
+
+fn audio_close(priv as i64) as i64 {
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { return abi.E_OK; }
+    let is i64 as si = holders[hi].stream;
+    enter(si);
+    let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+    grab.remove(&stream_gs[si], priv);
+    // The slot goes free but its buffer stays: a mapping this program may
+    // still hold points at those pages, and the header says why they are
+    // never handed back.
+    holders[hi].in_use = 0;
+    holders[hi].token = 0;
+    holders[hi].mode = AUDIO_MODE_NONE;
+    lock.release_irq(&stream_lk[si], fl);
+    // transition sees the new top and stops the engine if this was the last
+    // holder. It clears `active` itself, so the interrupt path stops finding
+    // this holder before the driver is touched.
+    transition(si);
+    leave(si);
+    return abi.E_OK;
+}
+
+// Type test for the syscall layer. KOBJ_DEVICE is shared with the keyboard,
+// the mouse, the tablet and the network port, so the discriminator is vtable
+// identity: an object built from AUDIO_OPS is an audio stream and nothing
+// else can be. Same one-function test netdev exports, for the same reason.
+fn holder_of(ko as i64) as i64 {
+    if (ko == 0) { return 0; }
+    let is *kobject.KObject as k = cast(*kobject.KObject, ko);
+    if (k.otype != kobject.KOBJ_DEVICE) { return 0; }
+    if (cast(i64, k.ops) != cast(i64, &AUDIO_OPS)) { return 0; }
+    return k.priv;
+}
+
+// Fill abi.AUDIO_INFO_WORDS words describing the stream this priv holds.
+fn stream_info(priv as i64, out as *i64) as i64 {
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { return abi.E_BADF; }
+    let is i64 as si = holders[hi].stream;
+    let is i64 as k with mut = 0;
+    while (k < abi.AUDIO_INFO_WORDS) { out[k] = 0; k = k + 1; }
+
+    out[0] = streams[si].rate;
+    out[1] = streams[si].channels;
+    out[2] = streams[si].format;
+    out[3] = streams[si].frame_bytes;
+    out[4] = streams[si].period_frames;
+    out[5] = streams[si].period_count;
+    out[6] = streams[si].buffer_frames;
+    out[7] = abi.AUDIO_CTL_BYTES;
+    out[8] = streams[si].direction;
+    out[9] = streams[si].map_bytes;
+    let is i64 as flags with mut = 0;
+    if (holders[hi].mode == AUDIO_MODE_MMAP)   { flags = flags | abi.AUDIO_FLAG_MODE_MMAP; }
+    if (holders[hi].mode == AUDIO_MODE_STREAM) { flags = flags | abi.AUDIO_FLAG_MODE_STREAM; }
+    if (grab.top(&stream_gs[si]) == priv)      { flags = flags | abi.AUDIO_FLAG_ACTIVE; }
+    out[10] = flags;
+
+    // The cursors, taken together under the lock so a caller never sees an
+    // app_ptr from before an interrupt with an hw_ptr from after it — which
+    // would read as the ring being one period fuller than it is.
+    let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
+    out[11] = holders[hi].hw_ptr;
+    out[12] = app_ptr_of(hi);
+    out[13] = holders[hi].xruns;
+    lock.release_irq(&stream_lk[si], fl);
+
+    let is *AudioDevice as dev = cast(*AudioDevice, streams[si].dev);
+    let is *u8 as nm = cast(*u8, &out[16]);
+    let is i64 as c with mut = 0;
+    while (c < 32) { nm[c] = dev.name[c]; c = c + 1; }
+    return abi.E_OK;
+}
+
+// ============================================================
+// Boot smoke
+//
+// What this proves that reading the code cannot: that the clock is real. An
+// audio driver that programs the wrong format, points the engine at the wrong
+// address or never enables the interrupt looks perfectly healthy from every
+// register you can read back — and produces either silence or noise. The only
+// honest question is "did the hardware consume frames, at the rate we claimed
+// it would", and that question needs a stopwatch.
+// ============================================================
+
+let is i64 as smoke_fails with mut = 0;
+let is [4096]u8 as smoke_pcm;
+
+fn smoke_check(name as *u8, nlen as i64, got as i64, want as i64) as void {
+    if (got == want) { serial.print("  ok   ", 7); }
+    else { serial.print("  FAIL ", 7); smoke_fails = smoke_fails + 1; }
+    serial.print(name, nlen);
+    serial.print(" got=", 5);
+    util.print_num(got);
+    serial.print(" want=", 6);
+    util.print_num(want);
+    serial.println("", 0);
+    return;
+}
+
+// A ramp rather than silence: if the ring were mapped or addressed wrongly,
+// zeroes would look exactly like a correct write.
+fn smoke_fill(frames as i64, fb as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < frames * fb) {
+        smoke_pcm[i] = cast(u8, i & 0xFF);
+        i = i + 1;
+    }
+    return;
+}
+
+fn smoke_stream(si as i64) as void {
+    let is i64 as ko = acquire_dir(streams[si].hw, streams[si].direction);
+    if (ko == 0) { smoke_check(cast(*u8, "acquire"), 7, 0, 1); return; }
+    let is i64 as priv = holder_of(ko);
+    let is i64 as hi = holder_index(priv);
+    if (hi < 0) { smoke_check(cast(*u8, "holder_of identifies the stream"), 31, 0, 1); return; }
+    let is i64 as base = holders[hi].virt;
+
+    // The facts a program reads out of the first page, before it trusts any
+    // of the rest of the mapping.
+    smoke_check(cast(*u8, "control page magic"), 18,
+                ctl_get(base, abi.AUDIO_W_MAGIC), abi.AUDIO_CTL_MAGIC);
+    smoke_check(cast(*u8, "control page version"), 20,
+                ctl_get(base, abi.AUDIO_W_VERSION), abi.AUDIO_CTL_VERSION);
+    smoke_check(cast(*u8, "rate is the one registered"), 26,
+                ctl_get(base, abi.AUDIO_W_RATE), streams[si].rate);
+    smoke_check(cast(*u8, "frame_bytes is channels x 2"), 27,
+                ctl_get(base, abi.AUDIO_W_FRAME_BYTES), streams[si].channels * 2);
+    smoke_check(cast(*u8, "ring starts after the ctl page"), 30,
+                ctl_get(base, abi.AUDIO_W_DATA_OFFSET), abi.AUDIO_CTL_BYTES);
+    smoke_check(cast(*u8, "buffer is periods x frames"), 26,
+                ctl_get(base, abi.AUDIO_W_BUFFER_FRAMES),
+                AUDIO_PERIOD_FRAMES * AUDIO_PERIOD_COUNT);
+    smoke_check(cast(*u8, "the mapping is a whole page count"), 33,
+                streams[si].map_bytes % 4096, 0);
+    // The engine runs from acquire. Nothing asked it to.
+    smoke_check(cast(*u8, "running without being told to"), 29,
+                ctl_get(base, abi.AUDIO_W_RUNNING), 1);
+
+    let is [20]i64 as inf;
+    smoke_check(cast(*u8, "audio_info succeeds"), 19,
+                stream_info(priv, cast(*i64, &inf[0])), abi.E_OK);
+    smoke_check(cast(*u8, "info agrees with the page"), 25, inf[0], streams[si].rate);
+    smoke_check(cast(*u8, "info reports this holder active"), 31,
+                inf[10] & abi.AUDIO_FLAG_ACTIVE, abi.AUDIO_FLAG_ACTIVE);
+
+    let is i64 as fb = streams[si].frame_bytes;
+    let is i64 as pf = streams[si].period_frames;
+
+    if (streams[si].direction == abi.AUDIO_DIR_OUT) {
+        // The op that does not exist in this direction.
+        smoke_check(cast(*u8, "read on a playback stream"), 25,
+                    audio_read(priv, cast(i64, &smoke_pcm[0]), fb), abi.E_INVAL);
+        // Half a frame is not a short write, it is a caller with the sample
+        // size wrong.
+        smoke_check(cast(*u8, "a partial frame is refused"), 26,
+                    audio_write(priv, cast(i64, &smoke_pcm[0]), fb - 1), abi.E_INVAL);
+
+        smoke_fill(2 * pf, fb);
+        // The clock does not wait to be written to. Between the acquire and
+        // this write the engine has already eaten some periods, so the cursor
+        // does not start at zero — it starts wherever playback had reached,
+        // which is what the catch-up in audio_write is for. Asserting
+        // app_ptr == 1024 passed under one cpu and failed under four, because
+        // it was really asserting that nothing else got scheduled.
+        //
+        // What is actually promised: the write begins at some point between
+        // where the hardware was before the call and where it is after, and
+        // advances the cursor by exactly what was handed over.
+        let is i64 as hp_before = ctl_get(base, abi.AUDIO_W_HW_PTR);
+        smoke_check(cast(*u8, "two periods accepted whole"), 26,
+                    audio_write(priv, cast(i64, &smoke_pcm[0]), 2 * pf * fb), 2 * pf * fb);
+        let is i64 as hp_after = ctl_get(base, abi.AUDIO_W_HW_PTR);
+        let is i64 as ap_now = ctl_get(base, abi.AUDIO_W_APP_PTR);
+        smoke_check(cast(*u8, "the cursor advanced by what was written"), 39,
+                    ap_now >= hp_before + 2 * pf && ap_now <= hp_after + 2 * pf, 1);
+        // And never further ahead than the ring is deep: a cursor past that
+        // would mean the copy wrote over frames the hardware had not read.
+        smoke_check(cast(*u8, "and stayed inside the ring"), 26,
+                    ap_now - hp_after <= streams[si].buffer_frames, 1);
+        // The mode is taken. Not E_INVAL — the arguments are fine.
+        smoke_check(cast(*u8, "mmap on a write-mode fd"), 23,
+                    audio_mmap(priv, 1, 0, 0), abi.E_PERM);
+    }
+
+    // THE STOPWATCH. Two periods were written and nothing more will be, so
+    // this window measures the clock and the underrun accounting at once.
+    let is i64 as t0 = timer.current_time_ns();
+    let is i64 as p0 = ctl_get(base, abi.AUDIO_W_HW_PTR);
+    sched.sleep_for_ns(250000000);
+    let is i64 as t1 = timer.current_time_ns();
+    let is i64 as p1 = ctl_get(base, abi.AUDIO_W_HW_PTR);
+
+    smoke_check(cast(*u8, "the hardware consumed frames"), 28, p1 > p0, 1);
+    smoke_check(cast(*u8, "period interrupts arrived"), 25,
+                ctl_get(base, abi.AUDIO_W_IRQ_SEQ) > 0, 1);
+    // Frames per second, measured. A driver that programs the wrong format or
+    // the wrong divisor reads back perfectly and runs at two or four times the
+    // rate it claims; this is the only place that shows.
+    let is i64 as elapsed = t1 - t0;
+    let is i64 as measured with mut = 0;
+    if (elapsed > 0) { measured = (p1 - p0) * 1000000000 / elapsed; }
+    let is i64 as nominal = streams[si].rate;
+    smoke_check(cast(*u8, "and at the rate it claimed"), 26,
+                measured > nominal * 3 / 4 && measured < nominal * 5 / 4, 1);
+    if (measured <= nominal * 3 / 4 || measured >= nominal * 5 / 4) {
+        serial.print("audio_smoke: measured ", 22);
+        util.print_num(measured);
+        serial.print(" Hz against ", 12);
+        util.print_num(nominal);
+        serial.println("", 0);
+    }
+
+    if (streams[si].direction == abi.AUDIO_DIR_OUT) {
+        // Nobody fed it for a quarter second. Every period past the two that
+        // were written is an underrun, and an underrun nobody counts is an
+        // underrun nobody fixes.
+        smoke_check(cast(*u8, "unfed periods counted as xruns"), 30,
+                    ctl_get(base, abi.AUDIO_W_XRUNS) > 0, 1);
+    }
+
+    kobject.ko_unref(ko);
+    return;
+}
+
+// The grab stack on a class where being displaced has to mean something
+// stronger than "stop delivering": the muted holder must keep its own ring,
+// its own cursor, and pick up exactly where it was.
+fn smoke_grab(si as i64) as void {
+    let is i64 as ko_a = acquire_dir(streams[si].hw, streams[si].direction);
+    let is i64 as priv_a = holder_of(ko_a);
+    let is i64 as hi_a = holder_index(priv_a);
+    if (ko_a == 0 || hi_a < 0) { smoke_check(cast(*u8, "first acquire"), 13, 0, 1); return; }
+
+    // Let it run long enough to have a cursor worth preserving.
+    sched.sleep_for_ns(60000000);
+    let is i64 as ko_b = acquire_dir(streams[si].hw, streams[si].direction);
+    let is i64 as priv_b = holder_of(ko_b);
+    let is i64 as hi_b = holder_index(priv_b);
+    if (ko_b == 0 || hi_b < 0) { smoke_check(cast(*u8, "second acquire"), 14, 0, 1); return; }
+
+    smoke_check(cast(*u8, "the second holder owns the engine"), 33,
+                streams[si].active, priv_b);
+    smoke_check(cast(*u8, "the two have different rings"), 28,
+                holders[hi_a].phys == holders[hi_b].phys, 0);
+    smoke_check(cast(*u8, "the displaced one is told it stopped"), 36,
+                ctl_get(holders[hi_a].virt, abi.AUDIO_W_RUNNING), 0);
+    smoke_check(cast(*u8, "and polls quiet"), 15, audio_poll(priv_a), 0);
+
+    // Frozen, not falling behind: a displaced holder's cursor does not move,
+    // which is what lets it resume instead of waking up a quarter second in
+    // debt.
+    let is i64 as frozen = holders[hi_a].hw_ptr;
+    sched.sleep_for_ns(80000000);
+    smoke_check(cast(*u8, "the displaced cursor is frozen"), 30,
+                holders[hi_a].hw_ptr, frozen);
+    smoke_check(cast(*u8, "while the top one advances"), 26,
+                holders[hi_b].hw_ptr > 0, 1);
+    // Every engine restarts at the top of its ring, so a handover leaves the
+    // cursor on a buffer boundary. If it did not, (ptr % buffer_frames) would
+    // stop naming the position the hardware is actually at.
+    smoke_check(cast(*u8, "and sits on a buffer boundary"), 29,
+                frozen % streams[si].buffer_frames, 0);
+
+    kobject.ko_unref(ko_b);
+    smoke_check(cast(*u8, "closing the top hands it back"), 29,
+                streams[si].active, priv_a);
+    smoke_check(cast(*u8, "the restored holder runs again"), 30,
+                ctl_get(holders[hi_a].virt, abi.AUDIO_W_RUNNING), 1);
+    sched.sleep_for_ns(60000000);
+    smoke_check(cast(*u8, "and resumes from where it froze"), 31,
+                holders[hi_a].hw_ptr > frozen, 1);
+
+    kobject.ko_unref(ko_a);
+    smoke_check(cast(*u8, "the last close leaves it idle"), 29, streams[si].active, 0);
+    return;
+}
+
+fn smoke_thread() as void {
+    // Wait for phase 2 to FINISH rather than for the first stream, for the
+    // reason netdev's smoke learned the hard way: a walk that starts early
+    // reports PASS having tested half the machine.
+    let is i64 as deadline = timer.current_time_ns() + 5000000000;
+    while (spec.phase2_done == 0 && timer.current_time_ns() < deadline) {
+        sched.sleep_for_ns(20000000);
+    }
+    serial.println("audio_smoke: start", 18);
+    if (stream_count == 0) {
+        serial.println("audio_smoke: no streams bound FAIL", 34);
+        return;
+    }
+
+    let is i64 as outs with mut = 0;
+    let is i64 as ins with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < stream_count) {
+        if (streams[i].direction == abi.AUDIO_DIR_OUT) { outs = outs + 1; }
+        else { ins = ins + 1; }
+        i = i + 1;
+    }
+    smoke_check(cast(*u8, "dev_count(DEV_AUDIO_OUT)"), 24,
+                driver.device_count(abi.DEV_AUDIO_OUT), outs);
+    smoke_check(cast(*u8, "dev_count(DEV_AUDIO_IN)"), 23,
+                driver.device_count(abi.DEV_AUDIO_IN), ins);
+    smoke_check(cast(*u8, "index 99 is not a stream"), 24,
+                driver.device_open(abi.DEV_AUDIO_OUT, 99), 0);
+
+    let is i64 as s with mut = 0;
+    while (s < stream_count) {
+        serial.print("audio_smoke: stream ", 20);
+        util.print_num(s);
+        serial.println("", 0);
+        smoke_stream(s);
+        s = s + 1;
+    }
+    // One playback stream is enough for the grab: it is the class contract
+    // being tested, not the driver.
+    let is i64 as g with mut = 0;
+    while (g < stream_count) {
+        if (streams[g].direction == abi.AUDIO_DIR_OUT) {
+            smoke_grab(g);
+            g = stream_count;
+        } else { g = g + 1; }
+    }
+
+    if (smoke_fails == 0) { serial.println("audio_smoke: PASS", 17); }
+    else {
+        serial.print("audio_smoke: FAIL n=", 20);
+        util.print_num(smoke_fails);
+        serial.println("", 0);
+    }
+    return;
+}

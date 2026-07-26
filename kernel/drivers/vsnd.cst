@@ -1,0 +1,586 @@
+// vsnd.cst — virtio-sound (virtio spec §5.14), the third consumer of the
+// modern PCI transport and the first that needs DESCRIPTOR CHAINS.
+//
+// vtablet posts one buffer per slot; vnet posts one buffer per frame. A
+// virtio-sound transfer is three descriptors that the device reads as one
+// message:
+//
+//   [device-readable  4 B]  virtio_snd_pcm_xfer { stream_id }
+//   [device-readable  N B]  one period of PCM — pointing STRAIGHT INTO the
+//                           ring the program mmap'd, so the sample it stored
+//                           is the sample the device reads. No bounce buffer,
+//                           no copy, no second address to keep in step.
+//   [device-writable  8 B]  virtio_snd_pcm_status { status, latency_bytes }
+//
+// and the completion of that message in the used ring IS the period
+// interrupt. There is no separate timer and no position register to sample:
+// the device tells us it consumed a period by handing the message back.
+//
+// CAPTURE IS THE SAME MESSAGE with the PCM descriptor marked device-writable.
+// That symmetry is why DEV_AUDIO_IN exists from the start rather than
+// "later": leaving it out would have been strictly more code, not less.
+//
+// Only in a hypervisor. This is a paravirtual device, so it proves the class
+// and the whole userspace stack on top of it, but it is not what makes a
+// laptop make noise — Intel HDA is, and that driver is still to come.
+
+use "pci.cst" as pci;
+use "driver.cst" as driver;
+use "spec.cst" as spec;
+use "ksym.cst" as ksym;
+use "serial.cst" as serial;
+use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "timer.cst" as timer;
+use "util.cst" as util;
+use "virtio.cst" as virtio;
+use "audio.cst" as audio;
+use "abi.cst" as abi;
+
+// ---- the wire, from virtio 1.2 §5.14.6 (mirrored in linux/virtio_snd.h) ----
+
+let is i64 as VQ_CONTROL = 0;
+let is i64 as VQ_EVENT   = 1;
+let is i64 as VQ_TX      = 2;
+let is i64 as VQ_RX      = 3;
+
+let is i64 as R_PCM_INFO       = 0x0100;
+let is i64 as R_PCM_SET_PARAMS = 0x0101;
+let is i64 as R_PCM_PREPARE    = 0x0102;
+let is i64 as R_PCM_RELEASE    = 0x0103;
+let is i64 as R_PCM_START      = 0x0104;
+let is i64 as R_PCM_STOP       = 0x0105;
+let is i64 as S_OK             = 0x8000;
+
+let is i64 as D_OUTPUT = 0;
+let is i64 as D_INPUT  = 1;
+
+// These enums are POSITIONAL — the value is the bit index in the device's
+// support bitmap, and picking the wrong one gives a device that accepts the
+// parameters and plays noise. Checked against linux/virtio_snd.h rather than
+// counted from the spec text.
+let is i64 as FMT_S16    = 5;
+let is i64 as RATE_48000 = 7;
+
+let is i64 as PCM_INFO_SZ = 32;      // virtio_snd_pcm_info
+let is i64 as CFG_STREAMS = 4;       // virtio_snd_config.streams (jacks is at 0)
+
+// The control queue is one request at a time and never in the fast path, so
+// it gets a small ring and a generous slot. Request at slot 0, reply at
+// CTL_SLOT — the whole transaction is two descriptors and one wait.
+let is i64 as CTL_Q    = 8;
+let is i64 as CTL_SLOT = 512;
+
+// The I/O queues carry chains of three, so descriptors are the limit rather
+// than slots. The small pool holds only the 4-byte header and the 8-byte
+// status of each message in flight, indexed by the chain's head descriptor —
+// the PCM itself lives in the program's ring.
+let is i64 as IO_Q    = 64;
+let is i64 as IO_SLOT = 16;
+
+let is i64 as MAX_CARDS = 2;
+
+// ============================================================
+// State
+// ============================================================
+
+struct VsndStream {
+    ctx          as i64;      // *VsndCtx
+    present      as i64;
+    stream_id    as i64;      // the device's numbering
+    direction    as i64;
+    audio_index  as i64;      // what audio.register handed back
+    ring_phys    as i64;
+    ring_bytes   as i64;
+    period_bytes as i64;
+    period_count as i64;
+    next_period  as i64;      // which period the next message will carry
+    inflight     as i64;
+    running      as i64;
+}
+
+struct VsndCtx {
+    present  as i64;
+    nstreams as i64;
+    vdev as virtio.VirtioDev;
+    ctlq as virtio.VirtQueue;
+    txq  as virtio.VirtQueue;
+    rxq  as virtio.VirtQueue;
+    lk   as lock.TicketLock;
+}
+
+let is [2]VsndCtx as ctxs with mut;          // == MAX_CARDS
+let is [4]VsndStream as strms with mut;      // two per card
+let is [4]audio.AudioDevice as ads with mut;
+let is i64 as nctx with mut = 0;
+let is i64 as nstrm with mut = 0;
+
+let is ksym.KSym as ksym_bind;
+let is ksym.KSym as ksym_irq;
+
+fn ctx_at(i as i64) as *VsndCtx {
+    if (i == 0) { return &ctxs[0]; }
+    return &ctxs[1];
+}
+
+fn strm_at(i as i64) as *VsndStream {
+    if (i == 0) { return &strms[0]; }
+    if (i == 1) { return &strms[1]; }
+    if (i == 2) { return &strms[2]; }
+    return &strms[3];
+}
+
+fn ad_at(i as i64) as *audio.AudioDevice {
+    if (i == 0) { return &ads[0]; }
+    if (i == 1) { return &ads[1]; }
+    if (i == 2) { return &ads[2]; }
+    return &ads[3];
+}
+
+fn vq_of(s as *VsndStream) as *virtio.VirtQueue {
+    let is *VsndCtx as c = cast(*VsndCtx, s.ctx);
+    if (s.direction == D_INPUT) { return &c.rxq; }
+    return &c.txq;
+}
+
+fn q_index_of(s as *VsndStream) as i64 {
+    if (s.direction == D_INPUT) { return VQ_RX; }
+    return VQ_TX;
+}
+
+// ============================================================
+// Control transactions
+//
+// Synchronous by construction: the caller stages a request at slot 0, this
+// posts it with a device-writable reply buffer and waits. Everything that
+// uses it runs on a thread — bind, and the grab handover, which audio.cst
+// deliberately performs with no lock held precisely so this can sleep.
+// ============================================================
+
+fn ctl_xact(c as *VsndCtx, req_len as i64, resp_len as i64) as i64 {
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    let is i64 as d0 = virtio.vio_desc_alloc(&c.ctlq);
+    let is i64 as d1 = virtio.vio_desc_alloc(&c.ctlq);
+    if (d0 < 0 || d1 < 0) {
+        if (d0 >= 0) { virtio.vio_desc_free_chain(&c.ctlq, d0); }
+        if (d1 >= 0) { virtio.vio_desc_free_chain(&c.ctlq, d1); }
+        lock.release_irq(&c.lk, fl);
+        return 0 - 1;
+    }
+    // The reply buffer holds whatever the last transaction left there, and a
+    // device that answers nothing would let that be read as an answer.
+    let is i64 as z with mut = 0;
+    while (z < resp_len) {
+        let is *u8 as p = cast(*u8, c.ctlq.buf_va + CTL_SLOT + z);
+        p[0] = cast(u8, 0);
+        z = z + 1;
+    }
+    virtio.vio_desc_set(&c.ctlq, d0, c.ctlq.buf_phys, req_len, virtio.DESC_F_NEXT, d1);
+    virtio.vio_desc_set(&c.ctlq, d1, c.ctlq.buf_phys + CTL_SLOT, resp_len,
+                        virtio.DESC_F_WRITE, 0);
+    virtio.vio_avail_push(&c.ctlq, d0);
+    virtio.vio_publish(&c.vdev, &c.ctlq, VQ_CONTROL);
+    lock.release_irq(&c.lk, fl);
+
+    // A deadline, not a spin: a device that never answers must fail the bind
+    // with a diagnosis rather than hang the boot.
+    let is i64 as deadline = timer.current_time_ns() + 1000000000;
+    let is i64 as got with mut = 0 - 1;
+    while (got < 0 && timer.current_time_ns() < deadline) {
+        let is i64 as f2 = lock.acquire_irq(&c.lk);
+        got = virtio.vio_next_used(&c.ctlq);
+        lock.release_irq(&c.lk, f2);
+        if (got < 0) { sched.sleep_for_ns(200000); }
+    }
+    let is i64 as f3 = lock.acquire_irq(&c.lk);
+    virtio.vio_desc_free_chain(&c.ctlq, d0);
+    lock.release_irq(&c.lk, f3);
+    if (got < 0) { return 0 - 2; }
+    return virtio.rd32(c.ctlq.buf_va + CTL_SLOT);
+}
+
+// virtio_snd_pcm_hdr { le32 code; le32 stream_id } — every PCM control
+// request that carries no parameters.
+fn pcm_cmd(c as *VsndCtx, code as i64, stream_id as i64) as i64 {
+    virtio.wr32(c.ctlq.buf_va + 0, code);
+    virtio.wr32(c.ctlq.buf_va + 4, stream_id);
+    return ctl_xact(c, 8, 4);
+}
+
+// virtio_snd_pcm_set_params — the one request with a body:
+//   hdr(8) buffer_bytes(4) period_bytes(4) features(4) channels(1)
+//   format(1) rate(1) padding(1)
+fn pcm_set_params(c as *VsndCtx, s as *VsndStream, channels as i64) as i64 {
+    virtio.wr32(c.ctlq.buf_va + 0,  R_PCM_SET_PARAMS);
+    virtio.wr32(c.ctlq.buf_va + 4,  s.stream_id);
+    virtio.wr32(c.ctlq.buf_va + 8,  s.ring_bytes);
+    virtio.wr32(c.ctlq.buf_va + 12, s.period_bytes);
+    virtio.wr32(c.ctlq.buf_va + 16, 0);                 // no optional features
+    virtio.wr8(c.ctlq.buf_va + 20, channels);
+    virtio.wr8(c.ctlq.buf_va + 21, FMT_S16);
+    virtio.wr8(c.ctlq.buf_va + 22, RATE_48000);
+    virtio.wr8(c.ctlq.buf_va + 23, 0);
+    return ctl_xact(c, 24, 4);
+}
+
+// ============================================================
+// I/O messages
+// ============================================================
+
+// Build and post one three-descriptor message for the next period in the
+// cycle. Caller holds c.lk. Returns 0, or negative when the queue is full.
+//
+// The chain is rebuilt every time rather than reposted: the period a message
+// carries moves on with each lap, and re-deriving the address is both simpler
+// and the only thing that stays correct when fewer messages are in flight
+// than there are periods in the ring.
+fn io_post(s as *VsndStream) as i64 {
+    let is *virtio.VirtQueue as vq = vq_of(s);
+    if (virtio.vio_desc_free_count(vq) < 3) { return 0 - 1; }
+    let is i64 as d0 = virtio.vio_desc_alloc(vq);
+    let is i64 as d1 = virtio.vio_desc_alloc(vq);
+    let is i64 as d2 = virtio.vio_desc_alloc(vq);
+    if (d0 < 0 || d1 < 0 || d2 < 0) { return 0 - 1; }
+
+    let is i64 as hdr_va = vq.buf_va + d0 * IO_SLOT;
+    let is i64 as hdr_phys = vq.buf_phys + d0 * IO_SLOT;
+    virtio.wr32(hdr_va, s.stream_id);
+    virtio.wr32(hdr_va + 8, 0);
+    virtio.wr32(hdr_va + 12, 0);
+
+    let is i64 as p = s.next_period % s.period_count;
+    s.next_period = s.next_period + 1;
+    let is i64 as data_phys = s.ring_phys + p * s.period_bytes;
+
+    // Device-readable descriptors must come before device-writable ones in a
+    // chain (virtio 1.2 §2.7.4). Playback: header and PCM are read, status is
+    // written. Capture: only the header is read, PCM and status are written —
+    // still readable-then-writable, so the same order holds.
+    let is i64 as pcm_flags with mut = virtio.DESC_F_NEXT;
+    if (s.direction == D_INPUT) { pcm_flags = pcm_flags | virtio.DESC_F_WRITE; }
+    virtio.vio_desc_set(vq, d0, hdr_phys, 4, virtio.DESC_F_NEXT, d1);
+    virtio.vio_desc_set(vq, d1, data_phys, s.period_bytes, pcm_flags, d2);
+    virtio.vio_desc_set(vq, d2, hdr_phys + 8, 8, virtio.DESC_F_WRITE, 0);
+    virtio.vio_avail_push(vq, d0);
+    s.inflight = s.inflight + 1;
+    return 0;
+}
+
+// Harvest completions. ONE COMPLETION IS ONE PERIOD, which is what makes this
+// the interrupt audio.cst is waiting for.
+//
+// c.lk is dropped before calling into audio.cst and taken again afterwards.
+// That is not tidiness: audio's handover path holds its own lock and calls
+// this driver's stop/start, so a handler that held c.lk while reaching for
+// audio's lock would close the cycle and deadlock the two on different cpus.
+fn io_drain(s as *VsndStream) as i64 {
+    let is *VsndCtx as c = cast(*VsndCtx, s.ctx);
+    let is *virtio.VirtQueue as vq = vq_of(s);
+    let is i64 as n with mut = 0;
+    while (1 == 1) {
+        let is i64 as fl = lock.acquire_irq(&c.lk);
+        let is i64 as head = virtio.vio_next_used(vq);
+        if (head >= 0) {
+            virtio.vio_desc_free_chain(vq, head);
+            if (s.inflight > 0) { s.inflight = s.inflight - 1; }
+        }
+        lock.release_irq(&c.lk, fl);
+        if (head < 0) { return n; }
+        n = n + 1;
+
+        if (s.running != 0) {
+            audio.irq_period(s.audio_index);
+            let is i64 as f2 = lock.acquire_irq(&c.lk);
+            if (s.running != 0) {
+                io_post(s);
+                virtio.vio_publish(&c.vdev, vq, q_index_of(s));
+            }
+            lock.release_irq(&c.lk, f2);
+        }
+    }
+    return n;
+}
+
+// ============================================================
+// The audio.AudioDevice vtable
+// ============================================================
+
+fn ad_set_buffer(priv as *u8, ring_phys as i64, ring_bytes as i64,
+                 period_bytes as i64) as i64 {
+    let is *VsndStream as s = cast(*VsndStream, priv);
+    if (s.present == 0) { return 0 - 1; }
+    if (period_bytes <= 0) { return 0 - 1; }
+    let is *VsndCtx as c = cast(*VsndCtx, s.ctx);
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    s.ring_phys = ring_phys;
+    s.ring_bytes = ring_bytes;
+    s.period_bytes = period_bytes;
+    s.period_count = ring_bytes / period_bytes;
+    // The engine is stopped, so the next message is the first of a new run.
+    // audio.cst rounds its frame counter to a buffer boundary on the way out
+    // for exactly this: period zero of the new ring is where playback picks
+    // up, and (hw_ptr % buffer_frames) has to agree.
+    s.next_period = 0;
+    lock.release_irq(&c.lk, fl);
+    return 0;
+}
+
+fn ad_start(priv as *u8) as i64 {
+    let is *VsndStream as s = cast(*VsndStream, priv);
+    if (s.present == 0) { return 0 - 1; }
+    if (s.ring_phys == 0) { return 0 - 1; }
+    let is *VsndCtx as c = cast(*VsndCtx, s.ctx);
+
+    let is i64 as chans = 2;
+    if (pcm_set_params(c, s, chans) != S_OK) {
+        serial.println("vsnd: SET_PARAMS refused", 24);
+        return 0 - 2;
+    }
+    if (pcm_cmd(c, R_PCM_PREPARE, s.stream_id) != S_OK) {
+        serial.println("vsnd: PREPARE refused", 21);
+        return 0 - 3;
+    }
+
+    // Fill the pipeline before starting, so the first period the device plays
+    // is one we chose rather than whatever it does when it finds nothing.
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    s.running = 1;
+    s.inflight = 0;
+    let is i64 as want with mut = s.period_count;
+    let is i64 as cap = vq_of(s).qsize / 3;
+    if (want > cap) { want = cap; }
+    let is i64 as i with mut = 0;
+    while (i < want) {
+        if (io_post(s) != 0) { i = want; } else { i = i + 1; }
+    }
+    virtio.vio_publish(&c.vdev, vq_of(s), q_index_of(s));
+    lock.release_irq(&c.lk, fl);
+
+    if (pcm_cmd(c, R_PCM_START, s.stream_id) != S_OK) {
+        serial.println("vsnd: START refused", 19);
+        let is i64 as f2 = lock.acquire_irq(&c.lk);
+        s.running = 0;
+        lock.release_irq(&c.lk, f2);
+        return 0 - 4;
+    }
+    return 0;
+}
+
+fn ad_stop(priv as *u8) as i64 {
+    let is *VsndStream as s = cast(*VsndStream, priv);
+    if (s.present == 0) { return 0 - 1; }
+    let is *VsndCtx as c = cast(*VsndCtx, s.ctx);
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    s.running = 0;
+    lock.release_irq(&c.lk, fl);
+
+    pcm_cmd(c, R_PCM_STOP, s.stream_id);
+    // RELEASE is what obliges the device to hand every pending message back
+    // (virtio 1.2 §5.14.6.6.3). Without it the descriptors those messages
+    // hold are the device's forever, and the queue drains away one handover
+    // at a time until nothing can be posted.
+    pcm_cmd(c, R_PCM_RELEASE, s.stream_id);
+
+    let is i64 as deadline = timer.current_time_ns() + 500000000;
+    while (s.inflight > 0 && timer.current_time_ns() < deadline) {
+        let is i64 as f2 = lock.acquire_irq(&c.lk);
+        let is i64 as head = virtio.vio_next_used(vq_of(s));
+        if (head >= 0) {
+            virtio.vio_desc_free_chain(vq_of(s), head);
+            if (s.inflight > 0) { s.inflight = s.inflight - 1; }
+        }
+        lock.release_irq(&c.lk, f2);
+        if (head < 0) { sched.sleep_for_ns(200000); }
+    }
+    if (s.inflight > 0) {
+        // Whatever is still out stays out: those descriptors belong to the
+        // device until it says otherwise, and reusing them would corrupt a
+        // transfer in progress. Loud, because it is a device that broke its
+        // side of the contract and the queue is now smaller for good.
+        serial.print("vsnd: device kept ", 18);
+        util.print_num(s.inflight);
+        serial.println(" messages after RELEASE", 23);
+    }
+    return 0;
+}
+
+// ============================================================
+// IRQ
+// ============================================================
+
+fn vsnd_irq(hw as *driver.Hardware, ctx as *u8) as i32 {
+    let is *spec.Binding as b = cast(*spec.Binding, ctx);
+    if (cast(i64, b) == 0) { return 0; }
+    let is *VsndCtx as c = cast(*VsndCtx, b.private);
+    if (cast(i64, c) == 0) { return 0; }
+    if (c.present == 0) { return 0; }
+    // Shared INTx: read-clear our own ISR and say nothing if the line was not
+    // ours. A handler that drains regardless is how one device's interrupt
+    // becomes another device's wedge.
+    let is i64 as isr = virtio.vio_isr_read(&c.vdev);
+    if ((isr & 1) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < nstrm) {
+        let is *VsndStream as s = strm_at(i);
+        if (s.present != 0 && cast(i64, s.ctx) == cast(i64, c)) { io_drain(s); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Bind
+// ============================================================
+
+// Ask the device about one PCM stream and decide whether we can drive it.
+// Returns the direction (0/1), or negative.
+fn probe_stream(c as *VsndCtx, id as i64) as i64 {
+    virtio.wr32(c.ctlq.buf_va + 0,  R_PCM_INFO);
+    virtio.wr32(c.ctlq.buf_va + 4,  id);          // start_id
+    virtio.wr32(c.ctlq.buf_va + 8,  1);           // count
+    virtio.wr32(c.ctlq.buf_va + 12, PCM_INFO_SZ); // size
+    if (ctl_xact(c, 16, 4 + PCM_INFO_SZ) != S_OK) { return 0 - 1; }
+
+    // virtio_snd_pcm_info, after the 4-byte reply header:
+    //   hda_fn_nid(4) features(4) formats(8) rates(8)
+    //   direction(1) channels_min(1) channels_max(1) padding[5]
+    let is i64 as info = c.ctlq.buf_va + CTL_SLOT + 4;
+    let is i64 as formats_lo = virtio.rd32(info + 8);
+    let is i64 as rates_lo = virtio.rd32(info + 16);
+    let is i64 as direction = cast(i64, virtio.rd8(info + 24));
+    let is i64 as ch_min = cast(i64, virtio.rd8(info + 25));
+    let is i64 as ch_max = cast(i64, virtio.rd8(info + 26));
+
+    // S16 is bit 5 and 48000 is bit 7, both inside the low word. A stream
+    // that cannot do them is skipped rather than opened and hoped for: the
+    // kernel reports the format it got, so it must not claim one it did not.
+    if ((formats_lo & (1 << FMT_S16)) == 0) { return 0 - 2; }
+    if ((rates_lo & (1 << RATE_48000)) == 0) { return 0 - 3; }
+    if (ch_min > 2 || ch_max < 2) { return 0 - 4; }
+    return direction;
+}
+
+fn name_of(ad as *audio.AudioDevice) as void {
+    ad.name[0] = cast(u8, 118);   // v
+    ad.name[1] = cast(u8, 115);   // s
+    ad.name[2] = cast(u8, 110);   // n
+    ad.name[3] = cast(u8, 100);   // d
+    ad.name[4] = cast(u8, 0);
+    let is i64 as i with mut = 5;
+    while (i < 32) { ad.name[i] = cast(u8, 0); i = i + 1; }
+    return;
+}
+
+fn vsnd_bind(b as *spec.Binding) as i32 {
+    if (nctx >= MAX_CARDS) {
+        serial.println("vsnd: no free instance slot", 27);
+        return cast(i32, 0 - 99);
+    }
+    let is *VsndCtx as c = ctx_at(nctx);
+    b.private = cast(*u8, c);
+    let is i64 as hw = cast(i64, b.hardware);
+
+    pci.pci_enable_bus_master(b.hardware);
+    if (virtio.vio_setup(hw, &c.vdev) != 0) {
+        serial.println("vsnd: no modern virtio caps", 27);
+        return 1;
+    }
+    if (virtio.vio_negotiate(&c.vdev) != 0) {
+        serial.println("vsnd: feature negotiation FAIL", 30);
+        return 1;
+    }
+    if (virtio.vio_queue_setup(&c.vdev, VQ_CONTROL, CTL_Q, CTL_SLOT * 2, &c.ctlq) != 0) {
+        serial.println("vsnd: controlq setup FAIL", 25);
+        return 1;
+    }
+    if (virtio.vio_queue_setup(&c.vdev, VQ_TX, IO_Q, IO_SLOT, &c.txq) != 0) {
+        serial.println("vsnd: txq setup FAIL", 20);
+        return 1;
+    }
+    if (virtio.vio_queue_setup(&c.vdev, VQ_RX, IO_Q, IO_SLOT, &c.rxq) != 0) {
+        serial.println("vsnd: rxq setup FAIL", 20);
+        return 1;
+    }
+    // The event queue is set up and left empty on purpose. Its events are
+    // jack hotplug and the device's own xrun notice — both things this design
+    // learns elsewhere (there is no jack to report, and an xrun is visible in
+    // the frame counters). Configuring it and posting nothing is honest; not
+    // configuring it at all would leave a queue the device may still select.
+    let is virtio.VirtQueue as evq with mut;
+    virtio.vio_queue_setup(&c.vdev, VQ_EVENT, 4, 16, &evq);
+
+    let is i64 as streams with mut = 0;
+    if (c.vdev.devcfg != 0) { streams = virtio.rd32(c.vdev.devcfg + CFG_STREAMS); }
+    if (streams <= 0) {
+        serial.println("vsnd: device reports no streams", 31);
+        return 1;
+    }
+    c.nstreams = streams;
+    c.present = 1;
+    virtio.vio_driver_ok(&c.vdev);
+
+    serial.print("vsnd: virtio-sound up, ", 23);
+    util.print_num(streams);
+    serial.println(" pcm streams", 12);
+
+    // One audio stream per direction, taking the first the device offers in
+    // each. A device with four outputs is four converters on one card and
+    // choosing among them is policy — but there is nowhere yet for that
+    // policy to live, so the honest v0 is "the first one, and say so".
+    let is i64 as got_out with mut = 0;
+    let is i64 as got_in with mut = 0;
+    let is i64 as id with mut = 0;
+    while (id < streams) {
+        let is i64 as dir = probe_stream(c, id);
+        let is i64 as take with mut = 0;
+        if (dir == D_OUTPUT && got_out == 0) { take = 1; got_out = 1; }
+        if (dir == D_INPUT && got_in == 0)   { take = 1; got_in = 1; }
+        if (take == 1 && nstrm < 4) {
+            let is *VsndStream as s = strm_at(nstrm);
+            let is *audio.AudioDevice as ad = ad_at(nstrm);
+            s.ctx = cast(i64, c);
+            s.stream_id = id;
+            s.direction = dir;
+            s.ring_phys = 0;
+            s.ring_bytes = 0;
+            s.period_bytes = 0;
+            s.period_count = 0;
+            s.next_period = 0;
+            s.inflight = 0;
+            s.running = 0;
+            s.present = 1;
+            name_of(ad);
+            ad.set_buffer = fn_ptr(ad_set_buffer);
+            ad.start      = fn_ptr(ad_start);
+            ad.stop       = fn_ptr(ad_stop);
+            ad.priv       = cast(*u8, s);
+            let is i64 as adir with mut = abi.AUDIO_DIR_OUT;
+            if (dir == D_INPUT) { adir = abi.AUDIO_DIR_IN; }
+            let is i64 as ai = audio.register(ad, hw, adir, 48000, 2, abi.AUDIO_FMT_S16_LE);
+            if (ai < 0) {
+                serial.println("vsnd: audio.register failed", 27);
+                s.present = 0;
+            } else {
+                s.audio_index = ai;
+                nstrm = nstrm + 1;
+            }
+        }
+        id = id + 1;
+    }
+    if (got_out == 0 && got_in == 0) {
+        serial.println("vsnd: no stream does 48kHz S16 stereo", 37);
+        return 1;
+    }
+    nctx = nctx + 1;
+    return 0;
+}
+
+fn register() as void {
+    ksym_bind.name_ptr = cast(*u8, "vsnd.vsnd_bind");  ksym_bind.name_len = 14;
+    ksym_bind.addr = cast(i64, fn_ptr(vsnd_bind));     ksym_bind.kind = ksym.KIND_FUNC;
+    ksym.register(&ksym_bind);
+    ksym_irq.name_ptr = cast(*u8, "vsnd.vsnd_irq");    ksym_irq.name_len = 13;
+    ksym_irq.addr = cast(i64, fn_ptr(vsnd_irq));       ksym_irq.kind = ksym.KIND_FUNC;
+    ksym.register(&ksym_irq);
+    serial.println("vsnd: registered", 16);
+}

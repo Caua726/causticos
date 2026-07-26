@@ -22,6 +22,8 @@
 .global _cdvrspec_vtablet_end
 .global _cdvrspec_vnet_start
 .global _cdvrspec_vnet_end
+.global _cdvrspec_vsnd_start
+.global _cdvrspec_vsnd_end
 _cdvrspec_dummy_start:
 .incbin "kernel/drivers/dummy.cdvrspec"
 _cdvrspec_dummy_end:
@@ -43,6 +45,9 @@ _cdvrspec_vtablet_end:
 _cdvrspec_vnet_start:
 .incbin "kernel/drivers/vnet.cdvrspec"
 _cdvrspec_vnet_end:
+_cdvrspec_vsnd_start:
+.incbin "kernel/drivers/vsnd.cdvrspec"
+_cdvrspec_vsnd_end:
 
 .section .cdvrspec_index
 .quad _cdvrspec_dummy_start
@@ -59,3 +64,5 @@ _cdvrspec_vnet_end:
 .quad _cdvrspec_vtablet_end
 .quad _cdvrspec_vnet_start
 .quad _cdvrspec_vnet_end
+.quad _cdvrspec_vsnd_start
+.quad _cdvrspec_vsnd_end

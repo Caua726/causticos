@@ -22,10 +22,16 @@
 #   QEMU_KVM    1 → -enable-kvm -cpu host           (default 0)
 #   QEMU_SMP    CPU count, "" → let qemu default    (default "")
 #   QEMU_PCAP   file to dump net0 traffic to, "" off (default "")
+#   QEMU_WAV    file to record guest audio into, "" off (default "")
 #
 # QEMU_PCAP is the highest-leverage debugging knob in the tree: when a packet
 # doesn't arrive, open the pcap in Wireshark and read the wrong byte instead of
 # guessing at it.
+#
+# QEMU_WAV is the same idea for sound, and it is the ONLY way to check audio
+# without a person listening: the guest plays a tone, QEMU writes the samples
+# to a file, and scripts/check-wav.py measures the frequency and the amplitude
+# that came out. Without it "the driver works" would mean "it did not crash".
 
 QEMU_ISO="${QEMU_ISO:-build/causticos.iso}"
 QEMU_DISK="${QEMU_DISK:-build/disk.img}"
@@ -33,6 +39,32 @@ QEMU_MEM="${QEMU_MEM:-128M}"
 QEMU_KVM="${QEMU_KVM:-0}"
 QEMU_SMP="${QEMU_SMP:-}"
 QEMU_PCAP="${QEMU_PCAP:-}"
+QEMU_WAV="${QEMU_WAV:-}"
+
+# The audio backend, decided before the device line that references it and
+# spliced into QEMU_ARGS itself rather than into a second array — a second
+# array is a second thing every caller has to remember, and the first one to
+# forget it was verify.sh, which then failed every run with a machine that
+# would not start.
+#
+# `wav` records at the rate the guest actually plays at, so check-wav.py
+# measures the guest's clock and not QEMU's resampler.
+if [ -n "$QEMU_WAV" ]; then
+    QEMU_AUDIO_BACKEND=("wav,id=snd0,path=$QEMU_WAV,out.frequency=48000,out.channels=2,out.format=s16")
+    # The wav backend RECORDS what the guest plays and has no input side at
+    # all — QEMU cannot open an ADC on it. So the card it backs is an
+    # output-only card, and says so with streams=1. Leaving the capture
+    # stream declared would mean advertising a converter with no clock behind
+    # it: the guest would open it, wait for frames that can never arrive, and
+    # the honest report would be a driver bug that is not one.
+    QEMU_SND_STREAMS=1
+else
+    QEMU_AUDIO_BACKEND=("none,id=snd0")
+    # `none` is a full-duplex backend: it consumes playback and produces
+    # silence for capture, both on QEMU's clock. That is what lets the boot
+    # smoke exercise the capture path on every ordinary run.
+    QEMU_SND_STREAMS=2
+fi
 
 QEMU_ARGS=(
     -cdrom "$QEMU_ISO"
@@ -62,6 +94,12 @@ QEMU_ARGS=(
 
     # Absolute pointer — the guest cursor tracks the host cursor with no grab.
     -device virtio-tablet-pci
+
+    # Sound. The backend is `none` for every ordinary run — the DMA engine
+    # still runs on QEMU's clock, which is all the driver needs to be
+    # exercised — and `wav` when a test wants to READ what the guest played.
+    -audiodev "${QEMU_AUDIO_BACKEND[0]}"
+    -device "virtio-sound-pci,audiodev=snd0,streams=$QEMU_SND_STREAMS,disable-legacy=on,disable-modern=off"
 
     # -boot d forces the CD first: the FAT32 image has a valid MBR and BIOS
     # would otherwise try to boot from it.
