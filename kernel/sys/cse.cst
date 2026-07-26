@@ -48,6 +48,11 @@ use "serial.cst" as serial;
 use "util.cst" as util;
 use "vma.cst" as vma;
 use "elf.cst" as elf;
+use "vfs.cst" as vfs;
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "vmm.cst" as vmm;
+use "abi.cst" as abi;
 
 let is i64 as CSE_VERSION = 2;
 let is i64 as CSE_MAX_SEGS = 16;
@@ -59,6 +64,8 @@ let is i64 as H_ARCH       = 0x06;
 let is i64 as H_FLAGS      = 0x07;   // v3 flags byte: bit0 = dynamic stack growth
 let is i64 as H_ENTRY      = 0x08;
 let is i64 as H_SEGCOUNT   = 0x18;
+let is i64 as H_IMPORT_OFF   = 0x20; // v3.2: import-table file offset (0 = none)
+let is i64 as H_IMPORT_COUNT = 0x28; // v3.2: number of imports
 let is i64 as H_STACKSIZE  = 0x2C;   // v3 only: user-stack bytes the program declares
 let is i64 as H_SIZE       = 0x20;
 
@@ -98,6 +105,65 @@ let is i64 as CSE_ARCH_X86_64  = 1;
 let is i64 as CSE_ARCH_AARCH64 = 2;
 let is i64 as CSE_ARCH_NATIVE  = 1 * __target_is_x86_64 + 2 * __target_is_aarch64;
 
+// ============================================================
+// Shared libraries (.csl) — the dynamic half.
+//
+// A v3.2 image imports symbols instead of bundling them. Its import table says
+// which libraries it needs, and for each symbol which of them exports it:
+//
+//   u32 import_count
+//   u32 lib_count
+//   lib_count * lib_name          (NUL-terminated, e.g. "libcaustic.csl")
+//   import_count * { u32 rtype, u32 lib_idx, u64 site_vaddr, sym_name }
+//
+// The loader opens /lib/<name> for each, maps its segments into the child, and
+// patches each site with the address the library exports the symbol at.
+//
+// The patch is one rule for both relocation kinds, and it is not a
+// simplification: caustic-ld resolves these sites against address ZERO, so a
+// PC32 site already holds `0 - (site+4) + addend` and a 64-bit site already
+// holds the addend. Adding S is therefore exactly right in both cases, with no
+// per-type arithmetic to get wrong.
+//
+// CSL_ v2 header (44 bytes), as written by cse_writer.cst:cse_emit_csl_image:
+//   0x00 4 "CSL_"  0x04 2 version=2  0x06 1 arch  0x07 1 flags
+//   0x08 8 base_addr  0x10 4 seg_count  0x14 4 export_count  0x18 8 export_off
+//   0x20 8 kimport_off  0x28 4 kimport_count
+//   then seg_count * 24 (vaddr, file_off, file_size, mem_size, perms),
+//   then the packed segment bytes, then export_count * 12 (name_off u32,
+//   vaddr u64) at export_off with an absolute-offset string blob.
+// ============================================================
+let is i64 as CSL_HDR_SIZE   = 44;
+let is i64 as CSL_VERSION     = 2;
+let is i64 as CSL_ARCH        = 0x06;
+let is i64 as CSL_SEGCOUNT    = 0x10;
+let is i64 as CSL_EXPCOUNT    = 0x14;
+let is i64 as CSL_EXPOFF      = 0x18;
+let is i64 as CSL_EXP_ENTRY   = 12;
+let is i64 as CSL_MAX_SEGS    = 16;
+
+// Relocation types, from the x86_64 psABI. Only the two the linker emits for
+// an undefined call or data reference.
+let is i64 as R_X86_64_64    = 1;
+let is i64 as R_X86_64_PC32  = 2;
+let is i64 as R_X86_64_PLT32 = 4;
+
+// Libraries stay resident once read: a shell spawning forty programs would
+// otherwise read the same file forty times off the volume. The cache is keyed
+// by name and never evicted — a .csl is small, there are a handful of them, and
+// they are exactly what every program needs.
+//
+// This is also where the RAM win will come from: the image is read once, so the
+// frames behind it can be mapped into several address spaces rather than
+// copied. Today each aspace gets its own copy; the cache is the part that has
+// to exist first.
+let is i64 as CSL_CACHE_MAX  = 8;
+let is i64 as CSL_NAME_MAX   = 32;
+let is [8]i64 as _csl_buf with mut;
+let is [8]i64 as _csl_size with mut;
+let is [256]u8 as _csl_name with mut;
+let is i64 as _csl_count with mut = 0;
+
 let is i64 as MINI_OFF        = 0x40;
 let is i64 as MINI_OFF_VER    = 0x44;     // u16: mini-header version
 let is i64 as MINI_OFF_BODY   = 0x48;     // 12 ASCII digits: file offset of CST image
@@ -133,6 +199,247 @@ fn perms_to_prot(perms as i64) as i64 {
     if ((perms & PERM_W) != 0) { prot = prot | vma.PROT_WRITE; }
     if ((perms & PERM_X) == 0) { prot = prot | vma.PROT_NX; }
     return prot;
+}
+
+// ============================================================
+// Shared-library loading
+// ============================================================
+
+// Byte-compare a NUL-terminated cache name against a length-delimited one.
+fn _csl_name_eq(slot as i64, nm as *u8, nl as i64) as i32 {
+    let is i64 as base = slot * CSL_NAME_MAX;
+    let is i64 as i with mut = 0;
+    while (i < nl) {
+        if (_csl_name[base + i] == cast(u8, 0)) { return 0; }
+        if (_csl_name[base + i] != nm[i]) { return 0; }
+        i = i + 1;
+    }
+    if (_csl_name[base + nl] != cast(u8, 0)) { return 0; }
+    return 1;
+}
+
+// Read /lib/<name> once and keep it. Returns the cache slot, or -1.
+fn _csl_open(nm as *u8, nl as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < _csl_count) {
+        if (_csl_name_eq(k, nm, nl) == 1) { return k; }
+        k = k + 1;
+    }
+    if (_csl_count >= CSL_CACHE_MAX) {
+        serial.println("cse: too many shared libraries", 30);
+        return 0 - 1;
+    }
+    if (nl <= 0 || nl >= CSL_NAME_MAX) { return 0 - 1; }
+
+    // "/lib/" + name. Built here rather than taken from the image: the path is
+    // the kernel's policy, and a library name out of a file must never be able
+    // to name a path.
+    let is [64]u8 as path;
+    let is *u8 as pfx = "/lib/";
+    let is i64 as i with mut = 0;
+    while (i < 5) { path[i] = pfx[i]; i = i + 1; }
+    let is i64 as j with mut = 0;
+    while (j < nl) {
+        // A name is a file name, never a path: a '/' in it would escape /lib.
+        if (nm[j] == cast(u8, 47)) { return 0 - 1; }
+        path[5 + j] = nm[j];
+        j = j + 1;
+    }
+    path[5 + nl] = cast(u8, 0);
+
+    let is *vfs.VfsFile as f = vfs.open(cast(*u8, &path[0]), 5 + nl, cast(i32, abi.O_RDONLY));
+    if (cast(i64, f) == 0) {
+        serial.print("cse: /lib/", 10);
+        serial.print(nm, nl);
+        serial.println(" not found", 10);
+        return 0 - 1;
+    }
+    let is i64 as sz = f.size;
+    if (sz < CSL_HDR_SIZE || sz > abi.SPAWN_IMG_MAX) { vfs.close(f); return 0 - 1; }
+    let is i64 as buf = heap.kmalloc(sz, cast(i32, 0));
+    if (buf == 0) { vfs.close(f); return 0 - 1; }
+    let is i64 as got = vfs.read(f, cast(*u8, buf), sz);
+    vfs.close(f);
+    if (got != sz) { return 0 - 1; }
+
+    let is *u8 as b = cast(*u8, buf);
+    if (b[0] != cast(u8, 67) || b[1] != cast(u8, 83)
+        || b[2] != cast(u8, 76) || b[3] != cast(u8, 95)) {       // "CSL_"
+        serial.println("cse: not a CSL_ image", 21);
+        return 0 - 1;
+    }
+    if (elf.read_u16_le(b, 4) != CSL_VERSION) {
+        serial.println("cse: CSL version unsupported", 28);
+        return 0 - 1;
+    }
+    if (cast(i64, b[CSL_ARCH]) != CSE_ARCH_NATIVE) {
+        serial.println("cse: CSL is for another arch", 28);
+        return 0 - 1;
+    }
+    let is i64 as ecount = elf.read_u32_le(b, CSL_EXPCOUNT);
+    let is i64 as eoff   = elf.read_u64_le(b, CSL_EXPOFF);
+    if (eoff < CSL_HDR_SIZE || eoff + ecount * CSL_EXP_ENTRY > sz) {
+        serial.println("cse: CSL export table out of bounds", 35);
+        return 0 - 1;
+    }
+
+    let is i64 as slot = _csl_count;
+    _csl_buf[slot] = buf;
+    _csl_size[slot] = sz;
+    let is i64 as nb = slot * CSL_NAME_MAX;
+    let is i64 as c with mut = 0;
+    while (c < nl) { _csl_name[nb + c] = nm[c]; c = c + 1; }
+    _csl_name[nb + nl] = cast(u8, 0);
+    _csl_count = _csl_count + 1;
+    return slot;
+}
+
+// Map a library's segments into `a` at the vaddrs it was linked for. The build
+// gives each library a distinct base, so two of them never overlap and neither
+// lands on the program at 0x400000.
+fn _csl_map(a as *vma.Aspace, slot as i64) as i32 {
+    let is *u8 as b = cast(*u8, _csl_buf[slot]);
+    let is i64 as sz = _csl_size[slot];
+    let is i64 as nseg = elf.read_u32_le(b, CSL_SEGCOUNT);
+    if (nseg <= 0 || nseg > CSL_MAX_SEGS) { return cast(i32, 0 - 40); }
+    let is i64 as i with mut = 0;
+    while (i < nseg) {
+        let is i64 as e = CSL_HDR_SIZE + i * S_SIZE;
+        let is i64 as vaddr = elf.read_u64_le(b, e + S_VADDR);
+        let is i64 as foff  = elf.read_u32_le(b, e + S_FOFF);
+        let is i64 as fsz   = elf.read_u32_le(b, e + S_FSZ);
+        let is i64 as msz   = elf.read_u32_le(b, e + S_MSZ);
+        let is i64 as perms = elf.read_u32_le(b, e + S_PERMS);
+        if (msz < fsz) { return cast(i32, 0 - 41); }
+        if (fsz > 0 && foff + fsz > sz) { return cast(i32, 0 - 42); }
+        let is i64 as p0  = page_align_down(vaddr);
+        let is i64 as end = page_align_up(vaddr + msz);
+        if (end > p0) {
+            // Writable while we copy; the library's own perms are what the
+            // segment table asks for, and a text segment is R-X.
+            let is i64 as prot = perms_to_prot(perms) | vma.PROT_WRITE;
+            let is i64 as got = vma.mmap_anon(a, p0, end - p0, prot, vma.VMA_FIXED);
+            if (got != p0) { return cast(i32, 0 - 43); }
+        }
+        if (fsz > 0) {
+            let is i32 as crc = elf.copy_segment_into_aspace(a, vaddr, b, foff, fsz, fsz);
+            if (crc != 0) { return cast(i32, 0 - 44); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The vaddr `sym` is exported at, or -1.
+fn _csl_sym(slot as i64, sym as *u8, slen as i64) as i64 {
+    let is *u8 as b = cast(*u8, _csl_buf[slot]);
+    let is i64 as ecount = elf.read_u32_le(b, CSL_EXPCOUNT);
+    let is i64 as eoff   = elf.read_u64_le(b, CSL_EXPOFF);
+    let is i64 as i with mut = 0;
+    while (i < ecount) {
+        let is i64 as ent = eoff + i * CSL_EXP_ENTRY;
+        let is i64 as noff = elf.read_u32_le(b, ent);
+        if (noff > 0 && noff < _csl_size[slot]) {
+            let is i64 as k with mut = 0;
+            let is i64 as hit with mut = 1;
+            while (k < slen) {
+                if (b[noff + k] == cast(u8, 0) || b[noff + k] != sym[k]) { hit = 0; k = slen; }
+                else { k = k + 1; }
+            }
+            if (hit == 1 && b[noff + slen] == cast(u8, 0)) {
+                return elf.read_u64_le(b, ent + 4);
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Add `s` to the value already at `site` in `a` — see the header comment: the
+// linker resolved these against address 0, so this one rule serves both PC32
+// and 64-bit sites. width is 4 or 8.
+fn _patch_site(a as *vma.Aspace, site as i64, s as i64, width as i64) as i32 {
+    // A site straddling a page boundary would need two walks; the linker never
+    // emits one (relocation fields are naturally aligned within an
+    // instruction), and silently patching half of it would be far worse than
+    // refusing.
+    if ((site & 0xFFF) + width > pmm.PAGE_SIZE) { return cast(i32, 0 - 45); }
+    let is i64 as page_va = page_align_down(site);
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
+    if (phys == 0) { return cast(i32, 0 - 46); }
+    let is i64 as kv = pmm.phys_to_virt(phys) + (site & 0xFFF);
+    if (width == 8) {
+        let is *i64 as p = cast(*i64, kv);
+        *p = *p + s;
+        return 0;
+    }
+    let is *i32 as p32 = cast(*i32, kv);
+    *p32 = cast(i32, cast(i64, *p32) + s);
+    return 0;
+}
+
+// Resolve every import of a v3.2 image: load each library it names, map it into
+// the child, and patch each site with the address its symbol lives at.
+fn resolve_imports(a as *vma.Aspace, img as *u8, cst_size as i64,
+                   imp_off as i64, imp_count as i64) as i32 {
+    if (imp_off + 8 > cst_size) { return cast(i32, 0 - 47); }
+    let is i64 as n     = elf.read_u32_le(img, imp_off);
+    let is i64 as nlibs = elf.read_u32_le(img, imp_off + 4);
+    if (n != imp_count) { return cast(i32, 0 - 48); }
+    if (nlibs <= 0 || nlibs > CSL_CACHE_MAX) { return cast(i32, 0 - 49); }
+
+    // Library table, then the entries. Both are variable-length strings, so the
+    // cursor walks once and every read is bounds-checked against the image.
+    let is [8]i64 as slots;
+    let is i64 as cur with mut = imp_off + 8;
+    let is i64 as li with mut = 0;
+    while (li < nlibs) {
+        let is i64 as start = cur;
+        while (cur < cst_size && img[cur] != cast(u8, 0)) { cur = cur + 1; }
+        if (cur >= cst_size) { return cast(i32, 0 - 50); }
+        let is i64 as slot = _csl_open(cast(*u8, &img[start]), cur - start);
+        if (slot < 0) { return cast(i32, 0 - 51); }
+        let is i32 as mrc = _csl_map(a, slot);
+        if (mrc != 0) { return mrc; }
+        slots[li] = slot;
+        cur = cur + 1;
+        li = li + 1;
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (cur + 16 > cst_size) { return cast(i32, 0 - 52); }
+        let is i64 as rtype   = elf.read_u32_le(img, cur);
+        let is i64 as lib_idx = elf.read_u32_le(img, cur + 4);
+        let is i64 as site    = elf.read_u64_le(img, cur + 8);
+        cur = cur + 16;
+        let is i64 as sstart = cur;
+        while (cur < cst_size && img[cur] != cast(u8, 0)) { cur = cur + 1; }
+        if (cur >= cst_size) { return cast(i32, 0 - 53); }
+        let is i64 as slen = cur - sstart;
+        cur = cur + 1;
+
+        if (lib_idx < 0 || lib_idx >= nlibs) { return cast(i32, 0 - 54); }
+        let is i64 as sv = _csl_sym(slots[lib_idx], cast(*u8, &img[sstart]), slen);
+        if (sv < 0) {
+            serial.print("cse: unresolved import ", 23);
+            serial.print(cast(*u8, &img[sstart]), slen);
+            serial.println("", 0);
+            return cast(i32, 0 - 55);
+        }
+        let is i64 as width with mut = 4;
+        if (rtype == R_X86_64_64) { width = 8; }
+        else if (rtype != R_X86_64_PC32 && rtype != R_X86_64_PLT32) {
+            serial.print("cse: unsupported reloc type ", 28);
+            util.print_num(rtype);
+            serial.println("", 0);
+            return cast(i32, 0 - 56);
+        }
+        let is i32 as prc = _patch_site(a, site, sv, width);
+        if (prc != 0) { return prc; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 // ============================================================
@@ -238,14 +545,22 @@ fn load_cse_image(a as *vma.Aspace, buf as *u8, size as i64,
         }
         cse_ver = cast(i64, img[H_VERSION]);
         cse_minor = cast(i64, img[H_VERSION + 1]);
-        if (cse_minor != 0) { return cast(i32, 0 - 22); }   // no nesting
+        // minor 0 = static image, 2 = one that imports from .csl libraries.
+        // Only 1 is refused, and that is the container itself: a fat image
+        // inside a fat image is the nesting this rejects.
+        if (cse_minor != 0 && cse_minor != 2) { return cast(i32, 0 - 22); }
     }
-    // v2 = compact 32-byte header; v3 = 48-byte header (adds import-table fields
-    // the kernel ignores — it loads static segments, not dynamic imports). The
-    // toolchain emits v3 for every .cse; the hand-built smokes use v2.
-    if ((cse_ver != 2 && cse_ver != 3) || cse_minor != 0) {
+    // v2 = compact 32-byte header; v3 = 48-byte header, whose import fields are
+    // read when the minor says they are there. The toolchain emits v3 for every
+    // .cse; the hand-built smokes use v2.
+    //
+    // Minor: 0 = static, 2 = imports from .csl libraries. 1 is the fat
+    // container, which is unwrapped above and never reaches here as an image.
+    if ((cse_ver != 2 && cse_ver != 3) || (cse_minor != 0 && cse_minor != 2)) {
         serial.print("cse: bad version ", 17);
         util.print_num(cse_ver);
+        serial.print(".", 1);
+        util.print_num(cse_minor);
         serial.println("", 0);
         return cast(i32, 0 - 8);
     }
@@ -310,6 +625,18 @@ fn load_cse_image(a as *vma.Aspace, buf as *u8, size as i64,
             if (crc != 0) { return cast(i32, 0 - 16); }
         }
         i = i + 1;
+    }
+
+    // Dynamic imports, if this image has any. After the segments, because the
+    // sites being patched live in them.
+    if (cse_ver == 3 && cse_minor == 2) {
+        let is i64 as imp_off   = elf.read_u64_le(img, H_IMPORT_OFF);
+        let is i64 as imp_count = elf.read_u32_le(img, H_IMPORT_COUNT);
+        if (imp_count > 0) {
+            if (imp_off <= 0 || imp_off >= cst_size) { return cast(i32, 0 - 57); }
+            let is i32 as irc = resolve_imports(a, img, cst_size, imp_off, imp_count);
+            if (irc != 0) { return irc; }
+        }
     }
 
     *out_entry = entry;
