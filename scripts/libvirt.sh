@@ -263,7 +263,7 @@ echo "libvirt: $NAME started"
 
 case "$VIEWER" in
     none)
-        echo "libvirt: attach with 'virt-manager' or 'virt-viewer $NAME'; serial: 'virsh console $NAME'"
+        echo "libvirt: attach with 'virt-manager' or 'virt-viewer --attach $NAME'; serial: 'virsh console $NAME'"
         ;;
     console)
         # Attaching AFTER the start loses nothing: QEMU's pty holds the early
@@ -275,9 +275,18 @@ case "$VIEWER" in
         ;;
     auto)
         if command -v virt-viewer >/dev/null 2>&1; then
+            # --attach is not optional here: the domain's <graphics> has
+            # <listen type='none'/>, so the SPICE server opens NO socket at all
+            # and the display is reachable only through a file descriptor
+            # libvirt hands over. Without it virt-viewer fails with "the display
+            # can only be attached through libvirt with --attach", which is the
+            # honest error for asking a port that deliberately does not exist.
+            # The alternative would be listening on a host port; a local viewer
+            # has no use for one.
+            #
             # --reconnect so the window survives a guest reboot rather than
             # closing the moment the display goes away.
-            exec virt-viewer --wait --reconnect "$NAME"
+            exec virt-viewer --attach --wait --reconnect "$NAME"
         elif command -v virt-manager >/dev/null 2>&1; then
             exec virt-manager --connect "$LIBVIRT_DEFAULT_URI" --show-domain-console "$NAME"
         else
