@@ -52,13 +52,13 @@ if [ "$MODE" = "wm" ]; then
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
            touch mkdir rmdir rm mv cp stat du tree find clear \
            ps free df top pager hexedit date poweroff reboot \
-           netd ifconfig ping wget nslookup arp nc httpd netsnoop aplay arecord"
+           netd ifconfig ping wget nslookup arp nc httpd netsnoop aplay arecord soundd"
     INITNAME="compositor (launches the window manager — Super+Enter opens a window, Alt+Tab cycles, Super+Q closes)"
 else
     addf init.cse shell.cse
     PROGS="echo cat ls uptime sysinfo vic btop ps top free df \
            grep wc sort head tail rev tac cut uniq \
-           netd ifconfig ping wget nslookup arp nc httpd netsnoop aplay arecord"
+           netd ifconfig ping wget nslookup arp nc httpd netsnoop aplay arecord soundd"
     INITNAME="shell (type 'btop', 'ls', 'help' ...)"
 fi
 for p in $PROGS; do addf "$p.cse" "$p.cse"; done

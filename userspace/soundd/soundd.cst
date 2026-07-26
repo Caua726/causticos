@@ -1,0 +1,573 @@
+// soundd — one holder of the audio stream, N programs that want to be heard.
+//
+// The same shape netd gives the network and the compositor gives the
+// framebuffer, and for the same reason: the device is exclusive, the policy
+// on top of it is not the kernel's business, and somebody has to own it.
+// What soundd decides, and the kernel deliberately does not:
+//
+//   - whose samples are summed, and how loud each one is
+//   - what happens when a sum runs past full scale
+//   - what a client that stops feeding sounds like (silence, not a hole)
+//
+// THIS IS THE PROGRAM THAT USES MMAP MODE. aplay writes with write(), which
+// is the simple half of the ABI; here the ring is mapped and the samples a
+// client sends are summed straight into it, so a client's PCM is copied
+// exactly once — from the channel into the mix — and never again on its way
+// to the converter.
+//
+// That also means soundd makes NO SYSCALL on the data path, and so it needs
+// something to wait on. poll() on the audio fd is that: it reports WRITABLE
+// when a period of room exists, which makes "wait for the next period" one
+// call and hands the cpu back in between. It is the reason poll is not
+// optional on an audio stream.
+//
+// PREEMPTION IS NOT A FAILURE. If something opens the device directly — aplay
+// does — the grab stack puts it on top, soundd's ring stops being played, its
+// hw_ptr freezes, and its poll goes quiet. soundd keeps mixing into its own
+// buffer the whole time and notices nothing except that the clock stopped.
+// When the other program exits, the stream comes back and its cursor resumes
+// where it froze. Nothing here has to know that happened, which is the whole
+// point of architecture.md §6.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/sndproto/sndproto.cst" as sp;
+
+let is i64 as MAX_CLIENTS = 8;
+let is i64 as MAX_STREAMS = 16;
+
+// Per-stream staging, in FRAMES. Two device buffers deep: enough that a client
+// scheduled a little late is still ahead of the mixer, small enough that a
+// client which stops is silent within a third of a second rather than playing
+// stale audio. When it is full soundd stops reading that client's channel and
+// the client's own write blocks — the hardware clock's backpressure, delivered
+// through the pipe it was already using.
+let is i64 as STAGE_FRAMES = 16384;
+
+// THE RING IS FILLED COMPLETELY, and that is what makes poll a clock.
+//
+// POLL_WRITABLE on an audio stream means "at least one period of room", and a
+// ring kept three periods ahead has eleven free — so poll returned instantly,
+// every time, and this loop became a spin. It still fed the mixer correctly;
+// what it did was take the cpu away from the very clients it was waiting for,
+// and they delivered their audio in bursts. Two voices came out as one steady
+// and one stuttering, which looks exactly like a mixing bug.
+//
+// Filled to the brim there is no room, poll blocks, and it returns precisely
+// when the converter has finished one period. One wake per period, no timer,
+// no spin. The cost is that the mix runs a full ring ahead of what is audible
+// — 149 ms — so a client that stops is heard for that long afterwards. That is
+// latency, it is stated, and it is the ring's depth rather than a choice made
+// here.
+let is i64 as STAGE_BYTES = 65536;          // STAGE_FRAMES * 4
+
+let is i64 as SND_ERR_BADSTREAM = 1;
+let is i64 as SND_ERR_RATE      = 2;
+let is i64 as SND_ERR_CHANNELS  = 3;
+let is i64 as SND_ERR_FULL      = 4;
+
+// ---- device ----
+let is i64 as dev_fd with mut = 0;
+let is i64 as map with mut = 0;             // control page; the ring follows
+let is i64 as ring with mut = 0;
+let is i64 as rate with mut = 0;
+let is i64 as channels with mut = 0;
+let is i64 as frame_bytes with mut = 0;
+let is i64 as period_frames with mut = 0;
+let is i64 as buffer_frames with mut = 0;
+
+// ---- clients ----
+// All flat arrays rather than an array of structs: the tables are small, every
+// field is an i64, and this sidesteps the mixed-width struct trap entirely.
+let is [8]i64 as cl_fd with mut;            // == MAX_CLIENTS, 0 = free
+let is [8]i64 as cl_live with mut;
+let is [16]i64 as st_client with mut;       // == MAX_STREAMS; owning client slot + 1, 0 = free
+let is [16]i64 as st_id with mut;           // the client's own stream number
+let is [16]i64 as st_gain with mut;
+let is [16]i64 as st_head with mut;         // frames consumed by the mixer
+let is [16]i64 as st_tail with mut;         // frames written by the client
+let is [16]i64 as st_drain with mut;        // 1 = tell the client when it runs dry
+let is [16]i64 as st_buf with mut;          // STAGE_BYTES of staging
+let is [16]i64 as st_mixed with mut;        // frames this stream contributed
+let is [16]i64 as st_short with mut;        // periods it could not fill
+let is [16]i64 as st_lost with mut;         // frames dropped for want of room — must stay 0
+
+let is [3072]i64 as pollbuf;                // (MAX_CLIENTS + 2) * 3, generously
+let is [4096]u8 as rxbuf;                   // == sp.SND_MAX_PAYLOAD
+
+let is [24]u8 as numbuf;
+
+fn num(v as i64) as *u8 {
+    let is i64 as x with mut = v;
+    let is i64 as i with mut = 23;
+    numbuf[23] = cast(u8, 0);
+    if (x == 0) { i = 22; numbuf[22] = cast(u8, 48); }
+    while (x > 0 && i > 0) {
+        i = i - 1;
+        numbuf[i] = cast(u8, 48 + (x % 10));
+        x = x / 10;
+    }
+    return cast(*u8, &numbuf[i]);
+}
+
+fn voices() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_STREAMS) {
+        if (st_client[i] != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The serial line only. A daemon's fd 1 is the console the kernel opened, so
+// writing to both printed everything twice, interleaved with itself —
+// "soundd: client soundd: client 00 minted". netd logs the same way.
+fn say(m as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (m[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(m, n);
+    return;
+}
+
+// ============================================================
+// The control page
+// ============================================================
+
+fn ctl(w as i64) as i64 { return sys.audio_ctl_get(map, w); }
+
+fn app_ptr() as i64 { return sys.audio_ctl_get(map, sys.AUDIO_W_APP_PTR); }
+fn hw_ptr()  as i64 { return sys.audio_ctl_get(map, sys.AUDIO_W_HW_PTR); }
+
+// ============================================================
+// Staging rings
+// ============================================================
+
+fn stage_avail(s as i64) as i64 { return st_tail[s] - st_head[s]; }
+fn stage_room(s as i64) as i64 { return STAGE_FRAMES - stage_avail(s); }
+
+// Copy a client's PCM into its staging ring. Bytes are frames of the device's
+// shape by the time they get here: open() refused anything else.
+fn stage_put(s as i64, src as *u8, frames as i64) as void {
+    let is i64 as base = st_buf[s];
+    let is i64 as done with mut = 0;
+    while (done < frames) {
+        let is i64 as pos = (st_tail[s] + done) % STAGE_FRAMES;
+        let is i64 as run with mut = STAGE_FRAMES - pos;
+        if (run > frames - done) { run = frames - done; }
+        let is i64 as d = base + pos * 4;
+        let is i64 as sbytes = cast(i64, src) + done * 4;
+        let is i64 as w with mut = 0;
+        while (w + 8 <= run * 4) {
+            let is *i64 as dp = cast(*i64, d + w);
+            let is *i64 as sp2 = cast(*i64, sbytes + w);
+            dp[0] = sp2[0];
+            w = w + 8;
+        }
+        while (w < run * 4) {
+            let is *u8 as dq = cast(*u8, d + w);
+            let is *u8 as sq = cast(*u8, sbytes + w);
+            dq[0] = sq[0];
+            w = w + 1;
+        }
+        done = done + run;
+    }
+    st_tail[s] = st_tail[s] + frames;
+    return;
+}
+
+// ============================================================
+// The mix
+//
+// Sum, with per-stream gain, and CLAMP. Clamping rather than wrapping is not
+// a detail: a sum that wraps turns a loud passage into full-scale noise in
+// both directions, which is the single most recognisable sound of a broken
+// mixer. Clamping distorts a peak; wrapping destroys the whole passage.
+// ============================================================
+
+fn mix_period(frames as i64, at as i64) as void {
+    // Silence first: a period nobody contributes to is silence, and starting
+    // from the last lap's samples would replay them.
+    let is i64 as z with mut = 0;
+    while (z < frames) {
+        let is i64 as pos = (at + z) % buffer_frames;
+        let is *i64 as p = cast(*i64, ring + pos * 4);
+        p[0] = 0;
+        z = z + 2;                          // two frames of 4 bytes at a time
+    }
+    if (frames % 2 != 0) {
+        let is i64 as pos = (at + frames - 1) % buffer_frames;
+        let is *i32 as p = cast(*i32, ring + pos * 4);
+        p[0] = cast(i32, 0);
+    }
+
+    let is i64 as s with mut = 0;
+    while (s < MAX_STREAMS) {
+        if (st_client[s] != 0) {
+            let is i64 as have with mut = stage_avail(s);
+            if (have > frames) { have = frames; }
+            let is i64 as g = st_gain[s];
+            let is i64 as i with mut = 0;
+            while (i < have) {
+                let is i64 as spos = (st_head[s] + i) % STAGE_FRAMES;
+                let is i64 as dpos = (at + i) % buffer_frames;
+                let is *i16 as src = cast(*i16, st_buf[s] + spos * 4);
+                let is *i16 as dst = cast(*i16, ring + dpos * 4);
+                let is i64 as c with mut = 0;
+                while (c < 2) {
+                    let is i64 as v = cast(i64, dst[c]) + (cast(i64, src[c]) * g) / sp.SND_UNITY;
+                    let is i64 as cl with mut = v;
+                    if (cl > 32767) { cl = 32767; }
+                    if (cl < 0 - 32768) { cl = 0 - 32768; }
+                    dst[c] = cast(i16, cl);
+                    c = c + 1;
+                }
+                i = i + 1;
+            }
+            st_head[s] = st_head[s] + have;
+            st_mixed[s] = st_mixed[s] + have;
+            if (have < frames) { st_short[s] = st_short[s] + 1; }
+        }
+        s = s + 1;
+    }
+    return;
+}
+
+// ============================================================
+// Clients
+// ============================================================
+
+fn client_slot(fd as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CLIENTS) {
+        if (cl_fd[i] == fd && cl_live[i] != 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn stream_find(cslot as i64, id as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_STREAMS) {
+        if (st_client[i] == cslot + 1 && st_id[i] == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn stream_alloc(cslot as i64, id as i64) as i64 {
+    if (stream_find(cslot, id) >= 0) { return 0 - 1; }   // ids are the client's; a duplicate is a bug
+    let is i64 as i with mut = 0;
+    while (i < MAX_STREAMS) {
+        if (st_client[i] == 0) {
+            st_client[i] = cslot + 1;
+            st_id[i] = id;
+            st_gain[i] = sp.SND_UNITY;
+            st_head[i] = 0;
+            st_tail[i] = 0;
+            st_drain[i] = 0;
+            st_mixed[i] = 0;
+            st_short[i] = 0;
+            st_lost[i] = 0;
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 2;
+}
+
+fn client_drop(cslot as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_STREAMS) {
+        if (st_client[i] == cslot + 1) { st_client[i] = 0; }
+        i = i + 1;
+    }
+    if (cl_fd[cslot] > 0) { sys.close(cl_fd[cslot]); }
+    cl_fd[cslot] = 0;
+    cl_live[cslot] = 0;
+    return;
+}
+
+// One message. Returns 0, or -1 when the client is gone.
+fn handle(cslot as i64) as i64 {
+    let is i64 as fd = cl_fd[cslot];
+    let is [4]i64 as m;
+    if (sp.recv(fd, cast(*i64, &m[0])) < 0) { return 0 - 1; }
+    let is i64 as mtype = m[0];
+    let is i64 as id = m[1];
+
+    if (mtype == sp.SREQ_HELLO) {
+        sp.send(fd, sp.SEV_HELLO, 0, rate, (channels << 32) | frame_bytes);
+        return 0;
+    }
+    if (mtype == sp.SREQ_OPEN) {
+        // The rate is reported, never negotiated — the kernel opened the
+        // device at what the hardware could do and soundd does not resample
+        // either. A client that wants another rate converts; it knows what its
+        // audio is and what quality it can afford to lose, and this does not.
+        if (m[2] != 0 && m[2] != rate) {
+            sp.send(fd, sp.SEV_ERROR, id, SND_ERR_RATE, rate);
+            return 0;
+        }
+        if (m[3] != 0 && m[3] != channels) {
+            sp.send(fd, sp.SEV_ERROR, id, SND_ERR_CHANNELS, channels);
+            return 0;
+        }
+        let is i64 as s = stream_alloc(cslot, id);
+        if (s < 0) {
+            sp.send(fd, sp.SEV_ERROR, id, SND_ERR_FULL, 0);
+            return 0;
+        }
+        sp.send(fd, sp.SEV_OPENED, id, rate, (channels << 32) | frame_bytes);
+        // How many voices are in the mix, every time it changes. A mixer that
+        // is quietly playing one client is indistinguishable from one playing
+        // two, right up until you measure the amplitude.
+        say("soundd: stream open, "); say(num(voices())); say(" voices\n");
+        return 0;
+    }
+
+    let is i64 as s = stream_find(cslot, id);
+    if (mtype == sp.SREQ_WRITE) {
+        let is i64 as n with mut = m[3];
+        // A length no correct client can send. Refusing it is the only way to
+        // stay in step: a payload this reader will not take is a stream it can
+        // never resynchronise.
+        if (n < 0 || n > sp.SND_MAX_PAYLOAD) { return 0 - 1; }
+        if (sp.read_all(fd, cast(*u8, &rxbuf[0]), n) < 0) { return 0 - 1; }
+        if (s < 0) { return 0; }                          // writing to a stream that is not open: dropped, not fatal
+        let is i64 as frames = n / 4;
+        if (frames > stage_room(s)) {
+            // Unreachable while the poll set only offers a client room for a
+            // whole message. Counted rather than clamped, because clamping is
+            // how the audio went missing in the first place and a silent drop
+            // is the one outcome this must never have again.
+            st_lost[s] = st_lost[s] + (frames - stage_room(s));
+            stage_put(s, cast(*u8, &rxbuf[0]), stage_room(s));
+        } else if (frames > 0) {
+            stage_put(s, cast(*u8, &rxbuf[0]), frames);
+        }
+        st_drain[s] = 0;
+        return 0;
+    }
+    if (s < 0) {
+        if (mtype != sp.SREQ_CLOSE) { sp.send(fd, sp.SEV_ERROR, id, SND_ERR_BADSTREAM, 0); }
+        return 0;
+    }
+    if (mtype == sp.SREQ_GAIN) {
+        let is i64 as g with mut = m[2];
+        if (g < 0) { g = 0; }
+        if (g > 4 * sp.SND_UNITY) { g = 4 * sp.SND_UNITY; }
+        st_gain[s] = g;
+        return 0;
+    }
+    if (mtype == sp.SREQ_DRAIN) { st_drain[s] = 1; return 0; }
+    if (mtype == sp.SREQ_CLOSE) {
+        st_client[s] = 0;
+        sp.send(fd, sp.SEV_CLOSED, id, 0, 0);
+        // What it actually contributed, and how often it had nothing to give.
+        // A stream that was starved and one that played cleanly look identical
+        // from anywhere else.
+        say("soundd: stream closed after "); say(num(st_mixed[s]));
+        say(" frames, "); say(num(st_short[s])); say(" short periods, ");
+        if (st_lost[s] > 0) { say(num(st_lost[s])); say(" DROPPED, "); }
+        say(num(voices())); say(" voices left\n");
+        return 0;
+    }
+    return 0;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as ctl_fd = sp.SND_FD;
+    // Announced before anything can go wrong, the way netd does. A daemon that
+    // dies during setup and a daemon that never got scheduled look identical
+    // from the outside otherwise.
+    say("soundd: starting\n");
+
+    dev_fd = sys.dev_open(sys.DEV_AUDIO_OUT, 0, 0);
+    if (dev_fd < 0) { say("soundd: no playback device\n"); return cast(i32, 1); }
+
+    let is [20]i64 as info;
+    if (sys.audio_info(dev_fd, cast(*i64, &info[0])) != 0) {
+        say("soundd: the device would not describe itself\n");
+        return cast(i32, 1);
+    }
+    rate = info[0]; channels = info[1]; frame_bytes = info[3];
+    period_frames = info[4]; buffer_frames = info[6];
+    if (channels != 2 || frame_bytes != 4) {
+        say("soundd: this mixer is 16-bit stereo only\n");
+        return cast(i32, 1);
+    }
+
+    // MMAP MODE. From here soundd owns app_ptr and the kernel never writes it;
+    // the samples go straight into the ring the converter reads.
+    say("soundd: mapping the ring\n");
+    map = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, dev_fd);
+    if (map < 0) { say("soundd: cannot map the ring\n"); return cast(i32, 1); }
+    if (ctl(sys.AUDIO_W_MAGIC) != sys.AUDIO_CTL_MAGIC) {
+        say("soundd: that mapping is not an audio stream\n");
+        return cast(i32, 1);
+    }
+    ring = map + ctl(sys.AUDIO_W_DATA_OFFSET);
+
+    let is i64 as i with mut = 0;
+    while (i < MAX_CLIENTS) { cl_fd[i] = 0; cl_live[i] = 0; i = i + 1; }
+    let is i64 as j with mut = 0;
+    while (j < MAX_STREAMS) {
+        st_client[j] = 0;
+        // Staging is mapped once and kept: a client comes and goes, and
+        // allocating 64 KiB on its arrival would put a page fault on the path
+        // of the first sound it makes.
+        let is i64 as va = sys.mmap(cast(i64, 0), STAGE_BYTES,
+                                    sys.PROT_READ | sys.PROT_WRITE);
+        if (va < 0) { say("soundd: cannot allocate staging\n"); return cast(i32, 1); }
+        st_buf[j] = va;
+        j = j + 1;
+    }
+
+    say("soundd: ready\n");
+
+    // Start one period ahead of the hardware: the ring is silence and the
+    // cursor is at zero, so publishing the first period before the first wait
+    // means the converter never enters an unwritten one while we are still
+    // deciding what to put in it.
+    let is i64 as cursor with mut = app_ptr();
+
+    while (1 == 1) {
+        // Poll the device and every client at once. The device's WRITABLE is
+        // the period clock; a client's READABLE is work to stage. One call
+        // waits for whichever comes first, and nothing spins.
+        let is i64 as n with mut = 0;
+        pollbuf[0] = dev_fd; pollbuf[1] = sys.POLL_WRITABLE; pollbuf[2] = 0;
+        n = 1;
+        pollbuf[n * 3 + 0] = ctl_fd;
+        pollbuf[n * 3 + 1] = sys.POLL_READABLE;
+        pollbuf[n * 3 + 2] = 0;
+        n = n + 1;
+        let is i64 as c with mut = 0;
+        while (c < MAX_CLIENTS) {
+            if (cl_live[c] != 0) {
+                // A client whose every stream is full is not polled: its
+                // channel fills, and its write blocks. That IS the flow
+                // control — see sndproto's header.
+                // Room for a WHOLE message, not merely some room. Reading one
+                // that does not fit means keeping what fits and dropping the
+                // rest — silently, since the client has already been told the
+                // write succeeded. That is what the backpressure in this
+                // protocol exists to prevent: a message left unread fills the
+                // channel and blocks the client, which is the truth. Asking
+                // for it and throwing half away is a lie that sounds like a
+                // starving mixer, and it cost both clients a third of their
+                // audio before anyone counted the frames.
+                let is i64 as room with mut = 0;
+                let is i64 as s2 with mut = 0;
+                while (s2 < MAX_STREAMS) {
+                    if (st_client[s2] == c + 1
+                        && stage_room(s2) >= sp.SND_MAX_PAYLOAD / 4) { room = 1; }
+                    s2 = s2 + 1;
+                }
+                // A client with no stream open yet still has to be heard: that
+                // is where its OPEN is going to come from.
+                let is i64 as has with mut = 0;
+                let is i64 as s3 with mut = 0;
+                while (s3 < MAX_STREAMS) {
+                    if (st_client[s3] == c + 1) { has = 1; }
+                    s3 = s3 + 1;
+                }
+                if (room != 0 || has == 0) {
+                    pollbuf[n * 3 + 0] = cl_fd[c];
+                    pollbuf[n * 3 + 1] = sys.POLL_READABLE;
+                    pollbuf[n * 3 + 2] = 0;
+                    n = n + 1;
+                }
+            }
+            c = c + 1;
+        }
+
+        // A ceiling rather than an indefinite wait: a displaced soundd gets no
+        // WRITABLE at all (its stream is not the one being played), and it
+        // still has clients to serve and a channel to answer.
+        sys.poll(cast(*i64, &pollbuf[0]), n, 50000000);
+
+        // The clock. Fill every period of room there is, so a late wake-up
+        // catches up in one pass instead of one period per turn.
+        if ((pollbuf[2] & sys.POLL_WRITABLE) != 0) {
+            let is i64 as hp = hw_ptr();
+            if (cursor < hp) { cursor = hp; }        // preempted, or we fell behind: resync
+            let is i64 as guard with mut = 0;
+            while (cursor - hp <= buffer_frames - period_frames && guard < 64) {
+                mix_period(period_frames, cursor);
+                cursor = cursor + period_frames;
+                guard = guard + 1;
+            }
+            // ONE store, fenced, after every sample is in place. This is the
+            // publication the whole design turns on: the converter may read
+            // anything below this number and must never read above it.
+            sys.audio_ctl_publish(map, sys.AUDIO_W_APP_PTR, cursor);
+        }
+
+        // Answer anyone who spoke. The control channel mints endpoints; a
+        // client channel carries stream work.
+        if ((pollbuf[5] & sys.POLL_READABLE) != 0) {
+            let is [4]i64 as m;
+            if (sp.recv(ctl_fd, cast(*i64, &m[0])) > 0) {
+                if (m[0] == sp.SREQ_NEW_CLIENT) {
+                    let is [2]i64 as ch;
+                    if (sys.channel_create(cast(*i64, &ch[0])) == 0) {
+                        let is i64 as slot with mut = 0 - 1;
+                        let is i64 as k with mut = 0;
+                        while (k < MAX_CLIENTS) {
+                            if (cl_live[k] == 0 && slot < 0) { slot = k; }
+                            k = k + 1;
+                        }
+                        if (slot < 0) { sys.close(ch[0]); sys.close(ch[1]); }
+                        else {
+                            cl_fd[slot] = ch[0];
+                            cl_live[slot] = 1;
+                            say("soundd: client "); say(num(slot)); say(" minted\n");
+                            // The far end goes back over the control channel;
+                            // the spawner installs it at SND_FD in the child.
+                            if (sys.fd_send(ctl_fd, ch[1]) != 0) {
+                                client_drop(slot);
+                                sys.close(ch[1]);
+                            } else { sys.close(ch[1]); }
+                        }
+                    }
+                } else if (m[0] == sp.SREQ_HELLO) {
+                    sp.send(ctl_fd, sp.SEV_HELLO, 0, rate,
+                            (channels << 32) | frame_bytes);
+                }
+            }
+        }
+
+        let is i64 as e with mut = 2;
+        while (e < n) {
+            if ((pollbuf[e * 3 + 2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                let is i64 as slot = client_slot(pollbuf[e * 3 + 0]);
+                if (slot >= 0) {
+                    if ((pollbuf[e * 3 + 2] & sys.POLL_READABLE) != 0) {
+                        if (handle(slot) < 0) { client_drop(slot); }
+                    } else { client_drop(slot); }
+                }
+            }
+            e = e + 1;
+        }
+
+        // A stream that asked to be told when it ran dry, and has.
+        let is i64 as d with mut = 0;
+        while (d < MAX_STREAMS) {
+            if (st_client[d] != 0 && st_drain[d] == 1 && stage_avail(d) == 0) {
+                let is i64 as owner = st_client[d] - 1;
+                if (cl_live[owner] != 0) {
+                    sp.send(cl_fd[owner], sp.SEV_DRAINED, st_id[d], 0, 0);
+                }
+                st_drain[d] = 2;
+            }
+            d = d + 1;
+        }
+    }
+    return cast(i32, 0);
+}

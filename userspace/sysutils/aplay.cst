@@ -25,6 +25,7 @@ use "../../../Caustic/std/causticos/prog.cst" as prog;
 use "../../../Caustic/std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
 use "../lib/wav/wav.cst" as wav;
+use "../lib/sndcli/sndcli.cst" as snd;
 
 // One period at 48 kHz stereo is 2 KiB; this is a comfortable multiple and
 // keeps the syscall count down without making any single write long enough
@@ -68,13 +69,64 @@ fn die(msg as *u8) as i32 {
 }
 
 fn usage() as i32 {
-    prog.outs("usage: aplay [-d INDEX] FILE.wav\n");
+    prog.outs("usage: aplay [-d INDEX] [-m] FILE.wav\n");
     prog.outs("  -d INDEX   playback device (default 0)\n");
+    prog.outs("  -m         through soundd, so others stay audible\n");
+    prog.outs("             (without it, aplay takes the stream and everything\n");
+    prog.outs("              else goes quiet until it exits)\n");
     return cast(i32, 2);
+}
+
+// Through the mixer. The whole difference from the direct path is who owns the
+// stream: here soundd does, this is one of several voices in it, and the
+// hardware clock reaches back through a blocking channel write instead of a
+// blocking device write. The pacing is identical and neither loop has a timer.
+fn play_mixed(src as i64, w as *wav.Wav) as i32 {
+    if (snd.adopt() != 0) { return die("no soundd on this channel"); }
+    if (w.rate != snd.rate()) {
+        report("aplay: the file is ");
+        report(num(w.rate));
+        report(" Hz and soundd is mixing at ");
+        report(num(snd.rate()));
+        report(" Hz\n");
+        return cast(i32, 1);
+    }
+    if (snd.channels() != 2) { return die("soundd is not mixing in stereo"); }
+    if (snd.open(1) != 0) { return die("soundd refused the stream"); }
+
+    let is i64 as left with mut = w.frames;
+    let is i64 as done with mut = 0;
+    while (left > 0) {
+        let is i64 as take with mut = left;
+        if (take > CHUNK_FRAMES) { take = CHUNK_FRAMES; }
+        let is i64 as rc with mut = 0;
+        if (w.channels == 1) {
+            wav.mono_to_stereo(cast(*u8, src + done * 2), cast(*u8, &stereo[0]), take);
+            rc = snd.write(1, cast(*u8, &stereo[0]), take * 4);
+        } else {
+            rc = snd.write(1, cast(*u8, src + done * w.frame_bytes),
+                           take * w.frame_bytes);
+        }
+        if (rc < 0) { snd.close(1); return die("soundd stopped listening"); }
+        done = done + take;
+        left = left - take;
+    }
+    // soundd says when the samples are mixed out; the converter's own buffer
+    // still follows, and only soundd knows how deep that is — so it is asked
+    // rather than guessed at.
+    snd.drain(1, 5000000000);
+    snd.close(1);
+    report("aplay: played ");
+    report(num(done));
+    report(" frames through soundd at ");
+    report(num(snd.rate()));
+    report(" Hz\n");
+    return cast(i32, 0);
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as dev with mut = 0;
+    let is i64 as mixed with mut = 0;
     let is *u8 as path with mut = cast(*u8, 0);
 
     let is i64 as i with mut = 1;
@@ -85,6 +137,8 @@ fn main(argc as i64, argv as *u8) as i32 {
             if (i >= argc) { return usage(); }
             let is *u8 as v = prog.arg(argv, i);
             dev = fu.parse_uint(v, prog.slen(v));
+        } else if (a[0] == cast(u8, 45) && a[1] == cast(u8, 109) && a[2] == cast(u8, 0)) {
+            mixed = 1;
         } else if (a[0] == cast(u8, 45)) {
             return usage();
         } else {
@@ -107,6 +161,12 @@ fn main(argc as i64, argv as *u8) as i32 {
     if (rc != wav.WAV_OK) {
         fu.unslurp(img, flen);
         return die(wav.reason(rc));
+    }
+
+    if (mixed == 1) {
+        let is i32 as mrc = play_mixed(img + w.data_off, &w);
+        fu.unslurp(img, flen);
+        return mrc;
     }
 
     let is i64 as fd = sys.dev_open(sys.DEV_AUDIO_OUT, dev, 0);

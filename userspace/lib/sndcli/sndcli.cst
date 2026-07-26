@@ -1,0 +1,199 @@
+// sndcli — how a program reaches soundd, and how it hands it on.
+//
+// The same two halves netsvc has, for the same reason: there is no service
+// namespace (architecture.md §2.2), so a soundd channel arrives exactly one
+// way — whoever spawned the program put one there.
+//
+//   adopt()      take the channel I was handed and prove soundd is behind it
+//   endpoint()   mint one for a program I am about to spawn
+//   start()      /init only
+//
+// EXACTLY ONE PROCESS STARTS SOUNDD. DEV_AUDIO_OUT is exclusive but
+// preemptible, so a second soundd does not fail — it takes the stream from the
+// first, which goes quiet with its clients still connected and still writing
+// into a mixer nobody can hear. Two mixers, one converter, one of them
+// silently pointless.
+//
+// A program with no soundd is not broken, it is unmixed: adopt() fails, and
+// the program can still open the device directly if it wants the whole thing
+// to itself. aplay does exactly that, which is why it can preempt.
+
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../sndproto/sndproto.cst" as sp;
+
+let is i64 as ready with mut = 0;
+let is i64 as ctl with mut = 0 - 1;
+let is i64 as soundd_pid with mut = 0;
+let is i64 as srate with mut = 0;
+let is i64 as schannels with mut = 0;
+let is i64 as sframe_bytes with mut = 0;
+
+fn available() as i64 { return ready; }
+fn pid() as i64 { return soundd_pid; }
+fn rate() as i64 { return srate; }
+fn channels() as i64 { return schannels; }
+fn frame_bytes() as i64 { return sframe_bytes; }
+fn ctl_fd() as i64 { return ctl; }
+
+fn load(path as *u8, out_len as *i64) as i64 {
+    out_len[0] = 0;
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0) { sys.close(fd); return 0; }
+    let is i64 as alloc = (sz + 4095) & (0 - 4096);
+    let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { sys.close(fd); return 0; }
+    let is i64 as got = sys.read(fd, cast(*u8, va), sz);
+    sys.close(fd);
+    if (got != sz) { sys.munmap(va, alloc); return 0; }
+    out_len[0] = got;
+    return va;
+}
+
+fn unload(va as i64, len as i64) as void {
+    if (va == 0) { return; }
+    sys.munmap(va, (len + 4095) & (0 - 4096));
+    return;
+}
+
+// One round trip that both proves there is a soundd behind the fd and learns
+// the shape it is mixing in — a client has to know the rate before it can send
+// a single correct sample.
+fn attach(fd as i64) as i64 {
+    if (sp.send(fd, sp.SREQ_HELLO, 0, sp.SND_VERSION, 0) < 0) { return sys.E_IO; }
+    let is [4]i64 as m;
+    if (sp.recv(fd, cast(*i64, &m[0])) < 0) { return sys.E_IO; }
+    if (m[0] != sp.SEV_HELLO) { return sys.E_INVAL; }
+    ctl = fd;
+    srate = m[2];
+    schannels = (m[3] >> 32) & 0xFFFFFFFF;
+    sframe_bytes = m[3] & 0xFFFFFFFF;
+    ready = 1;
+    return 0;
+}
+
+fn adopt() as i64 {
+    if (ready == 1) { return 0; }
+    return attach(sp.SND_FD);
+}
+
+// Start soundd and keep its control channel. /init only — see the header.
+fn start() as i64 {
+    if (ready == 1) { return 0; }
+    let is [1]i64 as ilen;
+    let is i64 as img = load(cast(*u8, "/soundd.cse"), cast(*i64, &ilen[0]));
+    if (img == 0) { return sys.E_NOENT; }
+
+    let is [2]i64 as ch;
+    if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
+        unload(img, ilen[0]);
+        return sys.E_NOMEM;
+    }
+    let is [2]i64 as fda;
+    fda[0] = sp.SND_FD; fda[1] = ch[1];
+    let is [2]i64 as av;
+    av[0] = cast(i64, "soundd"); av[1] = 6;
+    soundd_pid = sys.spawn(cast(*u8, img), ilen[0], cast(*u8, &fda[0]), 1,
+                           cast(*u8, &av[0]), 1);
+    unload(img, ilen[0]);
+    sys.close(ch[1]);
+    if (soundd_pid < 0) {
+        sys.close(ch[0]);
+        soundd_pid = 0;
+        return sys.E_IO;
+    }
+    if (attach(ch[0]) != 0) {
+        sys.close(ch[0]);
+        return sys.E_IO;
+    }
+    return 0;
+}
+
+fn attach_or_start(may_start as i64) as i64 {
+    if (adopt() == 0) { return 0; }
+    if (may_start == 0) { return sys.E_NOENT; }
+    return start();
+}
+
+// An endpoint to install at SND_FD in a child, or -1 when there is no mixer to
+// give — which is not an error: a program that never wanted sound should still
+// run.
+fn endpoint() as i64 {
+    if (ready == 0) { return 0 - 1; }
+    if (sp.send(ctl, sp.SREQ_NEW_CLIENT, 0, 0, 0) < 0) { return 0 - 1; }
+    let is i64 as deadline = sys.time_ns() + 2000000000;
+    while (sys.time_ns() < deadline) {
+        let is i64 as fd = sys.fd_recv(ctl);
+        if (fd >= 0) { return fd; }
+        sys.sleep_ns(1000000);
+    }
+    return 0 - 1;
+}
+
+// ---- streams ----
+
+fn open(id as i64) as i64 {
+    if (ready == 0) { return sys.E_NOENT; }
+    if (sp.send(ctl, sp.SREQ_OPEN, id, srate, schannels) < 0) { return sys.E_IO; }
+    let is [4]i64 as m;
+    if (sp.recv(ctl, cast(*i64, &m[0])) < 0) { return sys.E_IO; }
+    if (m[0] == sp.SEV_OPENED) { return 0; }
+    return sys.E_INVAL;
+}
+
+// PCM in. The write blocks when soundd has stopped reading this channel, which
+// is what the hardware clock's backpressure looks like from here — there is
+// nothing to poll and no credit to track.
+//
+// Split into messages that fit in a channel, because a caller should not have
+// to know that they must: sndproto's SND_MAX_PAYLOAD is the size at which a
+// whole message is in flight at once, and a bigger one leaves the reader
+// blocked mid-message with everyone else waiting on it.
+fn write(id as i64, pcm as *u8, bytes as i64) as i64 {
+    if (ready == 0) { return sys.E_NOENT; }
+    let is i64 as done with mut = 0;
+    while (done < bytes) {
+        let is i64 as take with mut = bytes - done;
+        if (take > sp.SND_MAX_PAYLOAD) { take = sp.SND_MAX_PAYLOAD; }
+        if (sp.send_data(ctl, sp.SREQ_WRITE, id, 0, take,
+                         cast(*u8, cast(i64, pcm) + done), take) < 0) {
+            return sys.E_IO;
+        }
+        done = done + take;
+    }
+    return done;
+}
+
+fn gain(id as i64, g as i64) as i64 {
+    if (ready == 0) { return sys.E_NOENT; }
+    return sp.send(ctl, sp.SREQ_GAIN, id, g, 0);
+}
+
+// Wait until everything written has been mixed out. The reply is soundd's, not
+// the hardware's: it means "your samples are in the ring", and one buffer of
+// device latency still follows. A client that wants the converter to have
+// finished as well waits that out — soundd is not the clock and should not
+// pretend to be.
+fn drain(id as i64, timeout_ns as i64) as i64 {
+    if (ready == 0) { return sys.E_NOENT; }
+    if (sp.send(ctl, sp.SREQ_DRAIN, id, 0, 0) < 0) { return sys.E_IO; }
+    let is i64 as deadline = sys.time_ns() + timeout_ns;
+    while (sys.time_ns() < deadline) {
+        let is [3]i64 as pe;
+        pe[0] = ctl; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        sys.poll(cast(*i64, &pe[0]), 1, 50000000);
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            let is [4]i64 as m;
+            if (sp.recv(ctl, cast(*i64, &m[0])) < 0) { return sys.E_IO; }
+            if (m[0] == sp.SEV_DRAINED && m[1] == id) { return 0; }
+        }
+    }
+    return sys.E_AGAIN;
+}
+
+fn close(id as i64) as i64 {
+    if (ready == 0) { return sys.E_NOENT; }
+    return sp.send(ctl, sp.SREQ_CLOSE, id, 0, 0);
+}

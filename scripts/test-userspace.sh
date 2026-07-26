@@ -160,6 +160,22 @@ if [ -z "$WANT" ] || [ "$WANT" = "audio" ]; then
     fi
 fi
 
+# soundd is the milestone the audio design was shaped around: two programs
+# audible at once, and a third taking the device away from both without
+# telling them. Only the recording can say whether any of that happened.
+if [ -z "$WANT" ] || [ "$WANT" = "soundd" ]; then
+    printf '%-8s ' "soundd"
+    if bash scripts/test-soundd.sh >/tmp/ut-soundd.log 2>&1; then
+        echo "PASS (mixed two, preempted, resumed)"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-soundd.log)"
+        grep -E "FAIL|panic:" /tmp/ut-soundd.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED soundd"
+    fi
+fi
+
 # record is the other half of audio, and it needs the OPPOSITE machine: the wav
 # backend that lets test-audio measure playback has no input side at all, so
 # capture runs on the ordinary full-duplex one and is checked by reading the

@@ -1,0 +1,137 @@
+// sndproto — the wire between a program and soundd.
+//
+// The kernel gives one program at a time a stream of PCM and a clock. That is
+// the honest mechanism and it is all a kernel should offer: mixing two
+// programs means deciding whose samples get quieter when they sum past full
+// scale, and a decision is policy (architecture.md §2.1). soundd is where that
+// decision lives, and this is how programs reach it — the same shape netd uses
+// for the network and the compositor for the framebuffer, because it is the
+// same problem three times over.
+//
+// FRAMING, copied from netproto for the same reasons. Every message is a fixed
+// 32-byte header of four i64 — {mtype, stream, a, b} — followed by `b` bytes of
+// PCM when the type says so. Fixed headers mean a reader always knows exactly
+// how much to ask for; abi.POLL_WRITE_UNIT guarantees 64 bytes cross a
+// writable channel without tearing, and 32 is half of that.
+//
+// STREAM IDs ARE THE CLIENT'S, again for netproto's reasons: no round trip
+// before the first write, and a reply can never arrive for a stream the client
+// has already closed and reopened, because the numbers are not the same.
+//
+// THERE IS NO FLOW-CONTROL MESSAGE, and that is deliberate. A client writes;
+// when soundd's buffer for that stream is full it stops reading that client's
+// channel; the channel fills; the client's write blocks. The backpressure of
+// the hardware clock reaches the client through the pipe it is already using,
+// with nothing to negotiate and nothing to get out of step. A credit scheme
+// would be a second copy of a fact the channel already carries.
+
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as SND_HDR_WORDS = 4;
+let is i64 as SND_HDR_BYTES = 32;
+let is i64 as SND_VERSION = 1;
+
+// A WHOLE MESSAGE MUST FIT IN A CHANNEL, with its header, and with room to
+// spare. channel.BUF_CAP is 8192; the first version of this sent 8192 bytes of
+// PCM behind a 32-byte header, which is 8224 — so every single message was
+// too big to be in flight at once. The client blocked partway through writing
+// it and soundd blocked inside read_all waiting for the rest, doing nothing
+// else: not mixing, not publishing a cursor, and not serving its other
+// clients. Two clients playing at once came out as one steady voice and one
+// that faded, which sounds like a mixing bug and is not.
+//
+// 4096 leaves the message at 4128 bytes, half the pipe. It is also two periods
+// of audio at 48 kHz stereo, so one message per turn of soundd's loop delivers
+// twice what the converter consumes in the same time.
+let is i64 as SND_MAX_PAYLOAD = 4096;
+
+// The fd a spawned client finds its soundd channel on. The map, which lives in
+// netproto's header and is repeated here only as far as it matters:
+//
+//   0,1,2  stdin / stdout / stderr
+//   3,4,5  the window manager and the compositor
+//   6      netproto.NET_FD   — the network
+//   7      here
+//
+// Seven, because six is taken and a program can only look in one place. There
+// is no service namespace to consult (architecture.md §2.2): you are handed
+// the key or you do not have it.
+let is i64 as SND_FD with imut = 7;
+
+// ---- client -> soundd ----
+let is i64 as SREQ_HELLO  with imut = 1;   // a=version         → EV_HELLO
+let is i64 as SREQ_NEW_CLIENT with imut = 2; // control channel only → an endpoint fd
+let is i64 as SREQ_OPEN   with imut = 3;   // stream=id, a=rate, b=channels → EV_OPENED | EV_ERROR
+let is i64 as SREQ_WRITE  with imut = 4;   // stream, b=bytes of PCM follow
+let is i64 as SREQ_GAIN   with imut = 5;   // stream, a=gain (SND_UNITY = unchanged)
+let is i64 as SREQ_DRAIN  with imut = 6;   // stream          → EV_DRAINED once it has all been played
+let is i64 as SREQ_CLOSE  with imut = 7;   // stream
+
+// ---- soundd -> client ----
+let is i64 as SEV_HELLO   with imut = 64;  // a=rate, b=(channels<<32)|frame_bytes
+let is i64 as SEV_OPENED  with imut = 65;  // stream
+let is i64 as SEV_DRAINED with imut = 66;  // stream
+let is i64 as SEV_CLOSED  with imut = 67;  // stream
+let is i64 as SEV_ERROR   with imut = 68;  // stream, a=errno
+
+// Gain is a fixed-point multiplier, 256 = unchanged. Integer because the
+// mixing loop runs once per sample and a shift is free; 8 bits of fraction is
+// finer than anyone can hear a step of.
+let is i64 as SND_UNITY with imut = 256;
+
+fn _wr(fd as i64, p as i64, n as i64) as i64 { return syscall(11, fd, p, n); }
+
+fn write_all(fd as i64, p as *u8, n as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = _wr(fd, cast(i64, p) + done, n - done);
+        if (r <= 0) { return 0 - 1; }
+        done = done + r;
+    }
+    return done;
+}
+
+fn read_all(fd as i64, p as *u8, n as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = sys.read(fd, cast(*u8, cast(i64, p) + done), n - done);
+        if (r <= 0) { return 0 - 1; }
+        done = done + r;
+    }
+    return done;
+}
+
+fn send(fd as i64, mtype as i64, stream as i64, a as i64, b as i64) as i64 {
+    let is [4]i64 as m;
+    m[0] = mtype; m[1] = stream; m[2] = a; m[3] = b;
+    return write_all(fd, cast(*u8, &m[0]), SND_HDR_BYTES);
+}
+
+// Header then payload as one logical message. They cannot be separated by
+// another sender because a channel has exactly one writer at each end.
+fn send_data(fd as i64, mtype as i64, stream as i64, a as i64, b as i64,
+             data as *u8, dlen as i64) as i64 {
+    let is [4]i64 as m;
+    m[0] = mtype; m[1] = stream; m[2] = a; m[3] = b;
+    if (write_all(fd, cast(*u8, &m[0]), SND_HDR_BYTES) < 0) { return 0 - 1; }
+    if (dlen > 0) {
+        if (write_all(fd, data, dlen) < 0) { return 0 - 1; }
+    }
+    return SND_HDR_BYTES + dlen;
+}
+
+fn recv(fd as i64, out as *i64) as i64 {
+    let is [4]i64 as m;
+    if (read_all(fd, cast(*u8, &m[0]), SND_HDR_BYTES) < 0) { return 0 - 1; }
+    out[0] = m[0]; out[1] = m[1]; out[2] = m[2]; out[3] = m[3];
+    return 1;
+}
+
+// How many bytes follow a header. One place that knows, so a reader that has
+// taken a header always knows exactly how much to take next — and a type this
+// does not recognise carries nothing, which keeps an unknown message from
+// desynchronising the stream instead of being skipped.
+fn payload_of(mtype as i64, a as i64, b as i64) as i64 {
+    if (mtype == SREQ_WRITE) { return b; }
+    return 0;
+}
