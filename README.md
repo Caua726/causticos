@@ -1,20 +1,44 @@
 # causticos
 
-An x86_64 operating system written in [Caustic](https://github.com/Caua726/Caustic), a from-scratch systems language with its own compiler, assembler, and linker. It boots under Limine and runs its own ring-3 programs.
+An x86_64 operating system written in [Caustic](https://github.com/Caua726/Caustic),
+a from-scratch systems language with its own compiler, assembler and linker. It
+boots under Limine, runs its own ring-3 programs, and compiles itself.
 
-causticos has its own syscall ABI and its own executable format, CSE — the *Caustic Standard Executable*. You build a program for the `caustic` target and get a `.cse` the kernel loads and runs in ring 3:
+**The ISO boots the whole system with no disk.** Around 7 MB: a kernel, a
+compositor, a window manager, a terminal, and 99 programs — including a TCP/IP
+stack with TLS, and audio. Write it to a USB stick and a real machine comes up
+into a desktop.
 
+```sh
+caustic-mk run doctor     # is everything installed?
+caustic-mk run build      # kernel + userspace + a bootable ISO
+caustic-mk run run        # boot it
 ```
-userspace.cse_smoke: PASS
-Hello from Caustic!
-sys.proc_exit: code=0
-```
 
-A `.cse` is polyglot. The toolchain welds a causticos, a Linux, and a Windows image into one file (macOS planned), so the same binary runs natively on each — every image calls its own OS's syscalls, APE/Cosmopolitan-style. On causticos, the kernel pulls out the causticos image and runs it.
+That is the whole loop, and it is the same on Linux, WSL and Windows. A full
+build is about two seconds; the machine it boots needs 64 MB of RAM and no
+hardware virtualisation.
 
-For the friendly version of how that works, see [docs/executables.md](docs/executables.md); the exact byte layout and syscall contract live in [docs/CSE_FORMAT.md](docs/CSE_FORMAT.md).
+- **[docs/INSTALL.md](docs/INSTALL.md)** — what to install, per operating system
+- **[docs/WRITING-APPS.md](docs/WRITING-APPS.md)** — writing a program: terminal, window, network, audio
+- **[docs/build-and-run.md](docs/build-and-run.md)** — every command and flag, profiles, how the live ISO works
 
-Around 21k lines of Caustic across ~40 modules. x86_64 only.
+---
+
+causticos has its own syscall ABI and its own executable format, CSE — the
+*Caustic Standard Executable*. You build a program for the `caustic` target and
+get a `.cse` the kernel loads and runs in ring 3.
+
+A `.cse` is polyglot. The toolchain welds a causticos, a Linux and a Windows
+image into one file (macOS planned), so the same binary runs natively on each —
+every image calls its own OS's syscalls, APE/Cosmopolitan-style. On causticos,
+the kernel pulls out the causticos image and runs it.
+
+For the friendly version of how that works, see
+[docs/executables.md](docs/executables.md); the exact byte layout and syscall
+contract live in [docs/CSE_FORMAT.md](docs/CSE_FORMAT.md).
+
+Around 74k lines of Caustic across 248 modules. x86_64 only.
 
 ## What works
 
@@ -39,42 +63,34 @@ Around 21k lines of Caustic across ~40 modules. x86_64 only.
 - One FAT32 volume at a time — the driver keeps its scratch buffers and FAT cache in module globals, so a second concurrent mount is not yet safe.
 - No ASLR, no KPTI (single-trust for now). x86_64 only.
 
-## Requirements
+## Running it
 
-The Caustic toolchain (`caustic`, `caustic-as`, `caustic-ld`, `caustic-mk`) on your `PATH`, plus:
-
-- [Limine](https://github.com/limine-bootloader/limine), installed under `/usr/share/limine`
-- `xorriso` and `qemu-system-x86_64`
-- `python3` 3.8+
-
-`caustic-mk run doctor` checks all of it and prints a fix for anything missing.
-
-## Build and run
-
-```sh
-caustic-mk run doctor     # check the prerequisites
-caustic-mk run build      # kernel + userspace + a live ISO
-caustic-mk run run        # boot it
-```
-
-That is the whole loop. `caustic-mk run run` boots **with no disk attached** — the root volume travels inside the ISO as a sparse container the kernel expands into RAM. Write to it freely; it is volatile, and the boot says so.
+The three commands at the top are the whole loop, and the flags worth knowing:
 
 ```sh
 caustic-mk run run -- --headless          # serial only, no window
-caustic-mk run run -- --smp 4 -m 1G       # more cpus, more memory
+caustic-mk run run -- --smp 4 -m 256M     # more cpus, more memory
+caustic-mk run run -- --kvm               # use the host accelerator (default is TCG)
 caustic-mk run build -- --profile shell   # a shell instead of the desktop
-caustic-mk run run -- --persist           # attach a disk and boot from it instead
+caustic-mk run run -- --persist           # attach a disk and boot from that instead
 caustic-mk run profiles                   # what a profile actually ships
-caustic-mk run verify                     # the regression sweep, both gates
+caustic-mk run verify                     # the regression sweep, both gates, ~15s
 ```
 
-Writing the ISO to a USB stick gives you the same system on real hardware, BIOS or UEFI, with no other storage:
+`run` boots **with no disk attached** — the root travels inside the ISO as a
+sparse container the kernel expands into RAM. Write to it freely; it is
+volatile, and the boot says so.
+
+Writing the ISO to a USB stick gives the same system on real hardware, BIOS or
+UEFI, with nothing else installed:
 
 ```sh
 caustic-mk run usb -- /dev/sdX
 ```
 
-[docs/build-and-run.md](docs/build-and-run.md) covers every command and flag, the profile format, and the on-disk layout of the ISO.
+Installing the prerequisites is [docs/INSTALL.md](docs/INSTALL.md), per OS.
+Every command and flag, the profile format and the ISO's layout are in
+[docs/build-and-run.md](docs/build-and-run.md).
 
 ## Layout
 
