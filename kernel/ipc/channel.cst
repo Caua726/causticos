@@ -22,8 +22,16 @@ use "sched.cst" as sched;
 use "serial.cst" as serial;
 use "util.cst" as util;
 
-let is i64 as BUF_CAP  = 1024;        // bytes per direction (power of 2)
-let is i64 as BUF_MASK = 1023;
+// Bytes per direction (power of 2). 8 KiB, not 1 KiB: a channel is the
+// transport under every daemon protocol in the system, and 1 KiB was already
+// throttling the shell. netd hands HTTP response bodies through one of these,
+// where a 1 KiB pipe costs a round trip per kilobyte. A Channel is kmalloc'ed,
+// so the whole cost is ~16 KiB per channel instead of ~2 KiB.
+//
+// The struct's array declarations below must be edited in lockstep — Caustic
+// takes a literal length there, so the constant cannot size them.
+let is i64 as BUF_CAP  = 8192;
+let is i64 as BUF_MASK = 8191;
 let is i64 as POLL_NS  = 1000000;     // 1 ms blocking poll
 
 // Tudo i64 (mixed-width rule); the two byte buffers go last.
@@ -40,8 +48,8 @@ struct Channel {
     to_a_pending as i64;    // a KObject sent by B, awaiting A's recv (0 = none)
     to_b_pending as i64;    // a KObject sent by A, awaiting B's recv (0 = none)
     lk as lock.TicketLock;
-    a2b_buf as [1024]u8;    // A → B
-    b2a_buf as [1024]u8;    // B → A
+    a2b_buf as [8192]u8;    // A → B   (== BUF_CAP)
+    b2a_buf as [8192]u8;    // B → A   (== BUF_CAP)
 }
 
 struct ChannelEndpoint {
@@ -203,6 +211,46 @@ fn chan_poll(priv as i64) as i64 {
         st = st | abi.POLL_WRITABLE;
     }
     return st;
+}
+
+// Is this KObject one of ours? Vtable identity is the type — otype is
+// KOBJ_CHANNEL for both ends and says nothing about which module built it,
+// and a syscall that reads `priv` on the strength of a shared otype is one
+// mismatched fd away from interpreting somebody else's pointer. Same
+// discriminator netdev and audio use.
+fn endpoint_of(ko as i64) as i64 {
+    let is *kobject.KObject as k = cast(*kobject.KObject, ko);
+    if (k.otype != kobject.KOBJ_CHANNEL) { return 0; }
+    if (cast(i64, k.ops) != cast(i64, &CHANNEL_OPS)) { return 0; }
+    return k.priv;
+}
+
+// How much this endpoint can move right now. See abi.CHAN_INFO_WORDS for what
+// each word means and abi's SYS_CHAN_INFO note for why a server cannot
+// multiplex without it.
+fn chan_info(priv as i64, out as *i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    let is *Channel as ch = cast(*Channel, ep.channel);
+    let is i64 as fl = lock.acquire_irq(&ch.lk);
+    let is i64 as in_count with mut = 0;
+    let is i64 as out_count with mut = 0;
+    let is i64 as other_closed with mut = 0;
+    if (ep.side == 0) {
+        in_count = ch.b2a_count;
+        out_count = ch.a2b_count;
+        other_closed = ch.b_closed;
+    } else {
+        in_count = ch.a2b_count;
+        out_count = ch.b2a_count;
+        other_closed = ch.a_closed;
+    }
+    lock.release_irq(&ch.lk, fl);
+    out[0] = BUF_CAP;
+    out[1] = in_count;
+    out[2] = BUF_CAP - out_count;
+    out[3] = other_closed;
+    return abi.E_OK;
 }
 
 // Close one endpoint. Marks its side closed (so the peer sees EOF/E_PIPE),

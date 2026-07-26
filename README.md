@@ -23,15 +23,18 @@ Around 21k lines of Caustic across ~40 modules. x86_64 only.
 - **Memory** — buddy physical allocator, binned heap, 4-level paging, a single kernel-VA mapper, strict reserve+commit (no demand paging), per-address-space VMA and file-descriptor tables.
 - **Scheduler** — EEVDF across QoS bands plus a deadline class (EDF + CBS), preemptive, backed by red-black trees.
 - **Time** — PIT, LAPIC timer (calibrated against the HPET), HPET nanosecond clock, RTC wall clock. ACPI discovery (RSDP/XSDT/MADT/MCFG/HPET) and IOAPIC routing.
-- **Drivers** — a declarative framework where devices are described in `.cdvrspec` files, over PCI, with shared-IRQ chaining. PS/2 keyboard and mouse, virtio-tablet, e1000 and virtio-net.
+- **Drivers** — a declarative framework where devices are described in `.cdvrspec` files, over PCI, with shared-IRQ chaining. PS/2 keyboard and mouse, virtio-tablet, e1000, virtio-net and virtio-sound.
 - **Storage** — AHCI (SATA) and a RAM-backed live root, behind one block-device registry; a FAT32 implementation (read, write, create, unlink, rename, mkdir) and a POSIX-shaped VFS on top.
-- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, process spawn with fd handoff, channels, shared segments, eventfds, surfaces. 75 programs: a shell, ~45 coreutils, monitors (`ps`, `top`, `btop`, `htop`, `df`, `free`), editors (`vic`, `pager`, `hexedit`).
+- **Network** — e1000 and virtio-net drivers under a `DEV_NET` class that hands userspace raw ethernet frames, and `netd`: ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, HTTP/1.1 and TLS 1.3 with certificate verification, all in ring 3. `wget https://…` works.
+- **Sound** — a `DEV_AUDIO_OUT` / `DEV_AUDIO_IN` class: a DMA ring of PCM and a control page, mapped into the holder, or fed with `write()`. virtio-sound drives it; Intel HDA (the one real machines have) is still to come.
+- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, process spawn with fd handoff, channels, shared segments, eventfds, surfaces. 99 programs: a shell, ~45 coreutils, monitors (`ps`, `top`, `btop`, `htop`, `df`, `free`), editors (`vic`, `pager`, `hexedit`), and the network and audio tools (`ping`, `wget`, `nslookup`, `nc`, `httpd`, `aplay`, `arecord`).
 - **Desktop** — a compositor that owns the framebuffer and input, a window manager with tags, layouts and a config file, a terminal emulator, and a launcher.
 - **Self-hosting** — the Caustic compiler compiles itself *on* causticos, four rounds, byte-identical.
 
 ## What's not there yet
 
-- The NIC drivers exist, but there is no TCP/IP stack.
+- Audio has no mixer in the kernel: one program holds the stream at a time (the grab stack makes that a takeover rather than a refusal). `soundd` is what makes two programs audible at once.
+- Intel HDA — the audio device real machines actually have — is not written yet; virtio-sound covers the VM.
 - No installer: the live system is volatile by design, and `--persist` is how you get a persistent root.
 - One FAT32 volume at a time — the driver keeps its scratch buffers and FAT cache in module globals, so a second concurrent mount is not yet safe.
 - No ASLR, no KPTI (single-trust for now). x86_64 only.

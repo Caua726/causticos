@@ -1,0 +1,113 @@
+// neteth — ethernet II framing, and the address helpers everything needs.
+//
+// The smallest layer in the stack: 14 bytes of header, three fields. It gets
+// its own module anyway, because "offset 12 is the ethertype" written out in
+// four different files is four places to get it wrong.
+//
+// The FCS is not here. The hardware appends it on transmit and strips it on
+// receive; by the time a frame reaches this code it has already been checked
+// and removed. A stack that tries to compute one is a stack that will send
+// frames with two.
+
+use "../netbuf/netbuf.cst" as nb;
+
+let is i64 as HDR_LEN  = 14;
+let is i64 as ADDR_LEN = 6;
+
+// Ethertypes, in host order.
+let is i64 as TYPE_IPV4 = 0x0800;
+let is i64 as TYPE_ARP  = 0x0806;
+let is i64 as TYPE_IPV6 = 0x86DD;
+
+// A frame shorter than this never reaches us: the wire minimum is 60 bytes
+// plus FCS, and short frames are padded. Padding means a declared length is
+// authoritative and the frame's own length is not.
+let is i64 as MIN_FRAME = 14;
+let is i64 as MAX_FRAME = 1514;      // 14 + 1500 MTU, FCS already stripped
+
+let is [6]u8 as BROADCAST with mut;
+let is i64 as bcast_ready with mut = 0;
+
+fn broadcast() as *u8 {
+    if (bcast_ready == 0) {
+        let is i64 as i with mut = 0;
+        while (i < 6) { BROADCAST[i] = cast(u8, 0xFF); i = i + 1; }
+        bcast_ready = 1;
+    }
+    return cast(*u8, &BROADCAST[0]);
+}
+
+fn addr_copy(dst as *u8, src as *u8) as void {
+    nb.copy(dst, src, ADDR_LEN);
+    return;
+}
+
+fn addr_equal(a as *u8, b as *u8) as i64 {
+    return nb.equal(a, b, ADDR_LEN);
+}
+
+fn is_broadcast(a as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        if (a[i] != cast(u8, 0xFF)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Bit 0 of the first octet is the group bit: multicast and broadcast both set
+// it. A host filters on this rather than comparing addresses one by one.
+fn is_multicast(a as *u8) as i64 {
+    if ((cast(i64, a[0]) & 1) != 0) { return 1; }
+    return 0;
+}
+
+fn is_zero(a as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        if (a[i] != cast(u8, 0)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// --- header field access, on a raw frame pointer ---
+
+fn dst(frame as *u8) as *u8 { return cast(*u8, cast(i64, frame) + 0); }
+fn src(frame as *u8) as *u8 { return cast(*u8, cast(i64, frame) + 6); }
+fn ethertype(frame as *u8) as i64 { return nb.get_be16(frame, 12); }
+
+// --- building ---
+
+// Prepend the header to a packet whose payload is already in place. This is
+// the last step of transmit, and the reason Pbuf keeps headroom.
+fn push_header(b as *nb.Pbuf, dst_mac as *u8, src_mac as *u8, etype as i64) as i64 {
+    let is *u8 as h = nb.prepend(b, HDR_LEN);
+    if (cast(i64, h) == 0) { return 0; }
+    addr_copy(cast(*u8, cast(i64, h) + 0), dst_mac);
+    addr_copy(cast(*u8, cast(i64, h) + 6), src_mac);
+    nb.put_be16(h, 12, etype);
+    return HDR_LEN;
+}
+
+// --- parsing ---
+
+// Strip the header, leaving the payload. Returns the ethertype, or -1 if the
+// buffer is too short to hold a header at all.
+fn pull_header(b as *nb.Pbuf, out_dst as *u8, out_src as *u8) as i64 {
+    let is *u8 as h = nb.pull(b, HDR_LEN);
+    if (cast(i64, h) == 0) { return 0 - 1; }
+    if (cast(i64, out_dst) != 0) { addr_copy(out_dst, cast(*u8, cast(i64, h) + 0)); }
+    if (cast(i64, out_src) != 0) { addr_copy(out_src, cast(*u8, cast(i64, h) + 6)); }
+    return nb.get_be16(h, 12);
+}
+
+// Is this frame addressed to us? Unicast to our address, broadcast, or any
+// multicast — the last because filtering multicast groups is the business of
+// whoever joined them, not of the framing layer.
+fn is_for_us(frame as *u8, our_mac as *u8) as i64 {
+    let is *u8 as d = dst(frame);
+    if (addr_equal(d, our_mac) == 1) { return 1; }
+    if (is_multicast(d) == 1) { return 1; }
+    return 0;
+}

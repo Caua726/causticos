@@ -1,0 +1,225 @@
+// netbuf — the byte-level floor every protocol above it stands on.
+//
+// Three things, and they are the three that every network stack gets wrong
+// somewhere:
+//
+//   BIG-ENDIAN ACCESSORS. Every wire header is big-endian and the machine is
+//   little. Doing the swap by hand at each field is how a stack ends up with
+//   one place that got it backwards and works anyway until the day it does
+//   not. There is exactly one implementation here.
+//
+//   THE PACKET BUFFER, WITH HEADROOM. A frame is built inside out — TCP
+//   writes its payload, then IP prepends 20 bytes, then ethernet prepends 14.
+//   A buffer that starts at offset zero has to memmove for every layer. This
+//   one starts with room in front, so prepending is a pointer moving
+//   backwards.
+//
+//   THE INTERNET CHECKSUM (RFC 1071). One implementation, and the incremental
+//   update from RFC 1624 so that a router-style edit does not rescan the whole
+//   header.
+//
+// Everything here is a pure function over memory, which is what lets the
+// protocol layers above be tested against a table of known packets rather
+// than against a network.
+
+// ============================================================
+// Big-endian accessors
+// ============================================================
+
+fn get_be16(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 8) | cast(i64, p[off + 1]);
+}
+
+fn get_be32(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 24) | (cast(i64, p[off + 1]) << 16)
+         | (cast(i64, p[off + 2]) << 8) | cast(i64, p[off + 3]);
+}
+
+fn put_be16(p as *u8, off as i64, v as i64) as void {
+    p[off]     = cast(u8, (v >> 8) & 0xFF);
+    p[off + 1] = cast(u8, v & 0xFF);
+    return;
+}
+
+fn put_be32(p as *u8, off as i64, v as i64) as void {
+    p[off]     = cast(u8, (v >> 24) & 0xFF);
+    p[off + 1] = cast(u8, (v >> 16) & 0xFF);
+    p[off + 2] = cast(u8, (v >> 8) & 0xFF);
+    p[off + 3] = cast(u8, v & 0xFF);
+    return;
+}
+
+fn copy(dst as *u8, src as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[i] = src[i]; i = i + 1; }
+    return;
+}
+
+fn fill(dst as *u8, v as i64, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[i] = cast(u8, v & 0xFF); i = i + 1; }
+    return;
+}
+
+fn equal(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// The internet checksum (RFC 1071)
+// ============================================================
+
+// Ones-complement sum of 16-bit big-endian words, with an odd trailing byte
+// treated as a high byte padded with zero. Returned as the SUM, not the
+// checksum: callers that need to fold in a pseudo-header sum the parts and
+// complement once at the end.
+fn sum16(p as *u8, len as i64) as i64 {
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i + 1 < len) {
+        sum = sum + get_be16(p, i);
+        i = i + 2;
+    }
+    if (i < len) { sum = sum + (cast(i64, p[i]) << 8); }
+    return sum;
+}
+
+// Fold carries out of the high half until only 16 bits remain, then
+// complement. This is the value that goes on the wire.
+fn fold(sum as i64) as i64 {
+    let is i64 as s with mut = sum;
+    while ((s >> 16) != 0) { s = (s & 0xFFFF) + (s >> 16); }
+    return (0 - 1 - s) & 0xFFFF;
+}
+
+fn checksum(p as *u8, len as i64) as i64 {
+    return fold(sum16(p, len));
+}
+
+// Verify: summing a block that already contains its own checksum gives zero.
+// This is the receive-side form, and it is cheaper and less error-prone than
+// zeroing the field, recomputing and comparing.
+fn verify(p as *u8, len as i64) as i64 {
+    let is i64 as s with mut = sum16(p, len);
+    while ((s >> 16) != 0) { s = (s & 0xFFFF) + (s >> 16); }
+    if (s == 0xFFFF) { return 1; }
+    return 0;
+}
+
+// Incremental update (RFC 1624 eqn 3): a header field changed from `old` to
+// `new`, so adjust the checksum instead of rescanning. What NAT and TTL
+// decrements want.
+//
+// The naive form (~(~C + ~m + m')) has the well-known bug of producing 0xFFFF
+// where the correct answer is 0x0000 — and 0xFFFF and 0x0000 are the same
+// number in ones-complement but NOT the same on the wire, where 0x0000 means
+// "no checksum computed" for UDP. This is the corrected form.
+fn adjust(old_sum as i64, old_word as i64, new_word as i64) as i64 {
+    let is i64 as s with mut = (0 - 1 - old_sum) & 0xFFFF;   // ~C
+    s = s + ((0 - 1 - old_word) & 0xFFFF);                    // + ~m
+    s = s + (new_word & 0xFFFF);                              // + m'
+    while ((s >> 16) != 0) { s = (s & 0xFFFF) + (s >> 16); }
+    return (0 - 1 - s) & 0xFFFF;
+}
+
+// ============================================================
+// Pbuf — a packet under construction, with room in front
+//
+// All-i64 scalars with the byte array last: the struct shape this project has
+// proven (userspace/tests/u64t.cst asserts it). `data` is the buffer; `head`
+// is where the packet currently starts and moves BACKWARDS as headers are
+// prepended; `tail` is one past the last byte.
+//
+// HEADROOM is the largest stack of headers that will ever be prepended:
+// 14 ethernet + 20 IPv4 + 20 TCP with room for options = 64, rounded up. A
+// prepend past it fails rather than corrupting, and says so.
+// ============================================================
+
+let is i64 as HEADROOM = 64;
+let is i64 as CAP      = 2048;      // headroom + 1518 frame + slack
+
+struct Pbuf {
+    head as i64;        // offset of the first live byte
+    tail as i64;        // offset one past the last live byte
+    err  as i64;        // sticky: set by any operation that could not fit
+    data as [2048]u8;   // == CAP
+}
+
+// Ready to build outward-in: empty, positioned at the end of the headroom.
+fn init(b as *Pbuf) as void {
+    b.head = HEADROOM;
+    b.tail = HEADROOM;
+    b.err = 0;
+    return;
+}
+
+// Ready to parse: `n` bytes already present, starting at the headroom mark.
+fn init_with(b as *Pbuf, src as *u8, n as i64) as i64 {
+    init(b);
+    if (n < 0 || n > CAP - HEADROOM) { b.err = 1; return 0; }
+    copy(cast(*u8, &b.data[HEADROOM]), src, n);
+    b.tail = HEADROOM + n;
+    return n;
+}
+
+fn len(b as *Pbuf) as i64 {
+    return b.tail - b.head;
+}
+
+fn ptr(b as *Pbuf) as *u8 {
+    return cast(*u8, &b.data[b.head]);
+}
+
+// Move the start back by n and return a pointer to the new space. The reason
+// the headroom exists: a header lands in front of the payload with no copy.
+fn prepend(b as *Pbuf, n as i64) as *u8 {
+    if (b.head - n < 0) { b.err = 1; return cast(*u8, 0); }
+    b.head = b.head - n;
+    return cast(*u8, &b.data[b.head]);
+}
+
+// Extend the end by n and return a pointer to the new space.
+fn append(b as *Pbuf, n as i64) as *u8 {
+    if (b.tail + n > CAP) { b.err = 1; return cast(*u8, 0); }
+    let is i64 as at = b.tail;
+    b.tail = b.tail + n;
+    return cast(*u8, &b.data[at]);
+}
+
+fn append_bytes(b as *Pbuf, src as *u8, n as i64) as i64 {
+    let is *u8 as d = append(b, n);
+    if (cast(i64, d) == 0) { return 0; }
+    copy(d, src, n);
+    return n;
+}
+
+// Consume n bytes from the front, returning where they were. How a parser
+// walks down the layers: pull the ethernet header, then the IP header, and
+// what remains is the payload.
+fn pull(b as *Pbuf, n as i64) as *u8 {
+    if (b.head + n > b.tail) { b.err = 1; return cast(*u8, 0); }
+    let is i64 as at = b.head;
+    b.head = b.head + n;
+    return cast(*u8, &b.data[at]);
+}
+
+// Look at the front without consuming, checking that n bytes are really
+// there. A parser that peeks without this is a parser that reads past the
+// end of a truncated packet.
+fn peek(b as *Pbuf, n as i64) as *u8 {
+    if (b.head + n > b.tail) { return cast(*u8, 0); }
+    return cast(*u8, &b.data[b.head]);
+}
+
+// Drop bytes from the end — how a payload is cut down to the length a header
+// declares, after the driver handed over a frame padded to the wire minimum.
+fn trim_to(b as *Pbuf, n as i64) as i64 {
+    if (n < 0 || n > len(b)) { return 0; }
+    b.tail = b.head + n;
+    return n;
+}

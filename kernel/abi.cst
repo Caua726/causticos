@@ -194,6 +194,55 @@ let is i64 as SYS_QUERY_DEVS      = 48;  // (out_uptr, max) → total count | er
 //     The class is still the driver's declaration — the kernel adds no
 //     judgement, it only forwards what the bus already answers. ---
 let is i64 as SYS_DEV_INFO        = 49;  // (class, index, out_uptr) → 0 | errno
+let is i64 as SYS_NET_INFO        = 50;  // (net_fd, out_uptr)  → 0 | errno
+// Unpredictable bytes, as a mechanism. TCP needs an ISN an off-path attacker
+// cannot guess (RFC 6528), DNS needs unguessable query IDs and source ports,
+// TLS needs client randoms and ephemeral keys — and every one of those fails
+// SILENTLY when the numbers are guessable. Each program inventing its own is
+// how that happens, so the kernel, which has the on-die TRNG and interrupt
+// timing, answers for everyone.
+//
+// Returns bytes written, or an errno. RANDOM_QUALITY tells the caller what it
+// is getting: RANDOM_HW is an on-die generator and key-grade; RANDOM_JITTER is
+// an interrupt-timing pool, adequate for sequence numbers and query IDs but
+// NOT for keys. A caller that needs key-grade material must check.
+let is i64 as SYS_GET_RANDOM      = 51;  // (buf_uptr, len)     → bytes | errno
+let is i64 as SYS_RANDOM_QUALITY  = 52;  // ()                  → RANDOM_*
+// What an audio stream IS: the rate, the channel count, the sample format and
+// the ring geometry the kernel opened it with. Takes the fd for the same
+// reason SYS_NET_INFO does — you hold the key to read the device's state.
+//
+// Reported, never configured. There is no SET_FORMAT and there will not be
+// one: the hardware decides what it can do, the driver picks by a fixed
+// documented preference (48000 > 44100 > whatever it has; 2 channels; S16_LE)
+// and says what it got. Resampling, mixing and conversion are decisions, and
+// decisions are userspace (soundd).
+let is i64 as SYS_AUDIO_INFO      = 53;  // (audio_fd, out_uptr) → 0 | errno
+
+// SYS_CHAN_INFO — how much a channel will take right now, and how much it
+// holds. A fact query about a kernel object, in the shape SYS_SURFACE_INFO
+// established: a dedicated typed syscall, not an ioctl.
+//
+// WHY A SERVER CANNOT WORK WITHOUT IT. A daemon holding a device and serving
+// N clients has one hard rule: never block on one client. POLL_WRITABLE says
+// only that POLL_WRITE_UNIT bytes will go through, which is enough to promise
+// a small message will not tear and useless for deciding whether a 4 KiB one
+// fits. Without the number, a server either writes and risks blocking — netd
+// did, and one slow client stopped the whole stack — or it drains its source
+// into a queue of its own, which moves the backpressure somewhere the sender
+// cannot see it.
+//
+// With it, a server can decline to dequeue what it cannot deliver, and the
+// congestion stays where it belongs: for netd, in the TCP receive buffer,
+// where it closes the advertised window and slows the peer down. That is
+// what flow control is, and it only works if the queue is allowed to build
+// at the layer that owns the protocol.
+let is i64 as SYS_CHAN_INFO       = 54;  // (chan_fd, out_uptr)  → 0 | errno
+let is i64 as RANDOM_JITTER = 1;
+let is i64 as RANDOM_HW     = 2;
+// One SYS_GET_RANDOM call is bounded by the kernel's per-thread staging
+// buffer; a caller wanting more loops.
+let is i64 as RANDOM_MAX_BYTES = 4096;
 
 // SYS_PROC_LIST fills an array of ProcInfo (PROC_INFO_WORDS i64 = 64 B each),
 // up to `max` entries, and returns the TOTAL live process count — so the
@@ -210,10 +259,21 @@ let is i64 as PROC_LIST_MAX   = 64;     // kbuf bound on the kstack
 // SYS_STATFS fills StatfsInfo (3 i64): [total_bytes, free_bytes, block_size]
 // for the mounted filesystem.
 
+// SYS_CHAN_INFO fills ChanInfo, 4 i64 = 32 bytes:
+//   [0] capacity        bytes each direction holds when empty
+//   [1] readable        bytes waiting to be read by THIS endpoint
+//   [2] writable        bytes this endpoint can write RIGHT NOW without
+//                       blocking. A write of no more than this returns having
+//                       moved all of it.
+//   [3] peer_closed     1 = the other end is gone; a write returns E_PIPE
+//                       rather than blocking, so `writable` is not the whole
+//                       answer on its own.
+let is i64 as CHAN_INFO_WORDS = 4;
+
 // SYS_COUNT = highest valid id + 1. This is the number reported to
 // userspace as the probe ceiling (KernInfo.syscalls_max): "syscall N
 // exists iff N < SYS_COUNT". Bump it when appending a real syscall.
-let is i64 as SYS_COUNT = 50;
+let is i64 as SYS_COUNT = 55;
 
 // SYS_DEV_INFO fills DevInfo, 8 i64 = 64 bytes:
 //   [0] class   [1] index (in-class)
@@ -223,6 +283,142 @@ let is i64 as SYS_COUNT = 50;
 //                              valid id, so 0 is unambiguous.
 //   [4..7] name — the Hardware node's name, 32 bytes, NUL-padded.
 let is i64 as DEV_INFO_WORDS = 8;
+
+// SYS_NET_INFO fills NetInfo, 16 i64 = 128 bytes. Takes the FD, not a
+// (class, index) pair — you have to hold the key to read the device's state:
+//   [0] mtu            [1] frame_max — the smallest buffer a read is safe
+//                          with; below it a read is E_RANGE and drops
+//   [2] link_up        [3] speed_mbps (0 = unknown)
+//   [4] mac            — the six bytes in the low 48 bits, mac[i] at 8*i
+//   [5] flags          — bit0 broadcast, bit1 promiscuous
+//   [6] rx_packets     [7] rx_dropped  [8] rx_toobig
+//   [9] tx_packets     [10] tx_errors  [11] reserved
+//   [12..15] driver name, 32 bytes NUL-padded ("e1000", "vnet")
+//
+// The name is here rather than left to SYS_DEV_INFO because DevInfo reports
+// the HARDWARE NODE's name, which for anything on PCI is "pci" — true, and
+// useless for telling one card from another. What a reader wants to know is
+// which driver is running the port.
+//
+// Separate from SYS_DEV_INFO rather than an extension of it, for the reason
+// already written down there: DevInfo is BUS IDENTITY, stable for the life of
+// the node and safe to cache. Link state and counters are alive, and "a field
+// that changes per call would silently go stale the moment userspace caches
+// the probe result". Same split, same reason, as SYS_SURFACE_INFO.
+let is i64 as NET_INFO_WORDS = 16;
+let is i64 as NET_FLAG_BROADCAST = 1;
+let is i64 as NET_FLAG_PROMISC   = 2;
+
+// ============================================================
+// The audio control page — SHARED MEMORY, therefore ABI.
+//
+// Every field is an i64 and every field has EXACTLY ONE WRITER. That is the
+// whole synchronisation design; there is no lock because there is nothing two
+// parties both write.
+//
+//   0x000  the facts. Written once when the stream is acquired, read-only
+//          afterwards. A program can trust them for the life of the fd.
+//   0x080  the HARDWARE cursor. Written only by the kernel, from the period
+//          interrupt. Read by the program.
+//   0x100  the APPLICATION cursor. Written only by the program (MMAP mode) or
+//          only by the kernel on its behalf (STREAM mode) — never both, which
+//          is what the one-mode-per-fd rule buys.
+//
+// The three live in separate cache lines so a program spinning on hw_ptr does
+// not bounce the line the kernel is writing app_ptr into and vice versa.
+//
+// hw_ptr AND app_ptr ARE MONOTONIC 64-BIT FRAME COUNTS, not ring indices. At
+// 48 kHz a 63-bit count runs for six million years, so wraparound is not a
+// case that exists. That removes every modular comparison and the entire
+// full-versus-empty ambiguity: frames available = hw_ptr - app_ptr, room =
+// buffer_frames - (app_ptr - hw_ptr), and the position in the ring is
+// (ptr % buffer_frames), computed locally by whoever needs it.
+//
+// ORDERING. x86-TSO does not reorder store→store or load→load, so a producer
+// that writes samples and THEN publishes app_ptr is seen in that order by the
+// consumer, and a consumer that reads hw_ptr and THEN reads samples cannot
+// read stale ones. This is the same argument virtio.cst already makes for
+// avail->idx. The risk is the COMPILER, not the machine: Caustic has no
+// volatile, so every access here derives a fresh pointer from the base
+// address (the idiom that makes virtio.rd32 correct) and the publication
+// points carry an explicit fence.
+let is i64 as AUDIO_CTL_BYTES   = 4096;
+let is i64 as AUDIO_CTL_MAGIC   = 0x43415544;    // "CAUD" — a mapping that is not this is not an audio stream
+let is i64 as AUDIO_CTL_VERSION = 1;
+
+// Word indices into the control page (byte offset = index * 8).
+let is i64 as AUDIO_W_MAGIC         = 0;
+let is i64 as AUDIO_W_VERSION       = 1;
+let is i64 as AUDIO_W_RATE          = 2;
+let is i64 as AUDIO_W_CHANNELS      = 3;
+let is i64 as AUDIO_W_FORMAT        = 4;
+let is i64 as AUDIO_W_FRAME_BYTES   = 5;
+let is i64 as AUDIO_W_PERIOD_FRAMES = 6;
+let is i64 as AUDIO_W_PERIOD_COUNT  = 7;
+let is i64 as AUDIO_W_BUFFER_FRAMES = 8;
+let is i64 as AUDIO_W_DATA_OFFSET   = 9;     // == AUDIO_CTL_BYTES; explicit so a program never hardcodes it
+let is i64 as AUDIO_W_DIRECTION     = 10;
+// 0x080: the kernel's line.
+let is i64 as AUDIO_W_HW_PTR        = 16;    // frames the hardware has consumed (out) or produced (in)
+// Periods the hardware ENTERED with nothing written in them (out), or filled
+// while the program was more than a buffer behind (in). Not "the margin got
+// thin" — the thing that is actually audible.
+//
+// A stream that ends on a period boundary shows exactly ONE: the period after
+// the last sample, entered because the engine keeps running until the fd is
+// closed. One that ends mid-period shows TWO, and the second is real — the
+// hardware played the unwritten tail of that period. A program that cares
+// finishes on a boundary, padding with silence if it has to; that costs at
+// most one period and says "this is the end" instead of looking late.
+//
+// A program that maps the ring can say AUDIO_APP_DRAINING and not get even
+// the one; a program using write() has no page to say it on, so it should
+// expect the one and read anything beyond it as real.
+let is i64 as AUDIO_W_XRUNS         = 17;
+let is i64 as AUDIO_W_IRQ_SEQ       = 18;    // period interrupts seen; a program can tell "no progress" from "slow"
+let is i64 as AUDIO_W_RUNNING       = 19;    // 1 while this holder owns the engine (0 = preempted, and quiet)
+// 0x100: the program's line.
+let is i64 as AUDIO_W_APP_PTR       = 32;    // frames the program has filled (out) or taken (in)
+let is i64 as AUDIO_W_APP_FLAGS     = 33;
+
+// app_flags. DRAINING says "I am deliberately not feeding you any more" — the
+// tail of a file is not an underrun, and a program that has to choose between
+// a bogus xrun count and a bogus trailing period is being asked the wrong
+// question. The kernel still plays silence; it just does not count it.
+let is i64 as AUDIO_APP_DRAINING = 1;
+
+// Sample formats. S16_LE is what every HDA output converter is required to
+// support and what virtio-sound offers first, so it is the one v0 opens with.
+// This enum grows when a driver actually reports something else — a number
+// here that no device produces would be a promise the kernel cannot keep.
+let is i64 as AUDIO_FMT_S16_LE = 0;
+
+let is i64 as AUDIO_DIR_OUT = 0;
+let is i64 as AUDIO_DIR_IN  = 1;
+
+// SYS_AUDIO_INFO fills AudioInfo, 20 i64 = 160 bytes:
+//   [0] rate_hz       [1] channels      [2] format (AUDIO_FMT_*)
+//   [3] frame_bytes   [4] period_frames [5] period_count
+//   [6] buffer_frames [7] data_offset — also the size of the control page
+//   [8] direction (AUDIO_DIR_*)         [9] map_bytes — the whole mapping
+//   [10] flags (AUDIO_FLAG_*)
+//   [11] hw_ptr       [12] app_ptr      [13] xruns
+//   [14..15] reserved [16..19] driver name, 32 bytes NUL-padded
+//
+// It duplicates the control page's fact line on purpose: a program in STREAM
+// mode never maps anything and still has to know the rate and the frame size
+// to write correct PCM.
+//
+// AND IT REPORTS THE TWO CURSORS, for the same reason. The contract says a
+// program finishes by waiting for hw_ptr to reach app_ptr — but a STREAM-mode
+// program has no mapping, so without these it could not do the one thing the
+// contract told it to do, and would have to guess a sleep instead. They are
+// live and they change under the caller, which is exactly why they are here
+// and not in a cacheable probe like SYS_DEV_INFO.
+let is i64 as AUDIO_INFO_WORDS = 20;
+let is i64 as AUDIO_FLAG_MODE_MMAP   = 1;   // the fd's mode is fixed to mmap
+let is i64 as AUDIO_FLAG_MODE_STREAM = 2;   // the fd's mode is fixed to write()
+let is i64 as AUDIO_FLAG_ACTIVE      = 4;   // this holder is the top of the grab stack
 
 // SYS_EVENT_SUBSCRIBE record kinds. A record is 3 × i64 = 24 bytes:
 // {pid (the process the event is about), kind, code}. mask = OR of the kinds
@@ -282,6 +478,60 @@ let is i64 as DEV_MOUSE    = 2;
 // device SYN batch — position is state, not deltas, which is what lets a
 // hypervisor's pointer track the host cursor with no grab.
 let is i64 as DEV_TABLET   = 3;
+// A network port → a raw ETHERNET FRAME device. One read returns exactly one
+// frame and its length (14..1518, FCS already stripped by the hardware); one
+// write transmits exactly one. A read whose buffer is smaller than the pending
+// frame returns E_RANGE and the frame is DROPPED — truncating would be a lie
+// and holding it would let one caller wedge the ring; SYS_NET_INFO reports
+// frame_max so a correct caller never provokes it.
+//
+// Frames, not connections. ARP, IPv4, TCP, DHCP and DNS are decisions, and
+// decisions are userspace (architecture.md §2.1) — netd holds the port and
+// serves clients over channels, the way the compositor holds the framebuffer.
+//
+// Records rather than a byte stream because the frame boundary is a fact of
+// the hardware: the PHY builds and strips the framing, so what lands in a
+// descriptor already IS a record. Flattening it would force the kernel to
+// invent a length prefix and would make loss indistinguishable from a large
+// frame.
+let is i64 as DEV_NET      = 4;
+
+// An audio stream → a RING OF PCM plus a control page, mapped into the
+// holder's address space by SYS_MMAP|MMAP_FD. Playback and capture are two
+// classes rather than one class with a direction argument, because the
+// exclusivity is per instance and you want soundd playing while something
+// else records: one grab stack each, one holder each.
+//
+// SYS_AUDIO_INFO reports the geometry. The mapping is
+// [control page, AUDIO_CTL_BYTES][ring, buffer_frames * frame_bytes], one
+// contiguous DMA allocation, and the ring is what the hardware reads or
+// writes directly — the sample a program stores IS the sample the DAC gets.
+//
+// THERE IS NO START AND NO STOP. The stream runs from the moment it is
+// acquired until the fd is closed; silence is what you get by not feeding it.
+// A verb pair would be an ioctl in disguise, and it would be a lie about the
+// hardware: an audio DMA engine is a clock, and a clock does not pause. Drain
+// is not a verb either — a program that wants to finish polls until hw_ptr
+// reaches its app_ptr, and it has both numbers. Volume is not a verb: it is
+// gain, it is policy, and it lives in soundd.
+//
+// ONE FD HAS ONE MODE, decided by its first data operation.
+//   mmap first  → MMAP mode. The program stores samples into the ring and
+//                 publishes its own app_ptr. The kernel never writes app_ptr.
+//                 A later write() is E_INVAL.
+//   write first → STREAM mode. The kernel copies the PCM in and advances
+//                 app_ptr itself, blocking while the ring is full. A later
+//                 mmap is E_INVAL.
+// Both would mean two writers on app_ptr with no lock userspace could take.
+// The closed set of honest ops says so out loud: using one excludes the other.
+//
+// poll is how a program in MMAP mode waits. It makes no syscall on the data
+// path, so without poll it would have nothing to block on: POLL_WRITABLE on a
+// playback stream means at least one period of room, POLL_READABLE on a
+// capture stream means at least one period of samples. That is the "wait for
+// the next period" primitive, and it is why poll is not optional here.
+let is i64 as DEV_AUDIO_OUT = 5;
+let is i64 as DEV_AUDIO_IN  = 6;
 
 // SYS_SURFACE_INFO pixel format (5th word of its out struct). v0 is always
 // XRGB8888 (32bpp packed LE: 0x00RRGGBB) — the surface mirrors the Limine

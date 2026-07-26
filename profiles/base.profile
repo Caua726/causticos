@@ -72,6 +72,27 @@ bin  nproc
 bin  lscpu
 bin  date
 
+# network. netd is a daemon, not a command: the compositor starts it (it is
+# /init, so it is the one process that may), and everything else asks it for an
+# endpoint. It is loaded by absolute path from userspace, so it has to be here
+# whether or not anyone types its name.
+bin  netd
+bin  ifconfig
+bin  ping
+bin  nslookup
+bin  arp
+bin  wget
+bin  nc
+bin  httpd
+bin  netsnoop
+
+# audio. soundd is the mixer: the kernel hands the stream to one holder at a
+# time, and soundd is what makes two programs audible at once. Also loaded by
+# absolute path (userspace/lib/sndcli), so it ships regardless.
+bin  soundd
+bin  aplay
+bin  arecord
+
 # power
 bin  poweroff
 bin  reboot

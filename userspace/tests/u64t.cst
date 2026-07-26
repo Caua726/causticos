@@ -1,0 +1,446 @@
+// u64t — the arithmetic floor the network stack and the crypto stack stand on.
+//
+// TCP does sequence arithmetic mod 2^32 and window arithmetic that must not
+// sign-extend; bignum, Poly1305 and X25519 do 64-bit unsigned limb work. Both
+// fail SILENTLY and late if `u64` compares or divides as signed — you get a
+// stack that works on a quiet link and corrupts under wrap or load. So the
+// floor gets proved once, from ring 3, before a line of either is written.
+//
+// This is a characterization test as much as a pass/fail one: where the answer
+// is a property of the machine rather than a choice (shift counts are masked to
+// 6 bits on x86), it asserts the machine's actual behaviour so that a future
+// change is loud instead of mysterious.
+//
+// Every value flows through a variable, never a constant expression: the point
+// is to test the emitted instruction, not the compiler's constant folder.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+
+// Everything goes to the terminal AND the serial line: this test earns its keep
+// on a headless boot, where serial is the only place a result can land.
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// ============================================================
+// 1. u64 is unsigned end to end
+//
+// 0xFFFFFFFFFFFFFFFF read as signed is -1: every one of these flips if the
+// compiler reaches for the signed instruction.
+// ============================================================
+
+fn u64_of(v as i64) as u64 { return cast(u64, v); }
+
+fn test_u64_unsigned() as void {
+    say("u64 is unsigned:\n");
+    let is u64 as max = u64_of(0 - 1);             // 0xFFFF_FFFF_FFFF_FFFF
+    let is u64 as one = u64_of(1);
+    let is u64 as two = u64_of(2);
+
+    // Comparison: as signed this is -1, and every one of these inverts.
+    check(cast(*u8, "max > 1"),  cast(i64, max > one), 1);
+    check(cast(*u8, "max >= 1"), cast(i64, max >= one), 1);
+    check(cast(*u8, "1 < max"),  cast(i64, one < max), 1);
+    check(cast(*u8, "max < 1"),  cast(i64, max < one), 0);
+
+    // Division: `idiv` on 0xFFFF... / 2 does not yield 0x7FFF... — it yields 0
+    // (as -1/2), and on some operand pairs it raises #DE outright.
+    let is u64 as half = max / two;
+    check(cast(*u8, "max/2 == 0x7FFF..."), cast(i64, half), 0x7FFFFFFFFFFFFFFF);
+
+    // Modulo shares the instruction with division, so it shares the failure.
+    let is u64 as three = u64_of(3);
+    check(cast(*u8, "max%3"), cast(i64, max % three), 0);
+
+    // Shift right must be logical (shr), not arithmetic (sar): sar would keep
+    // the sign bit and give max again.
+    let is u64 as sh1 = max >> one;
+    check(cast(*u8, "max>>1 == 0x7FFF..."), cast(i64, sh1), 0x7FFFFFFFFFFFFFFF);
+
+    // The high bit survives a round trip through a shift both ways.
+    let is u64 as hi = one << u64_of(63);
+    check(cast(*u8, "1<<63 >>63 == 1"), cast(i64, hi >> u64_of(63)), 1);
+    return;
+}
+
+fn test_i64_signed() as void {
+    say("i64 stays signed:\n");
+    let is i64 as neg with mut = 0 - 8;
+    // Arithmetic shift: -8 >> 1 is -4, not a huge positive number.
+    check(cast(*u8, "-8 >> 1"), neg >> 1, 0 - 4);
+    check(cast(*u8, "-1 >> 63"), (0 - 1) >> 63, 0 - 1);
+    check(cast(*u8, "-9 / 2"), (0 - 9) / 2, 0 - 4);
+    check(cast(*u8, "-9 % 2"), (0 - 9) % 2, 0 - 1);
+    check(cast(*u8, "-1 < 1"), cast(i64, (0 - 1) < 1), 1);
+    return;
+}
+
+// ============================================================
+// 2. TCP sequence arithmetic — the single largest source of bugs in a stack
+//
+// RFC 793 sequence numbers live mod 2^32 and there is no "greater than": there
+// is only "within half a window ahead". The idiom is to subtract and look at
+// the sign of the 32-bit difference, which stays correct across the wrap.
+// ============================================================
+
+let is i64 as SEQ_MASK = 0xFFFFFFFF;
+
+fn seq_lt(a as i64, b as i64) as i64 {
+    let is i32 as d = cast(i32, (a - b) & SEQ_MASK);
+    if (d < 0) { return 1; }
+    return 0;
+}
+
+fn seq_leq(a as i64, b as i64) as i64 {
+    if (a == b) { return 1; }
+    return seq_lt(a, b);
+}
+
+fn test_seq() as void {
+    say("seq arithmetic mod 2^32:\n");
+    check(cast(*u8, "1 < 2"), seq_lt(1, 2), 1);
+    check(cast(*u8, "2 < 1"), seq_lt(2, 1), 0);
+    check(cast(*u8, "n < n"), seq_lt(7, 7), 0);
+    check(cast(*u8, "n <= n"), seq_leq(7, 7), 1);
+
+    // The whole point: 0xFFFFFFF0 precedes 0x00000010, sixteen bytes later.
+    let is i64 as before = 0xFFFFFFF0;
+    let is i64 as after with mut = 16;
+    check(cast(*u8, "wrap: 0xFFFFFFF0 < 16"), seq_lt(before, after), 1);
+    check(cast(*u8, "wrap: 16 < 0xFFFFFFF0"), seq_lt(after, before), 0);
+
+    // Half the space away is where the comparison stops meaning anything, and
+    // it fails in a specific way worth pinning down: at EXACTLY 2^31 apart,
+    // each side reads as preceding the other. That is not a bug in seq_lt, it
+    // is the shape of the number line it lives on — which is why a receive
+    // window must never be allowed to approach 2^31. Asserting the ambiguity
+    // keeps the reason on the record instead of in someone's memory.
+    let is i64 as half = 0x80000000;
+    check(cast(*u8, "0 < 2^31-1"), seq_lt(0, half - 1), 1);
+    check(cast(*u8, "2^31-1 < 0 is false"), seq_lt(half - 1, 0), 0);
+    check(cast(*u8, "at 2^31 both read as before (a)"), seq_lt(0, half), 1);
+    check(cast(*u8, "at 2^31 both read as before (b)"), seq_lt(half, 0), 1);
+
+    // Advancing across the wrap must land where the arithmetic says.
+    let is i64 as adv = (before + 32) & SEQ_MASK;
+    check(cast(*u8, "0xFFFFFFF0 + 32 wraps"), adv, 16);
+    return;
+}
+
+// ============================================================
+// 3. Shifts by a variable count
+//
+// x86 masks the shift count to 6 bits, so `x >> 64` is `x >> 0` = x, NOT 0.
+// C calls this undefined; here it is simply what the machine does. Header
+// parsers that compute a shift from a wire field can reach 64 on malformed
+// input, so this is asserted rather than assumed.
+// ============================================================
+
+fn test_shifts() as void {
+    say("variable shifts (count masked to 6 bits):\n");
+    let is i64 as sh with mut = 0;
+    let is u64 as v = u64_of(1);
+    while (sh < 64) {
+        let is u64 as r = v << cast(u64, sh);
+        if (cast(i64, r >> cast(u64, sh)) != 1) {
+            check(cast(*u8, "1<<n>>n == 1"), sh, 0 - 1);
+            return;
+        }
+        sh = sh + 1;
+    }
+    check(cast(*u8, "1<<n>>n == 1 for n in 0..63"), 1, 1);
+
+    let is i64 as c64 with mut = 64;
+    check(cast(*u8, "1>>64 is 1 (masked, not 0)"), cast(i64, v >> cast(u64, c64)), 1);
+    check(cast(*u8, "1<<64 is 1 (masked, not 0)"), cast(i64, v << cast(u64, c64)), 1);
+    return;
+}
+
+// ============================================================
+// 4. Byte order helpers
+//
+// Every wire header in the stack is big-endian and the machine is little; get
+// this wrong once and every checksum in the system is quietly wrong.
+// ============================================================
+
+fn put_be16(p as *u8, off as i64, v as i64) as void {
+    p[off]     = cast(u8, (v >> 8) & 0xFF);
+    p[off + 1] = cast(u8, v & 0xFF);
+    return;
+}
+
+fn get_be16(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 8) | cast(i64, p[off + 1]);
+}
+
+fn put_be32(p as *u8, off as i64, v as i64) as void {
+    p[off]     = cast(u8, (v >> 24) & 0xFF);
+    p[off + 1] = cast(u8, (v >> 16) & 0xFF);
+    p[off + 2] = cast(u8, (v >> 8) & 0xFF);
+    p[off + 3] = cast(u8, v & 0xFF);
+    return;
+}
+
+fn get_be32(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 24) | (cast(i64, p[off + 1]) << 16)
+         | (cast(i64, p[off + 2]) << 8) | cast(i64, p[off + 3]);
+}
+
+fn test_endian() as void {
+    say("big-endian wire helpers:\n");
+    let is [16]u8 as b;
+    put_be16(cast(*u8, &b[0]), 0, 0x0806);
+    check(cast(*u8, "be16 byte0"), cast(i64, b[0]), 0x08);
+    check(cast(*u8, "be16 byte1"), cast(i64, b[1]), 0x06);
+    check(cast(*u8, "be16 round trip"), get_be16(cast(*u8, &b[0]), 0), 0x0806);
+
+    // A value with the top bit set must not sign-extend on the way back.
+    put_be32(cast(*u8, &b[0]), 0, 0xC0A80001);
+    check(cast(*u8, "be32 byte0"), cast(i64, b[0]), 0xC0);
+    check(cast(*u8, "be32 round trip"), get_be32(cast(*u8, &b[0]), 0), 0xC0A80001);
+    put_be32(cast(*u8, &b[0]), 0, 0xFFFFFFFF);
+    check(cast(*u8, "be32 all-ones is positive"), get_be32(cast(*u8, &b[0]), 0), 0xFFFFFFFF);
+    return;
+}
+
+// ============================================================
+// 5. The internet checksum (RFC 1071)
+//
+// Ones-complement sum of 16-bit words with end-around carry. Its correctness
+// depends on the carry fold, which depends on the shift being logical.
+// ============================================================
+
+fn checksum(p as *u8, len as i64) as i64 {
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i + 1 < len) {
+        sum = sum + get_be16(p, i);
+        i = i + 2;
+    }
+    if (i < len) { sum = sum + (cast(i64, p[i]) << 8); }
+    while ((sum >> 16) != 0) { sum = (sum & 0xFFFF) + (sum >> 16); }
+    return (0 - 1 - sum) & 0xFFFF;
+}
+
+fn test_checksum() as void {
+    say("internet checksum (RFC 1071):\n");
+    // The canonical RFC 1071 example: 00 01 f2 03 f4 f5 f6 f7. The RFC prints
+    // the ones-complement SUM, 0xddf2; what goes on the wire is its complement,
+    // 0x220d. checksum() returns the wire value, so both are asserted — mixing
+    // the two up is a classic way to ship a stack that never verifies.
+    let is [8]u8 as e;
+    e[0] = cast(u8, 0x00); e[1] = cast(u8, 0x01);
+    e[2] = cast(u8, 0xf2); e[3] = cast(u8, 0x03);
+    e[4] = cast(u8, 0xf4); e[5] = cast(u8, 0xf5);
+    e[6] = cast(u8, 0xf6); e[7] = cast(u8, 0xf7);
+    let is i64 as rfc = checksum(cast(*u8, &e[0]), 8);
+    check(cast(*u8, "RFC 1071 wire value"), rfc, 0x220d);
+    check(cast(*u8, "RFC 1071 sum"), (0 - 1 - rfc) & 0xFFFF, 0xddf2);
+
+    // A real IPv4 header: 20 bytes, checksum field zeroed, expected 0xb861.
+    let is [20]u8 as h;
+    let is i64 as z with mut = 0;
+    while (z < 20) { h[z] = cast(u8, 0); z = z + 1; }
+    h[0] = cast(u8, 0x45);                              // v4, IHL 5
+    put_be16(cast(*u8, &h[0]), 2, 0x0073);              // total length
+    put_be16(cast(*u8, &h[0]), 4, 0x0000);              // id
+    put_be16(cast(*u8, &h[0]), 6, 0x4000);              // DF
+    h[8] = cast(u8, 0x40); h[9] = cast(u8, 0x11);       // TTL 64, UDP
+    put_be32(cast(*u8, &h[0]), 12, 0xC0A80001);         // 192.168.0.1
+    put_be32(cast(*u8, &h[0]), 16, 0xC0A800C7);         // 192.168.0.199
+    let is i64 as ck = checksum(cast(*u8, &h[0]), 20);
+    check(cast(*u8, "ipv4 header checksum"), ck, 0xb861);
+
+    // Verification form: with the checksum written back in, the sum over the
+    // whole header is 0. This is the property the receive path relies on.
+    put_be16(cast(*u8, &h[0]), 10, ck);
+    check(cast(*u8, "verify sums to zero"), checksum(cast(*u8, &h[0]), 20), 0);
+    return;
+}
+
+// ============================================================
+// 6. Struct layout
+//
+// The project has been bitten by mixed-width struct fields aliasing each other,
+// which is why the rule is "all-i64, byte arrays last" or "copy a proven
+// shape". These assert both proven shapes still behave, so the rule rests on a
+// running test instead of memory.
+// ============================================================
+
+struct AllI64 {
+    a as i64;
+    b as i64;
+    c as i64;
+    d as i64;
+    buf as [16]u8;      // byte array last, the channel.Channel shape
+}
+
+// The storage.StorageDevice shape: a name array, then function pointers, then
+// plain pointers. netdev.NetDevice will copy this exactly.
+struct VtableShape {
+    name as [32]u8;
+    op_a as fn(*u8, i64) as i64;
+    op_b as fn(*u8) as i64;
+    priv as *u8;
+    next as *VtableShape;
+}
+
+fn vt_a(p as *u8, v as i64) as i64 { return v + 1; }
+fn vt_b(p as *u8) as i64 { return 7; }
+
+let is AllI64 as s1 with mut;
+let is VtableShape as s2 with mut;
+
+fn test_struct() as void {
+    say("struct layout:\n");
+    s1.a = 0 - 1;                      // all bits set: aliasing shows up loudly
+    s1.b = 2;
+    s1.c = 3;
+    s1.d = 4;
+    s1.buf[0] = cast(u8, 0xAB);
+    s1.buf[15] = cast(u8, 0xCD);
+    check(cast(*u8, "all-i64 field a"), s1.a, 0 - 1);
+    check(cast(*u8, "all-i64 field b"), s1.b, 2);
+    check(cast(*u8, "all-i64 field c"), s1.c, 3);
+    check(cast(*u8, "all-i64 field d"), s1.d, 4);
+    check(cast(*u8, "trailing array head"), cast(i64, s1.buf[0]), 0xAB);
+    check(cast(*u8, "trailing array tail"), cast(i64, s1.buf[15]), 0xCD);
+
+    // A write through the trailing array must not reach back into the scalars.
+    let is i64 as k with mut = 0;
+    while (k < 16) { s1.buf[k] = cast(u8, 0xFF); k = k + 1; }
+    check(cast(*u8, "array write spares scalars"), s1.b, 2);
+
+    let is i64 as n with mut = 0;
+    while (n < 32) { s2.name[n] = cast(u8, 0); n = n + 1; }
+    s2.name[0] = cast(u8, 110);        // 'n'
+    s2.op_a = fn_ptr(vt_a);
+    s2.op_b = fn_ptr(vt_b);
+    s2.priv = cast(*u8, 0);
+    s2.next = cast(*VtableShape, 0);
+    check(cast(*u8, "vtable name survives"), cast(i64, s2.name[0]), 110);
+    check(cast(*u8, "vtable dispatch op_a"), call(s2.op_a, cast(*u8, 0), 41), 42);
+    check(cast(*u8, "vtable dispatch op_b"), call(s2.op_b, cast(*u8, 0)), 7);
+    check(cast(*u8, "vtable priv null"), cast(i64, s2.priv), 0);
+    check(cast(*u8, "vtable next null"), cast(i64, s2.next), 0);
+    return;
+}
+
+// ============================================================
+// 7. Inline asm from ring 3
+//
+// The audio control page is a lock-free ring shared with an IRQ handler, and
+// Caustic has no `volatile`. x86-TSO orders the stores that matter, but the
+// COMPILER still has to be told not to sink the publishing store past the data
+// stores. mfence is that fence — so it had better assemble outside the kernel.
+// ============================================================
+
+fn barrier() as void {
+    asm("mfence\n");
+    return;
+}
+
+let is i64 as pub_data with mut = 0;
+let is i64 as pub_seq with mut = 0;
+
+fn test_barrier() as void {
+    say("inline asm from ring 3:\n");
+    pub_data = 0x1234;
+    barrier();                          // data before the sequence bump
+    pub_seq = 1;
+    check(cast(*u8, "mfence executes"), pub_seq, 1);
+    check(cast(*u8, "data published"), pub_data, 0x1234);
+    return;
+}
+
+// ============================================================
+// 8. The 64x64 -> 128 high half
+//
+// Bignum, Poly1305, GHASH and X25519 all need the top half of an unsigned
+// product. It is one x86 instruction and the compiler now exposes it as
+// __builtin_mulhi_u64 — which meant teaching the assembler `mul`, since it
+// knew only the signed imul.
+//
+// Asserted from ring 3, on values computed independently, because a wrong
+// mulhi does not crash: it silently produces a key nobody else agrees with.
+// ============================================================
+
+fn test_mulhi() as void {
+    say("64x64 high half:\n");
+    let is u64 as a with mut = u64_of(0);
+    let is u64 as b with mut = u64_of(0);
+
+    check(cast(*u8, "0 * 0"), cast(i64, __builtin_mulhi_u64(a, b)), 0);
+    a = u64_of(1); b = u64_of(1);
+    check(cast(*u8, "1 * 1 has no high half"), cast(i64, __builtin_mulhi_u64(a, b)), 0);
+
+    // 2^32 * 2^32 = 2^64 exactly, so the high half is 1 and the low half 0.
+    a = u64_of(4294967296); b = u64_of(4294967296);
+    check(cast(*u8, "2^32 * 2^32 == 1"), cast(i64, __builtin_mulhi_u64(a, b)), 1);
+    check(cast(*u8, "and its low half is 0"), cast(i64, a * b), 0);
+
+    // (2^64-1)^2 = 2^128 - 2^65 + 1; high half is 2^64 - 2.
+    a = u64_of(0 - 1); b = u64_of(0 - 1);
+    check(cast(*u8, "max * max"), cast(i64, __builtin_mulhi_u64(a, b)), 0 - 2);
+
+    // UNSIGNED is the whole point: the signed instruction gives another
+    // answer here, and using it would corrupt every limb above the first.
+    a = u64_of(0x8000000000000000); b = u64_of(2);
+    check(cast(*u8, "2^63 * 2 is unsigned"), cast(i64, __builtin_mulhi_u64(a, b)), 1);
+
+    // A product with no round-number structure, computed elsewhere:
+    // 0x0123456789ABCDEF * 0xFEDCBA9876543210 = 0x0121FA00AD77D742_2236D88FE5618CF0
+    a = u64_of(0x0123456789ABCDEF); b = u64_of(0xFEDCBA9876543210);
+    check(cast(*u8, "arbitrary product, high"),
+          cast(i64, __builtin_mulhi_u64(a, b)), 0x0121FA00AD77D742);
+    check(cast(*u8, "arbitrary product, low"),
+          cast(i64, a * b), 0x2236D88FE5618CF0);
+    return;
+}
+
+fn main() as i32 {
+    say("u64t: arithmetic floor for net + crypto\n");
+    test_u64_unsigned();
+    test_i64_signed();
+    test_seq();
+    test_shifts();
+    test_endian();
+    test_checksum();
+    test_struct();
+    test_barrier();
+    test_mulhi();
+    say("u64t: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("u64t: ALL PASS\n"); return cast(i32, 0); }
+    say("u64t: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

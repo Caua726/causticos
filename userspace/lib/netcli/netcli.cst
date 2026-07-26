@@ -1,0 +1,518 @@
+// netcli — netd, from a program's side of the channel.
+//
+// netd speaks a message protocol (netproto) and a program that wants a socket
+// should not have to run a message loop to get one. This is that loop, once,
+// so ping and wget and everything after them do not each write their own —
+// and get it subtly differently wrong, which is what happens when a protocol
+// has as many client implementations as it has clients.
+//
+// THE HARD PART IS THAT EVENTS ARE NOT REPLIES. netd volunteers EV_DATA the
+// moment a segment arrives, whether or not the program is asking for it. So a
+// client cannot simply write a request and read the next message: the next
+// message may be data for a different socket. Every message goes through
+// pump(), which files data where it belongs and hands back only what the
+// caller was waiting for.
+//
+// THE RECEIVE BUFFER IS BOUNDED BY SOMEONE ELSE'S BEHAVIOUR, which is why it
+// is checked rather than trusted. netd drains a connection as far as it can
+// each time a segment arrives, so what may be in flight towards this program
+// is a receive buffer's worth plus whatever the channel is already holding.
+// RX_CAP matches the receive buffer, and a caller that keeps reading never
+// comes close. A caller that does not — one that leaves a socket unread while
+// it does something else — can. So a drop is COUNTED and turns the socket into
+// an error: a stream with a hole in it is not a shorter stream, it is a
+// corrupt one, and handing back the bytes either side of the hole would give
+// a caller a file it believes is intact.
+
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../netproto/netproto.cst" as np;
+use "conn.cst" as cn;
+
+let is i64 as MAX_SOCK = 4;
+let is i64 as RX_CAP = 16384;      // == nettcp RCV_BUF; see the note above
+
+// How long a blocking operation waits before giving up. A network call that
+// can hang forever turns a program that lost its server into a program that
+// has to be killed.
+let is i64 as timeout_ns with mut = 20000000000;
+
+let is i64 as ctl with mut = 0 - 1;
+let is i64 as version with mut = 0;
+let is i64 as nifaces with mut = 0;
+
+// Socket states.
+let is i64 as S_FREE  with imut = 0;
+let is i64 as S_OPEN  with imut = 1;      // created, maybe connected
+let is i64 as S_EOF   with imut = 2;      // peer sent FIN; buffered bytes may remain
+let is i64 as S_ERR   with imut = 3;
+
+struct Sock {
+    st      as i64;
+    id      as i64;         // the id on the wire
+    proto   as i64;
+    head    as i64;         // first unread byte in the ring
+    len     as i64;         // bytes waiting
+    err     as i64;
+    credit  as i64;         // from EV_WRITABLE: bytes netd says will fit
+    peer_ip as i64;
+    peer_port as i64;
+    lost    as i64;         // bytes dropped because the ring was full
+}
+
+let is [4]Sock as socks with mut;
+let is [65536]u8 as rxpool with mut;       // MAX_SOCK * RX_CAP
+let is [2048]u8 as scratch with mut;
+let is [4]i64 as last with mut;            // the header pump() most recently took
+
+fn sock_at(i as i64) as *Sock { return &socks[i]; }
+
+fn set_timeout(ns as i64) as void { timeout_ns = ns; return; }
+fn iface_count() as i64 { return nifaces; }
+fn ctl_fd() as i64 { return ctl; }
+fn last_word(i as i64) as i64 { return last[i]; }
+fn payload_ptr() as *u8 { return cast(*u8, &scratch[0]); }
+
+// ---- the receive ring, one per socket ----
+
+fn ring_put(i as i64, src as *u8, n as i64) as i64 {
+    let is *Sock as s = sock_at(i);
+    let is i64 as base = i * RX_CAP;
+    if (s.len + n > RX_CAP) {
+        // The bytes are already off the channel, so dropping them is the only
+        // option left. Counting them is what turns a silently corrupt stream
+        // into an error the caller gets told about.
+        s.lost = s.lost + n;
+        return 0;
+    }
+    let is i64 as at with mut = s.head + s.len;
+    if (at >= RX_CAP) { at = at - RX_CAP; }
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        rxpool[base + at] = src[k];
+        at = at + 1;
+        if (at >= RX_CAP) { at = 0; }
+        k = k + 1;
+    }
+    s.len = s.len + n;
+    return n;
+}
+
+fn ring_get(i as i64, dst as *u8, n as i64) as i64 {
+    let is *Sock as s = sock_at(i);
+    let is i64 as base = i * RX_CAP;
+    let is i64 as want with mut = n;
+    if (want > s.len) { want = s.len; }
+    let is i64 as k with mut = 0;
+    while (k < want) {
+        dst[k] = rxpool[base + s.head];
+        s.head = s.head + 1;
+        if (s.head >= RX_CAP) { s.head = 0; }
+        k = k + 1;
+    }
+    s.len = s.len - want;
+    return want;
+}
+
+fn by_id(id as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        if (socks[i].st != S_FREE && socks[i].id == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ---- the message loop ----
+
+// Take EXACTLY ONE message. Data and closes are filed against their socket on
+// the way past; the type is returned either way and `last` holds the header.
+// 0 = the deadline passed, -1 = netd is gone.
+//
+// One, not "as many as are waiting". A version of this that kept consuming
+// while messages kept arriving looked tidier and was wrong: during a large
+// download there is always another message, so it never came back, the ring
+// filled with data nobody was taking out, and 49696 bytes of a 65536-byte
+// transfer were dropped by the branch that says it cannot happen. The caller
+// decides when it has enough; this only ever hands over one thing.
+fn pump(deadline as i64) as i64 {
+    while (1 == 1) {
+        let is i64 as now = sys.time_ns();
+        if (now >= deadline) { return 0; }
+        let is [3]i64 as pe;
+        pe[0] = ctl; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        sys.poll(cast(*i64, &pe[0]), 1, deadline - now);
+        if ((pe[2] & sys.POLL_READABLE) == 0) {
+            if ((pe[2] & sys.POLL_CLOSED) != 0) { return 0 - 1; }
+            continue;
+        }
+        if (np.recv(ctl, cast(*i64, &last[0])) < 0) { return 0 - 1; }
+        let is i64 as t = last[0];
+        let is i64 as plen = np.payload_of(t, last[2], last[3]);
+        // The payload comes off the channel whatever happens to it next.
+        // Leaving it there desynchronises every message after this one.
+        if (plen > 0) {
+            if (plen > 2048) { return 0 - 1; }
+            if (np.read_all(ctl, cast(*u8, &scratch[0]), plen) < 0) { return 0 - 1; }
+        }
+
+        if (t == np.EV_DATA) {
+            let is i64 as i = by_id(last[1]);
+            if (i >= 0) { ring_put(i, cast(*u8, &scratch[0]), plen); }
+        }
+        if (t == np.EV_CLOSED) {
+            let is i64 as i = by_id(last[1]);
+            // EOF, not free: bytes already buffered are still the caller's,
+            // and a read that discarded them because a FIN arrived would lose
+            // the tail of every response that ends with one.
+            if (i >= 0 && socks[i].st == S_OPEN) { socks[i].st = S_EOF; }
+        }
+        if (t == np.EV_WRITABLE) {
+            let is i64 as i = by_id(last[1]);
+            if (i >= 0) { socks[i].credit = last[2]; }
+        }
+        return t;
+    }
+    return 0;
+}
+
+// Wait for one specific message. Anything volunteered along the way is filed
+// by pump and skipped here, because a client that failed on an unexpected
+// event would be testing its own impatience.
+//   1 = got it, 0 = timed out, -1 = netd gone, -2 = EV_ERROR instead
+fn await(want as i64, deadline as i64) as i64 {
+    while (1 == 1) {
+        let is i64 as t = pump(deadline);
+        if (t <= 0) { return t; }
+        if (t == want) { return 1; }
+        if (t == np.EV_ERROR) {
+            let is i64 as i = by_id(last[1]);
+            if (i >= 0) { socks[i].err = last[2]; }
+            return 0 - 2;
+        }
+    }
+    return 0;
+}
+
+// ---- attaching ----
+
+// Take a netd channel and prove it is one. A program whose fd 3 is something
+// else finds out here, on one round trip, rather than by sending a socket
+// request into a pipe and waiting out a timeout.
+fn attach(fd as i64) as i64 {
+    ctl = fd;
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        socks[i].st = S_FREE;
+        socks[i].id = 0;
+        socks[i].head = 0; socks[i].len = 0;
+        socks[i].err = 0; socks[i].credit = 0; socks[i].lost = 0;
+        i = i + 1;
+    }
+    // Three different failures, three different answers: "that fd is not a
+    // channel", "it is a channel but nothing answered", and "something
+    // answered but speaks another version" are three different things to fix.
+    if (np.send(ctl, np.REQ_HELLO, 0, np.VERSION, 0) < 0) { return sys.E_PIPE; }
+    if (await(np.EV_HELLO, sys.time_ns() + 3000000000) != 1) { return sys.E_AGAIN; }
+    version = last[2];
+    nifaces = last[3];
+    if (version != np.VERSION) { return sys.E_INVAL; }
+    return 0;
+}
+
+// Mint a second endpoint, to hand to a program about to be spawned. netd
+// sends the fd first and announces it second, so by the time EV_OK arrives
+// the descriptor is already waiting.
+fn new_endpoint() as i64 {
+    if (np.send(ctl, np.REQ_NEW_CLIENT, 0, 0, 0) < 0) { return sys.E_IO; }
+    if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) { return sys.E_IO; }
+    let is i64 as fd = sys.fd_recv(ctl);
+    if (fd < 0) { return sys.E_IO; }
+    return fd;
+}
+
+// ---- naming and interfaces ----
+
+// The address of an interface, or 0 while it has none. DHCP takes a few round
+// trips, so a program that needs one waits for it rather than assuming.
+fn iface_addr(which as i64) as i64 {
+    if (np.send(ctl, np.REQ_IFINFO, 0, which, 0) < 0) { return 0; }
+    if (await(np.EV_IFINFO, sys.time_ns() + 2000000000) != 1) { return 0; }
+    return last[2];
+}
+
+fn wait_address(ns as i64) as i64 {
+    let is i64 as deadline = sys.time_ns() + ns;
+    while (sys.time_ns() < deadline) {
+        let is i64 as a = iface_addr(0);
+        if (a != 0) { return a; }
+        sys.sleep_ns(200000000);
+    }
+    return 0;
+}
+
+let is i64 as next_token with mut = 1;
+
+// A name to an address. netd answers a dotted quad from the literal and
+// anything else from the resolver, so a caller never has to know which it has.
+//
+// THE TOKEN IS NOT DECORATION. A lookup that times out is still answered
+// later, and without something to match on, that late answer is handed to the
+// next lookup — which then returns the previous name's address and reports
+// success. It showed up as a resolve of "10.0.2.2" returning nothing while the
+// very next call, for a real name, returned an address: the two had been
+// shifted by one.
+fn resolve(name as *u8, len as i64) as i64 {
+    if (len <= 0 || len > 255) { return 0; }
+    let is i64 as tok = next_token;
+    next_token = next_token + 1;
+    if (np.send_data(ctl, np.REQ_RESOLVE, 0, tok, len, name, len) < 0) { return 0; }
+    let is i64 as deadline = sys.time_ns() + timeout_ns;
+    while (1 == 1) {
+        if (await(np.EV_RESOLVED, deadline) != 1) { return 0; }
+        // An answer to an older question: discard it and keep waiting for
+        // ours rather than reporting somebody else's address.
+        if (last[3] == tok) { return last[2]; }
+    }
+    return 0;
+}
+
+// ---- sockets ----
+
+fn open(proto as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SOCK) {
+        if (socks[i].st == S_FREE) {
+            let is *Sock as s = sock_at(i);
+            s.id = i + 1;            // 0 is netd's "no socket", so never an id
+            s.proto = proto;
+            s.head = 0; s.len = 0;
+            s.err = 0; s.credit = 0; s.lost = 0;
+            s.peer_ip = 0; s.peer_port = 0;
+            if (np.send(ctl, np.REQ_SOCKET, s.id, proto, 0) < 0) { return sys.E_IO; }
+            s.st = S_OPEN;           // so an EV_DATA racing the reply is filed
+            if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) {
+                s.st = S_FREE;
+                return sys.E_IO;
+            }
+            return i;
+        }
+        i = i + 1;
+    }
+    return sys.E_MFILE;
+}
+
+// Connect, and for a stream do not return until the handshake finished. netd
+// holds EV_OK back until the peer answered, so a caller that gets 0 here
+// knows more than "a SYN left".
+fn connect(i as i64, addr as i64, port as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return sys.E_BADF; }
+    let is *Sock as s = sock_at(i);
+    if (s.st != S_OPEN) { return sys.E_BADF; }
+    if (np.send(ctl, np.REQ_CONNECT, s.id, addr, port) < 0) { return sys.E_IO; }
+    let is i64 as r = await(np.EV_OK, sys.time_ns() + timeout_ns);
+    if (r == 1) {
+        s.peer_ip = addr;
+        s.peer_port = port;
+        return 0;
+    }
+    if (r == 0 - 2) { s.st = S_ERR; return s.err; }
+    s.st = S_ERR;
+    return sys.E_IO;
+}
+
+fn bind(i as i64, addr as i64, port as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return sys.E_BADF; }
+    let is *Sock as s = sock_at(i);
+    if (np.send(ctl, np.REQ_BIND, s.id, addr, port) < 0) { return sys.E_IO; }
+    if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) { return sys.E_IO; }
+    return last[2];
+}
+
+// Hand bytes to netd. Returns what it took, which can be less than asked:
+// that is real backpressure and reporting it as full acceptance loses data.
+fn send_some(i as i64, buf as *u8, len as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return sys.E_BADF; }
+    let is *Sock as s = sock_at(i);
+    if (s.st == S_ERR) { return s.err; }
+    let is i64 as n with mut = len;
+    if (n > np.MAX_PAYLOAD) { n = np.MAX_PAYLOAD; }
+    if (np.send_data(ctl, np.REQ_SEND, s.id, 0, n, buf, n) < 0) { return sys.E_IO; }
+    let is i64 as r = await(np.EV_OK, sys.time_ns() + timeout_ns);
+    if (r == 0 - 2) { s.st = S_ERR; s.err = sys.E_PIPE; return sys.E_PIPE; }
+    if (r != 1) { return sys.E_IO; }
+    return last[2];
+}
+
+// Every byte, waiting on credit when the send buffer fills. netd promises an
+// EV_WRITABLE for a short accept, so this waits for a message rather than
+// retrying on a timer.
+fn send_all(i as i64, buf as *u8, len as i64) as i64 {
+    let is i64 as done with mut = 0;
+    while (done < len) {
+        let is i64 as n = send_some(i, cast(*u8, cast(i64, buf) + done), len - done);
+        if (n < 0) { return n; }
+        if (n == 0) {
+            let is i64 as r = await(np.EV_WRITABLE, sys.time_ns() + timeout_ns);
+            if (r == 0 - 1) { return sys.E_IO; }
+            if (r == 0) { return sys.E_AGAIN; }
+        }
+        done = done + n;
+    }
+    return done;
+}
+
+// Bytes, blocking until there are some. 0 means the peer is done and nothing
+// is left; a FIN with buffered data still hands the data over first.
+fn recv(i as i64, buf as *u8, len as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return sys.E_BADF; }
+    let is *Sock as s = sock_at(i);
+    // A hole in the stream is fatal to it. Handing back the bytes on either
+    // side would give the caller a file it has no way to know is wrong.
+    if (s.lost > 0) { s.st = S_ERR; s.err = sys.E_IO; return sys.E_IO; }
+    if (s.len > 0) { return ring_get(i, buf, len); }
+    if (s.st == S_ERR) { return s.err; }
+    if (s.st == S_EOF) { return 0; }
+    let is i64 as deadline = sys.time_ns() + timeout_ns;
+    while (1 == 1) {
+        let is i64 as t = pump(deadline);
+        if (t == 0 - 1) { s.st = S_ERR; s.err = sys.E_IO; return sys.E_IO; }
+        if (s.len > 0) { return ring_get(i, buf, len); }
+        if (s.st == S_EOF) { return 0; }
+        if (t == 0) { return sys.E_AGAIN; }
+        if (t == np.EV_ERROR && last[1] == s.id) {
+            s.st = S_ERR;
+            s.err = last[2];
+            return s.err;
+        }
+    }
+    return 0;
+}
+
+// Done writing, still reading. The peer sees end-of-stream and can answer;
+// a full close would throw away whatever it had left to say, which for a
+// request/response protocol is the entire response.
+fn shutdown_write(i as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return sys.E_BADF; }
+    let is *Sock as s = sock_at(i);
+    if (np.send(ctl, np.REQ_SHUTDOWN, s.id, np.SHUT_WR, 0) < 0) { return sys.E_IO; }
+    if (await(np.EV_OK, sys.time_ns() + timeout_ns) != 1) { return sys.E_IO; }
+    return 0;
+}
+
+// Wait for one accepted connection on a listening socket and adopt it as a new
+// local socket. Returns the new index, or a negative errno.
+fn accept(listener as i64, ns as i64) as i64 {
+    if (listener < 0 || listener >= MAX_SOCK) { return sys.E_BADF; }
+    if (await(np.EV_ACCEPTED, sys.time_ns() + ns) != 1) { return sys.E_AGAIN; }
+    let is i64 as peer_ip = last[2];
+    let is i64 as peer_port = last[3];
+
+    let is i64 as k with mut = 0;
+    while (k < MAX_SOCK) {
+        if (socks[k].st == S_FREE) {
+            let is *Sock as n = sock_at(k);
+            n.id = k + 1;
+            n.proto = np.SOCK_STREAM;
+            n.head = 0; n.len = 0;
+            n.err = 0; n.credit = 0; n.lost = 0;
+            n.peer_ip = peer_ip; n.peer_port = peer_port;
+            n.st = S_OPEN;
+            // netd names the new socket with the id WE choose, so the two
+            // sides never disagree about which connection is which.
+            if (np.send(ctl, np.REQ_ACCEPT, socks[listener].id, n.id, 0) < 0) {
+                n.st = S_FREE;
+                return sys.E_IO;
+            }
+            if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) {
+                n.st = S_FREE;
+                return sys.E_IO;
+            }
+            return k;
+        }
+        k = k + 1;
+    }
+    return sys.E_MFILE;
+}
+
+fn listen(i as i64, backlog as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return sys.E_BADF; }
+    if (np.send(ctl, np.REQ_LISTEN, socks[i].id, backlog, 0) < 0) { return sys.E_IO; }
+    if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) { return sys.E_IO; }
+    return 0;
+}
+
+fn peer_ip_of(i as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return 0; }
+    return socks[i].peer_ip;
+}
+fn peer_port_of(i as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return 0; }
+    return socks[i].peer_port;
+}
+
+fn close(i as i64) as void {
+    if (i < 0 || i >= MAX_SOCK) { return; }
+    let is *Sock as s = sock_at(i);
+    if (s.st == S_FREE) { return; }
+    np.send(ctl, np.REQ_CLOSE, s.id, 0, 0);
+    await(np.EV_OK, sys.time_ns() + 3000000000);
+    s.st = S_FREE;
+    s.head = 0; s.len = 0;
+    return;
+}
+
+fn state(i as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return S_ERR; }
+    return socks[i].st;
+}
+
+fn dropped(i as i64) as i64 {
+    if (i < 0 || i >= MAX_SOCK) { return 0; }
+    return socks[i].lost;
+}
+
+// ---- the Conn backend ----
+//
+// ctx is the socket index, not a pointer: there is nothing to allocate and
+// nothing to free, and a stale Conn refers to a closed socket rather than to
+// memory that has been reused for something else.
+
+fn c_read(ctx as i64, buf as *u8, len as i64) as i64 {
+    return recv(ctx, buf, len);
+}
+
+fn c_write(ctx as i64, buf as *u8, len as i64) as i64 {
+    return send_some(ctx, buf, len);
+}
+
+fn c_close(ctx as i64) as i64 {
+    close(ctx);
+    return 0;
+}
+
+fn c_state(ctx as i64) as i64 {
+    let is i64 as st = state(ctx);
+    if (st == S_OPEN) { return cn.OPEN; }
+    if (st == S_EOF) { return cn.EOF; }
+    if (st == S_FREE) { return cn.CLOSED; }
+    return cn.ERROR;
+}
+
+fn tcp_conn(c as *cn.Conn, i as i64) as void {
+    cn.init(c, i,
+            cast(i64, fn_ptr(c_read)), cast(i64, fn_ptr(c_write)),
+            cast(i64, fn_ptr(c_close)), cast(i64, fn_ptr(c_state)));
+    return;
+}
+
+// Open, resolve if needed, connect — the three steps every client program
+// takes, in one call, so none of them writes its own slightly different
+// version. Returns the socket index or a negative errno.
+fn dial(addr as i64, port as i64, c as *cn.Conn) as i64 {
+    let is i64 as s = open(np.SOCK_STREAM);
+    if (s < 0) { return s; }
+    let is i64 as r = connect(s, addr, port);
+    if (r != 0) { close(s); return r; }
+    tcp_conn(c, s);
+    return s;
+}

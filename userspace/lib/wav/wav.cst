@@ -1,0 +1,203 @@
+// wav.cst — reading a RIFF/WAVE file, and refusing the ones we cannot play.
+//
+// A WAV is a chunk list, not a fixed header, and the two facts that follow
+// from that are the whole reason this is a module rather than four lines in
+// aplay:
+//
+//   - The `data` chunk is not at offset 44. Files written by anything other
+//     than the simplest encoder carry LIST/INFO, fact, or padding chunks
+//     first. Assuming 44 plays metadata as audio, which sounds like a burst
+//     of noise and looks like a driver bug.
+//   - `fmt ` describes formats we cannot play. A-law, IMA ADPCM and float32
+//     all announce themselves in one field, and playing their bytes as if
+//     they were signed 16-bit PCM produces loud noise rather than silence.
+//
+// So this parser reads the chunk list properly and answers with a REASON
+// when it will not play something. Guessing would be the failure mode the
+// project's rules call a workaround: it would always produce sound, and the
+// sound would sometimes be wrong.
+
+use "../../../../Caustic/std/causticos/prog.cst" as prog;
+
+// Refusals, all negative and all specific. A caller prints wav.reason(rc) and
+// the person reading it knows what to do about it.
+let is i64 as WAV_OK          = 0;
+let is i64 as WAV_E_SHORT     = 0 - 1;   // truncated before a header ended
+let is i64 as WAV_E_NOTRIFF   = 0 - 2;   // not a RIFF/WAVE container at all
+let is i64 as WAV_E_NOFMT     = 0 - 3;   // no fmt chunk
+let is i64 as WAV_E_NODATA    = 0 - 4;   // no data chunk
+let is i64 as WAV_E_ENCODING  = 0 - 5;   // not uncompressed PCM
+let is i64 as WAV_E_BITS      = 0 - 6;   // not 16 bits a sample
+let is i64 as WAV_E_CHANNELS  = 0 - 7;   // zero channels, or more than we handle
+
+let is i64 as WAV_FMT_PCM = 1;
+let is i64 as WAV_MAX_CHANNELS = 2;
+
+// All i64: mixed widths in one struct is the miscompile this project has been
+// bitten by more than once.
+struct Wav {
+    rate        as i64;
+    channels    as i64;
+    bits        as i64;
+    frame_bytes as i64;
+    data_off    as i64;    // byte offset of the samples within the buffer
+    data_len    as i64;    // bytes of samples
+    frames      as i64;
+}
+
+fn rd16(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8);
+}
+
+fn rd32(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8)
+         | (cast(i64, p[off + 2]) << 16) | (cast(i64, p[off + 3]) << 24);
+}
+
+fn four_cc(p as *u8, off as i64, a as i64, b as i64, c as i64, d as i64) as i64 {
+    if (cast(i64, p[off]) != a) { return 0; }
+    if (cast(i64, p[off + 1]) != b) { return 0; }
+    if (cast(i64, p[off + 2]) != c) { return 0; }
+    if (cast(i64, p[off + 3]) != d) { return 0; }
+    return 1;
+}
+
+// Walk the chunk list. Returns WAV_OK, or one of the refusals above.
+fn parse(buf as *u8, len as i64, w as *Wav) as i64 {
+    if (len < 12) { return WAV_E_SHORT; }
+    // "RIFF" .... "WAVE"
+    if (four_cc(buf, 0, 82, 73, 70, 70) == 0) { return WAV_E_NOTRIFF; }
+    if (four_cc(buf, 8, 87, 65, 86, 69) == 0) { return WAV_E_NOTRIFF; }
+
+    w.rate = 0; w.channels = 0; w.bits = 0;
+    w.frame_bytes = 0; w.data_off = 0; w.data_len = 0; w.frames = 0;
+
+    let is i64 as have_fmt with mut = 0;
+    let is i64 as pos with mut = 12;
+    while (pos + 8 <= len) {
+        let is i64 as csz with mut = rd32(buf, pos + 4);
+        let is i64 as body = pos + 8;
+        if (csz < 0) { return WAV_E_SHORT; }
+        // "fmt "
+        if (four_cc(buf, pos, 102, 109, 116, 32) == 1) {
+            if (body + 16 > len) { return WAV_E_SHORT; }
+            let is i64 as tag = rd16(buf, body);
+            w.channels = rd16(buf, body + 2);
+            w.rate = rd32(buf, body + 4);
+            w.bits = rd16(buf, body + 14);
+            if (tag != WAV_FMT_PCM) { return WAV_E_ENCODING; }
+            if (w.bits != 16) { return WAV_E_BITS; }
+            if (w.channels < 1 || w.channels > WAV_MAX_CHANNELS) { return WAV_E_CHANNELS; }
+            w.frame_bytes = w.channels * 2;
+            have_fmt = 1;
+        }
+        // "data"
+        if (four_cc(buf, pos, 100, 97, 116, 97) == 1) {
+            if (have_fmt == 0) { return WAV_E_NOFMT; }
+            w.data_off = body;
+            // A length that runs past the end of the file is what a writer
+            // that was killed mid-stream leaves behind. The samples that ARE
+            // there are still good, so the file is clamped rather than
+            // rejected — but only ever downwards, never trusted upwards.
+            let is i64 as avail = len - body;
+            if (avail < 0) { return WAV_E_SHORT; }
+            if (csz == 0 || csz > avail) { csz = avail; }
+            w.data_len = csz - (csz % w.frame_bytes);
+            w.frames = w.data_len / w.frame_bytes;
+            return WAV_OK;
+        }
+        // Chunks are padded to an even length; the pad byte is not counted in
+        // the size field, and forgetting it shifts every later chunk by one.
+        pos = body + csz + (csz & 1);
+    }
+    if (have_fmt == 0) { return WAV_E_NOFMT; }
+    return WAV_E_NODATA;
+}
+
+fn reason(rc as i64) as *u8 {
+    if (rc == WAV_E_SHORT)    { return "truncated file"; }
+    if (rc == WAV_E_NOTRIFF)  { return "not a RIFF/WAVE file"; }
+    if (rc == WAV_E_NOFMT)    { return "no fmt chunk"; }
+    if (rc == WAV_E_NODATA)   { return "no data chunk"; }
+    if (rc == WAV_E_ENCODING) { return "compressed audio (only uncompressed PCM)"; }
+    if (rc == WAV_E_BITS)     { return "not 16-bit samples"; }
+    if (rc == WAV_E_CHANNELS) { return "unsupported channel count"; }
+    return "ok";
+}
+
+// Duplicate a mono frame run into a stereo buffer. The one conversion worth
+// doing here: it is exact, it loses nothing, and it is the difference between
+// "plays" and "refuses" for half the files anyone has. Anything that changes
+// the SAMPLE RATE is resampling — a decision with quality trade-offs — and
+// that belongs to soundd, not to a program that plays a file.
+fn mono_to_stereo(src as *u8, dst as *u8, frames as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < frames) {
+        let is i64 as lo = cast(i64, src[i * 2]);
+        let is i64 as hi = cast(i64, src[i * 2 + 1]);
+        dst[i * 4 + 0] = cast(u8, lo);
+        dst[i * 4 + 1] = cast(u8, hi);
+        dst[i * 4 + 2] = cast(u8, lo);
+        dst[i * 4 + 3] = cast(u8, hi);
+        i = i + 1;
+    }
+    return;
+}
+
+// ============================================================
+// Writing
+//
+// The RIFF header carries two lengths that both depend on how much audio
+// follows it, and it sits at the FRONT of the file. So a writer either buffers
+// everything in memory first, or writes a header for the length it intends and
+// rewrites it if the run ends short.
+//
+// This builds the 44 bytes; seeking back to correct them is the caller's, and
+// deliberately so — the length it should be corrected to is the number of
+// frames that were actually captured, which is a fact only the caller has.
+// A header left claiming more than the file holds is the single most common
+// broken WAV, and every player handles it differently.
+// ============================================================
+
+let is i64 as WAV_HDR_BYTES = 44;
+
+fn wr16(p as *u8, off as i64, v as i64) as void {
+    p[off]     = cast(u8, v & 0xFF);
+    p[off + 1] = cast(u8, (v >> 8) & 0xFF);
+    return;
+}
+
+fn wr32(p as *u8, off as i64, v as i64) as void {
+    p[off]     = cast(u8, v & 0xFF);
+    p[off + 1] = cast(u8, (v >> 8) & 0xFF);
+    p[off + 2] = cast(u8, (v >> 16) & 0xFF);
+    p[off + 3] = cast(u8, (v >> 24) & 0xFF);
+    return;
+}
+
+fn put4(p as *u8, off as i64, a as i64, b as i64, c as i64, d as i64) as void {
+    p[off] = cast(u8, a); p[off + 1] = cast(u8, b);
+    p[off + 2] = cast(u8, c); p[off + 3] = cast(u8, d);
+    return;
+}
+
+// Build a 44-byte canonical header for `frames` frames of PCM into `out`.
+// Returns WAV_HDR_BYTES.
+fn build_header(out as *u8, rate as i64, channels as i64, frames as i64) as i64 {
+    let is i64 as frame_bytes = channels * 2;
+    let is i64 as data_bytes = frames * frame_bytes;
+    put4(out, 0, 82, 73, 70, 70);                       // "RIFF"
+    wr32(out, 4, 36 + data_bytes);                      // everything after this field
+    put4(out, 8, 87, 65, 86, 69);                       // "WAVE"
+    put4(out, 12, 102, 109, 116, 32);                   // "fmt "
+    wr32(out, 16, 16);                                  // fmt chunk size
+    wr16(out, 20, WAV_FMT_PCM);
+    wr16(out, 22, channels);
+    wr32(out, 24, rate);
+    wr32(out, 28, rate * frame_bytes);                  // byte rate
+    wr16(out, 32, frame_bytes);                         // block align
+    wr16(out, 34, 16);                                  // bits per sample
+    put4(out, 36, 100, 97, 116, 97);                    // "data"
+    wr32(out, 40, data_bytes);
+    return WAV_HDR_BYTES;
+}

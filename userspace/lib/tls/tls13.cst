@@ -1,0 +1,1038 @@
+// tls13 — a TLS 1.3 client, as a Conn that wraps another Conn.
+//
+// This is why the Conn abstraction was written before HTTP and not after. HTTP
+// asks a Conn for bytes; a TLS session is a Conn that gets its bytes from
+// another Conn and decrypts them on the way past. So `https://` is one line in
+// wget — which Conn it hands to the HTTP code — and the HTTP code never learns
+// that anything changed.
+//
+// TLS 1.3 ONLY, AND THAT IS A CHOICE. TLS 1.2 is a second protocol wearing the
+// same name: different key schedule, different record layer, different
+// handshake, and a cipher negotiation with twenty years of downgrade attacks
+// built into it. Supporting both would roughly double this file and every bug
+// in it. 1.3 has been mandatory-to-offer on the public web for years, and a
+// server that cannot speak it is a server this refuses — declared here, not
+// discovered later as a mysterious failure.
+//
+// WHAT IS OFFERED, and why the list is short:
+//
+//   groups        x25519 only. Every server on the public internet supports
+//                 it. Offering one group means never receiving a
+//                 HelloRetryRequest, which in turn means never implementing
+//                 the transcript rewriting HRR requires (§4.4.1) — a piece of
+//                 code that could not be tested against any real server,
+//                 sitting in the most security-critical path there is. An HRR
+//                 is detected and reported, not guessed at.
+//
+//   suites        AES-128-GCM (mandatory to implement, §9.1), AES-256-GCM,
+//                 and ChaCha20-Poly1305.
+//
+//   signatures    rsa_pss_rsae_sha256, ecdsa_secp256r1_sha256, ed25519 — for
+//                 the server's CertificateVerify. The certificates in the
+//                 chain may additionally be signed RSA PKCS#1 with SHA-256,
+//                 384 or 512, which x509v handles.
+//
+// THE HANDSHAKE IS THE SECURITY, NOT THE ENCRYPTION. Getting AES right and the
+// certificate check wrong produces a connection that is encrypted perfectly to
+// an attacker. Three things are therefore checked and none of them is
+// optional: the chain reaches a trust anchor, the leaf names the host that was
+// asked for, and CertificateVerify proves the peer holds that leaf's private
+// key. A failure in any of them tears the connection down before a single byte
+// of application data moves.
+
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../netcli/conn.cst" as cn;
+use "../x509/x509v.cst" as x;
+use "../x509/trust.cst" as trust;
+use "tls_key.cst" as k;
+use "../../../../caustic-crypto/hash/sha2.cst" as sha2;
+use "../../../../caustic-crypto/pk/x25519.cst" as x25519;
+use "../../../../caustic-crypto/pk/ed25519.cst" as ed25519;
+use "../../../../caustic-crypto/pk/p256.cst" as p256;
+use "../../../../caustic-crypto/pk/rsa.cst" as rsa;
+use "../../../../caustic-crypto/bigint/bigint.cst" as bi;
+use "../../../../caustic-crypto/asn1/der.cst" as der;
+use "../../../../caustic-crypto/util/ct.cst" as ct;
+
+// ---- record layer ----
+let is i64 as REC_CHANGE_CIPHER with imut = 20;
+let is i64 as REC_ALERT         with imut = 21;
+let is i64 as REC_HANDSHAKE     with imut = 22;
+let is i64 as REC_APPDATA       with imut = 23;
+let is i64 as MAX_RECORD        with imut = 16384;
+
+// ---- handshake ----
+let is i64 as HS_CLIENT_HELLO   with imut = 1;
+let is i64 as HS_SERVER_HELLO   with imut = 2;
+let is i64 as HS_NEW_TICKET     with imut = 4;
+let is i64 as HS_ENC_EXT        with imut = 8;
+let is i64 as HS_CERT           with imut = 11;
+let is i64 as HS_CERT_REQ       with imut = 13;
+let is i64 as HS_CERT_VERIFY    with imut = 15;
+let is i64 as HS_FINISHED       with imut = 20;
+let is i64 as HS_KEY_UPDATE     with imut = 24;
+
+// ---- extensions ----
+let is i64 as EXT_SERVER_NAME    with imut = 0;
+let is i64 as EXT_SUPPORTED_GRPS with imut = 10;
+let is i64 as EXT_SIG_ALGS       with imut = 13;
+let is i64 as EXT_SUPPORTED_VERS with imut = 43;
+let is i64 as EXT_PSK_MODES      with imut = 45;
+let is i64 as EXT_KEY_SHARE      with imut = 51;
+
+let is i64 as GROUP_X25519 with imut = 0x001D;
+
+let is i64 as SIG_RSA_PSS_SHA256 with imut = 0x0804;
+let is i64 as SIG_ECDSA_P256     with imut = 0x0403;
+let is i64 as SIG_ED25519        with imut = 0x0807;
+
+// ---- errors, distinct because they call for different things ----
+let is i64 as OK            with imut = 0;
+let is i64 as E_IO          with imut = 0 - 1;
+let is i64 as E_PROTO       with imut = 0 - 2;   // malformed or out of order
+let is i64 as E_VERSION     with imut = 0 - 3;   // not TLS 1.3
+let is i64 as E_SUITE       with imut = 0 - 4;   // no suite in common
+let is i64 as E_HRR         with imut = 0 - 5;   // wants a group we do not offer
+let is i64 as E_CERT        with imut = 0 - 6;   // chain, hostname or dates
+let is i64 as E_CERT_VERIFY with imut = 0 - 7;   // it does not hold the key
+let is i64 as E_FINISHED    with imut = 0 - 8;   // transcript disagreement
+let is i64 as E_ALERT       with imut = 0 - 9;   // the peer gave up
+let is i64 as E_BIG         with imut = 0 - 10;  // something exceeded a buffer
+let is i64 as E_CLOSED      with imut = 0 - 11;
+
+// One buffer, sliced. Several trailing byte arrays in one struct is the shape
+// that has miscompiled in this project; one array with named offsets is the
+// shape that has not.
+let is i64 as OFF_TS with imut = 0;         let is i64 as CAP_TS with imut = 32768;
+let is i64 as OFF_RX with imut = 32768;     let is i64 as CAP_RX with imut = 17408;
+let is i64 as OFF_PT with imut = 50176;     let is i64 as CAP_PT with imut = 17408;
+let is i64 as OFF_TX with imut = 67584;     let is i64 as CAP_TX with imut = 17408;
+let is i64 as OFF_K  with imut = 84992;     let is i64 as CAP_K  with imut = 1024;
+// Scratch for building an outbound encrypted record. It gets its own slice
+// rather than borrowing the inbound plaintext one: a write while unread
+// received data is still buffered would otherwise erase it, and the symptom
+// would be a response that loses a chunk out of the middle whenever a client
+// sends something before it has finished reading.
+let is i64 as OFF_SC with imut = 86016;     let is i64 as CAP_SC with imut = 17408;
+let is i64 as BUF_BYTES with imut = 103424;
+
+// Inside the key region.
+let is i64 as K_CHS    with imut = 0;      // client handshake traffic secret
+let is i64 as K_SHS    with imut = 64;     // server handshake traffic secret
+let is i64 as K_CAP    with imut = 128;    // client application traffic secret
+let is i64 as K_SAP    with imut = 192;    // server application traffic secret
+let is i64 as K_CKEY   with imut = 256;
+let is i64 as K_CIV    with imut = 288;
+let is i64 as K_SKEY   with imut = 304;
+let is i64 as K_SIV    with imut = 336;
+let is i64 as K_HS     with imut = 352;    // handshake secret
+let is i64 as K_MS     with imut = 416;    // master secret
+let is i64 as K_PRIV   with imut = 480;
+let is i64 as K_PUB    with imut = 512;
+let is i64 as K_SHARED with imut = 544;
+let is i64 as K_RAND   with imut = 576;
+let is i64 as K_SESSID with imut = 608;
+
+struct Tls {
+    inner     as i64;      // *cn.Conn underneath
+    state     as i64;      // 0 = new, 1 = handshaking, 2 = up, 3 = closed, 4 = error
+    err       as i64;
+    suite     as i64;
+    hash_len  as i64;
+    key_len   as i64;
+
+    ts_len    as i64;      // bytes of transcript
+    hs_at     as i64;      // next unparsed handshake message in the transcript
+    keys_in   as i64;      // 1 once inbound records are encrypted
+    keys_out  as i64;      // 1 once outbound records are encrypted
+    seq_in    as i64;
+    seq_out   as i64;
+
+    pt_len    as i64;      // decrypted payload waiting in the PT slice
+    pt_at     as i64;
+    pt_type   as i64;
+
+    leaf_off  as i64;      // the server's leaf certificate, inside the transcript
+    leaf_len  as i64;
+    ncerts    as i64;
+    cert_off  as i64;      // where the CertificateEntry list starts
+    cert_len  as i64;
+
+    host      as i64;      // *u8, the name we asked for — checked, not trusted
+    host_len  as i64;
+    host_is_ip as i64;     // an address, so no SNI and an iPAddress SAN
+    alert     as i64;      // the description the peer sent, when it gave up
+
+    buf       as [103424]u8;
+}
+
+
+
+fn at(t as *Tls, off as i64) as *u8 {
+    return cast(*u8, cast(i64, &t.buf[0]) + off);
+}
+fn kp(t as *Tls, off as i64) as *u8 { return at(t, OFF_K + off); }
+fn inner_of(t as *Tls) as *cn.Conn { return cast(*cn.Conn, t.inner); }
+
+// ---- wire helpers ----
+fn be16(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 8) | cast(i64, p[off + 1]);
+}
+fn be24(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 16) | (cast(i64, p[off + 1]) << 8)
+           | cast(i64, p[off + 2]);
+}
+fn put16(p as *u8, off as i64, v as i64) as void {
+    p[off] = cast(u8, (v >> 8) & 0xFF);
+    p[off + 1] = cast(u8, v & 0xFF);
+    return;
+}
+fn put24(p as *u8, off as i64, v as i64) as void {
+    p[off] = cast(u8, (v >> 16) & 0xFF);
+    p[off + 1] = cast(u8, (v >> 8) & 0xFF);
+    p[off + 2] = cast(u8, v & 0xFF);
+    return;
+}
+// A move, not a copy, and the difference is not academic here. A handshake
+// message is built in the record buffer and then framed IN PLACE — the header
+// goes in front of it, so the body shifts up by five bytes inside the same
+// buffer. An ascending loop overwrites the source before it reads it, and what
+// went out was a ClientHello whose first five bytes were repeated over the
+// rest of it.
+//
+// It cost an afternoon because of how it failed: the bytes were correct
+// everywhere we could print them, and only wrong on the wire. Replaying the
+// printed hello from the host got a ServerHello back, which is what finally
+// said the message was fine and the sending was not.
+fn copy(dst as *u8, doff as i64, src as *u8, soff as i64, n as i64) as void {
+    if (cast(i64, dst) + doff > cast(i64, src) + soff) {
+        let is i64 as i with mut = n;
+        while (i > 0) { i = i - 1; dst[doff + i] = src[soff + i]; }
+        return;
+    }
+    let is i64 as j with mut = 0;
+    while (j < n) { dst[doff + j] = src[soff + j]; j = j + 1; }
+    return;
+}
+
+// Everything sent and received in the handshake goes here, in order, with no
+// record framing. It is both the accumulator that reassembles messages split
+// across records and the transcript every secret is derived from.
+fn ts_append(t as *Tls, p as *u8, off as i64, n as i64) as i64 {
+    if (t.ts_len + n > CAP_TS) { return E_BIG; }
+    copy(at(t, OFF_TS), t.ts_len, p, off, n);
+    t.ts_len = t.ts_len + n;
+    return OK;
+}
+
+// The same, for a message WE sent. The read cursor has to step over it: one
+// buffer holds both directions, so anything written here would otherwise be
+// read back as though the peer had sent it. That is not hypothetical — it is
+// what happened, and the symptom was a handshake failing before a single byte
+// arrived, because our own ClientHello was parsed as the server's answer.
+fn ts_sent(t as *Tls, p as *u8, off as i64, n as i64) as i64 {
+    let is i64 as r = ts_append(t, p, off, n);
+    if (r != OK) { return r; }
+    t.hs_at = t.ts_len;
+    return OK;
+}
+
+// ============================================================
+// Records
+// ============================================================
+
+// One record out. Before the keys exist it goes as-is; after, the real content
+// type is hidden inside the encrypted payload and the header says application
+// data, which is what stops an observer from telling a handshake message from
+// a byte of HTTP.
+fn send_record(t as *Tls, ctype as i64, p as *u8, off as i64, n as i64) as i64 {
+    let is *u8 as tx = at(t, OFF_TX);
+    if (t.keys_out == 0) {
+        if (n + 5 > CAP_TX) { return E_BIG; }
+        // THE BODY MOVES FIRST, THE HEADER GOES ON AFTERWARDS. A handshake
+        // message is built in this same buffer, so writing the five header
+        // bytes at the front first destroys the message's own first five —
+        // and no amount of overlap-safe copying can bring them back, because
+        // by then they are gone. What went out was a ClientHello whose first
+        // five bytes were the record header repeated, and OpenSSL answered
+        // "unexpected message" with nothing else to say.
+        copy(tx, 5, p, off, n);
+        tx[0] = cast(u8, ctype);
+        tx[1] = cast(u8, 3); tx[2] = cast(u8, 3);
+        put16(tx, 3, n);
+        if (cn.write_all(inner_of(t), tx, n + 5) != n + 5) { return E_IO; }
+        return OK;
+    }
+
+    // TLSInnerPlaintext = content || content_type. No padding: padding hides
+    // length, and every length here is already a fixed-size handshake message
+    // or a caller's buffer whose size the caller chose.
+    let is i64 as inner_len = n + 1;
+    if (inner_len + 5 + 16 > CAP_TX) { return E_BIG; }
+    let is [5]u8 as aad;
+    aad[0] = cast(u8, REC_APPDATA);
+    aad[1] = cast(u8, 3); aad[2] = cast(u8, 3);
+    put16(cast(*u8, &aad[0]), 3, inner_len + 16);
+
+    let is *u8 as pt = at(t, OFF_SC);
+    copy(pt, 0, p, off, n);
+    pt[n] = cast(u8, ctype);
+
+    let is [12]u8 as nonce;
+    k.record_nonce(kp(t, K_CIV), 12, t.seq_out, cast(*u8, &nonce[0]));
+
+    copy(tx, 0, cast(*u8, &aad[0]), 0, 5);
+    k.seal(t.suite, kp(t, K_CKEY), cast(*u8, &nonce[0]),
+           cast(*u8, &aad[0]), 5, pt, inner_len,
+           cast(*u8, cast(i64, tx) + 5),
+           cast(*u8, cast(i64, tx) + 5 + inner_len));
+    t.seq_out = t.seq_out + 1;
+    let is i64 as total = 5 + inner_len + 16;
+    if (cn.write_all(inner_of(t), tx, total) != total) { return E_IO; }
+    return OK;
+}
+
+// One record in, decrypted if the keys are up, left in the PT slice.
+// Returns the content type, or a negative error.
+fn recv_record(t as *Tls) as i64 {
+    let is *u8 as rx = at(t, OFF_RX);
+    let is i64 as got = cn.read_exact(inner_of(t), rx, 5);
+    if (got < 0) { return E_IO; }
+    if (got == 0) { return E_CLOSED; }
+    if (got < 5) { return E_IO; }
+    let is i64 as ctype = cast(i64, rx[0]);
+    let is i64 as len = be16(rx, 3);
+    // A record longer than the protocol allows is either a broken peer or an
+    // attempt to make us allocate; the limit is the protocol's, not ours.
+    if (len < 0 || len > MAX_RECORD + 256) { return E_PROTO; }
+    if (len > 0) {
+        if (cn.read_exact(inner_of(t), cast(*u8, cast(i64, rx) + 5), len) != len) {
+            return E_IO;
+        }
+    }
+
+    if (t.keys_in == 0 || ctype == REC_CHANGE_CIPHER) {
+        // The compatibility ChangeCipherSpec (§5) is noise a middlebox wants
+        // to see. It carries nothing and must never enter the transcript.
+        copy(at(t, OFF_PT), 0, rx, 5, len);
+        t.pt_len = len;
+        t.pt_at = 0;
+        t.pt_type = ctype;
+        return ctype;
+    }
+
+    if (len < 17) { return E_PROTO; }
+    let is i64 as ctlen = len - 16;
+    let is [12]u8 as nonce;
+    k.record_nonce(kp(t, K_SIV), 12, t.seq_in, cast(*u8, &nonce[0]));
+    let is i64 as ok = k.open(t.suite, kp(t, K_SKEY), cast(*u8, &nonce[0]),
+                              rx, 5,
+                              cast(*u8, cast(i64, rx) + 5), ctlen,
+                              cast(*u8, cast(i64, rx) + 5 + ctlen),
+                              at(t, OFF_PT));
+    if (ok != 1) { return E_PROTO; }
+    t.seq_in = t.seq_in + 1;
+
+    // The real content type is the last non-zero byte: padding is zeros after
+    // it, and scanning backwards is the only way to find where it ends.
+    let is i64 as e with mut = ctlen - 1;
+    let is *u8 as pt = at(t, OFF_PT);
+    while (e >= 0 && pt[e] == cast(u8, 0)) { e = e - 1; }
+    if (e < 0) { return E_PROTO; }
+    t.pt_len = e;
+    t.pt_at = 0;
+    t.pt_type = cast(i64, pt[e]);
+    return t.pt_type;
+}
+
+// ============================================================
+// Handshake message reassembly
+// ============================================================
+
+// The next complete handshake message, appended to the transcript on its way
+// past. Handles both directions of the framing mismatch: several messages in
+// one record, and one message split across several.
+//
+// Returns the message type; the body is at [out_off, out_off+out_len) in the
+// transcript.
+fn hs_next(t as *Tls, out_off as *i64, out_len as *i64) as i64 {
+    while (1 == 1) {
+        let is *u8 as ts = at(t, OFF_TS);
+        if (t.ts_len - t.hs_at >= 4) {
+            let is i64 as mtype = cast(i64, ts[t.hs_at]);
+            let is i64 as mlen = be24(ts, t.hs_at + 1);
+            if (t.ts_len - t.hs_at >= 4 + mlen) {
+                out_off[0] = t.hs_at + 4;
+                out_len[0] = mlen;
+                t.hs_at = t.hs_at + 4 + mlen;
+                return mtype;
+            }
+        }
+        // Not enough yet: another record.
+        let is i64 as ct2 = recv_record(t);
+        if (ct2 < 0) { return ct2; }
+        if (ct2 == REC_CHANGE_CIPHER) { continue; }
+        if (ct2 == REC_ALERT) {
+            // The peer's own description, kept for the caller. A handshake
+            // that fails with "alert" and no number is a handshake nobody can
+            // debug, which is how most TLS problems become guesswork.
+            if (t.pt_len >= 2) { t.alert = cast(i64, at(t, OFF_PT)[1]); }
+            return E_ALERT;
+        }
+        if (ct2 != REC_HANDSHAKE) { return E_PROTO; }
+        let is i64 as r = ts_append(t, at(t, OFF_PT), 0, t.pt_len);
+        if (r != OK) { return r; }
+    }
+    return E_PROTO;
+}
+
+// ============================================================
+// ClientHello
+// ============================================================
+
+fn client_hello(t as *Tls) as i64 {
+    let is *u8 as b = at(t, OFF_TX);
+    let is i64 as p with mut = 0;
+
+    b[p] = cast(u8, HS_CLIENT_HELLO); p = p + 1;
+    let is i64 as len_at = p; p = p + 3;          // filled in at the end
+    let is i64 as body = p;
+
+    put16(b, p, 0x0303); p = p + 2;               // legacy_version
+    copy(b, p, kp(t, K_RAND), 0, 32); p = p + 32;
+
+    // A random 32-byte legacy_session_id. TLS 1.3 has no sessions, but §4.1.2
+    // asks for one anyway so that the handshake looks like a resumed 1.2 one
+    // to middleboxes that would otherwise drop it.
+    b[p] = cast(u8, 32); p = p + 1;
+    copy(b, p, kp(t, K_SESSID), 0, 32); p = p + 32;
+
+    put16(b, p, 6); p = p + 2;                    // cipher_suites
+    put16(b, p, k.TLS_AES_128_GCM_SHA256); p = p + 2;
+    put16(b, p, k.TLS_CHACHA20_POLY1305_SHA256); p = p + 2;
+    put16(b, p, k.TLS_AES_256_GCM_SHA384); p = p + 2;
+
+    b[p] = cast(u8, 1); p = p + 1;                // legacy_compression_methods
+    b[p] = cast(u8, 0); p = p + 1;
+
+    let is i64 as ext_len_at = p; p = p + 2;
+    let is i64 as ext_start = p;
+
+    // server_name — the host we are asking for. Also the host the certificate
+    // will be checked against, and the certificate check is what makes sending
+    // it safe.
+    //
+    // NOT SENT FOR AN ADDRESS. RFC 6066 3 is explicit that a literal IPv4 or
+    // IPv6 address is not a HostName, and OpenSSL enforces it: a ClientHello
+    // whose SNI reads "10.0.2.2" is answered with unexpected_message and
+    // nothing else to go on. The certificate is still checked against the
+    // address — against an iPAddress SAN, which is where an address belongs.
+    if (t.host_is_ip == 0) {
+        put16(b, p, EXT_SERVER_NAME); p = p + 2;
+        put16(b, p, t.host_len + 5); p = p + 2;
+        put16(b, p, t.host_len + 3); p = p + 2;
+        b[p] = cast(u8, 0); p = p + 1;                // host_name
+        put16(b, p, t.host_len); p = p + 2;
+        copy(b, p, cast(*u8, t.host), 0, t.host_len); p = p + t.host_len;
+    }
+
+    // supported_versions: 1.3 and nothing else. This is the field that
+    // actually selects the version in 1.3; legacy_version above is a fossil.
+    put16(b, p, EXT_SUPPORTED_VERS); p = p + 2;
+    put16(b, p, 3); p = p + 2;
+    b[p] = cast(u8, 2); p = p + 1;
+    put16(b, p, 0x0304); p = p + 2;
+
+    put16(b, p, EXT_SUPPORTED_GRPS); p = p + 2;
+    put16(b, p, 4); p = p + 2;
+    put16(b, p, 2); p = p + 2;
+    put16(b, p, GROUP_X25519); p = p + 2;
+
+    put16(b, p, EXT_SIG_ALGS); p = p + 2;
+    put16(b, p, 8); p = p + 2;
+    put16(b, p, 6); p = p + 2;
+    put16(b, p, SIG_RSA_PSS_SHA256); p = p + 2;
+    put16(b, p, SIG_ECDSA_P256); p = p + 2;
+    put16(b, p, SIG_ED25519); p = p + 2;
+
+    put16(b, p, EXT_PSK_MODES); p = p + 2;
+    put16(b, p, 2); p = p + 2;
+    b[p] = cast(u8, 1); p = p + 1;
+    b[p] = cast(u8, 1); p = p + 1;                // psk_dhe_ke
+
+    // key_share: the x25519 public whose private half never leaves this
+    // process. Sending it in the first flight is what makes TLS 1.3 one round
+    // trip instead of two.
+    put16(b, p, EXT_KEY_SHARE); p = p + 2;
+    put16(b, p, 38); p = p + 2;
+    put16(b, p, 36); p = p + 2;
+    put16(b, p, GROUP_X25519); p = p + 2;
+    put16(b, p, 32); p = p + 2;
+    copy(b, p, kp(t, K_PUB), 0, 32); p = p + 32;
+
+    put16(b, ext_len_at, p - ext_start);
+    put24(b, len_at, p - body);
+
+    let is i64 as r = ts_sent(t, b, 0, p);
+    if (r != OK) { return r; }
+    return send_record(t, REC_HANDSHAKE, b, 0, p);
+}
+
+// ============================================================
+// ServerHello
+// ============================================================
+
+// The special random a HelloRetryRequest carries instead of a real one
+// (§4.1.3): SHA-256 of "HelloRetryRequest".
+let is *u8 as HRR_RANDOM with imut = "\xCF\x21\xAD\x74\xE5\x9A\x61\x11\xBE\x1D\x8C\x02\x1E\x65\xB8\x91\xC2\xA2\x11\x16\x7A\xBB\x8C\x5E\x07\x9E\x09\xE2\xC8\xA8\x33\x9C";
+
+fn server_hello(t as *Tls, off as i64, len as i64) as i64 {
+    let is *u8 as b = at(t, OFF_TS);
+    let is i64 as end = off + len;
+    let is i64 as p with mut = off;
+    if (p + 35 > end) { return E_PROTO; }
+    p = p + 2;   // legacy_version
+
+    if (ct.ct_eq(cast(*u8, cast(i64, b) + p), HRR_RANDOM, 32) == 1) {
+        // We offered one group and it wants another. For a client that offers
+        // x25519 this effectively never happens, and guessing at the
+        // transcript rewrite §4.4.1 requires — untested, in the most
+        // security-critical path there is — would be worse than saying so.
+        return E_HRR;
+    }
+    p = p + 32;
+
+    let is i64 as sidlen = cast(i64, b[p]); p = p + 1;
+    if (p + sidlen + 3 > end) { return E_PROTO; }
+    // The echo must match what we sent, or something rewrote the hello.
+    if (sidlen != 32) { return E_PROTO; }
+    if (ct.ct_eq(cast(*u8, cast(i64, b) + p), kp(t, K_SESSID), 32) != 1) {
+        return E_PROTO;
+    }
+    p = p + sidlen;
+
+    t.suite = be16(b, p); p = p + 2;
+    if (k.suite_ok(t.suite) == 0) { return E_SUITE; }
+    t.hash_len = k.suite_hash_len(t.suite);
+    t.key_len = k.suite_key_len(t.suite);
+    p = p + 1;                                     // legacy_compression_method
+
+    if (p + 2 > end) { return E_PROTO; }
+    let is i64 as extlen = be16(b, p); p = p + 2;
+    let is i64 as ext_end = p + extlen;
+    if (ext_end > end) { return E_PROTO; }
+
+    let is i64 as saw_version with mut = 0;
+    let is i64 as saw_share with mut = 0;
+    while (p + 4 <= ext_end) {
+        let is i64 as etype = be16(b, p);
+        let is i64 as elen = be16(b, p + 2);
+        p = p + 4;
+        if (p + elen > ext_end) { return E_PROTO; }
+        if (etype == EXT_SUPPORTED_VERS) {
+            if (elen != 2) { return E_PROTO; }
+            if (be16(b, p) != 0x0304) { return E_VERSION; }
+            saw_version = 1;
+        }
+        if (etype == EXT_KEY_SHARE) {
+            if (elen < 4) { return E_PROTO; }
+            if (be16(b, p) != GROUP_X25519) { return E_PROTO; }
+            if (be16(b, p + 2) != 32) { return E_PROTO; }
+            if (elen < 36) { return E_PROTO; }
+            x25519.x25519(kp(t, K_PRIV), cast(*u8, cast(i64, b) + p + 4),
+                          kp(t, K_SHARED));
+            saw_share = 1;
+        }
+        p = p + elen;
+    }
+    // A ServerHello with no supported_versions is a TLS 1.2 server answering
+    // in 1.2's clothes; taking it would be the downgrade this refuses.
+    if (saw_version == 0) { return E_VERSION; }
+    if (saw_share == 0) { return E_PROTO; }
+    return OK;
+}
+
+// ============================================================
+// The key schedule, at the two points it advances
+// ============================================================
+
+fn derive_handshake_keys(t as *Tls) as void {
+    let is i64 as hl = t.hash_len;
+    let is [64]u8 as zeros;
+    let is i64 as i with mut = 0;
+    while (i < 64) { zeros[i] = cast(u8, 0); i = i + 1; }
+
+    // Early Secret = HKDF-Extract(0, 0). No PSK, so both are zero — computed
+    // rather than written down, because the value depends on the hash.
+    let is [64]u8 as early;
+    k.extract(t.suite, cast(*u8, &zeros[0]), hl, cast(*u8, &zeros[0]), hl,
+              cast(*u8, &early[0]));
+    let is [64]u8 as derived;
+    k.derive_secret(t.suite, cast(*u8, &early[0]), hl,
+                    cast(*u8, "derived"), 7, cast(*u8, ""), 0,
+                    cast(*u8, &derived[0]));
+    k.extract(t.suite, cast(*u8, &derived[0]), hl, kp(t, K_SHARED), 32,
+              kp(t, K_HS));
+
+    k.derive_secret(t.suite, kp(t, K_HS), hl, cast(*u8, "c hs traffic"), 12,
+                    at(t, OFF_TS), t.hs_at, kp(t, K_CHS));
+    k.derive_secret(t.suite, kp(t, K_HS), hl, cast(*u8, "s hs traffic"), 12,
+                    at(t, OFF_TS), t.hs_at, kp(t, K_SHS));
+    k.traffic_keys(t.suite, kp(t, K_CHS), kp(t, K_CKEY), kp(t, K_CIV));
+    k.traffic_keys(t.suite, kp(t, K_SHS), kp(t, K_SKEY), kp(t, K_SIV));
+    t.seq_in = 0;
+    t.seq_out = 0;
+    t.keys_in = 1;
+    return;
+}
+
+fn derive_application_keys(t as *Tls, upto as i64) as void {
+    let is i64 as hl = t.hash_len;
+    let is [64]u8 as zeros;
+    let is i64 as i with mut = 0;
+    while (i < 64) { zeros[i] = cast(u8, 0); i = i + 1; }
+
+    let is [64]u8 as derived;
+    k.derive_secret(t.suite, kp(t, K_HS), hl, cast(*u8, "derived"), 7,
+                    cast(*u8, ""), 0, cast(*u8, &derived[0]));
+    k.extract(t.suite, cast(*u8, &derived[0]), hl, cast(*u8, &zeros[0]), hl,
+              kp(t, K_MS));
+    k.derive_secret(t.suite, kp(t, K_MS), hl, cast(*u8, "c ap traffic"), 12,
+                    at(t, OFF_TS), upto, kp(t, K_CAP));
+    k.derive_secret(t.suite, kp(t, K_MS), hl, cast(*u8, "s ap traffic"), 12,
+                    at(t, OFF_TS), upto, kp(t, K_SAP));
+    return;
+}
+
+// ============================================================
+// Certificate and CertificateVerify
+// ============================================================
+
+// certificate_list, entry by entry. The DER stays where it landed — inside the
+// transcript — so the chain is validated against the exact bytes the signature
+// was computed over, with no copy in between to get out of step.
+fn parse_certificates(t as *Tls, off as i64, len as i64) as i64 {
+    let is *u8 as b = at(t, OFF_TS);
+    let is i64 as end = off + len;
+    let is i64 as p with mut = off;
+    if (p + 1 > end) { return E_PROTO; }
+    let is i64 as ctxlen = cast(i64, b[p]); p = p + 1 + ctxlen;
+    if (p + 3 > end) { return E_PROTO; }
+    let is i64 as listlen = be24(b, p); p = p + 3;
+    if (p + listlen > end) { return E_PROTO; }
+
+    t.cert_off = p;
+    t.cert_len = listlen;
+    t.ncerts = 0;
+    let is i64 as q with mut = p;
+    let is i64 as list_end = p + listlen;
+    while (q + 3 <= list_end) {
+        let is i64 as clen = be24(b, q); q = q + 3;
+        if (q + clen > list_end) { return E_PROTO; }
+        if (t.ncerts == 0) {
+            t.leaf_off = q;
+            t.leaf_len = clen;
+        }
+        t.ncerts = t.ncerts + 1;
+        q = q + clen;
+        if (q + 2 > list_end) { break; }
+        let is i64 as extlen = be16(b, q); q = q + 2 + extlen;
+    }
+    if (t.ncerts == 0) { return E_PROTO; }
+    return OK;
+}
+
+// The chain, into the flat (pointer, length) pairs trust.verify_chain wants.
+fn build_chain(t as *Tls, out as *i64, max as i64) as i64 {
+    let is *u8 as b = at(t, OFF_TS);
+    let is i64 as n with mut = 0;
+    let is i64 as q with mut = t.cert_off;
+    let is i64 as end = t.cert_off + t.cert_len;
+    while (q + 3 <= end && n < max) {
+        let is i64 as clen = be24(b, q); q = q + 3;
+        if (q + clen > end) { return n; }
+        out[n * 2] = cast(i64, b) + q;
+        out[n * 2 + 1] = clen;
+        n = n + 1;
+        q = q + clen;
+        if (q + 2 > end) { return n; }
+        let is i64 as extlen = be16(b, q); q = q + 2 + extlen;
+    }
+    return n;
+}
+
+// What CertificateVerify signs (§4.4.3): 64 spaces, a context string, a zero,
+// then the transcript hash. The 64 spaces exist so that a signature made for
+// TLS can never be replayed as a signature over something else — a
+// cross-protocol attack the padding makes structurally impossible.
+fn verify_content(t as *Tls, upto as i64, out as *u8) as i64 {
+    let is i64 as p with mut = 0;
+    while (p < 64) { out[p] = cast(u8, 32); p = p + 1; }
+    let is *u8 as ctx = "TLS 1.3, server CertificateVerify";
+    let is i64 as i with mut = 0;
+    while (i < 33) { out[p] = ctx[i]; p = p + 1; i = i + 1; }
+    out[p] = cast(u8, 0); p = p + 1;
+    k.transcript_hash(t.suite, at(t, OFF_TS), upto, cast(*u8, cast(i64, out) + p));
+    return p + t.hash_len;
+}
+
+fn check_cert_verify(t as *Tls, off as i64, len as i64, upto as i64) as i64 {
+    let is *u8 as b = at(t, OFF_TS);
+    if (len < 4) { return E_PROTO; }
+    let is i64 as scheme = be16(b, off);
+    let is i64 as siglen = be16(b, off + 2);
+    if (off + 4 + siglen > off + len) { return E_PROTO; }
+    let is *u8 as sig = cast(*u8, cast(i64, b) + off + 4);
+
+    let is x.Cert as leaf;
+    let is *u8 as lb = cast(*u8, cast(i64, b) + t.leaf_off);
+    if (x.parse(lb, t.leaf_len, &leaf) != x.OK) { return E_CERT; }
+
+    let is [256]u8 as content;
+    let is i64 as clen = verify_content(t, upto, cast(*u8, &content[0]));
+
+    if (scheme == SIG_ED25519) {
+        if (leaf.pk_alg != x.PK_ED25519) { return E_CERT_VERIFY; }
+        if (siglen != 64) { return E_CERT_VERIFY; }
+        if (ed25519.ed25519_verify(cast(*u8, cast(i64, lb) + leaf.ec_off),
+                                   cast(*u8, &content[0]), clen, sig) == 1) {
+            return OK;
+        }
+        return E_CERT_VERIFY;
+    }
+    if (scheme == SIG_ECDSA_P256) {
+        if (leaf.pk_alg != x.PK_P256) { return E_CERT_VERIFY; }
+        let is [32]u8 as digest;
+        sha2.sha256(cast(*u8, &content[0]), clen, cast(*u8, &digest[0]));
+        let is bi.Big as qx = bi.big_from_bytes_be(
+            cast(*u8, cast(i64, lb) + leaf.ec_off + 1), 32);
+        let is bi.Big as qy = bi.big_from_bytes_be(
+            cast(*u8, cast(i64, lb) + leaf.ec_off + 33), 32);
+        let is i64 as sin; let is i64 as slen;
+        if (der.der_enter(sig, siglen, 0, der.TAG_SEQUENCE, &sin, &slen) < 0) {
+            bi.big_free(&qx); bi.big_free(&qy);
+            return E_CERT_VERIFY;
+        }
+        let is i64 as tg; let is i64 as co; let is i64 as cl;
+        let is i64 as after_r = der.der_read(sig, siglen, sin, &tg, &co, &cl);
+        if (after_r < 0) { bi.big_free(&qx); bi.big_free(&qy); return E_CERT_VERIFY; }
+        let is i64 as roff; let is i64 as rlen;
+        der.der_uint(sig, co, cl, &roff, &rlen);
+        if (der.der_read(sig, siglen, after_r, &tg, &co, &cl) < 0) {
+            bi.big_free(&qx); bi.big_free(&qy);
+            return E_CERT_VERIFY;
+        }
+        let is i64 as soff; let is i64 as slen2;
+        der.der_uint(sig, co, cl, &soff, &slen2);
+        let is bi.Big as r = bi.big_from_bytes_be(cast(*u8, cast(i64, sig) + roff), rlen);
+        let is bi.Big as s = bi.big_from_bytes_be(cast(*u8, cast(i64, sig) + soff), slen2);
+        let is bi.Big as z = bi.big_from_bytes_be(cast(*u8, &digest[0]), 32);
+        let is i64 as v = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s);
+        bi.big_free(&qx); bi.big_free(&qy);
+        bi.big_free(&r); bi.big_free(&s); bi.big_free(&z);
+        if (v == 1) { return OK; }
+        return E_CERT_VERIFY;
+    }
+    if (scheme == SIG_RSA_PSS_SHA256) {
+        if (leaf.pk_alg != x.PK_RSA) { return E_CERT_VERIFY; }
+        let is rsa.RsaPub as pub;
+        rsa.rsa_pub_from_bytes(&pub,
+            cast(*u8, cast(i64, lb) + leaf.n_off), leaf.n_len,
+            cast(*u8, cast(i64, lb) + leaf.e_off), leaf.e_len);
+        if (rsa.rsa_pss_sha256_verify(&pub, cast(*u8, &content[0]), clen, sig) == 1) {
+            return OK;
+        }
+        return E_CERT_VERIFY;
+    }
+    // A scheme we did not offer. Accepting one would let a server pick a
+    // signature we cannot actually check.
+    return E_CERT_VERIFY;
+}
+
+// ============================================================
+// The handshake
+// ============================================================
+
+fn send_alert(t as *Tls, level as i64, desc as i64) as void {
+    let is [2]u8 as a;
+    a[0] = cast(u8, level);
+    a[1] = cast(u8, desc);
+    send_record(t, REC_ALERT, cast(*u8, &a[0]), 0, 2);
+    return;
+}
+
+fn fail(t as *Tls, e as i64) as i64 {
+    t.state = 4;
+    t.err = e;
+    // 2 = fatal. 40 = handshake_failure, 42 = bad_certificate, 51 =
+    // decrypt_error. Telling the peer WHY is not politeness: a server whose
+    // certificate expired should learn that rather than see a dead socket.
+    let is i64 as d with mut = 40;
+    if (e == E_CERT) { d = 42; }
+    if (e == E_CERT_VERIFY || e == E_FINISHED) { d = 51; }
+    if (e == E_VERSION) { d = 70; }
+    send_alert(t, 2, d);
+    return e;
+}
+
+fn handshake(t as *Tls) as i64 {
+    t.state = 1;
+    let is i64 as r with mut = client_hello(t);
+    if (r != OK) { return fail(t, r); }
+
+    let is [1]i64 as moff;
+    let is [1]i64 as mlen;
+    let is i64 as mt with mut = hs_next(t, cast(*i64, &moff[0]), cast(*i64, &mlen[0]));
+    if (mt < 0) { return fail(t, mt); }
+    if (mt != HS_SERVER_HELLO) { return fail(t, E_PROTO); }
+    r = server_hello(t, moff[0], mlen[0]);
+    if (r != OK) { return fail(t, r); }
+
+    derive_handshake_keys(t);
+
+    // Everything from here to the server's Finished is encrypted.
+    let is i64 as seen_ee with mut = 0;
+    let is i64 as seen_cert with mut = 0;
+    let is i64 as seen_cv with mut = 0;
+    let is i64 as guard with mut = 0;
+    while (guard < 16) {
+        guard = guard + 1;
+        // The transcript length BEFORE this message is what CertificateVerify
+        // and Finished are computed over, so it is captured here rather than
+        // recomputed after the fact.
+        let is i64 as before = t.hs_at;
+        mt = hs_next(t, cast(*i64, &moff[0]), cast(*i64, &mlen[0]));
+        if (mt < 0) { return fail(t, mt); }
+
+        if (mt == HS_ENC_EXT) { seen_ee = 1; continue; }
+        if (mt == HS_CERT_REQ) {
+            // A server asking for a client certificate. We have none; the
+            // handshake continues and the server decides what to do about it.
+            continue;
+        }
+        if (mt == HS_CERT) {
+            if (seen_ee == 0) { return fail(t, E_PROTO); }
+            r = parse_certificates(t, moff[0], mlen[0]);
+            if (r != OK) { return fail(t, r); }
+            seen_cert = 1;
+            continue;
+        }
+        if (mt == HS_CERT_VERIFY) {
+            if (seen_cert == 0) { return fail(t, E_PROTO); }
+            r = check_cert_verify(t, moff[0], mlen[0], before);
+            if (r != OK) { return fail(t, r); }
+            seen_cv = 1;
+            continue;
+        }
+        if (mt == HS_FINISHED) {
+            if (seen_cv == 0) { return fail(t, E_PROTO); }
+            // The server's Finished proves it derived the same secrets from
+            // the same transcript. A mismatch means somebody changed a byte
+            // of the handshake in flight.
+            let is [64]u8 as want;
+            k.finished_mac(t.suite, kp(t, K_SHS), at(t, OFF_TS), before,
+                           cast(*u8, &want[0]));
+            if (mlen[0] != t.hash_len) { return fail(t, E_FINISHED); }
+            if (ct.ct_eq(cast(*u8, cast(i64, at(t, OFF_TS)) + moff[0]),
+                         cast(*u8, &want[0]), t.hash_len) != 1) {
+                return fail(t, E_FINISHED);
+            }
+            break;
+        }
+        return fail(t, E_PROTO);
+    }
+    if (seen_cv == 0) { return fail(t, E_PROTO); }
+
+    // The certificate, checked against the store and the name we asked for.
+    // Everything above proves who we are talking to consistently; this is
+    // what decides whether that party is the right one.
+    let is [16]i64 as chain;
+    let is i64 as n = build_chain(t, cast(*i64, &chain[0]), 8);
+    if (n <= 0) { return fail(t, E_CERT); }
+    let is [8]i64 as w;
+    sys.time_wall(cast(*i64, &w[0]));
+    let is i64 as now = x.stamp_from_wall(cast(*i64, &w[0]));
+    let is i64 as cv = trust.verify_chain(cast(*i64, &chain[0]), n,
+                                          cast(*u8, t.host), t.host_len, now);
+    if (cv != x.OK) {
+        t.err = cv;
+        t.state = 4;
+        send_alert(t, 2, 48);                      // unknown_ca
+        return E_CERT;
+    }
+
+    // Our Finished, over the transcript including the server's.
+    // The END OF THE SERVER'S FINISHED, which is a message boundary and not a
+    // record boundary. A server may pack several handshake messages into one
+    // record, and the transcript then holds bytes past the Finished that must
+    // not be hashed. hs_at is where the message ended; ts_len is where the
+    // record did, and they are the same only by luck.
+    let is i64 as fin_at = t.hs_at;
+    let is [64]u8 as mac;
+    k.finished_mac(t.suite, kp(t, K_CHS), at(t, OFF_TS), fin_at,
+                   cast(*u8, &mac[0]));
+    let is *u8 as tx = at(t, OFF_TX);
+    tx[0] = cast(u8, HS_FINISHED);
+    put24(tx, 1, t.hash_len);
+    copy(tx, 4, cast(*u8, &mac[0]), 0, t.hash_len);
+
+    // Application secrets come from the transcript up to the SERVER's
+    // Finished, not ours — so they are derived before our own is appended.
+    derive_application_keys(t, fin_at);
+
+    r = ts_sent(t, tx, 0, 4 + t.hash_len);
+    if (r != OK) { return fail(t, r); }
+    t.keys_out = 1;
+    r = send_record(t, REC_HANDSHAKE, tx, 0, 4 + t.hash_len);
+    if (r != OK) { return fail(t, r); }
+
+    // Switch both directions to the application keys.
+    k.traffic_keys(t.suite, kp(t, K_CAP), kp(t, K_CKEY), kp(t, K_CIV));
+    k.traffic_keys(t.suite, kp(t, K_SAP), kp(t, K_SKEY), kp(t, K_SIV));
+    t.seq_in = 0;
+    t.seq_out = 0;
+    t.state = 2;
+    return OK;
+}
+
+// ============================================================
+// The Conn face
+// ============================================================
+
+fn update_recv_key(t as *Tls) as void {
+    let is [64]u8 as next;
+    k.expand_label(t.suite, kp(t, K_SAP), t.hash_len,
+                   cast(*u8, "traffic upd"), 11, cast(*u8, ""), 0,
+                   cast(*u8, &next[0]), t.hash_len);
+    copy(kp(t, K_SAP), 0, cast(*u8, &next[0]), 0, t.hash_len);
+    k.traffic_keys(t.suite, kp(t, K_SAP), kp(t, K_SKEY), kp(t, K_SIV));
+    t.seq_in = 0;
+    return;
+}
+
+fn tls_read(ctx as i64, buf as *u8, len as i64) as i64 {
+    let is *Tls as t = cast(*Tls, ctx);
+    if (t.state == 3) { return 0; }
+    if (t.state != 2) { return E_IO; }
+
+    while (1 == 1) {
+        if (t.pt_at < t.pt_len && t.pt_type == REC_APPDATA) {
+            let is i64 as have = t.pt_len - t.pt_at;
+            let is i64 as n with mut = len;
+            if (n > have) { n = have; }
+            copy(buf, 0, at(t, OFF_PT), t.pt_at, n);
+            t.pt_at = t.pt_at + n;
+            return n;
+        }
+        let is i64 as ct2 = recv_record(t);
+        if (ct2 == E_CLOSED) { t.state = 3; return 0; }
+        if (ct2 < 0) { t.state = 4; t.err = ct2; return E_IO; }
+        if (ct2 == REC_CHANGE_CIPHER) { continue; }
+        if (ct2 == REC_ALERT) {
+            // close_notify (0) is the peer finishing cleanly; anything else
+            // is a failure and must not be reported as end of data.
+            if (t.pt_len >= 2 && t.pt_at < t.pt_len) {
+                let is *u8 as a = at(t, OFF_PT);
+                if (cast(i64, a[1]) == 0) { t.state = 3; return 0; }
+            }
+            t.state = 4;
+            t.err = E_ALERT;
+            return E_IO;
+        }
+        if (ct2 == REC_HANDSHAKE) {
+            // Post-handshake messages arrive in the middle of application
+            // data. A ticket is nothing to us; a KeyUpdate must be obeyed or
+            // every record after it fails to decrypt.
+            let is *u8 as p = at(t, OFF_PT);
+            if (t.pt_len >= 4) {
+                let is i64 as mt = cast(i64, p[0]);
+                if (mt == HS_KEY_UPDATE) { update_recv_key(t); }
+            }
+            continue;
+        }
+        if (ct2 != REC_APPDATA) { continue; }
+    }
+    return 0;
+}
+
+fn tls_write(ctx as i64, buf as *u8, len as i64) as i64 {
+    let is *Tls as t = cast(*Tls, ctx);
+    if (t.state != 2) { return E_IO; }
+    let is i64 as n with mut = len;
+    if (n > MAX_RECORD - 64) { n = MAX_RECORD - 64; }
+    if (send_record(t, REC_APPDATA, buf, 0, n) != OK) {
+        t.state = 4;
+        return E_IO;
+    }
+    return n;
+}
+
+fn tls_close(ctx as i64) as i64 {
+    let is *Tls as t = cast(*Tls, ctx);
+    if (t.state == 2) {
+        // close_notify, so the peer can tell a finished stream from a
+        // truncated one. Without it, a length-less HTTP body cannot be
+        // distinguished from one an attacker cut short.
+        send_alert(t, 1, 0);
+    }
+    t.state = 3;
+    return cn.close(inner_of(t));
+}
+
+fn tls_state(ctx as i64) as i64 {
+    let is *Tls as t = cast(*Tls, ctx);
+    if (t.state == 2) { return cn.OPEN; }
+    if (t.state == 3) { return cn.EOF; }
+    if (t.state == 4) { return cn.ERROR; }
+    return cn.OPEN;
+}
+
+fn error_of(t as *Tls) as i64 { return t.err; }
+fn alert_of(t as *Tls) as i64 { return t.alert; }
+
+// Wrap `inner` in TLS and hand back a Conn that speaks to `host`. The name is
+// checked against the certificate, so passing the name that was dialled — not
+// the address it resolved to — is what makes the whole thing mean anything.
+fn client(t as *Tls, inner as *cn.Conn, host as *u8, hlen as i64,
+          out as *cn.Conn) as i64 {
+    t.inner = cast(i64, inner);
+    t.state = 0;
+    t.err = OK;
+    t.suite = 0;
+    t.hash_len = 32;
+    t.key_len = 16;
+    t.ts_len = 0;
+    t.hs_at = 0;
+    t.keys_in = 0;
+    t.keys_out = 0;
+    t.seq_in = 0;
+    t.seq_out = 0;
+    t.pt_len = 0;
+    t.pt_at = 0;
+    t.pt_type = 0;
+    t.ncerts = 0;
+    t.leaf_off = 0;
+    t.leaf_len = 0;
+    t.host = cast(i64, host);
+    t.host_len = hlen;
+    let is [4]u8 as ipq;
+    t.host_is_ip = 0;
+    t.alert = 0;
+    if (x.as_ipv4(host, hlen, cast(*u8, &ipq[0])) == 1) { t.host_is_ip = 1; }
+
+    // The client random, the session id and the ephemeral private key all come
+    // from the kernel's entropy. A predictable ephemeral key is not a weak
+    // handshake, it is no handshake at all.
+    sys.get_random(kp(t, K_RAND), 32);
+    sys.get_random(kp(t, K_SESSID), 32);
+    sys.get_random(kp(t, K_PRIV), 32);
+    x25519.x25519_base(kp(t, K_PRIV), kp(t, K_PUB));
+
+    let is i64 as r = handshake(t);
+    if (r != OK) { return r; }
+
+    cn.init(out, cast(i64, t),
+            cast(i64, fn_ptr(tls_read)), cast(i64, fn_ptr(tls_write)),
+            cast(i64, fn_ptr(tls_close)), cast(i64, fn_ptr(tls_state)));
+    return OK;
+}

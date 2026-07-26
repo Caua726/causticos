@@ -1,0 +1,85 @@
+// netudp — UDP (RFC 768), which is eight bytes of header and two traps.
+//
+// THE CHECKSUM COVERS A PSEUDO-HEADER. Source address, destination address,
+// protocol and length are folded in even though none of them are in the UDP
+// header. That is deliberate: it is what stops a datagram delivered to the
+// wrong host, or reassembled from the wrong fragments, from passing. A stack
+// that checksums only the UDP header and payload produces datagrams that
+// every other stack rejects, and the symptom is "UDP does not work" with no
+// hint as to why.
+//
+// AND ZERO MEANS SOMETHING. A computed checksum of 0x0000 is transmitted as
+// 0xFFFF, because 0x0000 is the reserved value meaning "no checksum here".
+// The two are the same number in ones-complement and emphatically not the
+// same on the wire. This costs one line and its absence is a datagram
+// discarded roughly once in every 65536, which is the kind of loss rate that
+// gets blamed on the network for a very long time.
+
+use "../netbuf/netbuf.cst" as nb;
+use "../netip/netip.cst" as ip;
+
+let is i64 as HDR_LEN = 8;
+
+// The ports this stack picks from for outbound sockets. IANA's ephemeral
+// range; picked at random rather than sequentially, because a predictable
+// source port is half of what an off-path attacker needs to spoof a reply
+// (the other half being the DNS query ID, which is also random).
+let is i64 as EPHEMERAL_LO = 49152;
+let is i64 as EPHEMERAL_HI = 65535;
+
+fn src_port(p as *u8) as i64 { return nb.get_be16(p, 0); }
+fn dst_port(p as *u8) as i64 { return nb.get_be16(p, 2); }
+fn length_of(p as *u8) as i64 { return nb.get_be16(p, 4); }
+fn cksum_of(p as *u8) as i64 { return nb.get_be16(p, 6); }
+fn payload(p as *u8) as *u8 { return cast(*u8, cast(i64, p) + HDR_LEN); }
+fn payload_len(p as *u8) as i64 {
+    let is i64 as l = length_of(p);
+    if (l < HDR_LEN) { return 0; }
+    return l - HDR_LEN;
+}
+
+// Build a datagram in place: header, payload, then the checksum over both
+// plus the pseudo-header. Returns total bytes.
+fn build(out as *u8, sport as i64, dport as i64, src as i64, dst as i64,
+         data as *u8, dlen as i64) as i64 {
+    let is i64 as total = HDR_LEN + dlen;
+    nb.put_be16(out, 0, sport);
+    nb.put_be16(out, 2, dport);
+    nb.put_be16(out, 4, total);
+    nb.put_be16(out, 6, 0);
+    if (dlen > 0 && cast(i64, data) != 0) {
+        nb.copy(cast(*u8, cast(i64, out) + HDR_LEN), data, dlen);
+    }
+    let is i64 as sum with mut = ip.pseudo_sum(src, dst, ip.PROTO_UDP, total);
+    sum = sum + nb.sum16(out, total);
+    let is i64 as ck with mut = nb.fold(sum);
+    // 0x0000 is reserved for "no checksum": transmit the equivalent 0xFFFF.
+    if (ck == 0) { ck = 0xFFFF; }
+    nb.put_be16(out, 6, ck);
+    return total;
+}
+
+let is i64 as OK        = 0;
+let is i64 as ERR_SHORT = 0 - 1;
+let is i64 as ERR_LEN   = 0 - 2;
+let is i64 as ERR_CKSUM = 0 - 3;
+
+// Validate a received datagram. `avail` is what actually arrived, which may
+// exceed the declared length because the wire pads short frames — the header
+// is authoritative and anything past it is padding, not data.
+fn validate(p as *u8, avail as i64, src as i64, dst as i64) as i64 {
+    if (avail < HDR_LEN) { return ERR_SHORT; }
+    let is i64 as l = length_of(p);
+    if (l < HDR_LEN) { return ERR_LEN; }
+    if (l > avail) { return ERR_LEN; }
+    // A zero checksum means the sender chose not to compute one, which is
+    // legal over IPv4 (and forbidden over IPv6). Accept it rather than
+    // rejecting a legal datagram.
+    if (cksum_of(p) == 0) { return OK; }
+    let is i64 as sum with mut = ip.pseudo_sum(src, dst, ip.PROTO_UDP, l);
+    sum = sum + nb.sum16(p, l);
+    let is i64 as folded with mut = sum;
+    while ((folded >> 16) != 0) { folded = (folded & 0xFFFF) + (folded >> 16); }
+    if (folded != 0xFFFF) { return ERR_CKSUM; }
+    return OK;
+}

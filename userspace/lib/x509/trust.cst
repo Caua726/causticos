@@ -1,0 +1,259 @@
+// trust — the certificates this machine believes without being asked, and the
+// walk from a server's certificate up to one of them.
+//
+// A chain is not a list to be read, it is a claim to be checked, and the check
+// is the only thing standing between a TLS connection and whoever answered the
+// SYN. Every link is verified in the same three ways: the issuer's key really
+// signed this certificate, the issuer was ALLOWED to sign certificates, and
+// the issuer's own certificate is valid right now. Skip the middle one and any
+// web server's certificate can mint a certificate for a bank.
+//
+// THE ANCHOR IS NOT VERIFIED, IT IS TRUSTED. A root certificate is self-signed
+// and checking its signature proves only that it is internally consistent,
+// which every forgery also is. What makes it an anchor is that it is in the
+// file, so the file is the security boundary and its signature is not checked
+// at all. Saying that out loud is better than a line of code that looks like a
+// check and is not one.
+//
+// The store is a PEM file — the format every trust bundle in the world already
+// ships in, so /etc/ca.pem can be the host's bundle copied across unchanged.
+
+use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "../../../../caustic-crypto/util/base64.cst" as b64;
+use "x509v.cst" as x;
+
+// A full public bundle is around 150 anchors; 256 leaves room and costs two
+// arrays of i64.
+let is i64 as MAX_ANCHORS with imut = 256;
+// How long a presented chain may be. Real ones are two or three; anything
+// past four is either a mistake or somebody probing for a stack overflow.
+let is i64 as MAX_DEPTH with imut = 8;
+
+let is [256]i64 as a_off with mut;
+let is [256]i64 as a_len with mut;
+let is i64 as n_anchors with mut = 0;
+let is i64 as arena with mut = 0;
+let is i64 as arena_cap with mut = 0;
+let is i64 as arena_used with mut = 0;
+
+fn count() as i64 { return n_anchors; }
+fn anchor_ptr(i as i64) as *u8 { return cast(*u8, arena + a_off[i]); }
+fn anchor_len(i as i64) as i64 { return a_len[i]; }
+
+fn is_begin(p as *u8, at as i64, len as i64) as i64 {
+    let is *u8 as m = "-----BEGIN CERTIFICATE-----";
+    if (at + 27 > len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < 27) {
+        if (p[at + i] != m[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn is_end(p as *u8, at as i64, len as i64) as i64 {
+    let is *u8 as m = "-----END CERTIFICATE-----";
+    if (at + 25 > len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < 25) {
+        if (p[at + i] != m[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn line_end(p as *u8, at as i64, len as i64) as i64 {
+    let is i64 as i with mut = at;
+    while (i < len && p[i] != cast(u8, 10)) { i = i + 1; }
+    return i;
+}
+
+// Read a PEM file and decode every CERTIFICATE block in it into one arena of
+// DER. Returns the number of anchors, or a negative errno.
+//
+// Anything that is not a CERTIFICATE block is skipped rather than rejected:
+// bundles in the wild carry comments, subject lines and the occasional key,
+// and a loader that refused the whole file over one stray line would leave a
+// machine with no trust at all.
+fn load(path as *u8) as i64 {
+    n_anchors = 0;
+    arena_used = 0;
+
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return sys.E_NOENT; }
+    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+    if (sz <= 0) { sys.close(fd); return sys.E_NOENT; }
+
+    // The PEM text, then the DER it decodes to. Base64 is 4 bytes per 3, so
+    // the DER can never be larger than the text and one arena of the file's
+    // size is always enough.
+    let is i64 as textcap = (sz + 4095) & (0 - 4096);
+    let is i64 as text = sys.mmap(cast(i64, 0), textcap, sys.PROT_READ | sys.PROT_WRITE);
+    if (text < 0) { sys.close(fd); return sys.E_NOMEM; }
+    let is i64 as got = sys.read(fd, cast(*u8, text), sz);
+    sys.close(fd);
+    if (got != sz) { sys.munmap(text, textcap); return sys.E_IO; }
+
+    if (arena == 0) {
+        arena_cap = textcap;
+        arena = sys.mmap(cast(i64, 0), arena_cap, sys.PROT_READ | sys.PROT_WRITE);
+        if (arena < 0) { arena = 0; sys.munmap(text, textcap); return sys.E_NOMEM; }
+    }
+
+    // The base64 body is gathered line by line into a scratch buffer, because
+    // PEM wraps at 64 columns and base64_decode wants it contiguous.
+    let is i64 as bodycap = 8192;
+    let is i64 as body = sys.mmap(cast(i64, 0), bodycap, sys.PROT_READ | sys.PROT_WRITE);
+    if (body < 0) { sys.munmap(text, textcap); return sys.E_NOMEM; }
+
+    let is *u8 as p = cast(*u8, text);
+    let is *u8 as bp = cast(*u8, body);
+    let is i64 as at with mut = 0;
+    while (at < sz) {
+        if (is_begin(p, at, sz) == 0) {
+            at = line_end(p, at, sz) + 1;
+            continue;
+        }
+        at = line_end(p, at, sz) + 1;
+        let is i64 as blen with mut = 0;
+        let is i64 as closed with mut = 0;
+        while (at < sz) {
+            if (is_end(p, at, sz) == 1) { closed = 1; at = line_end(p, at, sz) + 1; break; }
+            let is i64 as e = line_end(p, at, sz);
+            let is i64 as i with mut = at;
+            while (i < e) {
+                let is i64 as ch = cast(i64, p[i]);
+                // Carriage returns and stray whitespace are not base64 and
+                // must not reach the decoder.
+                if (ch > 32) {
+                    if (blen < bodycap) { bp[blen] = cast(u8, ch); blen = blen + 1; }
+                }
+                i = i + 1;
+            }
+            at = e + 1;
+        }
+        if (closed == 0 || blen == 0) { continue; }
+        if (n_anchors >= MAX_ANCHORS) { break; }
+        if (arena_used + blen > arena_cap) { break; }
+
+        let is i64 as dlen = b64.base64_decode(bp, blen, cast(*u8, arena + arena_used));
+        if (dlen > 0) {
+            a_off[n_anchors] = arena_used;
+            a_len[n_anchors] = dlen;
+            arena_used = arena_used + dlen;
+            n_anchors = n_anchors + 1;
+        }
+    }
+
+    sys.munmap(body, bodycap);
+    sys.munmap(text, textcap);
+    return n_anchors;
+}
+
+// ============================================================
+// The walk
+// ============================================================
+
+// Which anchor, if any, has this subject. Matching on the DER bytes of the
+// Name rather than on a decoded string: two Names are the same issuer when
+// they encode identically, and comparing decoded text invites every
+// normalisation bug there is.
+fn find_anchor(sub as *u8, soff as i64, slen as i64, out as *x.Cert) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n_anchors) {
+        let is *u8 as ab = anchor_ptr(i);
+        if (x.parse(ab, a_len[i], out) == x.OK) {
+            if (x.same_bytes(sub, soff, slen, ab, out.subject_off, out.subject_len) == 1) {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Verify a chain as presented by a server: certs[2i] is a pointer, certs[2i+1]
+// a length, leaf first. `now` is the wall clock as x509v.stamp_from_wall gives
+// it, or 0 for a machine that does not know.
+//
+// Returns x509v.OK, or the specific reason it failed.
+fn verify_chain(certs as *i64, n as i64, host as *u8, hlen as i64, now as i64) as i64 {
+    if (n <= 0) { return x.E_PARSE; }
+    if (n > MAX_DEPTH) { return x.E_PATH_LEN; }
+    if (n_anchors == 0) { return x.E_UNTRUSTED; }
+
+    let is x.Cert as cur;
+    let is *u8 as curbuf with mut = cast(*u8, certs[0]);
+    let is i64 as curlen with mut = certs[1];
+    if (x.parse(curbuf, curlen, &cur) != x.OK) { return x.E_PARSE; }
+
+    // The leaf, on its own terms, before any signature is checked: an expired
+    // certificate for the wrong host is not made acceptable by a valid chain.
+    let is i64 as tr = x.time_ok(&cur, now);
+    if (tr != x.OK) { return tr; }
+    if (x.matches_host(curbuf, curlen, &cur, host, hlen) == 0) { return x.E_HOSTNAME; }
+
+    let is i64 as depth with mut = 0;
+    while (depth < MAX_DEPTH) {
+        // An anchor that issued this certificate ends the walk.
+        let is x.Cert as anc;
+        let is i64 as ai = find_anchor(curbuf, cur.issuer_off, cur.issuer_len, &anc);
+        if (ai >= 0) {
+            let is i64 as ma = x.may_sign_certs(&anc);
+            if (ma != x.OK) { return ma; }
+            // The anchor's own dates still count: a root that expired is a
+            // root that was retired, and the file may simply be old.
+            let is i64 as at = x.time_ok(&anc, now);
+            if (at != x.OK) { return at; }
+            let is i64 as sv = x.signed_by(curbuf, curlen, &cur,
+                                           anchor_ptr(ai), a_len[ai], &anc);
+            if (sv != x.OK) { return sv; }
+            // pathLenConstraint counts the intermediates BELOW this issuer,
+            // not including the leaf. depth is exactly that count.
+            if (anc.path_len >= 0 && depth > anc.path_len) { return x.E_PATH_LEN; }
+            return x.OK;
+        }
+
+        // Otherwise the issuer must be somewhere in what the server sent.
+        let is i64 as found with mut = 0 - 1;
+        let is x.Cert as up;
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            let is *u8 as jb = cast(*u8, certs[j * 2]);
+            let is i64 as jl = certs[j * 2 + 1];
+            // Never accept a certificate as its own issuer: a self-signed
+            // certificate in the chain that is not in the store would
+            // otherwise loop until the depth limit and look like a path
+            // problem rather than an untrusted one.
+            if (jb != curbuf) {
+                if (x.parse(jb, jl, &up) == x.OK) {
+                    if (x.same_bytes(curbuf, cur.issuer_off, cur.issuer_len,
+                                     jb, up.subject_off, up.subject_len) == 1) {
+                        found = j;
+                        j = n;
+                    }
+                }
+            }
+            if (j < n) { j = j + 1; }
+        }
+        if (found < 0) { return x.E_UNTRUSTED; }
+
+        let is *u8 as pbuf = cast(*u8, certs[found * 2]);
+        let is i64 as plen = certs[found * 2 + 1];
+        if (x.parse(pbuf, plen, &up) != x.OK) { return x.E_PARSE; }
+        let is i64 as ms = x.may_sign_certs(&up);
+        if (ms != x.OK) { return ms; }
+        let is i64 as ut = x.time_ok(&up, now);
+        if (ut != x.OK) { return ut; }
+        if (up.path_len >= 0 && depth > up.path_len) { return x.E_PATH_LEN; }
+        let is i64 as sv2 = x.signed_by(curbuf, curlen, &cur, pbuf, plen, &up);
+        if (sv2 != x.OK) { return sv2; }
+
+        curbuf = pbuf;
+        curlen = plen;
+        if (x.parse(curbuf, curlen, &cur) != x.OK) { return x.E_PARSE; }
+        depth = depth + 1;
+    }
+    return x.E_CHAIN_LOOP;
+}

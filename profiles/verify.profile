@@ -25,3 +25,24 @@ text "/long-name-with-spaces and mixed case.txt" LFN content here
 
 dir /docs
 text /docs/readme.md # Docs readme\n\nInside docs subdir.
+
+# The in-system test harnesses. They run from a terminal on the booted machine,
+# which is the only place some of them can run at all — a TLS handshake against
+# a real server is not something the host can stand in for.
+bin runall
+bin nett
+bin linkt
+bin netdt
+bin pingt
+bin tcpt
+bin httpt
+bin cryptot
+bin x509t
+bin tlst
+bin appt
+
+# u64t is `opt` because it currently cannot be built: the compiler segfaults on
+# tests/u64t.cst whenever --cache is passed, from a cold cache, and only on this
+# one file. mkroot reports the skip rather than dropping it silently, and the
+# line starts working again the moment the compiler does.
+opt bin u64t

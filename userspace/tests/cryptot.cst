@@ -1,0 +1,368 @@
+// cryptot — the crypto primitives, from ring 3, on this machine.
+//
+// caustic-crypto is a sibling repository with its own suite: 24 test programs,
+// official vectors from the RFCs and NIST CAVP, all green. This does not
+// duplicate that. It answers a different question, and the difference matters:
+//
+//   THE HOST SUITE PROVES THE ALGORITHMS. It runs on Linux, compiled for a
+//   hosted target, against a libc.
+//
+//   THIS PROVES THE BINARIES THIS MACHINE WILL ACTUALLY RUN. Different
+//   codegen path, freestanding, no libc, a stack that grows by explicit
+//   commit, and a heap that is std/mem's bins over SYS_MMAP rather than
+//   anything an operating system arranged. Every one of those has broken
+//   something in this project before, and none of them is exercised by a
+//   test that runs on the host.
+//
+// So: one vector per primitive TLS 1.3 needs, chosen to be the one the RFC
+// prints, run here. Not exhaustive — exhaustive lives upstream. What is here
+// is the set that a wrong answer would carry all the way into a handshake.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../../../caustic-crypto/util/hex.cst" as hex;
+use "../../../caustic-crypto/util/ct.cst" as ct;
+use "../../../caustic-crypto/hash/sha2.cst" as sha2;
+use "../../../caustic-crypto/mac/hmac.cst" as hmac;
+use "../../../caustic-crypto/kdf/hkdf.cst" as hkdf;
+use "../../../caustic-crypto/sym/chachapoly.cst" as ccp;
+use "../../../caustic-crypto/sym/aes.cst" as aes;
+use "../../../caustic-crypto/sym/aes_modes.cst" as aesm;
+use "../../../caustic-crypto/pk/x25519.cst" as x25519;
+use "../../../caustic-crypto/pk/ed25519.cst" as ed25519;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, ok as i64) as void {
+    checks = checks + 1;
+    if (ok == 1) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say("\n");
+    return;
+}
+
+let is [256]u8 as want;
+let is [256]u8 as got;
+let is [512]u8 as scratch;
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+// Compare a byte buffer against a hex literal. Reporting WHERE it diverges is
+// the difference between "sha256 is wrong" and "the last block's padding is
+// wrong", and the second one can be fixed.
+fn eq_hex(name as *u8, buf as *u8, n as i64, hexstr as *u8) as void {
+    let is i64 as hl = slen(hexstr);
+    if (hl != n * 2) {
+        say("  FAIL "); say(name); say(" (vector is the wrong length)\n");
+        checks = checks + 1; fails = fails + 1;
+        return;
+    }
+    hex.hex_decode(hexstr, hl, cast(*u8, &want[0]));
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (buf[i] != want[i]) {
+            say("  FAIL "); say(name);
+            say(" at byte "); say_num(i); say("\n");
+            checks = checks + 1; fails = fails + 1;
+            return;
+        }
+        i = i + 1;
+    }
+    check(name, 1);
+    return;
+}
+
+// ============================================================
+// Hashes — FIPS 180-4 / the one-block "abc" vector everyone prints
+// ============================================================
+
+fn t_sha() as void {
+    say("sha2:\n");
+    sha2.sha256(cast(*u8, "abc"), 3, cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "sha256(\"abc\")"), cast(*u8, &got[0]), 32,
+           cast(*u8, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+
+    // The empty string exercises the padding path with no message at all,
+    // which is where an off-by-one in the length encoding hides.
+    sha2.sha256(cast(*u8, ""), 0, cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "sha256(\"\")"), cast(*u8, &got[0]), 32,
+           cast(*u8, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+
+    // 1000 bytes: several blocks, so the streaming path and the buffered
+    // remainder both run. A one-block test passes with a broken update().
+    let is i64 as i with mut = 0;
+    while (i < 512) { scratch[i] = cast(u8, 97); i = i + 1; }        // 'a' x 512
+    let is sha2.Sha256 as s;
+    sha2.sha256_init(&s);
+    i = 0;
+    // Fed in uneven pieces on purpose: a hash that only works when it is
+    // handed whole blocks is a hash that fails on a TLS transcript.
+    sha2.sha256_update(&s, cast(*u8, &scratch[0]), 1);
+    sha2.sha256_update(&s, cast(*u8, &scratch[1]), 63);
+    sha2.sha256_update(&s, cast(*u8, &scratch[64]), 200);
+    sha2.sha256_update(&s, cast(*u8, &scratch[264]), 248);
+    sha2.sha256_final(&s, cast(*u8, &got[0]));
+    let is [32]u8 as oneshot;
+    sha2.sha256(cast(*u8, &scratch[0]), 512, cast(*u8, &oneshot[0]));
+    check(cast(*u8, "sha256 streamed == one-shot"),
+          ct.ct_eq(cast(*u8, &got[0]), cast(*u8, &oneshot[0]), 32));
+
+    sha2.sha384(cast(*u8, "abc"), 3, cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "sha384(\"abc\")"), cast(*u8, &got[0]), 48,
+           cast(*u8, "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"));
+
+    sha2.sha512(cast(*u8, "abc"), 3, cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "sha512(\"abc\")"), cast(*u8, &got[0]), 64,
+           cast(*u8, "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"));
+    return;
+}
+
+// ============================================================
+// HMAC — RFC 4231 test case 2, the one with a short key
+// ============================================================
+
+fn t_hmac() as void {
+    say("hmac:\n");
+    let is hmac.HashAlg as a256 = hmac.alg_sha256();
+    hmac.hmac(&a256, cast(*u8, "Jefe"), 4,
+              cast(*u8, "what do ya want for nothing?"), 28,
+              cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "hmac-sha256 rfc4231 #2"), cast(*u8, &got[0]), 32,
+           cast(*u8, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+
+    let is hmac.HashAlg as a384 = hmac.alg_sha384();
+    hmac.hmac(&a384, cast(*u8, "Jefe"), 4,
+              cast(*u8, "what do ya want for nothing?"), 28,
+              cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "hmac-sha384 rfc4231 #2"), cast(*u8, &got[0]), 48,
+           cast(*u8, "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649"));
+    return;
+}
+
+// ============================================================
+// HKDF — RFC 5869 test case 1
+// ============================================================
+
+fn t_hkdf() as void {
+    say("hkdf:\n");
+    let is hmac.HashAlg as a = hmac.alg_sha256();
+    let is [22]u8 as ikm;
+    let is [13]u8 as salt;
+    let is [10]u8 as info;
+    hex.hex_decode(cast(*u8, "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"), 44,
+                   cast(*u8, &ikm[0]));
+    hex.hex_decode(cast(*u8, "000102030405060708090a0b0c"), 26, cast(*u8, &salt[0]));
+    hex.hex_decode(cast(*u8, "f0f1f2f3f4f5f6f7f8f9"), 20, cast(*u8, &info[0]));
+
+    hkdf.hkdf_extract(&a, cast(*u8, &salt[0]), 13, cast(*u8, &ikm[0]), 22,
+                      cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "hkdf-extract rfc5869 #1"), cast(*u8, &got[0]), 32,
+           cast(*u8, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"));
+
+    hkdf.hkdf_expand(&a, cast(*u8, &got[0]), 32, cast(*u8, &info[0]), 10,
+                     cast(*u8, &scratch[0]), 42);
+    eq_hex(cast(*u8, "hkdf-expand rfc5869 #1"), cast(*u8, &scratch[0]), 42,
+           cast(*u8, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"));
+    return;
+}
+
+// ============================================================
+// ChaCha20-Poly1305 — RFC 8439 §2.8.2
+// ============================================================
+
+fn t_chachapoly() as void {
+    say("chacha20-poly1305:\n");
+    let is [32]u8 as key;
+    let is [12]u8 as nonce;
+    let is [12]u8 as aad;
+    hex.hex_decode(cast(*u8, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"), 64,
+                   cast(*u8, &key[0]));
+    hex.hex_decode(cast(*u8, "070000004041424344454647"), 24, cast(*u8, &nonce[0]));
+    hex.hex_decode(cast(*u8, "50515253c0c1c2c3c4c5c6c7"), 24, cast(*u8, &aad[0]));
+
+    let is *u8 as pt = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    let is i64 as ptlen = 114;
+    let is [16]u8 as tag;
+    ccp.chachapoly_seal(cast(*u8, &key[0]), cast(*u8, &nonce[0]),
+                        cast(*u8, &aad[0]), 12, pt, ptlen,
+                        cast(*u8, &scratch[0]), cast(*u8, &tag[0]));
+    eq_hex(cast(*u8, "ciphertext rfc8439"), cast(*u8, &scratch[0]), 114,
+           cast(*u8, "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"));
+    eq_hex(cast(*u8, "tag rfc8439"), cast(*u8, &tag[0]), 16,
+           cast(*u8, "1ae10b594f09e26a7e902ecbd0600691"));
+
+    // Open it back, and then break one byte of the tag: an AEAD that accepts
+    // a forged tag is worse than no AEAD, because it looks like it worked.
+    let is i64 as ok with mut = ccp.chachapoly_open(cast(*u8, &key[0]), cast(*u8, &nonce[0]),
+                                           cast(*u8, &aad[0]), 12,
+                                           cast(*u8, &scratch[0]), 114,
+                                           cast(*u8, &tag[0]), cast(*u8, &got[0]));
+    check(cast(*u8, "open accepts the real tag"), ok == 1);
+    check(cast(*u8, "and gives back the plaintext"),
+          ct.ct_eq(cast(*u8, &got[0]), cast(*u8, pt), 114));
+
+    tag[0] = cast(u8, cast(i64, tag[0]) ^ 1);
+    ok = ccp.chachapoly_open(cast(*u8, &key[0]), cast(*u8, &nonce[0]),
+                             cast(*u8, &aad[0]), 12,
+                             cast(*u8, &scratch[0]), 114,
+                             cast(*u8, &tag[0]), cast(*u8, &got[0]));
+    check(cast(*u8, "and rejects a forged one"), ok == 0);
+    return;
+}
+
+// ============================================================
+// AES-128-GCM — NIST GCM test vectors, case 4
+// ============================================================
+
+fn t_aesgcm() as void {
+    say("aes-128-gcm:\n");
+    let is [16]u8 as key;
+    let is [12]u8 as iv;
+    let is [20]u8 as aad;
+    let is [60]u8 as pt;
+    hex.hex_decode(cast(*u8, "feffe9928665731c6d6a8f9467308308"), 32, cast(*u8, &key[0]));
+    hex.hex_decode(cast(*u8, "cafebabefacedbaddecaf888"), 24, cast(*u8, &iv[0]));
+    hex.hex_decode(cast(*u8, "feedfacedeadbeeffeedfacedeadbeefabaddad2"), 40, cast(*u8, &aad[0]));
+    hex.hex_decode(cast(*u8, "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"), 120,
+                   cast(*u8, &pt[0]));
+
+    let is aes.Aes as a;
+    aes.aes_init(&a, cast(*u8, &key[0]), 16);
+    let is [16]u8 as tag;
+    aesm.aes_gcm_seal(&a, cast(*u8, &iv[0]), 12, cast(*u8, &aad[0]), 20,
+                      cast(*u8, &pt[0]), 60, cast(*u8, &scratch[0]), cast(*u8, &tag[0]));
+    eq_hex(cast(*u8, "ciphertext nist #4"), cast(*u8, &scratch[0]), 60,
+           cast(*u8, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091"));
+    eq_hex(cast(*u8, "tag nist #4"), cast(*u8, &tag[0]), 16,
+           cast(*u8, "5bc94fbc3221a5db94fae95ae7121a47"));
+
+    let is i64 as ok with mut = aesm.aes_gcm_open(&a, cast(*u8, &iv[0]), 12,
+                                         cast(*u8, &aad[0]), 20,
+                                         cast(*u8, &scratch[0]), 60,
+                                         cast(*u8, &tag[0]), cast(*u8, &got[0]));
+    check(cast(*u8, "open accepts the real tag"), ok == 1);
+    check(cast(*u8, "and gives back the plaintext"),
+          ct.ct_eq(cast(*u8, &got[0]), cast(*u8, &pt[0]), 60));
+
+    // A modified AAD must fail even though the ciphertext is untouched —
+    // that is the whole point of the A in AEAD, and it is what protects a
+    // TLS record header from being rewritten in flight.
+    aad[0] = cast(u8, cast(i64, aad[0]) ^ 0x80);
+    ok = aesm.aes_gcm_open(&a, cast(*u8, &iv[0]), 12, cast(*u8, &aad[0]), 20,
+                           cast(*u8, &scratch[0]), 60,
+                           cast(*u8, &tag[0]), cast(*u8, &got[0]));
+    check(cast(*u8, "and rejects tampered aad"), ok == 0);
+    return;
+}
+
+// ============================================================
+// X25519 — RFC 7748 §5.2 and §6.1
+// ============================================================
+
+fn t_x25519() as void {
+    say("x25519:\n");
+    let is [32]u8 as k;
+    let is [32]u8 as u;
+    hex.hex_decode(cast(*u8, "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"), 64,
+                   cast(*u8, &k[0]));
+    hex.hex_decode(cast(*u8, "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"), 64,
+                   cast(*u8, &u[0]));
+    x25519.x25519(cast(*u8, &k[0]), cast(*u8, &u[0]), cast(*u8, &got[0]));
+    eq_hex(cast(*u8, "scalar mult rfc7748 §5.2"), cast(*u8, &got[0]), 32,
+           cast(*u8, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"));
+
+    // The full key agreement: two private keys, two public keys, one shared
+    // secret. This is exactly what a TLS key_share does.
+    let is [32]u8 as apriv;
+    let is [32]u8 as bpriv;
+    hex.hex_decode(cast(*u8, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"), 64,
+                   cast(*u8, &apriv[0]));
+    hex.hex_decode(cast(*u8, "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"), 64,
+                   cast(*u8, &bpriv[0]));
+    let is [32]u8 as apub;
+    let is [32]u8 as bpub;
+    x25519.x25519_base(cast(*u8, &apriv[0]), cast(*u8, &apub[0]));
+    x25519.x25519_base(cast(*u8, &bpriv[0]), cast(*u8, &bpub[0]));
+    eq_hex(cast(*u8, "alice public rfc7748 §6.1"), cast(*u8, &apub[0]), 32,
+           cast(*u8, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"));
+
+    let is [32]u8 as ss1;
+    let is [32]u8 as ss2;
+    x25519.x25519(cast(*u8, &apriv[0]), cast(*u8, &bpub[0]), cast(*u8, &ss1[0]));
+    x25519.x25519(cast(*u8, &bpriv[0]), cast(*u8, &apub[0]), cast(*u8, &ss2[0]));
+    eq_hex(cast(*u8, "shared secret rfc7748 §6.1"), cast(*u8, &ss1[0]), 32,
+           cast(*u8, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"));
+    check(cast(*u8, "both sides agree"),
+          ct.ct_eq(cast(*u8, &ss1[0]), cast(*u8, &ss2[0]), 32));
+    return;
+}
+
+// ============================================================
+// Ed25519 — RFC 8032 §7.1 test 1
+// ============================================================
+
+fn t_ed25519() as void {
+    say("ed25519:\n");
+    let is [32]u8 as seed;
+    let is [32]u8 as pub;
+    hex.hex_decode(cast(*u8, "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"), 64,
+                   cast(*u8, &seed[0]));
+    ed25519.ed25519_pubkey(cast(*u8, &seed[0]), cast(*u8, &pub[0]));
+    eq_hex(cast(*u8, "public key rfc8032 #1"), cast(*u8, &pub[0]), 32,
+           cast(*u8, "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"));
+
+    let is [64]u8 as sig;
+    hex.hex_decode(cast(*u8, "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"), 128,
+                   cast(*u8, &sig[0]));
+    check(cast(*u8, "verify accepts the real signature"),
+          ed25519.ed25519_verify(cast(*u8, &pub[0]), cast(*u8, ""), 0,
+                                 cast(*u8, &sig[0])) == 1);
+
+    // One flipped bit must break it. A verifier that returns 1 for everything
+    // passes every positive test ever written.
+    sig[0] = cast(u8, cast(i64, sig[0]) ^ 1);
+    check(cast(*u8, "and rejects a tampered one"),
+          ed25519.ed25519_verify(cast(*u8, &pub[0]), cast(*u8, ""), 0,
+                                 cast(*u8, &sig[0])) == 0);
+    return;
+}
+
+fn main() as i32 {
+    say("cryptot: primitives, in ring 3, on this machine\n");
+    t_sha();
+    t_hmac();
+    t_hkdf();
+    t_chachapoly();
+    t_aesgcm();
+    t_x25519();
+    t_ed25519();
+    say("cryptot: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("cryptot: ALL PASS\n"); return cast(i32, 0); }
+    say("cryptot: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

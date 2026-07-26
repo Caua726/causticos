@@ -1,0 +1,183 @@
+// nc — a TCP connection with a shell on one end.
+//
+// What this proves that nothing else does is HALF-CLOSE. Every other client
+// here sends a request and then reads a response, which never needs the two
+// directions to end at different times. A pipeline does:
+//
+//     cat file | nc host port
+//
+// The send side finishes when stdin ends, and at that moment the peer has to
+// be told "no more from me" WITHOUT being told "I am done listening" — because
+// the answer is still coming. A full close there throws away the response; no
+// close at all leaves a server waiting for a request it will never see the end
+// of. That is what shutdown exists for, and it is the thing this exercises.
+//
+//   nc host port          — stdin to the socket, socket to stdout
+//   nc -l port            — wait for one connection and do the same
+//   nc -q host port       — send stdin, half-close, print the answer, exit
+//
+// One connection, then exit. A version that loops would need a process per
+// connection and this machine has a shell that can do that better.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netip/netip.cst" as ip;
+
+let is [4096]u8 as buf;
+let is i64 as quiet with mut = 0;
+
+fn note(s as *u8) as void { if (quiet == 0) { prog.outs(s); } return; }
+
+fn print_ip(v as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (i > 0) { prog.outs("."); }
+        prog.out_num(ip.addr_octet(v, i));
+        i = i + 1;
+    }
+    return;
+}
+
+fn parse_num(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c < 48 || c > 57) { return 0 - 1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (i == 0) { return 0 - 1; }
+    return v;
+}
+
+// Pump both directions until the socket ends. stdin and the netd channel are
+// polled together: reading either one blindly would stall the other, and a
+// tool that can only do one at a time is not a connection, it is a turn.
+fn pump(s as i64) as i64 {
+    let is i64 as ctl = nc.ctl_fd();
+    let is i64 as stdin_open with mut = 1;
+    let is i64 as total_in with mut = 0;
+    let is i64 as total_out with mut = 0;
+
+    while (1 == 1) {
+        let is [6]i64 as pe;
+        let is i64 as n with mut = 0;
+        pe[0] = ctl; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        n = 1;
+        if (stdin_open == 1) {
+            pe[3] = 0; pe[4] = sys.POLL_READABLE; pe[5] = 0;
+            n = 2;
+        }
+        sys.poll(cast(*i64, &pe[0]), n, 1000000000);
+
+        if (stdin_open == 1) {
+            if ((pe[5] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                let is i64 as r = sys.read(0, cast(*u8, &buf[0]), 4096);
+                if (r > 0) {
+                    if (nc.send_all(s, cast(*u8, &buf[0]), r) < 0) { return total_in; }
+                    total_out = total_out + r;
+                } else {
+                    // stdin is done. Say so on the wire and keep reading: the
+                    // peer's answer is still owed to us.
+                    stdin_open = 0;
+                    nc.shutdown_write(s);
+                }
+            }
+        }
+
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            let is i64 as r = nc.recv(s, cast(*u8, &buf[0]), 4096);
+            if (r == 0) { return total_in; }              // peer finished
+            if (r < 0) {
+                if (r != sys.E_AGAIN) { return total_in; }
+            } else {
+                prog.out(cast(*u8, &buf[0]), r);
+                total_in = total_in + r;
+            }
+        }
+
+        // Both ends done: we have said everything and the socket has ended.
+        if (stdin_open == 0 && nc.state(s) != nc.S_OPEN) { return total_in; }
+    }
+    return total_in;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as listen_mode with mut = 0;
+    let is i64 as port with mut = 0;
+    let is i64 as hostarg with mut = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as a = prog.arg(argv, ai);
+        if (a[0] == cast(u8, 45) && a[1] == cast(u8, 108)) { listen_mode = 1; ai = ai + 1; }
+        else {
+            if (a[0] == cast(u8, 45) && a[1] == cast(u8, 113)) { quiet = 1; ai = ai + 1; }
+            else {
+                if (hostarg == 0 && listen_mode == 0) { hostarg = cast(i64, a); }
+                else { port = parse_num(a); }
+                ai = ai + 1;
+            }
+        }
+    }
+    if (port <= 0 || port > 65535 || (listen_mode == 0 && hostarg == 0)) {
+        prog.outs("usage: nc [-q] host port  |  nc -l [-q] port\n");
+        return cast(i32, 1);
+    }
+
+    if (nc.attach(np.NET_FD) != 0) {
+        prog.outs("nc: no netd on fd 6\n");
+        return cast(i32, 1);
+    }
+    if (nc.wait_address(10000000000) == 0) {
+        prog.outs("nc: no address\n");
+        return cast(i32, 1);
+    }
+
+    let is i64 as s with mut = 0 - 1;
+    if (listen_mode == 1) {
+        let is i64 as ls = nc.open(np.SOCK_STREAM);
+        if (ls < 0) { prog.outs("nc: no socket\n"); return cast(i32, 1); }
+        if (nc.bind(ls, 0, port) < 0) { prog.outs("nc: port taken\n"); return cast(i32, 1); }
+        if (nc.listen(ls, 1) != 0) { prog.outs("nc: listen refused\n"); return cast(i32, 1); }
+        note("listening on port ");
+        if (quiet == 0) { prog.out_num(port); prog.outs("\n"); }
+        s = nc.accept(ls, 3600000000000);
+        if (s < 0) { prog.outs("nc: nothing connected\n"); return cast(i32, 1); }
+        note("connection from ");
+        if (quiet == 0) {
+            print_ip(nc.peer_ip_of(s));
+            prog.outs(":");
+            prog.out_num(nc.peer_port_of(s));
+            prog.outs("\n");
+        }
+    } else {
+        let is *u8 as h = cast(*u8, hostarg);
+        let is i64 as hlen with mut = 0;
+        while (h[hlen] != cast(u8, 0)) { hlen = hlen + 1; }
+        let is i64 as addr = nc.resolve(h, hlen);
+        if (addr == 0) { prog.outs("nc: cannot resolve\n"); return cast(i32, 1); }
+        s = nc.open(np.SOCK_STREAM);
+        if (s < 0) { prog.outs("nc: no socket\n"); return cast(i32, 1); }
+        if (nc.connect(s, addr, port) != 0) {
+            prog.outs("nc: connection refused\n");
+            return cast(i32, 1);
+        }
+        note("connected to ");
+        if (quiet == 0) {
+            print_ip(addr); prog.outs(":"); prog.out_num(port); prog.outs("\n");
+        }
+    }
+
+    let is i64 as got = pump(s);
+    nc.close(s);
+    if (quiet == 0) {
+        prog.outs("nc: ");
+        prog.out_num(got);
+        prog.outs(" bytes received\n");
+    }
+    return cast(i32, 0);
+}

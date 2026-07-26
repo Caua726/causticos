@@ -26,7 +26,10 @@ use "ksym.cst" as ksym;
 use "specparse.cst" as specparse;
 use "dummybus.cst" as dummybus;
 use "pci.cst" as pci;
-use "pcitest.cst" as pcitest;
+use "random.cst" as random;
+use "virtio.cst" as virtio;
+use "netdev.cst" as netdev;
+use "e1000.cst" as e1000;
 use "ioapic.cst" as ioapic;
 use "platform_bus.cst" as platform_bus;
 use "membus.cst" as membus;
@@ -34,6 +37,8 @@ use "kbd.cst" as kbd;
 use "mouse.cst" as mouse;
 use "vtablet.cst" as vtablet;
 use "vnet.cst" as vnet;
+use "vsnd.cst" as vsnd;
+use "audio.cst" as audio;
 use "ahci.cst" as ahci;
 use "fat32.cst" as fat32;
 use "vfs.cst" as vfs;
@@ -47,6 +52,20 @@ use "syshandlers.cst" as syshandlers;
 // Boot screen colors (32bpp XRGB)
 let is i64 as COLOR_BG    = 0x001a1a2e;
 let is i64 as COLOR_WHITE = 0x00FFFFFF;
+
+// The device smokes, one after the other on ONE thread. They were two
+// threads and their serial output interleaved line by line — the port smoke's
+// results landed in the middle of the audio smoke's, and reading either of
+// them meant untangling both. Worse, an audio smoke that stopped early looked
+// exactly like one still running behind the other's output. Serial writes are
+// atomic per call, not per report, so the fix is to have one reporter at a
+// time. Both wait for phase 2 internally, so the order costs a second of boot
+// and buys a log a person can read.
+fn device_smokes_thread() as void {
+    netdev.smoke_thread();
+    audio.smoke_thread();
+    return;
+}
 
 fn halt() as void {
     serial.println("kernel halted", 13);
@@ -131,6 +150,11 @@ fn _kernel_start() as void {
     // discovery data — these are just sentinels to keep early IRQs
     // from faulting on an uninstalled GS base.
     smp.init_bsp_early();
+    // Serial buffers a line per cpu and needs to know which cpu is speaking.
+    // Injected rather than imported: smp.cst logs through serial, so a `use`
+    // the other way would be a cycle. Wired here, the first moment asking is
+    // safe — before this, only the BSP is running and everything is cpu 0.
+    serial.set_cpu_id_fn(cast(i64, fn_ptr(smp.current_cpu_id)));
     timer.init();
     idt.init();
     font.init();
@@ -149,6 +173,12 @@ fn _kernel_start() as void {
     // regions for modern config access.
     acpi.parse();
     hpet.init();
+
+    // Entropy before anything that needs an unguessable number. Probes CPUID
+    // for RDSEED/RDRAND and says loudly when the machine has neither, since
+    // that is a real limitation TLS will have to refuse on later.
+    random.init();
+    random.smoke();
 
     // LAPIC timer: calibrate against HPET (falls back to PIT if HPET
     // missing), then take over scheduler ticking.
@@ -186,7 +216,11 @@ fn _kernel_start() as void {
     driver.init();
     ioapic.init();
     pci.register();
-    pcitest.register();
+    virtio.chain_smoke();  // descriptor free list, on a synthetic queue
+    netdev.net_init();     // wire the KOBJ_DEVICE vtable before dev_open(DEV_NET)
+    netdev.register_ksyms();
+    audio.audio_init();    // same, for dev_open(DEV_AUDIO_OUT / DEV_AUDIO_IN)
+    e1000.register();
     dummybus.register();
     platform_bus.register();
     kbd.kbd_init();        // wire the KOBJ_DEVICE vtable before dev_open(DEV_KEYBOARD)
@@ -196,6 +230,7 @@ fn _kernel_start() as void {
     vtablet.vtablet_init();
     vtablet.register();
     vnet.register();
+    vsnd.register();
     ahci.register();
     membus.register();     // RAM regions as hardware-tree nodes (L0)
     driver.driver_enumerate_all();
@@ -275,6 +310,11 @@ fn _kernel_start() as void {
     // they only run when no I/O thread is runnable.
     sched.create_thread(fn_addr_driver_init, sched.QOS_ACTIVE);
     sched.create_thread(fn_addr_fat32_mount, sched.QOS_ACTIVE);
+    // The network smoke waits for phase 2 to bind the NICs, then exercises the
+    // DEV_NET contract through the same KObject a program gets. It replaces
+    // the per-driver ARP smokes that used to run inside on_bind and cost up to
+    // two seconds of boot each.
+    sched.create_thread(cast(i64, fn_ptr(device_smokes_thread)), sched.QOS_ACTIVE);
     if (cmdline.smoke() != 0) {
         // Smoke boot (verify.sh): VFS self-test + the userspace smoke gauntlet.
         // No /init — the smokes are the workload, and the A/B preempt spinners

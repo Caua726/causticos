@@ -1,0 +1,336 @@
+// netarp — address resolution, and the cache that makes it bearable.
+//
+// ARP is four packets' worth of protocol and a great deal of state machine.
+// The protocol part is trivial; what matters is what happens to the packet
+// that triggered the lookup, and RFC 1122 §2.3.2.2 is explicit about it:
+//
+//   "The link layer SHOULD save (rather than discard) at least one (the
+//    latest) packet of each set of packets destined to the same unresolved
+//    IP address, and transmit the saved packet when the address has been
+//    resolved."
+//
+// A stack that drops it instead still works — TCP retransmits, and the second
+// attempt finds the cache warm. It just makes every new connection pay a
+// retransmission timeout, which is a second of latency for something that
+// should cost a millisecond. So each pending entry holds its packet.
+//
+// The state machine is the one from RFC 1122 / the Linux neighbour table,
+// because the alternative (a flat "known/unknown" cache with a timeout) has a
+// failure mode worth avoiding: an entry that expires while in use forces a
+// synchronous stall on the next packet. STALE means "probably still true, use
+// it and verify in the background", so a busy address is re-verified without
+// anything ever waiting.
+
+use "../netbuf/netbuf.cst" as nb;
+use "../neteth/neteth.cst" as eth;
+
+// Wire format: 28 bytes for IPv4-over-ethernet.
+let is i64 as PKT_LEN = 28;
+
+let is i64 as HTYPE_ETHER = 1;
+let is i64 as PTYPE_IPV4  = 0x0800;
+let is i64 as OP_REQUEST  = 1;
+let is i64 as OP_REPLY    = 2;
+
+// Neighbour states (RFC 1122 §2.3.2.1 terminology).
+let is i64 as ST_FREE       = 0;
+let is i64 as ST_INCOMPLETE = 1;   // request sent, no reply yet
+let is i64 as ST_REACHABLE  = 2;   // confirmed recently
+let is i64 as ST_STALE      = 3;   // was confirmed; usable, re-verify in background
+let is i64 as ST_PROBE      = 4;   // stale and in use; unicast probe outstanding
+
+// Timers, in nanoseconds. REACHABLE_NS is the standard 30s; a real
+// implementation randomises it to avoid synchronised refresh storms across
+// many hosts, and there is a note below where that would go.
+let is i64 as REACHABLE_NS = 30000000000;
+let is i64 as RETRY_NS     =  1000000000;
+let is i64 as MAX_TRIES    = 3;
+
+let is i64 as CACHE_SIZE = 16;
+
+// All-i64 plus trailing byte arrays: the proven struct shape. The pending
+// packet lives inside the entry rather than in a separate pool, because a
+// pool is a lifetime problem and this is bounded anyway.
+struct Entry {
+    state     as i64;
+    ip        as i64;      // host byte order
+    expires   as i64;      // ns; meaning depends on state
+    tries     as i64;
+    pend_len  as i64;      // 0 = nothing waiting
+    used      as i64;      // last-referenced timestamp, for eviction
+    mac       as [8]u8;    // 6 used; padded so the next field starts aligned
+    pending   as [1518]u8;
+}
+
+struct Cache {
+    n         as i64;
+    hits      as i64;
+    misses    as i64;
+    replaced  as i64;      // entries evicted while still live
+    e0 as Entry;  e1 as Entry;  e2 as Entry;  e3 as Entry;
+    e4 as Entry;  e5 as Entry;  e6 as Entry;  e7 as Entry;
+    e8 as Entry;  e9 as Entry;  e10 as Entry; e11 as Entry;
+    e12 as Entry; e13 as Entry; e14 as Entry; e15 as Entry;
+}
+
+// Caustic has no array-of-struct indexing that survives the mixed-width
+// rules cleanly, and grab.cst sets the precedent for spelling the slots out.
+fn at(c as *Cache, i as i64) as *Entry {
+    if (i == 0)  { return &c.e0; }
+    if (i == 1)  { return &c.e1; }
+    if (i == 2)  { return &c.e2; }
+    if (i == 3)  { return &c.e3; }
+    if (i == 4)  { return &c.e4; }
+    if (i == 5)  { return &c.e5; }
+    if (i == 6)  { return &c.e6; }
+    if (i == 7)  { return &c.e7; }
+    if (i == 8)  { return &c.e8; }
+    if (i == 9)  { return &c.e9; }
+    if (i == 10) { return &c.e10; }
+    if (i == 11) { return &c.e11; }
+    if (i == 12) { return &c.e12; }
+    if (i == 13) { return &c.e13; }
+    if (i == 14) { return &c.e14; }
+    return &c.e15;
+}
+
+fn cache_init(c as *Cache) as void {
+    c.n = 0; c.hits = 0; c.misses = 0; c.replaced = 0;
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) {
+        let is *Entry as e = at(c, i);
+        e.state = ST_FREE;
+        e.ip = 0;
+        e.expires = 0;
+        e.tries = 0;
+        e.pend_len = 0;
+        e.used = 0;
+        i = i + 1;
+    }
+    return;
+}
+
+fn find(c as *Cache, ip as i64) as *Entry {
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) {
+        let is *Entry as e = at(c, i);
+        if (e.state != ST_FREE && e.ip == ip) { return e; }
+        i = i + 1;
+    }
+    return cast(*Entry, 0);
+}
+
+// A free slot, or the least recently used one. Evicting the LRU rather than
+// the first match keeps an address that is actively in use from being thrown
+// out by a burst of one-off lookups.
+fn alloc(c as *Cache, now as i64) as *Entry {
+    let is i64 as i with mut = 0;
+    while (i < CACHE_SIZE) {
+        let is *Entry as e = at(c, i);
+        if (e.state == ST_FREE) { return e; }
+        i = i + 1;
+    }
+    let is *Entry as victim with mut = at(c, 0);
+    let is i64 as oldest with mut = victim.used;
+    i = 1;
+    while (i < CACHE_SIZE) {
+        let is *Entry as e = at(c, i);
+        if (e.used < oldest) { oldest = e.used; victim = e; }
+        i = i + 1;
+    }
+    c.replaced = c.replaced + 1;
+    victim.state = ST_FREE;
+    victim.pend_len = 0;
+    return victim;
+}
+
+// ============================================================
+// Packet build / parse
+// ============================================================
+
+// Build one ARP packet into `out` (PKT_LEN bytes). Caller frames it.
+fn build(out as *u8, op as i64, sender_mac as *u8, sender_ip as i64,
+         target_mac as *u8, target_ip as i64) as i64 {
+    nb.put_be16(out, 0, HTYPE_ETHER);
+    nb.put_be16(out, 2, PTYPE_IPV4);
+    out[4] = cast(u8, 6);
+    out[5] = cast(u8, 4);
+    nb.put_be16(out, 6, op);
+    eth.addr_copy(cast(*u8, cast(i64, out) + 8), sender_mac);
+    nb.put_be32(out, 14, sender_ip);
+    if (cast(i64, target_mac) == 0) {
+        nb.fill(cast(*u8, cast(i64, out) + 18), 0, 6);
+    } else {
+        eth.addr_copy(cast(*u8, cast(i64, out) + 18), target_mac);
+    }
+    nb.put_be32(out, 24, target_ip);
+    return PKT_LEN;
+}
+
+// Field accessors on a parsed ARP packet.
+fn op_of(p as *u8) as i64          { return nb.get_be16(p, 6); }
+fn sender_mac_of(p as *u8) as *u8  { return cast(*u8, cast(i64, p) + 8); }
+fn sender_ip_of(p as *u8) as i64   { return nb.get_be32(p, 14); }
+fn target_mac_of(p as *u8) as *u8  { return cast(*u8, cast(i64, p) + 18); }
+fn target_ip_of(p as *u8) as i64   { return nb.get_be32(p, 24); }
+
+// Is this a well-formed IPv4-over-ethernet ARP packet? Anything else is
+// rejected rather than interpreted: the hardware/protocol type fields exist
+// precisely so a receiver does not have to guess.
+fn is_valid(p as *u8, len as i64) as i64 {
+    if (len < PKT_LEN) { return 0; }
+    if (nb.get_be16(p, 0) != HTYPE_ETHER) { return 0; }
+    if (nb.get_be16(p, 2) != PTYPE_IPV4) { return 0; }
+    if (cast(i64, p[4]) != 6) { return 0; }
+    if (cast(i64, p[5]) != 4) { return 0; }
+    let is i64 as op = op_of(p);
+    if (op != OP_REQUEST && op != OP_REPLY) { return 0; }
+    return 1;
+}
+
+// ============================================================
+// Cache operations
+// ============================================================
+
+// Record a mapping learned from any packet. `solicited` marks a reply to a
+// request we sent, which is the only evidence strong enough to call an entry
+// REACHABLE — an unsolicited announcement proves the sender exists, not that
+// it can hear us, so it lands STALE and gets verified before being trusted.
+fn learn(c as *Cache, ip as i64, mac as *u8, solicited as i64, now as i64) as *Entry {
+    let is *Entry as e with mut = find(c, ip);
+    if (cast(i64, e) == 0) {
+        e = alloc(c, now);
+        e.ip = ip;
+        e.pend_len = 0;
+    }
+    eth.addr_copy(cast(*u8, &e.mac[0]), mac);
+    e.tries = 0;
+    e.used = now;
+    if (solicited != 0) {
+        e.state = ST_REACHABLE;
+        // A production stack randomises this over [0.5, 1.5] x REACHABLE_NS
+        // so that a thousand hosts that booted together do not all re-probe
+        // the gateway in the same millisecond. Deterministic here; the
+        // randomised form belongs with the timer wheel that will drive it.
+        e.expires = now + REACHABLE_NS;
+    } else {
+        e.state = ST_STALE;
+        e.expires = now;
+    }
+    return e;
+}
+
+let is i64 as LOOKUP_MISS  = 0;   // nothing known; caller should resolve
+let is i64 as LOOKUP_HIT   = 1;   // usable address in out_mac
+let is i64 as LOOKUP_WAIT  = 2;   // resolution already in flight
+
+// Resolve an address for transmission. HIT means send now; the entry may have
+// been STALE, in which case it has been moved to PROBE and the caller should
+// also send a verification request — but the packet goes out either way,
+// which is the entire point of having a STALE state.
+fn lookup(c as *Cache, ip as i64, out_mac as *u8, now as i64) as i64 {
+    let is *Entry as e = find(c, ip);
+    if (cast(i64, e) == 0) { c.misses = c.misses + 1; return LOOKUP_MISS; }
+    e.used = now;
+    if (e.state == ST_INCOMPLETE) { return LOOKUP_WAIT; }
+    if (e.state == ST_REACHABLE) {
+        if (now >= e.expires) {
+            e.state = ST_STALE;
+        } else {
+            c.hits = c.hits + 1;
+            eth.addr_copy(out_mac, cast(*u8, &e.mac[0]));
+            return LOOKUP_HIT;
+        }
+    }
+    if (e.state == ST_STALE) {
+        e.state = ST_PROBE;
+        e.expires = now + RETRY_NS;
+        e.tries = 0;
+    }
+    c.hits = c.hits + 1;
+    eth.addr_copy(out_mac, cast(*u8, &e.mac[0]));
+    return LOOKUP_HIT;
+}
+
+// Begin resolving, holding the packet that wanted the address. RFC 1122 says
+// keep the LATEST such packet, so a second one for the same address replaces
+// the first rather than being dropped.
+fn start_resolve(c as *Cache, ip as i64, pkt as *u8, pkt_len as i64, now as i64) as *Entry {
+    let is *Entry as e with mut = find(c, ip);
+    if (cast(i64, e) == 0) {
+        e = alloc(c, now);
+        e.ip = ip;
+        nb.fill(cast(*u8, &e.mac[0]), 0, 6);
+    }
+    e.state = ST_INCOMPLETE;
+    e.expires = now + RETRY_NS;
+    e.tries = 1;
+    e.used = now;
+    if (cast(i64, pkt) != 0 && pkt_len > 0 && pkt_len <= 1518) {
+        nb.copy(cast(*u8, &e.pending[0]), pkt, pkt_len);
+        e.pend_len = pkt_len;
+    }
+    return e;
+}
+
+// Take the held packet, if there is one, and clear it. Called after a reply
+// resolves the address.
+fn take_pending(e as *Entry, out as *u8) as i64 {
+    let is i64 as n = e.pend_len;
+    if (n <= 0) { return 0; }
+    nb.copy(out, cast(*u8, &e.pending[0]), n);
+    e.pend_len = 0;
+    return n;
+}
+
+let is i64 as TICK_NONE    = 0;
+let is i64 as TICK_RETRY   = 1;   // resend a broadcast request for out_ip
+let is i64 as TICK_PROBE   = 2;   // resend a unicast probe to out_mac
+let is i64 as TICK_EXPIRED = 3;   // gave up; entry dropped, pending discarded
+
+// Advance one entry's timers. Returns what the caller should do about it and
+// writes the address to act on. Driving this from the caller's poll loop
+// rather than from a thread is what keeps the whole stack single-threaded.
+fn tick(c as *Cache, i as i64, now as i64, out_ip as *i64, out_mac as *u8) as i64 {
+    let is *Entry as e = at(c, i);
+    if (e.state == ST_FREE) { return TICK_NONE; }
+    if (now < e.expires) { return TICK_NONE; }
+
+    if (e.state == ST_INCOMPLETE) {
+        if (e.tries >= MAX_TRIES) {
+            // Nobody answered. Drop it, discard the held packet, and let the
+            // layer above find out the way it always does — by timing out.
+            e.state = ST_FREE;
+            e.pend_len = 0;
+            out_ip[0] = e.ip;
+            return TICK_EXPIRED;
+        }
+        e.tries = e.tries + 1;
+        e.expires = now + RETRY_NS;
+        out_ip[0] = e.ip;
+        return TICK_RETRY;
+    }
+
+    if (e.state == ST_PROBE) {
+        if (e.tries >= MAX_TRIES) {
+            e.state = ST_FREE;
+            e.pend_len = 0;
+            out_ip[0] = e.ip;
+            return TICK_EXPIRED;
+        }
+        e.tries = e.tries + 1;
+        e.expires = now + RETRY_NS;
+        out_ip[0] = e.ip;
+        eth.addr_copy(out_mac, cast(*u8, &e.mac[0]));
+        return TICK_PROBE;
+    }
+
+    if (e.state == ST_REACHABLE) {
+        // Confirmation aged out. Not a failure: the address is almost
+        // certainly still right, so it stays usable and gets verified only if
+        // something actually sends to it again.
+        e.state = ST_STALE;
+        return TICK_NONE;
+    }
+    return TICK_NONE;
+}

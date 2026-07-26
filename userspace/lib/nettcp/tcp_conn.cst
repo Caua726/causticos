@@ -1,0 +1,932 @@
+// tcp_conn — the connection: its state, its buffers, and the rules that move
+// it between them.
+//
+// This is deliberately free of any notion of how a segment reaches the wire.
+// It is fed segments and it produces segments, into a caller-supplied buffer,
+// and it is driven by a clock the caller passes in. That is what lets the
+// whole protocol be tested by running two of these against each other in a
+// loop — a full handshake, a transfer with loss, a close, in microseconds and
+// with no hardware, no timing and no network.
+//
+// A stack tested only against a real peer is a stack whose retransmission
+// path has never run.
+//
+// WHAT IS HERE, AND WHY EACH ONE EXISTS:
+//
+//   The eleven states, including TIME_WAIT, which is not optional: without it
+//   a delayed segment from a closed connection can be accepted by its
+//   successor on the same four-tuple.
+//
+//   ISN from RFC 6528 — an unguessable initial sequence number, because a
+//   guessable one lets an off-path attacker inject into the stream.
+//
+//   Nagle, with a switch. Coalescing small writes is right for a bulk
+//   transfer and wrong for a request/response protocol, where it adds a round
+//   trip to every exchange; HTTP needs it off.
+//
+//   Delayed ACKs, bounded. Acknowledging every segment doubles the packet
+//   count; never delaying past 500ms or two full segments is what keeps the
+//   sender's window open.
+//
+//   SWS avoidance on both sides. A receiver that advertises tiny windows and
+//   a sender that fills them is the silly-window syndrome, and it degrades a
+//   connection to one byte per round trip.
+//
+//   Zero-window probing. When a receiver's window closes, the window update
+//   that reopens it is a pure ACK, and a pure ACK is not retransmitted — so
+//   if it is lost, both sides wait forever. The persist timer is the only
+//   thing that breaks that deadlock.
+
+use "../netbuf/netbuf.cst" as nb;
+use "tcp_wire.cst" as w;
+use "tcp_cc.cst" as cc;
+
+// The eleven states of RFC 793.
+let is i64 as CLOSED       = 0;
+let is i64 as LISTEN       = 1;
+let is i64 as SYN_SENT     = 2;
+let is i64 as SYN_RECEIVED = 3;
+let is i64 as ESTABLISHED  = 4;
+let is i64 as FIN_WAIT_1   = 5;
+let is i64 as FIN_WAIT_2   = 6;
+let is i64 as CLOSE_WAIT   = 7;
+let is i64 as CLOSING      = 8;
+let is i64 as LAST_ACK     = 9;
+let is i64 as TIME_WAIT    = 10;
+
+// Buffers, per direction. 16 KiB is the trade this stack makes: a Conn is a
+// fixed-size struct, netd holds a pool of them, and 64 KiB each way would be
+// a quarter megabyte per connection sitting idle. 16 KiB keeps a LAN link
+// busy at the latencies this runs at, and window scaling is negotiated for
+// paths where the bandwidth-delay product is larger.
+let is i64 as SND_BUF = 16384;
+let is i64 as RCV_BUF = 16384;
+
+// Out-of-order segments held while waiting for the gap to fill. Bounded: past
+// this, later segments are dropped and the sender retransmits, which is
+// slower than holding them but cannot be turned into a memory exhaustion.
+let is i64 as OOO_MAX = 8;
+
+let is i64 as MSL_NS = 30000000000;              // 30s; TIME_WAIT is twice this
+let is i64 as DELAYED_ACK_NS = 200000000;        // 200ms, well inside the 500ms cap
+let is i64 as PERSIST_MIN_NS = 200000000;
+let is i64 as PERSIST_MAX_NS = 60000000000;
+// RFC 1122 §4.2.3.5: give up after roughly 100 seconds of retransmission.
+let is i64 as MAX_RETRIES = 8;
+
+// A held out-of-order segment.
+struct Ooo {
+    used as i64;
+    seq  as i64;
+    len  as i64;
+    off  as i64;      // where its bytes sit in the ooo arena
+}
+
+struct Conn {
+    state      as i64;
+    // Identity.
+    local_ip   as i64;
+    local_port as i64;
+    peer_ip    as i64;
+    peer_port  as i64;
+
+    // Send sequence space (RFC 793 §3.2).
+    snd_una    as i64;      // oldest unacknowledged
+    snd_nxt    as i64;      // next to send
+    snd_wnd    as i64;      // the peer's advertised window, scaled
+    snd_wl1    as i64;      // sequence of the segment that last updated the window
+    snd_wl2    as i64;      // and its ack — together they stop an old segment
+    iss        as i64;      //   from shrinking a window it knows nothing about
+    snd_wscale as i64;
+
+    // Receive sequence space.
+    rcv_nxt    as i64;      // next expected
+    rcv_wnd    as i64;
+    irs        as i64;
+    rcv_wscale as i64;
+
+    // Negotiated.
+    mss        as i64;
+    sack_ok    as i64;
+    ts_ok      as i64;
+    ts_recent  as i64;      // the peer's clock, echoed back
+    ts_last_ack as i64;
+
+    // Flags in flight.
+    fin_sent   as i64;
+    fin_seq    as i64;
+    fin_rcvd   as i64;
+    need_ack   as i64;      // something must be acknowledged
+    nodelay    as i64;      // Nagle off
+
+    // Timers, as absolute deadlines. Zero means disarmed.
+    rto_at     as i64;
+    delack_at  as i64;
+    persist_at as i64;
+    persist_backoff as i64;
+    timewait_at as i64;
+    retries    as i64;
+
+    // RTT measurement: which sequence is being timed, and since when. Karn's
+    // algorithm says a retransmitted segment yields no sample — the reply
+    // cannot be attributed to either transmission.
+    rtt_seq    as i64;
+    rtt_at     as i64;
+    rtt_valid  as i64;
+
+    dupacks    as i64;
+    // High-water mark of what has been sent, for recovery bookkeeping.
+    high_sent  as i64;
+
+    error      as i64;      // nonzero once the connection has failed
+
+    rtt as cc.Rtt;
+    cong as cc.Cong;
+
+    // Send buffer: bytes the application handed over, not all sent, not all
+    // acked. snd_una marks where it starts in sequence terms.
+    snd_head   as i64;      // bytes consumed by acks
+    snd_len    as i64;      // bytes held
+    rcv_len    as i64;      // bytes ready for the application
+    n_ooo      as i64;
+
+    o0 as Ooo; o1 as Ooo; o2 as Ooo; o3 as Ooo;
+    o4 as Ooo; o5 as Ooo; o6 as Ooo; o7 as Ooo;
+
+    snd_buf as [16384]u8;      // == SND_BUF
+    rcv_buf as [16384]u8;      // == RCV_BUF
+    ooo_buf as [8192]u8;       // OOO_MAX * 1024
+}
+
+fn ooo_at(c as *Conn, i as i64) as *Ooo {
+    if (i == 0) { return &c.o0; }
+    if (i == 1) { return &c.o1; }
+    if (i == 2) { return &c.o2; }
+    if (i == 3) { return &c.o3; }
+    if (i == 4) { return &c.o4; }
+    if (i == 5) { return &c.o5; }
+    if (i == 6) { return &c.o6; }
+    return &c.o7;
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
+fn conn_init(c as *Conn) as void {
+    c.state = CLOSED;
+    c.local_ip = 0; c.local_port = 0; c.peer_ip = 0; c.peer_port = 0;
+    c.snd_una = 0; c.snd_nxt = 0; c.snd_wnd = 0;
+    c.snd_wl1 = 0; c.snd_wl2 = 0; c.iss = 0; c.snd_wscale = 0;
+    c.rcv_nxt = 0; c.rcv_wnd = RCV_BUF; c.irs = 0; c.rcv_wscale = 0;
+    c.mss = w.MSS_DEFAULT;
+    c.sack_ok = 0; c.ts_ok = 0; c.ts_recent = 0; c.ts_last_ack = 0;
+    c.fin_sent = 0; c.fin_seq = 0; c.fin_rcvd = 0;
+    c.need_ack = 0; c.nodelay = 0;
+    c.rto_at = 0; c.delack_at = 0; c.persist_at = 0; c.persist_backoff = 0;
+    c.timewait_at = 0; c.retries = 0;
+    c.rtt_seq = 0; c.rtt_at = 0; c.rtt_valid = 0;
+    c.dupacks = 0; c.high_sent = 0; c.error = 0;
+    c.snd_head = 0; c.snd_len = 0; c.rcv_len = 0; c.n_ooo = 0;
+    cc.rtt_init(&c.rtt);
+    cc.cong_init(&c.cong, w.MSS_DEFAULT);
+    let is i64 as i with mut = 0;
+    while (i < OOO_MAX) { ooo_at(c, i).used = 0; i = i + 1; }
+    return;
+}
+
+// The receive window we advertise. SWS avoidance, receiver half (RFC 1122
+// §4.2.3.3): rather than announcing every byte as it frees up, hold at zero
+// until at least a segment's worth is available. Announcing two bytes invites
+// two-byte segments, and the connection degrades to one round trip per byte.
+fn advertised_window(c as *Conn) as i64 {
+    let is i64 as free = RCV_BUF - c.rcv_len;
+    let is i64 as half = RCV_BUF / 2;
+    let is i64 as floor with mut = c.mss;
+    if (half < floor) { floor = half; }
+    if (free < floor) { return 0; }
+    return free;
+}
+
+// ============================================================
+// Emitting segments
+//
+// Nothing here touches a network. A segment is built into `out` and the
+// caller decides what becomes of it, which is what makes a loopback test of
+// the entire protocol possible.
+// ============================================================
+
+// Options that belong on a SYN. MSS always; the rest are what we are willing
+// to negotiate.
+fn put_syn_opts(c as *Conn, out as *u8, off as i64, ts_now as i64) as i64 {
+    let is i64 as o with mut = w.put_mss(out, off, c.mss);
+    o = w.put_wscale(out, o, 7);            // 7: enough for a 8 MiB window
+    o = w.put_sack_perm(out, o);
+    o = w.put_timestamp(out, o, ts_now, c.ts_recent);
+    return o;
+}
+
+// Build one segment. `data`/`dlen` are payload already chosen by the caller;
+// `flags` are what to set beyond ACK. Returns total length.
+fn build_segment(c as *Conn, out as *u8, seq as i64, flags as i64,
+                 data as *u8, dlen as i64, ts_now as i64) as i64 {
+    let is i64 as win = w.unscaled_window(advertised_window(c), c.rcv_wscale);
+    w.put_header(out, c.local_port, c.peer_port, seq, c.rcv_nxt, flags, win);
+    let is i64 as o with mut = w.HDR_MIN;
+    if ((flags & w.SYN) != 0) {
+        o = put_syn_opts(c, out, o, ts_now);
+    } else if (c.ts_ok == 1) {
+        o = w.put_timestamp(out, o, ts_now, c.ts_recent);
+    }
+    o = w.finish_opts(out, o);
+    if (dlen > 0) {
+        nb.copy(cast(*u8, cast(i64, out) + o), data, dlen);
+    }
+    let is i64 as total = o + dlen;
+    w.finish(out, total, c.local_ip, c.peer_ip);
+    return total;
+}
+
+// A bare RST, which needs no connection state and is the answer to a segment
+// for a connection that does not exist.
+fn build_rst(out as *u8, src_ip as i64, dst_ip as i64, sport as i64,
+             dport as i64, seq as i64, ack as i64, with_ack as i64) as i64 {
+    let is i64 as flags with mut = w.RST;
+    if (with_ack != 0) { flags = flags | w.ACK; }
+    w.put_header(out, sport, dport, seq, ack, flags, 0);
+    let is i64 as n = w.finish_opts(out, w.HDR_MIN);
+    w.finish(out, n, src_ip, dst_ip);
+    return n;
+}
+
+// ============================================================
+// Opening
+// ============================================================
+
+// The initial sequence number (RFC 6528). A predictable ISN lets an off-path
+// attacker inject into an established connection, and the defence is that it
+// cannot be guessed — the caller passes real entropy in.
+fn conn_connect(c as *Conn, local_ip as i64, local_port as i64,
+                peer_ip as i64, peer_port as i64, isn as i64,
+                out as *u8, now as i64, ts_now as i64) as i64 {
+    c.local_ip = local_ip; c.local_port = local_port;
+    c.peer_ip = peer_ip; c.peer_port = peer_port;
+    c.iss = isn & w.SEQ_MASK;
+    c.snd_una = c.iss;
+    c.snd_nxt = w.seq_add(c.iss, 1);         // the SYN occupies one
+    c.high_sent = c.snd_nxt;
+    c.state = SYN_SENT;
+    c.rto_at = now + cc.rtt_current(&c.rtt);
+    c.retries = 0;
+    // Time this SYN: the handshake gives the first RTT sample, and without it
+    // the first retransmission timeout is a guess.
+    c.rtt_seq = c.iss;
+    c.rtt_at = now;
+    c.rtt_valid = 1;
+    return build_segment(c, out, c.iss, w.SYN, cast(*u8, 0), 0, ts_now);
+}
+
+// A listening endpoint needs its own initial sequence number ready, for the
+// same reason a connecting one does: the SYN+ACK carries it, and it must be
+// as unguessable as the client's.
+fn conn_listen(c as *Conn, local_ip as i64, local_port as i64, isn as i64) as void {
+    c.local_ip = local_ip;
+    c.local_port = local_port;
+    c.iss = isn & w.SEQ_MASK;
+    c.snd_una = c.iss;
+    c.snd_nxt = c.iss;              // the SYN+ACK has not gone out yet
+    c.state = LISTEN;
+    return;
+}
+
+// ============================================================
+// Sending data
+// ============================================================
+
+// Hand bytes to the connection. Returns how many were taken — a short accept
+// is normal and means the send buffer is full.
+fn conn_write(c as *Conn, data as *u8, len as i64) as i64 {
+    if (c.state != ESTABLISHED && c.state != CLOSE_WAIT) { return 0 - 1; }
+    if (c.fin_sent == 1) { return 0 - 1; }
+    let is i64 as space = SND_BUF - c.snd_len;
+    let is i64 as n with mut = len;
+    if (n > space) { n = space; }
+    if (n <= 0) { return 0; }
+    nb.copy(cast(*u8, cast(i64, &c.snd_buf[0]) + c.snd_len), data, n);
+    c.snd_len = c.snd_len + n;
+    return n;
+}
+
+// How much may go out right now: the smaller of what the peer will accept and
+// what congestion control allows, minus what is already in flight.
+fn send_window(c as *Conn) as i64 {
+    let is i64 as inflight = w.seq_diff(c.snd_nxt, c.snd_una);
+    let is i64 as wnd with mut = c.snd_wnd;
+    if (c.cong.cwnd < wnd) { wnd = c.cong.cwnd; }
+    let is i64 as avail = wnd - inflight;
+    if (avail < 0) { return 0; }
+    return avail;
+}
+
+// Nagle (RFC 896): with unacknowledged data outstanding, hold a small segment
+// until either it grows to a full one or the outstanding data is acked.
+//
+// It is right for bulk transfer and wrong for request/response, where it adds
+// a round trip to every exchange — which is why TCP_NODELAY exists and why
+// HTTP sets it. The switch is part of the interface rather than a constant.
+fn nagle_allows(c as *Conn, len as i64) as i64 {
+    if (c.nodelay == 1) { return 1; }
+    if (len >= c.mss) { return 1; }
+    if (c.snd_una == c.snd_nxt) { return 1; }     // nothing outstanding
+    if (c.fin_sent == 1) { return 1; }            // closing: do not sit on it
+    return 0;
+}
+
+// Build the next segment to send, or return 0 when there is nothing to send
+// now. Called repeatedly by the driver until it returns 0.
+fn conn_output(c as *Conn, out as *u8, now as i64, ts_now as i64) as i64 {
+    if (c.state == CLOSED || c.state == LISTEN) { return 0; }
+
+    // TIME_WAIT sends nothing new, but it MUST still acknowledge — the ACK
+    // for the peer's FIN is what moves the peer out of LAST_ACK, and a side
+    // that stops talking the moment it enters TIME_WAIT strands the other end
+    // there until its retransmissions run out. Found by the loopback close
+    // test leaving the peer stuck in LAST_ACK.
+    if (c.state == TIME_WAIT) {
+        if (c.need_ack == 1) {
+            c.need_ack = 0;
+            c.delack_at = 0;
+            return build_segment(c, out, c.snd_nxt, w.ACK, cast(*u8, 0), 0, ts_now);
+        }
+        return 0;
+    }
+
+    // Retransmit before anything new: the oldest unacknowledged data is what
+    // the peer is waiting for, and sending past it just fills a queue.
+    if (c.rto_at != 0 && now >= c.rto_at) {
+        c.retries = c.retries + 1;
+        if (c.retries > MAX_RETRIES) {
+            c.state = CLOSED;
+            c.error = 1;
+            return 0;
+        }
+        cc.rtt_timeout(&c.rtt);
+        cc.cong_on_timeout(&c.cong);
+        c.rto_at = now + cc.rtt_current(&c.rtt);
+        // Karn: a retransmitted segment yields no RTT sample, because a reply
+        // cannot be attributed to one transmission or the other.
+        c.rtt_valid = 0;
+        c.snd_nxt = c.snd_una;                   // go back and resend
+
+        if (c.state == SYN_SENT) {
+            return build_segment(c, out, c.iss, w.SYN, cast(*u8, 0), 0, ts_now);
+        }
+        if (c.state == SYN_RECEIVED) {
+            c.snd_nxt = w.seq_add(c.iss, 1);
+            return build_segment(c, out, c.iss, w.SYN | w.ACK, cast(*u8, 0), 0, ts_now);
+        }
+    }
+
+    // The SYN+ACK a passive open owes. snd_nxt still sitting at iss is what
+    // says it has not gone out — the same test the retransmission path uses,
+    // rather than a separate flag that could disagree with it.
+    if (c.state == SYN_RECEIVED && c.snd_nxt == c.iss) {
+        c.snd_nxt = w.seq_add(c.iss, 1);
+        c.high_sent = c.snd_nxt;
+        if (c.rto_at == 0) { c.rto_at = now + cc.rtt_current(&c.rtt); }
+        return build_segment(c, out, c.iss, w.SYN | w.ACK, cast(*u8, 0), 0, ts_now);
+    }
+
+    if (c.state == SYN_SENT || c.state == SYN_RECEIVED) { return 0; }
+
+    // A window that has closed: probe it. The update that reopens it is a
+    // pure ACK, which is never retransmitted, so a lost one deadlocks both
+    // sides forever. This timer is the only thing that breaks that.
+    if (c.snd_wnd == 0 && c.snd_len > 0 && c.persist_at != 0 && now >= c.persist_at) {
+        c.persist_backoff = c.persist_backoff + 1;
+        let is i64 as back with mut = PERSIST_MIN_NS << c.persist_backoff;
+        if (back > PERSIST_MAX_NS) { back = PERSIST_MAX_NS; }
+        c.persist_at = now + back;
+        // One byte past the window: the peer must answer with its current
+        // window, whether it can take the byte or not.
+        let is i64 as off = w.seq_diff(c.snd_nxt, c.snd_una);
+        if (off < c.snd_len) {
+            return build_segment(c, out, c.snd_nxt, w.ACK,
+                                 cast(*u8, cast(i64, &c.snd_buf[0]) + off), 1, ts_now);
+        }
+    }
+
+    // New data.
+    let is i64 as unsent = c.snd_len - w.seq_diff(c.snd_nxt, c.snd_una);
+    if (unsent > 0) {
+        let is i64 as avail with mut = send_window(c);
+        if (c.cong.in_recovery == 1) {
+            let is i64 as pipe = w.seq_diff(c.snd_nxt, c.snd_una);
+            let is i64 as prr = cc.prr_allowed(&c.cong, 0, pipe);
+            if (prr < avail) { avail = prr; }
+        }
+        if (avail > 0) {
+            let is i64 as n with mut = unsent;
+            if (n > avail) { n = avail; }
+            if (n > c.mss) { n = c.mss; }
+            if (nagle_allows(c, n) == 1) {
+                let is i64 as off = w.seq_diff(c.snd_nxt, c.snd_una);
+                let is i64 as seq = c.snd_nxt;
+                let is i64 as flags with mut = w.ACK;
+                // PSH on the last segment of what the application has given
+                // us, which is a hint to the peer to deliver rather than wait.
+                if (n == unsent) { flags = flags | w.PSH; }
+                c.snd_nxt = w.seq_add(c.snd_nxt, n);
+                if (w.seq_gt(c.snd_nxt, c.high_sent) == 1) { c.high_sent = c.snd_nxt; }
+                if (c.rtt_valid == 0) {
+                    c.rtt_seq = seq;
+                    c.rtt_at = now;
+                    c.rtt_valid = 1;
+                }
+                if (c.rto_at == 0) { c.rto_at = now + cc.rtt_current(&c.rtt); }
+                if (c.cong.in_recovery == 1) { cc.prr_sent(&c.cong, n); }
+                c.need_ack = 0;
+                c.delack_at = 0;
+                return build_segment(c, out, seq, flags,
+                                     cast(*u8, cast(i64, &c.snd_buf[0]) + off),
+                                     n, ts_now);
+            }
+        }
+        // The window is closed and there is data waiting: arm the probe.
+        if (c.snd_wnd == 0 && c.persist_at == 0) {
+            c.persist_at = now + PERSIST_MIN_NS;
+        }
+    }
+
+    // A FIN we owe, once everything before it is out.
+    if (c.fin_sent == 1 && w.seq_lt(c.snd_nxt, w.seq_add(c.fin_seq, 1)) == 1) {
+        let is i64 as sent = w.seq_diff(c.snd_nxt, c.snd_una);
+        if (sent >= c.snd_len) {
+            let is i64 as seq = c.snd_nxt;
+            c.snd_nxt = w.seq_add(c.snd_nxt, 1);
+            if (c.rto_at == 0) { c.rto_at = now + cc.rtt_current(&c.rtt); }
+            return build_segment(c, out, seq, w.ACK | w.FIN, cast(*u8, 0), 0, ts_now);
+        }
+    }
+
+    // A pure ACK we owe, either immediately or because the delay expired.
+    if (c.need_ack == 1) {
+        if (c.delack_at == 0 || now >= c.delack_at) {
+            c.need_ack = 0;
+            c.delack_at = 0;
+            return build_segment(c, out, c.snd_nxt, w.ACK, cast(*u8, 0), 0, ts_now);
+        }
+    }
+    return 0;
+}
+
+fn conn_close(c as *Conn, now as i64) as i64 {
+    if (c.state == ESTABLISHED) {
+        c.fin_sent = 1;
+        c.fin_seq = w.seq_add(c.snd_una, c.snd_len);
+        c.state = FIN_WAIT_1;
+        return 0;
+    }
+    if (c.state == CLOSE_WAIT) {
+        c.fin_sent = 1;
+        c.fin_seq = w.seq_add(c.snd_una, c.snd_len);
+        c.state = LAST_ACK;
+        return 0;
+    }
+    if (c.state == SYN_SENT || c.state == LISTEN) {
+        c.state = CLOSED;
+        return 0;
+    }
+    return 0 - 1;
+}
+
+// ============================================================
+// Receiving
+// ============================================================
+
+// Take bytes the application has read, freeing window. The window opening is
+// what tells the peer it may send again, so this arms an ACK — a receiver
+// that frees space silently leaves the sender waiting on a window that is
+// already open.
+fn conn_read(c as *Conn, out as *u8, max as i64) as i64 {
+    let is i64 as n with mut = c.rcv_len;
+    if (n > max) { n = max; }
+    if (n <= 0) { return 0; }
+    nb.copy(out, cast(*u8, &c.rcv_buf[0]), n);
+    let is i64 as rest = c.rcv_len - n;
+    if (rest > 0) {
+        nb.copy(cast(*u8, &c.rcv_buf[0]),
+                cast(*u8, cast(i64, &c.rcv_buf[0]) + n), rest);
+    }
+    let is i64 as was = advertised_window(c);
+    c.rcv_len = rest;
+    c.need_ack = 1;
+    // A WINDOW UPDATE IS NEVER DELAYED. The delayed ACK exists to save a
+    // packet when acknowledging DATA — the peer is sending anyway and one ACK
+    // for two segments costs it nothing. A window that has just reopened is
+    // the opposite case: the peer has STOPPED, it is waiting on exactly this
+    // packet, and holding it back for 200 ms hands the connection to the
+    // sender's persist timer instead. That timer is measured in seconds, and
+    // in a capture of a stalling audio stream it showed up as three pauses of
+    // over a second in a six-second transfer.
+    //
+    // Only when the window actually went from shut to open: otherwise every
+    // read costs a packet and the delayed ACK stops paying for itself.
+    if (was <= 0 && advertised_window(c) > 0) { c.delack_at = 0; }
+    return n;
+}
+
+// Try to place a received segment's payload. In-order data goes straight in;
+// anything ahead of rcv_nxt is held, if there is room.
+fn deliver(c as *Conn, seq as i64, data as *u8, len as i64) as i64 {
+    if (len <= 0) { return 0; }
+    if (seq == c.rcv_nxt) {
+        let is i64 as space = RCV_BUF - c.rcv_len;
+        let is i64 as n with mut = len;
+        if (n > space) { n = space; }
+        if (n <= 0) { return 0; }
+        nb.copy(cast(*u8, cast(i64, &c.rcv_buf[0]) + c.rcv_len), data, n);
+        c.rcv_len = c.rcv_len + n;
+        c.rcv_nxt = w.seq_add(c.rcv_nxt, n);
+
+        // That may have filled a gap: drain whatever now lines up.
+        let is i64 as progress with mut = 1;
+        while (progress == 1) {
+            progress = 0;
+            let is i64 as i with mut = 0;
+            while (i < OOO_MAX) {
+                let is *Ooo as o = ooo_at(c, i);
+                if (o.used == 1 && o.seq == c.rcv_nxt) {
+                    let is i64 as sp = RCV_BUF - c.rcv_len;
+                    let is i64 as m with mut = o.len;
+                    if (m > sp) { m = sp; }
+                    if (m > 0) {
+                        nb.copy(cast(*u8, cast(i64, &c.rcv_buf[0]) + c.rcv_len),
+                                cast(*u8, cast(i64, &c.ooo_buf[0]) + o.off), m);
+                        c.rcv_len = c.rcv_len + m;
+                        c.rcv_nxt = w.seq_add(c.rcv_nxt, m);
+                        progress = 1;
+                    }
+                    o.used = 0;
+                    c.n_ooo = c.n_ooo - 1;
+                }
+                i = i + 1;
+            }
+        }
+        return n;
+    }
+
+    // Ahead of what we need: hold it, so the sender does not have to resend
+    // everything after the gap once the gap is filled. That is the whole
+    // value of SACK, and holding nothing makes SACK pointless.
+    if (w.seq_gt(seq, c.rcv_nxt) == 1) {
+        if (c.n_ooo >= OOO_MAX) { return 0; }
+        if (len > 1024) { return 0; }
+        let is i64 as i with mut = 0;
+        while (i < OOO_MAX) {
+            let is *Ooo as o = ooo_at(c, i);
+            if (o.used == 0) {
+                o.used = 1;
+                o.seq = seq;
+                o.len = len;
+                o.off = i * 1024;
+                nb.copy(cast(*u8, cast(i64, &c.ooo_buf[0]) + o.off), data, len);
+                c.n_ooo = c.n_ooo + 1;
+                return 0;
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// The SACK blocks to advertise: what we hold out of order. RFC 2018 wants the
+// most recently received block first.
+fn fill_sack(c as *Conn, o as *w.Opts) as void {
+    w.opts_clear(o);
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < OOO_MAX && n < 4) {
+        let is *Ooo as e = ooo_at(c, i);
+        if (e.used == 1) {
+            w.set_sack(o, n, e.seq, w.seq_add(e.seq, e.len));
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    o.n_sack = n;
+    return;
+}
+
+let is i64 as IN_OK      = 0;
+let is i64 as IN_RESET   = 1;    // the peer reset us
+let is i64 as IN_CLOSED  = 2;    // the connection finished
+let is i64 as IN_DROP    = 3;    // not for us / not acceptable
+
+// Feed one segment. `total` is header + payload.
+fn conn_input(c as *Conn, p as *u8, total as i64, now as i64) as i64 {
+    let is w.Opts as o;
+    w.parse_opts(p, total, &o);
+    let is i64 as flags = w.flags_of(p);
+    let is i64 as seq = w.seq_of(p);
+    let is i64 as ack = w.ack_of(p);
+    let is i64 as slen = w.seg_len(p, total);
+    let is i64 as plen = w.payload_len(p, total);
+
+    // --- LISTEN: only a SYN means anything ---
+    if (c.state == LISTEN) {
+        if ((flags & w.SYN) == 0) { return IN_DROP; }
+        c.irs = seq;
+        c.rcv_nxt = w.seq_add(seq, 1);
+        c.peer_port = w.src_port(p);
+        if (o.mss > 0) { c.mss = o.mss; }
+        if (o.wscale >= 0) { c.snd_wscale = o.wscale; c.rcv_wscale = 7; }
+        c.sack_ok = o.sack_ok;
+        c.ts_ok = o.has_ts;
+        if (o.has_ts == 1) { c.ts_recent = o.ts_val; }
+        c.snd_wnd = w.scaled_window(w.window_of(p), c.snd_wscale);
+        cc.cong_init(&c.cong, c.mss);
+        c.state = SYN_RECEIVED;
+        // snd_nxt still equals iss, which is what tells conn_output the
+        // SYN+ACK is owed. Arm the timer so a lost one is resent.
+        c.rto_at = now + cc.rtt_current(&c.rtt);
+        c.retries = 0;
+        c.rtt_seq = c.iss;
+        c.rtt_at = now;
+        c.rtt_valid = 1;
+        return IN_OK;
+    }
+
+    // --- SYN_SENT: the reply to our SYN ---
+    if (c.state == SYN_SENT) {
+        if ((flags & w.ACK) != 0) {
+            // An ACK that does not acknowledge our SYN is not an answer to
+            // it, and RFC 793 says answer with a RST.
+            if (ack != w.seq_add(c.iss, 1)) { return IN_DROP; }
+        }
+        if ((flags & w.RST) != 0) {
+            if ((flags & w.ACK) != 0) { c.state = CLOSED; c.error = 1; return IN_RESET; }
+            return IN_DROP;
+        }
+        if ((flags & w.SYN) == 0) { return IN_DROP; }
+
+        c.irs = seq;
+        c.rcv_nxt = w.seq_add(seq, 1);
+        if (o.mss > 0 && o.mss < c.mss) { c.mss = o.mss; }
+        else if (o.mss > 0) { c.mss = o.mss; }
+        if (o.wscale >= 0) { c.snd_wscale = o.wscale; c.rcv_wscale = 7; }
+        else { c.snd_wscale = 0; c.rcv_wscale = 0; }
+        c.sack_ok = o.sack_ok;
+        c.ts_ok = o.has_ts;
+        if (o.has_ts == 1) { c.ts_recent = o.ts_val; }
+        cc.cong_init(&c.cong, c.mss);
+
+        if ((flags & w.ACK) != 0) {
+            c.snd_una = ack;
+            c.snd_wnd = w.scaled_window(w.window_of(p), c.snd_wscale);
+            c.snd_wl1 = seq; c.snd_wl2 = ack;
+            c.state = ESTABLISHED;
+            c.rto_at = 0;
+            c.retries = 0;
+            // The handshake is the first RTT sample, and without it the first
+            // real timeout is a guess.
+            if (c.rtt_valid == 1 && c.rtt_seq == c.iss) {
+                cc.rtt_measure(&c.rtt, now - c.rtt_at);
+                c.rtt_valid = 0;
+            }
+            c.need_ack = 1;
+            return IN_OK;
+        }
+        // Simultaneous open: both sides sent SYN.
+        c.state = SYN_RECEIVED;
+        c.need_ack = 1;
+        return IN_OK;
+    }
+
+    // --- everything else: the segment must be acceptable ---
+    //
+    // RFC 793 §3.9: a segment is acceptable if any part of it falls inside
+    // the receive window. Checking only the first byte rejects a segment that
+    // partly overlaps what we already have, which is a normal retransmission.
+    let is i64 as win with mut = advertised_window(c);
+    if (win == 0) { win = 1; }             // always accept one byte, for probes
+    let is i64 as acceptable with mut = 0;
+    if (slen == 0) {
+        if (w.seq_between(seq, c.rcv_nxt, w.seq_add(c.rcv_nxt, win)) == 1) { acceptable = 1; }
+        if (seq == c.rcv_nxt) { acceptable = 1; }
+    } else {
+        if (w.seq_between(seq, c.rcv_nxt, w.seq_add(c.rcv_nxt, win)) == 1) { acceptable = 1; }
+        let is i64 as last = w.seq_add(seq, slen - 1);
+        if (w.seq_between(last, c.rcv_nxt, w.seq_add(c.rcv_nxt, win)) == 1) { acceptable = 1; }
+        // Or it covers the window entirely.
+        if (w.seq_leq(seq, c.rcv_nxt) == 1 && w.seq_geq(last, c.rcv_nxt) == 1) {
+            acceptable = 1;
+        }
+    }
+    if (acceptable == 0) {
+        // Not acceptable: acknowledge, so a peer that is confused about where
+        // we are finds out. Silence would leave it retransmitting forever.
+        c.need_ack = 1;
+        c.delack_at = 0;
+        return IN_DROP;
+    }
+
+    // PAWS (RFC 7323 §5.3): a timestamp older than the newest one seen means
+    // the segment is a straggler from an earlier incarnation of this
+    // connection, however plausible its sequence number.
+    if (c.ts_ok == 1 && o.has_ts == 1) {
+        if (w.seq_lt(o.ts_val, c.ts_recent) == 1 && slen > 0) {
+            c.need_ack = 1;
+            return IN_DROP;
+        }
+        if (w.seq_geq(seq, c.ts_last_ack) == 1) { c.ts_recent = o.ts_val; }
+    }
+
+    if ((flags & w.RST) != 0) {
+        // RFC 5961 §3.2: only a RST at exactly rcv_nxt is acted on. One that
+        // merely lands in the window gets a challenge ACK instead, because
+        // accepting it lets an off-path attacker tear down a connection by
+        // guessing anywhere in the window rather than exactly.
+        if (seq == c.rcv_nxt) {
+            c.state = CLOSED;
+            c.error = 1;
+            return IN_RESET;
+        }
+        c.need_ack = 1;
+        c.delack_at = 0;
+        return IN_DROP;
+    }
+
+    // A SYN inside an established connection is either a very confused peer
+    // or an attack; RFC 5961 §4 says challenge rather than reset.
+    if ((flags & w.SYN) != 0 && c.state != SYN_RECEIVED) {
+        c.need_ack = 1;
+        c.delack_at = 0;
+        return IN_DROP;
+    }
+
+    if ((flags & w.ACK) == 0) { return IN_DROP; }
+
+    // --- the ACK ---
+    if (c.state == SYN_RECEIVED) {
+        if (w.seq_leq(c.snd_una, ack) == 1 && w.seq_leq(ack, c.snd_nxt) == 1) {
+            c.snd_una = ack;
+            c.snd_wnd = w.scaled_window(w.window_of(p), c.snd_wscale);
+            c.snd_wl1 = seq; c.snd_wl2 = ack;
+            c.state = ESTABLISHED;
+            c.rto_at = 0;
+            c.retries = 0;
+        } else {
+            return IN_DROP;
+        }
+    }
+
+    if (w.seq_gt(ack, c.snd_nxt) == 1) {
+        // Acknowledging something we never sent.
+        c.need_ack = 1;
+        return IN_DROP;
+    }
+
+    if (w.seq_gt(ack, c.snd_una) == 1) {
+        let is i64 as acked = w.seq_diff(ack, c.snd_una);
+        // Drop the acknowledged bytes from the send buffer. The FIN consumes
+        // a sequence number but no byte, so it is not in the buffer.
+        let is i64 as data_acked with mut = acked;
+        if (c.fin_sent == 1 && w.seq_geq(ack, w.seq_add(c.fin_seq, 1)) == 1) {
+            data_acked = acked - 1;
+        }
+        if (data_acked > c.snd_len) { data_acked = c.snd_len; }
+        if (data_acked > 0) {
+            let is i64 as rest = c.snd_len - data_acked;
+            if (rest > 0) {
+                nb.copy(cast(*u8, &c.snd_buf[0]),
+                        cast(*u8, cast(i64, &c.snd_buf[0]) + data_acked), rest);
+            }
+            c.snd_len = rest;
+        }
+        c.snd_una = ack;
+        c.dupacks = 0;
+        c.retries = 0;
+
+        // An RTT sample, if this ACK covers the segment being timed and that
+        // segment was never retransmitted (Karn).
+        if (c.rtt_valid == 1 && w.seq_gt(ack, c.rtt_seq) == 1) {
+            cc.rtt_measure(&c.rtt, now - c.rtt_at);
+            c.rtt_valid = 0;
+        }
+
+        if (cc.cong_recovery_done(&c.cong, ack) == 0) {
+            cc.cong_on_ack(&c.cong, acked);
+        }
+
+        // Restart or disarm the retransmission timer: outstanding data keeps
+        // it running, an empty pipe stops it.
+        if (c.snd_una == c.snd_nxt) { c.rto_at = 0; }
+        else { c.rto_at = now + cc.rtt_current(&c.rtt); }
+
+        // Window reopened: the persist timer is no longer needed.
+        c.persist_at = 0;
+        c.persist_backoff = 0;
+    } else if (ack == c.snd_una && slen == 0 && plen == 0) {
+        // A duplicate ACK — the peer got something out of order. Three of
+        // them means a segment was lost, and retransmitting immediately
+        // rather than waiting for the timer is what keeps a single loss from
+        // costing a whole RTO.
+        if (w.window_of(p) == w.unscaled_window(c.snd_wnd, c.snd_wscale)) {
+            c.dupacks = c.dupacks + 1;
+            if (c.dupacks == 3 && c.cong.in_recovery == 0) {
+                cc.cong_enter_recovery(&c.cong, c.high_sent,
+                                       w.seq_diff(c.snd_nxt, c.snd_una));
+                c.snd_nxt = c.snd_una;          // resend the lost one now
+                c.rto_at = now + cc.rtt_current(&c.rtt);
+            }
+        }
+    }
+
+    // Window update. snd_wl1/wl2 keep an older segment from shrinking a
+    // window it knows nothing about — segments reorder, and a stale window is
+    // worse than none.
+    if (w.seq_lt(c.snd_wl1, seq) == 1
+        || (c.snd_wl1 == seq && w.seq_leq(c.snd_wl2, ack) == 1)) {
+        c.snd_wnd = w.scaled_window(w.window_of(p), c.snd_wscale);
+        c.snd_wl1 = seq;
+        c.snd_wl2 = ack;
+    }
+
+    // --- payload ---
+    if (plen > 0) {
+        let is i64 as data = cast(i64, w.payload(p));
+        let is i64 as s with mut = seq;
+        let is i64 as d with mut = data;
+        let is i64 as n with mut = plen;
+        // Trim what we already have: a retransmission may overlap.
+        if (w.seq_lt(s, c.rcv_nxt) == 1) {
+            let is i64 as skip = w.seq_diff(c.rcv_nxt, s);
+            if (skip >= n) { n = 0; }
+            else { d = d + skip; n = n - skip; s = c.rcv_nxt; }
+        }
+        if (n > 0) {
+            deliver(c, s, cast(*u8, d), n);
+            c.need_ack = 1;
+            // Delay the acknowledgement a little, so a stream of segments
+            // costs one ACK rather than one each — but never past the cap,
+            // and never when there is a gap, because a gap needs telling
+            // about immediately.
+            if (c.n_ooo > 0) { c.delack_at = 0; }
+            else if (c.delack_at == 0) { c.delack_at = now + DELAYED_ACK_NS; }
+            else { c.delack_at = 0; }        // second segment: ack now
+        }
+    }
+
+    // --- FIN ---
+    if ((flags & w.FIN) != 0 && w.seq_leq(seq, c.rcv_nxt) == 1) {
+        if (c.fin_rcvd == 0) {
+            c.fin_rcvd = 1;
+            c.rcv_nxt = w.seq_add(c.rcv_nxt, 1);
+            c.need_ack = 1;
+            c.delack_at = 0;
+            if (c.state == ESTABLISHED) { c.state = CLOSE_WAIT; }
+            else if (c.state == FIN_WAIT_1) {
+                if (c.fin_sent == 1 && w.seq_geq(ack, w.seq_add(c.fin_seq, 1)) == 1) {
+                    c.state = TIME_WAIT;
+                    c.timewait_at = now + 2 * MSL_NS;
+                } else {
+                    c.state = CLOSING;
+                }
+            } else if (c.state == FIN_WAIT_2) {
+                c.state = TIME_WAIT;
+                c.timewait_at = now + 2 * MSL_NS;
+            }
+        }
+    }
+
+    // --- our own FIN being acknowledged ---
+    if (c.fin_sent == 1 && w.seq_geq(ack, w.seq_add(c.fin_seq, 1)) == 1) {
+        if (c.state == FIN_WAIT_1) { c.state = FIN_WAIT_2; c.rto_at = 0; }
+        else if (c.state == CLOSING) {
+            c.state = TIME_WAIT;
+            c.timewait_at = now + 2 * MSL_NS;
+            c.rto_at = 0;
+        } else if (c.state == LAST_ACK) {
+            c.state = CLOSED;
+            c.rto_at = 0;
+            return IN_CLOSED;
+        }
+    }
+    return IN_OK;
+}
+
+// Advance time. Separate from output so a driver can run timers without
+// having somewhere to put a segment.
+fn conn_tick(c as *Conn, now as i64) as i64 {
+    if (c.state == TIME_WAIT) {
+        // 2*MSL, so that a delayed segment from this connection cannot be
+        // accepted by its successor on the same four-tuple.
+        if (now >= c.timewait_at) { c.state = CLOSED; return IN_CLOSED; }
+    }
+    return IN_OK;
+}
+
+fn conn_state(c as *Conn) as i64 { return c.state; }
+fn conn_readable(c as *Conn) as i64 { return c.rcv_len; }
+fn conn_writable(c as *Conn) as i64 { return SND_BUF - c.snd_len; }

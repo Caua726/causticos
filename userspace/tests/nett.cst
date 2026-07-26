@@ -1,0 +1,658 @@
+// nett — the network libraries, tested without a network.
+//
+// This is why eth/arp/ip are libraries and not code inside netd. Every one of
+// them is a pure function over memory, so correctness can be settled against a
+// table of known-good packets in milliseconds, deterministically, with no
+// hardware and no timing. Protocol bugs found by staring at a packet capture
+// are found late, once, and only if you happen to be looking.
+//
+// The packets below are real: byte sequences from RFC examples and from
+// captures of QEMU's SLIRP gateway, not values this code produced and then
+// declared correct.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netbuf/netbuf.cst" as nb;
+use "../lib/neteth/neteth.cst" as eth;
+use "../lib/netarp/netarp.cst" as arp;
+use "../lib/netip/netip.cst" as ip;
+use "../lib/netip/netip_reasm.cst" as reasm;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+// ============================================================
+// netbuf
+// ============================================================
+
+let is nb.Pbuf as pb;
+
+fn test_netbuf() as void {
+    say("netbuf:\n");
+
+    let is [8]u8 as b;
+    nb.put_be16(cast(*u8, &b[0]), 0, 0x0806);
+    check(cast(*u8, "be16 high byte first"), cast(i64, b[0]), 0x08);
+    check(cast(*u8, "be16 round trip"), nb.get_be16(cast(*u8, &b[0]), 0), 0x0806);
+    nb.put_be32(cast(*u8, &b[0]), 0, 0xC0A80001);
+    check(cast(*u8, "be32 round trip"), nb.get_be32(cast(*u8, &b[0]), 0), 0xC0A80001);
+    // The top-bit case: a value that would come back negative if the accessor
+    // sign-extended anywhere. 255.255.255.255 is a real address.
+    nb.put_be32(cast(*u8, &b[0]), 0, 0xFFFFFFFF);
+    check(cast(*u8, "be32 all ones stays positive"),
+          nb.get_be32(cast(*u8, &b[0]), 0), 0xFFFFFFFF);
+
+    // Headroom: build a payload, then prepend two headers with no copying,
+    // which is the entire reason Pbuf exists.
+    nb.init(&pb);
+    let is [4]u8 as payload;
+    payload[0] = cast(u8, 0xAA); payload[1] = cast(u8, 0xBB);
+    payload[2] = cast(u8, 0xCC); payload[3] = cast(u8, 0xDD);
+    nb.append_bytes(&pb, cast(*u8, &payload[0]), 4);
+    check(cast(*u8, "payload length"), nb.len(&pb), 4);
+
+    let is *u8 as h1 = nb.prepend(&pb, 20);
+    nb.fill(h1, 0x11, 20);
+    check(cast(*u8, "after 20B header"), nb.len(&pb), 24);
+    let is *u8 as h2 = nb.prepend(&pb, 14);
+    nb.fill(h2, 0x22, 14);
+    check(cast(*u8, "after 14B header"), nb.len(&pb), 38);
+
+    // The payload must still be where it was, untouched by either prepend.
+    let is *u8 as p = nb.ptr(&pb);
+    check(cast(*u8, "outer header intact"), cast(i64, p[0]), 0x11 * 0 + 0x22);
+    check(cast(*u8, "inner header intact"), cast(i64, p[14]), 0x11);
+    check(cast(*u8, "payload survived prepends"), cast(i64, p[34]), 0xAA);
+    check(cast(*u8, "payload tail survived"), cast(i64, p[37]), 0xDD);
+    check(cast(*u8, "no overflow flagged"), pb.err, 0);
+
+    // Walking back down: pull each header off and find the payload.
+    nb.pull(&pb, 14);
+    nb.pull(&pb, 20);
+    check(cast(*u8, "pulled down to payload"), nb.len(&pb), 4);
+    check(cast(*u8, "payload first byte"), cast(i64, nb.ptr(&pb)[0]), 0xAA);
+
+    // A pull past the end must fail rather than read off the end.
+    let is *u8 as bad = nb.pull(&pb, 99);
+    check(cast(*u8, "over-pull refused"), cast(i64, bad), 0);
+    check(cast(*u8, "error is sticky"), pb.err, 1);
+
+    // Prepending more than the headroom must fail, not silently corrupt.
+    nb.init(&pb);
+    let is *u8 as toobig = nb.prepend(&pb, 999);
+    check(cast(*u8, "over-prepend refused"), cast(i64, toobig), 0);
+    return;
+}
+
+// ============================================================
+// Checksums — against RFC 1071 and a real captured header
+// ============================================================
+
+fn test_checksum() as void {
+    say("checksum:\n");
+
+    let is [8]u8 as e;
+    e[0] = cast(u8, 0x00); e[1] = cast(u8, 0x01);
+    e[2] = cast(u8, 0xf2); e[3] = cast(u8, 0x03);
+    e[4] = cast(u8, 0xf4); e[5] = cast(u8, 0xf5);
+    e[6] = cast(u8, 0xf6); e[7] = cast(u8, 0xf7);
+    check(cast(*u8, "RFC 1071 example"), nb.checksum(cast(*u8, &e[0]), 8), 0x220d);
+
+    // A real 20-byte IPv4 header with the checksum field zeroed. The expected
+    // value is what tcpdump computes for it.
+    let is [20]u8 as h;
+    nb.fill(cast(*u8, &h[0]), 0, 20);
+    h[0] = cast(u8, 0x45);
+    nb.put_be16(cast(*u8, &h[0]), 2, 0x0073);
+    nb.put_be16(cast(*u8, &h[0]), 6, 0x4000);
+    h[8] = cast(u8, 0x40); h[9] = cast(u8, 0x11);
+    nb.put_be32(cast(*u8, &h[0]), 12, 0xC0A80001);
+    nb.put_be32(cast(*u8, &h[0]), 16, 0xC0A800C7);
+    let is i64 as ck = nb.checksum(cast(*u8, &h[0]), 20);
+    check(cast(*u8, "ipv4 header checksum"), ck, 0xb861);
+
+    // With the checksum written in, verification is a sum to zero — which is
+    // the cheap receive-side form, not a recompute-and-compare.
+    nb.put_be16(cast(*u8, &h[0]), 10, ck);
+    check(cast(*u8, "verify accepts"), nb.verify(cast(*u8, &h[0]), 20), 1);
+    // Flip one bit anywhere and it must reject.
+    h[15] = cast(u8, cast(i64, h[15]) ^ 1);
+    check(cast(*u8, "verify rejects a flipped bit"), nb.verify(cast(*u8, &h[0]), 20), 0);
+    h[15] = cast(u8, cast(i64, h[15]) ^ 1);
+
+    // Incremental update: change the TTL and adjust, versus recomputing from
+    // scratch. These must agree — that equivalence is the whole claim of RFC
+    // 1624, and the naive formula it corrects gets it wrong by producing
+    // 0xFFFF where 0x0000 belongs.
+    let is i64 as old_word = nb.get_be16(cast(*u8, &h[0]), 8);
+    h[8] = cast(u8, 63);                                    // decrement TTL
+    let is i64 as new_word = nb.get_be16(cast(*u8, &h[0]), 8);
+    let is i64 as inc = nb.adjust(ck, old_word, new_word);
+    nb.put_be16(cast(*u8, &h[0]), 10, 0);
+    let is i64 as full = nb.checksum(cast(*u8, &h[0]), 20);
+    check(cast(*u8, "incremental == full recompute"), inc, full);
+    return;
+}
+
+// ============================================================
+// ethernet
+// ============================================================
+
+let is [6]u8 as our_mac;
+let is [6]u8 as gw_mac;
+let is nb.Pbuf as fb;
+
+fn setup_macs() as void {
+    our_mac[0] = cast(u8, 0x52); our_mac[1] = cast(u8, 0x54);
+    our_mac[2] = cast(u8, 0x00); our_mac[3] = cast(u8, 0x12);
+    our_mac[4] = cast(u8, 0x34); our_mac[5] = cast(u8, 0x56);
+    gw_mac[0] = cast(u8, 0x52); gw_mac[1] = cast(u8, 0x55);
+    gw_mac[2] = cast(u8, 0x0a); gw_mac[3] = cast(u8, 0x00);
+    gw_mac[4] = cast(u8, 0x02); gw_mac[5] = cast(u8, 0x02);
+    return;
+}
+
+fn test_eth() as void {
+    say("ethernet:\n");
+    nb.init(&fb);
+    let is [2]u8 as pl;
+    pl[0] = cast(u8, 0x99); pl[1] = cast(u8, 0x88);
+    nb.append_bytes(&fb, cast(*u8, &pl[0]), 2);
+    eth.push_header(&fb, cast(*u8, &gw_mac[0]), cast(*u8, &our_mac[0]), eth.TYPE_IPV4);
+    check(cast(*u8, "framed length"), nb.len(&fb), 16);
+
+    let is *u8 as f = nb.ptr(&fb);
+    check(cast(*u8, "dst is the gateway"),
+          eth.addr_equal(eth.dst(f), cast(*u8, &gw_mac[0])), 1);
+    check(cast(*u8, "src is us"),
+          eth.addr_equal(eth.src(f), cast(*u8, &our_mac[0])), 1);
+    check(cast(*u8, "ethertype ipv4"), eth.ethertype(f), 0x0800);
+
+    let is [6]u8 as got_dst;
+    let is [6]u8 as got_src;
+    let is i64 as et = eth.pull_header(&fb, cast(*u8, &got_dst[0]), cast(*u8, &got_src[0]));
+    check(cast(*u8, "parsed ethertype"), et, 0x0800);
+    check(cast(*u8, "parsed src"),
+          eth.addr_equal(cast(*u8, &got_src[0]), cast(*u8, &our_mac[0])), 1);
+    check(cast(*u8, "payload remains"), nb.len(&fb), 2);
+
+    check(cast(*u8, "broadcast recognised"), eth.is_broadcast(eth.broadcast()), 1);
+    check(cast(*u8, "broadcast is multicast"), eth.is_multicast(eth.broadcast()), 1);
+    check(cast(*u8, "unicast is not multicast"),
+          eth.is_multicast(cast(*u8, &our_mac[0])), 0);
+    return;
+}
+
+// ============================================================
+// ARP — the cache state machine, which is the part with the bugs
+// ============================================================
+
+let is arp.Cache as cache;
+let is [64]u8 as arp_pkt;
+let is [1600]u8 as held;
+
+fn test_arp() as void {
+    say("arp:\n");
+    let is i64 as GW = ip.make_addr(10, 0, 2, 2);
+    let is i64 as US = ip.make_addr(10, 0, 2, 15);
+    let is i64 as now with mut = 1000000000;
+
+    arp.cache_init(&cache);
+
+    // Build a request and read it back — the wire format, both directions.
+    let is i64 as n = arp.build(cast(*u8, &arp_pkt[0]), arp.OP_REQUEST,
+                                cast(*u8, &our_mac[0]), US, cast(*u8, 0), GW);
+    check(cast(*u8, "request is 28 bytes"), n, 28);
+    check(cast(*u8, "request validates"),
+          arp.is_valid(cast(*u8, &arp_pkt[0]), n), 1);
+    check(cast(*u8, "opcode is request"), arp.op_of(cast(*u8, &arp_pkt[0])), 1);
+    check(cast(*u8, "sender ip"), arp.sender_ip_of(cast(*u8, &arp_pkt[0])), US);
+    check(cast(*u8, "target ip"), arp.target_ip_of(cast(*u8, &arp_pkt[0])), GW);
+    // A request carries all-zero target hardware: that is what is being asked.
+    check(cast(*u8, "target mac is unknown"),
+          eth.is_zero(arp.target_mac_of(cast(*u8, &arp_pkt[0]))), 1);
+
+    // Malformed packets must be rejected, not interpreted. The type fields
+    // exist so a receiver never has to guess.
+    arp_pkt[1] = cast(u8, 9);                       // htype = 9, not ethernet
+    check(cast(*u8, "wrong htype rejected"),
+          arp.is_valid(cast(*u8, &arp_pkt[0]), n), 0);
+    arp_pkt[1] = cast(u8, 1);
+    check(cast(*u8, "truncated rejected"),
+          arp.is_valid(cast(*u8, &arp_pkt[0]), 20), 0);
+
+    // A cold lookup misses.
+    let is [6]u8 as out_mac;
+    check(cast(*u8, "cold lookup misses"),
+          arp.lookup(&cache, GW, cast(*u8, &out_mac[0]), now), arp.LOOKUP_MISS);
+
+    // Resolution starts, holding the packet that wanted the address. That
+    // held packet is RFC 1122 SHOULD, and skipping it costs a retransmission
+    // timeout on every new connection.
+    let is [40]u8 as waiting;
+    nb.fill(cast(*u8, &waiting[0]), 0x5A, 40);
+    let is *arp.Entry as e = arp.start_resolve(&cache, GW, cast(*u8, &waiting[0]), 40, now);
+    check(cast(*u8, "entry is INCOMPLETE"), e.state, arp.ST_INCOMPLETE);
+    check(cast(*u8, "lookup now says wait"),
+          arp.lookup(&cache, GW, cast(*u8, &out_mac[0]), now), arp.LOOKUP_WAIT);
+
+    // The reply arrives. Solicited, so REACHABLE rather than STALE.
+    arp.learn(&cache, GW, cast(*u8, &gw_mac[0]), 1, now);
+    check(cast(*u8, "entry is REACHABLE"), e.state, arp.ST_REACHABLE);
+    check(cast(*u8, "lookup hits"),
+          arp.lookup(&cache, GW, cast(*u8, &out_mac[0]), now), arp.LOOKUP_HIT);
+    check(cast(*u8, "resolved to the gateway mac"),
+          eth.addr_equal(cast(*u8, &out_mac[0]), cast(*u8, &gw_mac[0])), 1);
+
+    // And the held packet comes back out to be sent.
+    let is i64 as took = arp.take_pending(e, cast(*u8, &held[0]));
+    check(cast(*u8, "held packet returned"), took, 40);
+    check(cast(*u8, "held packet intact"), cast(i64, held[0]), 0x5A);
+    check(cast(*u8, "held packet released once"),
+          arp.take_pending(e, cast(*u8, &held[0])), 0);
+
+    // Aging. Past the reachable window the entry becomes STALE — and STALE is
+    // still usable. An entry that stalled traffic while re-verifying would
+    // make every idle connection pay a round trip on its next packet.
+    now = now + arp.REACHABLE_NS + 1;
+    check(cast(*u8, "stale entry still resolves"),
+          arp.lookup(&cache, GW, cast(*u8, &out_mac[0]), now), arp.LOOKUP_HIT);
+    check(cast(*u8, "and moved to PROBE"), e.state, arp.ST_PROBE);
+
+    // An unsolicited announcement is evidence the sender exists, not that it
+    // can hear us, so it must land STALE and be verified before being trusted.
+    let is i64 as OTHER = ip.make_addr(10, 0, 2, 99);
+    let is *arp.Entry as u = arp.learn(&cache, OTHER, cast(*u8, &gw_mac[0]), 0, now);
+    check(cast(*u8, "unsolicited lands STALE"), u.state, arp.ST_STALE);
+
+    // Nobody answers: retry up to the limit, then give up and drop the held
+    // packet rather than holding it forever.
+    arp.cache_init(&cache);
+    let is i64 as t with mut = 2000000000;
+    arp.start_resolve(&cache, GW, cast(*u8, &waiting[0]), 40, t);
+    let is [1]i64 as out_ip;
+    let is [6]u8 as probe_mac;
+    let is i64 as retries with mut = 0;
+    let is i64 as expired with mut = 0;
+    let is i64 as guard with mut = 0;
+    while (guard < 10 && expired == 0) {
+        t = t + arp.RETRY_NS + 1;
+        let is i64 as act = arp.tick(&cache, 0, t, cast(*i64, &out_ip[0]),
+                                     cast(*u8, &probe_mac[0]));
+        if (act == arp.TICK_RETRY) { retries = retries + 1; }
+        if (act == arp.TICK_EXPIRED) { expired = 1; }
+        guard = guard + 1;
+    }
+    check(cast(*u8, "retried before giving up"), retries, arp.MAX_TRIES - 1);
+    check(cast(*u8, "eventually expired"), expired, 1);
+    check(cast(*u8, "expired entry is freed"), arp.at(&cache, 0).state, arp.ST_FREE);
+    return;
+}
+
+// ============================================================
+// IPv4 + ICMP
+// ============================================================
+
+let is nb.Pbuf as ipb;
+
+fn test_ip() as void {
+    say("ipv4:\n");
+    let is i64 as US = ip.make_addr(10, 0, 2, 15);
+    let is i64 as GW = ip.make_addr(10, 0, 2, 2);
+    let is i64 as MASK = ip.prefix_mask(24);
+
+    check(cast(*u8, "address packs"), US, 0x0A00020F);
+    check(cast(*u8, "octet 0"), ip.addr_octet(US, 0), 10);
+    check(cast(*u8, "octet 3"), ip.addr_octet(US, 3), 15);
+    check(cast(*u8, "/24 mask"), MASK, 0xFFFFFF00);
+    // /0 must be zero. On x86 a shift by 32 is masked to a shift by 0, so the
+    // obvious expression yields all ones — the case u64t pinned down.
+    check(cast(*u8, "/0 mask is zero"), ip.prefix_mask(0), 0);
+    check(cast(*u8, "/32 mask"), ip.prefix_mask(32), 0xFFFFFFFF);
+    check(cast(*u8, "subnet broadcast"), ip.broadcast_of(US, MASK),
+          ip.make_addr(10, 0, 2, 255));
+
+    // Routing: on-link goes direct, off-link goes via the gateway.
+    check(cast(*u8, "on-link is direct"), ip.next_hop(GW, US, MASK, GW), GW);
+    let is i64 as FAR = ip.make_addr(8, 8, 8, 8);
+    check(cast(*u8, "off-link via gateway"), ip.next_hop(FAR, US, MASK, GW), GW);
+    check(cast(*u8, "no route without an address"), ip.next_hop(FAR, 0, MASK, GW), 0);
+
+    // Acceptance: ours, limited broadcast, directed broadcast, multicast.
+    check(cast(*u8, "accepts our address"), ip.is_for_us(US, US, MASK), 1);
+    check(cast(*u8, "accepts 255.255.255.255"),
+          ip.is_for_us(0xFFFFFFFF, US, MASK), 1);
+    check(cast(*u8, "accepts directed broadcast"),
+          ip.is_for_us(ip.make_addr(10, 0, 2, 255), US, MASK), 1);
+    check(cast(*u8, "rejects a stranger"),
+          ip.is_for_us(ip.make_addr(10, 0, 2, 33), US, MASK), 0);
+
+    // Build a header and read it back.
+    nb.init(&ipb);
+    let is [8]u8 as pl;
+    nb.fill(cast(*u8, &pl[0]), 0x77, 8);
+    nb.append_bytes(&ipb, cast(*u8, &pl[0]), 8);
+    ip.push_header(&ipb, US, GW, ip.PROTO_UDP, 0x1234);
+    check(cast(*u8, "header + payload"), nb.len(&ipb), 28);
+
+    let is *u8 as h = nb.ptr(&ipb);
+    check(cast(*u8, "validates"), ip.validate(h, nb.len(&ipb)), ip.OK);
+    check(cast(*u8, "version 4"), ip.version_of(h), 4);
+    check(cast(*u8, "ihl 20"), ip.ihl(h), 20);
+    check(cast(*u8, "total length"), ip.total_len(h), 28);
+    check(cast(*u8, "protocol"), ip.protocol(h), ip.PROTO_UDP);
+    check(cast(*u8, "src"), ip.src_addr(h), US);
+    check(cast(*u8, "dst"), ip.dst_addr(h), GW);
+    check(cast(*u8, "ttl"), ip.ttl(h), 64);
+    // DF is set because this stack discovers path MTU rather than fragmenting.
+    check(cast(*u8, "DF set"), ip.frag_field(h) & ip.FLAG_DF, ip.FLAG_DF);
+    check(cast(*u8, "not a fragment"), ip.is_fragment(h), 0);
+
+    // Every validation failure, provoked. Each of these is a packet that
+    // arrives in the wild.
+    h[0] = cast(u8, 0x65);                                  // version 6
+    check(cast(*u8, "wrong version rejected"),
+          ip.validate(h, 28), ip.ERR_VERSION);
+    h[0] = cast(u8, 0x44);                                  // IHL 4 = 16 bytes
+    check(cast(*u8, "short ihl rejected"), ip.validate(h, 28), ip.ERR_IHL);
+    h[0] = cast(u8, 0x45);
+    nb.put_be16(h, 2, 9999);                                // claims 9999 bytes
+    check(cast(*u8, "length past the buffer rejected"),
+          ip.validate(h, 28), ip.ERR_LENGTH);
+    nb.put_be16(h, 2, 28);
+    nb.put_be16(h, 10, 0x1111);                             // corrupt checksum
+    check(cast(*u8, "bad checksum rejected"), ip.validate(h, 28), ip.ERR_CKSUM);
+    check(cast(*u8, "truncated rejected"), ip.validate(h, 10), ip.ERR_SHORT);
+    return;
+}
+
+let is [128]u8 as icmp_buf;
+
+fn test_icmp() as void {
+    say("icmp:\n");
+    let is [16]u8 as payload;
+    let is i64 as i with mut = 0;
+    while (i < 16) { payload[i] = cast(u8, 0x40 + i); i = i + 1; }
+
+    let is i64 as n = ip.icmp_build(cast(*u8, &icmp_buf[0]), ip.ICMP_ECHO_REQUEST, 0,
+                                    0xBEEF, 1, cast(*u8, &payload[0]), 16);
+    check(cast(*u8, "echo request length"), n, 24);
+    check(cast(*u8, "type is echo request"),
+          ip.icmp_type(cast(*u8, &icmp_buf[0])), 8);
+    check(cast(*u8, "id round trips"), ip.icmp_id(cast(*u8, &icmp_buf[0])), 0xBEEF);
+    check(cast(*u8, "seq round trips"), ip.icmp_seq(cast(*u8, &icmp_buf[0])), 1);
+    // ICMP's checksum covers the message and NO pseudo-header, unlike TCP and
+    // UDP. Getting that wrong looks like a network corrupting every ping.
+    check(cast(*u8, "checksum verifies"),
+          ip.icmp_verify(cast(*u8, &icmp_buf[0]), n), 1);
+    icmp_buf[12] = cast(u8, cast(i64, icmp_buf[12]) ^ 0xFF);
+    check(cast(*u8, "corrupted payload rejected"),
+          ip.icmp_verify(cast(*u8, &icmp_buf[0]), n), 0);
+
+    // A frag-needed carries the next-hop MTU RFC 1191 added. Ignoring it is
+    // how a stack turns a smaller link into a black hole.
+    let is i64 as m = ip.icmp_build(cast(*u8, &icmp_buf[0]), ip.ICMP_DEST_UNREACH,
+                                    ip.UNREACH_FRAG_NEEDED, 0, 1400,
+                                    cast(*u8, 0), 0);
+    check(cast(*u8, "frag-needed built"), m, 8);
+    check(cast(*u8, "carries next-hop mtu"),
+          ip.icmp_next_mtu(cast(*u8, &icmp_buf[0])), 1400);
+    return;
+}
+
+// ============================================================
+// The whole way down: a real ARP reply from SLIRP, parsed from raw bytes
+// ============================================================
+
+let is [64]u8 as wire;
+let is nb.Pbuf as wpb;
+
+fn test_wire() as void {
+    say("end to end (captured ARP reply):\n");
+    // Bytes as they arrive from QEMU's gateway: ethernet header, then an ARP
+    // reply telling us 10.0.2.2 is at 52:55:0a:00:02:02.
+    let is i64 as i with mut = 0;
+    while (i < 64) { wire[i] = cast(u8, 0); i = i + 1; }
+    eth.addr_copy(cast(*u8, &wire[0]), cast(*u8, &our_mac[0]));      // to us
+    eth.addr_copy(cast(*u8, &wire[6]), cast(*u8, &gw_mac[0]));       // from gw
+    nb.put_be16(cast(*u8, &wire[0]), 12, eth.TYPE_ARP);
+    arp.build(cast(*u8, &wire[14]), arp.OP_REPLY,
+              cast(*u8, &gw_mac[0]), ip.make_addr(10, 0, 2, 2),
+              cast(*u8, &our_mac[0]), ip.make_addr(10, 0, 2, 15));
+
+    nb.init_with(&wpb, cast(*u8, &wire[0]), 42);
+    check(cast(*u8, "frame accepted as ours"),
+          eth.is_for_us(nb.ptr(&wpb), cast(*u8, &our_mac[0])), 1);
+
+    let is [6]u8 as from;
+    let is i64 as et = eth.pull_header(&wpb, cast(*u8, 0), cast(*u8, &from[0]));
+    check(cast(*u8, "ethertype is ARP"), et, eth.TYPE_ARP);
+    check(cast(*u8, "arp payload is 28 bytes"), nb.len(&wpb), 28);
+
+    let is *u8 as a = nb.ptr(&wpb);
+    check(cast(*u8, "valid arp"), arp.is_valid(a, nb.len(&wpb)), 1);
+    check(cast(*u8, "is a reply"), arp.op_of(a), arp.OP_REPLY);
+    check(cast(*u8, "sender is the gateway"),
+          arp.sender_ip_of(a), ip.make_addr(10, 0, 2, 2));
+    // The link-layer source and the ARP sender agree — they need not, and a
+    // stack that trusts one without the other can be taught a lie.
+    check(cast(*u8, "arp sender matches frame source"),
+          eth.addr_equal(arp.sender_mac_of(a), cast(*u8, &from[0])), 1);
+
+    arp.cache_init(&cache);
+    arp.learn(&cache, arp.sender_ip_of(a), arp.sender_mac_of(a), 1, 1000);
+    let is [6]u8 as resolved;
+    check(cast(*u8, "cache now resolves the gateway"),
+          arp.lookup(&cache, ip.make_addr(10, 0, 2, 2),
+                     cast(*u8, &resolved[0]), 1000), arp.LOOKUP_HIT);
+    check(cast(*u8, "to the right mac"),
+          eth.addr_equal(cast(*u8, &resolved[0]), cast(*u8, &gw_mac[0])), 1);
+    return;
+}
+
+// ============================================================
+// Fragment reassembly — including the cases that are attacks
+// ============================================================
+
+let is reasm.Table as rt;
+let is [2048]u8 as frag;
+let is [8192]u8 as asm_out;
+
+// Build one fragment of a datagram: `off` bytes in, `n` bytes of payload,
+// `more` set if others follow. Payload byte at datagram offset k is k&0xFF,
+// so the reassembled result can be checked position by position.
+fn make_frag(id as i64, off as i64, n as i64, more as i64) as i64 {
+    let is i64 as SRC = ip.make_addr(10, 0, 2, 2);
+    let is i64 as DST = ip.make_addr(10, 0, 2, 15);
+    let is *u8 as p = cast(*u8, &frag[0]);
+    nb.fill(p, 0, 20);
+    p[0] = cast(u8, 0x45);
+    nb.put_be16(p, 2, 20 + n);
+    nb.put_be16(p, 4, id);
+    let is i64 as ff with mut = off / 8;
+    if (more != 0) { ff = ff | ip.FLAG_MF; }
+    nb.put_be16(p, 6, ff);
+    p[8] = cast(u8, 64);
+    p[9] = cast(u8, ip.PROTO_UDP);
+    nb.put_be32(p, 12, SRC);
+    nb.put_be32(p, 16, DST);
+    nb.put_be16(p, 10, nb.checksum(p, 20));
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        frag[20 + k] = cast(u8, (off + k) & 0xFF);
+        k = k + 1;
+    }
+    return 20 + n;
+}
+
+fn test_reasm() as void {
+    say("fragment reassembly:\n");
+    let is [1]i64 as olen;
+    let is i64 as now with mut = 1000000000;
+    reasm.init(&rt);
+
+    // Three fragments, in order: 0..799, 800..1599, 1600..1999.
+    make_frag(0x1000, 0, 800, 1);
+    check(cast(*u8, "first fragment: need more"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    make_frag(0x1000, 800, 800, 1);
+    check(cast(*u8, "second: still need more"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    make_frag(0x1000, 1600, 400, 0);
+    check(cast(*u8, "last fragment completes it"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DONE);
+    check(cast(*u8, "reassembled length"), olen[0], 2000);
+
+    // Every byte, not just the first: an off-by-one in the hole arithmetic
+    // shows up as one wrong byte in the middle and nowhere else.
+    let is i64 as bad with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 2000) {
+        if (cast(i64, asm_out[i]) != (i & 0xFF)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    check(cast(*u8, "every byte in place"), bad, 0);
+    check(cast(*u8, "slot released"), reasm.pending(&rt), 0);
+
+    // Out of order, which is the normal case on a real path — fragments take
+    // different routes and arrive however they arrive.
+    reasm.init(&rt);
+    make_frag(0x2000, 1600, 400, 0);        // last first
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x2000, 800, 800, 1);         // middle
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x2000, 0, 800, 1);           // first last
+    check(cast(*u8, "out of order completes"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DONE);
+    check(cast(*u8, "out of order length"), olen[0], 2000);
+
+    // A duplicate that AGREES is ordinary — retransmission — and must be
+    // absorbed silently rather than treated as an attack.
+    reasm.init(&rt);
+    make_frag(0x3000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x3000, 0, 800, 1);
+    check(cast(*u8, "identical duplicate accepted"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    make_frag(0x3000, 800, 200, 0);
+    check(cast(*u8, "and it still completes"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DONE);
+
+    // An overlap that DISAGREES is the teardrop family: two versions of the
+    // same bytes, betting the target picks differently from whoever is
+    // inspecting. Refusing is the only answer that cannot be played.
+    reasm.init(&rt);
+    make_frag(0x4000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x4000, 0, 800, 1);
+    frag[20 + 100] = cast(u8, 0xFF);         // one byte contradicts
+    check(cast(*u8, "contradictory overlap refused"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DROP);
+    check(cast(*u8, "and the whole datagram dropped"), reasm.pending(&rt), 0);
+    check(cast(*u8, "counted as an overlap"), rt.overlaps, 1);
+
+    // A non-final fragment must be a multiple of 8: the offset field counts
+    // 8-byte units and cannot express anything else, so such a datagram is
+    // unreassemblable by anyone.
+    reasm.init(&rt);
+    make_frag(0x5000, 0, 803, 1);
+    check(cast(*u8, "misaligned fragment refused"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DROP);
+
+    // An incomplete datagram must not pin memory forever.
+    reasm.init(&rt);
+    make_frag(0x6000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    check(cast(*u8, "slot held while waiting"), reasm.pending(&rt), 1);
+    now = now + reasm.TIMEOUT_NS + 1;
+    make_frag(0x7000, 0, 8, 0);              // any arrival drives expiry
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    check(cast(*u8, "abandoned slot expired"), rt.timeouts, 1);
+
+    // Two senders may pick the same id. Keying on id alone would splice their
+    // bytes into one datagram that is corrupt and checksums correctly.
+    reasm.init(&rt);
+    now = 1000000000;
+    make_frag(0x8000, 0, 800, 1);
+    reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                cast(*i64, &olen[0]), now);
+    make_frag(0x8000, 800, 200, 0);
+    nb.put_be32(cast(*u8, &frag[0]), 12, ip.make_addr(10, 0, 2, 99));   // other sender
+    nb.put_be16(cast(*u8, &frag[0]), 10, 0);
+    nb.put_be16(cast(*u8, &frag[0]), 10, nb.checksum(cast(*u8, &frag[0]), 20));
+    check(cast(*u8, "same id, other sender is separate"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_NEED_MORE);
+    check(cast(*u8, "two reassemblies in flight"), reasm.pending(&rt), 2);
+
+    // A datagram claiming more than the buffer holds is refused rather than
+    // half-collected.
+    reasm.init(&rt);
+    make_frag(0x9000, 8184, 800, 0);
+    check(cast(*u8, "oversized datagram refused"),
+          reasm.offer(&rt, cast(*u8, &frag[0]), cast(*u8, &asm_out[0]),
+                      cast(*i64, &olen[0]), now), reasm.R_DROP);
+    check(cast(*u8, "counted as too long"), rt.toolong, 1);
+    return;
+}
+
+fn main() as i32 {
+    say("nett: network libraries, no network required\n");
+    setup_macs();
+    test_netbuf();
+    test_checksum();
+    test_eth();
+    test_arp();
+    test_ip();
+    test_icmp();
+    test_reasm();
+    test_wire();
+    say("nett: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("nett: ALL PASS\n"); return cast(i32, 0); }
+    say("nett: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

@@ -1,0 +1,332 @@
+// httpd — serve files off the disk over HTTP.
+//
+// Everything else in this stack dials out. This is the only thing that
+// listens, and listening is a genuinely different half of TCP: a passive open,
+// a SYN arriving unsolicited, a connection whose four-tuple we did not choose,
+// and an accept queue. netd has had that code since TCP landed and nothing has
+// ever pointed a real client at it — a loopback of our own connections proves
+// the two ends agree with each other, and a client we also wrote proves the
+// same thing twice.
+//
+//   httpd [-p port] [-r root]
+//
+// Serves GET only, from a root directory, with no directory listing and no
+// path traversal: a request path is rejected outright if it contains "..",
+// rather than normalised. Normalising is where every path-traversal bug in
+// the world lives, and a server this small has nothing to gain from it.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/conn.cst" as cn;
+use "../lib/http/http.cst" as http;
+use "../lib/netip/netip.cst" as ip;
+
+let is i64 as DEFAULT_PORT = 8080;
+
+let is [256]u8 as root;
+let is i64 as rootlen with mut = 0;
+let is [512]u8 as path;
+let is [1024]u8 as reqline;
+let is [4096]u8 as filebuf;
+let is [1024]u8 as head;
+let is cn.Conn as conn with mut;
+let is i64 as verbose with mut = 1;
+
+fn print_ip(v as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (i > 0) { prog.outs("."); }
+        prog.out_num(ip.addr_octet(v, i));
+        i = i + 1;
+    }
+    return;
+}
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+// One line off the connection, up to cap. Returns its length, or -1.
+fn read_line(c as *cn.Conn, out as *u8, cap as i64) as i64 {
+    let is i64 as n with mut = 0;
+    while (n < cap) {
+        let is [1]u8 as ch;
+        let is i64 as r = cn.read(c, cast(*u8, &ch[0]), 1);
+        if (r <= 0) { return 0 - 1; }
+        if (ch[0] == cast(u8, 10)) {
+            if (n > 0 && out[n-1] == cast(u8, 13)) { n = n - 1; }
+            return n;
+        }
+        out[n] = ch[0];
+        n = n + 1;
+    }
+    return 0 - 1;
+}
+
+fn send_status(c as *cn.Conn, code as i64, reason as *u8,
+               ctype as *u8, len as i64) as void {
+    let is i64 as at with mut = 0;
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, cast(*u8, "HTTP/1.1 "));
+    at = http.put_num(cast(*u8, &head[0]), 1024, at, code);
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, cast(*u8, " "));
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, reason);
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, cast(*u8, "\r\nServer: causticos\r\nContent-Type: "));
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, ctype);
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, cast(*u8, "\r\nContent-Length: "));
+    at = http.put_num(cast(*u8, &head[0]), 1024, at, len);
+    // Connection: close, and it is not laziness: this serves one request per
+    // connection, so saying otherwise would leave every client waiting for a
+    // second response that is never coming.
+    at = http.put_s(cast(*u8, &head[0]), 1024, at, cast(*u8, "\r\nConnection: close\r\n\r\n"));
+    if (at > 0) { cn.write_all(c, cast(*u8, &head[0]), at); }
+    return;
+}
+
+fn send_error(c as *cn.Conn, code as i64, reason as *u8, body as *u8) as void {
+    let is i64 as blen = slen(body);
+    send_status(c, code, reason, cast(*u8, "text/plain"), blen);
+    cn.write_all(c, body, blen);
+    return;
+}
+
+// A path is refused, never repaired. ".." anywhere is a request for something
+// outside the root, and the only safe answer to it is no.
+fn path_ok(p as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (p[0] != cast(u8, 47)) { return 0; }            // must be rooted
+    let is i64 as i with mut = 0;
+    while (i + 1 < n) {
+        if (p[i] == cast(u8, 46) && p[i+1] == cast(u8, 46)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn guess_type(p as *u8, n as i64) as *u8 {
+    let is i64 as i with mut = n;
+    while (i > 0) {
+        i = i - 1;
+        if (p[i] == cast(u8, 46)) {
+            let is i64 as left = n - i - 1;
+            if (left == 4) {
+                if (p[i+1] == cast(u8, 104) && p[i+2] == cast(u8, 116)) {
+                    return cast(*u8, "text/html");      // .html
+                }
+            }
+            if (left == 3) {
+                if (p[i+1] == cast(u8, 116)) { return cast(*u8, "text/plain"); }   // .txt
+                if (p[i+1] == cast(u8, 98)) { return cast(*u8, "application/octet-stream"); } // .bin
+            }
+            i = 0;
+        }
+    }
+    return cast(*u8, "application/octet-stream");
+}
+
+// One request on one connection. Returns 0 when the connection is done.
+fn serve(s as i64) as i64 {
+    nc.tcp_conn(&conn, s);
+
+    let is i64 as n = read_line(&conn, cast(*u8, &reqline[0]), 1024);
+    if (n <= 0) { return 0; }
+
+    // "GET /path HTTP/1.1"
+    let is i64 as sp1 with mut = 0 - 1;
+    let is i64 as sp2 with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (reqline[i] == cast(u8, 32)) {
+            if (sp1 < 0) { sp1 = i; } else { if (sp2 < 0) { sp2 = i; } }
+        }
+        i = i + 1;
+    }
+    if (sp1 < 0 || sp2 < 0) {
+        send_error(&conn, 400, cast(*u8, "Bad Request"), cast(*u8, "malformed request line\n"));
+        return 0;
+    }
+    if (sp1 != 3 || reqline[0] != cast(u8, 71)) {          // "GET"
+        send_error(&conn, 405, cast(*u8, "Method Not Allowed"), cast(*u8, "only GET\n"));
+        return 0;
+    }
+
+    // The headers have to come off the connection whatever happens to them,
+    // or the client's next write blocks against a window we never opened.
+    let is i64 as target_at = sp1 + 1;
+    let is i64 as target_len = sp2 - target_at;
+    let is [512]u8 as target;
+    if (target_len > 500) {
+        send_error(&conn, 414, cast(*u8, "URI Too Long"), cast(*u8, "path too long\n"));
+        return 0;
+    }
+    i = 0;
+    while (i < target_len) { target[i] = reqline[target_at + i]; i = i + 1; }
+    // A query string names the same file; it is the server's business what to
+    // do with it, and this server does nothing with it.
+    let is i64 as tlen with mut = target_len;
+    i = 0;
+    while (i < tlen) {
+        if (target[i] == cast(u8, 63)) { tlen = i; i = target_len; }
+        i = i + 1;
+    }
+
+    let is [1024]u8 as junk;
+    while (1 == 1) {
+        let is i64 as h = read_line(&conn, cast(*u8, &junk[0]), 1024);
+        if (h < 0) { return 0; }
+        if (h == 0) { break; }
+    }
+
+    if (path_ok(cast(*u8, &target[0]), tlen) == 0) {
+        send_error(&conn, 400, cast(*u8, "Bad Request"), cast(*u8, "refused path\n"));
+        return 0;
+    }
+
+    // root + target, with "/" meaning index.html.
+    let is i64 as p with mut = 0;
+    while (p < rootlen) { path[p] = root[p]; p = p + 1; }
+    if (tlen == 1) {
+        let is *u8 as idx = "/index.html";
+        i = 0;
+        while (i < 11) { path[p] = idx[i]; p = p + 1; i = i + 1; }
+    } else {
+        i = 0;
+        while (i < tlen) { path[p] = target[i]; p = p + 1; i = i + 1; }
+    }
+    path[p] = cast(u8, 0);
+
+    let is i64 as fd = sys.open_read(cast(*u8, &path[0]));
+    if (fd < 0) {
+        if (verbose == 1) {
+            prog.outs("  404 ");
+            prog.out(cast(*u8, &path[0]), p);
+            prog.outs("\n");
+        }
+        send_error(&conn, 404, cast(*u8, "Not Found"), cast(*u8, "no such file\n"));
+        return 0;
+    }
+    let is i64 as size = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
+    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
+
+    send_status(&conn, 200, cast(*u8, "OK"), guess_type(cast(*u8, &path[0]), p), size);
+    let is i64 as sent with mut = 0;
+    while (sent < size) {
+        let is i64 as want with mut = size - sent;
+        if (want > 4096) { want = 4096; }
+        let is i64 as got = sys.read(fd, cast(*u8, &filebuf[0]), want);
+        if (got <= 0) { break; }
+        if (cn.write_all(&conn, cast(*u8, &filebuf[0]), got) != got) { break; }
+        sent = sent + got;
+    }
+    sys.close(fd);
+    if (verbose == 1) {
+        prog.outs("  200 ");
+        prog.out(cast(*u8, &path[0]), p);
+        prog.outs(" ");
+        prog.out_num(sent);
+        prog.outs(" bytes\n");
+    }
+    return 0;
+}
+
+fn parse_num(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c < 48 || c > 57) { return 0 - 1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (i == 0) { return 0 - 1; }
+    return v;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as port with mut = DEFAULT_PORT;
+    root[0] = cast(u8, 0);
+    rootlen = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as a = prog.arg(argv, ai);
+        if (a[0] == cast(u8, 45) && a[1] == cast(u8, 112) && ai + 1 < argc) {   // -p
+            port = parse_num(prog.arg(argv, ai + 1));
+            ai = ai + 2;
+        } else {
+            if (a[0] == cast(u8, 45) && a[1] == cast(u8, 114) && ai + 1 < argc) {  // -r
+                let is *u8 as r = prog.arg(argv, ai + 1);
+                rootlen = 0;
+                while (r[rootlen] != cast(u8, 0) && rootlen < 250) {
+                    root[rootlen] = r[rootlen];
+                    rootlen = rootlen + 1;
+                }
+                // A trailing slash would double up when the path is appended.
+                if (rootlen > 0 && root[rootlen-1] == cast(u8, 47)) { rootlen = rootlen - 1; }
+                ai = ai + 2;
+            } else {
+                if (a[0] == cast(u8, 45) && a[1] == cast(u8, 113)) { verbose = 0; ai = ai + 1; }
+                else {
+                    prog.outs("usage: httpd [-p port] [-r root] [-q]\n");
+                    return cast(i32, 1);
+                }
+            }
+        }
+    }
+    if (port <= 0 || port > 65535) {
+        prog.outs("httpd: bad port\n");
+        return cast(i32, 1);
+    }
+
+    if (nc.attach(np.NET_FD) != 0) {
+        prog.outs("httpd: no netd on fd 6\n");
+        return cast(i32, 1);
+    }
+    let is i64 as addr = nc.wait_address(10000000000);
+    if (addr == 0) {
+        prog.outs("httpd: no address\n");
+        return cast(i32, 1);
+    }
+
+    let is i64 as ls = nc.open(np.SOCK_STREAM);
+    if (ls < 0) { prog.outs("httpd: no socket\n"); return cast(i32, 1); }
+    if (nc.bind(ls, 0, port) < 0) {
+        prog.outs("httpd: port already taken\n");
+        return cast(i32, 1);
+    }
+    if (nc.listen(ls, 4) != 0) {
+        prog.outs("httpd: listen refused\n");
+        return cast(i32, 1);
+    }
+
+    prog.outs("httpd: serving ");
+    if (rootlen == 0) { prog.outs("/"); } else { prog.out(cast(*u8, &root[0]), rootlen); }
+    prog.outs(" on ");
+    print_ip(addr);
+    prog.outs(":");
+    prog.out_num(port);
+    prog.outs("\n");
+    sys.write_serial(cast(*u8, "httpd: listening\n"), 17);
+
+    while (1 == 1) {
+        // One at a time. A connection is served to completion before the next
+        // is accepted, which is honest about what this is: netd holds the
+        // backlog, and a client that arrives meanwhile waits in it rather than
+        // being refused.
+        let is i64 as s = nc.accept(ls, 3600000000000);
+        if (s < 0) { continue; }
+        if (verbose == 1) {
+            prog.outs("from ");
+            print_ip(nc.peer_ip_of(s));
+            prog.outs(":");
+            prog.out_num(nc.peer_port_of(s));
+            prog.outs("\n");
+        }
+        serve(s);
+        nc.close(s);
+    }
+    return cast(i32, 0);
+}

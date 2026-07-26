@@ -1,0 +1,798 @@
+// e1000.cst — Intel 82540EM ("e1000") gigabit ethernet driver.
+//
+// Lived in kernel/test/pcitest.cst until now, under the name it had when it
+// was the PCI enumeration smoke this driver grew out of. Nothing about it is
+// a test any more, and a production NIC driver filed under test/ is a name
+// that misleads every reader after the one who wrote it.
+//
+// Match (vendor 0x8086, device 0x100E) + capability lifecycle live in
+// kernel/drivers/e1000.cdvrspec; this file provides the bind and IRQ
+// callbacks, the netdev.NetDevice vtable that makes the port reachable from
+// userspace, and the static state behind both.
+//
+// Rings: legacy 16-byte TX/RX descriptors, 32 entries each, 2 KiB
+// buffers per slot (well above MTU for QEMU's user-mode netdev). All
+// DMA buffers come from driver.dma_alloc with the DMA32 flag — the
+// 82540EM accepts 64-bit addressing, but staying inside the low 4 GiB
+// keeps interop with bare-metal hardware that doesn't.
+
+use "driver.cst" as driver;
+use "pci.cst" as pci;
+use "spec.cst" as spec;
+use "ksym.cst" as ksym;
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "heap.cst" as heap;
+use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "timer.cst" as timer;
+use "netdev.cst" as netdev;
+
+// ============================================================
+// Register offsets (from Intel 8254x family software dev manual)
+// ============================================================
+
+let is i64 as REG_CTRL    = 0x0000;
+let is i64 as REG_STATUS  = 0x0008;
+let is i64 as REG_EERD    = 0x0014;
+let is i64 as REG_ICR     = 0x00C0;
+let is i64 as REG_ITR     = 0x00C8;
+let is i64 as REG_ICS     = 0x00D0;
+let is i64 as REG_IMS     = 0x00D8;
+let is i64 as REG_IMC     = 0x00E0;
+let is i64 as REG_RCTL    = 0x0100;
+let is i64 as REG_TCTL    = 0x0400;
+let is i64 as REG_TIPG    = 0x0410;
+let is i64 as REG_RDBAL   = 0x2800;
+let is i64 as REG_RDBAH   = 0x2804;
+let is i64 as REG_RDLEN   = 0x2808;
+let is i64 as REG_RDH     = 0x2810;
+let is i64 as REG_RDT     = 0x2818;
+let is i64 as REG_TDBAL   = 0x3800;
+let is i64 as REG_TDBAH   = 0x3804;
+let is i64 as REG_TDLEN   = 0x3808;
+let is i64 as REG_TDH     = 0x3810;
+let is i64 as REG_TDT     = 0x3818;
+let is i64 as REG_MTA     = 0x5200;       // 128 dwords (multicast filter)
+let is i64 as REG_RAL0    = 0x5400;
+let is i64 as REG_RAH0    = 0x5404;
+
+// CTRL bits
+let is i64 as CTRL_FD     = 0x00000001;       // full duplex
+let is i64 as CTRL_ASDE   = 0x00000020;       // auto-speed detection
+let is i64 as CTRL_SLU    = 0x00000040;       // set link up
+let is i64 as CTRL_RST    = 0x04000000;       // device reset
+let is i64 as CTRL_PHY_RST = 0x80000000;
+let is i64 as CTRL_VME    = 0x40000000;
+let is i64 as CTRL_ILOS   = 0x00000080;
+let is i64 as CTRL_LRST   = 0x00000008;
+
+// STATUS bits
+let is i64 as STATUS_LU   = 0x00000002;       // link up
+// STATUS bits 7:6 report the negotiated speed. 11 is reserved on this part
+// and is read as gigabit, which is what the two encodings 10 and 11 both mean
+// in practice on the 8254x.
+let is i64 as STATUS_SPEED_MASK  = 0x000000C0;
+let is i64 as STATUS_SPEED_SHIFT = 6;
+
+// ICR / IMS bits
+let is i64 as INT_TXDW    = 0x00000001;
+let is i64 as INT_TXQE    = 0x00000002;
+let is i64 as INT_LSC     = 0x00000004;
+let is i64 as INT_RXDMT0  = 0x00000010;
+let is i64 as INT_RXO     = 0x00000040;
+let is i64 as INT_RXT0    = 0x00000080;
+
+// RCTL bits
+let is i64 as RCTL_EN     = 0x00000002;
+let is i64 as RCTL_SBP    = 0x00000004;
+let is i64 as RCTL_UPE    = 0x00000008;       // unicast promisc
+let is i64 as RCTL_MPE    = 0x00000010;       // multicast promisc
+let is i64 as RCTL_LPE    = 0x00000020;
+let is i64 as RCTL_BAM    = 0x00008000;       // broadcast accept
+let is i64 as RCTL_BSIZE_2048 = 0x00000000;
+let is i64 as RCTL_BSIZE_1024 = 0x00010000;
+let is i64 as RCTL_SECRC  = 0x04000000;       // strip CRC
+
+// TCTL bits
+let is i64 as TCTL_EN     = 0x00000002;
+let is i64 as TCTL_PSP    = 0x00000008;       // pad short packets
+let is i64 as TCTL_CT_SHIFT = 4;
+let is i64 as TCTL_COLD_SHIFT = 12;
+let is i64 as TCTL_RTLC   = 0x01000000;       // re-transmit on late col
+
+// TX descriptor cmd bits (legacy)
+let is i64 as TXD_CMD_EOP  = 0x01;
+let is i64 as TXD_CMD_IFCS = 0x02;
+let is i64 as TXD_CMD_RS   = 0x08;
+
+// TX/RX descriptor status bit
+let is i64 as DESC_STATUS_DD  = 0x01;
+let is i64 as DESC_STATUS_EOP = 0x02;
+
+// Ring sizing — 32 descriptors × 16 B = 512 B (must align to 128 B).
+// e1000 spec also allows 64/128/256/4096; 32 is the minimum legal
+// size that still gives a comfortable TX backlog.
+let is i64 as RING_LEN     = 32;
+let is i64 as RING_BYTES   = 512;          // RING_LEN * 16
+let is i64 as PKT_BUF_SIZE = 2048;
+let is i64 as RX_BUFS_BYTES = 65536;       // RING_LEN * PKT_BUF_SIZE
+let is i64 as TX_BUFS_BYTES = 65536;
+
+// ============================================================
+// Driver state — single controller. Re-bind attempts (a second
+// matching PCI function) are refused, mirroring the AHCI driver's
+// V1 single-instance policy.
+// ============================================================
+
+struct E1000Ctx {
+    regs as *u8;
+    binding as *spec.Binding;
+
+    tx_ring as *driver.DmaBuffer;
+    tx_bufs as *driver.DmaBuffer;
+    tx_tail as i64;                       // local copy of TDT: next slot to fill
+    tx_clean as i64;                       // next slot to reap
+    tx_lock as lock.TicketLock;
+
+    rx_ring as *driver.DmaBuffer;
+    rx_bufs as *driver.DmaBuffer;
+    rx_head as i64;                       // next descriptor to consume
+    rx_lock as lock.TicketLock;
+
+    tx_packets as i64;
+    rx_packets as i64;
+
+    // Index handed back by netdev.register, so poll_rx knows which port's
+    // ring to push into and the IRQ knows whom to drain.
+    port_index as i64;
+    bound as i64;
+    promisc as i64;
+    mac as [8]u8;          // 6 used; padded so the struct stays i64-aligned
+}
+
+// Up to four controllers. A static array rather than a heap allocation: the
+// bound is real (a machine with five e1000s is not a machine this runs on),
+// there is no free path to get wrong, and the rest of the kernel — grab
+// stacks, netdev's own ports — is shaped the same way.
+//
+// This used to be a single global with a `ctx_bound` flag, and e1000_bind
+// REFUSED the second card. Two of anything is ordinary in a server, and the
+// refusal meant dev_open(DEV_NET, 1) reached a card only because the machine
+// happened to have one e1000 and one virtio-net.
+let is i64 as MAX_NICS = 4;
+let is [4]E1000Ctx as ctxs with mut;
+let is [4]netdev.NetDevice as nds with mut;
+let is i64 as nctx with mut = 0;
+
+fn ctx_at(i as i64) as *E1000Ctx {
+    if (i == 0) { return &ctxs[0]; }
+    if (i == 1) { return &ctxs[1]; }
+    if (i == 2) { return &ctxs[2]; }
+    return &ctxs[3];
+}
+
+fn nd_at(i as i64) as *netdev.NetDevice {
+    if (i == 0) { return &nds[0]; }
+    if (i == 1) { return &nds[1]; }
+    if (i == 2) { return &nds[2]; }
+    return &nds[3];
+}
+
+// ============================================================
+// MMIO helpers
+// ============================================================
+
+fn read32(c as *E1000Ctx, off as i64) as i64 {
+    let is *u32 as p = cast(*u32, cast(i64, c.regs) + off);
+    return cast(i64, *p) & 0xFFFFFFFF;
+}
+
+fn write32(c as *E1000Ctx, off as i64, val as i64) as void {
+    let is *u32 as p = cast(*u32, cast(i64, c.regs) + off);
+    *p = cast(u32, val & 0xFFFFFFFF);
+}
+
+// ============================================================
+// Descriptor accessors. Legacy descriptors are 16 bytes:
+//
+//   TX: u64 buffer_addr | u16 length | u8 cso | u8 cmd
+//       u8 status       | u8 css     | u16 special
+//   RX: u64 buffer_addr | u16 length | u16 csum
+//       u8 status       | u8 errors  | u16 special
+//
+// Caustic structs with mixed-width fields hit the codegen-aliasing
+// bug; touching the descriptor as raw bytes via *u8 sidesteps it
+// completely.
+// ============================================================
+
+fn desc_addr(ring_virt as i64, idx as i64) as *u8 {
+    return cast(*u8, ring_virt + idx * 16);
+}
+
+fn write_u64(p as *u8, off as i64, v as i64) as void {
+    let is *u64 as q = cast(*u64, cast(i64, p) + off);
+    *q = cast(u64, v);
+}
+
+fn write_u32(p as *u8, off as i64, v as i64) as void {
+    let is *u32 as q = cast(*u32, cast(i64, p) + off);
+    *q = cast(u32, v & 0xFFFFFFFF);
+}
+
+fn write_u16(p as *u8, off as i64, v as i64) as void {
+    let is *u16 as q = cast(*u16, cast(i64, p) + off);
+    *q = cast(u16, v & 0xFFFF);
+}
+
+fn write_u8_at(p as *u8, off as i64, v as i64) as void {
+    p[off] = cast(u8, v & 0xFF);
+}
+
+fn read_u64(p as *u8, off as i64) as i64 {
+    let is *u64 as q = cast(*u64, cast(i64, p) + off);
+    return cast(i64, *q);
+}
+
+fn read_u16(p as *u8, off as i64) as i64 {
+    let is *u16 as q = cast(*u16, cast(i64, p) + off);
+    return cast(i64, *q) & 0xFFFF;
+}
+
+fn read_u8_at(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) & 0xFF;
+}
+
+fn zero_region(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+// Phys address of the i-th packet buffer in either the tx or rx
+// pool. The pool is a single contiguous DMA allocation; the per-slot
+// buffer base is `pool_phys + idx * PKT_BUF_SIZE`.
+fn buf_phys(pool as *driver.DmaBuffer, idx as i64) as i64 {
+    return pool.phys + idx * PKT_BUF_SIZE;
+}
+
+fn buf_virt(pool as *driver.DmaBuffer, idx as i64) as *u8 {
+    return cast(*u8, cast(i64, pool.virt) + idx * PKT_BUF_SIZE);
+}
+
+// ============================================================
+// Reset + init sequence (Intel 8254x manual §14.5)
+// ============================================================
+
+fn delay_ms(n as i64) as void {
+    // Reset path runs on the bind thread before the IRQ wiring
+    // is live, so a real sleep is fine.
+    sched.sleep_for_ns(n * 1000000);
+}
+
+fn reset_controller(c as *E1000Ctx) as i32 {
+    // 1. Mask all interrupts at the controller
+    write32(c, REG_IMC, 0xFFFFFFFF);
+    // 2. Disable RX/TX engines so the reset is graceful
+    write32(c, REG_RCTL, 0);
+    write32(c, REG_TCTL, 0);
+    // 3. CTRL.RST self-clears once the device is ready again.
+    let is i64 as ctrl = read32(c, REG_CTRL);
+    write32(c, REG_CTRL, ctrl | CTRL_RST);
+    // Spec says ~1us; we sleep 10ms which is luxurious but cheap.
+    delay_ms(10);
+    let is i64 as deadline = timer.current_time_ns() + 1000000000;
+    while (timer.current_time_ns() < deadline) {
+        if ((read32(c, REG_CTRL) & CTRL_RST) == 0) {
+            // 4. Mask interrupts again — RST clears IMC.
+            write32(c, REG_IMC, 0xFFFFFFFF);
+            // 5. Drain any latched cause bits.
+            read32(c, REG_ICR);
+            return 0;
+        }
+        delay_ms(1);
+    }
+    return cast(i32, 0 - 1);
+}
+
+fn enable_link(c as *E1000Ctx) as void {
+    let is i64 as ctrl with mut = read32(c, REG_CTRL);
+    // Drop bits that interfere with autoneg, set SLU + ASDE so the
+    // PHY brings the link up itself.
+    ctrl = ctrl & (cast(i64, 0 - 1) - CTRL_LRST);
+    ctrl = ctrl & (cast(i64, 0 - 1) - CTRL_PHY_RST);
+    ctrl = ctrl & (cast(i64, 0 - 1) - CTRL_ILOS);
+    ctrl = ctrl & (cast(i64, 0 - 1) - CTRL_VME);
+    ctrl = ctrl | CTRL_SLU | CTRL_ASDE;
+    write32(c, REG_CTRL, ctrl);
+}
+
+fn read_mac_to_buf(c as *E1000Ctx) as void {
+    let is i64 as ral = read32(c, REG_RAL0);
+    let is i64 as rah = read32(c, REG_RAH0);
+    c.mac[0] = cast(u8, ral & 0xFF);
+    c.mac[1] = cast(u8, (ral >> 8)  & 0xFF);
+    c.mac[2] = cast(u8, (ral >> 16) & 0xFF);
+    c.mac[3] = cast(u8, (ral >> 24) & 0xFF);
+    c.mac[4] = cast(u8, rah & 0xFF);
+    c.mac[5] = cast(u8, (rah >> 8) & 0xFF);
+}
+
+// Print one byte as exactly two hex digits, no "0x" prefix.
+fn print_byte_hex(v as i64) as void {
+    let is i64 as hi = (v >> 4) & 0xF;
+    let is i64 as lo = v & 0xF;
+    if (hi < 10) { serial.putc(48 + hi); }
+    else         { serial.putc(87 + hi); }
+    if (lo < 10) { serial.putc(48 + lo); }
+    else         { serial.putc(87 + lo); }
+}
+
+fn print_mac(c as *E1000Ctx) as void {
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        print_byte_hex(cast(i64, c.mac[i]));
+        if (i < 5) { serial.putc(58); }
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// TX / RX setup
+// ============================================================
+
+fn init_tx(c as *E1000Ctx) as i32 {
+    let is i32 as r1 = driver.dma_alloc(c.binding.hardware,
+                                         cast(u64, RING_BYTES), cast(u64, 16),
+                                         cast(u32, 1), &c.tx_ring);
+    if (r1 != driver.OK) { return r1; }
+    let is i32 as r2 = driver.dma_alloc(c.binding.hardware,
+                                         cast(u64, TX_BUFS_BYTES), cast(u64, 16),
+                                         cast(u32, 1), &c.tx_bufs);
+    if (r2 != driver.OK) { return r2; }
+
+    // Zero the descriptor ring — DD bits start clear, so the first
+    // pass through the ring won't think slots are busy.
+    zero_region(cast(*u8, c.tx_ring.virt), RING_BYTES);
+
+    // Program TDBAL/TDBAH/TDLEN with the ring's physical layout.
+    write32(c, REG_TDBAL, c.tx_ring.phys & 0xFFFFFFFF);
+    write32(c, REG_TDBAH, (c.tx_ring.phys >> 32) & 0xFFFFFFFF);
+    write32(c, REG_TDLEN, RING_BYTES);
+    write32(c, REG_TDH, 0);
+    write32(c, REG_TDT, 0);
+    c.tx_tail = 0;
+
+    // Enable transmitter. CT (collision threshold) = 0x10 per spec
+    // §13.4.34 and COLD = 0x40 for full-duplex modes (small COLD is
+    // illegal on full-dpx but harmless). RTLC re-tries on late
+    // collisions, which never fire on QEMU but mirror real hardware.
+    let is i64 as tctl = TCTL_EN | TCTL_PSP
+                       | (cast(i64, 0x10) << TCTL_CT_SHIFT)
+                       | (cast(i64, 0x40) << TCTL_COLD_SHIFT)
+                       | TCTL_RTLC;
+    write32(c, REG_TCTL, tctl);
+    // Inter-packet gap: spec-mandated values for 1 GbE copper.
+    write32(c, REG_TIPG, 0x0060200A);
+    return 0;
+}
+
+fn init_rx(c as *E1000Ctx) as i32 {
+    let is i32 as r1 = driver.dma_alloc(c.binding.hardware,
+                                         cast(u64, RING_BYTES), cast(u64, 16),
+                                         cast(u32, 1), &c.rx_ring);
+    if (r1 != driver.OK) { return r1; }
+    let is i32 as r2 = driver.dma_alloc(c.binding.hardware,
+                                         cast(u64, RX_BUFS_BYTES), cast(u64, 16),
+                                         cast(u32, 1), &c.rx_bufs);
+    if (r2 != driver.OK) { return r2; }
+
+    zero_region(cast(*u8, c.rx_ring.virt), RING_BYTES);
+
+    // Pre-populate every descriptor with its packet buffer phys. The
+    // hardware never modifies the buffer_addr field; it only writes
+    // length / status / errors back when a frame lands.
+    let is i64 as rv = cast(i64, c.rx_ring.virt);
+    let is i64 as i with mut = 0;
+    while (i < RING_LEN) {
+        let is *u8 as d = desc_addr(rv, i);
+        write_u64(d, 0, buf_phys(c.rx_bufs, i));
+        write_u16(d, 8, 0);                // length (HW writes)
+        write_u16(d, 10, 0);               // csum
+        write_u8_at(d, 12, 0);             // status
+        write_u8_at(d, 13, 0);             // errors
+        write_u16(d, 14, 0);               // special
+        i = i + 1;
+    }
+
+    // Set RAL0/RAH0 with our MAC + AV bit (bit 31) so the filter
+    // accepts unicast frames addressed to us. The values were already
+    // populated by firmware; we copy them through to make the order
+    // explicit and to be robust to a future setup flow that comes up
+    // with a zero filter.
+    let is i64 as mac_lo = cast(i64, c.mac[0])
+                         | (cast(i64, c.mac[1]) << 8)
+                         | (cast(i64, c.mac[2]) << 16)
+                         | (cast(i64, c.mac[3]) << 24);
+    let is i64 as mac_hi = cast(i64, c.mac[4])
+                         | (cast(i64, c.mac[5]) << 8)
+                         | 0x80000000;     // AV
+    write32(c, REG_RAL0, mac_lo);
+    write32(c, REG_RAH0, mac_hi);
+
+    // Zero the multicast table; we accept multicast via MPE+BAM in
+    // RCTL, so the per-bit filter never matters but spec requires
+    // it to be initialised to a known value.
+    let is i64 as mi with mut = 0;
+    while (mi < 128) {
+        write32(c, REG_MTA + mi * 4, 0);
+        mi = mi + 1;
+    }
+
+    write32(c, REG_RDBAL, c.rx_ring.phys & 0xFFFFFFFF);
+    write32(c, REG_RDBAH, (c.rx_ring.phys >> 32) & 0xFFFFFFFF);
+    write32(c, REG_RDLEN, RING_BYTES);
+    write32(c, REG_RDH, 0);
+    // RDT must point to one past the last *valid* descriptor; setting
+    // it to RING_LEN-1 means slots 0..RING_LEN-2 are owned by HW and
+    // HW will stop one before wrapping back to RDT.
+    write32(c, REG_RDT, RING_LEN - 1);
+    c.rx_head = 0;
+
+    let is i64 as rctl = RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE
+                       | RCTL_BSIZE_2048 | RCTL_SECRC;
+    write32(c, REG_RCTL, rctl);
+    return 0;
+}
+
+// ============================================================
+// send() — copy `packet` into the next TX slot, post it, advance
+// TDT, and (synchronously) wait for DD. The caller's buffer doesn't
+// need to be DMA-mappable; the per-slot bounce buffer takes the
+// hit of one memcpy in exchange for not exposing every caller to
+// the DMA buffer alloc API.
+// ============================================================
+
+// Reap every transmit descriptor the controller has finished with, so the
+// slots come back. Caller holds tx_lock. One vacant slot is always kept so
+// tx_tail == tx_clean means empty and can never also mean full.
+fn tx_reclaim_locked(c as *E1000Ctx) as i64 {
+    while (c.tx_clean != c.tx_tail) {
+        let is *u8 as d = desc_addr(cast(i64, c.tx_ring.virt), c.tx_clean);
+        if ((read_u8_at(d, 12) & DESC_STATUS_DD) == 0) { return tx_free_locked(c); }
+        write_u8_at(d, 12, 0);
+        let is i64 as nx with mut = c.tx_clean + 1;
+        if (nx >= RING_LEN) { nx = 0; }
+        c.tx_clean = nx;
+    }
+    return tx_free_locked(c);
+}
+
+fn tx_free_locked(c as *E1000Ctx) as i64 {
+    let is i64 as inflight with mut = c.tx_tail - c.tx_clean;
+    if (inflight < 0) { inflight = inflight + RING_LEN; }
+    return RING_LEN - 1 - inflight;
+}
+
+// netdev vtable: transmit one frame. Never blocks and never waits on the
+// wire — it stages the frame, rings the doorbell and returns.
+//
+// It used to wait synchronously for this descriptor's DD bit with a one
+// second budget, which capped the interface at one frame per descriptor
+// writeback round trip: fine for a smoke test sending one ARP, useless for
+// a TCP stack. Waiting is netdev's business now (net_write blocks when the
+// ring is full), and reporting fullness honestly is this function's.
+fn nd_send(priv as *u8, frame as *u8, len as i64) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0 - 2; }
+    if (len < 14 || len > PKT_BUF_SIZE) { return 0 - 3; }
+
+    let is i64 as flags = lock.acquire_irq(&c.tx_lock);
+    if (tx_reclaim_locked(c) <= 0) {
+        lock.release_irq(&c.tx_lock, flags);
+        return netdev.NET_TX_BUSY;
+    }
+    let is i64 as slot = c.tx_tail;
+    let is *u8 as bbuf = buf_virt(c.tx_bufs, slot);
+    let is i64 as bphys = buf_phys(c.tx_bufs, slot);
+
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        bbuf[i] = frame[i];
+        i = i + 1;
+    }
+
+    let is *u8 as d = desc_addr(cast(i64, c.tx_ring.virt), slot);
+    write_u64(d, 0, bphys);
+    write_u16(d, 8, len);
+    write_u8_at(d, 10, 0);                  // cso
+    write_u8_at(d, 11, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
+    write_u8_at(d, 12, 0);                  // status (HW writes DD)
+    write_u8_at(d, 13, 0);
+    write_u16(d, 14, 0);
+
+    let is i64 as next_mod with mut = slot + 1;
+    if (next_mod >= RING_LEN) { next_mod = 0; }
+    c.tx_tail = next_mod;
+    write32(c, REG_TDT, next_mod);
+    c.tx_packets = c.tx_packets + 1;
+    lock.release_irq(&c.tx_lock, flags);
+    return len;
+}
+
+fn nd_tx_free(priv as *u8) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0; }
+    let is i64 as flags = lock.acquire_irq(&c.tx_lock);
+    let is i64 as n = tx_reclaim_locked(c);
+    lock.release_irq(&c.tx_lock, flags);
+    return n;
+}
+
+// netdev vtable: move up to `budget` received frames into the port's ring.
+// Runs from the IRQ handler and from a reader about to sleep; netdev holds
+// the port lock across the call, which is what serialises the ring, so this
+// takes no lock of its own.
+fn nd_poll_rx(priv as *u8, budget as i64) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0; }
+    let is i64 as taken with mut = 0;
+    while (taken < budget) {
+        let is i64 as slot = c.rx_head;
+        let is *u8 as d = desc_addr(cast(i64, c.rx_ring.virt), slot);
+        let is i64 as st = read_u8_at(d, 12);
+        if ((st & DESC_STATUS_DD) == 0) { return taken; }
+        let is i64 as len = read_u16(d, 8);
+        netdev.rx_push(c.port_index, cast(i64, buf_virt(c.rx_bufs, slot)), len);
+
+        // Hand the descriptor back: clear status/length/errors, leave
+        // buffer_addr alone, then publish the slot to the controller.
+        write_u16(d, 8, 0);
+        write_u16(d, 10, 0);
+        write_u8_at(d, 12, 0);
+        write_u8_at(d, 13, 0);
+        write_u16(d, 14, 0);
+        write32(c, REG_RDT, slot);
+        let is i64 as next with mut = slot + 1;
+        if (next >= RING_LEN) { next = 0; }
+        c.rx_head = next;
+        c.rx_packets = c.rx_packets + 1;
+        taken = taken + 1;
+    }
+    return taken;
+}
+
+fn nd_mac(priv as *u8, out6 as *u8) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    let is i64 as i with mut = 0;
+    while (i < 6) { out6[i] = c.mac[i]; i = i + 1; }
+    return 0;
+}
+
+fn nd_link_up(priv as *u8) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0; }
+    if ((read32(c, REG_STATUS) & STATUS_LU) != 0) { return 1; }
+    return 0;
+}
+
+fn nd_mtu(priv as *u8) as i64 {
+    return 1500;
+}
+
+// The negotiated line rate, from STATUS bits 7:6. Reported rather than
+// assumed: a port that came up at 100 Mb because of a bad cable looks
+// identical to a gigabit one from every other angle, and that is exactly the
+// fault someone spends an afternoon on.
+fn nd_speed(priv as *u8) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0; }
+    let is i64 as st = read32(c, REG_STATUS);
+    if ((st & STATUS_LU) == 0) { return 0; }       // down: no rate to report
+    let is i64 as sp = (st & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT;
+    if (sp == 0) { return 10; }
+    if (sp == 1) { return 100; }
+    return 1000;
+}
+
+// Promiscuous mode, for real rather than as a permanent state. The receiver
+// comes up promiscuous because netd wants every frame, but leaving the knob
+// unimplemented and calling it "always on" is a claim that stops being true
+// the moment anything wants the opposite — a capture tool that should NOT be
+// seeing its neighbours' traffic, or a bridge that must.
+//
+// UPE is unicast-promiscuous and MPE multicast-promiscuous; broadcast (BAM)
+// stays on either way, because a host that cannot hear broadcast cannot ARP.
+fn nd_set_promisc(priv as *u8, on as i64) as i64 {
+    let is *E1000Ctx as c = cast(*E1000Ctx, priv);
+    if (c.bound == 0) { return 0 - 2; }
+    let is i64 as rctl with mut = read32(c, REG_RCTL);
+    if (on != 0) { rctl = rctl | RCTL_UPE | RCTL_MPE; }
+    else { rctl = rctl & (0xFFFFFFFF - (RCTL_UPE | RCTL_MPE)); }
+    write32(c, REG_RCTL, rctl);
+    c.promisc = on;
+    return 0;
+}
+
+// ============================================================
+// IRQ handler — read ICR (clears most cause bits on read) and act
+// on the ones we care about. RXT0 wakes any thread blocked in the
+// smoke test; LSC just logs the new link state.
+// ============================================================
+
+// The framework registers this with the *Binding as its context (spec.cst
+// populate_caps), and the binding carries our per-card state in `private`.
+// That is what makes the handler work for the second card as well as the
+// first — with a global it would have acknowledged card 0's interrupt while
+// card 1 kept asserting its line.
+fn e1000_irq(hw as *driver.Hardware, context as *u8) as i32 {
+    let is *spec.Binding as b = cast(*spec.Binding, context);
+    if (cast(i64, b) == 0) { return 0; }
+    let is *E1000Ctx as c = cast(*E1000Ctx, b.private);
+    if (cast(i64, c) == 0) { return 0; }
+    if (c.bound == 0) { return 0; }
+    let is i64 as cause = read32(c, REG_ICR);
+    if (cause == 0) { return 0; }              // not for us (shared IRQ)
+
+    if ((cause & INT_LSC) != 0) {
+        let is i64 as st = read32(c, REG_STATUS);
+        serial.print("e1000.irq: LSC ", 15);
+        if ((st & STATUS_LU) != 0) { serial.print("up", 2); }
+        else                       { serial.print("down", 4); }
+        serial.println("", 0);
+    }
+
+    if ((cause & INT_RXO) != 0) {
+        // The controller ran out of descriptors and dropped frames. Nothing
+        // to do in-handler, but it is real information about a ring that is
+        // too small or a consumer that is too slow, so it gets counted rather
+        // than ignored.
+        netdev.note_hw_drop(c.port_index);
+    }
+
+    if ((cause & (INT_RXT0 | INT_RXO)) != 0) {
+        // Drain a bounded batch into the port ring and wake any reader. The
+        // budget is what keeps time-at-interrupt bounded; a reader that misses
+        // this wakeup still makes progress because net_read pumps before it
+        // sleeps.
+        netdev.irq_drain(c.port_index);
+    }
+    return 0;
+}
+
+// ============================================================
+// Lifecycle: bind callback resolved by specparse via ksym.
+// ============================================================
+
+fn e1000_bind(b as *spec.Binding) as i32 {
+    if (nctx >= MAX_NICS) {
+        serial.println("e1000: no free instance slot", 28);
+        return cast(i32, 0 - 99);
+    }
+    let is *E1000Ctx as c = ctx_at(nctx);
+    let is *netdev.NetDevice as nd = nd_at(nctx);
+    // The binding carries our state, which is how the IRQ handler finds the
+    // right card and how a second controller stops being a special case.
+    b.private = cast(*u8, c);
+    let is *u8 as regs = b.caps.mmio;
+    if (cast(i64, regs) == 0) {
+        serial.println("e1000: no mmio capability", 25);
+        return cast(i32, 0 - 1);
+    }
+
+    c.regs = regs;
+    c.binding = b;
+    c.bound = 0;
+    c.promisc = 1;                 // init_rx brings the receiver up promiscuous
+    c.tx_tail = 0;
+    c.tx_clean = 0;
+    c.rx_head = 0;
+    c.tx_packets = 0;
+    c.rx_packets = 0;
+    c.port_index = cast(i64, 0 - 1);
+
+    // PCI bus master + memory space — DMA fails silently otherwise.
+    pci.pci_enable_bus_master(b.hardware);
+
+    let is *pci.PciHardware as pd = cast(*pci.PciHardware, b.hardware);
+    serial.print("e1000: probe ", 13);
+    util.print_num(cast(i64, pd.bus));
+    serial.putc(58);
+    util.print_num(cast(i64, pd.dev));
+    serial.putc(46);
+    util.print_num(cast(i64, pd.func));
+    serial.print(" bar0=", 6);
+    util.print_hex(cast(i64, pd.bar0));
+    serial.println("", 0);
+
+    if (reset_controller(c) != 0) {
+        serial.println("e1000: reset timeout", 20);
+        return cast(i32, 0 - 2);
+    }
+
+    // Read MAC after reset (still valid — RAL0/RAH0 survive RST).
+    read_mac_to_buf(c);
+    serial.print("e1000: mac=", 11);
+    print_mac(c);
+    serial.println("", 0);
+
+    if (init_tx(c) != 0) {
+        serial.println("e1000: tx init failed", 21);
+        return cast(i32, 0 - 3);
+    }
+    if (init_rx(c) != 0) {
+        serial.println("e1000: rx init failed", 21);
+        return cast(i32, 0 - 4);
+    }
+
+    enable_link(c);
+
+    // Drain any latched ICR bits the reset might have left, then unmask only
+    // the causes we consume: RX-packet-timer, receive overrun, and link
+    // status. TXDW stays masked because transmit completions are reaped
+    // lazily on the next send — reaping them at interrupt would add a wakeup
+    // per packet and buy nothing. RXO is new: it means the controller itself
+    // dropped frames, which is worth counting even though nothing can be done
+    // about it in the handler.
+    read32(c, REG_ICR);
+    write32(c, REG_IMS, INT_RXT0 | INT_RXO | INT_LSC);
+
+    let is i64 as st = read32(c, REG_STATUS);
+    serial.print("e1000: status=", 14);
+    util.print_hex(st);
+    if ((st & STATUS_LU) != 0) { serial.print(" link=up", 8); }
+    else                        { serial.print(" link=down", 10); }
+    serial.println("", 0);
+
+    c.bound = 1;
+
+    // Publish the port. Until this returns, poll_rx has no ring to push into
+    // and the IRQ has nobody to drain, so it happens before the first frame
+    // can arrive — the controller's receiver was only just enabled and the
+    // interrupt is still the one we unmasked above.
+    nd.name[0] = cast(u8, 101); nd.name[1] = cast(u8, 49);      // "e1000"
+    nd.name[2] = cast(u8, 48);  nd.name[3] = cast(u8, 48);
+    nd.name[4] = cast(u8, 48);  nd.name[5] = cast(u8, 0);
+    nd.send        = fn_ptr(nd_send);
+    nd.poll_rx     = fn_ptr(nd_poll_rx);
+    nd.tx_free     = fn_ptr(nd_tx_free);
+    nd.mac         = fn_ptr(nd_mac);
+    nd.link_up     = fn_ptr(nd_link_up);
+    nd.mtu         = fn_ptr(nd_mtu);
+    nd.set_promisc = fn_ptr(nd_set_promisc);
+    nd.speed       = fn_ptr(nd_speed);
+    nd.priv        = cast(*u8, c);
+    nd.next        = cast(*netdev.NetDevice, 0);
+    let is i64 as pi = netdev.register(nd, cast(i64, b.hardware));
+    if (pi < 0) {
+        serial.println("e1000: netdev.register failed", 29);
+        return cast(i32, 0 - 5);
+    }
+    c.port_index = pi;
+    nctx = nctx + 1;
+    return driver.OK;
+}
+
+// ============================================================
+// ksym registration — names match the lifecycle block in e1000.cdvrspec
+// verbatim. Only bind and irq are published now: send/recv/mac used to be
+// here for the `implements NetworkController` block, which resolved them by
+// position in the spec text and which nothing ever called. They reach the
+// system through netdev.NetDevice instead, as a checked vtable.
+// ============================================================
+
+let is ksym.KSym as ksym_e1000_bind;
+let is ksym.KSym as ksym_e1000_irq;
+
+fn register() as void {
+    ksym_e1000_bind.name_ptr = cast(*u8, "e1000.e1000_bind");
+    ksym_e1000_bind.name_len = 16;
+    ksym_e1000_bind.addr     = cast(i64, fn_ptr(e1000_bind));
+    ksym_e1000_bind.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_e1000_bind);
+
+    ksym_e1000_irq.name_ptr = cast(*u8, "e1000.e1000_irq");
+    ksym_e1000_irq.name_len = 15;
+    ksym_e1000_irq.addr     = cast(i64, fn_ptr(e1000_irq));
+    ksym_e1000_irq.kind     = ksym.KIND_FUNC;
+    ksym.register(&ksym_e1000_irq);
+}

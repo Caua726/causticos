@@ -1,0 +1,435 @@
+// httpt — HTTP, against a server that is not our code.
+//
+// Three layers, tested where each of them can actually be wrong:
+//
+//   THE URL PARSER, on its own. Pure function, no network, so the awkward
+//   cases (a port, no path, a query, a userinfo that must be refused) are
+//   cheap enough to all be checked.
+//
+//   THE RESPONSE PARSER, against a canned response through a mock Conn that
+//   returns ONE BYTE PER READ. That is the fragmentation a real network
+//   produces at its worst, and a parser that only works when a whole header
+//   arrives in one read passes every friendly test and fails on the wire.
+//
+//   THE WHOLE STACK, against a Python server on the host. SLIRP presents the
+//   host as 10.0.2.2, so this is DHCP, DNS, ARP, IP, TCP and HTTP together,
+//   ending in a downloaded file whose every byte is checked against what the
+//   server was asked to send.
+//
+// The payload is a pure function of its offset — byte i is (i * 31 + 7) & 255
+// — so a wrong byte in the middle of 64 KiB is caught. A length check alone
+// would pass a transfer that delivered the right amount of the wrong data,
+// which is exactly what a sequence-number bug produces.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/netproto/netproto.cst" as np;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/netsvc.cst" as netsvc;
+use "../lib/netcli/conn.cst" as cn;
+use "../lib/http/url.cst" as url;
+use "../lib/http/http.cst" as http;
+
+let is i64 as SERVER_IP = 0x0A000202;        // 10.0.2.2, the host per SLIRP
+let is i64 as SERVER_PORT = 17780;
+let is i64 as BLOB_LEN = 65536;
+let is i64 as CHUNKED_LEN = 5000;
+let is i64 as NOCLEN_LEN = 3000;
+
+let is i64 as fails with mut = 0;
+let is i64 as checks with mut = 0;
+let is i64 as netd_pid with mut = 0;
+
+let is http.Resp as resp;
+let is cn.Conn as conn;
+let is i64 as sock with mut = 0 - 1;
+let is [2048]u8 as reqbuf;
+let is [4096]u8 as bodybuf;
+
+fn say(t as *u8) as void {
+    prog.outs(t);
+    let is i64 as n with mut = 0;
+    while (t[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(t, n);
+    return;
+}
+
+fn say_num(v as i64) as void {
+    prog.out_num(v);
+    let is i64 as x with mut = v;
+    if (x < 0) { sys.write_serial(cast(*u8, "-"), 1); x = 0 - x; }
+    if (x == 0) { sys.write_serial(cast(*u8, "0"), 1); return; }
+    let is [24]u8 as b;
+    let is i64 as i with mut = 24;
+    while (x > 0) { i = i - 1; b[i] = cast(u8, 48 + (x % 10)); x = x / 10; }
+    sys.write_serial(cast(*u8, &b[i]), 24 - i);
+    return;
+}
+
+fn check(name as *u8, got as i64, want as i64) as void {
+    checks = checks + 1;
+    if (got == want) { say("  ok   "); } else { say("  FAIL "); fails = fails + 1; }
+    say(name);
+    say(" got="); say_num(got);
+    say(" want="); say_num(want);
+    say("\n");
+    return;
+}
+
+fn expect_byte(i as i64) as i64 { return (i * 31 + 7) & 0xFF; }
+
+// ============================================================
+// The URL parser, on its own
+// ============================================================
+
+fn t_url() as void {
+    say("url:\n");
+    let is url.Url as u;
+
+    check(cast(*u8, "http with port and path"),
+          url.parse(cast(*u8, "http://10.0.2.2:8000/a/b.bin"), 28, &u), 0);
+    check(cast(*u8, "  scheme"), u.scheme, url.HTTP);
+    check(cast(*u8, "  port"), u.port, 8000);
+    check(cast(*u8, "  host length"), u.hostlen, 8);
+    check(cast(*u8, "  path length"), u.pathlen, 8);
+
+    check(cast(*u8, "https defaults to 443"),
+          url.parse(cast(*u8, "https://example.com"), 19, &u), 0);
+    check(cast(*u8, "  scheme"), u.scheme, url.HTTPS);
+    check(cast(*u8, "  port"), u.port, 443);
+    check(cast(*u8, "  no path"), u.pathlen, 0);
+
+    // A query is part of the resource, not decoration: dropping it asks the
+    // server for something else.
+    check(cast(*u8, "query is kept in the path"),
+          url.parse(cast(*u8, "http://h/s?a=1&b=2"), 18, &u), 0);
+    check(cast(*u8, "  path length"), u.pathlen, 10);
+
+    // A fragment is the client's business and never goes on the wire.
+    check(cast(*u8, "fragment is dropped"),
+          url.parse(cast(*u8, "http://h/p#frag"), 15, &u), 0);
+    check(cast(*u8, "  path length"), u.pathlen, 2);
+
+    // A bare host is what people type.
+    check(cast(*u8, "bare host accepted"),
+          url.parse(cast(*u8, "example.com/x"), 13, &u), 0);
+    check(cast(*u8, "  defaults to http"), u.scheme, url.HTTP);
+    check(cast(*u8, "  and port 80"), u.port, 80);
+
+    // Refusals. Each of these would otherwise become a silent wrong answer.
+    check(cast(*u8, "another scheme refused"),
+          url.parse(cast(*u8, "ftp://h/x"), 9, &u) < 0, 1);
+    check(cast(*u8, "userinfo refused"),
+          url.parse(cast(*u8, "http://u:p@h/x"), 14, &u) < 0, 1);
+    check(cast(*u8, "ipv6 literal refused"),
+          url.parse(cast(*u8, "http://[::1]/x"), 14, &u) < 0, 1);
+    check(cast(*u8, "non-numeric port refused"),
+          url.parse(cast(*u8, "http://h:80x/"), 13, &u) < 0, 1);
+    check(cast(*u8, "empty refused"), url.parse(cast(*u8, ""), 0, &u) < 0, 1);
+
+    // A colon inside a path must not be read as a scheme.
+    check(cast(*u8, "path with :// is not a scheme"),
+          url.parse(cast(*u8, "h/a://b"), 7, &u), 0);
+    check(cast(*u8, "  host is still h"), u.hostlen, 1);
+    return;
+}
+
+// ============================================================
+// The response parser, one byte at a time
+// ============================================================
+
+let is cn.Mock as mock;
+let is [512]u8 as mockwr;
+
+fn mock_start(text as *u8, len as i64, chunk as i64) as void {
+    cn.mock_init(&mock, text, len, cast(*u8, &mockwr[0]), 512);
+    mock.chunk = chunk;
+    cn.mock_conn(&conn, &mock);
+    return;
+}
+
+fn drain_mock(out as *u8, cap as i64) as i64 {
+    let is i64 as total with mut = 0;
+    while (1 == 1) {
+        let is i64 as n = http.read_body(&resp, &conn, cast(*u8, &bodybuf[0]), 4096);
+        if (n <= 0) {
+            if (n < 0) { return n; }
+            return total;
+        }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (total + i < cap) { out[total + i] = bodybuf[i]; }
+            i = i + 1;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+fn t_parse() as void {
+    say("response parser (one byte per read):\n");
+    let is [256]u8 as got;
+
+    // Content-Length, delivered one byte at a time.
+    mock_start(cast(*u8, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"), 43, 1);
+    check(cast(*u8, "status parsed"), http.read_head(&resp, &conn, 0), 200);
+    check(cast(*u8, "content-length parsed"), resp.clen, 5);
+    check(cast(*u8, "delimited by length"), resp.body_kind, http.BODY_LENGTH);
+    check(cast(*u8, "body length"), drain_mock(cast(*u8, &got[0]), 256), 5);
+    check(cast(*u8, "body content"), cast(i64, got[0]), 104);       // 'h'
+    check(cast(*u8, "body ends where it said"), resp.done, 1);
+
+    // A header name that merely starts the same must not be taken for it.
+    mock_start(cast(*u8, "HTTP/1.1 200 OK\r\nContent-Length-Hint: 99\r\nContent-Length: 2\r\n\r\nhi"), 65, 3);
+    check(cast(*u8, "prefix header not confused"), http.read_head(&resp, &conn, 0), 200);
+    check(cast(*u8, "  right length taken"), resp.clen, 2);
+
+    // Chunked, with an extension on one size line and a trailer at the end.
+    mock_start(cast(*u8, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;x=1\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n"), 79, 1);
+    check(cast(*u8, "chunked recognised"), http.read_head(&resp, &conn, 0), 200);
+    check(cast(*u8, "  delimited by chunks"), resp.body_kind, http.BODY_CHUNKED);
+    check(cast(*u8, "  reassembled length"), drain_mock(cast(*u8, &got[0]), 256), 5);
+    check(cast(*u8, "  first byte"), cast(i64, got[0]), 97);        // 'a'
+    check(cast(*u8, "  last byte"), cast(i64, got[4]), 101);        // 'e'
+
+    // Chunked wins over a Content-Length that disagrees. Taking the length
+    // instead is how a response gets read as two.
+    mock_start(cast(*u8, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nZ\r\n0\r\n\r\n"), 79, 5);
+    check(cast(*u8, "chunked beats content-length"), http.read_head(&resp, &conn, 0), 200);
+    check(cast(*u8, "  it is chunked"), resp.body_kind, http.BODY_CHUNKED);
+    check(cast(*u8, "  one byte of body"), drain_mock(cast(*u8, &got[0]), 256), 1);
+
+    // 100 Continue, then the real answer.
+    mock_start(cast(*u8, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nQ"), 69, 2);
+    check(cast(*u8, "informational skipped"), http.read_head(&resp, &conn, 0), 201);
+
+    // 204 has no body even with a Content-Length, and reading one would eat
+    // the next response on a reused connection.
+    mock_start(cast(*u8, "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nxxxxx"), 51, 4);
+    check(cast(*u8, "204 has no body"), http.read_head(&resp, &conn, 0), 204);
+    check(cast(*u8, "  and reads none"), drain_mock(cast(*u8, &got[0]), 256), 0);
+
+    // A location is captured for a redirect.
+    mock_start(cast(*u8, "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"), 63, 1);
+    check(cast(*u8, "redirect recognised"), http.read_head(&resp, &conn, 0), 302);
+    check(cast(*u8, "  is a redirect"), http.is_redirect(&resp), 1);
+    check(cast(*u8, "  location length"), resp.loclen, 10);
+
+    // Not HTTP at all: refused rather than parsed into nonsense.
+    mock_start(cast(*u8, "220 smtp.example.com ESMTP\r\n"), 28, 1);
+    check(cast(*u8, "non-http refused"), http.read_head(&resp, &conn, 0) < 0, 1);
+
+    // A truncated body is an error, not a short file. A caller that saw a
+    // clean end would keep the truncation and never know.
+    mock_start(cast(*u8, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"), 42, 1);
+    check(cast(*u8, "truncation detected"), http.read_head(&resp, &conn, 0), 200);
+    check(cast(*u8, "  read fails, not ends"), drain_mock(cast(*u8, &got[0]), 256) < 0, 1);
+    return;
+}
+
+// ============================================================
+// The whole stack
+// ============================================================
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+// One GET. Returns the status or a negative error; the connection stays open
+// on the module-level conn so the body can be read from it.
+fn get(path as *u8) as i64 {
+    sock = nc.dial(SERVER_IP, SERVER_PORT, &conn);
+    if (sock < 0) { return sock; }
+    let is i64 as n = http.build_request(cast(*u8, &reqbuf[0]), 2048, cast(*u8, "GET"),
+                                         cast(*u8, "10.0.2.2"), 8,
+                                         SERVER_PORT, url.PORT_HTTP,
+                                         path, slen(path));
+    if (n <= 0) { nc.close(sock); return 0 - 1; }
+    if (cn.write_all(&conn, cast(*u8, &reqbuf[0]), n) != n) {
+        nc.close(sock);
+        return 0 - 1;
+    }
+    return http.read_head(&resp, &conn, 0);
+}
+
+// Read the whole body, checking every byte against what the server was asked
+// to send. Returns the count, or -1 at the first byte that is wrong — the
+// position matters more than the fact, so it is reported.
+fn body_matches() as i64 {
+    let is i64 as total with mut = 0;
+    while (1 == 1) {
+        let is i64 as n = http.read_body(&resp, &conn, cast(*u8, &bodybuf[0]), 4096);
+        if (n < 0) {
+            // Where it stopped matters more than that it stopped: a transfer
+            // that dies at a round number died of a buffer, and one that dies
+            // anywhere died of the network.
+            say("    stopped after "); say_num(total);
+            say(" bytes, dropped "); say_num(nc.dropped(sock)); say("\n");
+            return n;
+        }
+        if (n == 0) { return total; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (cast(i64, bodybuf[i]) != expect_byte(total + i)) {
+                say("    first wrong byte at offset "); say_num(total + i); say("\n");
+                return 0 - 1;
+            }
+            i = i + 1;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+fn t_fetch() as void {
+    say("http over tcp:\n");
+
+    let is i64 as st with mut = get(cast(*u8, "/f.bin"));
+    check(cast(*u8, "server answers 200"), st, 200);
+    if (st == 200) {
+        check(cast(*u8, "content-length announced"), resp.clen, BLOB_LEN);
+        check(cast(*u8, "every byte of 64 KiB"), body_matches(), BLOB_LEN);
+    }
+    nc.close(sock);
+
+    st = get(cast(*u8, "/chunked"));
+    check(cast(*u8, "chunked answers 200"), st, 200);
+    if (st == 200) {
+        check(cast(*u8, "  framed by chunks"), resp.body_kind, http.BODY_CHUNKED);
+        check(cast(*u8, "  reassembled whole"), body_matches(), CHUNKED_LEN);
+    }
+    nc.close(sock);
+
+    // No length and no chunking: the body ends when the connection does, and
+    // the only way to know it was complete is that the peer closed cleanly.
+    st = get(cast(*u8, "/noclen"));
+    check(cast(*u8, "no content-length answers 200"), st, 200);
+    if (st == 200) {
+        check(cast(*u8, "  delimited by close"), resp.body_kind, http.BODY_EOF);
+        check(cast(*u8, "  read to the end"), body_matches(), NOCLEN_LEN);
+    }
+    nc.close(sock);
+
+    // A head fragmented across many small segments by the server.
+    st = get(cast(*u8, "/slow"));
+    check(cast(*u8, "fragmented head parsed"), st, 200);
+    if (st == 200) { check(cast(*u8, "  body intact"), body_matches(), 64); }
+    nc.close(sock);
+
+    st = get(cast(*u8, "/continue"));
+    check(cast(*u8, "100 continue skipped on the wire"), st, 200);
+    if (st == 200) { check(cast(*u8, "  real body follows"), body_matches(), 16); }
+    nc.close(sock);
+
+    st = get(cast(*u8, "/missing"));
+    check(cast(*u8, "404 reported as 404"), st, 404);
+    nc.close(sock);
+
+    st = get(cast(*u8, "/redirect"));
+    check(cast(*u8, "redirect status"), st, 302);
+    if (st == 302) {
+        check(cast(*u8, "  carries a location"), http.is_redirect(&resp), 1);
+        check(cast(*u8, "  location is /f.bin"), resp.loclen, 6);
+    }
+    nc.close(sock);
+    return;
+}
+
+// ============================================================
+// wget, as a program
+// ============================================================
+
+// Spawn the real binary with its own netd endpoint, minted for it, and check
+// what it left on disk. Spawning it rather than calling its logic is the same
+// discipline netdt uses: a test that reimplements what it tests can pass while
+// the shipped program is broken.
+fn t_wget() as void {
+    say("wget as a program:\n");
+
+    let is i64 as ilen with mut = 0;
+    let is i64 as img = fu.slurp(cast(*u8, "/wget.cse"), &ilen);
+    if (ilen <= 0) { check(cast(*u8, "/wget.cse on disk"), 0, 1); return; }
+
+    // Through netsvc, which is what the shell and the compositor use, so this
+    // exercises the code path the machine actually boots with rather than a
+    // second one written for the test.
+    let is i64 as ep = netsvc.endpoint();
+    check(cast(*u8, "netd mints an endpoint"), ep >= 0, 1);
+    // Never on top of stdin, stdout or stderr. A descriptor that lands on
+    // fd 1 turns every subsequent print into protocol garbage on somebody
+    // else's channel, and nothing fails where the mistake was made.
+    check(cast(*u8, "and not over a reserved fd"), ep >= 3, 1);
+    if (ep < 0) { fu.unslurp(img, ilen); return; }
+
+    let is [2]i64 as fda;
+    fda[0] = np.NET_FD; fda[1] = ep;
+    let is [10]i64 as av;
+    av[0] = cast(i64, "wget");  av[1] = 4;
+    av[2] = cast(i64, "-q");    av[3] = 2;
+    av[4] = cast(i64, "-O");    av[5] = 2;
+    av[6] = cast(i64, "/got.bin"); av[7] = 8;
+    av[8] = cast(i64, "http://10.0.2.2:17780/f.bin"); av[9] = 27;
+    let is i64 as pid = sys.spawn(cast(*u8, img), ilen, cast(*u8, &fda[0]), 1,
+                                  cast(*u8, &av[0]), 5);
+    fu.unslurp(img, ilen);
+    check(cast(*u8, "wget spawned"), pid > 0, 1);
+    if (pid <= 0) { return; }
+    sys.close(ep);                       // wget owns its endpoint now
+
+    let is [1]i64 as st;
+    st[0] = 0 - 1;
+    sys.wait(pid, cast(*i64, &st[0]));
+    check(cast(*u8, "wget exited cleanly"), st[0], 0);
+
+    // The file, byte for byte. Reading it back through the filesystem is what
+    // makes this end to end: the bytes went from a Python process on the host
+    // through SLIRP, the NIC, TCP, netd, a channel, wget and FAT32.
+    let is i64 as flen with mut = 0;
+    let is i64 as fva = fu.slurp(cast(*u8, "/got.bin"), &flen);
+    check(cast(*u8, "the file is there"), flen, BLOB_LEN);
+    if (flen == BLOB_LEN) {
+        let is *u8 as p = cast(*u8, fva);
+        let is i64 as bad with mut = 0 - 1;
+        let is i64 as i with mut = 0;
+        while (i < flen) {
+            if (cast(i64, p[i]) != expect_byte(i)) { bad = i; i = flen; }
+            i = i + 1;
+        }
+        if (bad >= 0) { say("    first wrong byte at offset "); say_num(bad); say("\n"); }
+        check(cast(*u8, "and every byte of it is right"), bad, 0 - 1);
+    }
+    if (flen > 0) { fu.unslurp(fva, flen); }
+    return;
+}
+
+fn main() as i32 {
+    say("httpt: http over the whole stack\n");
+
+    t_url();
+    t_parse();
+
+    // Exactly what /init does: nothing handed this process a netd channel, so
+    // it starts one. Going through netsvc rather than spawning netd by hand
+    // means this test covers the code the machine boots with — a test that
+    // reimplements what it tests can pass while the shipped path is broken.
+    check(cast(*u8, "no netd was handed to us"), netsvc.attach_or_start(0), sys.E_NOENT);
+    check(cast(*u8, "so /init starts one"), netsvc.attach_or_start(1), 0);
+    check(cast(*u8, "and it reports its interfaces"), nc.iface_count() > 0, 1);
+    netd_pid = netsvc.pid();
+    check(cast(*u8, "an address was leased"), nc.wait_address(10000000000) != 0, 1);
+
+    t_fetch();
+    t_wget();
+
+    sys.kill(netd_pid);
+    let is [1]i64 as st;
+    sys.wait(netd_pid, cast(*i64, &st[0]));
+
+    say("httpt: "); say_num(checks); say(" checks\n");
+    if (fails == 0) { say("httpt: ALL PASS\n"); return cast(i32, 0); }
+    say("httpt: FAIL n="); say_num(fails); say("\n");
+    return cast(i32, 1);
+}

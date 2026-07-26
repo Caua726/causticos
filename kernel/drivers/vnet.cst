@@ -3,9 +3,9 @@
 // on a one-queue input device, this proves it on a two-queue DMA device:
 // a receiveq the device fills with incoming frames and a transmitq the
 // driver fills with outgoing ones, each frame prefixed by a 12-byte
-// virtio_net_hdr. Same NetworkController interface the e1000 implements, so
-// it is a drop-in alternative NIC — the framework wires whichever device the
-// hardware presents.
+// virtio_net_hdr. Same netdev.NetDevice vtable the e1000 fills, so it is a
+// drop-in alternative NIC — the framework wires whichever devices the machine
+// presents, and up to four of them.
 //
 // Modern-only (VERSION_1 negotiated in virtio.cst). We do NOT negotiate
 // MRG_RXBUF or CSUM/GSO offloads, so the header is the plain 12-byte form
@@ -24,6 +24,7 @@ use "sched.cst" as sched;
 use "timer.cst" as timer;
 use "util.cst" as util;
 use "virtio.cst" as virtio;
+use "netdev.cst" as netdev;
 
 let is i64 as NET_HDR_LEN = 10;        // virtio_net_hdr, no MRG_RXBUF (legacy-compat 10 bytes... )
 // NOTE: the modern (VERSION_1) header is 12 bytes — flags(1) gso_type(1)
@@ -36,223 +37,265 @@ let is i64 as NQ = 16;                 // ring slots we drive per queue (<= devi
 // device config offsets (struct virtio_net_config): mac[6] then status le16
 let is i64 as CFG_MAC = 0;
 
-let is virtio.VirtioDev as vdev;
-let is virtio.VirtQueue as rxq;
-let is virtio.VirtQueue as txq;
-let is i64 as vnet_present with mut = 0;
-let is [6]u8 as vnet_mac with mut;
+// Up to four adapters. Same reasoning as e1000: a static array, no free path,
+// and two of the same device stops being a case the driver refuses. It used to
+// be one set of globals plus a `vnet_present` flag, and vnet_bind turned the
+// second card away.
+let is i64 as MAX_NICS = 4;
 
-let is lock.TicketLock as tx_lock;
-let is lock.TicketLock as rx_lock;
-let is i64 as rx_waiter_tid with mut = 0 - 1;
+struct VnetCtx {
+    present     as i64;
+    tx_inflight as i64;      // posted to the device, not yet reclaimed
+    port_index  as i64;      // handed back by netdev.register
+    vdev as virtio.VirtioDev;
+    rxq  as virtio.VirtQueue;
+    txq  as virtio.VirtQueue;
+    lk   as lock.TicketLock;
+    mac  as [8]u8;           // 6 used
+}
 
+let is [4]VnetCtx as ctxs with mut;
+let is [4]netdev.NetDevice as nds with mut;
+let is i64 as nctx with mut = 0;
+
+fn ctx_at(i as i64) as *VnetCtx {
+    if (i == 0) { return &ctxs[0]; }
+    if (i == 1) { return &ctxs[1]; }
+    if (i == 2) { return &ctxs[2]; }
+    return &ctxs[3];
+}
+
+fn nd_at(i as i64) as *netdev.NetDevice {
+    if (i == 0) { return &nds[0]; }
+    if (i == 1) { return &nds[1]; }
+    if (i == 2) { return &nds[2]; }
+    return &nds[3];
+}
 let is ksym.KSym as ksym_bind;
 let is ksym.KSym as ksym_irq;
-let is ksym.KSym as ksym_send;
-let is ksym.KSym as ksym_recv;
-let is ksym.KSym as ksym_mac;
-let is ksym.KSym as ksym_smoke;
 
-// ---- the NetworkController vtable methods ----
+// ---- the netdev.NetDevice vtable ----
 
-// Transmit one ethernet frame: stage [12-byte zero hdr][frame] into a tx
-// slot, post it, publish, then reclaim used tx descriptors (the device
-// consumed earlier frames). Bounded wait for THIS frame's completion.
-fn vnet_send(packet as *u8, len as i64) as i32 {
-    if (vnet_present == 0) { return driver.NOT_SUPPORTED; }
-    if (len < 14) { return driver.INVALID_ARGUMENT; }
-    if (len + HDR > SLOT_SZ) { return driver.INVALID_ARGUMENT; }
-    let is i64 as fl = lock.acquire_irq(&tx_lock);
-    // reclaim completed tx buffers so the ring doesn't wedge
-    let is i64 as r with mut = 0;
-    while (r >= 0) { r = virtio.vio_next_used(&txq); }
-    let is i64 as slot = txq.avail_shadow - (txq.avail_shadow / txq.qsize) * txq.qsize;
-    let is i64 as base = txq.buf_va + slot * SLOT_SZ;
+// Transmit one frame: stage [12-byte zero header][frame] into a tx slot,
+// describe it as device-readable, and publish. Never waits on the wire.
+//
+// The previous version computed its slot as avail_shadow % qsize and wrote it
+// unconditionally. After qsize sends that overwrites a descriptor the device
+// may still be reading — invisible while a smoke test sent one ARP every boot,
+// certain to corrupt under a TCP stack. Explicit accounting now: reclaim what
+// the device has finished, and report a full ring honestly instead of
+// scribbling over it.
+fn nd_send(priv as *u8, frame as *u8, len as i64) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    if (c.present == 0) { return 0 - 2; }
+    if (len < 14) { return 0 - 3; }
+    if (len + HDR > SLOT_SZ) { return 0 - 3; }
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    tx_reclaim_locked(c);
+    if (c.tx_inflight >= c.txq.qsize) {
+        lock.release_irq(&c.lk, fl);
+        return netdev.NET_TX_BUSY;
+    }
+    let is i64 as slot = c.txq.avail_shadow - (c.txq.avail_shadow / c.txq.qsize) * c.txq.qsize;
+    let is i64 as base = c.txq.buf_va + slot * SLOT_SZ;
     let is i64 as z with mut = 0;
     while (z < HDR) { let is *u8 as h = cast(*u8, base + z); h[0] = cast(u8, 0); z = z + 1; }
     let is i64 as i with mut = 0;
     while (i < len) {
         let is *u8 as d = cast(*u8, base + HDR + i);
-        d[0] = packet[i];
+        d[0] = frame[i];
         i = i + 1;
     }
-    // describe a DEVICE-READABLE buffer (no WRITE flag) of hdr+len bytes
-    let is i64 as desc = txq.desc + slot * 16;
-    virtio.wr64(desc, txq.buf_phys + slot * SLOT_SZ);
+    // Describe a DEVICE-READABLE buffer (no WRITE flag) of hdr+len bytes.
+    let is i64 as desc = c.txq.desc + slot * 16;
+    virtio.wr64(desc, c.txq.buf_phys + slot * SLOT_SZ);
     virtio.wr32(desc + 8, HDR + len);
     virtio.wr16(desc + 12, 0);              // flags 0 = device reads
     virtio.wr16(desc + 14, 0);
-    let is i64 as ring_slot = txq.avail_shadow - (txq.avail_shadow / txq.qsize) * txq.qsize;
-    virtio.wr16(txq.avail + 4 + ring_slot * 2, slot);
-    txq.avail_shadow = txq.avail_shadow + 1;
-    virtio.vio_publish(&vdev, &txq, 1);
-    lock.release_irq(&tx_lock, fl);
+    let is i64 as ring_slot = c.txq.avail_shadow - (c.txq.avail_shadow / c.txq.qsize) * c.txq.qsize;
+    virtio.wr16(c.txq.avail + 4 + ring_slot * 2, slot);
+    c.txq.avail_shadow = c.txq.avail_shadow + 1;
+    c.tx_inflight = c.tx_inflight + 1;
+    virtio.vio_publish(&c.vdev, &c.txq, 1);
+    lock.release_irq(&c.lk, fl);
+    return len;
+}
+
+// Take back every transmit descriptor the device has finished with. Caller
+// holds the adapter's lock.
+fn tx_reclaim_locked(c as *VnetCtx) as void {
+    let is i64 as r with mut = 0;
+    while (r >= 0) {
+        r = virtio.vio_next_used(&c.txq);
+        if (r >= 0 && c.tx_inflight > 0) { c.tx_inflight = c.tx_inflight - 1; }
+    }
+    return;
+}
+
+fn nd_tx_free(priv as *u8) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    if (c.present == 0) { return 0; }
+    let is i64 as fl = lock.acquire_irq(&c.lk);
+    tx_reclaim_locked(c);
+    let is i64 as free with mut = c.txq.qsize - c.tx_inflight;
+    lock.release_irq(&c.lk, fl);
+    if (free < 0) { free = 0; }
+    return free;
+}
+
+// Move up to `budget` received frames into the port ring. netdev holds the
+// port lock across this call; the rx queue itself is only ever touched from
+// here, so no second lock is taken.
+fn nd_poll_rx(priv as *u8, budget as i64) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    if (c.present == 0) { return 0; }
+    let is i64 as taken with mut = 0;
+    let is i64 as refilled with mut = 0;
+    while (taken < budget) {
+        let is i64 as id = virtio.vio_next_used(&c.rxq);
+        if (id < 0) {
+            if (refilled > 0) { virtio.vio_publish(&c.vdev, &c.rxq, 0); }
+            return taken;
+        }
+        // The device wrote a 12-byte virtio_net_hdr and then the frame;
+        // used_len covers both, so the frame is what is left.
+        let is i64 as flen with mut = c.rxq.last_used_len - HDR;
+        if (flen < 0) { flen = 0; }
+        if (flen > 0) {
+            netdev.rx_push(c.port_index, c.rxq.buf_va + id * SLOT_SZ + HDR, flen);
+        }
+        virtio.vio_repost(&c.rxq, id);
+        refilled = refilled + 1;
+        taken = taken + 1;
+    }
+    if (refilled > 0) { virtio.vio_publish(&c.vdev, &c.rxq, 0); }
+    return taken;
+}
+
+fn nd_mac(priv as *u8, out6 as *u8) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    let is i64 as i with mut = 0;
+    while (i < 6) { out6[i] = c.mac[i]; i = i + 1; }
     return 0;
 }
 
-// Receive: harvest one used rx buffer if present, copy the frame (past the
-// 12-byte header) into the caller's buffer, repost the slot. Non-blocking;
-// returns bytes (>0), 0 if nothing pending, or a negative driver code.
-fn vnet_recv(packet as i64, max_len as i64) as i32 {
-    if (vnet_present == 0) { return driver.NOT_SUPPORTED; }
-    let is i64 as fl = lock.acquire_irq(&rx_lock);
-    let is i64 as id = virtio.vio_next_used(&rxq);
-    if (id < 0) { lock.release_irq(&rx_lock, fl); return cast(i32, 0); }
-    // used.len isn't surfaced by vio_next_used; re-read it from the used ring
-    // is awkward, so trust the frame: the device wrote hdr+frame, and the
-    // ethernet frame length is bounded by SLOT_SZ. We copy up to max_len
-    // starting past the header; the caller knows ethernet framing.
-    let is i64 as base = rxq.buf_va + id * SLOT_SZ;
-    let is i64 as used_len = rxq.last_used_len;     // set by vio_next_used
-    let is i64 as flen with mut = used_len - HDR;
-    if (flen < 0) { flen = 0; }
-    if (flen > max_len) { flen = max_len; }
-    let is i64 as i with mut = 0;
-    while (i < flen) {
-        let is *u8 as s = cast(*u8, base + HDR + i);
-        let is *u8 as d = cast(*u8, packet + i);
-        d[0] = s[0];
-        i = i + 1;
-    }
-    virtio.vio_repost(&rxq, id);
-    virtio.vio_publish(&vdev, &rxq, 0);
-    lock.release_irq(&rx_lock, fl);
-    return cast(i32, flen);
+// virtio-net has no link register: if the device is here it is up. The
+// STATUS field exists only when VIRTIO_NET_F_STATUS is negotiated, and we
+// do not negotiate it — reporting a fact we did not ask for would be a
+// guess dressed as a reading.
+fn nd_link_up(priv as *u8) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    return c.present;
 }
 
-fn vnet_mac() as *u8 {
-    return cast(*u8, &vnet_mac[0]);
+fn nd_mtu(priv as *u8) as i64 {
+    return 1500;
 }
 
-// IRQ handler: read-clear the ISR and wake any rx waiter (the actual
-// harvest happens in vnet_recv, driven by the consumer).
+// IRQ handler: read-clear the ISR, then drain a bounded batch into the port
+// ring and wake any reader.
+//
+// The framework hands this the *Binding as context, and the binding carries
+// our per-adapter state. With a global it would have read card 0's ISR while
+// card 1 kept its INTx line asserted — and on a shared line that is a wedge,
+// not a slowdown.
 fn vnet_irq(hw as *driver.Hardware, ctx as *u8) as i32 {
-    if (vnet_present == 0) { return 0; }
-    let is i64 as isr = virtio.vio_isr_read(&vdev);
-    if ((isr & 1) == 0) { return 0; }
-    if (rx_waiter_tid >= 0) { sched.wakeup_thread(rx_waiter_tid); }
+    let is *spec.Binding as b = cast(*spec.Binding, ctx);
+    if (cast(i64, b) == 0) { return 0; }
+    let is *VnetCtx as c = cast(*VnetCtx, b.private);
+    if (cast(i64, c) == 0) { return 0; }
+    if (c.present == 0) { return 0; }
+    let is i64 as isr = virtio.vio_isr_read(&c.vdev);
+    if ((isr & 1) == 0) { return 0; }          // not ours (shared INTx)
+    netdev.irq_drain(c.port_index);
     return 0;
 }
 
 // ---- bind ----
 fn vnet_bind(b as *spec.Binding) as i32 {
-    if (vnet_present != 0) {
-        serial.println("vnet: skipping 2nd nic", 22);
+    if (nctx >= MAX_NICS) {
+        serial.println("vnet: no free instance slot", 27);
         return cast(i32, 0 - 99);
     }
+    let is *VnetCtx as c = ctx_at(nctx);
+    let is *netdev.NetDevice as nd = nd_at(nctx);
+    b.private = cast(*u8, c);
     let is i64 as hw = cast(i64, b.hardware);
-    if (virtio.vio_setup(hw, &vdev) != 0) {
+    if (virtio.vio_setup(hw, &c.vdev) != 0) {
         serial.println("vnet: no modern virtio caps", 27);
         return 1;
     }
-    if (virtio.vio_negotiate(&vdev) != 0) {
+    if (virtio.vio_negotiate(&c.vdev) != 0) {
         serial.println("vnet: feature negotiation FAIL", 30);
         return 1;
     }
     // rx = queue 0, tx = queue 1
-    if (virtio.vio_queue_setup(&vdev, 0, NQ, SLOT_SZ, &rxq) != 0) {
+    if (virtio.vio_queue_setup(&c.vdev, 0, NQ, SLOT_SZ, &c.rxq) != 0) {
         serial.println("vnet: rxq setup FAIL", 20);
         return 1;
     }
-    if (virtio.vio_queue_setup(&vdev, 1, NQ, SLOT_SZ, &txq) != 0) {
+    if (virtio.vio_queue_setup(&c.vdev, 1, NQ, SLOT_SZ, &c.txq) != 0) {
         serial.println("vnet: txq setup FAIL", 20);
         return 1;
     }
     // hand every rx buffer to the device (device-WRITABLE)
     let is i64 as i with mut = 0;
-    while (i < rxq.qsize) {
-        virtio.vio_post(&rxq, i, SLOT_SZ);
+    while (i < c.rxq.qsize) {
+        virtio.vio_post(&c.rxq, i, SLOT_SZ);
         i = i + 1;
     }
     // read the MAC from device config
-    if (vdev.devcfg != 0) {
+    if (c.vdev.devcfg != 0) {
         let is i64 as m with mut = 0;
         while (m < 6) {
-            vnet_mac[m] = cast(u8, virtio.rd8(vdev.devcfg + CFG_MAC + m) & 0xFF);
+            c.mac[m] = cast(u8, virtio.rd8(c.vdev.devcfg + CFG_MAC + m) & 0xFF);
             m = m + 1;
         }
     }
-    virtio.vio_driver_ok(&vdev);
-    virtio.vio_publish(&vdev, &rxq, 0);
-    vnet_present = 1;
+    c.tx_inflight = 0;
+    c.present = 1;
+    virtio.vio_driver_ok(&c.vdev);
+    virtio.vio_publish(&c.vdev, &c.rxq, 0);
     serial.print("vnet: virtio-net up mac=", 24);
-    print_mac();
+    print_mac(c);
     serial.println("", 0);
-    // Run the ARP smoke inline (like the e1000 bind), exercising the second
-    // virtio consumer's TX + RX path once before bind returns.
-    smoke_thread();
+
+    nd.name[0] = cast(u8, 118); nd.name[1] = cast(u8, 110);     // "vnet"
+    nd.name[2] = cast(u8, 101); nd.name[3] = cast(u8, 116);
+    nd.name[4] = cast(u8, 0);
+    nd.send        = fn_ptr(nd_send);
+    nd.poll_rx     = fn_ptr(nd_poll_rx);
+    nd.tx_free     = fn_ptr(nd_tx_free);
+    nd.mac         = fn_ptr(nd_mac);
+    nd.link_up     = fn_ptr(nd_link_up);
+    nd.mtu         = fn_ptr(nd_mtu);
+    // No control queue: VIRTIO_NET_F_CTRL_RX is what carries a promiscuous
+    // toggle, we do not negotiate it, and the device delivers everything the
+    // backend hands over regardless. Null says "cannot change it, and it is
+    // on" — which is the truth, rather than a knob that silently does nothing.
+    nd.set_promisc = cast(fn(*u8, i64) as i64, 0);
+    // And no notion of line rate at all: there is no wire. Reporting a number
+    // would be inventing one.
+    nd.speed       = cast(fn(*u8) as i64, 0);
+    nd.priv        = cast(*u8, c);
+    nd.next        = cast(*netdev.NetDevice, 0);
+    let is i64 as pi = netdev.register(nd, hw);
+    if (pi < 0) {
+        serial.println("vnet: netdev.register failed", 28);
+        return cast(i32, 0 - 5);
+    }
+    c.port_index = pi;
+    nctx = nctx + 1;
     return 0;
 }
 
-fn print_mac() as void {
+fn print_mac(c as *VnetCtx) as void {
     let is i64 as i with mut = 0;
     while (i < 6) {
         if (i > 0) { serial.putc(58); }
-        util.print_hex(cast(i64, vnet_mac[i]));
+        util.print_hex(cast(i64, c.mac[i]));
         i = i + 1;
     }
-    return;
-}
-
-// ---- ARP smoke (mirrors the e1000 one: send a request, await SLIRP's reply) ----
-fn store_be16(out as *u8, off as i64, v as i64) as void {
-    out[off] = cast(u8, (v >> 8) & 0xFF);
-    out[off + 1] = cast(u8, v & 0xFF);
-    return;
-}
-
-fn build_arp(out as *u8) as i64 {
-    let is i64 as i with mut = 0;
-    while (i < 6) { out[i] = cast(u8, 0xFF); i = i + 1; }
-    let is i64 as j with mut = 0;
-    while (j < 6) { out[6 + j] = vnet_mac[j]; j = j + 1; }
-    store_be16(out, 12, 0x0806);
-    store_be16(out, 14, 0x0001);
-    store_be16(out, 16, 0x0800);
-    out[18] = cast(u8, 6); out[19] = cast(u8, 4);
-    store_be16(out, 20, 0x0001);
-    let is i64 as k with mut = 0;
-    while (k < 6) { out[22 + k] = vnet_mac[k]; k = k + 1; }
-    out[28] = cast(u8, 10); out[29] = cast(u8, 0); out[30] = cast(u8, 2); out[31] = cast(u8, 15);
-    let is i64 as l with mut = 0;
-    while (l < 6) { out[32 + l] = cast(u8, 0); l = l + 1; }
-    out[38] = cast(u8, 10); out[39] = cast(u8, 0); out[40] = cast(u8, 2); out[41] = cast(u8, 2);
-    return 42;
-}
-
-fn smoke_thread() as void {
-    if (vnet_present == 0) {
-        serial.println("vnet.smoke: not bound", 21);
-        return;
-    }
-    serial.println("vnet.smoke: start", 17);
-    let is [64]u8 as arp;
-    let is i64 as alen = build_arp(&arp[0]);
-    if (vnet_send(&arp[0], alen) != 0) {
-        serial.println("vnet.smoke: send FAIL", 21);
-        return;
-    }
-    serial.println("vnet.smoke: sent ARP", 20);
-    rx_waiter_tid = sched.current_tid();
-    let is [128]u8 as rxbuf;
-    let is i64 as deadline = timer.current_time_ns() + 2000000000;
-    while (timer.current_time_ns() < deadline) {
-        let is i32 as rc = vnet_recv(cast(i64, &rxbuf[0]), 128);
-        if (rc > 0) {
-            serial.print("vnet.smoke: rx ", 15);
-            util.print_num(cast(i64, rc));
-            serial.print("B type=", 7);
-            util.print_hex(cast(i64, rxbuf[12]));
-            util.print_hex(cast(i64, rxbuf[13]));
-            serial.println("", 0);
-            rx_waiter_tid = cast(i64, 0 - 1);
-            serial.println("vnet.smoke: PASS", 16);
-            return;
-        }
-        sched.sleep_for_ns(20000000);
-    }
-    rx_waiter_tid = cast(i64, 0 - 1);
-    serial.println("vnet.smoke: no reply in 2s FAIL", 31);
     return;
 }
 
@@ -263,17 +306,5 @@ fn register() as void {
     ksym_irq.name_ptr = cast(*u8, "vnet.vnet_irq");    ksym_irq.name_len = 13;
     ksym_irq.addr = cast(i64, fn_ptr(vnet_irq));       ksym_irq.kind = ksym.KIND_FUNC;
     ksym.register(&ksym_irq);
-    ksym_send.name_ptr = cast(*u8, "vnet.vnet_send");  ksym_send.name_len = 14;
-    ksym_send.addr = cast(i64, fn_ptr(vnet_send));     ksym_send.kind = ksym.KIND_FUNC;
-    ksym.register(&ksym_send);
-    ksym_recv.name_ptr = cast(*u8, "vnet.vnet_recv");  ksym_recv.name_len = 14;
-    ksym_recv.addr = cast(i64, fn_ptr(vnet_recv));     ksym_recv.kind = ksym.KIND_FUNC;
-    ksym.register(&ksym_recv);
-    ksym_mac.name_ptr = cast(*u8, "vnet.vnet_mac");    ksym_mac.name_len = 13;
-    ksym_mac.addr = cast(i64, fn_ptr(vnet_mac));       ksym_mac.kind = ksym.KIND_FUNC;
-    ksym.register(&ksym_mac);
-    ksym_smoke.name_ptr = cast(*u8, "vnet.smoke_thread"); ksym_smoke.name_len = 17;
-    ksym_smoke.addr = cast(i64, fn_ptr(smoke_thread));    ksym_smoke.kind = ksym.KIND_FUNC;
-    ksym.register(&ksym_smoke);
     serial.println("vnet: registered", 16);
 }

@@ -1,0 +1,251 @@
+// netip — IPv4, and ICMP because the two are inseparable in practice.
+//
+// Addresses are HOST byte order everywhere in this stack, and cross to
+// big-endian only inside build/parse. Mixing the two conventions is the
+// single most common source of "works for 10.0.2.2, fails for 2.0.0.10"
+// bugs, so the rule is stated once and there is no second convention.
+//
+// What is here: header build and parse, checksum, the pseudo-header sum that
+// TCP and UDP both need, a routing decision, and ICMP echo plus the error
+// messages that carry real information upward (unreachable, fragmentation
+// needed, TTL exceeded).
+//
+// What is NOT here, deliberately and with the reason recorded:
+//
+//   FRAGMENTATION ON TRANSMIT. Every path this stack takes discovers its MTU
+//   and sends below it. Fragmenting on send is how you get a stack that works
+//   badly instead of one that reports a problem, and RFC 8200 removed it from
+//   IPv6 entirely for that reason. Frames go out with DF set.
+//
+//   REASSEMBLY on receive lives in netip_reasm.cst, because a sender we do
+//   not control may fragment and dropping those silently would be a stack
+//   that mostly works — the worst kind, since the failure is intermittent and
+//   looks like the network's fault.
+
+use "../netbuf/netbuf.cst" as nb;
+
+let is i64 as HDR_MIN = 20;
+let is i64 as VERSION = 4;
+
+// Protocol numbers.
+let is i64 as PROTO_ICMP = 1;
+let is i64 as PROTO_TCP  = 6;
+let is i64 as PROTO_UDP  = 17;
+
+// Flags / fragment field (offset 6, 16 bits: 3 flag bits then 13 offset bits).
+let is i64 as FLAG_DF = 0x4000;
+let is i64 as FLAG_MF = 0x2000;
+let is i64 as FRAG_MASK = 0x1FFF;
+
+let is i64 as DEFAULT_TTL = 64;
+
+// The floor every IPv4 host must accept (RFC 791). PMTU discovery may never
+// drive the path MTU below this.
+let is i64 as MIN_MTU = 576;
+
+fn make_addr(a as i64, b as i64, c as i64, d as i64) as i64 {
+    return ((a & 0xFF) << 24) | ((b & 0xFF) << 16) | ((c & 0xFF) << 8) | (d & 0xFF);
+}
+
+fn addr_octet(ip as i64, i as i64) as i64 {
+    return (ip >> (8 * (3 - i))) & 0xFF;
+}
+
+// A /n prefix as a mask. n=0 is a special case: shifting a 32-bit quantity by
+// 32 is masked to a shift by 0 on x86 and would yield all ones instead of
+// zero (userspace/tests/u64t.cst pins that behaviour down).
+fn prefix_mask(bits as i64) as i64 {
+    if (bits <= 0) { return 0; }
+    if (bits >= 32) { return 0xFFFFFFFF; }
+    return (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF;
+}
+
+fn same_subnet(a as i64, b as i64, mask as i64) as i64 {
+    if ((a & mask) == (b & mask)) { return 1; }
+    return 0;
+}
+
+fn broadcast_of(ip as i64, mask as i64) as i64 {
+    return (ip | (0xFFFFFFFF - mask)) & 0xFFFFFFFF;
+}
+
+fn is_multicast(ip as i64) as i64 {
+    if ((ip & 0xF0000000) == 0xE0000000) { return 1; }    // 224.0.0.0/4
+    return 0;
+}
+
+// Should this address be accepted as ours? Our unicast address, limited
+// broadcast, our subnet's directed broadcast, or any multicast group.
+fn is_for_us(dst as i64, our_ip as i64, mask as i64) as i64 {
+    if (dst == our_ip) { return 1; }
+    if (dst == 0xFFFFFFFF) { return 1; }
+    if (our_ip != 0 && dst == broadcast_of(our_ip, mask)) { return 1; }
+    if (is_multicast(dst) == 1) { return 1; }
+    return 0;
+}
+
+// The next hop for a destination: the destination itself when it is on our
+// link, otherwise the gateway. Returns 0 when there is no route, which the
+// caller must treat as an error rather than as "send to 0.0.0.0".
+fn next_hop(dst as i64, our_ip as i64, mask as i64, gw as i64) as i64 {
+    if (our_ip == 0) { return 0; }
+    if (same_subnet(dst, our_ip, mask) == 1) { return dst; }
+    if (dst == 0xFFFFFFFF) { return dst; }
+    if (is_multicast(dst) == 1) { return dst; }
+    return gw;
+}
+
+// ============================================================
+// Header access
+// ============================================================
+
+fn ihl(p as *u8) as i64      { return (cast(i64, p[0]) & 0x0F) * 4; }
+fn version_of(p as *u8) as i64 { return (cast(i64, p[0]) >> 4) & 0x0F; }
+fn total_len(p as *u8) as i64 { return nb.get_be16(p, 2); }
+fn ident(p as *u8) as i64     { return nb.get_be16(p, 4); }
+fn frag_field(p as *u8) as i64 { return nb.get_be16(p, 6); }
+fn frag_offset(p as *u8) as i64 { return (nb.get_be16(p, 6) & FRAG_MASK) * 8; }
+fn has_more_frags(p as *u8) as i64 {
+    if ((nb.get_be16(p, 6) & FLAG_MF) != 0) { return 1; }
+    return 0;
+}
+fn ttl(p as *u8) as i64       { return cast(i64, p[8]); }
+fn protocol(p as *u8) as i64  { return cast(i64, p[9]); }
+fn src_addr(p as *u8) as i64  { return nb.get_be32(p, 12); }
+fn dst_addr(p as *u8) as i64  { return nb.get_be32(p, 16); }
+
+fn is_fragment(p as *u8) as i64 {
+    if (frag_offset(p) != 0) { return 1; }
+    return has_more_frags(p);
+}
+
+// Validate a received header before believing any field in it. Every check
+// here has a packet that fails it: a truncated capture, a version-6 frame on
+// a v4 ethertype, a total_len that claims more than arrived (the classic
+// buffer-overrun vector), a corrupted checksum.
+let is i64 as OK          = 0;
+let is i64 as ERR_SHORT   = 0 - 1;
+let is i64 as ERR_VERSION = 0 - 2;
+let is i64 as ERR_IHL     = 0 - 3;
+let is i64 as ERR_LENGTH  = 0 - 4;
+let is i64 as ERR_CKSUM   = 0 - 5;
+
+fn validate(p as *u8, avail as i64) as i64 {
+    if (avail < HDR_MIN) { return ERR_SHORT; }
+    if (version_of(p) != VERSION) { return ERR_VERSION; }
+    let is i64 as hl = ihl(p);
+    if (hl < HDR_MIN) { return ERR_IHL; }
+    if (hl > avail) { return ERR_IHL; }
+    let is i64 as tl = total_len(p);
+    if (tl < hl) { return ERR_LENGTH; }
+    // Longer than what arrived is a lie; SHORTER is normal, since the wire
+    // pads frames up to 60 bytes and a small packet arrives with trailing
+    // padding. The declared length is authoritative and the caller trims.
+    if (tl > avail) { return ERR_LENGTH; }
+    if (nb.verify(p, hl) == 0) { return ERR_CKSUM; }
+    return OK;
+}
+
+// ============================================================
+// Build
+// ============================================================
+
+// Prepend a header to a packet whose payload is already in place, and compute
+// the checksum. DF is set: this stack discovers path MTU rather than
+// fragmenting (see the note at the top).
+fn push_header(b as *nb.Pbuf, src as i64, dst as i64, proto as i64, id as i64) as i64 {
+    let is i64 as payload = nb.len(b);
+    let is *u8 as h = nb.prepend(b, HDR_MIN);
+    if (cast(i64, h) == 0) { return 0; }
+    h[0] = cast(u8, 0x45);                       // v4, IHL 5 (no options)
+    h[1] = cast(u8, 0);                          // DSCP/ECN
+    nb.put_be16(h, 2, HDR_MIN + payload);
+    nb.put_be16(h, 4, id);
+    nb.put_be16(h, 6, FLAG_DF);
+    h[8] = cast(u8, DEFAULT_TTL);
+    h[9] = cast(u8, proto);
+    nb.put_be16(h, 10, 0);                       // checksum, filled below
+    nb.put_be32(h, 12, src);
+    nb.put_be32(h, 16, dst);
+    nb.put_be16(h, 10, nb.checksum(h, HDR_MIN));
+    return HDR_MIN;
+}
+
+// The pseudo-header sum TCP and UDP fold into their own checksums (RFC 793
+// §3.1, RFC 768). Returned unfolded so the caller can add its own sum before
+// the single final fold.
+fn pseudo_sum(src as i64, dst as i64, proto as i64, length as i64) as i64 {
+    let is i64 as s with mut = 0;
+    s = s + ((src >> 16) & 0xFFFF);
+    s = s + (src & 0xFFFF);
+    s = s + ((dst >> 16) & 0xFFFF);
+    s = s + (dst & 0xFFFF);
+    s = s + (proto & 0xFF);
+    s = s + (length & 0xFFFF);
+    return s;
+}
+
+// ============================================================
+// ICMP (RFC 792)
+// ============================================================
+
+let is i64 as ICMP_ECHO_REPLY   = 0;
+let is i64 as ICMP_DEST_UNREACH = 3;
+let is i64 as ICMP_ECHO_REQUEST = 8;
+let is i64 as ICMP_TIME_EXCEEDED = 11;
+let is i64 as ICMP_PARAM_PROBLEM = 12;
+
+// Codes for DEST_UNREACH. FRAG_NEEDED is the one that matters most: it is how
+// path MTU discovery learns anything at all, and a stack that ignores it sends
+// DF packets into a smaller link forever and calls it a black hole.
+let is i64 as UNREACH_NET      = 0;
+let is i64 as UNREACH_HOST     = 1;
+let is i64 as UNREACH_PROTO    = 2;
+let is i64 as UNREACH_PORT     = 3;
+let is i64 as UNREACH_FRAG_NEEDED = 4;
+
+let is i64 as ICMP_HDR_LEN = 8;
+
+fn icmp_type(p as *u8) as i64 { return cast(i64, p[0]); }
+fn icmp_code(p as *u8) as i64 { return cast(i64, p[1]); }
+fn icmp_id(p as *u8) as i64   { return nb.get_be16(p, 4); }
+fn icmp_seq(p as *u8) as i64  { return nb.get_be16(p, 6); }
+
+// The next-hop MTU a FRAG_NEEDED carries, in the field RFC 1191 added to what
+// RFC 792 left as "unused". Zero means an ancient router that did not fill it
+// in, and the caller has to guess downward instead.
+fn icmp_next_mtu(p as *u8) as i64 { return nb.get_be16(p, 6); }
+
+// Build an ICMP message in place, with its checksum. `payload` is appended
+// after the 8-byte header.
+fn icmp_build(out as *u8, itype as i64, code as i64, id as i64, seq as i64,
+              payload as *u8, plen as i64) as i64 {
+    out[0] = cast(u8, itype);
+    out[1] = cast(u8, code);
+    nb.put_be16(out, 2, 0);
+    nb.put_be16(out, 4, id);
+    nb.put_be16(out, 6, seq);
+    if (plen > 0 && cast(i64, payload) != 0) {
+        nb.copy(cast(*u8, cast(i64, out) + ICMP_HDR_LEN), payload, plen);
+    }
+    let is i64 as total = ICMP_HDR_LEN + plen;
+    nb.put_be16(out, 2, nb.checksum(out, total));
+    return total;
+}
+
+// ICMP's checksum covers the whole message and NO pseudo-header — unlike TCP
+// and UDP. Getting that wrong produces a checksum that is consistently wrong
+// in a way that looks like a corrupted network.
+fn icmp_verify(p as *u8, len as i64) as i64 {
+    if (len < ICMP_HDR_LEN) { return 0; }
+    return nb.verify(p, len);
+}
+
+// An error message quotes the header of the packet that caused it plus the
+// first 8 bytes of its payload, which is exactly enough for the receiver to
+// find the connection it belongs to (RFC 792). This returns a pointer to that
+// quoted header, or null if the message is truncated.
+fn icmp_quoted(p as *u8, len as i64) as *u8 {
+    if (len < ICMP_HDR_LEN + HDR_MIN) { return cast(*u8, 0); }
+    return cast(*u8, cast(i64, p) + ICMP_HDR_LEN);
+}

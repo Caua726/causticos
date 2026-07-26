@@ -1,0 +1,336 @@
+// netip_reasm — putting fragmented datagrams back together (RFC 815).
+//
+// This stack never fragments on transmit: it sets DF and discovers path MTU.
+// But the other end is not ours to control, and a DNS response over ~1472
+// bytes, or anything crossing a tunnel with a smaller MTU, arrives in pieces.
+// Dropping those silently is a stack that mostly works — which is the worst
+// kind, because the failure is intermittent and looks like the network.
+//
+// The design is RFC 815's, kept deliberately small:
+//
+//   A datagram is identified by (src, dst, protocol, id). All four, not just
+//   id — two senders picking the same id is ordinary, not exotic, and mixing
+//   their bytes together produces a datagram that is corrupt but checksummed
+//   correctly by whatever layer sits above.
+//
+//   Fragments arrive in any order, may overlap, and may repeat. Bytes are
+//   copied into a flat buffer at their offset, and a HOLE LIST tracks what is
+//   still missing. That is RFC 815's insight: rather than sorting fragments,
+//   track the gaps, and the datagram is complete when there are none.
+//
+// SECURITY, because reassembly is where naive stacks are attacked:
+//
+//   - A reassembly with a missing piece is discarded after a timeout, or a
+//     sender that never finishes pins memory forever (RFC 1122 requires
+//     15..120 seconds; this uses 30).
+//   - Overlapping fragments that DISAGREE are refused rather than resolved.
+//     Choosing a winner is what "teardrop" and every IDS-evasion trick since
+//     depends on — the attacker sends contradictory overlaps and relies on
+//     the target choosing differently from the inspector.
+//   - Total length is bounded, so one datagram cannot claim 64 KiB of memory
+//     per slot and a handful of them exhaust the pool.
+
+use "../netbuf/netbuf.cst" as nb;
+use "../netip/netip.cst" as ip;
+
+// Slots, and the biggest datagram one can hold. 8 KiB is well past a DNS
+// response over UDP and past anything this stack will ask for; a datagram
+// larger than this is refused rather than half-collected.
+let is i64 as SLOTS      = 4;
+let is i64 as MAX_LEN    = 8192;
+let is i64 as TIMEOUT_NS = 30000000000;
+
+// Holes, per slot. Each is a [first, last] byte range still missing. RFC 815
+// needs one more hole than the number of fragments that can create gaps; 8 is
+// generous for anything that is not an attack, and an attack that exceeds it
+// gets the datagram dropped, which is the correct answer anyway.
+let is i64 as HOLES = 8;
+
+let is i64 as ST_FREE = 0;
+let is i64 as ST_BUSY = 1;
+
+// All-i64 scalars, arrays last: the proven shape.
+struct Slot {
+    state    as i64;
+    src      as i64;
+    dst      as i64;
+    proto    as i64;
+    id       as i64;
+    expires  as i64;
+    total    as i64;      // known once the last fragment (MF=0) arrives; 0 until then
+    nholes   as i64;
+    frags    as i64;      // fragments accepted, for diagnostics
+    // Hole list, spelled out: [first, last] pairs.
+    h0f as i64; h0l as i64;  h1f as i64; h1l as i64;
+    h2f as i64; h2l as i64;  h3f as i64; h3l as i64;
+    h4f as i64; h4l as i64;  h5f as i64; h5l as i64;
+    h6f as i64; h6l as i64;  h7f as i64; h7l as i64;
+    // Which bytes have been written, so an overlap can be checked for
+    // agreement rather than trusted. One byte of flag per byte of data is
+    // wasteful and completely clear; at 8 KiB a slot it is affordable.
+    seen     as [8192]u8;
+    data     as [8192]u8;
+}
+
+struct Table {
+    hits      as i64;      // datagrams completed
+    timeouts  as i64;      // dropped incomplete
+    overlaps  as i64;      // refused for contradictory overlap
+    toolong   as i64;      // refused for exceeding MAX_LEN
+    evicted   as i64;      // a slot taken while still in use
+    s0 as Slot; s1 as Slot; s2 as Slot; s3 as Slot;
+}
+
+fn at(t as *Table, i as i64) as *Slot {
+    if (i == 0) { return &t.s0; }
+    if (i == 1) { return &t.s1; }
+    if (i == 2) { return &t.s2; }
+    return &t.s3;
+}
+
+fn hole_first(s as *Slot, i as i64) as i64 {
+    if (i == 0) { return s.h0f; }
+    if (i == 1) { return s.h1f; }
+    if (i == 2) { return s.h2f; }
+    if (i == 3) { return s.h3f; }
+    if (i == 4) { return s.h4f; }
+    if (i == 5) { return s.h5f; }
+    if (i == 6) { return s.h6f; }
+    return s.h7f;
+}
+
+fn hole_last(s as *Slot, i as i64) as i64 {
+    if (i == 0) { return s.h0l; }
+    if (i == 1) { return s.h1l; }
+    if (i == 2) { return s.h2l; }
+    if (i == 3) { return s.h3l; }
+    if (i == 4) { return s.h4l; }
+    if (i == 5) { return s.h5l; }
+    if (i == 6) { return s.h6l; }
+    return s.h7l;
+}
+
+fn hole_set(s as *Slot, i as i64, f as i64, l as i64) as void {
+    if (i == 0) { s.h0f = f; s.h0l = l; return; }
+    if (i == 1) { s.h1f = f; s.h1l = l; return; }
+    if (i == 2) { s.h2f = f; s.h2l = l; return; }
+    if (i == 3) { s.h3f = f; s.h3l = l; return; }
+    if (i == 4) { s.h4f = f; s.h4l = l; return; }
+    if (i == 5) { s.h5f = f; s.h5l = l; return; }
+    if (i == 6) { s.h6f = f; s.h6l = l; return; }
+    s.h7f = f; s.h7l = l;
+    return;
+}
+
+fn slot_free(s as *Slot) as void {
+    s.state = ST_FREE;
+    s.total = 0;
+    s.nholes = 0;
+    s.frags = 0;
+    return;
+}
+
+fn init(t as *Table) as void {
+    t.hits = 0; t.timeouts = 0; t.overlaps = 0; t.toolong = 0; t.evicted = 0;
+    let is i64 as i with mut = 0;
+    while (i < SLOTS) { slot_free(at(t, i)); i = i + 1; }
+    return;
+}
+
+fn find(t as *Table, src as i64, dst as i64, proto as i64, id as i64) as *Slot {
+    let is i64 as i with mut = 0;
+    while (i < SLOTS) {
+        let is *Slot as s = at(t, i);
+        if (s.state == ST_BUSY && s.src == src && s.dst == dst
+            && s.proto == proto && s.id == id) { return s; }
+        i = i + 1;
+    }
+    return cast(*Slot, 0);
+}
+
+// Retire anything that has run out of time. Called on every arrival rather
+// than from a timer: a table that only expires when something new shows up
+// still cannot leak, because a full table is what makes the next arrival
+// need a slot.
+fn expire(t as *Table, now as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < SLOTS) {
+        let is *Slot as s = at(t, i);
+        if (s.state == ST_BUSY && now >= s.expires) {
+            slot_free(s);
+            t.timeouts = t.timeouts + 1;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// A free slot, or the one closest to expiring. Never fail: a new datagram is
+// more likely to complete than one that has been sitting incomplete.
+fn alloc(t as *Table, now as i64) as *Slot {
+    let is i64 as i with mut = 0;
+    while (i < SLOTS) {
+        let is *Slot as s = at(t, i);
+        if (s.state == ST_FREE) { return s; }
+        i = i + 1;
+    }
+    let is *Slot as victim with mut = at(t, 0);
+    i = 1;
+    while (i < SLOTS) {
+        let is *Slot as s = at(t, i);
+        if (s.expires < victim.expires) { victim = s; }
+        i = i + 1;
+    }
+    t.evicted = t.evicted + 1;
+    slot_free(victim);
+    return victim;
+}
+
+let is i64 as R_NEED_MORE = 0;    // accepted, datagram still incomplete
+let is i64 as R_DONE      = 1;    // complete; out_len holds the payload length
+let is i64 as R_DROP      = 0 - 1; // refused (malformed, too long, bad overlap)
+
+// Offer one fragment. `p` is the full IPv4 packet, already validated by
+// ip.validate. Returns R_DONE with the reassembled PAYLOAD (transport header
+// onward, no IP header) copied into out.
+//
+// A packet that is not a fragment is not this function's business — the caller
+// checks ip.is_fragment first — but passing one is handled rather than
+// mishandled.
+fn offer(t as *Table, p as *u8, out as *u8, out_len as *i64, now as i64) as i64 {
+    let is i64 as hl = ip.ihl(p);
+    let is i64 as tl = ip.total_len(p);
+    let is i64 as off = ip.frag_offset(p);
+    let is i64 as more = ip.has_more_frags(p);
+    let is i64 as payload = tl - hl;
+    if (payload < 0) { return R_DROP; }
+
+    // A non-final fragment must be a multiple of 8 bytes: the offset field
+    // counts 8-byte units and cannot express anything else. A sender that
+    // violates this has produced a datagram that cannot be reassembled by
+    // anyone, so it is refused rather than guessed at.
+    if (more == 1 && (payload & 7) != 0) { return R_DROP; }
+    if (off + payload > MAX_LEN) {
+        t.toolong = t.toolong + 1;
+        return R_DROP;
+    }
+
+    expire(t, now);
+
+    let is i64 as src = ip.src_addr(p);
+    let is i64 as dst = ip.dst_addr(p);
+    let is i64 as proto = ip.protocol(p);
+    let is i64 as id = ip.ident(p);
+
+    let is *Slot as s with mut = find(t, src, dst, proto, id);
+    if (cast(i64, s) == 0) {
+        s = alloc(t, now);
+        s.state = ST_BUSY;
+        s.src = src; s.dst = dst; s.proto = proto; s.id = id;
+        s.expires = now + TIMEOUT_NS;
+        s.total = 0;
+        s.frags = 0;
+        // RFC 815 begins with one hole covering everything not yet known.
+        s.nholes = 1;
+        hole_set(s, 0, 0, MAX_LEN - 1);
+        nb.fill(cast(*u8, &s.seen[0]), 0, MAX_LEN);
+    }
+
+    let is i64 as first = off;
+    let is i64 as last = off + payload - 1;
+
+    // Copy the bytes, checking any overlap for AGREEMENT. Contradictory
+    // overlaps are the teardrop family and every IDS-evasion trick built on
+    // it: the attacker sends two versions of the same bytes and relies on the
+    // target picking differently from whoever is inspecting. Refusing is the
+    // only answer that cannot be played.
+    let is *u8 as body = cast(*u8, cast(i64, p) + hl);
+    let is i64 as k with mut = 0;
+    while (k < payload) {
+        let is i64 as pos = first + k;
+        if (s.seen[pos] != cast(u8, 0)) {
+            if (s.data[pos] != body[k]) {
+                t.overlaps = t.overlaps + 1;
+                slot_free(s);
+                return R_DROP;
+            }
+        } else {
+            s.data[pos] = body[k];
+            s.seen[pos] = cast(u8, 1);
+        }
+        k = k + 1;
+    }
+    s.frags = s.frags + 1;
+
+    // The fragment with MF clear names the end of the datagram.
+    if (more == 0) {
+        s.total = last + 1;
+        // Everything past the end stops being a hole.
+        let is i64 as i with mut = 0;
+        let is i64 as n with mut = s.nholes;
+        while (i < n) {
+            let is i64 as hf = hole_first(s, i);
+            let is i64 as hl2 = hole_last(s, i);
+            if (hf >= s.total) {
+                // Drop this hole by moving the last one into its place.
+                hole_set(s, i, hole_first(s, n - 1), hole_last(s, n - 1));
+                n = n - 1;
+            } else {
+                if (hl2 >= s.total) { hole_set(s, i, hf, s.total - 1); }
+                i = i + 1;
+            }
+        }
+        s.nholes = n;
+    }
+
+    // Split every hole this fragment lands in — the RFC 815 loop.
+    let is i64 as i2 with mut = 0;
+    let is i64 as n2 with mut = s.nholes;
+    while (i2 < n2) {
+        let is i64 as hf = hole_first(s, i2);
+        let is i64 as hlast = hole_last(s, i2);
+        if (first > hlast || last < hf) {
+            i2 = i2 + 1;                       // no overlap with this hole
+        } else {
+            // Remove it, then add back whatever of it survives on either side.
+            hole_set(s, i2, hole_first(s, n2 - 1), hole_last(s, n2 - 1));
+            n2 = n2 - 1;
+            if (first > hf) {
+                if (n2 >= HOLES) { slot_free(s); return R_DROP; }
+                hole_set(s, n2, hf, first - 1);
+                n2 = n2 + 1;
+            }
+            if (last < hlast && more == 1) {
+                if (n2 >= HOLES) { slot_free(s); return R_DROP; }
+                hole_set(s, n2, last + 1, hlast);
+                n2 = n2 + 1;
+            } else if (last < hlast && more == 0) {
+                // Nothing follows the final fragment, so the tail of this
+                // hole is not missing — it does not exist.
+            }
+            // Do NOT advance: the slot now holds a hole moved from the end.
+        }
+    }
+    s.nholes = n2;
+
+    if (s.total > 0 && s.nholes == 0) {
+        nb.copy(out, cast(*u8, &s.data[0]), s.total);
+        out_len[0] = s.total;
+        slot_free(s);
+        t.hits = t.hits + 1;
+        return R_DONE;
+    }
+    return R_NEED_MORE;
+}
+
+// How many slots are mid-reassembly. For diagnostics and for tests that want
+// to prove a timeout actually released one.
+fn pending(t as *Table) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < SLOTS) {
+        if (at(t, i).state == ST_BUSY) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}

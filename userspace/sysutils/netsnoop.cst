@@ -1,0 +1,213 @@
+// netsnoop — watch the wire, and take it away from netd to do it.
+//
+// This does not talk to netd. It opens DEV_NET directly, which means it
+// PREEMPTS whoever was holding the port — and on a running machine that is the
+// network stack. That is the design working, not a violation of it
+// (kernel/sys/grab.cst): a device has one holder, ownership is a stack, and
+// the newest holder wins while the displaced one goes quiet. netd's poll stops
+// reporting readable, its reads block, and nothing it holds is lost. Quit, and
+// the port goes straight back; netd resumes without having been told anything
+// happened.
+//
+// The whole grab mechanism has been exercised for the framebuffer and the
+// keyboard for a long time. This is the first thing that exercises it for a
+// network port, and it does so against a stack that is actively using it.
+//
+//   netsnoop [-c count] [-i port] [-x]
+//
+// -x also dumps the first bytes of each frame. Without it, one line per frame:
+// what the ethertype is, who it is between, and how big.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/neteth/neteth.cst" as eth;
+use "../lib/netip/netip.cst" as ip;
+use "../lib/netarp/netarp.cst" as arp;
+
+let is [2048]u8 as frame;
+let is i64 as hexdump with mut = 0;
+
+fn hex2(v as i64) as void {
+    let is [2]u8 as b;
+    let is i64 as hi = (v >> 4) & 15;
+    let is i64 as lo = v & 15;
+    if (hi < 10) { b[0] = cast(u8, 48 + hi); } else { b[0] = cast(u8, 87 + hi); }
+    if (lo < 10) { b[1] = cast(u8, 48 + lo); } else { b[1] = cast(u8, 87 + lo); }
+    prog.out(cast(*u8, &b[0]), 2);
+    return;
+}
+
+fn print_mac(p as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        if (i > 0) { prog.outs(":"); }
+        hex2(cast(i64, p[i]));
+        i = i + 1;
+    }
+    return;
+}
+
+fn print_ip(v as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        if (i > 0) { prog.outs("."); }
+        prog.out_num(ip.addr_octet(v, i));
+        i = i + 1;
+    }
+    return;
+}
+
+fn parse_num(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] != cast(u8, 0)) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c < 48 || c > 57) { return 0 - 1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (i == 0) { return 0 - 1; }
+    return v;
+}
+
+fn describe(f as *u8, n as i64) as void {
+    let is i64 as et = eth.ethertype(f);
+    print_mac(eth.src(f));
+    prog.outs(" -> ");
+    print_mac(eth.dst(f));
+    prog.outs("  ");
+
+    if (et == eth.TYPE_ARP) {
+        let is *u8 as a = cast(*u8, cast(i64, f) + eth.HDR_LEN);
+        if (arp.is_valid(a, n - eth.HDR_LEN) == 1) {
+            if (arp.op_of(a) == arp.OP_REQUEST) { prog.outs("arp who-has "); }
+            else { prog.outs("arp is-at "); }
+            print_ip(arp.target_ip_of(a));
+            prog.outs(" tell ");
+            print_ip(arp.sender_ip_of(a));
+        } else { prog.outs("arp (malformed)"); }
+    } else {
+        if (et == eth.TYPE_IPV4) {
+            let is *u8 as p = cast(*u8, cast(i64, f) + eth.HDR_LEN);
+            let is i64 as proto = ip.protocol(p);
+            if (proto == ip.PROTO_ICMP) { prog.outs("icmp "); }
+            else {
+                if (proto == ip.PROTO_TCP) { prog.outs("tcp  "); }
+                else {
+                    if (proto == ip.PROTO_UDP) { prog.outs("udp  "); }
+                    else { prog.outs("ip/"); prog.out_num(proto); prog.outs(" "); }
+                }
+            }
+            print_ip(ip.src_addr(p));
+            prog.outs(" -> ");
+            print_ip(ip.dst_addr(p));
+        } else {
+            prog.outs("ethertype 0x");
+            hex2((et >> 8) & 0xFF);
+            hex2(et & 0xFF);
+        }
+    }
+    prog.outs("  ");
+    prog.out_num(n);
+    prog.outs("B\n");
+
+    if (hexdump == 1) {
+        let is i64 as lim with mut = n;
+        if (lim > 64) { lim = 64; }
+        let is i64 as i with mut = 0;
+        while (i < lim) {
+            if ((i % 16) == 0) { prog.outs("    "); }
+            hex2(cast(i64, f[i]));
+            prog.outs(" ");
+            if ((i % 16) == 15) { prog.outs("\n"); }
+            i = i + 1;
+        }
+        if ((lim % 16) != 0) { prog.outs("\n"); }
+    }
+    return;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as count with mut = 20;
+    let is i64 as port with mut = 0;
+
+    let is i64 as ai with mut = 1;
+    while (ai < argc) {
+        let is *u8 as a = prog.arg(argv, ai);
+        if (a[0] == cast(u8, 45) && a[1] == cast(u8, 99) && ai + 1 < argc) {
+            count = parse_num(prog.arg(argv, ai + 1));
+            ai = ai + 2;
+        } else {
+            if (a[0] == cast(u8, 45) && a[1] == cast(u8, 105) && ai + 1 < argc) {
+                port = parse_num(prog.arg(argv, ai + 1));
+                ai = ai + 2;
+            } else {
+                if (a[0] == cast(u8, 45) && a[1] == cast(u8, 120)) {
+                    hexdump = 1;
+                    ai = ai + 1;
+                } else {
+                    prog.outs("usage: netsnoop [-c count] [-i port] [-x]\n");
+                    return cast(i32, 1);
+                }
+            }
+        }
+    }
+    if (count <= 0 || port < 0) {
+        prog.outs("netsnoop: bad argument\n");
+        return cast(i32, 1);
+    }
+
+    // This is the preemption. Whoever held the port — on a booted machine,
+    // netd — is displaced the moment this succeeds, and gets it back when
+    // this program exits or is killed.
+    let is i64 as fd = sys.dev_open(sys.DEV_NET, port, 0);
+    if (fd < 0) {
+        prog.outs("netsnoop: cannot open network port ");
+        prog.out_num(port);
+        prog.outs("\n");
+        return cast(i32, 1);
+    }
+
+    let is [16]i64 as inf;
+    if (sys.net_info(fd, cast(*i64, &inf[0])) != 0) {
+        prog.outs("netsnoop: net_info failed\n");
+        sys.close(fd);
+        return cast(i32, 1);
+    }
+    prog.outs("netsnoop: port ");
+    prog.out_num(port);
+    prog.outs(" (mtu ");
+    prog.out_num(inf[0]);
+    prog.outs(", link ");
+    if (inf[2] == 1) { prog.outs("up"); } else { prog.outs("down"); }
+    prog.outs("), ");
+    prog.out_num(count);
+    prog.outs(" frames — netd is displaced until this exits\n");
+    sys.write_serial(cast(*u8, "netsnoop: holding the port\n"), 27);
+
+    let is i64 as seen with mut = 0;
+    while (seen < count) {
+        // The read blocks until a frame arrives, and it only returns to the
+        // TOP holder — which is us, for as long as we live.
+        let is i64 as n = sys.read(fd, cast(*u8, &frame[0]), 2048);
+        if (n < 0) {
+            prog.outs("netsnoop: read failed ");
+            prog.out_num(n);
+            prog.outs("\n");
+            sys.close(fd);
+            return cast(i32, 1);
+        }
+        if (n < eth.HDR_LEN) { continue; }
+        seen = seen + 1;
+        prog.out_num(seen);
+        prog.outs("  ");
+        describe(cast(*u8, &frame[0]), n);
+    }
+
+    // And back it goes. netd never learns this happened; its next read simply
+    // starts working again.
+    sys.close(fd);
+    sys.write_serial(cast(*u8, "netsnoop: port handed back\n"), 27);
+    prog.outs("netsnoop: done, port handed back\n");
+    return cast(i32, 0);
+}

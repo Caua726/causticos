@@ -19,6 +19,7 @@ use "serial.cst" as serial;
 use "util.cst" as util;
 use "timer.cst" as timer;
 use "sched.cst" as sched;
+use "heap.cst" as heap;
 
 // PCI capability ids / virtio cfg_type values (§4.1.4)
 let is i64 as PCI_CAP_VENDOR  = 0x09;
@@ -50,7 +51,8 @@ let is i64 as C_QDRV   = 40;   // queue_driver / avail (le64)
 let is i64 as C_QDEV   = 48;   // queue_device / used (le64)
 
 // split-ring descriptor flags (§2.6.5)
-let is i64 as DESC_F_WRITE = 2;
+let is i64 as DESC_F_NEXT  = 1;      // this descriptor chains to `next`
+let is i64 as DESC_F_WRITE = 2;      // device writes it; absent means device reads
 
 // One discovered+mapped virtio PCI device. All scalars i64 (struct rule);
 // the four windows are kernel VAs from driver.mmio_map.
@@ -77,6 +79,12 @@ struct VirtQueue {
     last_used_len as i64; // bytes the device wrote into the last harvested buffer
     buf_va as i64;        // VA of the buffer pool inside the same page
     buf_phys as i64;
+    // Descriptor free list, for queues whose messages are CHAINS rather than
+    // one buffer each. vio_post/vio_repost keep the old one-descriptor-per-
+    // slot arrangement and never touch these; a queue is used one way or the
+    // other, not both.
+    free_head as i64;     // head of the free list, -1 when exhausted
+    num_free  as i64;
 }
 
 // ---- MMIO accessors (plain loads/stores; UC mapping from kvmap MMIO) ----
@@ -158,7 +166,10 @@ fn vio_setup(hw as i64, vd as *VirtioDev) as i64 {
 // VIRTIO_F_VERSION_1 (feature word 1, bit 0); the device offering it is
 // what makes this a modern device at all. Returns 0, or negative with the
 // device marked FAILED.
-fn vio_negotiate(vd as *VirtioDev) as i64 {
+// Negotiate, offering the driver feature words the caller asks for. Word 1
+// bit 0 (VERSION_1) is added unconditionally: a device without it is legacy
+// and this transport does not speak legacy.
+fn vio_negotiate_features(vd as *VirtioDev, want_lo as i64, want_hi as i64) as i64 {
     // reset, then wait for the device to report 0 (spec 4.1.4.3.2)
     wr8(vd.common + C_STATUS, 0);
     let is i64 as deadline = timer.current_time_ns() + 100000000;   // 100 ms
@@ -175,10 +186,15 @@ fn vio_negotiate(vd as *VirtioDev) as i64 {
         wr8(vd.common + C_STATUS, ST_FAILED);
         return 0 - 2;
     }
+    // Only accept what the device actually offers: acknowledging a feature
+    // that was not offered is a protocol violation, and the device is
+    // entitled to behave in any way it likes afterwards.
+    wr32(vd.common + C_DFSEL, 0);
+    let is i64 as f0 = rd32(vd.common + C_DF);
     wr32(vd.common + C_GFSEL, 0);
-    wr32(vd.common + C_GF, 0);                // no device-specific features
+    wr32(vd.common + C_GF, want_lo & f0);
     wr32(vd.common + C_GFSEL, 1);
-    wr32(vd.common + C_GF, 1);                // VERSION_1 only
+    wr32(vd.common + C_GF, (want_hi & f1) | 1);   // VERSION_1 always
 
     wr8(vd.common + C_STATUS, ST_ACKNOWLEDGE | ST_DRIVER | ST_FEATURES_OK);
     if ((rd8(vd.common + C_STATUS) & ST_FEATURES_OK) == 0) {
@@ -186,6 +202,11 @@ fn vio_negotiate(vd as *VirtioDev) as i64 {
         return 0 - 3;
     }
     return 0;
+}
+
+// The plain form: VERSION_1 and nothing else. What vnet and vtablet want.
+fn vio_negotiate(vd as *VirtioDev) as i64 {
+    return vio_negotiate_features(vd, 0, 0);
 }
 
 // Lay out and program split virtqueue `idx` inside one zeroed DMA page:
@@ -239,7 +260,96 @@ fn vio_queue_setup(vd as *VirtioDev, idx as i64, want_qsize as i64, buf_sz as i6
     vq.last_used = 0;
     vq.buf_va = base_va + buf_off;
     vq.buf_phys = base_phys + buf_off;
+    desc_freelist_init(vq);
     return 0;
+}
+
+// ============================================================
+// Descriptor chains
+//
+// vio_post describes exactly one device-writable buffer per slot, which is
+// all an input device or a receive queue ever needs. Anything whose messages
+// have STRUCTURE needs more: a virtio-sound transfer is three descriptors —
+// a device-readable header, a device-readable page of PCM, and a
+// device-writable status — and the device learns where one ends and the next
+// begins from the NEXT flag, not from their order.
+//
+// So descriptors become an allocatable resource. The free list threads
+// through the `next` field of unused descriptors, which is where the spec
+// intends it and costs no extra memory.
+// ============================================================
+
+fn desc_freelist_init(vq as *VirtQueue) as void {
+    let is i64 as i with mut = 0;
+    while (i < vq.qsize) {
+        let is i64 as d = vq.desc + i * 16;
+        wr16(d + 14, i + 1);                    // next = i+1; the last points past the end
+        i = i + 1;
+    }
+    vq.free_head = 0;
+    vq.num_free = vq.qsize;
+    return;
+}
+
+// Take one descriptor, or -1 when the queue is full. A caller that ignores
+// the -1 builds a chain from a descriptor the device already owns.
+fn vio_desc_alloc(vq as *VirtQueue) as i64 {
+    if (vq.num_free <= 0) { return 0 - 1; }
+    let is i64 as head = vq.free_head;
+    if (head < 0 || head >= vq.qsize) { return 0 - 1; }
+    vq.free_head = rd16(vq.desc + head * 16 + 14);
+    vq.num_free = vq.num_free - 1;
+    return head;
+}
+
+// Give a whole chain back, following NEXT to its end. Returning only the head
+// leaks every descriptor behind it, and the leak is silent until the queue
+// stops accepting work.
+fn vio_desc_free_chain(vq as *VirtQueue, head as i64) as void {
+    if (head < 0 || head >= vq.qsize) { return; }
+    let is i64 as cur with mut = head;
+    let is i64 as guard with mut = 0;
+    while (guard < vq.qsize) {
+        let is i64 as d = vq.desc + cur * 16;
+        let is i64 as flags = rd16(d + 12);
+        let is i64 as next = rd16(d + 14);
+        wr16(d + 14, vq.free_head);
+        vq.free_head = cur;
+        vq.num_free = vq.num_free + 1;
+        if ((flags & DESC_F_NEXT) == 0) { return; }
+        // A chain that points outside the table is a device or a driver bug;
+        // stop rather than walk off into the descriptor table's neighbours.
+        if (next < 0 || next >= vq.qsize) { return; }
+        cur = next;
+        guard = guard + 1;
+    }
+    return;
+}
+
+// Fill in one descriptor. `next` is ignored unless DESC_F_NEXT is in flags.
+fn vio_desc_set(vq as *VirtQueue, idx as i64, phys as i64, len as i64,
+                flags as i64, next as i64) as void {
+    let is i64 as d = vq.desc + idx * 16;
+    wr64(d, phys);
+    wr32(d + 8, len);
+    wr16(d + 12, flags);
+    wr16(d + 14, next);
+    return;
+}
+
+// Put a chain's head into the avail ring. Same as vio_repost, named for what
+// it does when descriptors are allocated rather than fixed.
+fn vio_avail_push(vq as *VirtQueue, head as i64) as void {
+    let is i64 as slot = vq.avail_shadow - (vq.avail_shadow / vq.qsize) * vq.qsize;
+    wr16(vq.avail + 4 + slot * 2, head);
+    vq.avail_shadow = vq.avail_shadow + 1;
+    return;
+}
+
+// Free descriptors available. A caller checks this before building a chain,
+// since running out halfway means unwinding.
+fn vio_desc_free_count(vq as *VirtQueue) as i64 {
+    return vq.num_free;
 }
 
 // Post buffer slot `i` (device-writable, buf_sz bytes) into the avail ring.
@@ -293,5 +403,97 @@ fn vio_isr_read(vd as *VirtioDev) as i64 {
 fn vio_driver_ok(vd as *VirtioDev) as void {
     wr8(vd.common + C_STATUS,
         ST_ACKNOWLEDGE | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
+    return;
+}
+
+// ============================================================
+// Descriptor-chain smoke
+//
+// Runs against a synthetic queue in heap memory — no device, no DMA, no
+// hardware needed — because the free list is pure bookkeeping and its bugs
+// (a leaked chain, a walk off the end of the table) are the kind that stay
+// invisible until a queue quietly stops accepting work hours later.
+//
+// This exists because the last three things added to this tree that had no
+// test turned out to have never executed at all.
+// ============================================================
+
+let is i64 as SMOKE_Q = 8;
+
+fn chain_smoke() as void {
+    let is i64 as mem = heap.kmalloc(SMOKE_Q * 16 + 64, cast(i32, 0));
+    if (mem == 0) { serial.println("virtio_chain_smoke: no memory FAIL", 34); return; }
+    let is VirtQueue as q with mut;
+    q.qsize = SMOKE_Q;
+    q.desc = mem;
+    q.avail_shadow = 0;
+    desc_freelist_init(&q);
+
+    let is i64 as fails with mut = 0;
+    if (q.num_free != SMOKE_Q) { fails = fails + 1; }
+
+    // The list must hand out every descriptor exactly once, then refuse.
+    let is [8]i64 as got;
+    let is i64 as i with mut = 0;
+    while (i < SMOKE_Q) {
+        got[i] = vio_desc_alloc(&q);
+        if (got[i] < 0 || got[i] >= SMOKE_Q) { fails = fails + 1; }
+        i = i + 1;
+    }
+    if (q.num_free != 0) { fails = fails + 1; }
+    if (vio_desc_alloc(&q) != 0 - 1) { fails = fails + 1; }   // exhausted, honestly
+
+    // No descriptor may be handed out twice: two chains sharing one is the
+    // device reading a buffer while the driver rewrites it.
+    let is i64 as a with mut = 0;
+    while (a < SMOKE_Q) {
+        let is i64 as b with mut = a + 1;
+        while (b < SMOKE_Q) {
+            if (got[a] == got[b]) { fails = fails + 1; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    // Freeing one at a time returns them one at a time.
+    i = 0;
+    while (i < SMOKE_Q) {
+        vio_desc_set(&q, got[i], 0, 0, 0, 0);         // no NEXT: a chain of one
+        vio_desc_free_chain(&q, got[i]);
+        i = i + 1;
+    }
+    if (q.num_free != SMOKE_Q) { fails = fails + 1; }
+
+    // A three-descriptor chain — the shape virtio-sound uses — must come back
+    // whole. Freeing only the head would leak the other two silently.
+    let is i64 as h0 = vio_desc_alloc(&q);
+    let is i64 as h1 = vio_desc_alloc(&q);
+    let is i64 as h2 = vio_desc_alloc(&q);
+    if (q.num_free != SMOKE_Q - 3) { fails = fails + 1; }
+    vio_desc_set(&q, h0, 0x1000, 8, DESC_F_NEXT, h1);
+    vio_desc_set(&q, h1, 0x2000, 4096, DESC_F_NEXT, h2);
+    vio_desc_set(&q, h2, 0x3000, 8, DESC_F_WRITE, 0);
+    vio_desc_free_chain(&q, h0);
+    if (q.num_free != SMOKE_Q) { fails = fails + 1; }
+
+    // A chain whose NEXT points outside the table must stop, not walk into
+    // whatever follows the descriptor table in memory.
+    let is i64 as bad = vio_desc_alloc(&q);
+    vio_desc_set(&q, bad, 0, 0, DESC_F_NEXT, 9999);
+    vio_desc_free_chain(&q, bad);
+    if (q.num_free != SMOKE_Q) { fails = fails + 1; }
+
+    // And an out-of-range head is ignored rather than corrupting the list.
+    vio_desc_free_chain(&q, 0 - 5);
+    vio_desc_free_chain(&q, 12345);
+    if (q.num_free != SMOKE_Q) { fails = fails + 1; }
+
+    heap.kfree(mem);
+    if (fails == 0) { serial.println("virtio_chain_smoke: PASS", 24); }
+    else {
+        serial.print("virtio_chain_smoke: FAIL n=", 27);
+        util.print_num(fails);
+        serial.println("", 0);
+    }
     return;
 }
