@@ -127,6 +127,23 @@ if [ -z "$WANT" ] || [ "$WANT" = "httpd" ]; then
     fi
 fi
 
+# audio is the only test whose answer is OUTSIDE the guest. Nothing in there
+# can tell a correct stream from one played at the wrong rate — the samples
+# left correctly either way — so the guest plays a tone and the host measures
+# the file QEMU recorded.
+if [ -z "$WANT" ] || [ "$WANT" = "audio" ]; then
+    printf '%-8s ' "audio"
+    if bash scripts/test-audio.sh >/tmp/ut-audio.log 2>&1; then
+        echo "PASS ($(grep -oE 'ch0: [0-9.]+Hz' /tmp/ut-audio.log | head -1))"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-audio.log)"
+        grep -E "FAIL|panic:" /tmp/ut-audio.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED audio"
+    fi
+fi
+
 # shellnet types at the real prompt, so it needs the monitor too — and it is
 # the only test that proves the machine you BOOT is wired up rather than the
 # one a test assembled for itself.

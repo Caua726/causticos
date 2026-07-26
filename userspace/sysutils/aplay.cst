@@ -1,0 +1,238 @@
+// aplay — play a WAV file straight at the hardware.
+//
+// The DIRECT path, on purpose. aplay opens DEV_AUDIO_OUT itself and writes
+// PCM into it; it does not talk to soundd and it does not want to. Two things
+// come out of that:
+//
+//   - It proves the write() half of the audio ABI, which is the half a
+//     program can use without mapping anything or thinking about cursors.
+//   - It proves the grab stack on a new device class. While aplay runs,
+//     whatever was holding the stream goes quiet; when it exits, that holder
+//     gets the stream back without ever having been told anything happened.
+//     That is architecture.md §6 as a program you can run.
+//
+// WHAT IT WILL NOT DO. If the file's sample rate is not the rate the device
+// opened at, aplay refuses and says so. Resampling is a decision with quality
+// trade-offs — which filter, how much aliasing, how much latency — and
+// decisions are policy. soundd is where that lives. A player that silently
+// resampled would be making that choice for everyone, badly, and hiding it.
+//
+// Mono files ARE widened to stereo, because duplicating a channel is not a
+// decision: it is exact, it loses nothing, and there is no other sensible
+// answer.
+
+use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "../../../Caustic/std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+use "../lib/wav/wav.cst" as wav;
+
+// One period at 48 kHz stereo is 2 KiB; this is a comfortable multiple and
+// keeps the syscall count down without making any single write long enough
+// to matter.
+let is i64 as CHUNK_FRAMES = 2048;
+let is [8192]u8 as stereo;          // CHUNK_FRAMES * 4 bytes, for the mono widen
+
+// The one line a machine reads. It goes to the terminal for the person and to
+// the serial port for scripts/test-audio.sh, which is on the host and has no
+// other way to learn what happened in here — the same reason httpd announces
+// "listening" on the serial line. One line, at the end, saying what the
+// program did or why it did not.
+fn report(msg as *u8) as void {
+    prog.outs(msg);
+    let is i64 as n with mut = 0;
+    while (msg[n] != cast(u8, 0)) { n = n + 1; }
+    sys.write_serial(msg, n);
+    return;
+}
+
+let is [24]u8 as numbuf;
+
+fn num(v as i64) as *u8 {
+    let is i64 as x with mut = v;
+    let is i64 as i with mut = 23;
+    numbuf[23] = cast(u8, 0);
+    if (x == 0) { i = 22; numbuf[22] = cast(u8, 48); }
+    while (x > 0 && i > 0) {
+        i = i - 1;
+        numbuf[i] = cast(u8, 48 + (x % 10));
+        x = x / 10;
+    }
+    return cast(*u8, &numbuf[i]);
+}
+
+fn die(msg as *u8) as i32 {
+    report("aplay: ");
+    report(msg);
+    report("\n");
+    return cast(i32, 1);
+}
+
+fn usage() as i32 {
+    prog.outs("usage: aplay [-d INDEX] FILE.wav\n");
+    prog.outs("  -d INDEX   playback device (default 0)\n");
+    return cast(i32, 2);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is i64 as dev with mut = 0;
+    let is *u8 as path with mut = cast(*u8, 0);
+
+    let is i64 as i with mut = 1;
+    while (i < argc) {
+        let is *u8 as a = prog.arg(argv, i);
+        if (a[0] == cast(u8, 45) && a[1] == cast(u8, 100) && a[2] == cast(u8, 0)) {
+            i = i + 1;
+            if (i >= argc) { return usage(); }
+            let is *u8 as v = prog.arg(argv, i);
+            dev = fu.parse_uint(v, prog.slen(v));
+        } else if (a[0] == cast(u8, 45)) {
+            return usage();
+        } else {
+            path = a;
+        }
+        i = i + 1;
+    }
+    if (cast(i64, path) == 0) { return usage(); }
+
+    // Read the file BEFORE opening the device. The stream is a clock: it
+    // starts the moment it is acquired and plays silence until something
+    // feeds it, so every millisecond spent reading a file with the device
+    // already open is a millisecond of silence at the front of the recording.
+    let is i64 as flen with mut = 0;
+    let is i64 as img = fu.slurp(path, &flen);
+    if (img == 0 || flen <= 0) { return die("cannot read that file"); }
+
+    let is wav.Wav as w;
+    let is i64 as rc = wav.parse(cast(*u8, img), flen, &w);
+    if (rc != wav.WAV_OK) {
+        fu.unslurp(img, flen);
+        return die(wav.reason(rc));
+    }
+
+    let is i64 as fd = sys.dev_open(sys.DEV_AUDIO_OUT, dev, 0);
+    if (fd < 0) {
+        fu.unslurp(img, flen);
+        return die("no playback device");
+    }
+
+    // AUDIO_INFO_WORDS, exactly. The kernel writes all of them, so a shorter
+    // array here is 32 bytes of somebody else's stack overwritten on every
+    // call — silently, and only sometimes fatally, which is the worst kind.
+    let is [20]i64 as info;
+    if (sys.audio_info(fd, cast(*i64, &info[0])) != 0) {
+        sys.close(fd);
+        fu.unslurp(img, flen);
+        return die("the device would not describe itself");
+    }
+    let is i64 as dev_rate = info[0];
+    let is i64 as dev_channels = info[1];
+    let is i64 as dev_frame_bytes = info[3];
+
+    if (w.rate != dev_rate) {
+        report("aplay: the file is ");
+        report(num(w.rate));
+        report(" Hz and the device is ");
+        report(num(dev_rate));
+        report(" Hz\n");
+        report("aplay: resampling is soundd's job, not this program's\n");
+        sys.close(fd);
+        fu.unslurp(img, flen);
+        return cast(i32, 1);
+    }
+    if (dev_channels != 2 || dev_frame_bytes != 4) {
+        sys.close(fd);
+        fu.unslurp(img, flen);
+        return die("this device is not 16-bit stereo");
+    }
+
+    // Feed it. write() blocks while the ring is full, which is exactly the
+    // pacing this wants: the loop runs at the speed of the hardware clock and
+    // needs no timer of its own.
+    let is i64 as src = img + w.data_off;
+    let is i64 as left with mut = w.frames;
+    let is i64 as done with mut = 0;
+    let is i64 as failed with mut = 0;
+    while (left > 0 && failed == 0) {
+        let is i64 as take with mut = left;
+        if (take > CHUNK_FRAMES) { take = CHUNK_FRAMES; }
+        let is i64 as wrote with mut = 0;
+        if (w.channels == 1) {
+            wav.mono_to_stereo(cast(*u8, src + done * 2), cast(*u8, &stereo[0]), take);
+            wrote = sys.write(fd, cast(*u8, &stereo[0]), take * 4);
+        } else {
+            wrote = sys.write(fd, cast(*u8, src + done * w.frame_bytes),
+                              take * w.frame_bytes);
+        }
+        if (wrote <= 0) { failed = 1; }
+        else {
+            let is i64 as got = wrote / dev_frame_bytes;
+            done = done + got;
+            left = left - got;
+        }
+    }
+    fu.unslurp(img, flen);
+
+    if (failed != 0) {
+        sys.close(fd);
+        return die("the device stopped accepting samples");
+    }
+
+    // Finish on a period boundary. A file whose length is not a whole number
+    // of periods leaves the last one partly written, and the hardware enters
+    // it with a hole at the end — a real underrun, of a few hundred inaudible
+    // samples, counted like any other. Writing the silence deliberately says
+    // "this is the end of the file" instead of leaving it to look like the
+    // program was late.
+    let is i64 as pf = info[4];
+    let is i64 as pad = (pf - (done % pf)) % pf;
+    if (pad > 0) {
+        let is i64 as z with mut = 0;
+        while (z < pad * dev_frame_bytes) { stereo[z] = cast(u8, 0); z = z + 1; }
+        if (sys.write(fd, cast(*u8, &stereo[0]), pad * dev_frame_bytes) > 0) {
+            done = done + pad;
+        }
+    }
+
+    // Drain. Closing straight after the last write would stop the engine with
+    // up to a buffer of audio — 149 ms — still sitting in the ring unplayed,
+    // and the file would simply end early with nothing to explain it.
+    //
+    // There is no drain verb because there does not need to be one: the
+    // stream is finished when the hardware cursor reaches the application
+    // cursor, and audio_info reports both. This is the one thing a
+    // write-mode program cannot see any other way, since it never maps the
+    // control page.
+    let is [20]i64 as now;
+    let is i64 as deadline = sys.time_ns() + 5000000000;
+    let is i64 as drained with mut = 0;
+    while (drained == 0 && sys.time_ns() < deadline) {
+        if (sys.audio_info(fd, cast(*i64, &now[0])) != 0) { drained = 1; }
+        else if (now[11] >= now[12]) { drained = 1; }
+        else { sys.sleep_ns(2000000); }
+    }
+
+    let is i64 as xruns = now[13];
+    sys.close(fd);
+    report("aplay: played ");
+    report(num(done));
+    report(" frames at ");
+    report(num(dev_rate));
+    report(" Hz");
+    // Reported, not hidden. An underrun is audible — it is the click in the
+    // middle — and a player that knew and said nothing would leave the person
+    // listening to guess whether their file or their machine was at fault.
+    //
+    // One is the end of the file. The engine runs until the fd closes, so it
+    // always enters one period past the last sample with nothing in it; a
+    // program that maps the ring declares AUDIO_APP_DRAINING and avoids even
+    // that, but this one writes and has no page to declare it on. Printing
+    // that one every single time would teach everybody to ignore the line,
+    // which is exactly how a real underrun goes unnoticed.
+    if (xruns > 1) {
+        report(", ");
+        report(num(xruns - 1));
+        report(" underruns");
+    }
+    report("\n");
+    return cast(i32, 0);
+}

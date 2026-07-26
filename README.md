@@ -25,14 +25,17 @@ Around 21k lines of Caustic across ~40 modules. x86_64 only.
 - **Time** — PIT, LAPIC timer (calibrated against the HPET), HPET nanosecond clock. ACPI table discovery (RSDP/XSDT/MADT/MCFG/HPET) and IOAPIC routing.
 - **Drivers** — a declarative framework where devices are described in `.cdvrspec` files, over PCI, with shared-IRQ chaining.
 - **Storage** — AHCI (SATA), a FAT32 implementation (read, write, create, unlink, rename, mkdir), and a POSIX-shaped VFS on top.
-- **Network** — an e1000 NIC driver: TX/RX rings, interrupts, ARP.
+- **Network** — e1000 and virtio-net drivers under a `DEV_NET` class that hands userspace raw ethernet frames, and `netd`: ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, HTTP/1.1 and TLS 1.3 with certificate verification, all in ring 3. `wget https://…` works.
+- **Sound** — a `DEV_AUDIO_OUT` / `DEV_AUDIO_IN` class: a DMA ring of PCM and a control page, mapped into the holder, or fed with `write()`. virtio-sound drives it; Intel HDA (the one real machines have) is still to come.
 - **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, a small v0 syscall ABI, and loaders for both ELF64 and CSE. It loads a real toolchain-built `.cse` and runs it to completion.
 
 ## What's not there yet
 
 - The syscall ABI is 7 calls: kernel info, monotonic time, sleep, exit, getpid, yield, write-to-console. There's no file I/O, `mmap`, or process spawning from userspace — fd-based read/write, user `mmap`, and `spawn` arrive with the capability layer.
 - No IPC, no signals.
-- The NIC driver exists, but there is no TCP/IP stack.
+- Audio has no mixer yet: one program holds the stream at a time (the grab
+  stack makes that a takeover rather than a refusal). `soundd` is what makes
+  two programs audible at once.
 - No ASLR, no KPTI (single-trust for now). x86_64 only.
 
 ## Requirements
