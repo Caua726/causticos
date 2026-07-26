@@ -142,7 +142,11 @@ let is i64 as CSL_EXPOFF      = 0x18;
 let is i64 as CSL_EXP_ENTRY   = 12;
 let is i64 as CSL_MAX_SEGS    = 16;
 
-// Relocation types, from the x86_64 psABI. Only the two the linker emits for
+// A program imports a few hundred distinct symbols at most, and the resolved
+// table is per-load stack state, so this cap is what bounds that stack frame.
+let is i64 as IMP_MAX_NAMES  = 512;
+
+// Relocation types, from the x86_64 psABI. Only the ones the linker emits for
 // an undefined call or data reference.
 let is i64 as R_X86_64_64    = 1;
 let is i64 as R_X86_64_PC32  = 2;
@@ -477,23 +481,46 @@ fn _csl_sym(slot as i64, sym as *u8, slen as i64) as i64 {
 // Add `s` to the value already at `site` in `a` — see the header comment: the
 // linker resolved these against address 0, so this one rule serves both PC32
 // and 64-bit sites. width is 4 or 8.
+// The bytes are walked ONE AT A TIME, each through its own page-table lookup,
+// because a site can straddle a page boundary. This started as a check that
+// refused such a site — on the reasoning that a relocation field is naturally
+// aligned inside its instruction, which is simply not true: x86_64
+// instructions are variable-length and neither they nor their displacement
+// fields are aligned to anything. `ls` was the first program whose import
+// landed across a boundary, and it failed to spawn with no explanation beyond
+// a number.
+//
+// Four or eight lookups per import, a few hundred per load. Against a spawn
+// that reads a file off the volume, that is not a cost worth optimising.
 fn _patch_site(a as *vma.Aspace, site as i64, s as i64, width as i64) as i32 {
-    // A site straddling a page boundary would need two walks; the linker never
-    // emits one (relocation fields are naturally aligned within an
-    // instruction), and silently patching half of it would be far worse than
-    // refusing.
-    if ((site & 0xFFF) + width > pmm.PAGE_SIZE) { return cast(i32, 0 - 45); }
-    let is i64 as page_va = page_align_down(site);
-    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
-    if (phys == 0) { return cast(i32, 0 - 46); }
-    let is i64 as kv = pmm.phys_to_virt(phys) + (site & 0xFFF);
-    if (width == 8) {
-        let is *i64 as p = cast(*i64, kv);
-        *p = *p + s;
-        return 0;
+    let is i64 as val with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < width) {
+        let is i64 as va = site + i;
+        let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, page_align_down(va));
+        if (phys == 0) { return cast(i32, 0 - 46); }
+        let is *u8 as p = cast(*u8, pmm.phys_to_virt(phys) + (va & 0xFFF));
+        val = val | (cast(i64, p[0]) << (i * 8));
+        i = i + 1;
     }
-    let is *i32 as p32 = cast(*i32, kv);
-    *p32 = cast(i32, cast(i64, *p32) + s);
+    // Sign-extend a 32-bit field before adding. The linker resolved these
+    // against address zero, so the value sitting there is NEGATIVE
+    // (0 - (site+4)); reading it as unsigned would add 4 GiB to every
+    // displacement and land the call somewhere else entirely.
+    if (width == 4) {
+        if ((val & 0x80000000) != 0) { val = val - 0x100000000; }
+    }
+    val = val + s;
+
+    i = 0;
+    while (i < width) {
+        let is i64 as va = site + i;
+        let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, page_align_down(va));
+        if (phys == 0) { return cast(i32, 0 - 46); }
+        let is *u8 as p = cast(*u8, pmm.phys_to_virt(phys) + (va & 0xFFF));
+        p[0] = cast(u8, (val >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -501,16 +528,19 @@ fn _patch_site(a as *vma.Aspace, site as i64, s as i64, width as i64) as i32 {
 // the child, and patch each site with the address its symbol lives at.
 fn resolve_imports(a as *vma.Aspace, img as *u8, cst_size as i64,
                    imp_off as i64, imp_count as i64) as i32 {
-    if (imp_off + 8 > cst_size) { return cast(i32, 0 - 47); }
-    let is i64 as n     = elf.read_u32_le(img, imp_off);
-    let is i64 as nlibs = elf.read_u32_le(img, imp_off + 4);
+    if (imp_off + 12 > cst_size) { return cast(i32, 0 - 47); }
+    let is i64 as n      = elf.read_u32_le(img, imp_off);
+    let is i64 as nlibs  = elf.read_u32_le(img, imp_off + 4);
+    let is i64 as nnames = elf.read_u32_le(img, imp_off + 8);
     if (n != imp_count) { return cast(i32, 0 - 48); }
     if (nlibs <= 0 || nlibs > CSL_CACHE_MAX) { return cast(i32, 0 - 49); }
+    if (nnames <= 0 || nnames > IMP_MAX_NAMES) { return cast(i32, 0 - 61); }
 
-    // Library table, then the entries. Both are variable-length strings, so the
-    // cursor walks once and every read is bounds-checked against the image.
+    // Library table, then the name table, then the fixed-size entries. The two
+    // string tables are walked once and every read is bounds-checked against
+    // the image.
     let is [8]i64 as slots;
-    let is i64 as cur with mut = imp_off + 8;
+    let is i64 as cur with mut = imp_off + 12;
     let is i64 as li with mut = 0;
     while (li < nlibs) {
         let is i64 as start = cur;
@@ -525,24 +555,45 @@ fn resolve_imports(a as *vma.Aspace, img as *u8, cst_size as i64,
         li = li + 1;
     }
 
-    let is i64 as i with mut = 0;
-    while (i < n) {
-        if (cur + 16 > cst_size) { return cast(i32, 0 - 52); }
-        let is i64 as rtype   = elf.read_u32_le(img, cur);
-        let is i64 as lib_idx = elf.read_u32_le(img, cur + 4);
-        let is i64 as site    = elf.read_u64_le(img, cur + 8);
-        cur = cur + 16;
-        let is i64 as sstart = cur;
+    // Names are interned, so a symbol used at fifty call sites is resolved ONCE
+    // and its address reused. That is the same reason the format interns them:
+    // the resolution is a linear walk of the library's export table, and doing
+    // it per site rather than per symbol was the other half of the cost.
+    let is [512]i64 as name_off;
+    let is [512]i64 as name_len;
+    let is [512]i64 as name_val;
+    let is i64 as ni with mut = 0;
+    while (ni < nnames) {
+        let is i64 as start = cur;
         while (cur < cst_size && img[cur] != cast(u8, 0)) { cur = cur + 1; }
         if (cur >= cst_size) { return cast(i32, 0 - 53); }
-        let is i64 as slen = cur - sstart;
+        name_off[ni] = start;
+        name_len[ni] = cur - start;
+        name_val[ni] = 0 - 2;          // -2 = not resolved yet
         cur = cur + 1;
+        ni = ni + 1;
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (cur + 24 > cst_size) { return cast(i32, 0 - 52); }
+        let is i64 as rtype    = elf.read_u32_le(img, cur);
+        let is i64 as lib_idx  = elf.read_u32_le(img, cur + 4);
+        let is i64 as name_idx = elf.read_u32_le(img, cur + 8);
+        let is i64 as site     = elf.read_u64_le(img, cur + 16);
+        cur = cur + 24;
 
         if (lib_idx < 0 || lib_idx >= nlibs) { return cast(i32, 0 - 54); }
-        let is i64 as sv = _csl_sym(slots[lib_idx], cast(*u8, &img[sstart]), slen);
+        if (name_idx < 0 || name_idx >= nnames) { return cast(i32, 0 - 62); }
+        let is i64 as sv with mut = name_val[name_idx];
+        if (sv == 0 - 2) {
+            sv = _csl_sym(slots[lib_idx], cast(*u8, &img[name_off[name_idx]]),
+                          name_len[name_idx]);
+            name_val[name_idx] = sv;
+        }
         if (sv < 0) {
             serial.print("cse: unresolved import ", 23);
-            serial.print(cast(*u8, &img[sstart]), slen);
+            serial.print(cast(*u8, &img[name_off[name_idx]]), name_len[name_idx]);
             serial.println("", 0);
             return cast(i32, 0 - 55);
         }
