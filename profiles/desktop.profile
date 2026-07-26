@@ -28,4 +28,5 @@ dir  /var/wm
 # the .csl's export table — on a booted machine rather than on paper.
 dir  /lib
 file userspace/build/libdyndemo.csl  /lib/libdyndemo.csl
+file userspace/build/libdyndemo2.csl /lib/libdyndemo2.csl
 bin  dyntest

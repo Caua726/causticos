@@ -153,16 +153,32 @@ let is i64 as R_X86_64_PLT32 = 4;
 // by name and never evicted — a .csl is small, there are a handful of them, and
 // they are exactly what every program needs.
 //
-// This is also where the RAM win will come from: the image is read once, so the
-// frames behind it can be mapped into several address spaces rather than
-// copied. Today each aspace gets its own copy; the cache is the part that has
-// to exist first.
+// It is also what makes the frames shareable. A library's READ-ONLY segments —
+// its text and rodata, which is nearly all of it — are laid into frames once,
+// and those same frames are mapped into every address space that uses the
+// library. Ten programs linked against it cost one copy of its code, not ten.
+//
+// Writable segments are NOT shared, and that distinction is the whole point: a
+// library's mutable data belongs to the process, and one program's writes must
+// never be visible to another. Those get a private copy per aspace.
+//
+// The shared frames are never freed. A dying aspace unmaps them without freeing
+// (their VMA carries VMA_FILE, which is exactly "these frames are not yours"),
+// so they stay resident for the next program — the same lifetime as the cache
+// entry they belong to.
 let is i64 as CSL_CACHE_MAX  = 8;
 let is i64 as CSL_NAME_MAX   = 32;
+let is i64 as CSL_MAX_PAGES  = 256;    // 1 MiB of shared text+rodata per library
 let is [8]i64 as _csl_buf with mut;
 let is [8]i64 as _csl_size with mut;
 let is [256]u8 as _csl_name with mut;
 let is i64 as _csl_count with mut = 0;
+// The shared pages, CSL_MAX_PAGES per library: where each goes, what backs it,
+// and with which permissions.
+let is [2048]i64 as _csl_pg_va with mut;
+let is [2048]i64 as _csl_pg_phys with mut;
+let is [2048]i64 as _csl_pg_prot with mut;
+let is [8]i64 as _csl_npages with mut;
 
 let is i64 as MINI_OFF        = 0x40;
 let is i64 as MINI_OFF_VER    = 0x44;     // u16: mini-header version
@@ -290,14 +306,115 @@ fn _csl_open(nm as *u8, nl as i64) as i64 {
     let is i64 as c with mut = 0;
     while (c < nl) { _csl_name[nb + c] = nm[c]; c = c + 1; }
     _csl_name[nb + nl] = cast(u8, 0);
+    // The shared frames are built once, here, before the slot is published:
+    // a failure now must not leave a half-built library in the cache for the
+    // next spawn to map.
+    _csl_npages[slot] = 0;
+    let is i32 as src = _csl_share(slot);
+    if (src != 0) { return 0 - 1; }
     _csl_count = _csl_count + 1;
     return slot;
+}
+
+// Lay the library's read-only segments into frames, ONCE. Everything after this
+// maps these same frames; nothing copies them again.
+//
+// Read-only is the whole test for shareability. Text and rodata are identical
+// for every user of the library and can never diverge, so one copy serves all
+// of them. A writable segment is the opposite: it is the library's per-process
+// state, and sharing it would let one program see another's writes.
+fn _csl_share(slot as i64) as i32 {
+    let is *u8 as b = cast(*u8, _csl_buf[slot]);
+    let is i64 as sz = _csl_size[slot];
+    let is i64 as nseg = elf.read_u32_le(b, CSL_SEGCOUNT);
+    if (nseg <= 0 || nseg > CSL_MAX_SEGS) { return cast(i32, 0 - 40); }
+    let is i64 as base = slot * CSL_MAX_PAGES;
+    let is i64 as np with mut = 0;
+
+    let is i64 as i with mut = 0;
+    while (i < nseg) {
+        let is i64 as e = CSL_HDR_SIZE + i * S_SIZE;
+        let is i64 as perms = elf.read_u32_le(b, e + S_PERMS);
+        if ((perms & PERM_W) == 0) {
+            let is i64 as vaddr = elf.read_u64_le(b, e + S_VADDR);
+            let is i64 as foff  = elf.read_u32_le(b, e + S_FOFF);
+            let is i64 as fsz   = elf.read_u32_le(b, e + S_FSZ);
+            let is i64 as msz   = elf.read_u32_le(b, e + S_MSZ);
+            if (msz < fsz) { return cast(i32, 0 - 41); }
+            if (fsz > 0 && foff + fsz > sz) { return cast(i32, 0 - 42); }
+            let is i64 as p0  = page_align_down(vaddr);
+            let is i64 as end = page_align_up(vaddr + msz);
+            let is i64 as prot = perms_to_prot(perms);
+            let is i64 as pg with mut = p0;
+            while (pg < end) {
+                if (np >= CSL_MAX_PAGES) {
+                    serial.println("cse: .csl exceeds the shared-page budget", 39);
+                    return cast(i32, 0 - 57);
+                }
+                let is i32 as pfn = pmm.alloc_pages(pmm.ALLOC_ZERO, cast(i32, 0),
+                                                    pmm.USAGE_KERNEL, cast(i32, 0));
+                if (pfn == pmm.PFN_NONE) { return cast(i32, 0 - 58); }
+                let is i64 as phys = pmm.pfn_to_phys(pfn);
+                // Copy this page's slice of the segment. The bss tail needs
+                // nothing: ALLOC_ZERO already handed back a zeroed frame.
+                let is i64 as kv = pmm.phys_to_virt(phys);
+                let is i64 as seg_off = pg - vaddr;      // may be negative on page 0
+                let is i64 as src with mut = seg_off;
+                let is i64 as dst with mut = 0;
+                if (src < 0) { dst = 0 - src; src = 0; }
+                let is i64 as n with mut = fsz - src;
+                if (n > pmm.PAGE_SIZE - dst) { n = pmm.PAGE_SIZE - dst; }
+                let is i64 as k with mut = 0;
+                while (k < n) {
+                    let is *u8 as d = cast(*u8, kv + dst + k);
+                    *d = b[foff + src + k];
+                    k = k + 1;
+                }
+                _csl_pg_va[base + np] = pg;
+                _csl_pg_phys[base + np] = phys;
+                _csl_pg_prot[base + np] = prot;
+                np = np + 1;
+                pg = pg + pmm.PAGE_SIZE;
+            }
+        }
+        i = i + 1;
+    }
+    _csl_npages[slot] = np;
+    return 0;
 }
 
 // Map a library's segments into `a` at the vaddrs it was linked for. The build
 // gives each library a distinct base, so two of them never overlap and neither
 // lands on the program at 0x400000.
+//
+// Read-only segments are mapped from the shared frames; writable ones get a
+// private copy. The shared VMA is reserved with VMA_FILE so the aspace teardown
+// unmaps it without freeing frames that belong to every other user.
 fn _csl_map(a as *vma.Aspace, slot as i64) as i32 {
+    let is i64 as base = slot * CSL_MAX_PAGES;
+    let is i64 as np = _csl_npages[slot];
+    let is i64 as i with mut = 0;
+    while (i < np) {
+        let is i64 as va   = _csl_pg_va[base + i];
+        let is i64 as prot = _csl_pg_prot[base + i];
+        // One VMA per page is wasteful in bookkeeping but exact in lifetime,
+        // and the alternative — one VMA spanning a segment — needs the pages to
+        // be contiguous in the reservation, which they are not required to be.
+        let is i64 as got = vma.reserve(a, va, pmm.PAGE_SIZE, prot,
+                                        vma.VMA_FIXED | vma.VMA_FILE);
+        if (got != va) { return cast(i32, 0 - 59); }
+        let is i64 as full = vmm.PTE_PRESENT | vmm.PTE_USER | prot;
+        if (vmm.vmm_map_range(a.pml4_phys, va, _csl_pg_phys[base + i], 1, full) != 0) {
+            return cast(i32, 0 - 60);
+        }
+        i = i + 1;
+    }
+    return _csl_map_private(a, slot);
+}
+
+// The writable half: a per-process copy, mapped and filled exactly as a
+// program's own data segment is.
+fn _csl_map_private(a as *vma.Aspace, slot as i64) as i32 {
     let is *u8 as b = cast(*u8, _csl_buf[slot]);
     let is i64 as sz = _csl_size[slot];
     let is i64 as nseg = elf.read_u32_le(b, CSL_SEGCOUNT);
@@ -305,25 +422,27 @@ fn _csl_map(a as *vma.Aspace, slot as i64) as i32 {
     let is i64 as i with mut = 0;
     while (i < nseg) {
         let is i64 as e = CSL_HDR_SIZE + i * S_SIZE;
-        let is i64 as vaddr = elf.read_u64_le(b, e + S_VADDR);
-        let is i64 as foff  = elf.read_u32_le(b, e + S_FOFF);
-        let is i64 as fsz   = elf.read_u32_le(b, e + S_FSZ);
-        let is i64 as msz   = elf.read_u32_le(b, e + S_MSZ);
         let is i64 as perms = elf.read_u32_le(b, e + S_PERMS);
-        if (msz < fsz) { return cast(i32, 0 - 41); }
-        if (fsz > 0 && foff + fsz > sz) { return cast(i32, 0 - 42); }
-        let is i64 as p0  = page_align_down(vaddr);
-        let is i64 as end = page_align_up(vaddr + msz);
-        if (end > p0) {
-            // Writable while we copy; the library's own perms are what the
-            // segment table asks for, and a text segment is R-X.
-            let is i64 as prot = perms_to_prot(perms) | vma.PROT_WRITE;
-            let is i64 as got = vma.mmap_anon(a, p0, end - p0, prot, vma.VMA_FIXED);
-            if (got != p0) { return cast(i32, 0 - 43); }
-        }
-        if (fsz > 0) {
-            let is i32 as crc = elf.copy_segment_into_aspace(a, vaddr, b, foff, fsz, fsz);
-            if (crc != 0) { return cast(i32, 0 - 44); }
+        // Read-only segments came from the shared frames; only the writable
+        // ones are copied per process.
+        if ((perms & PERM_W) != 0) {
+            let is i64 as vaddr = elf.read_u64_le(b, e + S_VADDR);
+            let is i64 as foff  = elf.read_u32_le(b, e + S_FOFF);
+            let is i64 as fsz   = elf.read_u32_le(b, e + S_FSZ);
+            let is i64 as msz   = elf.read_u32_le(b, e + S_MSZ);
+            if (msz < fsz) { return cast(i32, 0 - 41); }
+            if (fsz > 0 && foff + fsz > sz) { return cast(i32, 0 - 42); }
+            let is i64 as p0  = page_align_down(vaddr);
+            let is i64 as end = page_align_up(vaddr + msz);
+            if (end > p0) {
+                let is i64 as prot = perms_to_prot(perms);
+                let is i64 as got = vma.mmap_anon(a, p0, end - p0, prot, vma.VMA_FIXED);
+                if (got != p0) { return cast(i32, 0 - 43); }
+            }
+            if (fsz > 0) {
+                let is i32 as crc = elf.copy_segment_into_aspace(a, vaddr, b, foff, fsz, fsz);
+                if (crc != 0) { return cast(i32, 0 - 44); }
+            }
         }
         i = i + 1;
     }
