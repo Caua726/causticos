@@ -75,16 +75,19 @@ PURE=$(build_form pure   --extension=cse)
 COMPAT=$(build_form compat --mode=compat)
 BUNDLE=$(build_form bundle --mode=bundle)
 
-bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin fpure.cse   "$PURE"   >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin fcompat.cse "$COMPAT" >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin fbundle.cse "$BUNDLE" >/dev/null
+# Its own image, so this test can run beside the others rather than
+# fighting them for build/disk.img.
+DISK=build/disk-cse-forms.img
+SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin fpure.cse   "$PURE"   >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin fcompat.cse "$COMPAT" >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin fbundle.cse "$BUNDLE" >/dev/null
 
 MON=/tmp/causticos-cseforms-mon.$$
 LOG=/tmp/causticos-cseforms.log
-QEMU_DISK=build/disk.img
+QEMU_DISK="$DISK"
 QEMU_KVM=1
-QEMU_HTTPD_PORT=18086
+QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18086}"
 source scripts/qemu-args.sh
 
 qemu-system-x86_64 "${QEMU_ARGS[@]}" \

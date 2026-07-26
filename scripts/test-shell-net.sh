@@ -34,7 +34,10 @@ GOT=/tmp/shellnet-got.bin
 
 # The guest trusts the test CA and nothing else, so the https fetch is checked
 # against a real chain rather than waved through.
-CA_PEM=build/certs/ca.pem bash scripts/seed-disk.sh shell --no-build >/dev/null
+CA_PEM=build/certs/ca.pem # Its own image, so this test can run beside the others rather than
+# fighting them for build/disk.img.
+DISK=build/disk-shell-net.img
+SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
 
 python3 scripts/http-server.py "$PORT" 200 >/tmp/shellnet-srv.log 2>&1 &
 SRV=$!
@@ -44,7 +47,7 @@ SRV_TLS=$!
 
 MON=/tmp/causticos-shellnet-mon.$$
 LOG=$(mktemp)
-QEMU_DISK=build/disk.img
+QEMU_DISK="$DISK"
 QEMU_KVM=1
 source scripts/qemu-args.sh
 
@@ -113,9 +116,12 @@ type_line() {
 # there is, since the shell's output went to a framebuffer nobody is looking at.
 wait_for_file() {
     local name="$1" want="$2" i
-    for (( i=0; i<240; i++ )); do
-        sleep 0.5
-        if python3 scripts/fat32_get.py build/disk.img "$name" "$GOT" >/dev/null 2>&1; then
+    # 20 seconds, not 120. The cap exists to catch a HANG; a download that
+    # has not appeared in twenty is not going to, and waiting two minutes
+    # to say so is most of what made this suite too slow to run.
+    for (( i=0; i<100; i++ )); do
+        sleep 0.2
+        if python3 scripts/fat32_get.py "$DISK" "$name" "$GOT" >/dev/null 2>&1; then
             if [ "$(stat -c%s "$GOT" 2>/dev/null || echo 0)" = "$want" ]; then return 0; fi
         fi
         kill -0 $QPID 2>/dev/null || return 1

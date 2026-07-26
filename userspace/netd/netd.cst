@@ -576,6 +576,110 @@ fn tcp_credit(s as *nsock.Sock) as void {
     return;
 }
 
+// How many bytes this client's channel will take right now. Negative if the
+// channel is gone, which the caller treats as "deliver nothing" rather than
+// dropping the client: a peer that closed is noticed by the poll loop, in one
+// place, and not by every writer separately.
+// Is this client still owed bytes that are sitting in a TCP receive buffer?
+// Cheap: a walk of a 32-entry table, once per poll, and the alternative is a
+// per-client flag that has to be right in six places.
+fn client_owes(who as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < nsock.count()) {
+        let is *nsock.Sock as s = nsock.at(i);
+        if (s.state == nsock.ST_CONN && s.client == who && s.conn >= 0) {
+            if (tc.conn_readable(nsock.conn_at(s.conn)) > 0) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Hand over whatever now fits, for every connection this client owns.
+fn flush_client(who as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < nsock.count()) {
+        let is *nsock.Sock as s = nsock.at(i);
+        if (s.state == nsock.ST_CONN && s.client == who && s.conn >= 0) {
+            let is i64 as before = tc.conn_readable(nsock.conn_at(s.conn));
+            deliver_data(s);
+            // TELL THE PEER. Handing bytes to the client is what reopens the
+            // receive window, and a window that reopens in silence is a
+            // sender still waiting. conn_read marks an ACK owed; nothing
+            // sends it unless the output path runs, and until this call
+            // existed the update waited for the next arriving segment or
+            // timer — from a peer that had stopped sending precisely because
+            // the window was shut. That is how a correct-looking flow-control
+            // fix made throughput worse instead of better.
+            if (tc.conn_readable(nsock.conn_at(s.conn)) < before) {
+                tcp_flush(s.conn);
+            }
+            // The peer may have finished while this client was behind; the
+            // close has been waiting for the last byte to go out.
+            tell_closed_if_drained(s);
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn client_room(who as i64) as i64 {
+    let is [4]i64 as ci;                     // == sys.CHAN_INFO_WORDS
+    if (sys.chan_info(client_fd[who], cast(*i64, &ci[0])) != 0) { return 0 - 1; }
+    if (ci[3] != 0) { return 0 - 1; }        // peer gone
+    return ci[2];
+}
+
+// Move what fits from a connection's receive buffer to its client, and stop.
+// Never blocks; leaves the rest in TCP on purpose (see the note in
+// tcp_notify). Returns 1 if anything is still waiting to go out, which is
+// what tells the poll loop to watch this client for writability.
+fn deliver_data(s as *nsock.Sock) as i64 {
+    if (s.conn < 0) { return 0; }
+    let is *tc.Conn as c = nsock.conn_at(s.conn);
+    let is i64 as guard with mut = 0;
+    while (tc.conn_readable(c) > 0 && guard < 32) {
+        let is i64 as room = client_room(s.client);
+        // A header with nothing behind it is a wasted message and a header
+        // that will not fit is a blocking write. Both mean: come back later.
+        if (room <= np.HDR_BYTES) { return 1; }
+        let is i64 as want with mut = room - np.HDR_BYTES;
+        if (want > np.MAX_PAYLOAD) { want = np.MAX_PAYLOAD; }
+        if (want > tc.conn_readable(c)) { want = tc.conn_readable(c); }
+        let is i64 as got = tc.conn_read(c, cast(*u8, &payload[0]), want);
+        if (got <= 0) { return 0; }
+        np.send_data(client_fd[s.client], np.EV_DATA, s.id, 0, got,
+                     cast(*u8, &payload[0]), got);
+        guard = guard + 1;
+    }
+    if (tc.conn_readable(c) > 0) { return 1; }
+    return 0;
+}
+
+// A FIN means the peer will send no more. The client is told once, and NOT
+// UNTIL EVERYTHING BEFORE IT HAS BEEN HANDED OVER — end-of-stream is the last
+// thing on a stream, and a client that hears it while bytes are still queued
+// stops reading and loses them.
+//
+// This was not a hazard while delivery drained the whole receive buffer in one
+// blocking pass: the data always went first. Bounding delivery to what the
+// channel will take made the close able to overtake it, and a three-second
+// audio stream came out two and a half seconds long, reported as a truncated
+// body — correctly, because that is what the client saw.
+//
+// A half-close is not a shutdown of both directions: the client may still
+// write afterwards.
+fn tell_closed_if_drained(s as *nsock.Sock) as void {
+    if (s.told_closed != 0) { return; }
+    if (s.conn < 0) { return; }
+    let is *tc.Conn as c = nsock.conn_at(s.conn);
+    if (c.fin_rcvd != 1) { return; }
+    if (tc.conn_readable(c) > 0) { return; }        // not yet: bytes still owed
+    s.told_closed = 1;
+    np.send(client_fd[s.client], np.EV_CLOSED, s.id, 0, 0);
+    return;
+}
+
 // Tell a client what changed about its connection. Called after every input,
 // because a segment can deliver data, complete a handshake and close a
 // connection all at once.
@@ -588,27 +692,29 @@ fn tcp_notify(s as *nsock.Sock, was as i64) as void {
         np.send(client_fd[s.client], np.EV_OK, s.id, c.local_port, 0);
     }
 
-    // Data, in as many messages as it takes. A client that is slow gets
-    // backpressure through the channel rather than having bytes dropped.
-    let is i64 as guard with mut = 0;
-    while (tc.conn_readable(c) > 0 && guard < 32) {
-        let is i64 as want with mut = tc.conn_readable(c);
-        if (want > np.MAX_PAYLOAD) { want = np.MAX_PAYLOAD; }
-        let is i64 as got = tc.conn_read(c, cast(*u8, &payload[0]), want);
-        if (got <= 0) { guard = 32; }
-        else {
-            np.send_data(client_fd[s.client], np.EV_DATA, s.id, 0, got,
-                         cast(*u8, &payload[0]), got);
-        }
-        guard = guard + 1;
-    }
+    // Data — but ONLY as much as the client's channel will take right now.
+    //
+    // This used to drain the whole receive buffer into send_data, whose
+    // write_all blocks when the channel is full. A client that stops reading
+    // — which is exactly what a media player does while it is playing — then
+    // stopped netd itself: no interfaces pumped, no other client served, no
+    // timers run. The NIC's ring overflowed, frames were lost, and the peer
+    // found out by timing out. A packet capture of a 288 KiB transfer showed
+    // three stalls of over a second accounting for four fifths of it.
+    //
+    // Worse, it was invisible to the sender. Emptying the TCP receive buffer
+    // the instant anything landed in it meant the advertised window never
+    // moved: every packet said 16384 while the receiver was doing nothing at
+    // all, so the peer kept sending at full speed into a wall.
+    //
+    // Leaving it where it is fixes both. Undelivered bytes stay in the TCP
+    // receive buffer, which is what advertised_window measures, so the window
+    // closes and the peer slows down — that is what flow control is for, and
+    // it only works if the queue is allowed to build at the layer that owns
+    // the protocol. The daemon never blocks, and the sender learns the truth.
+    deliver_data(s);
 
-    // A FIN means the peer will send no more. The client is told once; it may
-    // still write, because a half-close is not a shutdown of both directions.
-    if (c.fin_rcvd == 1 && s.told_closed == 0) {
-        s.told_closed = 1;
-        np.send(client_fd[s.client], np.EV_CLOSED, s.id, 0, 0);
-    }
+    tell_closed_if_drained(s);
     if (now == tc.CLOSED && c.error != 0) {
         np.send(client_fd[s.client], np.EV_ERROR, s.id, sys.E_PIPE, 0);
     }
@@ -1180,7 +1286,16 @@ fn main(argc as i64, argv as *u8) as i32 {
         while (k < MAX_CLIENTS) {
             if (client_live[k] == 1) {
                 pe[n*3+0] = client_fd[k];
+                // WRITABLE as well, but only for a client that is still owed
+                // bytes. deliver_data stops when the channel is full and
+                // leaves the rest in TCP; something has to notice when the
+                // client drains it, and this is that something. Asking for it
+                // unconditionally would make every idle client ready every
+                // time and turn this loop into a spin.
                 pe[n*3+1] = sys.POLL_READABLE;
+                if (client_owes(k) == 1) {
+                    pe[n*3+1] = sys.POLL_READABLE | sys.POLL_WRITABLE;
+                }
                 pe[n*3+2] = 0;
                 polled[npolled] = k;
                 npolled = npolled + 1;
@@ -1212,6 +1327,11 @@ fn main(argc as i64, argv as *u8) as i32 {
             let is i64 as who = polled[j];
             if (client_live[who] == 1) {
                 let is i64 as ev = pe[(first_client + j)*3+2];
+                // Room first: a client that has just drained its channel is
+                // owed data that has been sitting in a TCP receive buffer
+                // holding the window shut. Handing it over before reading the
+                // client's next request keeps the peer moving.
+                if ((ev & sys.POLL_WRITABLE) != 0) { flush_client(who); }
                 if ((ev & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
                     if (serve_client(who) == 0) { drop_client(who); }
                 }

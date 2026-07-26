@@ -50,7 +50,7 @@ PROGS="$PROGS ps free df top btop htop lscpu ifconfig ping netd wget"
 PROGS="$PROGS nslookup arp nc httpd netsnoop"
 #   audio (category G): aplay writes PCM straight at DEV_AUDIO_OUT — the
 #   direct path, which is also what proves the grab stack on the new class.
-PROGS="$PROGS aplay arecord soundd"
+PROGS="$PROGS aplay arecord soundd runall"
 #   compiler front-ends (category F): spawn the embedded /caustic.cse. run +
 #   cc + make compile; objdump inspects a .cse. (caustic-as / caustic-ld are
 #   built separately by scripts/build-tools.sh.)

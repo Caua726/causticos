@@ -33,15 +33,18 @@ TONE=build/tone.wav
 python3 scripts/make-tone-wav.py "$TONE" --freq "$FREQ" \
     --seconds "$SECONDS_OF_TONE" --rate 48000 --channels 2
 
-bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin tone.wav "$TONE" >/dev/null
+# Its own image, so this test can run beside the others rather than
+# fighting them for build/disk.img.
+DISK=build/disk-audio.img
+SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin tone.wav "$TONE" >/dev/null
 
 MON=/tmp/causticos-audio-mon.$$
 LOG=/tmp/causticos-audio.log
 rm -f "$WAV"
-QEMU_DISK=build/disk.img
+QEMU_DISK="$DISK"
 QEMU_KVM=1
-QEMU_HTTPD_PORT=18085
+QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18085}"
 QEMU_WAV="$WAV"
 source scripts/qemu-args.sh
 

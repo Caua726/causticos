@@ -49,16 +49,19 @@ python3 scripts/make-tone-wav.py build/mix2.wav --freq "$MIXHZ2" --seconds "$SEC
 python3 scripts/make-tone-wav.py build/low.wav --freq "$PREEMPTHZ" --seconds 1 \
     --rate 48000 --channels 2 --amplitude 0.60
 
-bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin mix.wav build/mix.wav >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin mix2.wav build/mix2.wav >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin low.wav build/low.wav >/dev/null
+# Its own image, so this test can run beside the others rather than
+# fighting them for build/disk.img.
+DISK=build/disk-soundd.img
+SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin mix.wav build/mix.wav >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin mix2.wav build/mix2.wav >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin low.wav build/low.wav >/dev/null
 
 MON=/tmp/causticos-soundd-mon.$$
 rm -f "$WAV"
-QEMU_DISK=build/disk.img
+QEMU_DISK="$DISK"
 QEMU_KVM=1
-QEMU_HTTPD_PORT=18088
+QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18088}"
 QEMU_WAV="$WAV"
 source scripts/qemu-args.sh
 

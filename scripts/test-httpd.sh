@@ -32,13 +32,16 @@ pathlib.Path('build/httpd-payload.bin').write_bytes(
     bytes(((i * 31 + 7) & 0xFF) for i in range(4096)))
 PY
 
-bash scripts/seed-disk.sh shell --no-build >/dev/null
-python3 scripts/fat32_add_file.py build/disk.img addfilebin served.bin \
+# Its own image, so this test can run beside the others rather than
+# fighting them for build/disk.img.
+DISK=build/disk-httpd.img
+SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+python3 scripts/fat32_add_file.py "$DISK" addfilebin served.bin \
     build/httpd-payload.bin >/dev/null
 
 MON=/tmp/causticos-httpd-mon.$$
 LOG=$(mktemp)
-QEMU_DISK=build/disk.img
+QEMU_DISK="$DISK"
 QEMU_KVM=1
 QEMU_HTTPD_PORT=$FWD
 source scripts/qemu-args.sh

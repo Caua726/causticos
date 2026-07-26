@@ -27,9 +27,14 @@ done
 B=userspace/build
 [ -f "$B/shell.cse" ] || { echo "userspace not built — run without --no-build"; exit 1; }
 
-qemu-img create -f raw build/disk.img 64M >/dev/null
-mkfs.fat -F 32 -n CAUSTICOS build/disk.img >/dev/null
-addf() { [ -f "$B/$2" ] && python3 scripts/fat32_add_file.py build/disk.img addfilebin "$1" "$B/$2" >/dev/null; }
+# WHERE the image goes, so two tests can seed their own at the same time.
+# Everything that does not say otherwise still gets build/disk.img, which is
+# what the interactive scripts and every existing caller expect.
+DISK="${SEED_DISK:-build/disk.img}"
+
+qemu-img create -f raw "$DISK" 64M >/dev/null
+mkfs.fat -F 32 -n CAUSTICOS "$DISK" >/dev/null
+addf() { [ -f "$B/$2" ] && python3 scripts/fat32_add_file.py "$DISK" addfilebin "$1" "$B/$2" >/dev/null; }
 
 # /netd.cse is not just another tool in the list below: whichever program is
 # /init opens it BY THAT NAME at startup and spawns it, and everything the
@@ -44,9 +49,9 @@ if [ "$MODE" = "wm" ]; then
     addf launcher.cse launcher.cse
     # The WM's shipped config. /var/wm/config.cst (the user's) is read after it
     # and overrides key by key; /var/wm also holds the saved layout.
-    python3 scripts/fat32_add_file.py build/disk.img mkdir etc >/dev/null
-    python3 scripts/fat32_add_file.py build/disk.img mkdir var/wm >/dev/null
-    python3 scripts/fat32_add_file.py build/disk.img addfilebin etc/wm.cst \
+    python3 scripts/fat32_add_file.py "$DISK" mkdir etc >/dev/null
+    python3 scripts/fat32_add_file.py "$DISK" mkdir var/wm >/dev/null
+    python3 scripts/fat32_add_file.py "$DISK" addfilebin etc/wm.cst \
         userspace/wm/wm.default.cst >/dev/null
     PROGS="wmpat wterm newterm btop echo cat ls uptime sysinfo vic guess \
            wc head tail grep rev tac uniq fold cmp seq cut sort hexdump \
@@ -69,10 +74,10 @@ for p in $PROGS; do addf "$p.cse" "$p.cse"; done
 # a test seed its own anchors instead of the machine's.
 CA_PEM="${CA_PEM:-/etc/ssl/certs/ca-certificates.crt}"
 if [ -f "$CA_PEM" ]; then
-    python3 scripts/fat32_add_file.py build/disk.img mkdir etc >/dev/null 2>&1 || true
-    python3 scripts/fat32_add_file.py build/disk.img addfilebin etc/ca.pem "$CA_PEM" >/dev/null
+    python3 scripts/fat32_add_file.py "$DISK" mkdir etc >/dev/null 2>&1 || true
+    python3 scripts/fat32_add_file.py "$DISK" addfilebin etc/ca.pem "$CA_PEM" >/dev/null
 fi
-python3 scripts/fat32_add_file.py build/disk.img addfile hello.txt \
+python3 scripts/fat32_add_file.py "$DISK" addfile hello.txt \
     "ola do CausticOS! este arquivo veio do disco FAT32 via cat." >/dev/null
-echo "seeded build/disk.img -> /init = $INITNAME"
+echo "seeded $DISK -> /init = $INITNAME"
 echo "start it:  virsh -c qemu:///session start causticos   (or ▶ in virt-manager, then open the console)"

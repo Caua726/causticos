@@ -30,13 +30,16 @@ GOT=/tmp/causticos-recorded.wav
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
 [ -f userspace/build/arecord.cse ] || { echo "arecord not built"; exit 1; }
 
-bash scripts/seed-disk.sh shell --no-build >/dev/null
+# Its own image, so this test can run beside the others rather than
+# fighting them for build/disk.img.
+DISK=build/disk-record.img
+SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
 
 MON=/tmp/causticos-rec-mon.$$
 LOG=/tmp/causticos-rec.log
-QEMU_DISK=build/disk.img
+QEMU_DISK="$DISK"
 QEMU_KVM=1
-QEMU_HTTPD_PORT=18087
+QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18087}"
 source scripts/qemu-args.sh
 
 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
@@ -87,7 +90,7 @@ mon "quit"
 for _ in $(seq 1 50); do kill -0 $QPID 2>/dev/null || break; sleep 0.1; done
 kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
 
-python3 scripts/fat32_add_file.py build/disk.img readfile rec.wav "$GOT"
+python3 scripts/fat32_add_file.py "$DISK" readfile rec.wav "$GOT"
 
 python3 - "$GOT" "$SECS" <<'PY'
 import struct, sys

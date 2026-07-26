@@ -1,213 +1,200 @@
 #!/bin/bash
-# test-userspace.sh — run every ring-3 self-test, each in its own boot.
+# test-userspace.sh — every ring-3 test there is.
 #
-# verify.sh is the KERNEL gate: it boots the smoke flavour and checks the
-# kernel's own markers, many times, looking for races. This is the other half —
-# the tests that run as programs, against the syscall ABI, the way a user's
-# code will.
+# Two kinds, and the difference is which side the test is driven from:
+# the SELF-TESTS are programs that decide for themselves and all run in
+# ONE boot; the DRIVEN ones are steered from the host — typing at the
+# prompt, pulling the cable, measuring the sound QEMU recorded — and each
+# needs its own machine and its own disk image.
 #
-# One boot per test, because a self-test that shares a machine with another
-# one is a self-test whose failures have two possible causes.
+# The suite used to boot a machine per test: nineteen boots to run about twenty
+# seconds of testing, and thirty seconds of each was a machine sitting idle
+# after its program had already printed the answer. A suite slow enough to skip
+# is a suite nobody runs before a commit, which is the only moment it is for.
 #
-#   scripts/test-userspace.sh          # all of them
-#   scripts/test-userspace.sh nett     # just one
+# /init here is runall.cse, which spawns each test in turn and prints a line
+# around each one. Failures stay attributable: every test names itself in its
+# own verdict, and a test that dies without printing is visible as a name with
+# no verdict rather than as silence.
+#
+# The host peers stay up for the whole boot. They are on different ports and
+# the guest dials them one at a time, so one set serves the lot.
+#
+#   scripts/test-userspace.sh
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-# name:timeout:extra-files-to-seed
-TESTS=(
-    "u64t:30:"
-    "nett:40:"
-    "tcpt:60:"
-    "kabi:30:"
-    "cryptot:60:"
-    "x509t:90:build/certs/root.der build/certs/int.der build/certs/leaf.der build/certs/wild.der build/certs/expired.der build/certs/future.der build/certs/rogue.der build/certs/under.der build/certs/notca.der build/certs/ecroot.der build/certs/ecleaf.der build/certs/ca.pem"
-    "pingt:60:userspace/build/ping.cse"
-    "netdt:70:userspace/build/netd.cse"
-    "httpt:150:userspace/build/netd.cse userspace/build/wget.cse"
-    "tlst:180:userspace/build/netd.cse build/certs/ca.pem build/certs/empty.pem"
-    "appt:150:userspace/build/netd.cse userspace/build/netsnoop.cse"
-)
+TOUT="${TOUT:-120}"
+START=$SECONDS
+IMG=build/selftests.img
+LOG=$(mktemp)
 
-# The certificate fixtures are generated rather than committed. A certificate
-# has an expiry date in it, and one checked into a repository is a test that
-# starts failing on a day nobody picked.
-if [ ! -f build/certs/srv.pem ]; then
-    bash scripts/make-test-certs.sh >/dev/null
-fi
-# An empty trust store, so a test can prove that a perfect chain with
-# nothing to anchor it in is refused.
+[ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
+[ -f userspace/build/runall.cse ] || { echo "runall not built"; exit 1; }
+
+if [ ! -f build/certs/srv.pem ]; then bash scripts/make-test-certs.sh >/dev/null; fi
 : > build/certs/empty.pem
 
-WANT="${1:-}"
-PASS=0
-FAIL=0
-FAILED=""
+qemu-img create -f raw "$IMG" 64M >/dev/null 2>&1
+mkfs.fat -F 32 -n CAUSTICOS "$IMG" >/dev/null 2>&1
+add() { python3 scripts/fat32_add_file.py "$IMG" addfilebin "$(basename "$2")" "$2" >/dev/null; }
 
-for entry in "${TESTS[@]}"; do
-    name="${entry%%:*}"
-    rest="${entry#*:}"
-    tout="${rest%%:*}"
-    extra="${rest#*:}"
-    [ -n "$WANT" ] && [ "$WANT" != "$name" ] && continue
+python3 scripts/fat32_add_file.py "$IMG" addfilebin init.cse userspace/build/runall.cse >/dev/null
+for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst; do
+    [ -f "userspace/build/$t.cse" ] && add x "userspace/build/$t.cse"
+done
+# What the tests reach for: the daemon they spawn, the programs they drive, and
+# the certificate fixtures. Generated rather than committed — a certificate has
+# an expiry date in it, and one checked into a repository is a test that starts
+# failing on a day nobody picked.
+for f in userspace/build/netd.cse userspace/build/ping.cse \
+         userspace/build/wget.cse userspace/build/netsnoop.cse \
+         build/certs/root.der build/certs/int.der build/certs/leaf.der \
+         build/certs/wild.der build/certs/expired.der build/certs/future.der \
+         build/certs/rogue.der build/certs/under.der build/certs/notca.der \
+         build/certs/ecroot.der build/certs/ecleaf.der \
+         build/certs/ca.pem build/certs/empty.pem; do
+    [ -f "$f" ] && add x "$f"
+done
 
-    printf '%-8s ' "$name"
-    # netdt and httpt both need a peer that is NOT our code — a loopback of
-    # two of our own connections proves they agree with each other, not that
-    # they agree with anyone else. SLIRP presents the host as 10.0.2.2, so a
-    # listener here is what the guest dials.
-    HELPER_PID=""
-    if [ "$name" = "netdt" ] || [ "$name" = "appt" ]; then
-        python3 scripts/echo-server.py 17777 "$tout" >/dev/null 2>&1 &
-        HELPER_PID=$!
-        sleep 0.3
+# One set of peers for the whole boot. Different ports, so they coexist; the
+# guest dials them one at a time.
+python3 scripts/echo-server.py 17777 "$TOUT" >/dev/null 2>&1 & E1=$!
+python3 scripts/http-server.py 17780 "$TOUT" >/dev/null 2>&1 & E2=$!
+python3 scripts/http-server.py 17782 "$TOUT" \
+    build/certs/srvchain.pem build/certs/srv.key >/dev/null 2>&1 & E3=$!
+sleep 0.4
+
+QEMU_DISK="$IMG"
+QEMU_KVM=1
+QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18081}"
+source scripts/qemu-args.sh
+
+qemu-system-x86_64 "${QEMU_ARGS[@]}" -serial stdio -display none > "$LOG" 2>&1 &
+QPID=$!
+cleanup() {
+    kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
+    kill $E1 $E2 $E3 2>/dev/null || true
+    wait $E1 $E2 $E3 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Stop at the verdict, not at the timeout: the deadline is for a HANG, not for
+# the running time of a success.
+DEADLINE=$((SECONDS + TOUT))
+while kill -0 $QPID 2>/dev/null; do
+    OUT=$(tr -d '\000' < "$LOG")
+    if echo "$OUT" | grep -qE "runall: DONE|EXCEPTION|panic:|kernel halted"; then break; fi
+    [ $SECONDS -ge $DEADLINE ] && break
+    sleep 0.1
+done
+kill -9 $QPID 2>/dev/null || true
+wait $QPID 2>/dev/null || true
+
+RAW=$(tr -d '\000' < "$LOG")
+cp "$LOG" /tmp/ut-selftests.log
+
+PASS=0; FAIL=0; FAILED=""
+# THE EXIT CODE IS THE VERDICT. Matching each test's printed marker meant the
+# harness had to know how every one of them spells success — and it guessed
+# wrong twice in a row, reporting a green kabi ("kabi: PASS", not "ALL PASS")
+# and a green appt as failures. A process that returns 0 succeeded; that is
+# uniform, it is what runall already reports, and it cannot drift from what the
+# test actually decided. The printed line is kept as detail, not as evidence.
+for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst; do
+    printf '%-9s ' "$t"
+    if echo "$RAW" | grep -q "^runall: <<< $t MISSING"; then
+        echo "SKIP  (not built)"
+        continue
     fi
-    if [ "$name" = "httpt" ]; then
-        python3 scripts/http-server.py 17780 "$tout" >/dev/null 2>&1 &
-        HELPER_PID=$!
-        sleep 0.3
-    fi
-    if [ "$name" = "tlst" ]; then
-        # OpenSSL's server side, pinned to TLS 1.3. Two implementations by one
-        # author agree with each other; this one refuses anything that is not
-        # what the RFC says, and refuses without explaining, which is exactly
-        # the check that is worth having.
-        python3 scripts/http-server.py 17782 "$tout" \
-            build/certs/srvchain.pem build/certs/srv.key >/dev/null 2>&1 &
-        HELPER_PID=$!
-        sleep 0.5
-    fi
-    if bash scripts/run-test.sh "$name" "$tout" $extra >/tmp/ut-$name.log 2>&1; then
-        # Echo the count so a test that silently stopped checking things is
-        # visible as a number that dropped, not just as a green line.
-        n=$(grep -oE "^$name: [0-9]+ checks" /tmp/ut-$name.log | head -1 | grep -oE '[0-9]+' || true)
+    n=$(echo "$RAW" | grep -oE "^$t: [0-9]+ checks" | head -1 | grep -oE '[0-9]+' || true)
+    if echo "$RAW" | grep -q "^runall: <<< $t exit=0"; then
         if [ -n "$n" ]; then echo "PASS ($n checks)"; else echo "PASS"; fi
         PASS=$((PASS+1))
     else
-        echo "FAIL  (see /tmp/ut-$name.log)"
-        grep -E "  FAIL |panic:|EXCEPTION" /tmp/ut-$name.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED $name"
-    fi
-    # `[ -n ... ] && ...` would abort the whole script under set -e whenever
-    # the variable is empty, which silently dropped every test after this one.
-    if [ -n "$HELPER_PID" ]; then
-        kill $HELPER_PID 2>/dev/null || true
-        wait $HELPER_PID 2>/dev/null || true
+        echo "FAIL"
+        echo "$RAW" | grep -E "^$t: |  FAIL |^runall: <<< $t" | head -4 || true
+        FAIL=$((FAIL+1)); FAILED="$FAILED $t"
     fi
 done
 
-# linkt needs the host to drive a QEMU monitor, so it has its own runner
-# rather than a line in the table above.
-if [ -z "$WANT" ] || [ "$WANT" = "linkt" ]; then
-    printf '%-8s ' "linkt"
-    if bash scripts/test-link.sh >/tmp/ut-linkt.log 2>&1; then
-        echo "PASS (host pulled the cable)"
-        PASS=$((PASS+1))
-    else
-        echo "FAIL  (see /tmp/ut-linkt.log)"
-        grep -E "FAIL|panic:" /tmp/ut-linkt.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED linkt"
-    fi
+if ! echo "$RAW" | grep -q "runall: DONE"; then
+    echo "=== selftests: the runner never finished (log: /tmp/ut-selftests.log) ==="
+    exit 1
 fi
 
-# httpd is the only thing here that LISTENS, so its client has to come from
-# outside — curl on the host, reaching in through QEMU's port forward.
-if [ -z "$WANT" ] || [ "$WANT" = "httpd" ]; then
-    printf '%-8s ' "httpd"
-    if bash scripts/test-httpd.sh >/tmp/ut-httpd.log 2>&1; then
-        echo "PASS (host fetched from the guest)"
+# The tests that CANNOT share a machine, each in its own. They are driven from
+# outside — typing at the prompt, pulling the cable, measuring the sound the
+# host recorded — so the guest is the subject rather than the host of the test,
+# and they need their own boot and their own disk image.
+DRIVEN=(
+    "linkt|scripts/test-link.sh|host pulled the cable"
+    "httpd|scripts/test-httpd.sh|host fetched from the guest"
+    "cseforms|scripts/test-cse-forms.sh|pure, compat and bundle"
+    "audio|scripts/test-audio.sh|@grep -oE 'ch0: [0-9.]+Hz'"
+    "stream|scripts/test-stream.sh|@grep -oE '[0-9]+ KiB/s from the network'"
+    "soundd|scripts/test-soundd.sh|mixed two, preempted, resumed"
+    "record|scripts/test-record.sh|@grep -oE '[0-9]+ frames'"
+    "shellnet|scripts/test-shell-net.sh|wget typed at the prompt"
+)
+
+# AT THE SAME TIME. They are separate machines with separate disk images and
+# separate port forwards, so nothing about them is sequential except that they
+# used to be — and eight boots in a row was most of the wall clock. The cap is
+# a core each, less two for the host.
+NJOBS="${JOBS:-}"
+if [ -z "$NJOBS" ]; then
+    NJOBS=$(( $(nproc 2>/dev/null || echo 4) - 2 ))
+    [ "$NJOBS" -lt 2 ] && NJOBS=2
+    [ "$NJOBS" -gt 6 ] && NJOBS=6
+fi
+RES=$(mktemp -d)
+
+run_driven() {
+    local name="$1" script="$2" note="$3" port="$4"
+    local t0=$SECONDS rc=0
+    QEMU_HTTPD_PORT="$port" bash "$script" >/tmp/ut-$name.log 2>&1 || rc=1
+    local label="$note"
+    case "$note" in
+        @*) label=$(eval "${note#@}" < /tmp/ut-$name.log | head -1 || true) ;;
+    esac
+    printf '%s|%s|%s\n' "$rc" "$label" "$((SECONDS-t0))" > "$RES/$name"
+}
+
+PORT=18120
+for entry in "${DRIVEN[@]}"; do
+    name="${entry%%|*}"; rest="${entry#*|}"
+    script="${rest%%|*}"; note="${rest#*|}"
+    PORT=$((PORT+1))
+    while [ "$(jobs -rp | wc -l)" -ge "$NJOBS" ]; do wait -n 2>/dev/null || break; done
+    run_driven "$name" "$script" "$note" "$PORT" &
+done
+wait
+
+# Reported in list order, not completion order: a suite whose output shuffles
+# between runs cannot be diffed against the last one.
+for entry in "${DRIVEN[@]}"; do
+    name="${entry%%|*}"
+    printf '%-9s ' "$name"
+    if [ ! -f "$RES/$name" ]; then
+        echo "FAIL  (never reported)"
+        FAIL=$((FAIL+1)); FAILED="$FAILED $name"
+        continue
+    fi
+    IFS='|' read -r rc label secs < "$RES/$name"
+    if [ "$rc" = 0 ]; then
+        echo "PASS ($label, ${secs}s)"
         PASS=$((PASS+1))
     else
-        echo "FAIL  (see /tmp/ut-httpd.log)"
-        grep -E "FAIL|panic:" /tmp/ut-httpd.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED httpd"
+        echo "FAIL  (see /tmp/ut-$name.log)"
+        grep -E "FAIL|panic:" /tmp/ut-$name.log | head -4 || true
+        FAIL=$((FAIL+1)); FAILED="$FAILED $name"
     fi
-fi
+done
+rm -rf "$RES"
 
-# The .cse comes in three shapes and only one of them was ever loaded. The
-# other two go down the polyglot path, which parses a header whose layout has
-# changed twice — so it needs a test that actually runs one.
-if [ -z "$WANT" ] || [ "$WANT" = "cseforms" ]; then
-    printf '%-8s ' "cseforms"
-    if bash scripts/test-cse-forms.sh >/tmp/ut-cseforms.log 2>&1; then
-        echo "PASS (pure, compat and bundle)"
-        PASS=$((PASS+1))
-    else
-        echo "FAIL  (see /tmp/ut-cseforms.log)"
-        grep -E "FAIL|panic:" /tmp/ut-cseforms.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED cseforms"
-    fi
+if [ -n "$FAILED" ]; then
+    echo "=== userspace: $PASS passed, $FAIL failed —$FAILED  ($((SECONDS-START))s) ==="
+    exit 1
 fi
-
-# audio is the only test whose answer is OUTSIDE the guest. Nothing in there
-# can tell a correct stream from one played at the wrong rate — the samples
-# left correctly either way — so the guest plays a tone and the host measures
-# the file QEMU recorded.
-if [ -z "$WANT" ] || [ "$WANT" = "audio" ]; then
-    printf '%-8s ' "audio"
-    if bash scripts/test-audio.sh >/tmp/ut-audio.log 2>&1; then
-        echo "PASS ($(grep -oE 'ch0: [0-9.]+Hz' /tmp/ut-audio.log | head -1))"
-        PASS=$((PASS+1))
-    else
-        echo "FAIL  (see /tmp/ut-audio.log)"
-        grep -E "FAIL|panic:" /tmp/ut-audio.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED audio"
-    fi
-fi
-
-# soundd is the milestone the audio design was shaped around: two programs
-# audible at once, and a third taking the device away from both without
-# telling them. Only the recording can say whether any of that happened.
-if [ -z "$WANT" ] || [ "$WANT" = "soundd" ]; then
-    printf '%-8s ' "soundd"
-    if bash scripts/test-soundd.sh >/tmp/ut-soundd.log 2>&1; then
-        echo "PASS (mixed two, preempted, resumed)"
-        PASS=$((PASS+1))
-    else
-        echo "FAIL  (see /tmp/ut-soundd.log)"
-        grep -E "FAIL|panic:" /tmp/ut-soundd.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED soundd"
-    fi
-fi
-
-# record is the other half of audio, and it needs the OPPOSITE machine: the wav
-# backend that lets test-audio measure playback has no input side at all, so
-# capture runs on the ordinary full-duplex one and is checked by reading the
-# file the guest wrote back off the disk.
-if [ -z "$WANT" ] || [ "$WANT" = "record" ]; then
-    printf '%-8s ' "record"
-    if bash scripts/test-record.sh >/tmp/ut-record.log 2>&1; then
-        echo "PASS ($(grep -oE '[0-9]+ frames' /tmp/ut-record.log | head -1))"
-        PASS=$((PASS+1))
-    else
-        echo "FAIL  (see /tmp/ut-record.log)"
-        grep -E "FAIL|panic:" /tmp/ut-record.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED record"
-    fi
-fi
-
-# shellnet types at the real prompt, so it needs the monitor too — and it is
-# the only test that proves the machine you BOOT is wired up rather than the
-# one a test assembled for itself.
-if [ -z "$WANT" ] || [ "$WANT" = "shellnet" ]; then
-    printf '%-8s ' "shellnet"
-    if bash scripts/test-shell-net.sh >/tmp/ut-shellnet.log 2>&1; then
-        echo "PASS (wget typed at the prompt)"
-        PASS=$((PASS+1))
-    else
-        echo "FAIL  (see /tmp/ut-shellnet.log)"
-        grep -E "FAIL|panic:" /tmp/ut-shellnet.log | head -5 || true
-        FAIL=$((FAIL+1))
-        FAILED="$FAILED shellnet"
-    fi
-fi
-
-echo "=== userspace: $PASS passed, $FAIL failed${FAILED:+ ($FAILED)} ==="
-[ "$FAIL" -eq 0 ]
+echo "=== userspace: $PASS passed, 0 failed  ($((SECONDS-START))s) ==="
