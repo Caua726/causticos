@@ -64,6 +64,12 @@ build_form() {
     echo "$out"
 }
 
+# The polyglot orchestrator spawns sub-builds whose debug files land in the
+# CURRENT directory, not next to -o. Left alone they show up as untracked
+# junk in the repo root, which is how build artefacts end up committed.
+cleanup_pdb() { rm -f ./*.cse.exe.__cse_*.pdb ./*.__cse_*.pdb; }
+trap cleanup_pdb EXIT
+
 echo "=== building the three forms ==="
 PURE=$(build_form pure   --extension=cse)
 COMPAT=$(build_form compat --mode=compat)
@@ -86,7 +92,11 @@ qemu-system-x86_64 "${QEMU_ARGS[@]}" \
     -serial stdio -display none > "$LOG" 2>&1 &
 QPID=$!
 mon() { printf '%s\n' "$1" | socat - "unix-connect:$MON" >/dev/null 2>&1 || true; }
-cleanup() { kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true; rm -f "$MON"; }
+cleanup() {
+    kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
+    rm -f "$MON"
+    cleanup_pdb
+}
 trap cleanup EXIT
 
 for _ in $(seq 1 400); do
