@@ -8,6 +8,13 @@
 # place a program's source path is written down; if a name below is not a target
 # there, the build says so by name instead of silently shipping less.
 
+# The shared libraries every image needs. 49 of the programs below import from
+# libfutil, so their code is NOT in them — without this file they load and stop
+# at the first unresolved symbol. It ships in base for exactly that reason: it
+# is not optional for anything that includes base.
+dir  /lib
+file userspace/build/libfutil.csl  /lib/libfutil.csl
+
 # text/file tools
 bin  cat
 bin  echo

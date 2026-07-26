@@ -55,3 +55,10 @@ bin animt
 # check on the terminal's stdin path. Nothing else in the tree exercises that
 # from a program's side.
 bin guess
+
+# The shared-library demo: two .csl at distinct bases and a 1 KB program that
+# calls into both. It belongs here rather than on the desktop image — it proves
+# the loader, it is not part of the system.
+file userspace/build/libdyndemo.csl   /lib/libdyndemo.csl
+file userspace/build/libdyndemo2.csl  /lib/libdyndemo2.csl
+bin  dyntest
