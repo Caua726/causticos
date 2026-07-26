@@ -76,6 +76,10 @@ let is i64 as PERM_W = 2;
 let is i64 as PERM_X = 4;
 
 // Polyglot mini-header ("CST*") at 0x40.
+// The multi-architecture container the toolchain wraps every image in.
+let is i64 as CONTAINER_HDR   = 16;       // header + index start
+let is i64 as CSE_ARCH_X86_64 = 1;        // matches H_ARCH inside an image
+
 let is i64 as MINI_OFF        = 0x40;
 let is i64 as MINI_OFF_BODY   = 0x48;     // u64: file offset of CST image
 let is i64 as MINI_OFF_BODYSZ = 0x50;     // u64: size of CST image
@@ -101,12 +105,75 @@ fn perms_to_prot(perms as i64) as i64 {
 // Locate the CST image inside the container -> (out_off, out_size).
 // ============================================================
 
+// A CST_ file whose MINOR version is 1 is not an image, it is a CONTAINER: a
+// thin index over one complete, unmodified image per architecture. The
+// toolchain emits this shape for every .cse now — a single-architecture link
+// produces a container holding one slice, so there is exactly one shape to
+// read rather than two.
+//
+// Layout, from the writer (caustic-linker/cse/cse_writer.cst write_cse_fat):
+//
+//   0x00  "CST_"
+//   0x04  major (3)     0x05  minor (1 = container, 0 = a bare image)
+//   0x06  image count   0x07  flags
+//   0x08  index offset, u32        0x0C  reserved
+//   index[k], 8 bytes each:  +0 arch (u8)   +4 image offset, u32
+//
+// Each slice is byte-identical to what a single-target link emits, so once one
+// is picked everything below parses exactly as it always did.
+//
+// This is what a portable executable format costs the loader: eleven fields
+// and a search. It is also what buys a .cse that runs on this machine and on
+// an ARM one without being built twice by hand.
+fn select_slice(buf as *u8, base as i64, avail as i64,
+                out_off as *i64, out_size as *i64) as i32 {
+    if (avail < CONTAINER_HDR) { return cast(i32, 0 - 20); }
+    let is i64 as count = cast(i64, buf[base + 6]);
+    if (count <= 0 || count > 8) { return cast(i32, 0 - 21); }
+    let is i64 as idx = elf.read_u32_le(buf, base + 8);
+    if (idx < CONTAINER_HDR) { return cast(i32, 0 - 22); }
+    if (idx + count * 8 > avail) { return cast(i32, 0 - 23); }
+
+    let is i64 as mine with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (k < count) {
+        if (cast(i64, buf[base + idx + k * 8]) == CSE_ARCH_X86_64) { mine = k; }
+        k = k + 1;
+    }
+    if (mine < 0) {
+        // A real answer, not a parse failure: the file is well formed and
+        // simply does not carry code for this machine.
+        serial.println("cse: container has no x86_64 image", 34);
+        return cast(i32, 0 - 24);
+    }
+
+    let is i64 as off = elf.read_u32_le(buf, base + idx + mine * 8 + 4);
+    if (off < CONTAINER_HDR || off >= avail) { return cast(i32, 0 - 25); }
+    // The image runs to the start of the next one. Found by scanning rather
+    // than by taking index[mine+1], because nothing in the format promises the
+    // entries are ordered by offset — and a size taken from an assumption is a
+    // truncated image on the day it stops holding.
+    let is i64 as end with mut = avail;
+    let is i64 as j with mut = 0;
+    while (j < count) {
+        let is i64 as o = elf.read_u32_le(buf, base + idx + j * 8 + 4);
+        if (o > off && o < end) { end = o; }
+        j = j + 1;
+    }
+    *out_off = base + off;
+    *out_size = end - off;
+    return 0;
+}
+
 fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32 {
     if (size < H_SIZE) { return cast(i32, 0 - 1); }
 
     // Pure: magic "CST_" at offset 0.
     if (cast(i64, buf[0]) == 0x43 && cast(i64, buf[1]) == 0x53
         && cast(i64, buf[2]) == 0x54 && cast(i64, buf[3]) == 0x5F) {
+        if (cast(i64, buf[4]) == 3 && cast(i64, buf[5]) == 1) {
+            return select_slice(buf, 0, size, out_off, out_size);
+        }
         *out_off = 0;
         *out_size = size;
         return 0;
@@ -124,6 +191,12 @@ fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32
         if (body_off < 0) { return cast(i32, 0 - 4); }
         if (body_sz < H_SIZE) { body_sz = size - body_off; }   // fallback if size absent
         if (body_off + body_sz > size) { return cast(i32, 0 - 5); }
+        // The polyglot's CausticOS body is a container too — the same one a
+        // plain .cse is — so the arch pick happens here as well rather than
+        // only on the direct path.
+        if (cast(i64, buf[body_off + 4]) == 3 && cast(i64, buf[body_off + 5]) == 1) {
+            return select_slice(buf, body_off, body_sz, out_off, out_size);
+        }
         *out_off = body_off;
         *out_size = body_sz;
         return 0;
