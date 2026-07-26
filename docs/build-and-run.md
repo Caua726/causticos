@@ -254,10 +254,30 @@ vfs: mounted /
 boot: /init.cse launched pid=2
 ```
 
+### Why the root volume is 33 MiB and 93% empty
+
 Because FAT32 requires at least 65525 clusters to be FAT32 at all — the kernel
-checks, and is right to — the smallest legal root volume is 66581 sectors, about
-32.5 MiB. The default is 64 MiB, which is why the free space is not waste: it is
-the live session's scratch.
+checks on mount, and is right to — the smallest legal root volume is 66581
+sectors, about **32.5 MiB**, whatever it holds. Bigger clusters make a bigger
+volume, not a smaller one, so there is no such thing as a small FAT32. The
+default is 33 MiB: one megabyte over the floor.
+
+The desktop profile's payload is about 2.2 MB, so 30 of those 33 MiB are empty.
+That empty space costs nothing on the ISO — the CSVI container stores only
+non-zero sectors — but it is **guest RAM at boot**, because the kernel expands
+the volume into memory. It is the single largest allocation of the boot.
+
+This is measured, not guessed. The default used to be 45 MiB, and on the
+documented 64 MB machine the desktop came up with **684 KB free**: it booted,
+looked right, and could not spawn anything bigger than that. `cat` worked and
+`ls` did not, failing in the CSE loader with `cse: seg map fail i=3` — which
+reads like a loader bug and is a machine out of memory. At 33 MiB the same
+machine reports **12992 KB free** and runs everything on the image.
+
+If you want a genuinely small RAM footprint, the volume size is not the lever —
+the filesystem is. The live root is FAT32 only because FAT32 is the filesystem
+this kernel speaks, and it speaks it for real disks and USB sticks. A RAM root
+in a format of its own would not owe FAT32's 32 MiB entry fee.
 
 ## The kernel command line
 
@@ -274,9 +294,9 @@ a *different binary* from the one that shipped.
 
 ## CSVI — the sparse container, v1
 
-A 64 MiB root holding ~1.4 MiB of programs is 97% zeros, and ISO 9660 does not
+A 33 MiB root holding ~2.2 MiB of programs is 93% zeros, and ISO 9660 does not
 compress. CSVI stores only the sectors that carry data, each tagged with its LBA.
-The desktop profile's container is about 1.4 MiB.
+The desktop profile's container is about 2.3 MiB.
 
 All fields little-endian.
 

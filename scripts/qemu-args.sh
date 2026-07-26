@@ -28,9 +28,14 @@
 # 64M is measured, not assumed. The ISO is ~7 MB, but the root inside it is a
 # SPARSE container (~2.3 MB of non-zero sectors) that the kernel expands into a
 # full FAT32 in RAM — the EXPANDED volume, not the ISO, is what costs memory.
-# At the 45 MiB mkroot defaults to, the whole desktop comes up in a 64M machine.
-# (FAT32 needs 65525 clusters to be FAT32 at all, so ~32.5 MiB is the floor
-# below which the kernel refuses the volume, and says so.)
+# At the 33 MiB mkroot defaults to, the desktop comes up in a 64M machine with
+# about 13 MB free, which is what makes it a machine you can run things on
+# rather than one that merely boots.
+#
+# (FAT32 needs 65525 clusters to be FAT32 at all, so 66581 sectors ≈ 32.5 MiB is
+# the floor below which the kernel refuses the volume, and says so. 33 MiB is
+# one megabyte over it. The volume is 93% empty and that is not slack to trim:
+# a smaller FAT32 does not exist.)
 #
 # QEMU_PCAP is the highest-leverage debugging knob in the tree: when a packet
 # doesn't arrive, open the pcap in Wireshark and read the wrong byte instead of

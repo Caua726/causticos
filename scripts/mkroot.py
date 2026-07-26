@@ -44,11 +44,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import csvi
 import fat32
 
-# 45 MiB, not 64: the sparse container on the ISO is the SAME size either way
-# (it only stores non-zero sectors), so the difference is purely guest RAM at
-# boot — and 45 MiB is what lets the whole system come up in a 64 MB machine.
-# The floor is ~32.5 MiB, below which FAT32 is not FAT32 and the kernel says so.
-DEFAULT_SIZE = 45 * 1024 * 1024
+# 33 MiB: one megabyte over the floor, and the floor is the only thing setting
+# this number. The sparse container on the ISO is the SAME size either way (it
+# only stores non-zero sectors), so every byte here is guest RAM at boot and
+# nothing else.
+#
+# It was 45 MiB, which booted and then could not run anything. On a 64 MB
+# machine the desktop came up with 684 KB free — measured with `free` on the
+# booted system — and every spawn bigger than that died in the CSE loader with
+# "cse: seg map fail". `cat` worked, `ls` did not, and the terminal looked
+# broken rather than out of memory. At 33 MiB the same machine has about 13 MB
+# free and runs everything on the image.
+#
+# 30 of those 33 MiB are empty, and that is not waste to be trimmed: FAT32 is
+# 65525 clusters or it is not FAT32, so with 512-byte sectors and one sector per
+# cluster the smallest legal volume is 66581 sectors ≈ 32.5 MiB whatever it
+# holds. The desktop profile's payload is about 2.2 MB. The kernel checks the
+# cluster count on mount and is right to.
+DEFAULT_SIZE = 33 * 1024 * 1024
 SECTOR = 512
 
 
