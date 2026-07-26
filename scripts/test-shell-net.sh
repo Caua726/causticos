@@ -34,10 +34,13 @@ GOT=/tmp/shellnet-got.bin
 
 # The guest trusts the test CA and nothing else, so the https fetch is checked
 # against a real chain rather than waved through.
-CA_PEM=build/certs/ca.pem # Its own image, so this test can run beside the others rather than
-# fighting them for build/disk.img.
+# Its own image, so this test can run beside the others rather than fighting
+# them for build/disk.img — and its own trust store, because the server it
+# dials is signed by the test CA and the machine's real bundle has never heard
+# of it. A guest that accepted it anyway would be the bug.
 DISK=build/disk-shell-net.img
-SEED_DISK="$DISK" bash scripts/seed-disk.sh shell --no-build >/dev/null
+CA_PEM=build/certs/ca.pem SEED_DISK="$DISK" \
+    bash scripts/seed-disk.sh shell --no-build >/dev/null
 
 python3 scripts/http-server.py "$PORT" 200 >/tmp/shellnet-srv.log 2>&1 &
 SRV=$!
