@@ -41,8 +41,4 @@ bin x509t
 bin tlst
 bin appt
 
-# u64t is `opt` because it currently cannot be built: the compiler segfaults on
-# tests/u64t.cst whenever --cache is passed, from a cold cache, and only on this
-# one file. mkroot reports the skip rather than dropping it silently, and the
-# line starts working again the moment the compiler does.
-opt bin u64t
+bin u64t
