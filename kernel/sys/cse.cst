@@ -80,9 +80,28 @@ let is i64 as PERM_X = 4;
 let is i64 as CONTAINER_HDR   = 16;       // header + index start
 let is i64 as CSE_ARCH_X86_64 = 1;        // matches H_ARCH inside an image
 
+// The polyglot's CST* mini-header, which is how this loader finds the
+// CausticOS body without scanning a 25 KiB file for a magic that also appears
+// inside it.
+//
+//   0x40  4   "CST*"
+//   0x44  2   version      0x46 2 reserved
+//   0x48  12  body offset  0x54 12 body size   — ASCII DECIMAL, not integers
+//   0x60  12  arm64 PE offset               0x6C 12 arm64 PE size
+//
+// The numbers are decimal digits because the whole header sits inside the
+// polyglot's single-quoted shell region: a raw little-endian offset whose
+// second byte happened to be 0x27 would close the quote early and leave
+// /bin/sh parsing machine code as script. 0x30..0x39 can never do that.
+// Version 1 wrote raw u64 and had exactly that bug; this loader was still
+// reading the v1 layout, which is why a polyglot loaded as garbage.
 let is i64 as MINI_OFF        = 0x40;
-let is i64 as MINI_OFF_BODY   = 0x48;     // u64: file offset of CST image
-let is i64 as MINI_OFF_BODYSZ = 0x50;     // u64: size of CST image
+let is i64 as MINI_OFF_VER    = 0x44;
+let is i64 as MINI_VERSION    = 3;
+let is i64 as MINI_OFF_BODY   = 0x48;
+let is i64 as MINI_OFF_BODYSZ = 0x54;
+let is i64 as MINI_FIELD      = 12;       // digits per number
+let is i64 as MINI_END        = 0x78;     // one past the last field
 
 fn page_align_up(x as i64) as i64 {
     return (x + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
@@ -125,6 +144,21 @@ fn perms_to_prot(perms as i64) as i64 {
 // This is what a portable executable format costs the loader: eleven fields
 // and a search. It is also what buys a .cse that runs on this machine and on
 // an ARM one without being built twice by hand.
+// One zero-padded ASCII decimal field of the mini-header. Negative if any
+// byte is not a digit — which is the honest answer when the layout has moved
+// again, rather than a number made of whatever text is there.
+fn mini_decimal(buf as *u8, off as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MINI_FIELD) {
+        let is i64 as c = cast(i64, buf[off + i]);
+        if (c < 48 || c > 57) { return cast(i64, 0 - 1); }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
 fn select_slice(buf as *u8, base as i64, avail as i64,
                 out_off as *i64, out_size as *i64) as i32 {
     if (avail < CONTAINER_HDR) { return cast(i32, 0 - 20); }
@@ -181,14 +215,27 @@ fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32
 
     // Polyglot: "MZ" -> read the "CST*" mini-header at 0x40.
     if (cast(i64, buf[0]) == 0x4D && cast(i64, buf[1]) == 0x5A) {
-        if (size < MINI_OFF + 0x20) { return cast(i32, 0 - 2); }
+        if (size < MINI_END) { return cast(i32, 0 - 2); }
         if (cast(i64, buf[MINI_OFF + 0]) != 0x43 || cast(i64, buf[MINI_OFF + 1]) != 0x53
             || cast(i64, buf[MINI_OFF + 2]) != 0x54 || cast(i64, buf[MINI_OFF + 3]) != 0x2A) {
             return cast(i32, 0 - 3);
         }
-        let is i64 as body_off = elf.read_u64_le(buf, MINI_OFF_BODY);
-        let is i64 as body_sz with mut = elf.read_u64_le(buf, MINI_OFF_BODYSZ);
-        if (body_off < 0) { return cast(i32, 0 - 4); }
+        // Gate on the version rather than parsing whatever is there. The field
+        // layout has changed twice, and a loader that reads the wrong one gets
+        // a plausible-looking offset into the middle of a shell script — which
+        // fails far away from here, as a corrupt image.
+        let is i64 as mver = elf.read_u16_le(buf, MINI_OFF_VER);
+        if (mver != MINI_VERSION) {
+            serial.print("cse: polyglot header version ", 29);
+            util.print_num(mver);
+            serial.print(", this kernel reads ", 20);
+            util.print_num(MINI_VERSION);
+            serial.println("", 0);
+            return cast(i32, 0 - 10);
+        }
+        let is i64 as body_off = mini_decimal(buf, MINI_OFF_BODY);
+        let is i64 as body_sz with mut = mini_decimal(buf, MINI_OFF_BODYSZ);
+        if (body_off < 0 || body_sz < 0) { return cast(i32, 0 - 4); }
         if (body_sz < H_SIZE) { body_sz = size - body_off; }   // fallback if size absent
         if (body_off + body_sz > size) { return cast(i32, 0 - 5); }
         // The polyglot's CausticOS body is a container too — the same one a

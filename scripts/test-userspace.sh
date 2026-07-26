@@ -127,6 +127,22 @@ if [ -z "$WANT" ] || [ "$WANT" = "httpd" ]; then
     fi
 fi
 
+# The .cse comes in three shapes and only one of them was ever loaded. The
+# other two go down the polyglot path, which parses a header whose layout has
+# changed twice — so it needs a test that actually runs one.
+if [ -z "$WANT" ] || [ "$WANT" = "cseforms" ]; then
+    printf '%-8s ' "cseforms"
+    if bash scripts/test-cse-forms.sh >/tmp/ut-cseforms.log 2>&1; then
+        echo "PASS (pure, compat and bundle)"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL  (see /tmp/ut-cseforms.log)"
+        grep -E "FAIL|panic:" /tmp/ut-cseforms.log | head -5 || true
+        FAIL=$((FAIL+1))
+        FAILED="$FAILED cseforms"
+    fi
+fi
+
 # audio is the only test whose answer is OUTSIDE the guest. Nothing in there
 # can tell a correct stream from one played at the wrong rate — the samples
 # left correctly either way — so the guest plays a tone and the host measures
