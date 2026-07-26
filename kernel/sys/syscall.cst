@@ -68,40 +68,44 @@ let is i64 as FMASK_VALUE = 0x47700;     // IF | TF | DF | AC | NT | IOPL bits
 let is i64 as syscall_entry_addr with mut = 0;
 
 // ============================================================
-// MSR helpers (rdmsr / wrmsr go through asm).
+// MSR helpers.
 //
-// Args go through shuttle globals because Caustic prologues spill
-// rdi/rsi to stack slots before any inline asm runs, so reading
-// them from registers is unreliable. The globals are also handy
-// for wrmsr: edx:eax has to hold the value split, and we'd rather
-// load the i64 once and shr in asm than bounce through Caustic.
+// These used to route their arguments through two MODULE GLOBALS —
+// msr_id and msr_value — written by the caller and read back by the
+// inline asm. That is a data race, because init() below runs on EVERY
+// cpu: each AP installs its own LSTAR/STAR/FMASK and turns on EFER.SCE.
+// Two cpus overlapping in here interleave like this:
+//
+//   cpu A: msr_id = IA32_EFER          cpu B: msr_id = IA32_LSTAR
+//   cpu A: msr_value = <efer|SCE>      cpu B: msr_value = <entry addr>
+//   cpu A: wrmsr  →  writes B's ADDRESS into A's EFER
+//
+// which is a #GP on wrmsr, or worse, silently the wrong MSR. It showed
+// up as an intermittent "EXCEPTION #13" during AP bring-up at -smp 4 —
+// about one boot in ten, and never at -smp 1 or 2. The EFER path is the
+// worst of them: rdmsr-modify-wrmsr across a shared global means A can
+// write back a value B read.
+//
+// smp_asm.s already had the race-free spelling, taking msr in edi and
+// value in rsi and touching no memory at all. Those symbols are .globl,
+// so calling them needs no import and closes no cycle. Registers are
+// per-cpu by construction; a global is exactly what must not be here.
 // ============================================================
 
-let is i64 as msr_id with mut = 0;
-let is i64 as msr_value with mut = 0;
-
 fn wrmsr(msr as i64, val as i64) as void {
-    msr_id = msr;
-    msr_value = val;
-    asm("lea rax, [rip+_kernel_sys_syscall_cst_msr_value]\n");
-    asm("mov rax, QWORD PTR [rax]\n");
-    asm("mov rdx, rax\n");
-    asm("shr rdx, 32\n");
-    asm("lea rbx, [rip+_kernel_sys_syscall_cst_msr_id]\n");
-    asm("mov ecx, DWORD PTR [rbx]\n");
-    asm(".byte 0x0F, 0x30\n");       // wrmsr
+    asm("call smp_wrmsr\n");
 }
 
+fn rdmsr_into(msr as i64, out as *i64) as void {
+    asm("call smp_rdmsr_into\n");
+}
+
+// The out-pointer is a caller stack local, so it is per-cpu the same way
+// the registers are.
 fn rdmsr(msr as i64) as i64 {
-    msr_id = msr;
-    asm("lea rbx, [rip+_kernel_sys_syscall_cst_msr_id]\n");
-    asm("mov ecx, DWORD PTR [rbx]\n");
-    asm(".byte 0x0F, 0x32\n");       // rdmsr — eax = low, edx = high
-    asm("shl rdx, 32\n");
-    asm("or rax, rdx\n");
-    asm("lea rbx, [rip+_kernel_sys_syscall_cst_msr_value]\n");
-    asm("mov QWORD PTR [rbx], rax\n");
-    return msr_value;
+    let is i64 as v with mut = 0;
+    rdmsr_into(msr, &v);
+    return v;
 }
 
 // ============================================================
