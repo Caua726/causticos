@@ -62,3 +62,11 @@ bin guess
 file userspace/build/libdyndemo.csl   /lib/libdyndemo.csl
 file userspace/build/libdyndemo2.csl  /lib/libdyndemo2.csl
 bin  dyntest
+
+# The ring-3 inflate self-test and its fixture. The fixture is generated, so a
+# clean tree has to make it before the image can be packed:
+#   python3 -c "import zlib;d=(b'CausticOS inflate self-test. '*200);\
+#     c=zlib.compressobj(9,zlib.DEFLATED,-15);\
+#     open('build/inflate-test.z','wb').write(c.compress(d)+c.flush())"
+bin  inflt
+file build/inflate-test.z  /inflate-test.z
