@@ -33,7 +33,7 @@ manifest before you get that far.
 The whole of `coreutils/echo.cst`:
 
 ```caustic
-use "../../../Caustic/std/causticos/prog.cst" as prog;
+use "std/causticos/prog.cst" as prog;
 
 fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as i with mut = 1;
@@ -70,7 +70,7 @@ The conversation is 32-byte messages on `wmproto.WM_FD`, in this order:
 
 ```caustic
 use "../../lib/wmproto/wmproto.cst" as wmp;
-use "../../../../Caustic/std/os/causticos.cst" as sys;
+use "std/os/causticos.cst" as sys;
 
 // 1. Read MSG_WELCOME — it carries the screen size and the size the WM gave you.
 //    a = screen_w, b = screen_h, c = (win_w << 32) | win_h
