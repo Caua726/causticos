@@ -21,7 +21,6 @@ ROOT_ARGS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --compress) ROOT_ARGS+=(--compress); shift ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --profile=*) PROFILE="${1#*=}"; shift ;;
         --no-live) LIVE=0; shift ;;

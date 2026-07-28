@@ -67,14 +67,12 @@ Around 74k lines of Caustic across 248 modules. x86_64 only.
 ## Running it
 
 The only thing that has to be installed is the
-[Caustic toolchain](https://github.com/Caua726/Caustic). Two libraries are
-declared dependencies —
-[`caustic-crypto`](https://github.com/Caua726/caustic-crypto) for the TLS stack
-and X.509 verification, and
-[`caustic-compact`](https://github.com/Caua726/caustic-compact) for the ramvol
-driver's decompression — and `caustic-mk` clones both into `.caustic/deps` at
-their pinned tags on the first build. There is nothing to fetch by hand and
-nothing that has to sit in a particular directory.
+[Caustic toolchain](https://github.com/Caua726/Caustic). One library is a
+declared dependency —
+[`caustic-crypto`](https://github.com/Caua726/caustic-crypto), for the TLS stack
+and X.509 verification — and `caustic-mk` clones it into `.caustic/deps` at its
+pinned tag on the first build. There is nothing to fetch by hand and nothing
+that has to sit in a particular directory.
 
 The three commands at the top are the whole loop, and the flags worth knowing:
 
