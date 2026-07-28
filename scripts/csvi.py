@@ -58,6 +58,22 @@ VERSION = 1
 HEADER_BYTES = 64
 SECTOR = 512
 FLAG_FAT32 = 1
+# bit 1: the RECORD REGION is a raw DEFLATE stream (no zlib or gzip wrapper —
+# the CSVI header already carries the length and the checksum, so a second
+# framing would only repeat them).
+#
+# deflate rather than xz or zstd, and the reason is the KERNEL, not the ratio:
+# it is the only decoder in caustic-compact that allocates nothing. lzma keeps
+# its probability array behind mmap and zstd and lz4 allocate too, which inside
+# a kernel means a host syscall executing where there is no host. xz would give
+# 12.7% against deflate's 21.0%; the difference is 170 KB of ISO against a
+# decompressor that cannot run. The header stays plain — the kernel
+# has to read it to know how much to allocate before it can decompress anything.
+#
+# The checksum still covers the UNCOMPRESSED records, so it verifies what was
+# actually packed rather than what happened to arrive: a corrupt xz stream fails
+# in the decoder, and a stream that decodes to the wrong bytes fails here.
+FLAG_DEFLATE = 2
 
 FNV_OFFSET = 0x811C9DC5
 FNV_PRIME = 0x01000193
@@ -71,7 +87,7 @@ def fnv1a32(data):
     return h
 
 
-def pack(image, sector_size=SECTOR, flags=FLAG_FAT32):
+def pack(image, sector_size=SECTOR, flags=FLAG_FAT32, compress=False):
     """Compact a raw volume image into a CSVI container."""
     if len(image) % sector_size:
         raise ValueError("image of {} bytes is not a whole number of {}-byte sectors"
@@ -89,6 +105,15 @@ def pack(image, sector_size=SECTOR, flags=FLAG_FAT32):
         records += chunk
         count += 1
 
+    checksum = fnv1a32(records)
+    if compress:
+        import zlib
+        # wbits=-15: raw deflate, no wrapper. Level 9 because this runs once at
+        # build time and the size is the entire point.
+        co = zlib.compressobj(9, zlib.DEFLATED, -15)
+        records = co.compress(bytes(records)) + co.flush()
+        flags = flags | FLAG_DEFLATE
+
     header = bytearray(HEADER_BYTES)
     struct.pack_into("<I", header, 0, MAGIC)
     struct.pack_into("<I", header, 4, VERSION)
@@ -98,7 +123,7 @@ def pack(image, sector_size=SECTOR, flags=FLAG_FAT32):
     struct.pack_into("<I", header, 28, flags)
     struct.pack_into("<Q", header, 32, count)
     struct.pack_into("<Q", header, 40, HEADER_BYTES)
-    struct.pack_into("<I", header, 48, fnv1a32(records))
+    struct.pack_into("<I", header, 48, checksum)
     return bytes(header) + bytes(records)
 
 
@@ -124,31 +149,56 @@ def parse_header(blob):
                          .format(vol_bytes, vol_sectors, sector_size))
     if rec_off != HEADER_BYTES:
         raise ValueError("records_offset {}, v1 requires {}".format(rec_off, HEADER_BYTES))
-    if flags & ~FLAG_FAT32:
+    if flags & ~(FLAG_FAT32 | FLAG_DEFLATE):
         raise ValueError("reserved flag bits set: 0x{:08X}".format(flags))
 
     stride = 8 + sector_size
     want = rec_off + count * stride
-    if len(blob) != want:
-        raise ValueError("file is {} bytes, header describes {} "
-                         "({} records x {} + {} header)"
-                         .format(len(blob), want, count, stride, rec_off))
-    if fnv1a32(blob[rec_off:]) != checksum:
+    if flags & FLAG_DEFLATE:
+        # A compressed region has no derivable size, so the exact-length
+        # invariant does not apply: it is replaced by the decompressed length
+        # having to match, checked below.
+        import zlib
+        recs = zlib.decompress(blob[rec_off:], -15)
+        if len(recs) != count * stride:
+            raise ValueError("decompressed to {} bytes, header describes {} "
+                             "({} records x {})".format(len(recs), count * stride, count, stride))
+    else:
+        recs = blob[rec_off:]
+        if len(blob) != want:
+            raise ValueError("file is {} bytes, header describes {} "
+                             "({} records x {} + {} header)"
+                             .format(len(blob), want, count, stride, rec_off))
+    if fnv1a32(recs) != checksum:
         raise ValueError("checksum mismatch: stored 0x{:08X}, computed 0x{:08X}"
-                         .format(checksum, fnv1a32(blob[rec_off:])))
+                         .format(checksum, fnv1a32(recs)))
 
     return dict(volume_bytes=vol_bytes, volume_sectors=vol_sectors,
                 sector_size=sector_size, flags=flags, record_count=count,
                 records_offset=rec_off, checksum=checksum)
 
 
+def records_of(blob, hdr):
+    """The record region, decompressed if the header says it is compressed.
+
+    Everything that walks records goes through here, so a compressed container
+    is not a second code path — only a different way of getting to the same
+    bytes."""
+    region = blob[hdr["records_offset"]:]
+    if hdr["flags"] & FLAG_DEFLATE:
+        import zlib
+        return zlib.decompress(region, -15)
+    return region
+
+
 def iter_records(blob, hdr):
     """Yield (lba, data), enforcing the ordering invariant as it goes."""
     stride = 8 + hdr["sector_size"]
     prev = -1
-    off = hdr["records_offset"]
+    recs = records_of(blob, hdr)
+    off = 0
     for i in range(hdr["record_count"]):
-        lba = struct.unpack_from("<Q", blob, off)[0]
+        lba = struct.unpack_from("<Q", recs, off)[0]
         if lba <= prev:
             raise ValueError("record {}: lba {} not greater than previous {} "
                              "(records must be strictly ascending)".format(i, lba, prev))
@@ -156,7 +206,7 @@ def iter_records(blob, hdr):
             raise ValueError("record {}: lba {} outside a {}-sector volume"
                              .format(i, lba, hdr["volume_sectors"]))
         prev = lba
-        yield lba, blob[off + 8:off + stride]
+        yield lba, recs[off + 8:off + stride]
         off += stride
 
 

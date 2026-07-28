@@ -308,6 +308,8 @@ def main():
     ap.add_argument("--profile", default="desktop")
     ap.add_argument("--img", help="write the raw FAT32 volume here")
     ap.add_argument("--csvi", help="write the CSVI container here")
+    ap.add_argument("--compress", action="store_true",
+                    help="xz the container's record region (the kernel inflates it at boot)")
     ap.add_argument("--size", help="volume size (default 64M, or the profile's `size`)")
     ap.add_argument("--label", default="CAUSTICOS")
     ap.add_argument("--init", metavar="TARGET",
@@ -383,7 +385,7 @@ def main():
 
     blob = None
     if a.csvi:
-        blob = csvi.pack(bytes(f.getbuffer()))
+        blob = csvi.pack(bytes(f.getbuffer()), compress=a.compress)
         os.makedirs(os.path.dirname(os.path.abspath(a.csvi)), exist_ok=True)
         with open(a.csvi, "wb") as fh:
             fh.write(blob)

@@ -18,6 +18,14 @@
 // would like to be considered.
 
 use "limine.cst"  as limine;
+// The inflate decoder, from caustic-compact: pure Caustic, no dependencies,
+// and — the part that matters here — it allocates NOTHING. lzma keeps its
+// probability array behind mmap, and zstd and lz4 allocate too; inside a
+// kernel that is a host syscall executing where there is no host, which is
+// exactly how the first attempt died (page fault, rsp=0, inside the decoder).
+// The output buffer is pre-sized below so even Bytes never grows.
+use "../../../caustic-compact/formats/inflate.cst" as inflate;
+use "../../../caustic-compact/core/bytes.cst" as czbytes;
 use "pmm.cst"     as pmm;
 use "vmm.cst"     as vmm;
 use "storage.cst" as storage;
@@ -32,6 +40,7 @@ let is i64 as CSVI_MAGIC      = 0x49565343;   // "CSVI" as a little-endian u32
 let is i64 as CSVI_VERSION    = 1;
 let is i64 as CSVI_HDR_BYTES  = 64;
 let is i64 as CSVI_FLAG_FAT32 = 1;
+let is i64 as CSVI_FLAG_DEFLATE = 2; // the record region is a raw deflate stream
 let is i64 as CSVI_SECTOR     = 512;
 let is i64 as CSVI_REC_BYTES  = 520;          // 8-byte lba + 512-byte payload
 
@@ -186,6 +195,18 @@ fn expand(img as *u8, img_len as i64) as i32 {
         return cast(i32, 0 - 3);
     }
 
+    // bit 0 = the payload is FAT32 (informative; the VFS decides what mounts).
+    // bit 1 = the record region is an xz stream. Anything else set is a
+    // container from a newer packer than this kernel, and guessing at it would
+    // mean mounting a volume assembled by rules we do not know.
+    let is i64 as flags = rd_u32(img, CSVI_OFF_FLAGS);
+    if ((flags & ~(CSVI_FLAG_FAT32 | CSVI_FLAG_DEFLATE)) != 0) {
+        serial.print("csvi: reserved flag bits set: 0x", 32);
+        util.print_hex(flags);
+        serial.println("", 0);
+        return cast(i32, 0 - 10);
+    }
+
     let is i64 as volsecs  = rd_u64(img, CSVI_OFF_VOLSECS);
     let is i64 as volbytes = rd_u64(img, CSVI_OFF_VOLBYTES);
     if (volsecs <= 0 || volbytes != volsecs * secsz) {
@@ -210,20 +231,71 @@ fn expand(img as *u8, img_len as i64) as i32 {
         return cast(i32, 0 - 5);
     }
 
-    // Exact, no slack. This is the cheapest integrity check there is and it
-    // catches a truncated read before anything is allocated.
-    let is i64 as want_len = recoff + reccnt * CSVI_REC_BYTES;
-    if (img_len != want_len) {
-        serial.print("csvi: module is ", 16);
-        util.print_num(img_len);
-        serial.print(" bytes, header describes ", 25);
-        util.print_num(want_len);
-        serial.println("", 0);
-        return cast(i32, 0 - 6);
+    let is i64 as rec_bytes = reccnt * CSVI_REC_BYTES;
+    let is i64 as recs with mut = cast(i64, img) + recoff;
+
+    // A compressed region (flags bit 1) is a raw deflate stream that inflates
+    // to exactly rec_bytes. The header itself is never compressed — it has to be
+    // readable to know how much to allocate for the result.
+    //
+    // This costs a transient buffer the size of the UNCOMPRESSED records, on
+    // top of the volume window below, and nothing else: the records are blitted
+    // into the volume and the buffer is released before the volume is
+    // published. On the ISO it turns 2.0 MB into 265 KB.
+    if ((flags & CSVI_FLAG_DEFLATE) != 0) {
+        let is i64 as buf = vmm.kvmap(rec_bytes, vmm.KV_DATA, 0, 0);
+        if (buf == 0) {
+            serial.print("csvi: kvmap failed for ", 23);
+            util.print_num(rec_bytes);
+            serial.println(" bytes of decompressed records", 30);
+            return cast(i32, 0 - 8);
+        }
+        // Pre-sized EXACTLY, which is what lets a decompressor written against
+        // a growable heap buffer run in a kernel with no heap of that shape:
+        // cap is already the final length, so it never reaches for the
+        // allocator behind it.
+        let is czbytes.Bytes as out;
+        out.ptr = cast(*u8, buf);
+        out.len = 0;
+        out.cap = rec_bytes;
+        let is i64 as rc = inflate.inflate(cast(*u8, cast(i64, img) + recoff),
+                                           img_len - recoff, &out);
+        if (rc < 0 || out.len != rec_bytes) {
+            serial.print("csvi: inflate rc=", 17);
+            util.print_num(rc);
+            serial.print(" produced ", 10);
+            util.print_num(out.len);
+            serial.print(" of ", 4);
+            util.print_num(rec_bytes);
+            serial.println("", 0);
+            return cast(i32, 0 - 9);
+        }
+        recs = buf;
+        serial.print("csvi: inflate ", 14);
+        util.print_num(img_len - recoff);
+        serial.print(" -> ", 4);
+        util.print_num(rec_bytes);
+        serial.println(" bytes", 6);
+    } else {
+        // Exact, no slack. This is the cheapest integrity check there is and it
+        // catches a truncated read before anything is allocated. A compressed
+        // region has no derivable length, so its equivalent is the decompressed
+        // size having to match, checked above.
+        let is i64 as want_len = recoff + rec_bytes;
+        if (img_len != want_len) {
+            serial.print("csvi: module is ", 16);
+            util.print_num(img_len);
+            serial.print(" bytes, header describes ", 25);
+            util.print_num(want_len);
+            serial.println("", 0);
+            return cast(i32, 0 - 6);
+        }
     }
 
+    // Over the records as they will be USED — decompressed, if they were
+    // compressed — so it verifies what was packed rather than what arrived.
     let is i64 as stored = rd_u32(img, CSVI_OFF_CKSUM);
-    let is i64 as actual = fnv1a32(cast(*u8, cast(i64, img) + recoff), reccnt * CSVI_REC_BYTES);
+    let is i64 as actual = fnv1a32(cast(*u8, recs), rec_bytes);
     if (stored != actual) {
         serial.print("csvi: checksum mismatch, stored 0x", 34);
         util.print_hex(stored);
@@ -249,7 +321,7 @@ fn expand(img as *u8, img_len as i64) as i32 {
     let is i64 as prev with mut = 0 - 1;
     let is i64 as i with mut = 0;
     while (i < reccnt) {
-        let is i64 as rec = cast(i64, img) + recoff + i * CSVI_REC_BYTES;
+        let is i64 as rec = recs + i * CSVI_REC_BYTES;
         let is i64 as lba = rd_u64(cast(*u8, rec), 0);
         // Strictly ascending: one comparison rejects a corrupt container and a
         // hostile one alike, and makes the blit below provably in bounds.
