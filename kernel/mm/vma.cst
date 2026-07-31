@@ -107,11 +107,25 @@ struct Aspace {
     // reserved-not-committed stack is still fatal; the probe just commits
     // first). Set from the CSE header flags byte (0x07 bit0). Appended last.
     stack_dynamic as i64;
+    // The cached image this aspace was loaded from (imgcache slot + 1, so a
+    // zeroed Aspace means "none"). Its read-only frames are mapped here and
+    // owned by the cache; teardown drops the reference so the cache can
+    // eventually take them back. Appended last.
+    img_ref as i64;
 }
 
 fn lk_ptr(a as *Aspace) as *lock.TicketLock {
     return &a.lk;
 }
+
+// Set by main.cst to imgcache.release. A function pointer rather than an
+// import because vma is BELOW imgcache (imgcache maps through vma), and a
+// `use` back up would close a cycle — which segfaults the compiler with no
+// diagnostic. Composition lives in main, the way every other cycle here is
+// broken.
+let is i64 as img_release_fn with mut = 0;
+
+fn set_img_release(fp as i64) as void { img_release_fn = fp; }
 
 // ============================================================
 // Aspace alloc / free
@@ -190,6 +204,12 @@ fn aspace_destroy(a as *Aspace) as void {
     a.vma_count = 0;
     lock.release_irq(lk_ptr(a), flags);
     vmm.as_destroy(a.pml4_phys);
+    // Drop the image reference AFTER the mappings are gone: while a page table
+    // still points at the cache's frames, the cache must not be free to reuse
+    // them. VMA_FILE already kept the teardown above from freeing them.
+    if (a.img_ref != 0 && img_release_fn != 0) {
+        call(cast(fn(i64) as void, img_release_fn), a.img_ref - 1);
+    }
     heap.kfree(cast(i64, a));
 }
 
@@ -663,13 +683,33 @@ fn mmap_phys(a as *Aspace, phys as i64, npages as i64,
 // teardown unmaps without freeing (the segment owns the frames). Returns the VA.
 fn mmap_pages(a as *Aspace, pfns_ptr as i64, npages as i64,
               prot as i64, owner as i64) as i64 {
+    return mmap_pages_at(a, 0, pfns_ptr, npages, prot, owner);
+}
+
+// mmap_pages_at: mmap_pages with the VA named. `va_hint` 0 = pick one (what
+// mmap_pages does); non-zero = honour it exactly or fail, the VMA_FIXED
+// contract. A loaded image needs this: its segments carry the vaddrs the
+// linker assigned, and its frames are a page LIST (allocated one at a time,
+// so they are never physically contiguous). One VMA per segment instead of
+// one per page — a 1 MiB image is 256 pages, and the bookkeeping is charged
+// to the process.
+fn mmap_pages_at(a as *Aspace, va_hint as i64, pfns_ptr as i64, npages as i64,
+                 prot as i64, owner as i64) as i64 {
     if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
     if (npages <= 0) { return cast(i64, 0 - 1); }
     if (pfns_ptr == 0) { return cast(i64, 0 - 1); }
     let is i64 as size = npages * pmm.PAGE_SIZE;
     let is i64 as f_internal = lock.acquire_irq(lk_ptr(a));
 
-    let is i64 as start = vma_find_free_va(a, pmm.PAGE_SIZE, size);
+    let is i64 as start with mut = va_hint;
+    if (va_hint == 0) {
+        start = vma_find_free_va(a, pmm.PAGE_SIZE, size);
+    } else if (vma_range_overlaps(a, va_hint, va_hint + size) != 0) {
+        // The window is already claimed. Honouring the hint "as close as
+        // possible" would put a segment somewhere its own code does not
+        // expect; failing is the only honest answer.
+        start = cast(i64, 0 - 1);
+    }
     if (start < 0) {
         lock.release_irq(lk_ptr(a), f_internal);
         return cast(i64, 0 - 1);

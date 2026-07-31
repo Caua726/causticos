@@ -1,0 +1,1166 @@
+// imgcache.cst — the loaded-image cache: one entry per executable image on the
+// volume, holding the frames its segments live in, so that spawning a program
+// MAPS it instead of copying it.
+//
+// Why this exists
+// ---------------
+// SYS_SPAWN used to take the image as BYTES: the parent read the whole file
+// into an eager-committed mapping, the kernel staged a second copy, and the
+// loader copied a third time into the child. Three residencies and two full
+// memcpys per exec, and — because bytes are not an object — nothing shared:
+// ten processes running the same binary cost ten copies of its text.
+//
+// Nobody else does that. Linux and the BSDs map the file (execveat takes an
+// fd), NT hands NtCreateProcessEx an image SECTION object, Fuchsia a VMO, seL4
+// frame caps. What is passed is always a reference to an object, because a
+// buffer can be neither shared nor counted.
+//
+// This kernel already had the right mechanism — it was just spelled for
+// libraries only (the old _csl_* in cse.cst): read the file once, lay its
+// read-only segments into frames, map THOSE frames into every address space,
+// copy only the writable half per process. That is what this module
+// generalises. A program is one more image; it stopped being the exception.
+//
+// What an entry owns
+// ------------------
+//   read-only frames   text + rodata, laid out at their linked vaddrs, mapped
+//                      shared into every aspace (VMA_FILE: teardown unmaps but
+//                      never frees — the frames belong to the cache).
+//   writable template  data, kept as the SOURCE of a per-process copy. Never
+//                      shared: a program's mutable state is its own.
+//   metadata           entry point, declared stack, header flags, and — for a
+//                      library — its export table.
+//
+// The file buffer itself is NOT kept. The old library cache held the entire
+// file resident forever alongside the frames it had already built from it;
+// with a 1.2 MiB compiler in the cache that would be 1.2 MiB duplicated per
+// image. Only the export tail survives a build (~20 KiB of a library), because
+// it is the only part a LATER load still reads.
+//
+// Imports are resolved at BUILD time, once, into the shared frames — not per
+// spawn. That is sound because a library is linked at a fixed base, so the
+// address a symbol resolves to is the same in every process; the patched text
+// is identical for all of them. It used to be several hundred page-table walks
+// on every single spawn.
+//
+// Identity, not name
+// ------------------
+// An entry is keyed by (first_cluster, size) — what the file IS, not what it is
+// called. Two paths to the same file share one entry; a rewritten file is a
+// different one. E_TXTBSY (imgcache_is_live) is what keeps that key honest on a
+// FAT32 that recycles clusters.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "vma.cst" as vma;
+use "elf.cst" as elf;
+use "vfs.cst" as vfs;
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "vmm.cst" as vmm;
+use "lock.cst" as lock;
+use "abi.cst" as abi;
+
+// ============================================================
+// CSE container format (docs/CSE_FORMAT.md)
+//
+//   [ header ] [ segment table: seg_count * 24B ] [ segment bytes ]
+//
+//   Header: 0x00 "CST_" | 0x04 version u16 | 0x06 arch u8 | 0x07 flags u8
+//           0x08 entry u64 | 0x10 base u64 | 0x18 seg_count u32
+//           v3 adds: 0x20 import_off u64 | 0x28 import_count u32
+//                    0x2C stack_size u32
+//   Segment (24B): vaddr u64 | file_off u32 | file_size u32 | mem_size u32
+//                  | perms u32 (bit0=R bit1=W bit2=X)
+//
+// Each segment is mapped at its own vaddr and its file bytes copied in:
+// file_off is NOT congruent to vaddr modulo a page, so the file can never be
+// flat-mapped. The bss tail (mem_size - file_size) needs no work — frames come
+// from the allocator zeroed.
+// ============================================================
+
+let is i64 as H_MAGIC        = 0x00;
+let is i64 as H_VERSION      = 0x04;
+let is i64 as H_ARCH         = 0x06;
+let is i64 as H_FLAGS        = 0x07;   // bit0 = dynamic stack growth
+let is i64 as H_ENTRY        = 0x08;
+let is i64 as H_SEGCOUNT     = 0x18;
+let is i64 as H_IMPORT_OFF   = 0x20;   // v3.2
+let is i64 as H_IMPORT_COUNT = 0x28;   // v3.2
+let is i64 as H_STACKSIZE    = 0x2C;   // v3
+let is i64 as H_SIZE         = 0x20;   // v2 header; v3 is 0x30
+
+let is i64 as S_VADDR = 0x00;
+let is i64 as S_FOFF  = 0x08;
+let is i64 as S_FSZ   = 0x0C;
+let is i64 as S_MSZ   = 0x10;
+let is i64 as S_PERMS = 0x14;
+let is i64 as S_SIZE  = 24;
+
+let is i64 as PERM_R = 1;
+let is i64 as PERM_W = 2;
+let is i64 as PERM_X = 4;
+
+let is i64 as CSE_MAX_SEGS = 16;
+
+// Polyglot mini-header ("CST*") at 0x40, written by caustic-ld's
+// write_cse_combine_ape. It sits inside the shell-quoted region of the APE
+// header, so both numbers are 12-digit zero-padded ASCII decimal: a raw u64
+// could place a 0x27 (') there, close the quote early, and make /bin/sh
+// execute the binary payload as a script.
+let is i64 as MINI_OFF        = 0x40;
+let is i64 as MINI_OFF_VER    = 0x44;
+let is i64 as MINI_OFF_BODY   = 0x48;
+let is i64 as MINI_OFF_BODYSZ = 0x54;
+let is i64 as MINI_FIELD_LEN  = 12;
+
+// CST_ v3.1 multi-arch container: a header plus an 8-byte index entry per
+// embedded image (arch u32, image_off u32).
+let is i64 as FAT_COUNT     = 0x06;
+let is i64 as FAT_INDEX_OFF = 0x08;
+let is i64 as FAT_ENTRY     = 8;
+let is i64 as FAT_MAX       = 8;
+
+let is i64 as CSE_ARCH_X86_64  = 1;
+let is i64 as CSE_ARCH_AARCH64 = 2;
+let is i64 as CSE_ARCH_NATIVE  = 1 * __target_is_x86_64 + 2 * __target_is_aarch64;
+
+// ============================================================
+// CSL_ v2 library header (44 bytes), from cse_writer.cst:cse_emit_csl_image:
+//   0x00 "CSL_" | 0x04 version u16 | 0x06 arch u8 | 0x07 flags u8
+//   0x08 base_addr u64 | 0x10 seg_count u32 | 0x14 export_count u32
+//   0x18 export_off u64 | 0x20 kimport_off u64 | 0x28 kimport_count u32
+//   then seg_count * 24, then the packed segment bytes, then
+//   export_count * 12 (name_off u32, vaddr u64) at export_off.
+// ============================================================
+let is i64 as CSL_HDR_SIZE  = 44;
+let is i64 as CSL_VERSION   = 2;
+let is i64 as CSL_BASE      = 0x08;
+let is i64 as CSL_SEGCOUNT  = 0x10;
+let is i64 as CSL_EXPCOUNT  = 0x14;
+let is i64 as CSL_EXPOFF    = 0x18;
+let is i64 as CSL_EXP_ENTRY = 12;
+
+// Relocation types, from the x86_64 psABI — the ones the linker emits for an
+// undefined call or data reference.
+let is i64 as R_X86_64_64    = 1;
+let is i64 as R_X86_64_PC32  = 2;
+let is i64 as R_X86_64_PLT32 = 4;
+
+// A program imports a few hundred distinct symbols at most, and the resolved
+// table is per-build stack state, so this bounds that stack frame.
+let is i64 as IMP_MAX_NAMES = 512;
+
+// ============================================================
+// The cache
+// ============================================================
+
+let is i64 as IMG_KIND_CSE = 1;
+let is i64 as IMG_KIND_CSL = 2;
+
+let is i64 as ENT_MAX     = 32;
+let is i64 as ENT_LIB_MAX = 8;      // libraries one image may import from
+
+// All scalars i64 (the mixed-width struct rule). The page lists are heap
+// arrays, not inline: an image's size is not known at compile time, and the
+// old fixed 256-page ceiling could not hold a 1.2 MiB compiler.
+struct ImgEntry {
+    in_use      as i64;
+    kind        as i64;      // IMG_KIND_*
+    // Identity: what the file IS. cluster 0 = an anonymous image (built from a
+    // segment / an in-kernel buffer), which is never looked up or reused.
+    key_cluster as i64;
+    key_size    as i64;
+    refcount    as i64;      // live aspaces holding this image
+    pinned      as i64;      // 1 = never evicted (a library in use by the cache)
+
+    entry       as i64;      // CSE: entry vaddr
+    stack_size  as i64;      // CSE: declared user stack (0 = loader default)
+    hdr_flags   as i64;      // CSE: header flags byte (bit0 = dynamic stack)
+
+    // Read-only frames: shared into every aspace.
+    ro_n        as i64;
+    ro_pfn      as i64;      // *i64[ro_n]
+    ro_va       as i64;      // *i64[ro_n]
+    ro_prot     as i64;      // *i64[ro_n]
+    // Writable frames: the TEMPLATE a per-process copy is made from.
+    rw_n        as i64;
+    rw_pfn      as i64;
+    rw_va       as i64;
+    rw_prot     as i64;
+
+    // CSL only: the export tail, copied out of the file ([exp_base, file end))
+    // because it is the one part a later program's import resolution reads.
+    exp_blob    as i64;      // *u8
+    exp_len     as i64;
+    exp_count   as i64;
+    exp_base    as i64;      // original file offset of exp_blob[0]
+
+    lib_n       as i64;
+    libs        as [8]i64;   // slots of the libraries this image imports from
+}
+
+let is [32]ImgEntry as _ent with mut;
+
+// A plain ticket lock, NOT the IRQ-saving variant. This lock is held across
+// vfs.open/vfs.read — real disk I/O that waits on an AHCI completion — and
+// holding it with interrupts disabled would be a deadlock waiting for a
+// machine slow enough to hit it. Nothing takes this lock from interrupt
+// context: the cache is only ever touched by a thread that is spawning.
+let is lock.TicketLock as _lk with mut;
+
+fn init() as void {
+    let is i64 as i with mut = 0;
+    while (i < ENT_MAX) { _ent[i].in_use = 0; i = i + 1; }
+}
+
+// ============================================================
+// Small helpers
+// ============================================================
+
+fn page_align_up(x as i64) as i64 {
+    return (x + 0xFFF) & (cast(i64, 0 - 1) - 0xFFF);
+}
+
+// One page, 8 bytes at a time. There is no memcpy in util, and a byte loop
+// over a multi-MiB image's writable half is 8x the work for nothing.
+fn _copy_page(dst as i64, src as i64) as void {
+    let is *i64 as d = cast(*i64, dst);
+    let is *i64 as s = cast(*i64, src);
+    let is i64 as i with mut = 0;
+    while (i < 512) { d[i] = s[i]; i = i + 1; }
+}
+
+fn page_align_down(x as i64) as i64 {
+    return x & (cast(i64, 0 - 1) - 0xFFF);
+}
+
+// CSE perms (R=1,W=2,X=4) -> vma protection bits. Read is implied by
+// PROT_USER. No X bit => set NX. W bit => writable.
+fn perms_to_prot(perms as i64) as i64 {
+    let is i64 as prot with mut = vma.PROT_USER;
+    if ((perms & PERM_W) != 0) { prot = prot | vma.PROT_WRITE; }
+    if ((perms & PERM_X) == 0) { prot = prot | vma.PROT_NX; }
+    return prot;
+}
+
+// Parse `len` ASCII decimal digits at `off`. Returns -1 on any non-digit.
+fn read_ascii_num(buf as *u8, off as i64, len as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is i64 as c = cast(i64, buf[off + i]);
+        if (c < 48 || c > 57) { return cast(i64, 0 - 1); }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Locate the CST image inside its container -> (out_off, out_size). A pure
+// .cse is the image at offset 0; a polyglot .cse.exe (MZ) carries it behind
+// the "CST*" mini-header at 0x40.
+fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32 {
+    if (size < H_SIZE) { return cast(i32, 0 - 1); }
+
+    if (cast(i64, buf[0]) == 0x43 && cast(i64, buf[1]) == 0x53
+        && cast(i64, buf[2]) == 0x54 && cast(i64, buf[3]) == 0x5F) {   // "CST_"
+        *out_off = 0;
+        *out_size = size;
+        return 0;
+    }
+
+    if (cast(i64, buf[0]) == 0x4D && cast(i64, buf[1]) == 0x5A) {      // "MZ"
+        if (size < MINI_OFF + 0x20) { return cast(i32, 0 - 2); }
+        if (cast(i64, buf[MINI_OFF + 0]) != 0x43 || cast(i64, buf[MINI_OFF + 1]) != 0x53
+            || cast(i64, buf[MINI_OFF + 2]) != 0x54 || cast(i64, buf[MINI_OFF + 3]) != 0x2A) {
+            return cast(i32, 0 - 3);
+        }
+        let is i64 as mini_ver = elf.read_u16_le(buf, MINI_OFF_VER);
+        // v3 appends the ARM64 PE locator after the fields read here; both fine.
+        if (mini_ver != 2 && mini_ver != 3) { return cast(i32, 0 - 3); }
+        let is i64 as body_off = read_ascii_num(buf, MINI_OFF_BODY, MINI_FIELD_LEN);
+        let is i64 as body_sz with mut = read_ascii_num(buf, MINI_OFF_BODYSZ, MINI_FIELD_LEN);
+        if (body_off < 0 || body_sz < 0) { return cast(i32, 0 - 4); }
+        if (body_sz < H_SIZE) { body_sz = size - body_off; }   // fallback if size absent
+        if (body_off + body_sz > size) { return cast(i32, 0 - 5); }
+        *out_off = body_off;
+        *out_size = body_sz;
+        return 0;
+    }
+
+    return cast(i32, 0 - 6);
+}
+
+// ============================================================
+// Entry lifetime
+// ============================================================
+
+fn _slot_find(cluster as i64, size as i64) as i64 {
+    if (cluster == 0) { return 0 - 1; }        // anonymous images are never reused
+    let is i64 as i with mut = 0;
+    while (i < ENT_MAX) {
+        if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster
+            && _ent[i].key_size == size) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _slot_alloc() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < ENT_MAX) {
+        if (_ent[i].in_use == 0) { return i; }
+        i = i + 1;
+    }
+    // Every slot taken: drop the unreferenced ones and look again. A cache that
+    // fills up and then refuses to load anything is worse than one that forgets.
+    _reclaim_locked();
+    i = 0;
+    while (i < ENT_MAX) {
+        if (_ent[i].in_use == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Release one entry's frames and heap arrays. Caller holds the lock and has
+// checked refcount == 0 && pinned == 0.
+fn _free_locked(s as i64) as i64 {
+    let is i64 as freed with mut = 0;
+    let is i64 as i with mut = 0;
+    if (_ent[s].ro_pfn != 0) {
+        let is *i64 as p = cast(*i64, _ent[s].ro_pfn);
+        while (i < _ent[s].ro_n) {
+            pmm.free_pages(cast(i32, p[i]), cast(i32, 0));
+            freed = freed + 1;
+            i = i + 1;
+        }
+        heap.kfree(_ent[s].ro_pfn);
+        heap.kfree(_ent[s].ro_va);
+        heap.kfree(_ent[s].ro_prot);
+    }
+    i = 0;
+    if (_ent[s].rw_pfn != 0) {
+        let is *i64 as p = cast(*i64, _ent[s].rw_pfn);
+        while (i < _ent[s].rw_n) {
+            pmm.free_pages(cast(i32, p[i]), cast(i32, 0));
+            freed = freed + 1;
+            i = i + 1;
+        }
+        heap.kfree(_ent[s].rw_pfn);
+        heap.kfree(_ent[s].rw_va);
+        heap.kfree(_ent[s].rw_prot);
+    }
+    if (_ent[s].exp_blob != 0) { heap.kfree(_ent[s].exp_blob); }
+
+    // An image holds references to the libraries it imports from; dropping it
+    // drops those too, or a library outlives every user of it forever.
+    i = 0;
+    while (i < _ent[s].lib_n) {
+        let is i64 as ls = _ent[s].libs[i];
+        if (ls >= 0 && ls < ENT_MAX && _ent[ls].in_use != 0) {
+            _ent[ls].refcount = _ent[ls].refcount - 1;
+        }
+        i = i + 1;
+    }
+
+    _ent[s].in_use = 0;
+    _ent[s].ro_pfn = 0; _ent[s].ro_va = 0; _ent[s].ro_prot = 0; _ent[s].ro_n = 0;
+    _ent[s].rw_pfn = 0; _ent[s].rw_va = 0; _ent[s].rw_prot = 0; _ent[s].rw_n = 0;
+    _ent[s].exp_blob = 0;
+    _ent[s].lib_n = 0;
+    return freed;
+}
+
+// Drop every entry no aspace is using. Repeated until nothing more goes,
+// because freeing a program releases its libraries' references too.
+fn _reclaim_locked() as i64 {
+    let is i64 as freed with mut = 0;
+    let is i64 as again with mut = 1;
+    while (again == 1) {
+        again = 0;
+        let is i64 as i with mut = 0;
+        while (i < ENT_MAX) {
+            if (_ent[i].in_use != 0 && _ent[i].refcount <= 0 && _ent[i].pinned == 0) {
+                freed = freed + _free_locked(i);
+                again = 1;
+            }
+            i = i + 1;
+        }
+    }
+    return freed;
+}
+
+// Public reclaim: pages handed back. Called from the allocator's out-of-memory
+// path — cached images are the one thing in the kernel that is pure cache, so
+// they are what an allocation under pressure should be able to take back.
+fn reclaim() as i64 {
+    lock.acquire(&_lk);
+    let is i64 as n = _reclaim_locked();
+    lock.release(&_lk);
+    return n;
+}
+
+// Is any live image backed by this file? The E_TXTBSY question: rewriting a
+// file whose (cluster, size) still names a cached image would leave the cache
+// describing bytes that are gone.
+fn is_live(cluster as i64) as i32 {
+    if (cluster == 0) { return 0; }
+    lock.acquire(&_lk);
+    let is i64 as i with mut = 0;
+    let is i32 as hit with mut = 0;
+    while (i < ENT_MAX) {
+        if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster) {
+            hit = 1;
+            i = ENT_MAX;
+        } else { i = i + 1; }
+    }
+    lock.release(&_lk);
+    return hit;
+}
+
+fn release(slot as i64) as void {
+    if (slot < 0 || slot >= ENT_MAX) { return; }
+    lock.acquire(&_lk);
+    if (_ent[slot].in_use != 0 && _ent[slot].refcount > 0) {
+        _ent[slot].refcount = _ent[slot].refcount - 1;
+    }
+    // The frames are NOT freed here. An image is worth keeping precisely
+    // because the next spawn of the same program is likely; reclaim() takes it
+    // back when memory is actually short. That is a cache, not a leak — the
+    // difference being that something can get the memory back.
+    lock.release(&_lk);
+}
+
+// For main.cst to wire into vma.set_img_release — a qualified fn_ptr across
+// modules is not available to the wirer, so the owner hands out the address.
+fn release_ptr() as i64 { return cast(i64, fn_ptr(release)); }
+
+fn entry_point(slot as i64) as i64  { return _ent[slot].entry; }
+fn stack_size(slot as i64) as i64   { return _ent[slot].stack_size; }
+fn hdr_flags(slot as i64) as i64    { return _ent[slot].hdr_flags; }
+
+// ============================================================
+// Building an entry: file bytes -> frames
+// ============================================================
+
+// Count how many pages a segment list needs on each side of the R/W split, so
+// the arrays are allocated once at the right size.
+fn _count_pages(b as *u8, hdr as i64, nseg as i64, want_w as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nseg) {
+        let is i64 as e = hdr + i * S_SIZE;
+        let is i64 as perms = elf.read_u32_le(b, e + S_PERMS);
+        let is i64 as is_w with mut = 0;
+        if ((perms & PERM_W) != 0) { is_w = 1; }
+        if (is_w == want_w) {
+            let is i64 as vaddr = elf.read_u64_le(b, e + S_VADDR);
+            let is i64 as msz   = elf.read_u32_le(b, e + S_MSZ);
+            let is i64 as p0  = page_align_down(vaddr);
+            let is i64 as end = page_align_up(vaddr + msz);
+            n = n + (end - p0) / pmm.PAGE_SIZE;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Lay one side of the segment split into freshly allocated frames, filling each
+// page with its slice of the file. Frames come zeroed, so the bss tail beyond
+// file_size needs nothing done to it.
+fn _lay_pages(s as i64, b as *u8, base_off as i64, img_size as i64,
+              hdr as i64, nseg as i64, want_w as i64,
+              pfn_arr as *i64, va_arr as *i64, prot_arr as *i64, cap as i64) as i64 {
+    let is i64 as np with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nseg) {
+        let is i64 as e = hdr + i * S_SIZE;
+        let is i64 as perms = elf.read_u32_le(b, e + S_PERMS);
+        let is i64 as is_w with mut = 0;
+        if ((perms & PERM_W) != 0) { is_w = 1; }
+        if (is_w == want_w) {
+            let is i64 as vaddr = elf.read_u64_le(b, e + S_VADDR);
+            let is i64 as foff  = elf.read_u32_le(b, e + S_FOFF);
+            let is i64 as fsz   = elf.read_u32_le(b, e + S_FSZ);
+            let is i64 as msz   = elf.read_u32_le(b, e + S_MSZ);
+            if (msz < fsz) { return cast(i64, 0 - 41); }
+            if (fsz > 0 && foff + fsz > img_size) { return cast(i64, 0 - 42); }
+            let is i64 as p0   = page_align_down(vaddr);
+            let is i64 as end  = page_align_up(vaddr + msz);
+            let is i64 as prot = perms_to_prot(perms);
+            let is i64 as pg with mut = p0;
+            while (pg < end) {
+                if (np >= cap) { return cast(i64, 0 - 57); }
+                let is i32 as pfn = pmm.alloc_pages(pmm.ALLOC_ZERO, cast(i32, 0),
+                                                    pmm.USAGE_KERNEL, cast(i32, 0));
+                if (pfn == pmm.PFN_NONE) { return cast(i64, 0 - 58); }
+                let is i64 as kv = pmm.phys_to_virt(pmm.pfn_to_phys(pfn));
+                // This page's slice of the segment. On the first page the
+                // segment may start mid-page (seg_off negative), so the copy is
+                // shifted into the page instead of out of the file.
+                let is i64 as seg_off = pg - vaddr;
+                let is i64 as src with mut = seg_off;
+                let is i64 as dst with mut = 0;
+                if (src < 0) { dst = 0 - src; src = 0; }
+                let is i64 as n with mut = fsz - src;
+                if (n > pmm.PAGE_SIZE - dst) { n = pmm.PAGE_SIZE - dst; }
+                let is i64 as k with mut = 0;
+                while (k < n) {
+                    let is *u8 as d = cast(*u8, kv + dst + k);
+                    *d = b[base_off + foff + src + k];
+                    k = k + 1;
+                }
+                pfn_arr[np]  = cast(i64, pfn);
+                va_arr[np]   = pg;
+                prot_arr[np] = prot;
+                np = np + 1;
+                pg = pg + pmm.PAGE_SIZE;
+            }
+        }
+        i = i + 1;
+    }
+    return np;
+}
+
+// Allocate the three parallel arrays for one side. Returns 0 on OOM.
+fn _alloc_lists(n as i64, out_pfn as *i64, out_va as *i64, out_prot as *i64) as i32 {
+    if (n == 0) { *out_pfn = 0; *out_va = 0; *out_prot = 0; return 0; }
+    let is i64 as bytes = n * 8;
+    let is i64 as a = heap.kmalloc(bytes, cast(i32, 0));
+    let is i64 as b = heap.kmalloc(bytes, cast(i32, 0));
+    let is i64 as c = heap.kmalloc(bytes, cast(i32, 0));
+    if (a == 0 || b == 0 || c == 0) {
+        if (a != 0) { heap.kfree(a); }
+        if (b != 0) { heap.kfree(b); }
+        if (c != 0) { heap.kfree(c); }
+        return cast(i32, 0 - 58);
+    }
+    *out_pfn = a; *out_va = b; *out_prot = c;
+    return 0;
+}
+
+// The kernel VA a vaddr inside this image's own frames lives at, or 0. This is
+// how an import site is patched at build time: the frames exist, but no address
+// space maps them yet, so there is no page table to walk.
+fn _img_kv(s as i64, va as i64) as i64 {
+    let is i64 as pg = page_align_down(va);
+    let is i64 as off = va & 0xFFF;
+    let is i64 as i with mut = 0;
+    if (_ent[s].ro_va != 0) {
+        let is *i64 as vs = cast(*i64, _ent[s].ro_va);
+        let is *i64 as ps = cast(*i64, _ent[s].ro_pfn);
+        while (i < _ent[s].ro_n) {
+            if (vs[i] == pg) { return pmm.phys_to_virt(pmm.pfn_to_phys(cast(i32, ps[i]))) + off; }
+            i = i + 1;
+        }
+    }
+    i = 0;
+    if (_ent[s].rw_va != 0) {
+        let is *i64 as vs = cast(*i64, _ent[s].rw_va);
+        let is *i64 as ps = cast(*i64, _ent[s].rw_pfn);
+        while (i < _ent[s].rw_n) {
+            if (vs[i] == pg) { return pmm.phys_to_virt(pmm.pfn_to_phys(cast(i32, ps[i]))) + off; }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// Add `sym` to the value already at `site`. The linker resolved these sites
+// against address ZERO, so a PC32 site already holds `0 - (site+4) + addend`
+// and a 64-bit site already holds the addend: adding S is exactly right for
+// both, with no per-type arithmetic to get wrong.
+//
+// The bytes are walked one at a time because a site can straddle a page
+// boundary — x86_64 instructions are variable-length and neither they nor
+// their displacement fields are aligned to anything. (`ls` was the first
+// program whose import landed across a boundary.)
+fn _patch_site(s as i64, site as i64, sym as i64, width as i64) as i32 {
+    let is i64 as val with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < width) {
+        let is i64 as kv = _img_kv(s, site + i);
+        if (kv == 0) { return cast(i32, 0 - 46); }
+        let is *u8 as p = cast(*u8, kv);
+        val = val | (cast(i64, p[0]) << (i * 8));
+        i = i + 1;
+    }
+    // Sign-extend a 32-bit field before adding: the value sitting there is
+    // NEGATIVE (0 - (site+4)), and reading it unsigned would add 4 GiB to every
+    // displacement and land the call somewhere else entirely.
+    if (width == 4) {
+        if ((val & 0x80000000) != 0) { val = val - 0x100000000; }
+    }
+    val = val + sym;
+
+    i = 0;
+    while (i < width) {
+        let is i64 as kv = _img_kv(s, site + i);
+        if (kv == 0) { return cast(i32, 0 - 46); }
+        let is *u8 as p = cast(*u8, kv);
+        p[0] = cast(u8, (val >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The vaddr a library exports `sym` at, or -1. Reads the export tail kept from
+// the file: name offsets there are original file offsets, so they are rebased
+// onto the blob.
+fn _sym(s as i64, sym as *u8, slen as i64) as i64 {
+    if (_ent[s].exp_blob == 0) { return 0 - 1; }
+    let is *u8 as b = cast(*u8, _ent[s].exp_blob);
+    let is i64 as base = _ent[s].exp_base;
+    let is i64 as len  = _ent[s].exp_len;
+    let is i64 as i with mut = 0;
+    while (i < _ent[s].exp_count) {
+        let is i64 as ent = i * CSL_EXP_ENTRY;
+        let is i64 as noff = elf.read_u32_le(b, ent) - base;
+        if (noff > 0 && noff + slen < len) {
+            let is i64 as k with mut = 0;
+            let is i64 as hit with mut = 1;
+            while (k < slen) {
+                if (b[noff + k] == cast(u8, 0) || b[noff + k] != sym[k]) { hit = 0; k = slen; }
+                else { k = k + 1; }
+            }
+            if (hit == 1 && b[noff + slen] == cast(u8, 0)) {
+                return elf.read_u64_le(b, ent + 4);
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================
+// Acquire: the public way in
+// ============================================================
+
+// Read a whole file into a transient kernel buffer. kvmap, not kmalloc: a
+// multi-MiB image needs a 2 MiB+ contiguous buddy block that a fragmented heap
+// can lack even with ~1 GiB free (which used to spuriously E_NOMEM a spawn).
+// kvmap only needs free pages, not a contiguous run.
+fn _slurp(f as *vfs.VfsFile, out_size as *i64) as i64 {
+    let is i64 as sz = f.size;
+    if (sz <= 0 || sz > abi.SPAWN_IMG_MAX) { return 0; }
+    let is i64 as buf = vmm.kvmap(sz, vmm.KV_DATA, 0, 0);
+    if (buf == 0) { return 0; }
+    let is i64 as got = vfs.read(f, cast(*u8, buf), sz);
+    if (got != sz) { vmm.kvunmap(buf); return 0; }
+    *out_size = sz;
+    return buf;
+}
+
+// Build a library entry from its bytes. Caller holds the lock.
+fn _build_csl(s as i64, b as *u8, sz as i64) as i32 {
+    if (b[0] != cast(u8, 67) || b[1] != cast(u8, 83)
+        || b[2] != cast(u8, 76) || b[3] != cast(u8, 95)) {       // "CSL_"
+        serial.println("imgcache: not a CSL_ image", 26);
+        return cast(i32, 0 - 7);
+    }
+    if (elf.read_u16_le(b, 4) != CSL_VERSION) {
+        serial.println("imgcache: CSL version unsupported", 33);
+        return cast(i32, 0 - 8);
+    }
+    if (cast(i64, b[0x06]) != CSE_ARCH_NATIVE) {
+        serial.println("imgcache: CSL is for another arch", 33);
+        return cast(i32, 0 - 9);
+    }
+    let is i64 as nseg   = elf.read_u32_le(b, CSL_SEGCOUNT);
+    let is i64 as ecount = elf.read_u32_le(b, CSL_EXPCOUNT);
+    let is i64 as eoff   = elf.read_u64_le(b, CSL_EXPOFF);
+    if (nseg <= 0 || nseg > CSE_MAX_SEGS) { return cast(i32, 0 - 40); }
+    if (eoff < CSL_HDR_SIZE || eoff + ecount * CSL_EXP_ENTRY > sz) {
+        serial.println("imgcache: CSL export table out of bounds", 39);
+        return cast(i32, 0 - 43); }
+
+    let is i32 as rc = _lay_all(s, b, 0, sz, CSL_HDR_SIZE, nseg);
+    if (rc != 0) { return rc; }
+
+    // Keep the export tail — the table plus the name blob that follows it. It
+    // is the only part of the file a later import resolution reads, and it is
+    // ~20 KiB against the ~100 KiB the whole file would cost.
+    let is i64 as tail = sz - eoff;
+    let is i64 as blob = heap.kmalloc(tail, cast(i32, 0));
+    if (blob == 0) { return cast(i32, 0 - 58); }
+    let is *u8 as d = cast(*u8, blob);
+    let is i64 as i with mut = 0;
+    while (i < tail) { d[i] = b[eoff + i]; i = i + 1; }
+    _ent[s].exp_blob  = blob;
+    _ent[s].exp_len   = tail;
+    _ent[s].exp_count = ecount;
+    _ent[s].exp_base  = eoff;
+    _ent[s].kind      = IMG_KIND_CSL;
+    return 0;
+}
+
+// Lay both sides of a segment table into frames. Shared by CSE and CSL.
+fn _lay_all(s as i64, b as *u8, base_off as i64, img_size as i64,
+            hdr as i64, nseg as i64) as i32 {
+    let is i64 as ron = _count_pages(b, hdr, nseg, 0);
+    let is i64 as rwn = _count_pages(b, hdr, nseg, 1);
+
+    let is i64 as rp with mut = 0;
+    let is i64 as rv with mut = 0;
+    let is i64 as rt with mut = 0;
+    let is i32 as arc = _alloc_lists(ron, &rp, &rv, &rt);
+    if (arc != 0) { return arc; }
+    let is i64 as wp with mut = 0;
+    let is i64 as wv with mut = 0;
+    let is i64 as wt with mut = 0;
+    let is i32 as brc = _alloc_lists(rwn, &wp, &wv, &wt);
+    if (brc != 0) {
+        if (rp != 0) { heap.kfree(rp); heap.kfree(rv); heap.kfree(rt); }
+        return brc;
+    }
+    _ent[s].ro_pfn = rp; _ent[s].ro_va = rv; _ent[s].ro_prot = rt; _ent[s].ro_n = 0;
+    _ent[s].rw_pfn = wp; _ent[s].rw_va = wv; _ent[s].rw_prot = wt; _ent[s].rw_n = 0;
+
+    let is i64 as n1 = _lay_pages(s, b, base_off, img_size, hdr, nseg, 0,
+                                  cast(*i64, rp), cast(*i64, rv), cast(*i64, rt), ron);
+    if (n1 < 0) { return cast(i32, n1); }
+    _ent[s].ro_n = n1;
+    let is i64 as n2 = _lay_pages(s, b, base_off, img_size, hdr, nseg, 1,
+                                  cast(*i64, wp), cast(*i64, wv), cast(*i64, wt), rwn);
+    if (n2 < 0) { return cast(i32, n2); }
+    _ent[s].rw_n = n2;
+    return 0;
+}
+
+// Acquire a library by name: "/lib/<name>". Caller holds the lock.
+// The path is built here rather than taken from the image — the path is the
+// kernel's policy, and a library name out of a file must never name a path.
+fn _acquire_lib_locked(nm as *u8, nl as i64) as i64 {
+    if (nl <= 0 || nl > 48) { return 0 - 1; }
+    let is [64]u8 as path;
+    let is *u8 as pfx = "/lib/";
+    let is i64 as i with mut = 0;
+    while (i < 5) { path[i] = pfx[i]; i = i + 1; }
+    let is i64 as j with mut = 0;
+    while (j < nl) {
+        if (nm[j] == cast(u8, 47)) { return 0 - 1; }   // a '/' would escape /lib
+        path[5 + j] = nm[j];
+        j = j + 1;
+    }
+    path[5 + nl] = cast(u8, 0);
+
+    let is *vfs.VfsFile as f = vfs.open(cast(*u8, &path[0]), 5 + nl, cast(i32, abi.O_RDONLY));
+    if (cast(i64, f) == 0) {
+        serial.print("imgcache: /lib/", 15);
+        serial.print(nm, nl);
+        serial.println(" not found", 10);
+        return 0 - 1;
+    }
+    let is i64 as cluster = f.first_cluster;
+    let is i64 as fsize   = f.size;
+
+    let is i64 as hit = _slot_find(cluster, fsize);
+    if (hit >= 0) {
+        vfs.close(f);
+        _ent[hit].refcount = _ent[hit].refcount + 1;
+        return hit;
+    }
+
+    let is i64 as sz with mut = 0;
+    let is i64 as buf = _slurp(f, &sz);
+    vfs.close(f);
+    if (buf == 0) { return 0 - 1; }
+
+    let is i64 as s = _slot_alloc();
+    if (s < 0) { vmm.kvunmap(buf); return 0 - 1; }
+    _ent_reset(s, cluster, fsize);
+    let is i32 as rc = _build_csl(s, cast(*u8, buf), sz);
+    vmm.kvunmap(buf);
+    if (rc != 0) { _free_locked(s); return 0 - 1; }
+    return s;
+}
+
+// Claim a slot for a build. in_use and refcount go up HERE, not when the build
+// finishes: building a program resolves its imports, which acquires libraries,
+// which allocates slots — and a slot left unclaimed until the end is handed
+// straight back out, so the library overwrites the program that is loading it.
+// (That failed as a -46 "import site not in this image's frames", because by
+// the time the sites were patched the frame lists belonged to the library.)
+// The refcount is the builder's own reference; failure unwinds via _free_locked.
+fn _ent_reset(s as i64, cluster as i64, size as i64) as void {
+    _ent[s].in_use      = 1;
+    _ent[s].kind        = 0;
+    _ent[s].key_cluster = cluster;
+    _ent[s].key_size    = size;
+    _ent[s].refcount    = 1;
+    _ent[s].pinned      = 0;
+    _ent[s].entry       = 0;
+    _ent[s].stack_size  = 0;
+    _ent[s].hdr_flags   = 0;
+    _ent[s].ro_n = 0; _ent[s].ro_pfn = 0; _ent[s].ro_va = 0; _ent[s].ro_prot = 0;
+    _ent[s].rw_n = 0; _ent[s].rw_pfn = 0; _ent[s].rw_va = 0; _ent[s].rw_prot = 0;
+    _ent[s].exp_blob = 0; _ent[s].exp_len = 0; _ent[s].exp_count = 0; _ent[s].exp_base = 0;
+    _ent[s].lib_n = 0;
+}
+
+// ============================================================
+// Building a program image
+// ============================================================
+
+fn _build_cse(s as i64, buf as *u8, size as i64) as i32 {
+    let is i64 as cst_off with mut = 0;
+    let is i64 as cst_size with mut = 0;
+    let is i32 as lrc = locate_cst(buf, size, &cst_off, &cst_size);
+    if (lrc != 0) {
+        serial.print("imgcache: locate rc=", 20);
+        util.print_num(cast(i64, lrc));
+        serial.println("", 0);
+        return lrc;
+    }
+
+    let is *u8 as img with mut = cast(*u8, &buf[cst_off]);
+    if (cast(i64, img[0]) != 0x43 || cast(i64, img[1]) != 0x53
+        || cast(i64, img[2]) != 0x54 || cast(i64, img[3]) != 0x5F) {
+        return cast(i32, 0 - 7);
+    }
+    // Version is major.minor in two bytes: minor 1 marks a container indexing N
+    // images, minor 0 a plain image. Reading it as a u16 would conflate them.
+    let is i64 as ver with mut   = cast(i64, img[H_VERSION]);
+    let is i64 as minor with mut = cast(i64, img[H_VERSION + 1]);
+
+    // v3.1 = multi-arch container. Select the slice matching this machine and
+    // fall through to the ordinary path on it — the payloads are byte-identical
+    // to a single-target link, so nothing below changes.
+    if (ver == 3 && minor == 1) {
+        let is i64 as img_count = cast(i64, img[FAT_COUNT]);
+        let is i64 as index_off = elf.read_u32_le(img, FAT_INDEX_OFF);
+        if (img_count <= 0 || img_count > FAT_MAX) { return cast(i32, 0 - 17); }
+        if (index_off + img_count * FAT_ENTRY > cst_size) { return cast(i32, 0 - 18); }
+        let is i64 as picked with mut = 0 - 1;
+        let is i64 as k with mut = 0;
+        while (k < img_count) {
+            let is i64 as e = index_off + k * FAT_ENTRY;
+            if (cast(i64, img[e]) == CSE_ARCH_NATIVE) {
+                picked = elf.read_u32_le(img, e + 4);
+                k = img_count;
+            } else { k = k + 1; }
+        }
+        if (picked < 0) {
+            serial.println("imgcache: fat image has no slice for this arch", 45);
+            return cast(i32, 0 - 19);
+        }
+        if (picked + H_SIZE > cst_size) { return cast(i32, 0 - 20); }
+        cst_off = cst_off + picked;
+        cst_size = cst_size - picked;
+        img = cast(*u8, &buf[cst_off]);
+        if (cast(i64, img[0]) != 0x43 || cast(i64, img[1]) != 0x53
+            || cast(i64, img[2]) != 0x54 || cast(i64, img[3]) != 0x5F) {
+            return cast(i32, 0 - 21);
+        }
+        ver = cast(i64, img[H_VERSION]);
+        minor = cast(i64, img[H_VERSION + 1]);
+        // A fat image inside a fat image is the nesting this rejects.
+        if (minor != 0 && minor != 2) { return cast(i32, 0 - 22); }
+    }
+    // v2 = 32-byte header; v3 = 48-byte. Minor 0 = static, 2 = imports from
+    // .csl libraries; 1 is the container, unwrapped above.
+    if ((ver != 2 && ver != 3) || (minor != 0 && minor != 2)) {
+        serial.print("imgcache: bad version ", 22);
+        util.print_num(ver);
+        serial.print(".", 1);
+        util.print_num(minor);
+        serial.println("", 0);
+        return cast(i32, 0 - 8);
+    }
+    let is i64 as hsize with mut = H_SIZE;
+    if (ver == 3) { hsize = 0x30; }
+    if (cast(i64, img[H_ARCH]) != CSE_ARCH_NATIVE) { return cast(i32, 0 - 9); }
+
+    let is i64 as entry = elf.read_u64_le(img, H_ENTRY);
+    let is i64 as nseg  = elf.read_u32_le(img, H_SEGCOUNT);
+    if (entry == 0) { return cast(i32, 0 - 10); }
+    if (nseg <= 0 || nseg > CSE_MAX_SEGS) { return cast(i32, 0 - 11); }
+    if (hsize + nseg * S_SIZE > cst_size) { return cast(i32, 0 - 12); }
+
+    _ent[s].entry = entry;
+    _ent[s].kind  = IMG_KIND_CSE;
+    if (ver == 3) {
+        // v3 declares its worst-case user stack at 0x2C, computed by the
+        // toolchain from the call graph. The initial stack is committed to
+        // exactly that — no OS default.
+        _ent[s].stack_size = elf.read_u32_le(img, H_STACKSIZE);
+        _ent[s].hdr_flags  = cast(i64, img[H_FLAGS]);
+    }
+
+    let is i32 as rc = _lay_all(s, buf, cst_off, cst_size, cst_off + hsize, nseg);
+    if (rc != 0) { return rc; }
+
+    // Imports, if any. AFTER the frames, because the sites being patched live
+    // in them — and once, here, rather than on every spawn: a library sits at a
+    // fixed linked base, so the address a symbol resolves to is the same in
+    // every process and the patched text is identical for all of them.
+    if (ver == 3 && minor == 2) {
+        let is i64 as imp_off   = elf.read_u64_le(img, H_IMPORT_OFF);
+        let is i64 as imp_count = elf.read_u32_le(img, H_IMPORT_COUNT);
+        if (imp_count > 0) {
+            if (imp_off <= 0 || imp_off >= cst_size) { return cast(i32, 0 - 57); }
+            return _resolve_imports(s, img, cst_size, imp_off, imp_count);
+        }
+    }
+    return 0;
+}
+
+// Resolve every import of a v3.2 image into this entry's own frames.
+fn _resolve_imports(s as i64, img as *u8, cst_size as i64,
+                    imp_off as i64, imp_count as i64) as i32 {
+    if (imp_off + 12 > cst_size) { return cast(i32, 0 - 47); }
+    let is i64 as n      = elf.read_u32_le(img, imp_off);
+    let is i64 as nlibs  = elf.read_u32_le(img, imp_off + 4);
+    let is i64 as nnames = elf.read_u32_le(img, imp_off + 8);
+    if (n != imp_count) { return cast(i32, 0 - 48); }
+    if (nlibs <= 0 || nlibs > ENT_LIB_MAX) { return cast(i32, 0 - 49); }
+    if (nnames <= 0 || nnames > IMP_MAX_NAMES) { return cast(i32, 0 - 61); }
+
+    // Library table, then the name table, then the fixed-size entries. Every
+    // read is bounds-checked against the image.
+    let is i64 as cur with mut = imp_off + 12;
+    let is i64 as li with mut = 0;
+    while (li < nlibs) {
+        let is i64 as start = cur;
+        while (cur < cst_size && img[cur] != cast(u8, 0)) { cur = cur + 1; }
+        if (cur >= cst_size) { return cast(i32, 0 - 50); }
+        let is i64 as slot = _acquire_lib_locked(cast(*u8, &img[start]), cur - start);
+        if (slot < 0) { return cast(i32, 0 - 51); }
+        _ent[s].libs[li] = slot;
+        _ent[s].lib_n = li + 1;
+        cur = cur + 1;
+        li = li + 1;
+    }
+
+    // Names are interned, so a symbol used at fifty call sites is resolved ONCE
+    // and its address reused — resolution is a linear walk of the library's
+    // export table, and doing it per site rather than per symbol was the other
+    // half of the cost.
+    let is [512]i64 as name_off;
+    let is [512]i64 as name_len;
+    let is [512]i64 as name_val;
+    let is i64 as ni with mut = 0;
+    while (ni < nnames) {
+        let is i64 as start = cur;
+        while (cur < cst_size && img[cur] != cast(u8, 0)) { cur = cur + 1; }
+        if (cur >= cst_size) { return cast(i32, 0 - 53); }
+        name_off[ni] = start;
+        name_len[ni] = cur - start;
+        name_val[ni] = 0 - 2;          // -2 = not resolved yet
+        cur = cur + 1;
+        ni = ni + 1;
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (cur + 24 > cst_size) { return cast(i32, 0 - 52); }
+        let is i64 as rtype    = elf.read_u32_le(img, cur);
+        let is i64 as lib_idx  = elf.read_u32_le(img, cur + 4);
+        let is i64 as name_idx = elf.read_u32_le(img, cur + 8);
+        let is i64 as site     = elf.read_u64_le(img, cur + 16);
+        cur = cur + 24;
+
+        if (lib_idx < 0 || lib_idx >= nlibs) { return cast(i32, 0 - 54); }
+        if (name_idx < 0 || name_idx >= nnames) { return cast(i32, 0 - 62); }
+        let is i64 as sv with mut = name_val[name_idx];
+        if (sv == 0 - 2) {
+            sv = _sym(_ent[s].libs[lib_idx], cast(*u8, &img[name_off[name_idx]]),
+                      name_len[name_idx]);
+            name_val[name_idx] = sv;
+        }
+        if (sv < 0) {
+            serial.print("imgcache: unresolved import ", 28);
+            serial.print(cast(*u8, &img[name_off[name_idx]]), name_len[name_idx]);
+            serial.println("", 0);
+            return cast(i32, 0 - 55);
+        }
+        let is i64 as width with mut = 4;
+        if (rtype == R_X86_64_64) { width = 8; }
+        else if (rtype != R_X86_64_PC32 && rtype != R_X86_64_PLT32) {
+            serial.print("imgcache: unsupported reloc type ", 33);
+            util.print_num(rtype);
+            serial.println("", 0);
+            return cast(i32, 0 - 56);
+        }
+        let is i32 as prc = _patch_site(s, site, sv, width);
+        if (prc != 0) { return prc; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Public acquire / map
+// ============================================================
+
+// Acquire the image an already-open file holds. The caller owns the VfsFile and
+// closes it; the cache keeps frames, never the handle.
+fn acquire_file(f as *vfs.VfsFile) as i64 {
+    if (cast(i64, f) == 0) { return 0 - 1; }
+    lock.acquire(&_lk);
+    let is i64 as cluster = f.first_cluster;
+    let is i64 as fsize   = f.size;
+
+    let is i64 as hit = _slot_find(cluster, fsize);
+    if (hit >= 0) {
+        _ent[hit].refcount = _ent[hit].refcount + 1;
+        lock.release(&_lk);
+        return hit;
+    }
+
+    let is i64 as sz with mut = 0;
+    let is i64 as buf = _slurp(f, &sz);
+    if (buf == 0) { lock.release(&_lk); return 0 - 1; }
+
+    let is i64 as s = _slot_alloc();
+    if (s < 0) { vmm.kvunmap(buf); lock.release(&_lk); return 0 - 1; }
+    _ent_reset(s, cluster, fsize);
+    let is i32 as rc = _build_cse(s, cast(*u8, buf), sz);
+    vmm.kvunmap(buf);
+    if (rc != 0) {
+        serial.print("imgcache: build rc=", 19);
+        util.print_num(cast(i64, rc));
+        serial.println("", 0);
+        _free_locked(s);
+        lock.release(&_lk);
+        return 0 - 1;
+    }
+    lock.release(&_lk);
+    return s;
+}
+
+// Acquire an image from bytes the kernel already holds (a boot-embedded smoke).
+// Anonymous: keyed by nothing, so it is never found by a later lookup and its
+// frames go back the moment its last aspace dies.
+fn acquire_bytes(buf as *u8, size as i64) as i64 {
+    lock.acquire(&_lk);
+    let is i64 as s = _slot_alloc();
+    if (s < 0) { lock.release(&_lk); return 0 - 1; }
+    _ent_reset(s, 0, size);
+    let is i32 as rc = _build_cse(s, buf, size);
+    if (rc != 0) {
+        serial.print("imgcache: build rc=", 19);
+        util.print_num(cast(i64, rc));
+        serial.println("", 0);
+        _free_locked(s);
+        lock.release(&_lk);
+        return 0 - 1;
+    }
+    lock.release(&_lk);
+    return s;
+}
+
+// Map one side of an entry into an aspace. Read-only frames are SHARED — the
+// same physical pages in every address space, VMA_FILE so teardown unmaps
+// without freeing. Consecutive pages go in as one VMA per segment rather than
+// one per page: a 1 MiB image is 256 pages, and the bookkeeping is charged to
+// the process.
+fn _map_shared(s as i64, a as *vma.Aspace) as i32 {
+    if (_ent[s].ro_n == 0) { return 0; }
+    let is *i64 as vs = cast(*i64, _ent[s].ro_va);
+    let is *i64 as ps = cast(*i64, _ent[s].ro_pfn);
+    let is *i64 as pr = cast(*i64, _ent[s].ro_prot);
+    let is i64 as i with mut = 0;
+    while (i < _ent[s].ro_n) {
+        // Extend the run while the VA stays contiguous and the protection is
+        // the same — that is exactly one source segment.
+        let is i64 as j with mut = i + 1;
+        while (j < _ent[s].ro_n && vs[j] == vs[j - 1] + pmm.PAGE_SIZE && pr[j] == pr[i]) {
+            j = j + 1;
+        }
+        let is i64 as got = vma.mmap_pages_at(a, vs[i], cast(i64, &ps[i]), j - i,
+                                              pr[i], cast(i64, 0));
+        if (got != vs[i]) { return cast(i32, 0 - 59); }
+        i = j;
+    }
+    return 0;
+}
+
+// The writable half: a private copy per process, filled from the template.
+// Sharing it would let one program see another's writes — the whole reason the
+// R/W split is the shareability test.
+fn _map_private(s as i64, a as *vma.Aspace) as i32 {
+    if (_ent[s].rw_n == 0) { return 0; }
+    let is *i64 as vs = cast(*i64, _ent[s].rw_va);
+    let is *i64 as ps = cast(*i64, _ent[s].rw_pfn);
+    let is *i64 as pr = cast(*i64, _ent[s].rw_prot);
+    let is i64 as i with mut = 0;
+    while (i < _ent[s].rw_n) {
+        let is i64 as j with mut = i + 1;
+        while (j < _ent[s].rw_n && vs[j] == vs[j - 1] + pmm.PAGE_SIZE && pr[j] == pr[i]) {
+            j = j + 1;
+        }
+        let is i64 as got = vma.mmap_anon(a, vs[i], (j - i) * pmm.PAGE_SIZE,
+                                          pr[i], vma.VMA_FIXED);
+        if (got != vs[i]) { return cast(i32, 0 - 43); }
+        // Copy through the physical pages: the destination may be read-only to
+        // the process, and this write is the kernel's, not its.
+        let is i64 as k with mut = i;
+        while (k < j) {
+            let is i64 as dphys = vmm.virt_to_phys_walk(a.pml4_phys, vs[k]);
+            if (dphys == 0) { return cast(i32, 0 - 44); }
+            let is i64 as src = pmm.phys_to_virt(pmm.pfn_to_phys(cast(i32, ps[k])));
+            let is i64 as dst = pmm.phys_to_virt(dphys);
+            _copy_page(dst, src);
+            k = k + 1;
+        }
+        i = j;
+    }
+    return 0;
+}
+
+// Map an image, and everything it imports from, into a fresh address space.
+fn map(slot as i64, a as *vma.Aspace) as i32 {
+    if (slot < 0 || slot >= ENT_MAX) { return cast(i32, 0 - 1); }
+    lock.acquire(&_lk);
+    if (_ent[slot].in_use == 0) { lock.release(&_lk); return cast(i32, 0 - 1); }
+
+    // Libraries first: their bases are distinct and below the program's, and a
+    // failure here must not leave a half-mapped program behind.
+    let is i64 as i with mut = 0;
+    while (i < _ent[slot].lib_n) {
+        let is i64 as ls = _ent[slot].libs[i];
+        let is i32 as lrc with mut = _map_shared(ls, a);
+        if (lrc == 0) { lrc = _map_private(ls, a); }
+        if (lrc != 0) { lock.release(&_lk); return lrc; }
+        i = i + 1;
+    }
+    let is i32 as rc with mut = _map_shared(slot, a);
+    if (rc == 0) { rc = _map_private(slot, a); }
+
+    // The declared stack travels with the image: the loader commits exactly it,
+    // no OS default (strict reserve/commit — see the memory model).
+    if (rc == 0) {
+        if (_ent[slot].stack_size > 0) { a.stack_size = _ent[slot].stack_size; }
+        if ((_ent[slot].hdr_flags & 1) != 0) { a.stack_dynamic = 1; }
+    }
+    lock.release(&_lk);
+    return rc;
+}
+
+// ============================================================
+// Introspection — what the cache is holding (free/top read this).
+// ============================================================
+
+// [entries, resident_pages, shared_pages]. resident = every frame the cache
+// owns; shared = the read-only half, the part that costs one copy no matter
+// how many processes run it.
+fn stats(out as *i64) as void {
+    lock.acquire(&_lk);
+    let is i64 as n with mut = 0;
+    let is i64 as res with mut = 0;
+    let is i64 as sh with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < ENT_MAX) {
+        if (_ent[i].in_use != 0) {
+            n = n + 1;
+            res = res + _ent[i].ro_n + _ent[i].rw_n;
+            sh = sh + _ent[i].ro_n;
+        }
+        i = i + 1;
+    }
+    lock.release(&_lk);
+    out[0] = n; out[1] = res; out[2] = sh;
+}
