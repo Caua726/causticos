@@ -4,11 +4,12 @@ How causticos is put together, and *why*. This is the design record for the
 userspace model: processes, IPC, devices, display, input, and the terminal/shell —
 plus the principles that decide each call.
 
-> Status note: some of this is **built and verified** (processes, the polymorphic fd
-> object, the syscall ABI, storage/VFS). The rest (channel, surface, device
-> acquisition, terminal, shell) is **designed here, not yet built** — see
-> [Status](#11-status-built-vs-designed). This
-> document is the decided design, written down so it isn't re-litigated.
+> Status note: nearly all of this is **built and verified** — processes, channels,
+> surfaces, device acquisition, the compositor, the window manager, the terminal and
+> the shell all exist and ship. §11 lists what is built and the short list that is
+> still only designed. This document is the decided design, written down so it isn't
+> re-litigated; where it once described an intention as though it were the system,
+> §2 now says so plainly.
 
 ---
 
@@ -47,12 +48,25 @@ Three things this is, and is not:
    the fd table, and the dispatch of raw events. *Anything with a decision in it* —
    the terminal, the shell, the keymap, compositing, line editing, job control — is a
    userspace program. The kernel has no concept of "shell", "terminal", or "tty".
-2. **Explicit acquisition; no ambient global namespace.** You obtain a key by either
-   (a) **asking the kernel** — `dev_open` a device by class, `open` a file, create a
-   channel — or (b) **being handed one** at spawn or over a channel. There is **no
-   global path you implicitly resolve against**: no ambient cwd, no `/dev` tree, no
-   ambient root. Names, if they ever exist, resolve through a namespace you were
-   *granted*, never a global one.
+2. **Explicit acquisition; authority is the key, not the name.** You obtain a key by
+   either (a) **asking the kernel** — `dev_open` a device by class, `open` a file,
+   `spawn` a program — or (b) **being handed one** at spawn or over a channel. Once
+   you hold it, the key is the whole of your authority over that thing: it is what
+   you pass, what you close, and what the kernel checks.
+
+   The root filesystem **is** a global namespace, and this document used to claim it
+   was not. `open("/x")` resolves against it from any process; so does `spawn` when
+   given a path, and so does the loader when it pulls a program's libraries out of
+   `/lib`. Saying otherwise described an intention, not the system. What is true, and
+   is the part that matters, is narrower: **a name is never authority.** A path gets
+   you a key by going through the kernel, and everything after that — reading,
+   writing, passing it to a child — happens through the key alone. There is no
+   ambient cwd (the shell keeps its own and resolves before it asks), no `/dev` tree,
+   and `argv` is data the kernel never resolves.
+
+   Granted, per-process namespaces — where even that first `open` resolves through a
+   root you were handed — remain the direction. They are not built, and until they
+   are, this paragraph says so.
 3. **Open, not sandboxed.** causticos is **not** a capability-lockdown OS. Any program
    may *ask* for any resource. The real constraint on hardware is **physical
    exclusivity, not permission**: a physical device has one owner at a time. **User >
@@ -85,10 +99,29 @@ yielding raw event streams. The set stays small on purpose: one new concept, the
   pid + lineage (parent/children) + state/exit_code + one or more threads. A *Thread*
   is the scheduler/execution unit and points back to its Process (`process_ptr`).
   `pid != tid`.
-- **Creation = create-suspended → configure → start. No fork.** `spawn(image)` makes a
-  fresh aspace, loads a fresh image, and creates a suspended main thread. The child's
-  fd table starts **empty** — authority is never ambient; the parent installs keys
-  explicitly. There is no COW address-space duplication.
+- **Creation = create-suspended → configure → start. No fork.** `spawn` makes a fresh
+  aspace, loads a fresh image, and creates a suspended main thread. The child's fd
+  table starts **empty** — authority is never ambient; the parent installs keys
+  explicitly. There is no COW address-space duplication. (This is the same shape NT
+  uses — `NtCreateProcessEx` then `NtCreateThreadEx` then resume — arrived at
+  independently and for the same reason: every step of building a child should be
+  something you can see.)
+- **A spawn NAMES its source; it does not carry it.** `SpawnParams` gives either a
+  path the kernel opens or an **fd you already hold** (a file, or a segment for an
+  image that never came from the filesystem). It used to take the image as bytes,
+  which meant the parent read the whole file into an eager-committed mapping, the
+  kernel staged a second copy, and the loader copied a third time into the child —
+  and because bytes are not an object, ten processes running one program cost ten
+  copies of its text. Nobody else does that: Linux and the BSDs take a path or an fd
+  (`execveat`), NT an image **section**, Fuchsia a **VMO**, seL4 **frame caps**. What
+  travels is always a reference, because a buffer can be neither shared nor counted.
+- **The image cache** (`kernel/sys/imgcache.cst`) is what a named source buys. A
+  program's read-only segments are laid into frames once, keyed by what the file *is*
+  (first cluster + size), and those same frames are mapped into every process running
+  it; only the writable half is copied per process. Its libraries ride the same
+  mechanism, which is where it started. Frames come back under memory pressure
+  (`pmm.alloc_pages` reclaims before reporting OOM), and while a process is running
+  from a file, changing that file is `E_TXTBSY`.
 - **wait + deferred reaper.** A dying thread can't free its own kernel stack (it is
   running on it). It is queued in `schedule()` *before* the context switch and freed
   by a per-cpu reaper in `idle` *after* the switch — race-free. `wait` then frees the
@@ -223,13 +256,19 @@ userspace programs.
   keyboard device, renders text (cursor, scroll, colours — all its own policy),
   applies the keymap, and **serves console channels** to clients.
 - **The shell** is a userspace program. It holds a **console channel** (received at
-  spawn), reads keys / writes characters, and runs programs the explicit way:
-  `open()` the program's `.cse` → `read` it into an `mmap`'d buffer → `spawn(buf)` →
-  `wait`. It passes a console channel to each child it runs (that is how the child's
-  stdio "inherits"). No special `spawn-by-path` syscall — the shell reads the file and
-  passes the image.
-- **Launch *(built)*.** The boot path loads `/init.cse` from the FAT32 disk
-  (`vfs.open → read → proc_spawn → proc_start`, behind a bounded mount-wait, failing
+  spawn), reads keys / writes characters, and runs programs by naming them:
+  `spawn(path)` → `wait`. It passes a console channel to each child it runs (that is
+  how the child's stdio "inherits").
+
+  It used to read the `.cse` into an `mmap`'d buffer and hand `spawn` the bytes,
+  which is what the "no spawn-by-path" rule cost: an eager-committed copy of every
+  program the shell launched, held for as long as the job lived, and no sharing
+  between two shells running the same thing. The rule was also not true of the
+  kernel, which already opened `/lib` by path in the middle of a spawn. Naming a
+  source is *more* faithful to §1, not less — a path gets you a key through the
+  kernel, and authority still travels only as keys.
+- **Launch *(built)*.** The boot path loads `/init.cse` from the root volume
+  (`vfs.open → proc_spawn_file → proc_start`, behind a bounded mount-wait, failing
   loud — never a silent hang) and runs it in ring 3. `init` is an ordinary file on the
   disk, not embedded: drop the terminal in as `/init.cse` and it launches, no kernel
   change. The terminal then `dev_open`s the surface + keyboard and spawns the shell with
@@ -319,6 +358,10 @@ in a swappable userspace program.
   terminal — the kernel side of the userspace model is now complete.**
 
 **Built since:**
+- **A spawn names its source** (§4): `SpawnParams` carries a path or an fd, never the
+  image, and `kernel/sys/imgcache.cst` maps one set of frames into every process
+  running the same program — with reclaim under memory pressure and `E_TXTBSY` while
+  a process is running from a file. `userspace/tests/imgt.cst` measures it.
 - **Preemptible device ownership** (grab stack) — keyboard, mouse, and the framebuffer
   surface all ride `kernel/sys/grab.cst`; a non-top holder goes quiet, ownership returns
   on close.
@@ -328,10 +371,11 @@ in a swappable userspace program.
   fds (`SYS_EVENT_SUBSCRIBE`); device enumeration (`SYS_QUERY_DEVS`).
 
 **Designed here, not yet built:**
-- **Userspace keymap + focus relay** (the kernel side — raw keyboard as a device — is
-  built; full layout/cooking/routing policy still lands in the terminal).
-- Rich granted namespaces; handle-passing over a channel (SCM_RIGHTS-style, beyond the
-  current one-slot `SYS_FD_SEND`/`SYS_FD_RECV`).
+- **Granted, per-process namespaces** — the piece §2 is honest about not having: a
+  root you were handed, so that even the first `open` resolves through a key rather
+  than against the one global filesystem.
+- **Handle-passing over a channel** beyond the current one-slot
+  `SYS_FD_SEND`/`SYS_FD_RECV` (SCM_RIGHTS-style, several in flight).
 
 ---
 

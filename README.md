@@ -53,6 +53,7 @@ Around 74k lines of Caustic across 248 modules. x86_64 only.
 - **Network** — e1000 and virtio-net drivers under a `DEV_NET` class that hands userspace raw ethernet frames, and `netd`: ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, HTTP/1.1 and TLS 1.3 with certificate verification, all in ring 3. `wget https://…` works.
 - **Sound** — a `DEV_AUDIO_OUT` / `DEV_AUDIO_IN` class: a DMA ring of PCM and a control page, mapped into the holder, or fed with `write()`. virtio-sound drives it; Intel HDA (the one real machines have) is still to come.
 - **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, process spawn with fd handoff, channels, shared segments, eventfds, surfaces. 99 programs: a shell, ~45 coreutils, monitors (`ps`, `top`, `btop`, `htop`, `df`, `free`), editors (`vic`, `pager`, `hexedit`), and the network and audio tools (`ping`, `wget`, `nslookup`, `nc`, `httpd`, `aplay`, `arecord`).
+- **Spawning names the image, never carries it** — a path, or an fd you hold (a file, or a segment for an image that was never on disk). The kernel reads it once into frames that every later spawn of the same program maps instead of copying, so a second terminal costs its data and not its code. Changing a file a process is running from is `E_TXTBSY`.
 - **Desktop** — a compositor that owns the framebuffer and input, a window manager with tags, layouts and a config file, a terminal emulator, and a launcher.
 - **Self-hosting** — the Caustic compiler compiles itself *on* causticos, four rounds, byte-identical.
 

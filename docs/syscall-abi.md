@@ -7,8 +7,16 @@ syscall lib) needs to talk to the kernel. Pairs with
 
 > Status: **v0, provisional** — numbers/layouts may still change until
 > self-host (then `ABI_MAJOR` gates incompatible changes). Source of truth:
-> `kernel/abi.cst` + the handlers in `kernel/syshandlers.cst`. `SYS_COUNT = 27`
-> (syscall `N` exists iff `N < SYS_COUNT`; probe it via `KERN_INFO`).
+> `kernel/abi.cst` + the handlers in `kernel/sys/syshandlers.cst`.
+> **`SYS_COUNT = 55`** (syscall `N` exists iff `N < SYS_COUNT`; probe it via
+> `KERN_INFO`).
+>
+> **The table below covers 0–26 only.** Everything from 27 up — commit/decommit,
+> segments, fd passing, poll, kill, the ps/top/free introspection calls, power,
+> statx, event fds, threads, device/network/audio queries, randomness — is real
+> and shipped but documented nowhere except `kernel/abi.cst`, which carries a
+> comment per number. This file drifted; saying by how much beats implying the
+> ABI is a third of its size.
 
 ---
 
@@ -47,7 +55,7 @@ Args are listed by register. "→" is the `rax` return.
 | 11 | `WRITE` | fd | buf | n | | | bytes \| errno |
 | 12 | `CLOSE` | fd | | | | | 0 \| errno |
 | 13 | `LSEEK` | fd | off | whence | | | new offset \| errno |
-| 14 | `SPAWN` | img | img_len | fdacts | n_acts | argv | argc → child pid \| errno |
+| 14 | `SPAWN` | *SpawnParams | | | | | child pid \| errno |
 | 15 | `WAIT` | pid | status_ptr | | | | exit code \| `E_AGAIN` |
 | 16 | `UNLINK` | path | path_len | | | | 0 \| errno |
 | 17 | `MKDIR` | path | path_len | | | | 0 \| errno |
@@ -76,11 +84,23 @@ Per-call notes:
   endpoint, a keyboard device. They block where the object blocks (a channel
   read waits for bytes; a keyboard read waits for events; `0` from a channel
   = the peer closed = EOF).
-- **`SPAWN`** (14): only a Process may spawn (`E_PERM` otherwise). The child's
-  fd table starts **empty**; `fdacts` (a `[{child_fd, src_fd}]` array,
-  `n_acts ≤ 16`) is the *only* way it gets keys — see §6. `img` is the in-memory
-  CSE image (≤ 64 KiB in v0). There is **no spawn-by-path**; read the file
-  yourself and pass the bytes.
+- **`SPAWN`** (14): takes ONE pointer, to a `SpawnParams` (§5). Only a Process
+  may spawn (`E_PERM` otherwise). The child's fd table starts **empty**; `fdacts`
+  (a `[{child_fd, src_fd}]` array, `n_acts ≤ 16`) is the *only* way it gets
+  keys — see §6.
+
+  A spawn **names its source**; it does not carry the image. `src_kind` selects
+  either a path the kernel opens (`SPAWN_SRC_PATH`) or an fd you already hold
+  (`SPAWN_SRC_FD` — a file, or a **segment** for an image that never came from
+  the filesystem, which is the `memfd_create` + `execveat` shape). An fd source
+  is borrowed: it stays yours and you still close it.
+
+  It used to take the bytes, and every caller paid the same three copies for it —
+  an eager-committed one in the parent, a staging one in the kernel, and the
+  loader's into the child — with nothing shared between two processes running the
+  same program. The kernel now reads the source once into frames that every later
+  spawn of that file maps instead of copying. While a process is running from a
+  file, writing/unlinking/renaming it is `E_TXTBSY`.
   `argv` (r8) is an array of `argc` (r9, ≤ 32) `{str_ptr, str_len}` i64 pairs —
   the child's argument vector, copied onto its initial System V stack (at
   `_start`, `rsp` → `argc`, then `argv[0..n]`, NULL, **empty envp**, auxv). argv
@@ -122,7 +142,7 @@ Per-call notes:
 | -5 | `E_NOMEM` | | -14 | `E_NOSPC` |
 | -6 | `E_RANGE` | | -15 | `E_IO` |
 | -7 | `E_PERM` | | -16 | `E_PIPE` (write to a channel whose far end closed) |
-| -8 | `E_AGAIN` | | | |
+| -8 | `E_AGAIN` | | -17 | `E_TXTBSY` (change a file a live process was loaded from) |
 
 ---
 
@@ -158,6 +178,13 @@ layouts the kernel reads/writes.
 **`VfsDirEntry`** (from `READDIR`): `name[256]` (u8, NUL-padded), then five i64 —
 `name_len, first_cluster, size, attr, is_dir`.
 
+**`SpawnParams`** (72 B, `SPAWN`'s only argument): nine i64 —
+`src_kind, src_fd, path_uptr, path_len, fdacts_uptr, n_acts, argv_uptr, argc,
+budget`. `src_kind` is `SPAWN_SRC_PATH (0)` or `SPAWN_SRC_FD (1)`; anything else
+is `E_INVAL`, because a source is named explicitly rather than inferred from
+whichever field happens to be non-zero (fd 0 is a real fd). `budget` 0 = no
+ceiling; > 0 caps the child's `committed_bytes`.
+
 **`FdAction`** (16 B; `SPAWN`'s `fdacts` is an array of these): two i64 —
 `child_fd, src_fd`. Installs the KObject the parent holds at `src_fd` into the
 child's table at `child_fd`.
@@ -191,7 +218,9 @@ READ(kfd, &ev, 2)        # ev[0]=scancode, ev[1]=flags; blocks for an event
 ```
 CHANNEL_CREATE(&fds)                 # fds[0]=fd_a (keep), fds[1]=fd_b (hand off)
 acts = [ {child_fd: 0, src_fd: fd_b} ]
-pid  = SPAWN(child_img, len, acts, 1)   # child gets the endpoint as its fd 0
+sp   = { src_kind: SPAWN_SRC_PATH, path: "/cat.cse", path_len: 8,
+         fdacts: acts, n_acts: 1 }
+pid  = SPAWN(&sp)                       # child gets the endpoint as its fd 0
 WRITE(fd_a, buf, n)  /  READ(fd_a, buf, n)   # talk to the child; child uses fd 0
 WAIT(pid, &status)
 ```
@@ -199,54 +228,55 @@ A console **is** a channel: the terminal keeps one end (renders the bytes the
 shell writes, feeds the keys it typed), the shell holds the other as stdio.
 For a pipe `a | b`, mint a pair and hand the write end to `a`, the read end to `b`.
 
-**Run a program (the shell):** there is no exec-by-path. Do it explicitly:
+**Run a program (the shell):** name it, do not carry it.
 ```
-fd  = OPEN(path, len, O_RDONLY)
-sz  = LSEEK(fd, 0, SEEK_END);  LSEEK(fd, 0, SEEK_SET)
-buf = MMAP(0, sz, MMAP_PROT_READ|MMAP_PROT_WRITE)   # anonymous scratch
-READ(fd, buf, sz);  CLOSE(fd)
 argv = [{ "cat",3 }, { "foo.txt",7 }]               # parsed from the command line
-pid = SPAWN(buf, sz, console_acts, n, argv, 2)      # console = capability, argv = data
+sp   = { src_kind: SPAWN_SRC_PATH, path: "/cat.cse", path_len: 8,
+         fdacts: console_acts, n_acts: n, argv: argv, argc: 2 }
+pid  = SPAWN(&sp)                                   # console = capability, argv = data
 WAIT(pid, &status)
 ```
+This used to be six lines — open, lseek to the end, mmap, read, spawn, munmap —
+because SPAWN took the bytes. Every one of them cost a full eager-committed copy
+of the program in the caller, and no two processes running it shared anything.
 
----
-
-## 7. Gaps to close in the kernel before the terminal (Fatia 4)
-
-These are **my** side (kernel work), not yours — flagged so we both know
-what's missing:
-
-1. ~~**Surface geometry query.**~~ ✅ **Done** — `SURFACE_INFO` (25) copies
-   `{width, height, pitch, bpp_bytes, format}` (5×i64), proven from ring 3 via
-   `fb_smoke`. The device-model is also complete: the `index` in `DEV_OPEN` is
-   honest, `DEV_COUNT` (26) enumerates, and a driver declares its class in its
-   `.cdvrspec` `device { }` block (the framework auto-registers).
-2. ~~**Terminal bootstrap.**~~ ✅ **Done** — the boot path loads `/init.cse`
-   from the FAT32 disk (`vfs.open → read → proc_spawn → proc_start`), behind a
-   bounded mount-wait, failing loud on serial (never a silent hang). It is an
-   ordinary file on the disk: drop your terminal `.cse` in as `/init.cse` and
-   it launches, no kernel change. A stub proves the path (writes a ring-3
-   serial marker). **This is the handoff point — the kernel side is complete;
-   the terminal is yours.**
-3. *(nice-to-have)* `SYS_PROC_KILL` for the shell to stop a runaway child;
-   today only graceful exit + `WAIT`. Not required for a first terminal.
-
-Everything else the terminal/shell need — `dev_open`, `mmap`+`present`,
-channels, `fdacts`, `open/read/write/lseek/close`, `spawn/wait` — is **built
-and proven from ring 3** (see architecture.md §11).
-
----
-
-## 8. What the toolchain side needs (your work)
-
-- A **syscall lib** for the `caustic-x86_64` causticos target: thin wrappers
-  that load `rax` + args and execute `syscall`, one per §2 entry, returning
-  `rax` (negative = errno). The clobber set in §1 is the inline-asm contract.
-- A **keymap** (scancode set-1 → char, modifier state) for the terminal.
-- An **8×8 font** in userspace for text rendering (the kernel's
-  `font/font8x8.cst` is the reference; it moves out of the kernel).
-- The **terminal** and **shell** programs themselves, emitted as `.cse`
-  (CSE_FORMAT.md) for the `caustic` target.
+**Run an image you built in memory** (a compiler that never wrote its output to
+disk). A segment is a key, so this stays inside the model:
+```
+sfd = SEG_CREATE(npages, 0)                   # shareable RAM behind an fd
+SEG_COPY(sfd, 0, img, len, 1)                 # 1 = write into the segment
+sp  = { src_kind: SPAWN_SRC_FD, src_fd: sfd, argv: argv, argc: 1 }
+pid = SPAWN(&sp)
+CLOSE(sfd)                                    # the image was read at spawn
 ```
 
+---
+
+## 7. What this document does not cover
+
+Syscalls 27–54. They exist, they are used by the shipped system, and their only
+description is the per-number comment in `kernel/abi.cst`:
+
+| range | what |
+|---|---|
+| 27–28 | `COMMIT` / `DECOMMIT` — strict reserve/commit (no demand paging) |
+| 29–31 | segments: `SEG_CREATE` / `SEG_CLONE` / `SEG_COPY` |
+| 32–33 | `FD_SEND` / `FD_RECV` — one-slot fd passing over a channel |
+| 34–35 | `POLL`, `PROC_KILL` |
+| 36–39 | `PROC_LIST` / `MEM_INFO` / `STATFS` / `CPU_STAT` (ps, top, free, df) |
+| 40–44 | `TIME_WALL`, `POWEROFF`, `REBOOT`, `POWER_PENDING`, `STATX` |
+| 45 | `EVENT_SUBSCRIBE` — the signal replacement |
+| 46–47 | `THREAD_SPAWN` / `THREAD_EXIT` |
+| 48–53 | device / network / audio queries, `GET_RANDOM`, `RANDOM_QUALITY` |
+
+The sections above were written when the ABI had 27 calls and were not kept up.
+Listing the gap is worth more than pretending it is not there; filling it in is
+its own piece of work.
+
+## 8. The userspace side
+
+All of it exists. The syscall wrappers live in the Caustic stdlib
+(`std/os/causticos.cst`) — `spawn_path`, `spawn_fd`, `open_read`, `dev_open`,
+`poll`, and the rest — and the keymap, the 8x8 font, the terminal and the shell
+are ordinary programs under `userspace/`. This section used to be a to-do list
+addressed to whoever was writing them.
