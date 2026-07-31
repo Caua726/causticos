@@ -41,8 +41,13 @@ GOT=/tmp/shellnet-got.bin
 # dials is signed by the test CA and the machine's real bundle has never heard
 # of it. A guest that accepted it anyway would be the bug.
 DISK=build/disk-shell-net.img
-CA_PEM=build/certs/ca.pem SEED_DISK="$DISK" \
-    "$PY" scripts/mkroot.py --profile shell --img "$DISK" -q
+# The trust store goes on as a FILE at the path wget reads (/etc/ca.pem). It
+# used to be handed over as a CA_PEM environment variable, which nothing has
+# read for a long time — so the guest booted with no test CA, refused the
+# server's certificate exactly as it should, and the test read that correct
+# refusal as a broken TLS stack.
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q \
+    --add "build/certs/ca.pem:/etc/ca.pem"
 
 "$PY" scripts/http-server.py "$PORT" 200 >/tmp/shellnet-srv.log 2>&1 &
 SRV=$!
@@ -54,6 +59,21 @@ MON=/tmp/causticos-shellnet-mon.$$
 LOG=$(mktemp)
 QEMU_DISK="$DISK"
 QEMU_KVM=1
+# The live root inside the ISO outranks an attached disk (prio 100 vs 10), so a
+# seeded disk alone is never mounted — the kernel boots the ISO's own desktop
+# root and every check here looks at the wrong system. root= on the command line
+# is what says "mount THIS one", and it is why the disk is still a disk: the
+# host reads results back out of it after the boot, which a volatile RAM root
+# cannot offer.
+# ROOTED_ISO lets a caller hand us one that is already built. mkiso stages
+# through a single build/iso directory, so eight of these running at once —
+# which is how test-userspace.sh drives them — would tread on each other.
+if [ -n "${ROOTED_ISO:-}" ]; then
+    QEMU_ISO="$ROOTED_ISO"
+else
+    QEMU_ISO=build/test-shell-net.iso
+    bash scripts/mkiso.sh --cmdline "root=ahci-p0" --out "$QEMU_ISO" >/dev/null
+fi
 source scripts/qemu-args.sh
 
 qemu-system-x86_64 "${QEMU_ARGS[@]}" \
@@ -126,7 +146,12 @@ wait_for_file() {
     # to say so is most of what made this suite too slow to run.
     for (( i=0; i<100; i++ )); do
         sleep 0.2
-        if "$PY" scripts/fat32_get.py "$DISK" "$name" "$GOT" >/dev/null 2>&1; then
+        # fat32.py, not fat32_get.py: the four host-side FAT32 scripts were
+        # consolidated into one with subcommands and this call kept the dead
+        # name. With stderr swallowed it looked exactly like "the file is not
+        # there yet" — every iteration, until the loop gave up and blamed the
+        # guest for a download that had in fact arrived.
+        if "$PY" scripts/fat32.py "$DISK" get "$name" "$GOT" >/dev/null 2>&1; then
             if [ "$(stat -c%s "$GOT" 2>/dev/null || echo 0)" = "$want" ]; then return 0; fi
         fi
         kill -0 $QPID 2>/dev/null || return 1

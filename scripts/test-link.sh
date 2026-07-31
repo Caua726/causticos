@@ -32,6 +32,21 @@ MON=/tmp/causticos-link-mon.$$
 LOG=$(mktemp)
 QEMU_DISK="$IMG"
 QEMU_KVM=1
+# The live root inside the ISO outranks an attached disk (prio 100 vs 10), so a
+# seeded disk alone is never mounted — the kernel boots the ISO's own desktop
+# root and every check here looks at the wrong system. root= on the command line
+# is what says "mount THIS one", and it is why the disk is still a disk: the
+# host reads results back out of it after the boot, which a volatile RAM root
+# cannot offer.
+# ROOTED_ISO lets a caller hand us one that is already built. mkiso stages
+# through a single build/iso directory, so eight of these running at once —
+# which is how test-userspace.sh drives them — would tread on each other.
+if [ -n "${ROOTED_ISO:-}" ]; then
+    QEMU_ISO="$ROOTED_ISO"
+else
+    QEMU_ISO=build/test-link.iso
+    bash scripts/mkiso.sh --cmdline "root=ahci-p0" --out "$QEMU_ISO" >/dev/null
+fi
 source scripts/qemu-args.sh
 
 qemu-system-x86_64 "${QEMU_ARGS[@]}" \

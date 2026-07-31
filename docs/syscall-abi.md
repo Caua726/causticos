@@ -11,12 +11,7 @@ syscall lib) needs to talk to the kernel. Pairs with
 > **`SYS_COUNT = 55`** (syscall `N` exists iff `N < SYS_COUNT`; probe it via
 > `KERN_INFO`).
 >
-> **The table below covers 0–26 only.** Everything from 27 up — commit/decommit,
-> segments, fd passing, poll, kill, the ps/top/free introspection calls, power,
-> statx, event fds, threads, device/network/audio queries, randomness — is real
-> and shipped but documented nowhere except `kernel/abi.cst`, which carries a
-> comment per number. This file drifted; saying by how much beats implying the
-> ABI is a third of its size.
+> All 55 are listed. §2 covers 0–26, §2b covers 27–54.
 
 ---
 
@@ -68,6 +63,43 @@ Args are listed by register. "→" is the `rax` return.
 | 24 | `CHANNEL_CREATE` | out_ptr | | | | | 0; writes `[fd_a, fd_b]` (2×i64) \| errno |
 | 25 | `SURFACE_INFO` | fd | out | | | | 0; writes `{w,h,pitch,bpp,fmt}` (5×i64) \| errno |
 | 26 | `DEV_COUNT` | class | | | | | count (≥ 0) |
+
+### 2b. Syscalls 27–54
+
+Appended after the first table was written, and each is documented at its number
+in `kernel/abi.cst` — that comment is the source of truth for the exact layout of
+whatever struct it fills.
+
+| #  | name | args (`rdi, rsi, rdx, r10, r8`) | → |
+|----|------|------|---|
+| 27 | `COMMIT` | addr, len, prot | 0 \| errno — back a reserved range with frames |
+| 28 | `DECOMMIT` | addr, len | 0 \| errno — drop the frames, keep the reservation |
+| 29 | `SEG_CREATE` | npages, flags | fd \| errno — shareable RAM behind a key |
+| 30 | `SEG_CLONE` | fd | fd \| errno — a second fd over the same frames |
+| 31 | `SEG_COPY` | fd, off, ubuf, len, dir | 0 \| errno; dir 0 = seg→buf, 1 = buf→seg |
+| 32 | `FD_SEND` | chan_fd, fd | 0 \| `E_AGAIN` (slot busy) — one-slot SCM_RIGHTS |
+| 33 | `FD_RECV` | chan_fd | fd \| `E_AGAIN` (nothing pending) |
+| 34 | `POLL` | entries, n, timeout_ns | n_ready \| errno (§5 `PollEntry`) |
+| 35 | `PROC_KILL` | pid | 0 \| `E_NOENT` (not your child) |
+| 36 | `PROC_LIST` | entries, max | total live count (may exceed `max`) |
+| 37 | `MEM_INFO` | out | 0; `[total_pages, free_pages, page_size, committed]` |
+| 38 | `STATFS` | out | 0; `[total_bytes, free_bytes, block_size]` |
+| 39 | `CPU_STAT` | out | ncpu; `[ncpu, busy_ns per cpu…, now_ns]`, cumulative |
+| 40 | `TIME_WALL` | out | 0; raw RTC `[year,month,day,hour,min,sec]` |
+| 41 | `POWEROFF` | | does not return — ACPI S5 |
+| 42 | `REBOOT` | | does not return |
+| 43 | `POWER_PENDING` | | 1 if the power button was pressed (the WM polls this) |
+| 44 | `STATX` | path, len, out | 0 \| errno — `stat` plus mtime |
+| 45 | `EVENT_SUBSCRIBE` | pid, mask | fd \| errno — the signal replacement |
+| 46 | `THREAD_SPAWN` | entry, arg, stack_top | tid \| errno (same aspace) |
+| 47 | `THREAD_EXIT` | code | does not return |
+| 48 | `QUERY_DEVS` | out, max | total device count |
+| 49 | `DEV_INFO` | class, index, out | 0 \| errno |
+| 50 | `NET_INFO` | net_fd, out | 0 \| errno — mtu, link state, frame_max |
+| 51 | `GET_RANDOM` | buf, len | bytes \| errno |
+| 52 | `RANDOM_QUALITY` | | `RANDOM_*` — says when the machine has no real entropy |
+| 53 | `AUDIO_INFO` | audio_fd, out | 0 \| errno — the geometry the stream opened with |
+| 54 | `CHAN_INFO` | chan_fd, out | 0 \| errno |
 
 **Pointers are user virtual addresses**; the kernel copies in/out and
 validates them (bad pointer → `E_FAULT`). All sizes/counts are bytes unless
@@ -252,26 +284,12 @@ CLOSE(sfd)                                    # the image was read at spawn
 
 ---
 
-## 7. What this document does not cover
+## 7. Where the detail lives
 
-Syscalls 27–54. They exist, they are used by the shipped system, and their only
-description is the per-number comment in `kernel/abi.cst`:
-
-| range | what |
-|---|---|
-| 27–28 | `COMMIT` / `DECOMMIT` — strict reserve/commit (no demand paging) |
-| 29–31 | segments: `SEG_CREATE` / `SEG_CLONE` / `SEG_COPY` |
-| 32–33 | `FD_SEND` / `FD_RECV` — one-slot fd passing over a channel |
-| 34–35 | `POLL`, `PROC_KILL` |
-| 36–39 | `PROC_LIST` / `MEM_INFO` / `STATFS` / `CPU_STAT` (ps, top, free, df) |
-| 40–44 | `TIME_WALL`, `POWEROFF`, `REBOOT`, `POWER_PENDING`, `STATX` |
-| 45 | `EVENT_SUBSCRIBE` — the signal replacement |
-| 46–47 | `THREAD_SPAWN` / `THREAD_EXIT` |
-| 48–53 | device / network / audio queries, `GET_RANDOM`, `RANDOM_QUALITY` |
-
-The sections above were written when the ABI had 27 calls and were not kept up.
-Listing the gap is worth more than pretending it is not there; filling it in is
-its own piece of work.
+This file is the shape of the ABI. For the exact byte layout of a struct a call
+fills — `PollEntry`, `ProcInfo`, `DevInfo`, `NetInfo`, `AudioInfo`, `Statx` —
+read the comment at that number in `kernel/abi.cst`, which is what the handlers
+are written against and therefore cannot drift from them.
 
 ## 8. The userspace side
 

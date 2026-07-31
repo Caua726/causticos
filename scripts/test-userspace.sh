@@ -28,7 +28,7 @@ source "$(dirname "$0")/portable.sh"
 
 TOUT="${TOUT:-120}"
 START=$SECONDS
-IMG=build/selftests.img
+ISO=build/selftests.iso
 LOG=$(mktemp)
 
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
@@ -41,7 +41,7 @@ if [ ! -f build/certs/srv.pem ]; then bash scripts/make-test-certs.sh >/dev/null
 # --add; /init is the runner itself.
 ADD=(--init runall)
 add() { ADD+=(--add "$2"); }
-for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst; do
+for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst imgt; do
     [ -f "userspace/build/$t.cse" ] && add x "userspace/build/$t.cse"
 done
 # What the tests reach for: the daemon they spawn, the programs they drive, and
@@ -50,6 +50,7 @@ done
 # failing on a day nobody picked.
 for f in userspace/build/netd.cse userspace/build/ping.cse \
          userspace/build/wget.cse userspace/build/netsnoop.cse \
+         userspace/build/shell.cse \
          build/certs/root.der build/certs/int.der build/certs/leaf.der \
          build/certs/wild.der build/certs/expired.der build/certs/future.der \
          build/certs/rogue.der build/certs/under.der build/certs/notca.der \
@@ -66,9 +67,14 @@ done
     build/certs/srvchain.pem build/certs/srv.key >/dev/null 2>&1 & E3=$!
 sleep 0.4
 
-"$PY" scripts/mkroot.py --profile base "${ADD[@]}" --img "$IMG" -q
+# An ISO with the runner as /init — NOT a disk. The live root travels inside
+# the image and OUTRANKS an attached disk, so building the harness as a disk
+# meant the kernel mounted the ISO's ordinary desktop root and booted the
+# compositor: every test reported MISSING and the suite blamed the tests. That
+# is what this script did from the day the live root landed.
+bash scripts/mkiso.sh --profile base "${ADD[@]}" --out "$ISO" >/dev/null
 
-QEMU_DISK="$IMG"
+QEMU_ISO="$ISO"
 QEMU_KVM=1
 QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18081}"
 source scripts/qemu-args.sh
@@ -104,7 +110,7 @@ PASS=0; FAIL=0; FAILED=""
 # and a green appt as failures. A process that returns 0 succeeded; that is
 # uniform, it is what runall already reports, and it cannot drift from what the
 # test actually decided. The printed line is kept as detail, not as evidence.
-for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst; do
+for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst imgt; do
     printf '%-9s ' "$t"
     if echo "$RAW" | grep -q "^runall: <<< $t MISSING"; then
         echo "SKIP  (not built)"
@@ -134,11 +140,21 @@ DRIVEN=(
     "linkt|scripts/test-link.sh|host pulled the cable"
     "httpd|scripts/test-httpd.sh|host fetched from the guest"
     "cseforms|scripts/test-cse-forms.sh|pure, compat and bundle"
+    "shellnet|scripts/test-shell-net.sh|wget typed at the prompt"
+)
+
+# The ones that MEASURE TIME, run one at a time. Each of these records real
+# audio off the host and checks how long a tone lasted, to a ±25% tolerance —
+# so six QEMUs competing for the same cores is enough to make a correct system
+# report half a tone. They were in the pool above and failed roughly one run in
+# two, on a different test each time, which is the signature of load rather
+# than of a bug. Tightening nothing and loosening nothing: just not measuring
+# a clock while five other machines fight for it.
+TIMED=(
     "audio|scripts/test-audio.sh|@grep -oE 'ch0: [0-9.]+Hz'"
     "stream|scripts/test-stream.sh|@grep -oE '[0-9]+ KiB/s from the network'"
     "soundd|scripts/test-soundd.sh|mixed two, preempted, resumed"
     "record|scripts/test-record.sh|@grep -oE '[0-9]+ frames'"
-    "shellnet|scripts/test-shell-net.sh|wget typed at the prompt"
 )
 
 # AT THE SAME TIME. They are separate machines with separate disk images and
@@ -149,6 +165,14 @@ DRIVEN=(
 # did not finish: the driven set took longer under it than run one at a time,
 # for reasons not worth chasing when the tool that does this correctly has
 # been in every unix for thirty years.
+# One rooted ISO for the whole fan-out, built HERE because mkiso stages through
+# a single build/iso directory and these run at the same time. The disk each of
+# them seeds is what the kernel must mount, and root= is what says so — the live
+# root inside the ISO outranks a disk otherwise.
+ROOTED_ISO=build/rooted.iso
+bash scripts/mkiso.sh --cmdline "root=ahci-p0" --out "$ROOTED_ISO" >/dev/null
+export ROOTED_ISO
+
 NJOBS="${JOBS:-}"
 if [ -z "$NJOBS" ]; then
     NJOBS=$(( $(nproc 2>/dev/null || echo 4) / 2 ))
@@ -173,6 +197,17 @@ RES="$RES" xargs -P "$NJOBS" -L 1 bash -c '
     printf "%s|%s\n" "$rc" "$((SECONDS-t0))" > "$RES/$1"
 ' < "$PLAN"
 rm -f "$PLAN"
+
+# Then the timed ones, alone, with the pool drained.
+for entry in "${TIMED[@]}"; do
+    name="${entry%%|*}"; rest="${entry#*|}"; script="${rest%%|*}"
+    PORT=$((PORT+1))
+    t0=$SECONDS
+    rc=0
+    QEMU_HTTPD_PORT=$PORT bash "$script" >/tmp/ut-$name.log 2>&1 || rc=1
+    printf "%s|%s\n" "$rc" "$((SECONDS-t0))" > "$RES/$name"
+done
+DRIVEN+=("${TIMED[@]}")
 
 # Reported in list order, not completion order: a suite whose output shuffles
 # between runs cannot be diffed against the last one.

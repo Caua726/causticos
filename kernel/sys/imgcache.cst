@@ -159,7 +159,18 @@ let is i64 as IMP_MAX_NAMES = 512;
 let is i64 as IMG_KIND_CSE = 1;
 let is i64 as IMG_KIND_CSL = 2;
 
-let is i64 as ENT_MAX     = 32;
+// Entries. This is not a cache-size preference — it is a CEILING, and running
+// into it fails a spawn. So it is derived from the real one: a process needs at
+// least one thread, sched.MAX_THREADS is 64, so at most 64 distinct programs can
+// be live at once; the libraries they import need room on top. Keep this above
+// sched.MAX_THREADS + a handful, or a system with many distinct programs running
+// will start refusing to launch anything new.
+//
+// It was 32, which is half of what the scheduler allows, so a busy system could
+// have reached it. ~256 bytes an entry, so the headroom costs ~24 KiB of BSS.
+// (The array literal below must be edited in lockstep — Caustic takes a literal
+// length there, so the constant cannot size it.)
+let is i64 as ENT_MAX     = 96;
 let is i64 as ENT_LIB_MAX = 8;      // libraries one image may import from
 
 // All scalars i64 (the mixed-width struct rule). The page lists are heap
@@ -173,7 +184,6 @@ struct ImgEntry {
     key_cluster as i64;
     key_size    as i64;
     refcount    as i64;      // live aspaces holding this image
-    pinned      as i64;      // 1 = never evicted (a library in use by the cache)
     stale       as i64;      // 1 = the file changed; not findable, freed at reclaim
 
     entry       as i64;      // CSE: entry vaddr
@@ -202,7 +212,7 @@ struct ImgEntry {
     libs        as [8]i64;   // slots of the libraries this image imports from
 }
 
-let is [32]ImgEntry as _ent with mut;
+let is [96]ImgEntry as _ent with mut;   // == ENT_MAX
 
 // A plain ticket lock, NOT the IRQ-saving variant. This lock is held across
 // vfs.open/vfs.read — real disk I/O that waits on an AHCI completion — and
@@ -323,11 +333,17 @@ fn _slot_alloc() as i64 {
         if (_ent[i].in_use == 0) { return i; }
         i = i + 1;
     }
+    // Still nothing: every entry has a live user, so this many DISTINCT programs
+    // are running at once. The spawn is about to fail, and it would otherwise
+    // fail as a bare E_NOMEM with nothing to point at.
+    serial.print("imgcache: no free entry — ", 26);
+    util.print_num(ENT_MAX);
+    serial.println(" distinct images are live; raise ENT_MAX", 40);
     return 0 - 1;
 }
 
 // Release one entry's frames and heap arrays. Caller holds the lock and has
-// checked refcount == 0 && pinned == 0.
+// checked refcount == 0.
 fn _free_locked(s as i64) as i64 {
     let is i64 as freed with mut = 0;
     let is i64 as i with mut = 0;
@@ -384,10 +400,7 @@ fn _reclaim_locked() as i64 {
         again = 0;
         let is i64 as i with mut = 0;
         while (i < ENT_MAX) {
-            // A stale entry goes even if pinned: pinning keeps a library that
-            // is still the library, not one whose bytes have been replaced.
-            if (_ent[i].in_use != 0 && _ent[i].refcount <= 0
-                && (_ent[i].pinned == 0 || _ent[i].stale != 0)) {
+            if (_ent[i].in_use != 0 && _ent[i].refcount <= 0) {
                 freed = freed + _free_locked(i);
                 again = 1;
             }
@@ -466,8 +479,7 @@ fn release(slot as i64) as void {
         // would not be a cache, it would be a leak with a nicer name. Only an
         // image with a file behind it is worth holding, because the next spawn
         // of that program is genuinely likely.
-        if (_ent[slot].refcount <= 0 && _ent[slot].key_cluster == 0
-            && _ent[slot].pinned == 0) {
+        if (_ent[slot].refcount <= 0 && _ent[slot].key_cluster == 0) {
             _free_locked(slot);
         }
     }
@@ -693,7 +705,14 @@ fn _slurp(f as *vfs.VfsFile, out_size as *i64) as i64 {
     if (sz <= 0 || sz > abi.SPAWN_IMG_MAX) { return 0; }
     let is i64 as buf = vmm.kvmap(sz, vmm.KV_DATA, 0, 0);
     if (buf == 0) { return 0; }
+    // The file handle belongs to the CALLER, and a spawn borrows it. Read from
+    // the start whatever its cursor was, and put the cursor back after — a
+    // spawn that silently seeks a caller's fd to EOF is a spawn that breaks the
+    // next read through it, which is exactly what happened the first time.
+    let is i64 as saved = f.offset;
+    f.offset = 0;
     let is i64 as got = vfs.read(f, cast(*u8, buf), sz);
+    f.offset = saved;
     if (got != sz) { vmm.kvunmap(buf); return 0; }
     *out_size = sz;
     return buf;
@@ -836,7 +855,6 @@ fn _ent_reset(s as i64, cluster as i64, size as i64) as void {
     _ent[s].key_cluster = cluster;
     _ent[s].key_size    = size;
     _ent[s].refcount    = 1;
-    _ent[s].pinned      = 0;
     _ent[s].stale       = 0;
     _ent[s].entry       = 0;
     _ent[s].stack_size  = 0;

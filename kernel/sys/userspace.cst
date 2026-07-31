@@ -875,20 +875,29 @@ fn spawn_user_commit_chunk_smoke() as void {
     serial.print("userspace.commit_smoke: spawned tid=", 36);
     util.print_num(tid);
     serial.println("", 0);
-    sched.sleep_for_ns(200000000);
 
     // Read both chunk sentinels via the aspace's phys (the program ran in its
     // own aspace, not our CR3). 0xAA + 0xBB present => both chunks committed +
     // written from ring 3.
-    let is i64 as ok with mut = 1;
-    let is i64 as ph0 = vmm.virt_to_phys_walk(a.pml4_phys, RV);
-    let is i64 as ph1 = vmm.virt_to_phys_walk(a.pml4_phys, RV + 0x8000);
-    if (ph0 == 0 || ph1 == 0) { ok = 0; }
-    else {
-        let is *i64 as p0 = cast(*i64, pmm.phys_to_virt(ph0));
-        let is *i64 as p1 = cast(*i64, pmm.phys_to_virt(ph1));
-        if ((p0[0] & 0xFF) != 0xAA) { ok = 0; }
-        if ((p1[0] & 0xFF) != 0xBB) { ok = 0; }
+    //
+    // POLLED to a deadline, not slept for a fixed 200 ms. The fixed sleep was a
+    // guess about how fast the child gets scheduled, and it was wrong on a q35
+    // machine — more devices to enumerate, a slower boot, and the child had not
+    // reached its second chunk yet. The test then failed for a machine being
+    // slow, which is the kind of failure that teaches people to ignore a suite.
+    // A deadline is honest either way: it passes as soon as the work is done,
+    // and still fails if it never is.
+    let is i64 as ok with mut = 0;
+    let is i64 as deadline = timer.current_time_ns() + 5000000000;    // 5 s, generous
+    while (ok == 0 && timer.current_time_ns() < deadline) {
+        let is i64 as ph0 = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+        let is i64 as ph1 = vmm.virt_to_phys_walk(a.pml4_phys, RV + 0x8000);
+        if (ph0 != 0 && ph1 != 0) {
+            let is *i64 as p0 = cast(*i64, pmm.phys_to_virt(ph0));
+            let is *i64 as p1 = cast(*i64, pmm.phys_to_virt(ph1));
+            if ((p0[0] & 0xFF) == 0xAA && (p1[0] & 0xFF) == 0xBB) { ok = 1; }
+        }
+        if (ok == 0) { sched.sleep_for_ns(20000000); }
     }
     vma.aspace_destroy(a);
     if (ok == 1) { serial.println("userspace.commit_smoke: chunks committed PASS", 45); }
@@ -1041,6 +1050,15 @@ fn emit_spawn_params(dst as *u8, c0 as i64, img_va as i64, img_len as i64,
     c = emit_mov_reg_imm(dst, c, 0, 14);                    // rax = SYS_SPAWN
     c = emit_syscall(dst, c);
     dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xC4); dst[c+3]=cast(u8,0x50); c = c + 4;  // add rsp,80
+
+    // Close the segment fd, keeping the pid. The image was read at spawn, so
+    // the child does not need it — and a smoke that leaks a key is a smoke
+    // teaching the wrong pattern to whoever copies it next.
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xC5); c = c + 3;   // mov rbp,rax (save pid)
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xDF); c = c + 3;   // mov rdi,rbx (seg fd)
+    c = emit_mov_reg_imm(dst, c, 0, 12);                    // rax = SYS_CLOSE
+    c = emit_syscall(dst, c);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xE8); c = c + 3;   // mov rax,rbp (restore pid)
     return c;
 }
 
@@ -2543,17 +2561,36 @@ fn spawn_user_cse_smoke() as void {
                 serial.print(" munmap=", 8);
                 util.print_num(p[4]);
                 serial.println("", 0);
-                // file I/O: fd>=0, read returned the fixture, close ok, and
-                // the bytes read back match "Hello from causticos FAT32!".
+                // file I/O: fd>=0, close ok, and the bytes ring 3 read are the
+                // bytes that are in the file.
+                //
+                // Compared against the FILE, read here through the VFS, and not
+                // against a string literal. It used to expect exactly "Hello
+                // from causticos FAT32!" — which is what /hello.txt holds on the
+                // verify profile and not on base, so this check failed on every
+                // image the system actually ships. A test that only passes on
+                // one profile is testing the profile.
                 let is *u8 as pb = cast(*u8, p);
-                let is *u8 as want = cast(*u8, "Hello from causticos FAT32!");
-                let is i32 as fmatch with mut = 1;
-                let is i64 as fi with mut = 0;
-                while (fi < 27) {
-                    if (pb[0x200 + fi] != want[fi]) { fmatch = 0; }
-                    fi = fi + 1;
+                let is i32 as fmatch with mut = 0;
+                let is i64 as rlen = p[6];
+                if (rlen > 0 && rlen <= 256) {
+                    let is *vfs.VfsFile as hf = vfs.open(cast(*u8, "/hello.txt"), 10,
+                                                         cast(i32, abi.O_RDONLY));
+                    if (cast(i64, hf) != 0) {
+                        let is [256]u8 as truth;
+                        let is i64 as got = vfs.read(hf, cast(*u8, &truth[0]), rlen);
+                        vfs.close(hf);
+                        if (got == rlen) {
+                            fmatch = 1;
+                            let is i64 as fi with mut = 0;
+                            while (fi < rlen) {
+                                if (pb[0x200 + fi] != truth[fi]) { fmatch = 0; }
+                                fi = fi + 1;
+                            }
+                        }
+                    }
                 }
-                if (p[6] >= 27 && p[5] >= 0 && p[7] == 0 && fmatch == 1) {
+                if (p[6] > 0 && p[5] >= 0 && p[7] == 0 && fmatch == 1) {
                     file_ok = 1;
                 }
                 serial.print("userspace.cse_smoke: open fd=", 29);
@@ -3463,16 +3500,17 @@ fn init_thread() as void {
     wait_input_ready();                // keyboard/mouse must be registered first
     acpi.power_init();                 // arm the ACPI power button
     spawn_init_from_disk();
-    // Once the desktop has settled, say what the image cache is holding. One
-    // line, once — the whole point of the cache is a number, and a number
-    // nobody can see is a claim rather than a measurement.
-    sched.sleep_for_ns(3000000000);
-    imgcache_report();
     // Done launching — this thread never returns; it becomes the power-button
-    // poller. A press sets acpi.power_event; the WM (polling SYS_POWER_PENDING)
+    // poller.
+    //
+    // The image-cache report rides the SAME loop rather than a sleep before it.
+    // A 3-second sleep here is 3 seconds in which a press of the power button is
+    // not noticed, which is a real cost for a line of diagnostics.
+    // A press sets acpi.power_event; the WM (polling SYS_POWER_PENDING)
     // runs the graceful shutdown — close windows, paint its notice — then calls
     // SYS_POWEROFF. Fallback: if the WM is wedged and hasn't powered off within
     // ~5 s, the kernel forces it so the box never refuses to die.
+    let is i64 as ticks with mut = 0;
     while (1 == 1) {
         if (acpi.power_button_pressed() == 1) {
             let is i64 as k with mut = 0;
@@ -3480,6 +3518,11 @@ fn init_thread() as void {
             system_poweroff();
         }
         sched.sleep_for_ns(200000000);
+        // Report the image cache once the desktop has settled — 15 ticks in,
+        // from inside this loop rather than from a sleep before it, so the
+        // button stays answered the whole time.
+        ticks = ticks + 1;
+        if (ticks == 15) { imgcache_report(); }
     }
 }
 
@@ -3529,8 +3572,13 @@ fn poll_unit_smoke() as void {
     let is [256]u8 as blk;
     let is i64 as zz with mut = 0;
     while (zz < 256) { blk[zz] = cast(u8, 0x55); zz = zz + 1; }
+    // Fill to the channel's OWN capacity, asked for rather than assumed. This
+    // loop stopped at a hardcoded 1024 — which was the capacity, until the
+    // buffer grew to 8 KiB to stop throttling the shell and this was not
+    // touched. It then filled an eighth of the ring, found it still writable,
+    // and panicked about a contract the channel was honouring correctly.
     let is i64 as pushed with mut = 0;
-    while (pushed < 1024) {
+    while (pushed < channel.BUF_CAP) {
         let is i64 as w = channel.chan_write(kobject.ko_priv(ko_a), cast(i64, &blk[0]), 256);
         if (w <= 0) { pmm.panic("poll_smoke: fill FAIL", 21); }
         pushed = pushed + w;
