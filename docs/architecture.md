@@ -337,9 +337,14 @@ in a swappable userspace program.
 - **Channel** (`KOBJ_CHANNEL`): the founding IPC primitive — two endpoints over a pair of
   byte ring buffers; read/write are honest ops (dispatch via ko_read/ko_write, so
   SYS_READ/SYS_WRITE drive a channel fd), no framing/handle-passing in the kernel.
-  `SYS_CHANNEL_CREATE` mints a pair. Blocking is by polling (a wakeup_thread fast-path is
-  a refinement). The KObject **refcount is atomic** (lock xadd) so two aspaces can share
-  an endpoint. **Endpoint handoff at spawn is live**: `SYS_SPAWN`'s `fdacts` installs the
+  `SYS_CHANNEL_CREATE` mints a pair. **Blocking parks, it does not poll**: a blocked
+  endpoint sleeps until the peer's write/read/close calls `poll_wake`, and the readiness
+  counter it reads first closes the lost-wakeup window — the same mechanism `SYS_POLL`,
+  netdev and audio use. Measured on a two-thread ping-pong, the round trip went from
+  5.39 ms (1 ms poll on both sides, compounding) to 52–890 µs; what is left is the
+  scheduler's context-switch cost, not the channel's. The KObject **refcount is atomic**
+  (lock xadd) so two aspaces can share an endpoint.
+  **Endpoint handoff at spawn is live**: `SYS_SPAWN`'s `fdacts` installs the
   parent's KObjects into the still-suspended child. Proven: a ring-3 child receives a
   channel endpoint as its fd, blocks on read, wakes on the byte (smp 1/2/4).
 - **Keyboard device** (`KOBJ_DEVICE`): `dev_open(DEV_KEYBOARD)` → an fd whose read drains
