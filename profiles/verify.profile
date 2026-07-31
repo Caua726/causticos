@@ -42,6 +42,12 @@ bin tlst
 bin appt
 
 bin u64t
+# imgt measures what a second copy of the same program costs — the whole point
+# of the image cache, in free-memory terms. It spawns `shell` several times
+# because it needs a target big enough for its text to show against the fixed
+# cost of a stack, and one that blocks rather than exits while it is counted.
+bin imgt
+bin shell
 # kabi belongs to the list above — scripts/test-userspace.sh runs it alongside
 # u64t, nett and the rest — and was the one name missing from it. animt is the
 # same shape: a lib self-test that prints PASS/FAIL and runs from a terminal.
@@ -62,4 +68,3 @@ bin guess
 file userspace/build/libdyndemo.csl   /lib/libdyndemo.csl
 file userspace/build/libdyndemo2.csl  /lib/libdyndemo2.csl
 bin  dyntest
-

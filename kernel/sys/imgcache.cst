@@ -59,6 +59,7 @@ use "heap.cst" as heap;
 use "pmm.cst" as pmm;
 use "vmm.cst" as vmm;
 use "lock.cst" as lock;
+use "segment.cst" as segment;
 use "abi.cst" as abi;
 
 // ============================================================
@@ -425,17 +426,26 @@ fn release(slot as i64) as void {
     lock.acquire(&_lk);
     if (_ent[slot].in_use != 0 && _ent[slot].refcount > 0) {
         _ent[slot].refcount = _ent[slot].refcount - 1;
+        // An ANONYMOUS image is freed the moment its last user goes. It has no
+        // identity, so no future lookup can ever find it — keeping its frames
+        // would not be a cache, it would be a leak with a nicer name. Only an
+        // image with a file behind it is worth holding, because the next spawn
+        // of that program is genuinely likely.
+        if (_ent[slot].refcount <= 0 && _ent[slot].key_cluster == 0
+            && _ent[slot].pinned == 0) {
+            _free_locked(slot);
+        }
     }
-    // The frames are NOT freed here. An image is worth keeping precisely
-    // because the next spawn of the same program is likely; reclaim() takes it
-    // back when memory is actually short. That is a cache, not a leak — the
-    // difference being that something can get the memory back.
+    // A file-backed image keeps its frames. reclaim() takes them back when
+    // memory is actually short — that is a cache, not a leak, the difference
+    // being that something can get the memory back.
     lock.release(&_lk);
 }
 
 // For main.cst to wire into vma.set_img_release — a qualified fn_ptr across
 // modules is not available to the wirer, so the owner hands out the address.
 fn release_ptr() as i64 { return cast(i64, fn_ptr(release)); }
+fn reclaim_ptr() as i64 { return cast(i64, fn_ptr(reclaim)); }
 
 fn entry_point(slot as i64) as i64  { return _ent[slot].entry; }
 fn stack_size(slot as i64) as i64   { return _ent[slot].stack_size; }
@@ -1006,9 +1016,12 @@ fn acquire_file(f as *vfs.VfsFile) as i64 {
     let is i64 as hit = _slot_find(cluster, fsize);
     if (hit >= 0) {
         _ent[hit].refcount = _ent[hit].refcount + 1;
+        _hits = _hits + 1;
+        _shared_pages_saved = _shared_pages_saved + _ent[hit].ro_n;
         lock.release(&_lk);
         return hit;
     }
+    _misses = _misses + 1;
 
     let is i64 as sz with mut = 0;
     let is i64 as buf = _slurp(f, &sz);
@@ -1028,6 +1041,28 @@ fn acquire_file(f as *vfs.VfsFile) as i64 {
         return 0 - 1;
     }
     lock.release(&_lk);
+    return s;
+}
+
+// Acquire an image out of a SEGMENT — shareable RAM behind an fd. This is how a
+// program spawns an image that never came from the filesystem: mint a segment,
+// write the bytes into it, spawn from the fd. The memfd_create + execveat
+// pattern, and the reason removing the old byte-carrying spawn closes no door.
+//
+// Anonymous, like acquire_bytes: a segment's contents can change under us, so
+// there is no identity to key a cache entry on and nothing is ever reused.
+fn acquire_seg(priv as i64, size as i64) as i64 {
+    if (priv == 0 || size <= 0 || size > abi.SPAWN_IMG_MAX) { return 0 - 1; }
+    // Staged through a kernel buffer: the segment's frames hold the image at
+    // arbitrary page boundaries, and the loader needs it flat to parse.
+    let is i64 as buf = vmm.kvmap(size, vmm.KV_DATA, 0, 0);
+    if (buf == 0) { return 0 - 1; }
+    if (segment.seg_copy_range(priv, 0, buf, size, 0) != abi.E_OK) {
+        vmm.kvunmap(buf);
+        return 0 - 1;
+    }
+    let is i64 as s = acquire_bytes(cast(*u8, buf), size);
+    vmm.kvunmap(buf);
     return s;
 }
 
@@ -1143,6 +1178,18 @@ fn map(slot as i64, a as *vma.Aspace) as i32 {
 // ============================================================
 // Introspection — what the cache is holding (free/top read this).
 // ============================================================
+
+// How the cache is doing. A hit is a spawn that mapped an image already in
+// memory — it read nothing off the volume and allocated no frames for the text.
+// `_shared_pages_saved` is what those hits did NOT have to copy: the pages a
+// byte-carrying spawn would have duplicated per process.
+let is i64 as _hits with mut = 0;
+let is i64 as _misses with mut = 0;
+let is i64 as _shared_pages_saved with mut = 0;
+
+fn hits() as i64   { return _hits; }
+fn misses() as i64 { return _misses; }
+fn saved_pages() as i64 { return _shared_pages_saved; }
 
 // [entries, resident_pages, shared_pages]. resident = every frame the cache
 // owns; shared = the read-only half, the part that costs one copy no matter

@@ -32,6 +32,7 @@ use "timer.cst" as timer;
 use "vfs.cst" as vfs;
 use "elf.cst" as elf;
 use "cse.cst" as cse;
+use "imgcache.cst" as imgcache;
 use "abi.cst" as abi;
 use "process.cst" as proc;
 use "fb.cst" as fb;
@@ -969,28 +970,77 @@ fn emit_store_rsp(dst as *u8, c0 as i64, off as i64, val as i64) as i64 {
     return c;
 }
 
-// Emit a SYS_SPAWN(*SpawnParams) call: build the 56-byte struct on the stack
-// (sub rsp,64; seven stores) then syscall(14, rsp). One tested encoder shared by
-// every ring-3 spawner — the struct marshalling lives here, not duplicated.
+// mov <reg>, imm64. reg is the low 3 bits of the destination (rax=0, rcx=1,
+// rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7); REX.W is always set.
+fn emit_mov_reg_imm(dst as *u8, c0 as i64, reg as i64, val as i64) as i64 {
+    let is i64 as c with mut = c0;
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8, 0xB8 + reg); write_le_u64(dst, c+2, val);
+    return c + 10;
+}
+
+fn emit_syscall(dst as *u8, c0 as i64) as i64 {
+    let is i64 as c with mut = c0;
+    dst[c+0]=cast(u8,0x0F); dst[c+1]=cast(u8,0x05);
+    return c + 2;
+}
+
+// Emit the whole "spawn this image that is sitting in my own memory" sequence:
+//
+//   rbx = SYS_SEG_CREATE(pages, 0)          mint shareable RAM behind an fd
+//         SYS_SEG_COPY(rbx, 0, img, len, 1) write the image into it
+//         SYS_SPAWN(&params{SRC_FD, rbx})   spawn from the fd
+//
+// A spawn NAMES its source now — it does not carry bytes — and an image a
+// program built or carries inside itself has no path to name. A segment is the
+// answer: it is a key, so it fits the model, and it is exactly the memfd that
+// Linux makes you create before execveat will run bytes out of memory.
+//
+// The segment fd is deliberately left open in rbx. These are smokes that exit
+// right after; a real program would close it, and the child is unaffected
+// either way (the cache read the image at spawn).
+//
+// rbx is callee-saved across a syscall, which is why the fd lives there.
 // Leaves the pid in rax and restores rsp. All field values are compile-time
 // constants (image/fdacts/argv VAs are fixed in the CSE layout).
 fn emit_spawn_params(dst as *u8, c0 as i64, img_va as i64, img_len as i64,
                      fdacts_va as i64, n_acts as i64, argv_va as i64,
                      argc as i64, budget as i64) as i64 {
     let is i64 as c with mut = c0;
-    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xEC); dst[c+3]=cast(u8,0x40); c = c + 4;  // sub rsp,64
-    c = emit_store_rsp(dst, c, 0,  img_va);
-    c = emit_store_rsp(dst, c, 8,  img_len);
-    c = emit_store_rsp(dst, c, 16, fdacts_va);
-    c = emit_store_rsp(dst, c, 24, n_acts);
-    c = emit_store_rsp(dst, c, 32, argv_va);
-    c = emit_store_rsp(dst, c, 40, argc);
-    c = emit_store_rsp(dst, c, 48, budget);
+    let is i64 as pages = (img_len + 4095) / 4096;
+
+    // rbx = seg_create(pages, 0)
+    c = emit_mov_reg_imm(dst, c, 7, pages);                 // rdi = pages
+    c = emit_mov_reg_imm(dst, c, 6, 0);                     // rsi = flags
+    c = emit_mov_reg_imm(dst, c, 0, 29);                    // rax = SYS_SEG_CREATE
+    c = emit_syscall(dst, c);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xC3); c = c + 3;   // mov rbx,rax
+
+    // seg_write(rbx, 0, img_va, img_len)  == SYS_SEG_COPY(..., to_seg=1)
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xDF); c = c + 3;   // mov rdi,rbx
+    c = emit_mov_reg_imm(dst, c, 6, 0);                     // rsi = offset
+    c = emit_mov_reg_imm(dst, c, 2, img_va);                // rdx = buf
+    dst[c+0]=cast(u8,0x49); dst[c+1]=cast(u8,0xBA); write_le_u64(dst, c+2, img_len); c = c + 10;  // mov r10,len
+    dst[c+0]=cast(u8,0x49); dst[c+1]=cast(u8,0xB8); write_le_u64(dst, c+2, 1); c = c + 10;        // mov r8,1 (to_seg)
+    c = emit_mov_reg_imm(dst, c, 0, 31);                    // rax = SYS_SEG_COPY
+    c = emit_syscall(dst, c);
+
+    // spawn(&params) — 9 x i64 on the stack, source = the segment fd in rbx.
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xEC); dst[c+3]=cast(u8,0x50); c = c + 4;  // sub rsp,80
+    c = emit_store_rsp(dst, c, 0,  1);                      // src_kind = SPAWN_SRC_FD
+    // src_fd comes from rbx, not an immediate: mov [rsp+8], rbx
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0x5C);
+    dst[c+3]=cast(u8,0x24); dst[c+4]=cast(u8,8); c = c + 5;
+    c = emit_store_rsp(dst, c, 16, 0);                      // path_uptr
+    c = emit_store_rsp(dst, c, 24, 0);                      // path_len
+    c = emit_store_rsp(dst, c, 32, fdacts_va);
+    c = emit_store_rsp(dst, c, 40, n_acts);
+    c = emit_store_rsp(dst, c, 48, argv_va);
+    c = emit_store_rsp(dst, c, 56, argc);
+    c = emit_store_rsp(dst, c, 64, budget);
     dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x8D); dst[c+2]=cast(u8,0x3C); dst[c+3]=cast(u8,0x24); c = c + 4;  // lea rdi,[rsp]
-    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0xC7); dst[c+2]=cast(u8,0xC0);
-    dst[c+3]=cast(u8,14); dst[c+4]=cast(u8,0); dst[c+5]=cast(u8,0); dst[c+6]=cast(u8,0); c = c + 7;             // mov rax,14
-    dst[c+0]=cast(u8,0x0F); dst[c+1]=cast(u8,0x05); c = c + 2;                                                  // syscall
-    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xC4); dst[c+3]=cast(u8,0x40); c = c + 4;  // add rsp,64
+    c = emit_mov_reg_imm(dst, c, 0, 14);                    // rax = SYS_SPAWN
+    c = emit_syscall(dst, c);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xC4); dst[c+3]=cast(u8,0x50); c = c + 4;  // add rsp,80
     return c;
 }
 
@@ -2874,9 +2924,47 @@ fn proc_spawn(parent as i64, img as *u8, img_len as i64) as i64 {
     return proc_from_loaded(parent, a, entry, user_rsp);
 }
 
+// Spawn from an OPEN FILE — what SYS_SPAWN does. The file is borrowed, not
+// consumed: the image cache reads it if this is the first load and maps the
+// frames it already holds if it is not, so a second process running the same
+// program costs its writable data and nothing else. The caller closes the file.
+//
+// argv_ptrs/argv_lens are KERNEL pointers; argc 0 gives the child the default
+// argv. argv is data laid on the child's stack, never resolved by the kernel
+// (architecture §2) — authority travels only as fds.
+fn proc_spawn_file(parent as i64, f as *vfs.VfsFile,
+                   argv_ptrs as *i64, argv_lens as *i64, argc as i64) as i64 {
+    return proc_spawn_slot(parent, imgcache.acquire_file(f), argv_ptrs, argv_lens, argc);
+}
+
+// The same, from an image already acquired from the cache — a file, a segment,
+// whatever named it. The reference is consumed: it passes to the child's aspace
+// on success and is dropped on failure.
+fn proc_spawn_slot(parent as i64, slot as i64,
+                   argv_ptrs as *i64, argv_lens as *i64, argc as i64) as i64 {
+    if (slot < 0) { return 0; }
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { imgcache.release(slot); return 0; }
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse_slot(a, slot, argv_ptrs, argv_lens, argc,
+                                         &entry, &user_rsp);
+    if (rc != 0) {
+        // The caller only learns "spawn failed"; the code says WHICH of the
+        // twenty ways it can fail this was, and a load that dies inside the
+        // dynamic loader is otherwise indistinguishable from a bad image.
+        serial.print("spawn: load_cse rc=", 19);
+        util.print_num(cast(i64, rc));
+        serial.println("", 0);
+        vma.aspace_destroy(a);
+        return 0;
+    }
+    return proc_from_loaded(parent, a, entry, user_rsp);
+}
+
 // argv-aware spawn: same as proc_spawn but the child receives a full argument
-// vector (argv_ptrs/argv_lens are KERNEL pointers, argc >= 1). SYS_SPAWN uses
-// this — argv is data laid on the child's stack, never resolved (architecture §2).
+// vector (argv_ptrs/argv_lens are KERNEL pointers, argc >= 1). Used by the
+// in-kernel smokes, whose images are bytes the kernel already holds.
 fn proc_spawn_argv(parent as i64, img as *u8, img_len as i64,
                    argv_ptrs as *i64, argv_lens as *i64, argc as i64) as i64 {
     let is *vma.Aspace as a = vma.aspace_create();
@@ -2889,7 +2977,7 @@ fn proc_spawn_argv(parent as i64, img as *u8, img_len as i64,
         // The caller only learns "spawn failed"; the code says WHICH of the
         // twenty ways it can fail this was, and a load that dies inside the
         // dynamic loader is otherwise indistinguishable from a bad image.
-        serial.print("spawn: load_cse rc=", 20);
+        serial.print("spawn: load_cse rc=", 19);
         util.print_num(cast(i64, rc));
         serial.println("", 0);
         vma.aspace_destroy(a);
@@ -3249,31 +3337,18 @@ fn spawn_init_from_disk() as void {
         return;
     }
     let is i64 as sz = f.size;
-    // Same structural bound as SYS_SPAWN: the image is staged in one contiguous
-    // kernel buffer (buddy max 4 MiB). No static cap any more — the buffer is
-    // kmalloc'd to the file's exact size and freed after proc_spawn copies it
-    // into the child aspace, so /init can be any real program up to the ceiling.
     if (sz <= 0 || sz > abi.SPAWN_IMG_MAX) {
         serial.print("boot: /init.cse bad size", 24);
         serial.println("", 0);
         vfs.close(f);
         return;
     }
-    let is i64 as buf = heap.kmalloc(sz, cast(i32, 0));
-    if (buf == 0) {
-        serial.println("boot: /init.cse no mem", 22);
-        vfs.close(f);
-        return;
-    }
-    let is i64 as got = vfs.read(f, cast(*u8, buf), sz);
+    // Straight from the open file: the image cache reads it into the frames the
+    // child maps, with no staging buffer in between. /init is the compositor,
+    // the largest program on the volume, and it used to be read into a kmalloc
+    // and then copied again into the child.
+    let is i64 as child = proc_spawn_file(proc.init_proc, f, cast(*i64, 0), cast(*i64, 0), 0);
     vfs.close(f);
-    if (got != sz) {
-        serial.println("boot: /init.cse short read", 26);
-        heap.kfree(buf);
-        return;
-    }
-    let is i64 as child = proc_spawn(proc.init_proc, cast(*u8, buf), got);
-    heap.kfree(buf);   // proc_spawn copied the image into the child aspace; buffer is transient
     if (child == 0) {
         serial.println("boot: /init.cse spawn FAIL", 26);
         return;
@@ -3289,6 +3364,30 @@ fn spawn_init_from_disk() as void {
     proc_start(child);
     serial.print("boot: /init.cse launched pid=", 29);
     util.print_num(proc.proc_pid(child));
+    serial.println("", 0);
+}
+
+// What the image cache is holding and what it saved. Printed on demand rather
+// than every boot: it is a measurement, and a number nobody reads is noise.
+//
+// `saved` is the honest figure — pages a spawn did NOT have to allocate or copy
+// because the image was already resident. Under the old byte-carrying spawn
+// every one of them was a per-process copy.
+fn imgcache_report() as void {
+    let is [3]i64 as st;
+    imgcache.stats(cast(*i64, &st[0]));
+    serial.print("imgcache: images=", 17);
+    util.print_num(st[0]);
+    serial.print(" resident_kb=", 13);
+    util.print_num(st[1] * 4);
+    serial.print(" shared_kb=", 11);
+    util.print_num(st[2] * 4);
+    serial.print(" hits=", 6);
+    util.print_num(imgcache.hits());
+    serial.print(" misses=", 8);
+    util.print_num(imgcache.misses());
+    serial.print(" saved_kb=", 10);
+    util.print_num(imgcache.saved_pages() * 4);
     serial.println("", 0);
 }
 
@@ -3364,6 +3463,11 @@ fn init_thread() as void {
     wait_input_ready();                // keyboard/mouse must be registered first
     acpi.power_init();                 // arm the ACPI power button
     spawn_init_from_disk();
+    // Once the desktop has settled, say what the image cache is holding. One
+    // line, once — the whole point of the cache is a number, and a number
+    // nobody can see is a claim rather than a measurement.
+    sched.sleep_for_ns(3000000000);
+    imgcache_report();
     // Done launching — this thread never returns; it becomes the power-button
     // poller. A press sets acpi.power_event; the WM (polling SYS_POWER_PENDING)
     // runs the graceful shutdown — close windows, paint its notice — then calls

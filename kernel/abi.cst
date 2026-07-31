@@ -72,11 +72,36 @@ let is i64 as SYS_LSEEK          = 13;   // (fd, off, whence)  → off   | errno
 let is i64 as SYS_SPAWN          = 14;   // (*SpawnParams) → pid | errno
 let is i64 as SYS_WAIT           = 15;   // (pid, status_ptr)  → exit_code | errno
 
-// 7 x i64 = 56 bytes, all-i64 (no mixed-width miscompile). Copied from the
+// A spawn NAMES ITS SOURCE; it does not carry the image.
+//
+// It used to take `img_uptr`: the parent read the whole file into an
+// eager-committed mapping, the kernel staged a second copy, and the loader
+// copied a third time into the child. Three residencies and two full memcpys
+// per exec — and because bytes are not an object, nothing could be shared: ten
+// processes running one binary cost ten copies of its text.
+//
+// Nobody else passes bytes. Linux and the BSDs take a path or an fd
+// (execveat), NT hands NtCreateProcessEx an image SECTION object, Fuchsia a
+// VMO, seL4 frame caps. What travels is always a reference, because a buffer
+// can be neither shared nor counted. Here it is one of:
+//
+//   SPAWN_SRC_PATH  the kernel opens it (and the loader already opened /lib
+//                   during a spawn, so this resolves nothing new)
+//   SPAWN_SRC_FD    a key the caller holds — a file, or a segment for an image
+//                   that never came from the filesystem (the memfd analogue)
+//
+// src_kind is an explicit discriminator rather than "whichever field is
+// non-zero": nothing here is implicit, and fd 0 is a real fd.
+let is i64 as SPAWN_SRC_PATH = 0;
+let is i64 as SPAWN_SRC_FD   = 1;
+
+// 9 x i64 = 72 bytes, all-i64 (no mixed-width miscompile). Copied from the
 // caller in one copy_from_user.
 struct SpawnParams {
-    img_uptr    as i64;      // user VA of the CSE image
-    img_len     as i64;      // 0 < img_len <= SPAWN_IMG_MAX
+    src_kind    as i64;      // SPAWN_SRC_*; anything else is E_INVAL
+    src_fd      as i64;      // SPAWN_SRC_FD: an open file or segment fd
+    path_uptr   as i64;      // SPAWN_SRC_PATH: user VA of the path
+    path_len    as i64;      // <= PATH_MAX
     fdacts_uptr as i64;      // array of {child_fd, src_fd} i64 pairs (0 if none)
     n_acts      as i64;      // <= 16
     argv_uptr   as i64;      // array of {str_ptr, str_len} i64 pairs (0 if none)
@@ -84,15 +109,16 @@ struct SpawnParams {
     budget      as i64;      // 0 = unlimited (physical only); >0 = committed_bytes ceiling
 }
 
-// Max bytes for a spawn/boot image. NOT a policy quota (memory has none — see
-// the memory model: commit is bounded only by physical RAM). It's a STRUCTURAL
-// bound: the image is staged in ONE contiguous kernel buffer (heap.kmalloc →
-// pmm.alloc_pages, a single buddy block), and the buddy allocator's largest
-// block is 2^MAX_BLOCK_ORDER pages = 1024 * 4096 = 4 MiB. A self-hosting
-// compiler image (~1.1 MiB pure) fits with headroom. To go past 4 MiB the
-// staging must move to a kvmap-backed (non-contiguous → contiguous-virtual)
-// buffer; until then this is the honest ceiling, kept in one place.
-let is i64 as SPAWN_IMG_MAX = 4194304;   // 4 MiB = 1024 pages (buddy MAX_BLOCK_ORDER)
+// The longest path a spawn will resolve. Same bound the VFS uses.
+let is i64 as SPAWN_PATH_MAX = 255;
+
+// Max bytes for an image the cache will take. NOT a policy quota (memory has
+// none — commit is bounded only by physical RAM). It used to be a structural
+// bound: the image was staged in ONE contiguous buddy block, whose largest is
+// 4 MiB. Staging is a kvmap now (free pages, no contiguous run), so what this
+// bounds is the read a single image is allowed to be — a sanity ceiling on a
+// file the loader is about to trust, kept in one place.
+let is i64 as SPAWN_IMG_MAX = 4194304;   // 4 MiB
 
 // VFS metadata — thin forwards to the vfs.* ops, whose implementation is
 // already complete (vfs.test exercises all of them). Userspace had file
@@ -600,7 +626,11 @@ let is i64 as SYS_MAX = 64;
 let is i64 as KERN_INFO_SIZE = 48;
 
 let is i64 as ABI_MAJOR = 0;
-let is i64 as ABI_MINOR = 2;
+// 3: SYS_SPAWN names its source (SpawnParams src_kind/src_fd/path) instead of
+// carrying the image bytes. Not additive — the struct changed shape — but this
+// is ABI v0, where the whole system is built together and the major gate does
+// not arm until self-host.
+let is i64 as ABI_MINOR = 3;
 
 struct KernInfo {
     info_size as i64;          // 0:  bytes the kernel wrote (KERN_INFO_SIZE)

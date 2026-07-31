@@ -1,0 +1,118 @@
+// imgt.cst — does spawning the same program twice cost its text twice?
+//
+// It used to. A spawn carried the image as BYTES: the parent read the whole
+// file into an eager-committed mapping and the kernel copied it into the child,
+// so N processes of one program meant N copies of its text with nothing shared.
+// A spawn names its source now, and the kernel's image cache lays a program's
+// read-only segments into frames ONCE and maps those same frames into every
+// process running it.
+//
+// Measured from the outside, through free memory, rather than by trusting a
+// counter: spawn the same program N times and watch what each one costs. The
+// first pays for the image; every one after it should pay only for its own
+// writable data and its stack — so the FIRST spawn should cost roughly one
+// image more than the rest.
+//
+// The target is /shell.cse for two reasons. It is big enough for its text to
+// show against the fixed per-process cost of a stack and an address space (a
+// coreutil is a couple of KiB, because its code lives in the shared library and
+// was never the thing being duplicated). And handed a channel nobody writes to
+// as its stdin, it blocks on the first read — alive and quiet while the
+// measurement is taken, which a program that exits would not be.
+
+use "std/causticos/prog.cst" as prog;
+use "std/os/causticos.cst" as sys;
+
+let is i64 as N with imut = 5;
+
+// A function, not a module-global *u8: a global pointer initialised to a string
+// literal does not get the literal's address relocated into it, so indexing it
+// reads garbage (a Caustic quirk that costs an afternoon if you meet it fresh).
+fn target() as *u8 { return "/shell.cse"; }
+
+fn say(s as *u8) as void { prog.outs(s); }
+
+fn free_kb() as i64 {
+    let is [4]i64 as mi;
+    sys.mem_info(cast(*i64, &mi[0]));
+    return mi[1] * mi[2] / 1024;          // free_pages * page_size
+}
+
+fn check(name as *u8, cond as i64) as i64 {
+    if (cond == 1) { say("  ok   "); } else { say("  FAIL "); }
+    say(name); say("\n");
+    if (cond == 1) { return 0; }
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    say("imgt: what a second copy of the same program costs\n");
+
+    let is [4]i64 as st;
+    if (sys.stat(target(), cast(*u8, &st[0])) != 0 || st[0] <= 0) {
+        say("imgt: target not on disk\n");
+        return cast(i32, 1);
+    }
+    let is i64 as img_kb = st[0] / 1024;
+    say("imgt: image is "); prog.out_num(img_kb); say(" KiB on disk\n");
+
+    let is [4]i64 as av;
+    av[0] = cast(i64, "shell"); av[1] = 5;
+
+    let is [8]i64 as pids;
+    let is [8]i64 as keeps;               // our end of each child's stdin
+    let is i64 as first_cost with mut = 0;
+    let is i64 as later_total with mut = 0;
+
+    let is i64 as i with mut = 0;
+    while (i < N) {
+        let is [2]i64 as ch;
+        if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
+            say("imgt: no channel\n");
+            return cast(i32, 1);
+        }
+        let is [2]i64 as fda;
+        fda[0] = 0; fda[1] = ch[1];       // child fd 0 = a channel we never write
+
+        let is i64 as before = free_kb();
+        let is i64 as pid = sys.spawn_path(target(), cast(*u8, &fda[0]), 1,
+                                           cast(*u8, &av[0]), 1);
+        sys.close(ch[1]);
+        if (pid < 0) {
+            say("imgt: spawn failed\n");
+            return cast(i32, 1);
+        }
+        pids[i] = pid;
+        keeps[i] = ch[0];
+        // Let it reach its first blocking read: the image is paid for at load,
+        // but the reading is steadier once the child has stopped allocating.
+        sys.sleep_ns(300000000);
+        let is i64 as cost = before - free_kb();
+        say("imgt: spawn "); prog.out_num(i); say(" cost "); prog.out_num(cost); say(" KiB\n");
+        if (i == 0) { first_cost = cost; } else { later_total = later_total + cost; }
+        i = i + 1;
+    }
+
+    let is i64 as later_avg = later_total / (N - 1);
+    let is i64 as saved = first_cost - later_avg;
+    say("imgt: first "); prog.out_num(first_cost);
+    say(" KiB, repeats average "); prog.out_num(later_avg);
+    say(" KiB, so a repeat saves "); prog.out_num(saved); say(" KiB\n");
+
+    let is i64 as bad with mut = 0;
+    // The claim: a repeat does not pay for the image again. Half the file size
+    // is the threshold rather than all of it, because a .cse is not all
+    // read-only — its writable data IS copied per process, correctly, and only
+    // the read-only half is shared.
+    bad = bad + check(cast(*u8, "a repeat costs less than the first"), later_avg < first_cost);
+    bad = bad + check(cast(*u8, "the saving is most of the image"), saved * 2 >= img_kb);
+
+    i = 0;
+    while (i < N) { sys.kill(pids[i]); sys.close(keeps[i]); i = i + 1; }
+    i = 0;
+    while (i < N) { let is [1]i64 as s2; sys.wait(pids[i], cast(*i64, &s2[0])); i = i + 1; }
+
+    if (bad == 0) { say("imgt: PASS\n"); return 0; }
+    say("imgt: FAIL\n");
+    return cast(i32, 1);
+}

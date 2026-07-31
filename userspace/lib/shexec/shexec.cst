@@ -604,33 +604,30 @@ fn _cpath(w as i64) as *u8 {
     return resolve(cast(*u8, &wbuf[w_off[w]]), w_len[w]);
 }
 
-// load — read /<name>.cse into a fresh mapping. Returns the buffer or 0, and
-// writes the byte count and the mapped size the caller must eventually unmap.
-fn load(w as i64, out_len as *i64, out_alloc as *i64) as *u8 {
-    *out_len = 0; *out_alloc = 0;
-    let is [128]u8 as path;
-    if (w_len[w] > 110) { return cast(*u8, 0); }
-    path[0] = cast(u8, 47);
+// prog_path — write "/<name>.cse" into `out` (NUL-terminated) and say whether
+// such a file exists. 1 = found, 0 = no such command.
+//
+// This used to be `load`: open, lseek to the end, mmap a page-rounded buffer,
+// read the whole image in, and hand the bytes to spawn — which copied them
+// again on its way into the child. A spawn names its source now, so the shell
+// carries a path and one stat instead of a full eager-committed copy of every
+// program it launches. The stat is what keeps "command not found" a distinct
+// answer from "it failed to start".
+fn prog_path(w as i64, out as *u8) as i64 {
+    if (w_len[w] > 110) { return 0; }
+    out[0] = cast(u8, 47);
     let is i64 as i with mut = 0;
-    while (i < w_len[w]) { path[1 + i] = wbuf[w_off[w] + i]; i = i + 1; }
+    while (i < w_len[w]) { out[1 + i] = wbuf[w_off[w] + i]; i = i + 1; }
     let is *u8 as ext = ".cse";
     let is i64 as j with mut = 0;
-    while (j < 4) { path[1 + w_len[w] + j] = ext[j]; j = j + 1; }
-    path[1 + w_len[w] + 4] = cast(u8, 0);
+    while (j < 4) { out[1 + w_len[w] + j] = ext[j]; j = j + 1; }
+    out[1 + w_len[w] + 4] = cast(u8, 0);
 
-    let is i64 as fd = sys.open_read(cast(*u8, &path[0]));
-    if (fd < 0) { return cast(*u8, 0); }
-    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
-    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
-    if (sz <= 0 || sz > IMG_CAP) { sys.close(fd); return cast(*u8, 0); }
-    let is i64 as alloc = (sz + 4095) & (0 - 4096);
-    let is i64 as va = sys.mmap(cast(i64, 0), alloc, sys.PROT_READ | sys.PROT_WRITE);
-    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
-    let is i64 as got = sys.read(fd, cast(*u8, va), sz);
-    sys.close(fd);
-    if (got != sz) { sys.munmap(va, alloc); return cast(*u8, 0); }
-    *out_len = got; *out_alloc = alloc;
-    return cast(*u8, va);
+    let is [4]i64 as st;
+    if (sys.stat(cast(*u8, out), cast(*u8, &st[0])) != 0) { return 0; }
+    if (st[3] != 0) { return 0; }                  // a directory is not a command
+    if (st[0] <= 0 || st[0] > IMG_CAP) { return 0; }
+    return 1;
 }
 
 // exec — build the whole pipeline and register it as one job.
@@ -656,10 +653,8 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
     while (c < ncmd && failed == 0) {
         if (cmds[c].wn <= 0) { failed = 4; }
         else {
-            let is i64 as img_len with mut = 0;
-            let is i64 as alloc with mut = 0;
-            let is *u8 as img = load(cmds[c].w0, &img_len, &alloc);
-            if (cast(i64, img) == 0) { failed = 1; }
+            let is [128]u8 as ipath;
+            if (prog_path(cmds[c].w0, cast(*u8, &ipath[0])) == 0) { failed = 1; }
             else {
                 // stdin: the previous stage's output, an explicit '<' file, or
                 // a fresh channel the shell can type into (first stage only).
@@ -734,8 +729,9 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         av[2 * k + 1] = w_len[cmds[c].w0 + k];
                         k = k + 1;
                     }
-                    let is i64 as pid = sys.spawn(img, img_len, cast(*u8, &fdacts[0]), nact,
-                                                  cast(*u8, &av[0]), k);
+                    let is i64 as pid = sys.spawn_path(cast(*u8, &ipath[0]),
+                                                       cast(*u8, &fdacts[0]), nact,
+                                                       cast(*u8, &av[0]), k);
                     // The child owns its ends now; the shell must let go of them
                     // or the next stage never sees end-of-stream.
                     if (child_in >= 0 && prev_read < 0 && cmds[c].in_w < 0) { sys.close(child_in); }
@@ -751,16 +747,10 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         if (keep_in >= 0) { sys.close(keep_in); }
                         if (keep_out >= 0) { sys.close(keep_out); }
                         if (next_read >= 0) { sys.close(next_read); }
-                        sys.munmap(cast(i64, img), alloc);
                     } else {
                         jobs.add_pid(slot, pid);
                         if (keep_in >= 0)  { jb.in_fd = keep_in; }
                         if (keep_out >= 0) { jb.out_fd = keep_out; }
-                        // Only the last image is tracked for unmapping; the
-                        // earlier stages' buffers are released right away since
-                        // spawn has already copied what it needs.
-                        if (c + 1 == ncmd) { jb.img = cast(i64, img); jb.img_len = alloc; }
-                        else { sys.munmap(cast(i64, img), alloc); }
                         prev_read = next_read;
                     }
                 } else {
@@ -769,7 +759,6 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     if (keep_out >= 0) { sys.close(keep_out); }
                     if (child_out >= 0) { sys.close(child_out); }
                     if (next_read >= 0) { sys.close(next_read); }
-                    sys.munmap(cast(i64, img), alloc);
                 }
             }
         }

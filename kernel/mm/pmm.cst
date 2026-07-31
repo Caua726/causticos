@@ -1068,7 +1068,7 @@ fn alloc_pages(flags as i32, order as i32, usage as i32, owner as i32) as i32 {
     // lock AND saves RFLAGS on this stack frame (no shared saved_flags
     // slot), so concurrent cpus neither corrupt the freelist nor mis-
     // restore IF on exit.
-    let is i64 as pflags = lock.acquire_irq(&pmm_lock);
+    let is i64 as pflags with mut = lock.acquire_irq(&pmm_lock);
 
     if (has_budget(flags, need) != cast(i32, 0)) {
         // Smallest order >= requested that has a block satisfying `below`.
@@ -1120,11 +1120,39 @@ fn alloc_pages(flags as i32, order as i32, usage as i32, owner as i32) as i32 {
         }
     }
 
-    // OOM (or no below-4G block of sufficient order): honest failure.
+    // Out of memory — but before saying so, reclaim. The image cache is the one
+    // thing in this kernel that is PURE cache: it holds the frames of programs
+    // that have already run so the next spawn of them maps instead of reads, and
+    // every one of those frames is reproducible from the volume. An allocation
+    // that would otherwise fail is exactly the moment to take them back.
+    //
+    // Once, and only from thread context: reclaim walks the cache under its own
+    // (non-IRQ) lock, so it cannot run from inside an interrupt, and a second
+    // attempt after a reclaim that freed nothing is just a slower failure.
+    lock.release_irq(&pmm_lock, pflags);
+    if (img_reclaim_fn != 0 && irq_context() == 0 && reclaiming == cast(i32, 0)) {
+        reclaiming = 1;
+        let is i64 as freed = call(cast(fn() as i64, img_reclaim_fn));
+        reclaiming = 0;
+        if (freed > 0) { return alloc_pages(flags, order, usage, owner); }
+    }
+
+    // Honest failure.
+    pflags = lock.acquire_irq(&pmm_lock);
     record_fail(order, flags);
     lock.release_irq(&pmm_lock, pflags);
     return PFN_NONE;
 }
+
+// Set by main.cst to imgcache.reclaim. A function pointer rather than an import
+// because imgcache sits ABOVE pmm (it allocates through it), and a `use` back
+// down would close a cycle — which segfaults the compiler with no diagnostic.
+// `reclaiming` guards the re-entry: reclaim frees pages, and freeing does not
+// allocate, but a future reclaimer that did would otherwise recurse forever.
+let is i64 as img_reclaim_fn with mut = 0;
+let is i32 as reclaiming with mut = 0;
+
+fn set_img_reclaim(fp as i64) as void { img_reclaim_fn = fp; }
 
 // ============================================================
 // Free with merge

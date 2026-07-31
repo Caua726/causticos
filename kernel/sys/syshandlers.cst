@@ -18,6 +18,7 @@ use "sched.cst" as sched;
 use "userspace.cst" as userspace;
 use "vma.cst" as vma;
 use "vfs.cst" as vfs;
+use "imgcache.cst" as imgcache;
 use "kobject.cst" as kobject;
 use "channel.cst" as channel;
 use "eventfd.cst" as eventfd;
@@ -1144,12 +1145,25 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
                                  sizeof(abi.SpawnParams)) != 0) {
         return abi.E_FAULT;
     }
-    let is i64 as img_uptr = sp.img_uptr;
-    let is i64 as img_len = sp.img_len;
     let is i64 as fdacts_uptr = sp.fdacts_uptr;
     let is i64 as n_acts with mut = sp.n_acts;
-    if (img_len <= 0) { return abi.E_INVAL; }
-    if (img_len > abi.SPAWN_IMG_MAX) { return abi.E_INVAL; }   // sanity bound on a spawned image (kvmap-staged, see below)
+
+    // The source, copied in before anything is created. A path is copied here
+    // and opened below; an fd is resolved against the caller's own table. Both
+    // are keys the caller already holds — neither is a buffer the kernel has to
+    // take a copy of.
+    let is [256]u8 as pathbuf;
+    if (sp.src_kind == abi.SPAWN_SRC_PATH) {
+        if (sp.path_uptr == 0) { return abi.E_INVAL; }
+        if (sp.path_len <= 0 || sp.path_len > abi.SPAWN_PATH_MAX) { return abi.E_INVAL; }
+        if (userspace.copy_from_user(pml4, cast(*u8, &pathbuf[0]), sp.path_uptr,
+                                     sp.path_len) != 0) {
+            return abi.E_FAULT;
+        }
+    } else if (sp.src_kind != abi.SPAWN_SRC_FD) {
+        return abi.E_INVAL;                            // an unknown kind, said so
+    }
+
     if (n_acts < 0) { n_acts = 0; }
     if (n_acts > 16) { return abi.E_INVAL; }           // bound the fd-action list
     if (sp.budget < 0) { return abi.E_INVAL; }         // budget is a ceiling, not negative
@@ -1208,25 +1222,52 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
         }
     }
 
-    // Snapshot the image into a transient kernel buffer; proc_spawn copies it
-    // into the child's fresh aspace. Staged via kvmap(KV_DATA) — scattered
-    // frames behind a contiguous VA — NOT a contiguous kmalloc: a multi-MiB
-    // image (the self-host compiler is >1 MiB) needs a 2 MiB+ buddy block that
-    // a fragmented heap can lack even with ~1 GiB free, which spuriously
-    // E_NOMEM'd the spawn. kvmap only needs free pages, not a contiguous run.
-    let is i64 as kbuf = vmm.kvmap(img_len, vmm.KV_DATA, 0, 0);
-    if (kbuf == 0) { return abi.E_NOMEM; }
-    let is i32 as crc = userspace.copy_from_user(pml4, cast(*u8, kbuf), img_uptr, img_len);
-    if (crc != 0) { vmm.kvunmap(kbuf); return abi.E_FAULT; }
+    // Resolve the source into a cached image. No staging buffer: the cache
+    // reads the source once into the frames the child will map, and every later
+    // spawn of the same file maps those same frames instead of reading or
+    // copying anything. What used to happen here — kvmap a whole second copy of
+    // the image and copy_from_user into it — is gone with the bytes it staged.
+    let is i64 as slot with mut = 0 - 1;
+    if (sp.src_kind == abi.SPAWN_SRC_PATH) {
+        let is *vfs.VfsFile as srcf = vfs.open(cast(*u8, &pathbuf[0]), sp.path_len,
+                                               cast(i32, abi.O_RDONLY));
+        if (cast(i64, srcf) == 0) { return abi.E_NOENT; }
+        if (srcf.is_dir != 0) { vfs.close(srcf); return abi.E_ISDIR; }
+        slot = imgcache.acquire_file(srcf);
+        vfs.close(srcf);
+    } else {
+        // An fd source is resolved against the CALLER's table — the key it
+        // already holds. Borrowed, not consumed: the caller still owns the fd
+        // and closes it itself.
+        let is i64 as asp = sched.thr_aspace_ptr(tid);
+        let is i64 as ko = vma.fd_get(cast(*vma.Aspace, asp), sp.src_fd);
+        if (ko == 0) { return abi.E_BADF; }
+        let is i64 as kt = kobject.ko_type(ko);
+        let is i64 as kp = kobject.ko_priv(ko);
+        if (kp == 0) { return abi.E_BADF; }
+        if (kt == kobject.KOBJ_FILE) {
+            let is *vfs.VfsFile as srcf = cast(*vfs.VfsFile, kp);
+            if (srcf.is_dir != 0) { return abi.E_ISDIR; }
+            slot = imgcache.acquire_file(srcf);
+        } else if (kt == kobject.KOBJ_SEGMENT) {
+            // An image that never came from the filesystem: mint a segment,
+            // write the bytes in, spawn from the fd. A segment has no length of
+            // its own — its capacity is what it spans — so the whole thing is
+            // the image, and a program sizes the segment to the image it wrote.
+            slot = imgcache.acquire_seg(kp, segment.seg_bytes(kp));
+        } else {
+            return abi.E_INVAL;                        // not a source of bytes
+        }
+    }
+    if (slot < 0) { return abi.E_NOENT; }
 
     let is i64 as child with mut = 0;
     if (argc > 0) {
-        child = userspace.proc_spawn_argv(parent, cast(*u8, kbuf), img_len,
+        child = userspace.proc_spawn_slot(parent, slot,
                                           cast(*i64, &argv_ptrs[0]), cast(*i64, &argv_lens[0]), argc);
     } else {
-        child = userspace.proc_spawn(parent, cast(*u8, kbuf), img_len);
+        child = userspace.proc_spawn_slot(parent, slot, cast(*i64, 0), cast(*i64, 0), 0);
     }
-    vmm.kvunmap(kbuf);
     if (child == 0) { return abi.E_NOMEM; }
 
     // Stash argv[0] (<=15 chars) as the child's display name at Process+112 — a
