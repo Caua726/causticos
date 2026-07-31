@@ -55,6 +55,9 @@ let is i32 as VFS_ENOSYS    = cast(i32, 0 - 38);
 let is i32 as VFS_ENOTEMPTY = cast(i32, 0 - 39);
 let is i32 as VFS_EEXIST    = cast(i32, 0 - 17);
 let is i32 as VFS_EXDEV     = cast(i32, 0 - 18);
+// A live process was loaded from this file. Same number Linux gives ETXTBSY,
+// and the same reason: its text is executing out of pages the kernel holds.
+let is i32 as VFS_ETXTBSY   = cast(i32, 0 - 26);
 
 // ============================================================
 // open() flags (POSIX-ish). Bitmask.
@@ -361,6 +364,33 @@ fn pool_release(f as *VfsFile) as void {
 // open/close/read/write/seek/stat
 // ============================================================
 
+// Set by main.cst to imgcache.is_live. A function pointer rather than an import
+// because imgcache reads files THROUGH the VFS, so a `use` back would close a
+// cycle the compiler dies on. Composition lives in main, as it does for every
+// other cycle here. Absent (0) = nothing is cached, so nothing is busy.
+let is i64 as img_live_fn with mut = 0;
+let is i64 as img_stale_fn with mut = 0;
+
+fn set_img_live(fp as i64) as void { img_live_fn = fp; }
+fn set_img_stale(fp as i64) as void { img_stale_fn = fp; }
+
+// The bytes behind this cluster are about to change: retire any cached image
+// built from them. Called only after img_busy said no, so nothing is executing
+// out of it — this drops a cache entry, it never pulls the rug from a process.
+fn img_invalidate(first_cluster as i64) as void {
+    if (img_stale_fn == 0) { return; }
+    if (first_cluster == 0) { return; }
+    call(cast(fn(i64) as void, img_stale_fn), first_cluster);
+}
+
+// Is a live image loaded from this file? The ETXTBSY question, asked before any
+// change to the bytes behind a running program's text.
+fn img_busy(first_cluster as i64) as i32 {
+    if (img_live_fn == 0) { return 0; }
+    if (first_cluster == 0) { return 0; }
+    return call(cast(fn(i64) as i32, img_live_fn), first_cluster);
+}
+
 fn open_inner(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     if (path_len <= 0) { return cast(*VfsFile, 0); }
     let is i64 as rel_off with mut = 0;
@@ -405,6 +435,17 @@ fn open_inner(path as *u8, path_len as i64, flags as i32) as *VfsFile {
         if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
             return cast(*VfsFile, 0);
         }
+    }
+
+    // Opening for WRITE a file a live process was loaded from: refuse. The
+    // image cache holds the frames that program's text is executing out of and
+    // keys them by (first_cluster, size); rewriting the file would leave the
+    // cache describing bytes that are gone. Checked here, before O_TRUNC below
+    // gets a chance to shorten it. Read-only opens are always fine — reading a
+    // running program is what `cp` does.
+    if ((flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC) != 0) {
+        if (img_busy(first_cluster) != 0) { return cast(*VfsFile, 0); }
+        img_invalidate(first_cluster);
     }
 
     let is *VfsFile as f = pool_alloc();
@@ -537,6 +578,26 @@ fn stat_path_inner(path as *u8, path_len as i64, out as *VfsStat) as i32 {
 // Metadata dispatch
 // ============================================================
 
+// Would this path's bytes be pulled out from under a running program? Resolves
+// the entry to get its cluster, then asks the image cache. A path that does not
+// resolve is not busy — the op below will fail on its own terms, and answering
+// "busy" for a file that is not there would be a lie.
+fn _busy_or_retire(mnt as *VfsMount, path as *u8, path_len as i64) as i32 {
+    if (img_live_fn == 0) { return 0; }
+    let is i64 as parent_cluster with mut = 0;
+    let is i64 as first_cluster with mut = 0;
+    let is i64 as size with mut = 0;
+    let is i32 as attr with mut = 0;
+    let is i64 as ent_cluster with mut = 0;
+    let is i64 as ent_off with mut = 0;
+    if (call(mnt.ops.resolve, mnt.priv, path, path_len,
+             &parent_cluster, &first_cluster, &size, &attr,
+             &ent_cluster, &ent_off) != 0) { return 0; }
+    if (img_busy(first_cluster) != 0) { return 1; }
+    img_invalidate(first_cluster);
+    return 0;
+}
+
 fn unlink_inner(path as *u8, path_len as i64) as i32 {
     let is i64 as rel_off with mut = 0;
     let is *VfsMount as mnt = resolve_mount(path, path_len, &rel_off);
@@ -546,6 +607,7 @@ fn unlink_inner(path as *u8, path_len as i64) as i32 {
     let is i64 as ef_len with mut = rel_len;
     let is *u8 as ef_path with mut = rel;
     if (rel_len == 0) { ef_path = cast(*u8, "/"); ef_len = 1; }
+    if (_busy_or_retire(mnt, ef_path, ef_len) != 0) { return VFS_ETXTBSY; }
     return call(mnt.ops.unlink, mnt.priv, ef_path, ef_len);
 }
 
@@ -583,6 +645,10 @@ fn rename_inner(src as *u8, src_len as i64,
     if (cast(i64, m1) != cast(i64, m2))           { return VFS_EXDEV; }
     let is *u8 as rs = cast(*u8, cast(i64, src) + src_off);
     let is *u8 as rd = cast(*u8, cast(i64, dst) + dst_off);
+    // Both ends: renaming the source moves a running program's bytes, and
+    // renaming ONTO the destination replaces them.
+    if (_busy_or_retire(m1, rs, src_len - src_off) != 0) { return VFS_ETXTBSY; }
+    if (_busy_or_retire(m1, rd, dst_len - dst_off) != 0) { return VFS_ETXTBSY; }
     return call(m1.ops.rename, m1.priv,
                 rs, src_len - src_off,
                 rd, dst_len - dst_off);
@@ -625,6 +691,7 @@ fn err_to_abi(rc as i64) as i64 {
     if (rc == cast(i64, VFS_EMFILE))    { return abi.E_MFILE; }
     if (rc == cast(i64, VFS_ENOSPC))    { return abi.E_NOSPC; }
     if (rc == cast(i64, VFS_EIO))       { return abi.E_IO; }
+    if (rc == cast(i64, VFS_ETXTBSY))   { return abi.E_TXTBSY; }
     return abi.E_INVAL;
 }
 

@@ -174,6 +174,7 @@ struct ImgEntry {
     key_size    as i64;
     refcount    as i64;      // live aspaces holding this image
     pinned      as i64;      // 1 = never evicted (a library in use by the cache)
+    stale       as i64;      // 1 = the file changed; not findable, freed at reclaim
 
     entry       as i64;      // CSE: entry vaddr
     stack_size  as i64;      // CSE: declared user stack (0 = loader default)
@@ -302,7 +303,7 @@ fn _slot_find(cluster as i64, size as i64) as i64 {
     let is i64 as i with mut = 0;
     while (i < ENT_MAX) {
         if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster
-            && _ent[i].key_size == size) { return i; }
+            && _ent[i].key_size == size && _ent[i].stale == 0) { return i; }
         i = i + 1;
     }
     return 0 - 1;
@@ -383,7 +384,10 @@ fn _reclaim_locked() as i64 {
         again = 0;
         let is i64 as i with mut = 0;
         while (i < ENT_MAX) {
-            if (_ent[i].in_use != 0 && _ent[i].refcount <= 0 && _ent[i].pinned == 0) {
+            // A stale entry goes even if pinned: pinning keeps a library that
+            // is still the library, not one whose bytes have been replaced.
+            if (_ent[i].in_use != 0 && _ent[i].refcount <= 0
+                && (_ent[i].pinned == 0 || _ent[i].stale != 0)) {
                 freed = freed + _free_locked(i);
                 again = 1;
             }
@@ -406,20 +410,51 @@ fn reclaim() as i64 {
 // Is any live image backed by this file? The E_TXTBSY question: rewriting a
 // file whose (cluster, size) still names a cached image would leave the cache
 // describing bytes that are gone.
+// Deliberately WITHOUT the cache lock, and that is a lock-ORDER decision, not
+// laziness. The VFS asks this while holding fs_lock; loading a library takes
+// _lk and then calls vfs.open, which takes fs_lock. Taking _lk here would close
+// the cycle (_lk→fs_lock against fs_lock→_lk) and deadlock two cpus.
+//
+// Safe to read unlocked because it is two i64 loads per entry and the answer is
+// a snapshot either way — the cache can change the instant after it is given,
+// lock or no lock. A racing build is not yet published as the entry it will be,
+// and a racing free has already dropped in_use, so both races land on "not
+// busy", which is what those states honestly are.
 fn is_live(cluster as i64) as i32 {
     if (cluster == 0) { return 0; }
-    lock.acquire(&_lk);
     let is i64 as i with mut = 0;
-    let is i32 as hit with mut = 0;
     while (i < ENT_MAX) {
-        if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster) {
-            hit = 1;
-            i = ENT_MAX;
-        } else { i = i + 1; }
+        // refcount, not mere presence: an entry with no users is CACHE, and a
+        // cache must never make a file permanently unwritable. Only a process
+        // actually executing out of those frames makes the bytes untouchable.
+        if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster
+            && _ent[i].refcount > 0 && _ent[i].stale == 0) { return 1; }
+        i = i + 1;
     }
-    lock.release(&_lk);
-    return hit;
+    return 0;
 }
+
+// The file behind this cluster is about to change. Any cached entry for it with
+// no users left describes bytes that will not exist, so retire it: it stops
+// being findable now and its frames go back at the next reclaim.
+//
+// One i64 store per entry, and no lock, for the lock-order reason above — the
+// VFS calls this holding fs_lock. An entry that gains a user between the check
+// and this store cannot exist: the caller only reaches here when is_live said
+// no, and both run under fs_lock, which every path to this file must hold.
+fn mark_stale(cluster as i64) as void {
+    if (cluster == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < ENT_MAX) {
+        if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster
+            && _ent[i].refcount <= 0) {
+            _ent[i].stale = 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn mark_stale_ptr() as i64 { return cast(i64, fn_ptr(mark_stale)); }
 
 fn release(slot as i64) as void {
     if (slot < 0 || slot >= ENT_MAX) { return; }
@@ -446,6 +481,7 @@ fn release(slot as i64) as void {
 // modules is not available to the wirer, so the owner hands out the address.
 fn release_ptr() as i64 { return cast(i64, fn_ptr(release)); }
 fn reclaim_ptr() as i64 { return cast(i64, fn_ptr(reclaim)); }
+fn is_live_ptr() as i64 { return cast(i64, fn_ptr(is_live)); }
 
 fn entry_point(slot as i64) as i64  { return _ent[slot].entry; }
 fn stack_size(slot as i64) as i64   { return _ent[slot].stack_size; }
@@ -801,6 +837,7 @@ fn _ent_reset(s as i64, cluster as i64, size as i64) as void {
     _ent[s].key_size    = size;
     _ent[s].refcount    = 1;
     _ent[s].pinned      = 0;
+    _ent[s].stale       = 0;
     _ent[s].entry       = 0;
     _ent[s].stack_size  = 0;
     _ent[s].hdr_flags   = 0;
