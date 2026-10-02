@@ -28,6 +28,7 @@ use "timer.cst"  as timer;
 use "abi.cst"    as abi;
 use "kobject.cst" as kobject;
 use "lock.cst"    as lock;
+use "mutex.cst"   as mutex;
 
 // Serialises filesystem operations. The backing FS (fat32) keeps shared
 // scratch buffers with no internal lock, so two processes doing file I/O on
@@ -36,7 +37,12 @@ use "lock.cst"    as lock;
 // X wraps acquire/inner/release so multiple internal returns can't leak the
 // lock. The fat32 self-test bypasses VFS but runs exclusively before vfs.mount,
 // so it needs no lock. lseek is purely local (VfsFile offset) and stays unlocked.
-let is lock.TicketLock as fs_lock;
+//
+// A MUTEX, not a spinlock: it is held across disk I/O, and a holder waiting on
+// the disk sleeps. As a ticket spinlock every other file operation on the
+// machine spun a cpu while it waited, and on the holder's own cpu a spinner
+// that outranked it kept it from running at all — the disk-root freeze.
+let is mutex.Mutex as fs_lock with mut;
 
 // ============================================================
 // Error codes. Negative to play nice with syscalls that return -errno.
@@ -229,6 +235,7 @@ fn init() as void {
     mount_pool_used = 0;
     set_mount_head(cast(*VfsMount, 0));
     file_ops_init();
+    mutex.name(&fs_lock, "vfs.fs_lock", 11);
     serial.println("vfs: ready", 10);
 }
 
@@ -701,33 +708,33 @@ fn err_to_abi(rc as i64) as i64 {
 // shared fat32 scratch buffers are never touched by two cpus at once.
 // ============================================================
 fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is *VfsFile as r = open_inner(path, path_len, flags);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn close(f as *VfsFile) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = close_inner(f);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i64 as r = read_inner(f, buf, n);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i64 as r = write_inner(f, buf, n);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = stat_path_inner(path, path_len, out);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 
@@ -735,9 +742,9 @@ fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
 // but dispatches to fs_ops.statx (NULL = E_NOSYS) so filesystems without
 // timestamp support (or new ones in development) keep working.
 fn statx_path(path as *u8, path_len as i64, out as *abi.Statx) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = statx_path_inner(path, path_len, out);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 
@@ -756,33 +763,33 @@ fn statx_path_inner(path as *u8, path_len as i64, out as *abi.Statx) as i32 {
     return call(mnt.ops.statx, mnt.priv, ef_path, ef_len, out);
 }
 fn unlink(path as *u8, path_len as i64) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = unlink_inner(path, path_len);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn mkdir(path as *u8, path_len as i64) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = mkdir_inner(path, path_len);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn rmdir(path as *u8, path_len as i64) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = rmdir_inner(path, path_len);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn rename(src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = rename_inner(src, src_len, dst, dst_len);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
-    lock.acquire(&fs_lock);
+    mutex.acquire(&fs_lock);
     let is i32 as r = readdir_inner(f, out);
-    lock.release(&fs_lock);
+    mutex.release(&fs_lock);
     return r;
 }
 
@@ -795,8 +802,8 @@ fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
 // EXISTING file resolve as "not found". The lock is the single FS-wide mutex;
 // every fat32 buffer-touching path must hold it. (fat32 imports vfs already,
 // so these accessors avoid an import cycle — vfs must not import fat32.)
-fn fs_lock_acquire() as void { lock.acquire(&fs_lock); }
-fn fs_lock_release() as void { lock.release(&fs_lock); }
+fn fs_lock_acquire() as void { mutex.acquire(&fs_lock); }
+fn fs_lock_release() as void { mutex.release(&fs_lock); }
 
 fn file_op_read(priv as i64, buf as i64, n as i64) as i64 {
     let is i64 as r = read(cast(*VfsFile, priv), cast(*u8, buf), n);

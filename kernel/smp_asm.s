@@ -137,3 +137,33 @@ smp_call_ptr:
 smp_in_irq_context:
     .byte   0x65, 0x48, 0x8B, 0x04, 0x25, 0x70, 0x00, 0x00, 0x00   # mov rax, QWORD PTR gs:[0x70]
     ret
+
+# Per-cpu preempt count (smp.PerCpu.preempt_count, gs:[0x78]). One
+# instruction each, so an interrupt can never split the read-modify-write;
+# no lock prefix, because only this cpu ever touches its own slot.
+.globl smp_preempt_inc
+smp_preempt_inc:
+    .byte   0x65, 0x48, 0xFF, 0x04, 0x25, 0x78, 0x00, 0x00, 0x00   # inc QWORD PTR gs:[0x78]
+    ret
+
+.globl smp_preempt_dec
+smp_preempt_dec:
+    .byte   0x65, 0x48, 0xFF, 0x0C, 0x25, 0x78, 0x00, 0x00, 0x00   # dec QWORD PTR gs:[0x78]
+    ret
+
+# void smp_gs_load_into(uint64_t off /*rdi*/, uint64_t *out /*rsi*/)
+# *out = QWORD PTR gs:[off] — a per-cpu field read for modules that cannot
+# import smp.cst (lock.cst sits below it).
+.globl smp_gs_load_into
+smp_gs_load_into:
+    .byte   0x65, 0x48, 0x8B, 0x07        # mov rax, QWORD PTR gs:[rdi]
+    .byte   0x48, 0x89, 0x06              # mov [rsi], rax
+    ret
+
+# void smp_rflags_into(uint64_t *out /*rdi*/) — *out = RFLAGS, IF untouched.
+.globl smp_rflags_into
+smp_rflags_into:
+    .byte   0x9C                          # pushfq
+    .byte   0x8F, 0x07                    # pop QWORD PTR [rdi]
+    ret
+

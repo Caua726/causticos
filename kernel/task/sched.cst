@@ -137,10 +137,21 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 320  io_buf           i64   (lazy 4 KiB syscall-I/O staging — kfree'd by the reaper)
 // 328  kill_pending     i64   (SYS_PROC_KILL marked this thread; the scheduler
 //                              never resumes it again — see kill_finalize)
-// 336  reserved         48 bytes
+// 336  initial_rdi      i64   (ring-3 rdi of a SYS_THREAD_SPAWN worker)
+// 344  poll_parked      i64   (1 while parked in poll_park_seq)
+// 352  wait_next        i64   (mutex wait queue link: next waiter tid + 1)
+// 360  wait_granted     i64   (1 once a mutex release handed this thread the lock)
+// 368  reserved         16 bytes
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
+
+// Named slots used outside this file. initial_rdi and poll_parked used to
+// share 336; they never collided only because a worker reads its rdi before
+// it can ever park, which is luck, not a layout.
+let is i64 as THR_INITIAL_RDI  = 336;
+let is i64 as THR_WAIT_NEXT    = 352;
+let is i64 as THR_WAIT_GRANTED = 360;
 // Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
 // Created lazily on first use under heap_lock (SMP-safe), so there is no
 // init-order dependency between sched.init and per_cpu_init / AP bring-up.
@@ -431,8 +442,8 @@ fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
 // Initial ring-3 rdi for a thread (Thread+336, the arg SYS_THREAD_SPAWN passes
 // to the worker's entry fn). 0 for a normal process main thread — its args
 // arrive on the stack, and enter_user's register clear keeps rdi = 0 there.
-fn thr_set_initial_rdi(tid as i64, v as i64) as void { thr_set(tid, 336, v); }
-fn thr_initial_rdi(tid as i64) as i64                { return thr_get(tid, 336); }
+fn thr_set_initial_rdi(tid as i64, v as i64) as void { thr_set(tid, THR_INITIAL_RDI, v); }
+fn thr_initial_rdi(tid as i64) as i64                { return thr_get(tid, THR_INITIAL_RDI); }
 
 // 1 while any thread of `proc_ptr` is still a live scheduler object (thread_ptr
 // != 0 — RUNNING, parked, or DEAD-but-not-yet-reaped). proc_wait spins on this
@@ -684,13 +695,13 @@ fn preempt_disable() as void {
 
 fn preempt_enable() as void {
     smp.this_cpu_set_preempt_count(smp.this_cpu_preempt_count() - 1);
-    if (smp.this_cpu_preempt_count() == 0) {
-        if (smp.this_cpu_in_irq_context() == 0) {
-            if (smp.this_cpu_need_resched() != 0) {
-                schedule();
-            }
-        }
-    }
+    lock.preempt_check();
+}
+
+// What lock.preempt_check calls once the last spinlock is dropped with a
+// reschedule pending (installed by init; lock.cst cannot import this file).
+fn preempt_resched() as void {
+    schedule();
 }
 
 // ============================================================
@@ -1468,7 +1479,7 @@ fn sleep_locked_and_yield(saved_flags as i64) as void {
 // one cap instead of a hang. The cap is a safety net on a liveness hazard, not
 // the mechanism — events wake a parked poller immediately.
 let is i64 as POLL_PARK_CAP_NS = 50000000;      // 50 ms
-let is i64 as THR_POLL_PARKED = 336;            // reserved slot in the thread struct
+let is i64 as THR_POLL_PARKED = 344;            // slot in the thread struct (see layout)
 
 // process_cpu_ns — cumulative cpu time of every thread of one process. The
 // per-thread totals are the honest source; a process is just their sum.
@@ -1795,6 +1806,22 @@ fn schedule() as void {
 
     let is i64 as from_irq = smp.this_cpu_in_irq_context();
 
+    // Preemption held off (a spinlock is held, or preempt_disable). From an
+    // interrupt that is the normal case: leave need_resched set and return —
+    // the release that brings the count to zero takes the switch. A thread
+    // calling in to SLEEP with a spinlock held is a bug that would wedge every
+    // later ticket on that lock behind a thread that is not running; stop the
+    // kernel and say so instead.
+    if (smp.this_cpu_preempt_count() != 0) {
+        if (from_irq != 0) { return; }
+        serial.print("sched: schedule() with preemption held off, count=", 51);
+        util.print_num(smp.this_cpu_preempt_count());
+        serial.print(" tid=", 5);
+        util.print_num(current_tid());
+        serial.println("", 0);
+        pmm.panic("sleeping while atomic", 21);
+    }
+
     asm(".byte 0xFA\n");  // cli
     let is i64 as cpu = this_cpu();
     lock.acquire(sched_lock_ptr(cpu));
@@ -1961,6 +1988,14 @@ fn schedule() as void {
             asm("pop r15\n");
         }
     }
+
+    // We are whoever got resumed now, so the cpu's interrupt-context flag must
+    // be OURS. A thread that went to sleep voluntarily and is woken by a
+    // switch made from an interrupt stub would otherwise run on with the
+    // stub's in_irq_context = 1: it would then skip the sti below on its next
+    // voluntary schedule(), defer when it should switch, and refuse to take a
+    // mutex. from_irq is this invocation's own answer, saved on our stack.
+    smp.this_cpu_set_in_irq_context(from_irq);
 
     // Program LAPIC for next event under the cpu's lock — both
     // the deadline tree and the suspended-deadline scan are
@@ -2408,6 +2443,10 @@ fn init() as void {
         bb_set(ci, 5, 0, 100); bb_set(ci, 5, 1, QOS_WINDOW_NS); bb_set(ci, 5, 2, 0); bb_set(ci, 5, 3, 0);
         ci = ci + 1;
     }
+
+    // A spinlock release that drops the last hold with a reschedule pending
+    // calls back into the scheduler through this.
+    lock.set_resched_hook(cast(i64, fn_ptr(preempt_resched)));
 
     // BSP creates its own idle here; APs do it from ap_start.
     per_cpu_init();

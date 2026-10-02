@@ -1,0 +1,184 @@
+// mutex.cst — a sleeping lock, for anything held across a wait.
+//
+// A ticket spinlock is for a few hundred instructions on a running cpu. The
+// file system lock was one, and it was held across disk I/O: the holder slept
+// in io.wait_complete while every other thread that wanted the volume burned a
+// cpu spinning, and a spinner that outranked the holder on the holder's own cpu
+// kept it from ever running again. That is how a busy disk root froze the whole
+// machine. A Mutex waiter does not spin: it queues and sleeps, and the release
+// hands the lock straight to the oldest waiter and wakes it.
+//
+// Properties:
+//   - FIFO and handoff: release gives ownership to the first waiter before it
+//     wakes it, so a newcomer can never barge past a thread that has waited.
+//   - Not recursive. Acquiring a mutex you already hold is a bug, and it stops
+//     the kernel with the mutex's name instead of hanging it.
+//   - Only from a context that may sleep: thread context, interrupts on, no
+//     spinlock held. Anything else stops the kernel with a message — sleeping
+//     there would wedge the cpu instead.
+//   - Waiting is uninterruptible. A kill reaches the waiter once it holds the
+//     lock and its syscall unwinds; holders release in bounded time, which is
+//     the contract every user of this lock signs.
+//
+// Zero-initialised is a valid, free, nameless mutex, so globals need no init.
+// Every field is an i64 (mixed widths miscompile — see the language notes);
+// tids are stored +1 so that zero means "nobody".
+
+use "serial.cst" as serial;
+use "util.cst"   as util;
+use "lock.cst"   as lock;
+use "timer.cst"  as timer;
+use "sched.cst"  as sched;
+use "pmm.cst"    as pmm;
+
+struct Mutex {
+    owner as i64;         // holder tid + 1; 0 = free; BOOT_OWNER before the scheduler
+    head as i64;          // oldest waiter tid + 1; 0 = no waiter
+    tail as i64;          // newest waiter tid + 1
+    since_ns as i64;      // when the current holder got it (the watchdog reads it)
+    waits as i64;         // acquisitions that had to sleep, for diagnostics
+    name as *u8;          // set by mutex.name(); printed when something goes wrong
+    name_len as i64;
+    guard as lock.TicketLock;
+}
+
+// Owner value while only the boot cpu runs and there are no threads yet. A
+// mutex taken there is released there; nothing can be waiting on it.
+let is i64 as BOOT_OWNER = 0 - 1;
+
+fn name(m as *Mutex, n as *u8, len as i64) as void {
+    m.name = n;
+    m.name_len = len;
+}
+
+fn die(m as *Mutex, what as *u8, what_len as i64) as void {
+    serial.print("mutex ", 6);
+    if (m.name_len > 0) { serial.print(m.name, m.name_len); }
+    else { serial.print("(unnamed)", 9); }
+    serial.print(": ", 2);
+    serial.print(what, what_len);
+    serial.print(" tid=", 5);
+    util.print_num(sched.current_tid());
+    serial.print(" owner=", 7);
+    util.print_num(m.owner - 1);
+    serial.println("", 0);
+    pmm.panic("mutex misuse", 12);
+}
+
+// The caller must be able to sleep. Checked on every acquire, not only the
+// slow path: a misuse that only bites under contention is the kind that ships.
+fn check_may_sleep(m as *Mutex) as void {
+    if (lock.gs_load(0x70) != 0) { die(m, "acquired in interrupt context", 29); }
+    if (lock.preempt_count() != 0) { die(m, "acquired under a spinlock", 25); }
+    if (lock.interrupts_enabled() == 0) { die(m, "acquired with interrupts off", 28); }
+}
+
+fn acquire(m as *Mutex) as void {
+    if (sched.is_active() == 0) {
+        // One cpu, no threads: nothing can hold it but us, and nothing can wait.
+        if (m.owner != 0) { die(m, "taken twice before the scheduler", 32); }
+        m.owner = BOOT_OWNER;
+        m.since_ns = timer.current_time_ns();
+        return;
+    }
+    check_may_sleep(m);
+    let is i64 as me = sched.current_tid();
+    let is i64 as f = lock.acquire_irq(&m.guard);
+    if (m.owner == 0) {
+        m.owner = me + 1;
+        m.since_ns = timer.current_time_ns();
+        lock.release_irq(&m.guard, f);
+        return;
+    }
+    if (m.owner == me + 1) {
+        lock.release_irq(&m.guard, f);
+        die(m, "acquired twice by its holder", 28);
+    }
+    // Queue at the tail. The link and the grant live in the waiter's own
+    // Thread, so waiting allocates nothing.
+    sched.thr_set(me, sched.THR_WAIT_NEXT, 0);
+    sched.thr_set(me, sched.THR_WAIT_GRANTED, 0);
+    if (m.tail != 0) { sched.thr_set(m.tail - 1, sched.THR_WAIT_NEXT, me + 1); }
+    else { m.head = me + 1; }
+    m.tail = me + 1;
+    m.waits = m.waits + 1;
+    lock.release_irq(&m.guard, f);
+
+    // Sleep until release() hands the lock over. The grant is re-checked under
+    // this cpu's scheduler lock — the same lock wakeup_thread takes — so a
+    // release landing between the check and the sleep finds us SLEEPING and
+    // wakes us, instead of waking a thread that then sleeps through the news.
+    // Any other wakeup is spurious and loops back to sleep.
+    while (1 == 1) {
+        let is i64 as sf = sched.take_lock();
+        if (sched.thr_get(me, sched.THR_WAIT_GRANTED) != 0) {
+            sched.drop_lock(sf);
+            return;
+        }
+        sched.sleep_locked_and_yield(sf);
+    }
+}
+
+// 1 = acquired, 0 = it was held (the caller goes without). For paths that
+// must not sleep — the allocator's out-of-memory reclaim runs under whatever
+// the allocating caller holds.
+fn try_acquire(m as *Mutex) as i64 {
+    if (sched.is_active() == 0) {
+        if (m.owner != 0) { return 0; }
+        m.owner = BOOT_OWNER;
+        m.since_ns = timer.current_time_ns();
+        return 1;
+    }
+    let is i64 as me = sched.current_tid();
+    let is i64 as f = lock.acquire_irq(&m.guard);
+    if (m.owner != 0) {
+        lock.release_irq(&m.guard, f);
+        return 0;
+    }
+    m.owner = me + 1;
+    m.since_ns = timer.current_time_ns();
+    lock.release_irq(&m.guard, f);
+    return 1;
+}
+
+fn release(m as *Mutex) as void {
+    if (m.owner == BOOT_OWNER) {
+        m.owner = 0;
+        return;
+    }
+    let is i64 as me = sched.current_tid();
+    let is i64 as f = lock.acquire_irq(&m.guard);
+    if (m.owner != me + 1) {
+        lock.release_irq(&m.guard, f);
+        die(m, "released by a thread that does not hold it", 42);
+    }
+    let is i64 as next = m.head;
+    if (next != 0) {
+        let is i64 as nt = next - 1;
+        m.head = sched.thr_get(nt, sched.THR_WAIT_NEXT);
+        if (m.head == 0) { m.tail = 0; }
+        m.owner = next;                       // handoff: it is theirs before they run
+        m.since_ns = timer.current_time_ns();
+        sched.thr_set(nt, sched.THR_WAIT_GRANTED, 1);
+    } else {
+        m.owner = 0;
+    }
+    lock.release_irq(&m.guard, f);
+    if (next != 0) { sched.wakeup_thread(next - 1); }
+}
+
+// Does the calling thread hold it? For assertions in code that requires the
+// lock without taking it.
+fn held_by_me(m as *Mutex) as i64 {
+    if (m.owner == BOOT_OWNER) { return 1; }
+    if (m.owner == sched.current_tid() + 1) { return 1; }
+    return 0;
+}
+
+// Holder tid (-1 = free) and how long it has held it — for the watchdog's
+// report on a lock that has been held far longer than any I/O should take.
+fn holder(m as *Mutex) as i64 { return m.owner - 1; }
+fn held_ns(m as *Mutex) as i64 {
+    if (m.owner == 0) { return 0; }
+    return timer.current_time_ns() - m.since_ns;
+}
