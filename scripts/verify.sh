@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # verify.sh — boot the system N times per cpu count and check what it printed.
 #
-# Two gates, both against the SAME kernel binary the ISO ships:
+# Three gates, all against the SAME kernel binary the ISO ships:
 #
 #   live     the ISO alone, no disk on the bus. Proves the claim the whole
 #            reform exists for: the root travels inside the image.
-#   persist  a scratch FAT32 disk as the root, with the `smoke` command line, so
-#            the AHCI driver and the FAT32 write path are actually exercised.
+#   persist  a scratch FAT32 disk as the root, with the `selftest` command line,
+#            so the AHCI driver and the FAT32 write path are actually exercised.
+#   smoke    the live ISO with the `smoke` command line: the in-kernel gauntlet
+#            (memory, IPC objects, the driver framework, both NICs, audio, the
+#            VFS self-test, the ring-3 smokes). Every one of them has to report
+#            PASS and nothing may say FAIL. No gate ran this boot before, and
+#            the VFS self-test in it had quietly stopped at its first check.
 #
 # What the script this replaces got wrong, and why each is fixed here:
 #
@@ -38,7 +43,7 @@ source "$(dirname "$0")/portable.sh"
 SMPS="1,2,4"
 RUNS=1
 TOUT=25
-GATES="live persist"
+GATES="live persist smoke"
 KEEP=0
 USE_ACCEL=0
 
@@ -53,6 +58,7 @@ usage: caustic-mk run verify -- [options]
   --timeout S      per-boot deadline in seconds (default 25)
   --live-only      only the live gate (no disk)
   --persist-only   only the persist gate (AHCI + FAT32 writes)
+  --smoke-only     only the smoke gate (the in-kernel test gauntlet)
   --keep-logs      leave the serial logs in build/verify/ for inspection
   --kvm            use the host accelerator (default: TCG, so the sweep is
                    identical on every machine)
@@ -66,6 +72,7 @@ while [ $# -gt 0 ]; do
         --timeout) TOUT="$2"; shift 2 ;;
         --live-only) GATES="live"; shift ;;
         --persist-only) GATES="persist"; shift ;;
+        --smoke-only) GATES="smoke"; shift ;;
         --keep-logs) KEEP=1; shift ;;
         --kvm) USE_ACCEL=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -100,6 +107,21 @@ PERSIST_MARKERS=(
     'boot: /init.cse launched pid='
     'ALL PHASE-6 TESTS PASS'
 )
+# The last line each smoke prints when it passes. The ring-3 gauntlet runs its
+# smokes in a fixed order and the kill smoke is the last of them.
+SMOKE_MARKERS=(
+    'kvmap_smoke: PASS'
+    'heap_smoke: PASS'
+    'random_smoke: PASS'
+    'surface_smoke: PASS'
+    'dummy.dma: PASS'
+    'netdev_smoke: PASS'
+    'audio_smoke: PASS'
+    'vfs.test: ALL PASS'
+    'userspace.kill_smoke: sleep PASS'
+)
+# On the smoke boot a FAIL from any smoke fails the gate.
+SMOKE_FAIL_PATTERN="$FAIL_PATTERN|FAIL"
 
 echo "verify: building the images under test"
 caustic-mk build kernel >/dev/null 2>&1 || { echo "verify: kernel build failed" >&2; exit 1; }
@@ -107,6 +129,9 @@ caustic-mk build kernel >/dev/null 2>&1 || { echo "verify: kernel build failed" 
 
 case " $GATES " in *" live "*)
     bash scripts/mkiso.sh --profile desktop --out "$WORK/live.iso" >/dev/null ;;
+esac
+case " $GATES " in *" smoke "*)
+    bash scripts/mkiso.sh --profile desktop --cmdline smoke --out "$WORK/smoke.iso" >/dev/null ;;
 esac
 case " $GATES " in *" persist "*)
     # No live root in this ISO: the disk must be the only candidate, so a pass
@@ -136,12 +161,11 @@ run_one() {   # run_one <gate> <smp> <index>
     # became 64M, and no sound card at all — so the audio driver was exercised by
     # `run` and by the test scripts, and silently not by the gate.
     local disk=""
-    if [ "$gate" != live ]; then
+    if [ "$gate" = persist ]; then
         disk="$WORK/disk-smp$smp-$idx.img"
         cp "$WORK/pristine.img" "$disk"
     fi
-    local iso="$WORK/live.iso"
-    [ "$gate" = live ] || iso="$WORK/persist.iso"
+    local iso="$WORK/$gate.iso"
 
     # A port per run. The machine forwards a host port to the guest's httpd, and
     # twenty boots at once all asked for 18080 — nineteen of them died at startup
@@ -160,7 +184,9 @@ run_one() {   # run_one <gate> <smp> <index>
     qemu-system-x86_64 "${args[@]}" > "$log" 2>&1 &
     local qpid=$!
     local deadline=$((SECONDS + TOUT))
-    local -n markers="$([ "$gate" = live ] && echo LIVE_MARKERS || echo PERSIST_MARKERS)"
+    local -n markers="${gate^^}_MARKERS"
+    local fail_pattern="$FAIL_PATTERN"
+    [ "$gate" = smoke ] && fail_pattern="$SMOKE_FAIL_PATTERN"
 
     # Wait for ALL markers, not for one of them. Waiting on a single "last"
     # marker means depending on the order the kernel happens to print in, and
@@ -175,7 +201,7 @@ run_one() {   # run_one <gate> <smp> <index>
             echo "$raw_now" | grep -qaF "$m" || { seen=0; break; }
         done
         [ "$seen" = 1 ] && break
-        echo "$raw_now" | grep -qaE "$FAIL_PATTERN" && break
+        echo "$raw_now" | grep -qaE "$fail_pattern" && break
         [ "$SECONDS" -ge "$deadline" ] && break
         sleep 0.2
     done
@@ -185,7 +211,7 @@ run_one() {   # run_one <gate> <smp> <index>
     local raw; raw="$(tr -d '\000' < "$log")"
     [ "$KEEP" = 1 ] || rm -f "$WORK/disk-smp$smp-$idx.img"
 
-    local hit; hit="$(echo "$raw" | grep -aE "$FAIL_PATTERN" | head -1)"
+    local hit; hit="$(echo "$raw" | grep -aE "$fail_pattern" | head -1)"
     if [ -n "$hit" ]; then
         echo "  $gate smp=$smp run=$idx: FAIL  ${hit:0:70}"
         echo "    log: $log"; KEEP=1

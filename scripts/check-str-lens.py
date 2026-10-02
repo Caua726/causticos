@@ -58,7 +58,7 @@ SPEC_REF = re.compile(r'^\s*[a-z_]+\s*:\s*([A-Za-z0-9_]+\.[A-Za-z0-9_]+)\s*$', r
 # length, since plenty of others take a literal followed by an unrelated number
 # (check("name", got, want) being the obvious one).
 SERIAL = re.compile(
-    r'(?:serial|fb)\.(?:print|println|print_scaled)\s*\(\s*'
+    r'(?:(?:serial|fb)\.(?:print|println|print_scaled)|\b(?:pmm\.)?panic|\btest_fail)\s*\(\s*'
     r'(?:cast\(\*u8,\s*)?"(?P<text>(?:[^"\\]|\\.)*)"\)?'
     r'\s*,\s*(?P<len>\d+)'
 )

@@ -121,9 +121,11 @@ the manifest before you get that far.
 
 ## Validating
 
-`caustic-mk run verify` boots the shipped kernel `1/2/4 cpus x 20 runs` through
-two gates — the live ISO with no disk, and a scratch disk with the FAT32 write
-suite — and reports which markers were missing when one fails. It works entirely
+`caustic-mk run verify` boots the shipped kernel on 1, 2 and 4 cpus through
+three gates — the live ISO with no disk, a scratch disk with the FAT32 write
+suite, and the `smoke` command line, where every in-kernel smoke has to report
+PASS and none may say FAIL — and reports which markers were missing when one
+fails. `--runs N` repeats each configuration to hunt an intermittent. It works entirely
 under `build/verify/`, so it is safe to run while a VM holds `build/disk.img`.
 
 The strongest check for anything touching the toolchain is still the four-round

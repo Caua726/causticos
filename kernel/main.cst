@@ -182,12 +182,26 @@ fn _kernel_start() as void {
     font.init();
     serial.println("boot ok", 7);
 
+    // Test code runs only on a smoke boot (`smoke` on the command line). A
+    // production boot used to run all of it: synthetic buses, a test pattern
+    // drawn on the scanout, broadcast ARPs claiming QEMU's addresses on
+    // whatever network the machine was plugged into, and a network read with
+    // no deadline that hung the audio smoke behind it on a quiet link.
+    let is i64 as smoke = cmdline.smoke();
+
     pmm.init();
-    pmm.buddy_selftest();   // validate frame_meta + intrusive free-list before heap rides on the PMM
-    pmm.pzero_smoke();      // pre-zeroed frame pool: refill → serve-from-pool → drain → free_total round-trip
+    if (smoke != 0) {
+        pmm.buddy_selftest();   // validate frame_meta + intrusive free-list before heap rides on the PMM
+        pmm.pzero_smoke();      // pre-zeroed frame pool: refill → serve-from-pool → drain → free_total round-trip
+    }
     heap.init();
-    heap.heap_smoke();      // exercise bins (every class + reuse), large, kpool + double-free gate
+    if (smoke != 0) {
+        heap.heap_smoke();      // exercise bins (every class + reuse), large, kpool + double-free gate
+    }
     vmm.init();
+    if (smoke != 0) {
+        vmm.kvmap_smoke();      // KV_DATA/KV_MMIO/KV_WC round trips + the MMIO no-leak proof
+    }
 
     // ACPI before anything time-sensitive: MADT supplies the IOAPIC
     // address + ISA IRQ overrides, HPET gives us the high-resolution
@@ -200,7 +214,7 @@ fn _kernel_start() as void {
     // for RDSEED/RDRAND and says loudly when the machine has neither, since
     // that is a real limitation TLS will have to refuse on later.
     random.init();
-    random.smoke();
+    if (smoke != 0) { random.smoke(); }
 
     // LAPIC timer: calibrate against HPET (falls back to PIT if HPET
     // missing), then take over scheduler ticking.
@@ -218,14 +232,16 @@ fn _kernel_start() as void {
     fb.print_scaled(cast(*u8, "causticos"), 9, tx + 4, ty + 5, cast(i32, 0x00123040), sc);  // shadow
     fb.print_scaled(cast(*u8, "causticos"), 9, tx, ty, cast(i32, 0x0073d0ff), sc);          // cyan face
     surface.init();        // wire the KOBJ_SURFACE vtable before dev_open
-    surface.smoke();       // kernel-side: acquire → draw → present → verify scanout
     channel.init();        // wire the KOBJ_CHANNEL vtable before channel_create
-    channel.smoke();       // kernel-side: mint pair → write A → read B → verify
-    channel.fd_pass_smoke();  // kernel-side: pass a KObject reference across a channel
     segment.init();        // wire the KOBJ_SEGMENT vtable before SYS_SEG_CREATE
-    segment.smoke();       // kernel-side: create → attach 2 aspaces → share → teardown
     eventfd.init();        // wire the KOBJ_EVENT vtable before SYS_EVENT_SUBSCRIBE
-    eventfd.smoke();       // kernel-side: create → post → read back → verify → close
+    if (smoke != 0) {
+        surface.smoke();       // acquire → draw → present → verify scanout
+        channel.smoke();       // mint pair → write A → read B → verify
+        channel.fd_pass_smoke();  // pass a KObject reference across a channel
+        segment.smoke();       // create → attach 2 aspaces → share → teardown
+        eventfd.smoke();       // create → post → read back → verify → close
+    }
 
     proc.init();
     // Wire the child-exit hook: process.finish_exit -> eventfd.event_post. Done
@@ -238,12 +254,13 @@ fn _kernel_start() as void {
     driver.init();
     ioapic.init();
     pci.register();
-    virtio.chain_smoke();  // descriptor free list, on a synthetic queue
+    if (smoke != 0) { virtio.chain_smoke(); }  // descriptor free list, on a synthetic queue
     netdev.net_init();     // wire the KOBJ_DEVICE vtable before dev_open(DEV_NET)
     netdev.register_ksyms();
     audio.audio_init();    // same, for dev_open(DEV_AUDIO_OUT / DEV_AUDIO_IN)
     e1000.register();
     dummybus.register();
+    if (smoke != 0) { dummybus.register_bus(); }
     platform_bus.register();
     kbd.kbd_init();        // wire the KOBJ_DEVICE vtable before dev_open(DEV_KEYBOARD)
     kbd.register();
@@ -256,17 +273,18 @@ fn _kernel_start() as void {
     ahci.register();
     membus.register();     // RAM regions as hardware-tree nodes (L0)
     driver.driver_enumerate_all();
-    membus.smoke();        // DFS the tree, log the RAM regions
-    ksym.dump();
-
-    // Exercise ksym lookup as smoke test for Phase 2.3.
-    let is i64 as bind_addr = ksym.lookup(cast(*u8, "dummybus.dummy_bind"), 19);
-    if (bind_addr != 0) {
-        serial.print("ksym: dummybus.dummy_bind=", 26);
-        util.print_hex(bind_addr);
-        serial.println("", 0);
-    } else {
-        serial.println("ksym: lookup FAILED", 19);
+    if (smoke != 0) {
+        membus.smoke();        // DFS the tree, log the RAM regions
+        ksym.dump();
+        // ksym lookup by name, the way specparse resolves on_bind.
+        let is i64 as bind_addr = ksym.lookup(cast(*u8, "dummybus.dummy_bind"), 19);
+        if (bind_addr != 0) {
+            serial.print("ksym: dummybus.dummy_bind=", 26);
+            util.print_hex(bind_addr);
+            serial.println("", 0);
+        } else {
+            serial.println("ksym: lookup FAILED", 19);
+        }
     }
 
     // Phase 2.4: parse embedded .cdvrspec blobs and register each one.
@@ -351,12 +369,11 @@ fn _kernel_start() as void {
     // they only run when no I/O thread is runnable.
     sched.create_thread(fn_addr_driver_init, sched.QOS_ACTIVE);
     sched.create_thread(fn_addr_fat32_mount, sched.QOS_ACTIVE);
-    // The network smoke waits for phase 2 to bind the NICs, then exercises the
-    // DEV_NET contract through the same KObject a program gets. It replaces
-    // the per-driver ARP smokes that used to run inside on_bind and cost up to
-    // two seconds of boot each.
-    sched.create_thread(cast(i64, fn_ptr(device_smokes_thread)), sched.QOS_ACTIVE);
-    if (cmdline.smoke() != 0) {
+    if (smoke != 0) {
+        // The network smoke waits for phase 2 to bind the NICs, then exercises
+        // the DEV_NET contract through the same KObject a program gets; the
+        // audio smoke does the same for DEV_AUDIO_*.
+        sched.create_thread(cast(i64, fn_ptr(device_smokes_thread)), sched.QOS_ACTIVE);
         // Smoke boot (verify.sh): VFS self-test + the userspace smoke gauntlet.
         // No /init — the smokes are the workload, and the A/B preempt spinners
         // ride along so context-switching is exercised under load.
