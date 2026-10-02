@@ -204,10 +204,10 @@ run_one() {   # run_one <gate> <smp> <index>
         local raw_now; raw_now="$(tr -d '\000' < "$log")"
         local seen=1
         for m in "${markers[@]}"; do
-            echo "$raw_now" | grep -qaF "$m" || { seen=0; break; }
+            [[ "$raw_now" == *"$m"* ]] || { seen=0; break; }
         done
         [ "$seen" = 1 ] && break
-        echo "$raw_now" | grep -qaE "$fail_pattern" && break
+        grep -qaE "$fail_pattern" <<< "$raw_now" && break
         [ "$SECONDS" -ge "$deadline" ] && break
         sleep 0.2
     done
@@ -217,7 +217,7 @@ run_one() {   # run_one <gate> <smp> <index>
     local raw; raw="$(tr -d '\000' < "$log")"
     [ "$KEEP" = 1 ] || rm -f "$WORK/disk-smp$smp-$idx.img"
 
-    local hit; hit="$(echo "$raw" | grep -aE "$fail_pattern" | head -1)"
+    local hit; hit="$(grep -aE -m1 "$fail_pattern" <<< "$raw")"
     if [ -n "$hit" ]; then
         echo "  $gate smp=$smp run=$idx: FAIL  ${hit:0:70}"
         echo "    log: $log"; KEEP=1
@@ -225,7 +225,10 @@ run_one() {   # run_one <gate> <smp> <index>
     fi
     local missing=()
     for m in "${markers[@]}"; do
-        echo "$raw" | grep -qaF "$m" || missing+=("$m")
+        # Not `echo | grep -q`: under pipefail, grep -q leaving at the first
+        # match sends echo SIGPIPE, and the pipeline "fails" — a marker early
+        # in a long log was reported missing while it sat on line 74.
+        [[ "$raw" == *"$m"* ]] || missing+=("$m")
     done
     if [ "${#missing[@]}" -ne 0 ]; then
         echo "  $gate smp=$smp run=$idx: FAIL  missing: ${missing[*]}"
