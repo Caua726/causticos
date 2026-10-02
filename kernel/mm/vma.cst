@@ -60,6 +60,7 @@ struct Vma {
     flags as i64;            // VMA_* bitmask
     file_offset as i64;      // 0 for VMA_ANON
     file_handle as i64;      // 0 for VMA_ANON (later: *VfsFile)
+    ko as i64;               // KObject this mapping holds a reference to, or 0
     next as *Vma;
     prev as *Vma;
     // (A reserved `pager` field for a userspace-pager / AUTOFILL endpoint was
@@ -197,6 +198,7 @@ fn aspace_destroy(a as *Aspace) as void {
     while (cast(i64, v) != 0) {
         let is *Vma as next = v.next;
         unmap_vma_pages(a.pml4_phys, v, cast(i32, 0));   // dying aspace: no remote TLB
+        if (v.ko != 0) { kobject.ko_unref(v.ko); }       // the pages are unmapped: let go
         heap.kpool_free(vma_pool, cast(i64, v));
         v = next;
     }
@@ -231,6 +233,7 @@ fn vma_alloc(start as i64, end as i64, prot as i64, flags as i64) as *Vma {
     v.flags = flags;
     v.file_offset = 0;
     v.file_handle = 0;
+    v.ko = 0;
     v.next = cast(*Vma, 0);
     v.prev = cast(*Vma, 0);
     return v;
@@ -538,6 +541,9 @@ fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
                         // wholly inside → remove the VMA
                         a.bookkeeping_bytes = a.bookkeeping_bytes - sizeof(Vma);
                         vma_unlink(a, cur);
+                        // Unmapped above (and shot down), so the object may now
+                        // free what it backed. Its close op takes no aspace lock.
+                        if (cur.ko != 0) { kobject.ko_unref(cur.ko); }
                         heap.kpool_free(vma_pool, cast(i64, cur));
                     } else {
                         cur.start = end;                // straddles the low end → trim head
@@ -551,6 +557,9 @@ fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
                         if (cast(i64, nv) != 0) {
                             nv.file_handle = cur.file_handle;
                             nv.file_offset = cur.file_offset + (end - vs);
+                            // Two mappings now, each holding the object.
+                            nv.ko = cur.ko;
+                            if (nv.ko != 0) { kobject.ko_ref(nv.ko); }
                             cur.end = start;
                             vma_insert_sorted(a, nv);
                             a.bookkeeping_bytes = a.bookkeeping_bytes + sizeof(Vma);
@@ -648,6 +657,31 @@ fn decommit(a as *Aspace, vaddr as i64, len as i64) as i32 {
 // the pages; this VMA only maps them, so munmap/teardown unmaps without
 // freeing (see unmap_vma_pages). Used by surface mmap to expose a
 // kernel-allocated backbuffer to its holder. Returns the user VA, or -1.
+// The mapping at `va` (made just now by an object's mmap op) holds a reference
+// to that object from here on, dropped when the mapping goes. A surface or a
+// segment owns the pages its mappings point at and frees them when its last
+// reference goes; while only the fd counted, closing the fd of a still-mapped
+// surface freed pages the process could go on reading and writing — pages the
+// allocator was free to hand to anyone else. 0, or -1 if no mapping starts at va.
+fn attach_object(a as *Aspace, va as i64, ko as i64) as i32 {
+    if (cast(i64, a) == 0 || ko == 0) { return cast(i32, 0 - 1); }
+    lock.acquire(lk_ptr(a));
+    let is *Vma as v with mut = a.vma_head;
+    while (cast(i64, v) != 0) {
+        if (v.start == va) {
+            if (v.ko == 0) {
+                kobject.ko_ref(ko);
+                v.ko = ko;
+            }
+            lock.release(lk_ptr(a));
+            return 0;
+        }
+        v = v.next;
+    }
+    lock.release(lk_ptr(a));
+    return cast(i32, 0 - 1);
+}
+
 fn mmap_phys(a as *Aspace, phys as i64, npages as i64,
              prot as i64, owner as i64) as i64 {
     if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }

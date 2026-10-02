@@ -293,6 +293,52 @@ fn test_fd_races() as void {
     return;
 }
 
+// A mapping outlives its fd. Closing the fd of a mapped segment used to free
+// the segment's frames while the process still had them mapped: its stores
+// went on landing in pages the allocator had handed to someone else. Here the
+// "someone else" is ourselves — a fresh anonymous mapping, which the kernel
+// zeroes — so a leak shows up as our pattern inside memory we never wrote.
+fn test_mapping_outlives_fd() as void {
+    say("a mapping outlives its fd:\n");
+    let is i64 as NP = 256;                       // 1 MiB
+    let is i64 as fd = sys.seg_create(NP, 0);
+    check(cast(*u8, "segment created"), fd >= 0, fd, 3);
+    if (fd < 0) { return; }
+    let is i64 as va = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, fd);
+    check(cast(*u8, "segment mapped"), va > 0, va, 1);
+    if (va <= 0) { sys.close(fd); return; }
+    let is i64 as cr = cast(i64, sys.close(fd));
+    check(cast(*u8, "fd closed while mapped"), cr == 0, cr, 0);
+
+    // Still ours: write a pattern through the mapping...
+    let is *i64 as m = cast(*i64, va);
+    let is i64 as words = NP * 512;
+    let is i64 as i with mut = 0;
+    while (i < words) { m[i] = 0x5EC7A11A5EC7A11A; i = i + 1; }
+    // ...then take fresh memory several times the size and look for it.
+    let is i64 as ALEN = NP * 4096 * 4;
+    let is i64 as an = sys.mmap(cast(i64, 0), ALEN, sys.PROT_READ | sys.PROT_WRITE);
+    check(cast(*u8, "fresh memory"), an > 0, an, 1);
+    let is i64 as hits with mut = 0;
+    if (an > 0) {
+        let is *i64 as q = cast(*i64, an);
+        let is i64 as j with mut = 0;
+        while (j < ALEN / 8) {
+            if (q[j] == 0x5EC7A11A5EC7A11A) { hits = hits + 1; }
+            j = j + 1;
+        }
+        sys.munmap(an, ALEN);
+    }
+    check(cast(*u8, "the closed segment's pages were not handed out"), hits == 0, hits, 0);
+    // And the mapping still reads back what was written.
+    let is i64 as bad with mut = 0;
+    i = 0;
+    while (i < words) { if (m[i] != 0x5EC7A11A5EC7A11A) { bad = bad + 1; } i = i + 1; }
+    check(cast(*u8, "the mapping still holds what was written"), bad == 0, bad, 0);
+    sys.munmap(va, NP * 4096);
+    return;
+}
+
 fn main() as i32 {
     say("kabi: phase-A syscalls from ring 3\n");
     test_thread();
@@ -300,6 +346,7 @@ fn main() as i32 {
     test_devs();
     test_fd_reservation();
     test_fd_races();
+    test_mapping_outlives_fd();
     if (fails == 0) { say("kabi: PASS\n"); return cast(i32, 0); }
     say("kabi: FAIL n="); say_num(fails); say("\n");
     return cast(i32, 1);
