@@ -57,6 +57,10 @@ fn print_job(t as *term.Term, slot as i64) as void {
 }
 
 // run_line — returns 1 when the window should close, 0 otherwise.
+//
+// The line is a list (`a ; b`, `a && b`, `a || b`, `a & b` — see shexec): its
+// parts run one at a time, and the terminal comes back to list_run when the
+// foreground job ends (wterm.finish_job).
 fn run_line(t as *term.Term, line as *u8, len as i64) as i64 {
     // A construct being typed, or a line that opens one, belongs to the script
     // engine: control flow needs the WHOLE thing before any of it can run.
@@ -64,23 +68,33 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as i64 {
         ss.feed(t, line, len);
         return 0;
     }
+    let is i64 as n = sx.list_begin(line, len);
+    if (n == 0 - 1) { g.err(t, "syntax: ; && || or & with no command on one side\n"); sx.set_status(2); return 0; }
+    if (n == 0 - 2) { g.err(t, "line has too many commands\n"); sx.set_status(2); return 0; }
+    return list_run(t);
+}
+
+// Run the list's next parts until one is left running in the foreground or the
+// list is done. 1 if a part was `exit`.
+fn list_run(t as *term.Term) as i64 {
+    let is i64 as p with mut = 0;
+    let is i64 as n with mut = 0;
+    let is i64 as bg with mut = 0;
+    while (sx.list_next(&p, &n, &bg) == 1) {
+        if (run_part(t, cast(*u8, p), n, bg) == 1) { sx.list_cancel(); return 1; }
+        if (s.fg_job >= 0) { return 0; }
+    }
+    return 0;
+}
+
+// One part of the list: a builtin, a function, or a pipeline (bg = 1: not
+// waited for). Returns 1 when the window should close.
+fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as i64 {
     let is [16]i64 as argv_ptr;
     let is [16]i64 as argv_len;
     let is i64 as argc with mut = repl.parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
     if (argc == 0) { return 0; }
-
-    // A trailing '&' is not an argument: it says "do not wait for this". The
-    // LINE is shortened too, not just the argv built here — shexec re-parses
-    // the raw line, and left in place the '&' reached the program as an
-    // argument (`sleep 9 &` became `sleep 9 '&'`).
-    let is i64 as bg with mut = 0;
-    let is i64 as len2 with mut = len;
-    if (repl.streq(cast(*u8, argv_ptr[argc - 1]), argv_len[argc - 1], "&") == 1) {
-        bg = 1; argc = argc - 1;
-        while (len2 > 0 && line[len2 - 1] != cast(u8, 38)) { len2 = len2 - 1; }
-        if (len2 > 0) { len2 = len2 - 1; }
-        if (argc == 0) { return 0; }
-    }
+    let is i64 as len2 = len;
 
     let is *u8 as cmd = cast(*u8, argv_ptr[0]);
     let is i64 as cl = argv_len[0];
@@ -147,15 +161,14 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as i64 {
     sys.close(aux[1]);                       // the child holds its own end now
     if (slot < 0) {
         sys.close(aux[0]);
-        if (slot == 0 - 1) { g.err(t, "not found\n"); }
-        else if (slot == 0 - 2) { g.err(t, "too many jobs\n"); }
-        else if (slot == 0 - 3) { g.err(t, "spawn failed\n"); }
-        else { g.err(t, "bad command\n"); }
-        sx.set_status(127);
+        let is [192]u8 as m;
+        sx.failure_text(slot, cast(*u8, &m[0]));
+        g.err(t, cast(*u8, &m[0]));
+        sx.set_status(sx.failure_status(slot));
         return 0;
     }
     jobs.get(slot).aux_fd = aux[0];
-    if (bg == 1) { print_job(t, slot); }
+    if (bg == 1) { print_job(t, slot); sx.set_status(0); }
     else {
         s.fg_job = slot;
         cli.set_title(cast(*u8, argv_ptr[0]), argv_len[0]);

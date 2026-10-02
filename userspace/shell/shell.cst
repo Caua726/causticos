@@ -172,23 +172,35 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as void {
         ss.feed(t, line, len);
         return;
     }
+    // The line is a list (`a ; b`, `a && b`, `a || b`, `a & b` — see shexec):
+    // its parts run one at a time, resumed by finish_job when the foreground
+    // job ends.
+    let is i64 as n = sx.list_begin(line, len);
+    if (n == 0 - 1) { err(t, "syntax: ; && || or & with no command on one side\n"); sx.set_status(2); return; }
+    if (n == 0 - 2) { err(t, "line has too many commands\n"); sx.set_status(2); return; }
+    list_run(t);
+}
+
+// Run the list's next parts until one is left running in the foreground or the
+// list is done.
+fn list_run(t as *term.Term) as void {
+    let is i64 as p with mut = 0;
+    let is i64 as n with mut = 0;
+    let is i64 as bg with mut = 0;
+    while (sx.list_next(&p, &n, &bg) == 1) {
+        run_part(t, cast(*u8, p), n, bg);
+        if (fg_job >= 0) { return; }
+    }
+}
+
+// One part of the list: a builtin, a function, or a pipeline (bg = 1: not
+// waited for).
+fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
     let is [16]i64 as argv_ptr;
     let is [16]i64 as argv_len;
     let is i64 as argc with mut = repl.parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
     if (argc == 0) { return; }
-
-    // A trailing '&' is not an argument: it says "do not wait for this". The
-    // LINE is shortened too, not just the argv built here — shexec re-parses
-    // the raw line, and left in place the '&' reached the program as an
-    // argument (`sleep 9 &` became `sleep 9 '&'`).
-    let is i64 as bg with mut = 0;
-    let is i64 as len2 with mut = len;
-    if (repl.streq(cast(*u8, argv_ptr[argc - 1]), argv_len[argc - 1], "&") == 1) {
-        bg = 1; argc = argc - 1;
-        while (len2 > 0 && line[len2 - 1] != cast(u8, 38)) { len2 = len2 - 1; }
-        if (len2 > 0) { len2 = len2 - 1; }
-        if (argc == 0) { return; }
-    }
+    let is i64 as len2 = len;
 
     let is *u8 as cmd = cast(*u8, argv_ptr[0]);
     let is i64 as cl = argv_len[0];
@@ -248,14 +260,13 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as void {
     if (nc <= 0) { err(t, "too many pipeline stages\n"); return; }
     let is i64 as slot = sx.exec(bg, line, len2, 0 - 1, cast(*i64, 0));
     if (slot < 0) {
-        if (slot == 0 - 1) { _col(t, C_ERR); puts(t, "not found\n"); _col(t, C_TEXT); }
-        else if (slot == 0 - 2) { err(t, "too many jobs\n"); }
-        else if (slot == 0 - 3) { err(t, "spawn failed\n"); }
-        else { err(t, "bad command\n"); }
-        sx.set_status(127);
+        let is [192]u8 as m;
+        sx.failure_text(slot, cast(*u8, &m[0]));
+        err(t, cast(*u8, &m[0]));
+        sx.set_status(sx.failure_status(slot));
         return;
     }
-    if (bg == 1) { print_job(t, slot, "\n"); } else { fg_job = slot; }
+    if (bg == 1) { print_job(t, slot, "\n"); sx.set_status(0); } else { fg_job = slot; }
     return;
 }
 
@@ -309,7 +320,10 @@ fn finish_job(t as *term.Term, slot as i64) as void {
         return;
     }
     jobs.release(slot);
-    if (was_fg == 1) { prompt(t); }
+    if (was_fg == 1) {
+        if (sx.list_pending() == 1) { list_run(t); }      // the rest of `a && b`
+        if (fg_job < 0) { prompt(t); }
+    }
     term.flush(t);
     return;
 }
@@ -319,7 +333,7 @@ fn finish_job(t as *term.Term, slot as i64) as void {
 fn key_to_fg(ev as *input.KeyEvent) as void {
     let is *jobs.Job as jb = jobs.get(fg_job);
     if (jb.in_fd < 0) { return; }
-    if (g_ctrl == 1 && ev.scancode == 0x2E) { jobs.kill_job(fg_job); return; }   // Ctrl+C
+    if (g_ctrl == 1 && ev.scancode == 0x2E) { jobs.kill_job(fg_job); sx.list_cancel(); return; }   // Ctrl+C ends its line too
     if (ev.extended == 1 && (ev.scancode == 0x48 || ev.scancode == 0x50
                              || ev.scancode == 0x4D || ev.scancode == 0x4B)) {
         let is [3]u8 as ek; ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
