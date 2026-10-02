@@ -422,8 +422,8 @@ fn thr_is_running(tid as i64) as i64 {
 fn kill_kick(tid as i64) as void {
     if (thread_ptr(tid) == 0) { return; }
     thr_set(tid, THR_KILL, 1);
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu with mut = 0;
+    let is i64 as f = lock_home(tid, &cpu);
     let is i64 as st = thr_state(tid);
     let is i64 as intr = thr_get(tid, THR_INTR_SLEEP);
     let is i64 as lapic_id with mut = 0 - 1;
@@ -532,6 +532,24 @@ fn rq_ptr(cpu as i64) as i64 {
 // Pointer to a specific cpu's sched_lock for lock.acquire_irq.
 fn sched_lock_ptr(cpu as i64) as *lock.TicketLock {
     return &per_cpu_sched_locks[cpu];
+}
+
+// Lock the run queue `tid` lives on, and say which (cpu_out[0]). A RUNNABLE
+// thread can be pulled to another cpu by an idle one (steal_work), and the move
+// happens under the SOURCE cpu's lock — so after taking the lock we look again,
+// and follow the thread if it left. A RUNNING or sleeping thread never moves,
+// so for those the first try always holds.
+fn lock_home(tid as i64, cpu_out as *i64) as i64 {
+    while (1 == 1) {
+        let is i64 as cpu = thr_home_cpu(tid);
+        let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+        if (thr_home_cpu(tid) == cpu) {
+            cpu_out[0] = cpu;
+            return f;
+        }
+        lock.release_irq(sched_lock_ptr(cpu), f);
+    }
+    return 0;
 }
 
 // Per-cpu reap list — head tid of a singly-linked list of DEAD threads
@@ -647,9 +665,9 @@ let is i64 as switch_rsp with mut = 0;
 // Lock handoff during context switch: schedule on cpu X holds X's
 // lock across the rsp swap, and the resuming side (either
 // thread_entry_trampoline for new threads or .Lresume for
-// previously-suspended threads) is responsible for dropping it.
-// Both new and resumed threads always run on the cpu whose lock
-// is currently held — schedule() never moves a thread cross-cpu.
+// previously-suspended threads) is responsible for dropping it —
+// X's lock, the cpu it resumes on, which for a thread an idle cpu
+// pulled over (steal_work) is not the cpu it was switched out on.
 
 fn band_weight(b as i64) as i64 {
     if (b == QOS_BATCH) { return 512; }
@@ -1007,8 +1025,8 @@ fn dl_total_utilization(cpu as i64) as i64 {
 }
 
 fn sched_set_deadline(tid as i64, runtime_ns as i64, period_ns as i64, deadline_ns as i64) as i64 {
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = lock_home(tid, &cpu);
     // Check capability
     if ((thr_caps(tid) & CAP_SCHED_REALTIME) == 0) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
@@ -1189,8 +1207,8 @@ fn promote_thread(cpu as i64, tid as i64) as void {
 // ============================================================
 
 fn sched_set_qos(tid as i64, requested_band as i64) as i64 {
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = lock_home(tid, &cpu);
     if (requested_band == QOS_INPUT) {
         if ((thr_caps(tid) & CAP_SCHED_INPUT) == 0) {
             lock.release_irq(sched_lock_ptr(cpu), saved_flags);
@@ -1300,11 +1318,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     // any lock — the placement choice is itself the input that
     // selects which lock to take. Every cpu (including BSP) gets
     // a turn so workload spreads evenly across the topology.
-    let is i64 as cpus = smp.get_cpu_count();
-    let is i64 as home_cpu with mut = next_placement_cpu;
-    if (home_cpu >= cpus) { home_cpu = 0; }
-    next_placement_cpu = home_cpu + 1;
-    if (next_placement_cpu >= cpus) { next_placement_cpu = 0; }
+    let is i64 as home_cpu = pick_home_cpu();
 
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(home_cpu));
 
@@ -1405,11 +1419,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
 fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
                       user_entry as i64, user_rsp as i64, aspace_ptr as i64,
                       process_ptr as i64, suspended as i64) as i64 {
-    let is i64 as cpus = smp.get_cpu_count();
-    let is i64 as home_cpu with mut = next_placement_cpu;
-    if (home_cpu >= cpus) { home_cpu = 0; }
-    next_placement_cpu = home_cpu + 1;
-    if (next_placement_cpu >= cpus) { next_placement_cpu = 0; }
+    let is i64 as home_cpu = pick_home_cpu();
 
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(home_cpu));
 
@@ -1506,9 +1516,9 @@ fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
 // runqueue. The process spawn path calls this (proc_start) after the
 // child's fd table is set up. No-op if the thread isn't suspended.
 fn make_runnable(tid as i64) as void {
-    let is i64 as cpu = thr_home_cpu(tid);
     let is i64 as band = thr_band(tid);
-    let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu with mut = 0;
+    let is i64 as f = lock_home(tid, &cpu);
     if (thr_state(tid) == THREAD_SUSPENDED) {
         // Re-placed against the band as it is NOW: the average has moved on
         // since the thread was created suspended.
@@ -1807,8 +1817,8 @@ fn poll_wake() as void {
 }
 
 fn wakeup_thread(tid as i64) as void {
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = lock_home(tid, &cpu);
     if (thr_state(tid) != THREAD_SLEEPING) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
@@ -1875,6 +1885,135 @@ fn wakeup_thread(tid as i64) as void {
             lapic.send_resched_ipi_to(target_lapic_id);
         }
     }
+    kick_idle_for(cpu);
+}
+
+// Work just became runnable on `cpu`. If that cpu is already busy and another
+// sits idle, wake the idle one so it pulls the work (steal_work) now rather
+// than at its next tick — or never, as it was before there was any balancing.
+let is i64 as BALANCE_NS = 50000000;       // 50 ms between periodic checks per cpu
+let is [128]u8 as cpu_last_balance_ns;      // 16 cpus * i64
+
+fn kick_idle_for(cpu as i64) as void {
+    let is i64 as n = smp.get_cpu_count();
+    if (n <= 1) { return; }
+    let is *smp.PerCpu as hp = smp.get_per_cpu(cpu);
+    if (cast(i64, hp) == 0) { return; }
+    if (hp.current_tid == hp.idle_tid) { return; }        // it will run it itself
+    if (nr_running(cpu) < 2) { return; }
+    let is i64 as c with mut = 0;
+    while (c < n) {
+        if (c != cpu) {
+            let is *smp.PerCpu as pc = smp.get_per_cpu(c);
+            if (cast(i64, pc) != 0 && pc.is_online != 0
+                && pc.current_tid == pc.idle_tid && nr_running(c) == 0) {
+                lapic.send_resched_ipi_to(pc.lapic_id);
+                return;
+            }
+        }
+        c = c + 1;
+    }
+}
+
+// ============================================================
+// Load balancing
+// ============================================================
+// Every thread used to stay on the cpu it was created on, forever: a cpu could
+// sit idle while another had a queue. Now an idle cpu pulls.
+//
+// steal_work: takes the busiest other run queue when it holds at least two more
+// runnable threads than this one, and moves one queued QoS thread here. Called
+// by an idle cpu from its loop (an idle cpu has 0, so any queue with a thread
+// waiting behind a running one qualifies), and by every cpu from its timer tick
+// every BALANCE_NS, which is what evens out 3-and-1 when nobody is idle. A gap
+// of one is left alone: moving would only swap which cpu has the extra thread.
+// No lock may be held by the caller; interrupts may be on or off. Not moved:
+//   - the source's running thread (it is on that cpu's stack and CR3),
+//   - the source's FPU owner: with lazy FPU save its latest registers may still
+//     be live on that cpu and not in its save area, and it can only become the
+//     owner again by running there — which a queued thread is not doing,
+//   - deadline-class threads, whose admission was against that cpu's load.
+// Its vruntime keeps its distance from the band average, measured on the old
+// queue and re-applied on the new one, so the move is neither credit nor debt.
+fn steal_work() as i64 {
+    let is i64 as self = this_cpu();
+    let is i64 as n = smp.get_cpu_count();
+    if (n <= 1) { return 0; }
+    let is i64 as mine = nr_running(self);
+    let is i64 as src with mut = 0 - 1;
+    let is i64 as most with mut = mine + 1;
+    let is i64 as c with mut = 0;
+    while (c < n) {
+        if (c != self && nr_running(c) > most) { most = nr_running(c); src = c; }
+        c = c + 1;
+    }
+    if (src < 0) { return 0; }
+
+    // Both locks, lower cpu first: two cpus stealing from each other must
+    // take them in the same order.
+    let is i64 as lo with mut = self;
+    let is i64 as hi with mut = src;
+    if (src < self) { lo = src; hi = self; }
+    let is i64 as f = lock.acquire_irq(sched_lock_ptr(lo));
+    lock.acquire_raw(sched_lock_ptr(hi));
+
+    let is i64 as moved with mut = 0;
+    if (nr_running(src) >= nr_running(self) + 2) {
+        let is *smp.PerCpu as sp = smp.get_per_cpu(src);
+        let is i64 as busy_tid = sp.current_tid;
+        let is i64 as fpu_tid = sp.fpu_owner_tid;
+        let is i64 as b with mut = 0;
+        while (b < NUM_QOS_BANDS && moved == 0) {
+            let is i64 as nd with mut = rb.rb_leftmost(band_root(src, b));
+            while (nd != 0 && moved == 0) {
+                let is i64 as tid = rb.nd_val(nd);
+                nd = rb.rb_next(nd);
+                if (tid != busy_tid && tid != fpu_tid
+                    && thr_state(tid) == THREAD_RUNNABLE
+                    && thr_class(tid) == SCHED_CLASS_QOS) {
+                    let is i64 as rel = thr_vruntime(tid)
+                        - band_avg_vruntime(src, b, running_in_band(src, b));
+                    runlist_remove(src, b, tid);
+                    set_nr_running(src, nr_running(src) - 1);
+                    thr_set(tid, 256, self);
+                    let is i64 as v = band_avg_vruntime(self, b, running_in_band(self, b)) + rel;
+                    let is i64 as w with mut = thr_weight(tid);
+                    let is i64 as sl with mut = thr_slice(tid);
+                    if (w <= 0) { w = BASE_WEIGHT; }
+                    if (sl <= 0) { sl = DEFAULT_SLICE_NS; }
+                    thr_set(tid, 48, v);
+                    thr_set(tid, 56, v + sl * BASE_WEIGHT / w);
+                    runlist_insert(self, b, tid);
+                    set_nr_running(self, nr_running(self) + 1);
+                    smp.this_cpu_set_need_resched(1);
+                    moved = 1;
+                }
+            }
+            b = b + 1;
+        }
+    }
+    lock.release_raw(sched_lock_ptr(hi));
+    lock.release_irq(sched_lock_ptr(lo), f);
+    return moved;
+}
+
+// Where a new thread starts: the cpu with the fewest runnable threads. It used
+// to be round robin, which spreads threads evenly by COUNT and ignores that one
+// cpu may be running three busy programs while another idles.
+fn pick_home_cpu() as i64 {
+    let is i64 as n = smp.get_cpu_count();
+    let is i64 as start with mut = next_placement_cpu;
+    if (start >= n) { start = 0; }
+    next_placement_cpu = start + 1;
+    if (next_placement_cpu >= n) { next_placement_cpu = 0; }
+    let is i64 as best with mut = start;
+    let is i64 as k with mut = 1;
+    while (k < n) {
+        let is i64 as c = (start + k) % n;
+        if (nr_running(c) < nr_running(best)) { best = c; }
+        k = k + 1;
+    }
+    return best;
 }
 
 fn suspend_thread(tid as i64) as void {
@@ -1891,8 +2030,8 @@ fn suspend_thread(tid as i64) as void {
 }
 
 fn resume_thread(tid as i64) as void {
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = lock_home(tid, &cpu);
     if (thr_state(tid) != THREAD_SUSPENDED) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
@@ -2199,12 +2338,20 @@ fn schedule() as void {
     // mutex. from_irq is this invocation's own answer, saved on our stack.
     smp.this_cpu_set_in_irq_context(from_irq);
 
+    // The cpu we are on NOW. `cpu` above is where this invocation began, and a
+    // thread can resume somewhere else: it was switched out here, pulled to an
+    // idle cpu while queued (steal_work), and picked there — so it comes back
+    // out of this same call frame on the other cpu, holding THAT cpu's lock.
+    // Releasing the stale one would free a lock we do not hold and leak the
+    // one we do.
+    let is i64 as here = this_cpu();
+
     // Program LAPIC for next event under the cpu's lock — both
     // the deadline tree and the suspended-deadline scan are
     // per-cpu state.
-    program_next_tick(cpu);
+    program_next_tick(here);
 
-    lock.release(sched_lock_ptr(cpu));
+    lock.release(sched_lock_ptr(here));
 
     // sti only on the thread-call path. If schedule() was called
     // from an IRQ stub, the stub's iretq will restore IF from the
@@ -2253,6 +2400,15 @@ fn on_timer_tick() as void {
 
     if (cpu == smp.get_bsp_cpu_id()) {
         watchdog_check();
+    }
+
+    // Periodic balance (see steal_work). From the tick, with interrupts off and
+    // no scheduler lock held — the same conditions steal_work takes its locks
+    // under on the idle path.
+    let is *i64 as lb = cast(*i64, &cpu_last_balance_ns);
+    if (now - lb[cpu] >= BALANCE_NS) {
+        lb[cpu] = now;
+        if (steal_work() != 0) { smp.this_cpu_set_need_resched(1); }
     }
 
     if (current_tid() >= 0) {
@@ -2640,6 +2796,8 @@ fn idle_fn() as void {
     // already; the sti here is a harmless no-op for it.
     asm(".byte 0xFB\n");   // sti
     while (1 == 1) {
+        // Nothing of our own to run: take queued work from a busier cpu.
+        if (nr_running(this_cpu()) == 0) { steal_work(); }
         if (smp.this_cpu_need_resched() != 0) { schedule(); }
         reap_drain(this_cpu());     // free threads that died on this cpu
         // Top up the pre-zeroed frame pool while idle (bounded per pass) so a
