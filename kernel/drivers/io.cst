@@ -268,35 +268,44 @@ fn harvest_all(p as *BlockIOProvider) as i64 {
 //              (A is still RUNNING; wakeup is a no-op)
 //   CPU A:  sleep_thread → state=SLEEPING, never woken
 //
-// Fix: hold sched_lock across the predicate check + SLEEPING
-// transition. wakeup_thread acquires the same lock, so if the
-// completer fires while we're in the check it blocks until we
-// either see COMPLETE (and bail out of the loop) or transition
-// to SLEEPING — in which case wakeup now observes SLEEPING and
-// re-queues us correctly. sched.sleep_locked_and_yield drops the
-// lock atomically with the hand-off to schedule().
+// Fix: the predicate check and the SLEEPING transition happen under
+// one hold of the scheduler lock (sched.sleep_unless). wakeup_thread
+// takes the same lock, so the completer either finished first and we
+// see COMPLETE, or it finds us SLEEPING and re-queues us.
 fn wait_complete(p as *BlockIOProvider, r as *BlockRequest) as void {
-    // Timed-poll wait that ALSO actively harvests the hardware, NOT the
-    // indefinite sleep_locked_and_yield primitive. The root SMP failure was a
-    // LOST AHCI completion IRQ: the hardware finished the command (PX_CI bit
-    // cleared) but the IRQ on another cpu was missed, so the IRQ-only harvest
-    // never ran, r.state never reached COMPLETE, and the waiter slept forever.
-    // Here each poll we drive harvest_all ourselves: ahci_harvest reads PX_CI
-    // under the port lock, so a completion the IRQ missed is picked up within
-    // one poll. The submit path's wakeup_thread stays as an early-wake
-    // optimisation.
+    // Sleep until complete() wakes us — the completion interrupt's harvest
+    // calls it — or POLL_NS passes, and then harvest the hardware ourselves:
+    // the poll is the backstop for a completion whose interrupt never comes.
+    // (The one such case we had, on SMP, was the AHCI handler acknowledging
+    // PxIS after its harvest, which could wipe a completion's status; it now
+    // acknowledges first.) The state is re-read under the scheduler lock that
+    // complete()'s wakeup takes, so a completion landing between our check and
+    // our sleep still wakes us at once. This harvested before every sleep,
+    // which is a round of register reads per request that the interrupt does
+    // anyway, and checked-then-slept, which lost exactly that wakeup and slept
+    // out the whole poll interval.
     //
     // A request that has not finished in STALL_NS is aborted, not waited on
     // forever and not answered with a halted machine: this used to print the
     // stall and `cli; hlt` the whole system over one slow sector. The driver's
     // abort_io stops the device's DMA and fails everything outstanding, and
     // the caller gets an I/O error it can report.
-    let is i64 as wait_start = timer.current_time_ns();
-    let is i64 as bail_at    = wait_start + STALL_NS;
+    //
+    // The clock is read only once a poll has come up empty: a request the
+    // interrupt completes — nearly all of them — never pays for the read.
+    let is i64 as wait_start with mut = 0;
+    let is i64 as bail_at    with mut = 0;
     while (r.state != REQ_COMPLETE) {
-        harvest_all(p);                              // active poll — covers a lost completion IRQ
+        sched.sleep_unless(&r.state, REQ_COMPLETE, POLL_NS);
         if (r.state == REQ_COMPLETE) { return; }
-        if (timer.current_time_ns() > bail_at) {
+        harvest_all(p);
+        if (r.state == REQ_COMPLETE) { return; }
+        let is i64 as now = timer.current_time_ns();
+        if (bail_at == 0) {
+            wait_start = now - POLL_NS;
+            bail_at = wait_start + STALL_NS;
+        }
+        if (now > bail_at) {
             serial.print("io: request stalled op=", 23);
             util.print_num(r.op);
             serial.print(" lba=", 5);
@@ -304,7 +313,7 @@ fn wait_complete(p as *BlockIOProvider, r as *BlockRequest) as void {
             serial.print(" count=", 7);
             util.print_num(r.count);
             serial.print(" waited_ms=", 11);
-            util.print_num((timer.current_time_ns() - wait_start) / 1000000);
+            util.print_num((now - wait_start) / 1000000);
             serial.println(" - aborting", 11);
             abort(p);
             if (r.state == REQ_COMPLETE) { return; }
@@ -315,9 +324,12 @@ fn wait_complete(p as *BlockIOProvider, r as *BlockRequest) as void {
             r.status = cast(i64, 0 - 1);
             return;
         }
-        sched.sleep_for_ns(500000);   // 0.5 ms poll — robust to a missed completion wakeup
     }
 }
+
+// How often a waiter looks at the hardware itself when no completion
+// interrupt has woken it.
+let is i64 as POLL_NS = 500000;   // 0.5 ms
 
 // How long a request may take before it is aborted. Generous on purpose: a
 // spinning disk recovering a bad sector can take seconds, and an abort throws

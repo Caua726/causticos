@@ -83,6 +83,11 @@ let is i64 as CMD_FRE = 0x10;
 let is i64 as CMD_FR  = 0x4000;
 let is i64 as CMD_CR  = 0x8000;
 
+// PxIS bits that mean the port has stopped processing commands (AHCI 1.3.1
+// §3.3.5): task file error, host bus fatal, host bus data, interface fatal,
+// overflow.
+let is i64 as PXIS_ERRORS = 0x79000000;
+
 // Port TFD bits
 let is i64 as TFD_ERR = 1;
 let is i64 as TFD_DRQ = 8;
@@ -122,6 +127,13 @@ struct AhciCtx {
     // arrays of pointers trip the mixed-width layout convention; i64
     // is the canonical carrier. slot_requests_raw is indexed directly.
     slot_requests_raw as [32]i64;
+    // Completions seen by the last look at PxCI and not yet handed to io
+    // (bit per slot), and which of them failed. See ahci_harvest.
+    done_mask as i64;
+    fail_mask as i64;
+    // The interrupt handler saw a PxIS error bit. It acknowledges PxIS before
+    // harvesting, so the bit is kept here for harvest; recovery clears it.
+    irq_err as i64;
     // Per-port ticket lock. Protects the critical sections that
     // combine an MMIO read of PX_CI with a write to
     // slot_requests_raw + PX_CI: without it two cpus submitting
@@ -860,9 +872,17 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
     // already been stomped). lock.acquire_irq masks IRQs so the
     // IRQ-side harvest path, which also takes this lock, can't
     // deadlock against us on this cpu either.
+    //
+    // A slot is free when no request holds it: harvest takes a request out of
+    // its slot only once the slot's PxCI bit has cleared, so the table is the
+    // whole truth and the hardware need not be asked — except after an error
+    // that recovery has not run for yet, when the stopped port still has
+    // the failed commands' bits set. (PxSACT is not consulted: no NCQ
+    // commands are issued.)
     let is i64 as pflags = lock.acquire_irq(&c.port_lock);
     let is i64 as slot with mut = cast(i64, 0 - 1);
-    let is i64 as used_mask = mmio_read32(pb, PX_CI) | mmio_read32(pb, 0x34);
+    let is i64 as used_mask with mut = 0;
+    if (c.recover_pending != 0) { used_mask = mmio_read32(pb, PX_CI); }
     let is i64 as s with mut = 0;
     while (s < c.ncs) {
         let is i64 as used_bit = (used_mask >> s) & 1;
@@ -936,6 +956,7 @@ fn recover_port(c as *AhciCtx) as i32 {
             rc = cast(i32, 0 - 1);
         }
         c.recover_pending = 0;
+        c.irq_err = 0;
     }
     mutex.release(&c.recover_lk);
     return rc;
@@ -983,12 +1004,24 @@ fn ahci_abort(p as *io.BlockIOProvider) as i32 {
     mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
     mmio_write32(pb, PX_IS,   cast(i64, 0 - 1));
     c.recover_pending = 0;
+    c.irq_err = 0;
+    c.done_mask = 0;
+    c.fail_mask = 0;
     let is i32 as src = port_start(pb);
     mutex.release(&c.recover_lk);
     if (src != 0) { serial.println("ahci: abort: port did not restart", 33); }
     return 0;
 }
 
+// io.BlockIOProvider.harvest_io: one finished request per call, 0 when there
+// are none. Each call used to read PxCI, PxTFD and PxIS — and io.harvest_all
+// calls until it gets 0, so one completion cost six register reads, and under
+// virtualisation every one of them is an exit to the hypervisor. Now one read
+// of PxCI finds every request finished since the last look (PxCI clears a
+// slot's bit when its command completes; a command that fails leaves its bit
+// set, because the port stops), and they are handed out from done_mask
+// without touching the hardware again. PxTFD is read only when slots are
+// still busy, to tell "not done yet" from "never will be".
 fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
     let is *AhciCtx as c = cast(*AhciCtx, p.private);
     let is *u8 as pb = port_base(c.abar, c.port);
@@ -999,47 +1032,56 @@ fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
     // mistake for a completion and return a freshly-submitted
     // request as though its DMA had finished.
     let is i64 as pflags = lock.acquire_irq(&c.port_lock);
-    let is i64 as ci = mmio_read32(pb, PX_CI);
-    let is i64 as tfd = mmio_read32(pb, PX_TFD);
-    let is i64 as pxis = mmio_read32(pb, PX_IS);
-    // TFES is bit 30 of PxIS; falls back to TFD.ERR for HBAs that
-    // don't assert PxIS.TFES on every error path.
-    let is i64 as has_err with mut = 0;
-    if ((tfd & TFD_ERR) != 0)          { has_err = 1; }
-    if ((pxis & 0x40000000) != 0)      { has_err = 1; }
-
-    let is i64 as slot with mut = 0;
-    while (slot < c.ncs) {
-        let is *io.BlockRequest as r = slot_request_get(c, slot);
-        if (cast(i64, r) != 0) {
-            let is i64 as bit = (ci >> slot) & 1;
-            let is i32 as return_this with mut = 0;
-            if (has_err == 1) {
-                // Every outstanding slot on this port is orphaned —
-                // the HBA won't finish them. Drain them all as failed.
-                return_this = 1;
-                r.status = cast(i64, 0 - 1);
-            } else if (bit == 0) {
-                return_this = 1;
-                r.status = 0;
+    if (c.done_mask == 0) {
+        let is i64 as outstanding with mut = 0;
+        let is i64 as s with mut = 0;
+        while (s < c.ncs) {
+            if (cast(i64, slot_request_get(c, s)) != 0) {
+                outstanding = outstanding | (cast(i64, 1) << s);
             }
-            if (return_this == 1) {
-                slot_request_set(c, slot, cast(*io.BlockRequest, 0));
-                *out = r;
-                if (has_err == 1) {
-                    // Recovery waits on the HBA; it is not for an interrupt
-                    // handler with interrupts off. The next submit runs it.
+            s = s + 1;
+        }
+        if (outstanding != 0) {
+            let is i64 as ci = mmio_read32(pb, PX_CI);
+            let is i64 as busy = outstanding & ci;
+            c.done_mask = outstanding & (~ci);
+            if (busy != 0) {
+                let is i64 as err with mut = c.irq_err;
+                if (err == 0) {
+                    if ((mmio_read32(pb, PX_TFD) & TFD_ERR) != 0) { err = 1; }
+                }
+                if (err != 0) {
+                    // The port stopped: every slot still set is orphaned, the
+                    // HBA will not finish it. Fail them all. Recovery waits on
+                    // the HBA, which is not for an interrupt handler with
+                    // interrupts off — the next submit runs it.
+                    c.fail_mask = busy;
+                    c.done_mask = c.done_mask | busy;
                     c.recover_pending = 1;
                 }
-                lock.release_irq(&c.port_lock, pflags);
-                return 1;
             }
         }
-        slot = slot + 1;
     }
-    *out = cast(*io.BlockRequest, 0);
+    if (c.done_mask == 0) {
+        *out = cast(*io.BlockRequest, 0);
+        lock.release_irq(&c.port_lock, pflags);
+        return 0;
+    }
+    let is i64 as slot with mut = 0;
+    while (((c.done_mask >> slot) & 1) == 0) { slot = slot + 1; }
+    let is i64 as bit = cast(i64, 1) << slot;
+    let is *io.BlockRequest as r = slot_request_get(c, slot);
+    c.done_mask = c.done_mask & (~bit);
+    if ((c.fail_mask & bit) != 0) {
+        c.fail_mask = c.fail_mask & (~bit);
+        r.status = cast(i64, 0 - 1);
+    } else {
+        r.status = 0;
+    }
+    slot_request_set(c, slot, cast(*io.BlockRequest, 0));
+    *out = r;
     lock.release_irq(&c.port_lock, pflags);
-    return 0;
+    return 1;
 }
 
 // ============================================================
@@ -1055,15 +1097,23 @@ fn ahci_irq(hw as *driver.Hardware, context as *u8) as i32 {
     let is i64 as hba_is = mmio_read32(ctx.abar, HBA_IS);
     if ((hba_is & (cast(i64, 1) << ctx.port)) == 0) { return 0; }
 
+    // Acknowledge first — port IS, then HBA IS, the order §10.1.2 asks for —
+    // and only then look at PxCI. A command that completes after that look
+    // raises PxIS again, and with it another interrupt. The acknowledgement
+    // used to come after the harvest, and it wiped the status of exactly such
+    // a completion: its request sat finished in hardware with no interrupt
+    // coming, until the waiter's own poll found it.
+    let is *u8 as pb = port_base(ctx.abar, ctx.port);
+    let is i64 as pxis = mmio_read32(pb, PX_IS);
+    mmio_write32(pb, PX_IS, pxis);
+    mmio_write32(ctx.abar, HBA_IS, cast(i64, 1) << ctx.port);
+    if ((pxis & PXIS_ERRORS) != 0) { ctx.irq_err = 1; }
+
     let is *spec.Binding as b = cast(*spec.Binding, context);
     let is *io.BlockIOProvider as p = io.find_provider(b.hardware);
     if (cast(i64, p) != 0) {
         io.harvest_all(p);
     }
-    // Clear port IS then HBA IS in that order per AHCI spec §10.1.2.
-    let is *u8 as pb = port_base(ctx.abar, ctx.port);
-    mmio_write32(pb, PX_IS, cast(i64, 0 - 1));
-    mmio_write32(ctx.abar, HBA_IS, cast(i64, 1) << ctx.port);
     return 0;
 }
 
