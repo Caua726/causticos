@@ -123,6 +123,8 @@ fn spawn_client_path(cpath as *u8, cname as *u8, cnlen as i64,
     s.wins[i].swallowed_by = 0 - 1;
     s.wins[i].swallowing = 0 - 1;
     s.wins[i].drops = 0;
+    s.outq_head[i] = 0;
+    s.outq_n[i] = 0;
     s.wins[i].pend_resize_w = 0; s.wins[i].pend_resize_h = 0;
     s.wins[i].pend_focus = 0 - 1;
     s.wins[i].pend_close = 0;
@@ -405,36 +407,81 @@ fn service_win(i as i64, got as i64) as void {
     return;
 }
 
-// Drain per-window control messages: CLOSE_REQ, RESIZE, FOCUS. Quota of 2 per
-// sweep per window.
-fn drain_pending(i as i64) as void {
+// ---- what the WM owes each client --------------------------------------------
+//
+// The WM must never block on a client, so it writes a client's channel only
+// as far as it has room. Input used to go straight out under a quota of two
+// messages per window per pass of the loop — what one POLL_WRITABLE promises
+// — and whatever did not fit was thrown away: keys typed while the WM was
+// busy (a few at once from the compositor), clicks, and every key pressed
+// while a new window was still opening. After 256 such losses the window was
+// closed, program and all.
+//
+// Now input waits in the window's queue, in order, and goes out as the
+// channel takes it: SYS_CHAN_INFO says how many bytes fit right now, and the
+// loop polls for WRITABLE while anything waits. Only a client that leaves
+// OUTQ messages unread loses input, and it is not closed for it — it may be
+// busy, and it is the user's to close. Keys for a window still opening wait
+// until it is ready.
+
+fn queue_msg(i as i64, mtype as i64, a as i64, b as i64, c as i64) as void {
+    if (s.outq_n[i] >= s.OUTQ) {
+        if (s.wins[i].drops == 0) {
+            sys.write_serial(cast(*u8, "wm: a client is not reading its input - events dropped\n"), 55);
+        }
+        s.wins[i].drops = s.wins[i].drops + 1;
+        return;
+    }
+    let is i64 as slot = (s.outq_head[i] + s.outq_n[i]) % s.OUTQ;
+    let is i64 as base = (i * s.OUTQ + slot) * 4;
+    s.outq[base] = mtype;
+    s.outq[base + 1] = a;
+    s.outq[base + 2] = b;
+    s.outq[base + 3] = c;
+    s.outq_n[i] = s.outq_n[i] + 1;
+    return;
+}
+
+// Anything owed to window i's client: a control message or queued input.
+fn has_output(i as i64) as i64 {
+    if (s.outq_n[i] > 0 || s.wins[i].pend_close == 1 || s.wins[i].pend_resize_w > 0
+        || s.wins[i].pend_focus >= 0) { return 1; }
+    return 0;
+}
+
+// Write what window i's client is owed, as much as its channel takes without
+// blocking: the control messages first — they are state (the size it has
+// now, whether it has focus), not a sequence — then queued input, in order.
+fn flush_out(i as i64) as void {
     if (s.wins[i].state != 2 || s.wins[i].closing == 1) { return; }
-    if (s.writable[i] == 0) { return; }
-    if (s.wins[i].pend_close == 1 && s.quota[i] < 2) {
+    if (has_output(i) == 0) { return; }
+    let is [4]i64 as ci;
+    if (sys.chan_info(s.wins[i].chan, &ci[0]) != 0) { return; }
+    if (ci[3] != 0) { return; }                      // gone: service_win reaps it
+    let is i64 as room with mut = ci[2] / wmp.MSG_BYTES;
+    if (room > 0 && s.wins[i].pend_close == 1) {
         wmp.msg_send(s.wins[i].chan, wmp.MSG_CLOSE_REQ, 0, 0, 0);
         s.wins[i].pend_close = 0;
-        s.quota[i] = s.quota[i] + 1;
+        room = room - 1;
     }
-    if (s.wins[i].pend_resize_w > 0 && s.quota[i] < 2) {
+    if (room > 0 && s.wins[i].pend_resize_w > 0) {
         wmp.msg_send(s.wins[i].chan, wmp.MSG_RESIZE, s.wins[i].pend_resize_w, s.wins[i].pend_resize_h, 0);
         s.wins[i].pend_resize_w = 0;
         s.wins[i].pend_resize_h = 0;
-        s.quota[i] = s.quota[i] + 1;
+        room = room - 1;
     }
-    if (s.wins[i].pend_focus >= 0 && s.quota[i] < 2) {
+    if (room > 0 && s.wins[i].pend_focus >= 0) {
         wmp.msg_send(s.wins[i].chan, wmp.MSG_FOCUS, s.wins[i].pend_focus, 0, 0);
         s.wins[i].pend_focus = 0 - 1;
-        s.quota[i] = s.quota[i] + 1;
+        room = room - 1;
+    }
+    while (room > 0 && s.outq_n[i] > 0) {
+        let is i64 as base = (i * s.OUTQ + s.outq_head[i]) * 4;
+        wmp.msg_send(s.wins[i].chan, s.outq[base], s.outq[base + 1], s.outq[base + 2], s.outq[base + 3]);
+        s.outq_head[i] = (s.outq_head[i] + 1) % s.OUTQ;
+        s.outq_n[i] = s.outq_n[i] - 1;
+        room = room - 1;
     }
     return;
 }
 
-fn chan_writable_now(i as i64) as i64 {
-    let is [3]i64 as ce;
-    ce[0] = s.wins[i].chan;
-    ce[1] = sys.POLL_WRITABLE;
-    ce[2] = 0;
-    sys.poll(&ce[0], 1, 0);
-    if ((ce[2] & sys.POLL_WRITABLE) != 0) { return 1; }
-    return 0;
-}
