@@ -26,34 +26,34 @@ fn forward_key(t as *term.Term, keysym as i64, kb as i64) as void {
     if (keysym == cp.KEY_UP) {
         let is [3]u8 as ek;
         ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 65);
-        syscall(11, cin, cast(i64, &ek[0]), 3);
+        g.to_child(cin, cast(*u8, &ek[0]), 3);
     } else if (keysym == cp.KEY_DOWN) {
         let is [3]u8 as ek;
         ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 66);
-        syscall(11, cin, cast(i64, &ek[0]), 3);
+        g.to_child(cin, cast(*u8, &ek[0]), 3);
     } else if (keysym == cp.KEY_RIGHT) {
         let is [3]u8 as ek;
         ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 67);
-        syscall(11, cin, cast(i64, &ek[0]), 3);
+        g.to_child(cin, cast(*u8, &ek[0]), 3);
     } else if (keysym == cp.KEY_LEFT) {
         let is [3]u8 as ek;
         ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B); ek[2] = cast(u8, 68);
-        syscall(11, cin, cast(i64, &ek[0]), 3);
+        g.to_child(cin, cast(*u8, &ek[0]), 3);
     } else if (keysym == cp.KEY_ENTER) {
         let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x0A);
-        syscall(11, cin, cast(i64, &kb_b[0]), 1);
+        g.to_child(cin, cast(*u8, &kb_b[0]), 1);
     } else if (keysym == cp.KEY_BACKSPACE) {
         let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x08);
-        syscall(11, cin, cast(i64, &kb_b[0]), 1);
+        g.to_child(cin, cast(*u8, &kb_b[0]), 1);
     } else if (keysym == cp.KEY_TAB) {
         let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x09);
-        syscall(11, cin, cast(i64, &kb_b[0]), 1);
+        g.to_child(cin, cast(*u8, &kb_b[0]), 1);
     } else if (keysym == cp.KEY_ESC) {
         let is [1]u8 as kb_b; kb_b[0] = cast(u8, 0x1B);
-        syscall(11, cin, cast(i64, &kb_b[0]), 1);
+        g.to_child(cin, cast(*u8, &kb_b[0]), 1);
     } else if (keysym > 0 && keysym < 0x80) {
         let is [1]u8 as kb_b; kb_b[0] = cast(u8, keysym);
-        syscall(11, cin, cast(i64, &kb_b[0]), 1);
+        g.to_child(cin, cast(*u8, &kb_b[0]), 1);
     }
     return;
 }
@@ -113,7 +113,7 @@ fn mouse_emit(t as *term.Term, xbtn as i64, col as i64, row as i64, press as i64
         seq[3] = cast(u8, cb & 0xFF); seq[4] = cast(u8, cx & 0xFF); seq[5] = cast(u8, cy & 0xFF);
         n = 6;
     }
-    syscall(11, cin, cast(i64, &seq[0]), n);
+    g.to_child(cin, cast(*u8, &seq[0]), n);
     return;
 }
 
@@ -165,9 +165,24 @@ fn finish_job(t as *term.Term, slot as i64) as void {
         guard = guard + 1;
     }
     let is i64 as was_fg with mut = 0;
+    let is i64 as unread with mut = 0;
     if (s.fg_job == slot) {
         was_fg = 1;
         s.fg_job = 0 - 1;
+        // What it was sent and never read: the channel still counts it after
+        // the job's end closed. Saved before release closes ours.
+        let is i64 as cin = jobs.get(slot).in_fd;
+        if (cin >= 0) {
+            let is [4]i64 as ci;
+            if (sys.chan_info(cin, &ci[0]) == 0) { unread = ci[0] - ci[2]; }
+        }
+        if (unread > s.ta_end) { unread = s.ta_end; }
+        if (unread > s.TA_CAP) { unread = s.TA_CAP; }
+        let is i64 as k with mut = 0;
+        while (k < unread) {
+            s.ta_back[k] = s.ta_ring[(s.ta_end - unread + k) % s.TA_CAP];
+            k = k + 1;
+        }
         // This is where '$?' comes from. Without it the status a script or an
         // `if` reads is whatever a builtin last returned, not what the command
         // the user actually ran exited with.
@@ -194,8 +209,39 @@ fn finish_job(t as *term.Term, slot as i64) as void {
             if (r.list_run(t) == 1) { quit(); return; }
         }
         if (s.fg_job < 0) { g.prompt(t); }
+        if (unread > 0) { type_ahead(t, unread); }
     }
     g.show(t);
+    return;
+}
+
+// The n bytes of s.ta_back — typed while the last job ran, never read by it —
+// as if typed now: into the line, and Enter runs it. Once a line starts a job,
+// the rest is that job's input, the way it would have been on a tty. Escape
+// sequences (arrows, mouse reports) were for the program that is gone and are
+// skipped.
+fn type_ahead(t as *term.Term, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (s.fg_job >= 0) {
+            let is i64 as cin = jobs.get(s.fg_job).in_fd;
+            if (cin >= 0) { g.to_child(cin, cast(*u8, &s.ta_back[i]), n - i); }
+            return;
+        }
+        let is i64 as c = cast(i64, s.ta_back[i]);
+        if (c == 0x1B) {
+            i = i + 1;
+            if (i < n && s.ta_back[i] == cast(u8, 0x5B)) {               // CSI: up to its final byte
+                i = i + 1;
+                while (i < n && (s.ta_back[i] < cast(u8, 0x40) || s.ta_back[i] > cast(u8, 0x7E))) { i = i + 1; }
+            }
+        }
+        else if (c == 0x0A) { handle_key(t, cp.KEY_ENTER, 0x100, 0x1C); }
+        else if (c == 0x08) { handle_key(t, cp.KEY_BACKSPACE, 0x100, 0x0E); }
+        else if (c == 0x09) { handle_key(t, cp.KEY_TAB, 0x100, 0x0F); }
+        else if (c >= 32 && c < 127) { handle_key(t, c, 0x100, 0); }
+        i = i + 1;
+    }
     return;
 }
 
