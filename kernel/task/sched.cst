@@ -1313,6 +1313,23 @@ fn heartbeat_set(cpu as i64, ns as i64) as void {
     p[cpu] = ns;
 }
 
+// When each cpu last got into schedule() past the preemption gate. A cpu whose
+// timer still ticks (fresh heartbeat) but which has not managed to switch for
+// WATCHDOG_THRESHOLD_NS is stuck with preemption held off — spinning on a
+// spinlock nobody will release, or looping inside one. The heartbeat alone
+// never saw that: the tick keeps firing on a cpu that spins with interrupts on.
+let is [128]u8 as cpu_switch_ns;        // 16 cpus * i64
+
+fn switch_get(cpu as i64) as i64 {
+    let is *i64 as p = cast(*i64, &cpu_switch_ns);
+    return p[cpu];
+}
+
+fn switch_set(cpu as i64, ns as i64) as void {
+    let is *i64 as p = cast(*i64, &cpu_switch_ns);
+    p[cpu] = ns;
+}
+
 fn create_thread(entry as i64, band as i64) as i64 {
     // Pick this thread's home cpu via round-robin BEFORE taking
     // any lock — the placement choice is itself the input that
@@ -2154,7 +2171,7 @@ fn schedule() as void {
     // kernel and say so instead.
     if (smp.this_cpu_preempt_count() != 0) {
         if (from_irq != 0) { return; }
-        serial.print("sched: schedule() with preemption held off, count=", 51);
+        serial.print("sched: schedule() with preemption held off, count=", 50);
         util.print_num(smp.this_cpu_preempt_count());
         serial.print(" tid=", 5);
         util.print_num(current_tid());
@@ -2168,6 +2185,7 @@ fn schedule() as void {
 
     let is i64 as now = timer.current_time_ns();
     heartbeat_set(cpu, now);
+    switch_set(cpu, now);
     let is i64 as prev = current_tid();
 
     // Charge the slice that just ended to this cpu's busy or idle total. Done
@@ -2398,9 +2416,9 @@ fn on_timer_tick() as void {
     // has passed (no-op when no timed sleeper is registered).
     tick_wake(cpu, now);
 
-    if (cpu == smp.get_bsp_cpu_id()) {
-        watchdog_check();
-    }
+    // Every cpu checks every other: a watchdog that runs only on the boot cpu
+    // goes blind exactly when the boot cpu is the one that is stuck.
+    watchdog_check();
 
     // Periodic balance (see steal_work). From the tick, with interrupts off and
     // no scheduler lock held — the same conditions steal_work takes its locks
@@ -2504,7 +2522,7 @@ let is i64 as watchdog_armed_at_ns with mut = 0;
 let is i64 as watchdog_fired with mut = 0;
 
 fn watchdog_check() as void {
-    if (watchdog_fired != 0) { return; }
+    if (lock.load_word(&watchdog_fired) != 0) { return; }
     let is i64 as now = timer.current_time_ns();
     if (watchdog_armed_at_ns == 0) {
         watchdog_armed_at_ns = now + WATCHDOG_WARM_NS;
@@ -2512,28 +2530,47 @@ fn watchdog_check() as void {
     }
     if (now < watchdog_armed_at_ns) { return; }
 
-    // Stage 1: cpu-level — heartbeat too old.
+    let is i64 as self = this_cpu();
     let is i64 as cpus = smp.get_cpu_count();
     let is i64 as ci with mut = 0;
     while (ci < cpus) {
+        // Stage 1: no timer tick — a cpu stuck with interrupts off. Never this
+        // cpu: we are in its tick.
         let is i64 as last = heartbeat_get(ci);
-        if (last > 0) {
-            if (now - last > WATCHDOG_THRESHOLD_NS) {
-                watchdog_fired = 1;
+        if (ci != self && last > 0 && now - last > WATCHDOG_THRESHOLD_NS) {
+            if (lock.atomic_add(&watchdog_fired, 1) == 0) {
                 watchdog_dump_and_halt(ci, now - last);
+            }
+            return;
+        }
+        // Stage 2: ticking, busy, and still no switch — stuck with preemption
+        // off. This cpu too: its tick still fires while it spins with
+        // interrupts on, and on a single cpu there is nobody else to look. An
+        // idle cpu sits in HLT and switches only when work arrives, so it is
+        // left out.
+        let is *smp.PerCpu as pc = smp.get_per_cpu(ci);
+        if (cast(i64, pc) != 0 && pc.current_tid >= 0 && pc.current_tid != pc.idle_tid) {
+            let is i64 as sw = switch_get(ci);
+            if (sw > 0 && now - sw > WATCHDOG_THRESHOLD_NS) {
+                if (lock.atomic_add(&watchdog_fired, 1) == 0) {
+                    serial.println("", 0);
+                    serial.print("=== WATCHDOG: cpu ", 18);
+                    util.print_num(ci);
+                    serial.print(" has not switched threads for ", 30);
+                    util.print_num((now - sw) / 1000000);
+                    serial.print(" ms (preempt_count=", 19);
+                    util.print_num(pc.preempt_count);
+                    serial.print(" current_tid=", 13);
+                    util.print_num(pc.current_tid);
+                    serial.println(") - stuck with preemption off ===", 33);
+                    dump_threads();
+                    pmm.panic("watchdog: a cpu is stuck with preemption off", 44);
+                }
                 return;
             }
         }
         ci = ci + 1;
     }
-
-    // Stage 2 (thread-level RUNNABLE-not-picked walk) was useful to
-    // catch the nr_running counter leak and the vfs_test-vs-B band
-    // starvation interaction, but walking next_tid threads on every
-    // 5ms tick added per-thread thr_get pressure that ate into the
-    // -smp 2 verify timing budget. Disabled until / unless we move
-    // last_run_ns into a per-cpu cache that doesn't need a hash
-    // lookup per scan.
 }
 
 // Every thread's scheduling state on one line each — for a test that just saw
@@ -2648,9 +2685,7 @@ fn starvation_dump_and_halt(starved_tid as i64, age_ns as i64) as void {
         tid = tid + 1;
     }
 
-    serial.println("=== STARVATION halt ===", 23);
-    asm("cli\n");
-    while (1 == 1) { asm(".byte 0xF4\n"); }
+    pmm.panic("starvation: a runnable thread was never picked", 46);
 }
 
 fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
@@ -2730,9 +2765,7 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
         tid = tid + 1;
     }
 
-    serial.println("=== WATCHDOG halt ===", 21);
-    asm("cli\n");
-    while (1 == 1) { asm(".byte 0xF4\n"); }
+    pmm.panic("watchdog: a cpu stopped taking its timer interrupt", 50);
 }
 
 // Free one fully-dead thread's resources: kernel stack page, FPU area,

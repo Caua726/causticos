@@ -34,6 +34,32 @@ let is i64 as LF = 10;
 // than a single byte.
 let is lock.TicketLock as serial_lock with mut;
 
+// Set by the panic path (pmm.panic_begin) once every other cpu has been told
+// to stop. From then on output goes straight out without the lock: the cpu
+// holding it may be one of the stopped ones, or the panicking cpu itself (a
+// fault inside the logger), and waiting for it would turn a panic into a
+// silent hang. Nothing else runs by then, so nothing else can interleave.
+let is i64 as panic_mode with mut = 0;
+
+fn enter_panic_mode() as void { panic_mode = 1; }
+
+// The lock, or nothing at all in panic mode. LOCK_SKIPPED is no RFLAGS value
+// (its reserved bits are zero), so it cannot collide with a real saved state.
+let is i64 as LOCK_SKIPPED = 0 - 1;
+
+fn out_lock() as i64 {
+    if (panic_mode != 0) {
+        asm("cli\n");
+        return LOCK_SKIPPED;
+    }
+    return lock.acquire_irq(&serial_lock);
+}
+
+fn out_unlock(flags as i64) as void {
+    if (flags == LOCK_SKIPPED) { return; }
+    lock.release_irq(&serial_lock, flags);
+}
+
 // Per-cpu line buffers. A line longer than LINE_CAP flushes early and may
 // interleave — 240 bytes is far past anything the kernel prints, and the
 // degraded case is exactly today's behaviour, so overflow costs nothing that
@@ -42,6 +68,48 @@ let is i64 as LINE_CAP = 240;
 let is i64 as MAX_LINE_CPUS = 16;      // == smp.MAX_CPUS
 let is [16]i64 as line_len with mut;
 let is [3840]u8 as line_buf with mut;   // MAX_LINE_CPUS * LINE_CAP
+
+// The last HIST_LINES complete lines, whoever printed them. The panic screen
+// shows them: a machine that dies with its log only on a serial port nobody
+// has attached tells its user nothing at all. Kept as text without the CRLF.
+let is i64 as HIST_LINES = 20;
+let is i64 as HIST_CAP = 120;
+let is [2400]u8 as hist_buf with mut;    // HIST_LINES * HIST_CAP
+let is [20]i64 as hist_len with mut;
+let is i64 as hist_next with mut = 0;    // slot the next line goes into
+let is i64 as hist_count with mut = 0;
+
+// Caller holds serial_lock.
+fn hist_record(c as i64) as void {
+    let is i64 as n with mut = line_len[c];
+    let is i64 as base = c * LINE_CAP;
+    while (n > 0 && (line_buf[base + n - 1] == cast(u8, CR) || line_buf[base + n - 1] == cast(u8, LF))) {
+        n = n - 1;
+    }
+    if (n > HIST_CAP) { n = HIST_CAP; }
+    let is i64 as slot = hist_next;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        hist_buf[slot * HIST_CAP + i] = line_buf[base + i];
+        i = i + 1;
+    }
+    hist_len[slot] = n;
+    hist_next = (slot + 1) % HIST_LINES;
+    if (hist_count < HIST_LINES) { hist_count = hist_count + 1; }
+}
+
+// Line k of the history, oldest first (k < history_count()). Copies at most
+// HIST_CAP bytes into out and returns the length. No lock: it is read by the
+// panic path after every other cpu has been stopped.
+fn history_count() as i64 { return hist_count; }
+fn history_line(k as i64, out as *u8) as i64 {
+    if (k < 0 || k >= hist_count) { return 0; }
+    let is i64 as slot = (hist_next - hist_count + k + HIST_LINES) % HIST_LINES;
+    let is i64 as n = hist_len[slot];
+    let is i64 as i with mut = 0;
+    while (i < n) { out[i] = hist_buf[slot * HIST_CAP + i]; i = i + 1; }
+    return n;
+}
 
 // Which cpu is speaking. Injected rather than imported: smp.cst logs through
 // this module, so a `use` here would be a cycle, and serial.init() runs before
@@ -99,7 +167,7 @@ fn flush_locked(c as i64) as void {
 // interrupts off: an IRQ handler that logs would otherwise land in the middle
 // of the line this cpu is building.
 fn emit(ch as i64) as void {
-    let is i64 as flags = lock.acquire_irq(&serial_lock);
+    let is i64 as flags = out_lock();
     let is i64 as c = which_cpu();
     if (ch == LF) {
         // Normalise to CRLF at the boundary, so callers keep writing '\n'.
@@ -111,13 +179,14 @@ fn emit(ch as i64) as void {
             line_buf[c * LINE_CAP + line_len[c]] = cast(u8, LF);
             line_len[c] = line_len[c] + 1;
         }
+        hist_record(c);
         flush_locked(c);
     } else if (ch != CR) {
         line_buf[c * LINE_CAP + line_len[c]] = cast(u8, ch);
         line_len[c] = line_len[c] + 1;
         if (line_len[c] >= LINE_CAP) { flush_locked(c); }
     }
-    lock.release_irq(&serial_lock, flags);
+    out_unlock(flags);
     return;
 }
 
@@ -146,16 +215,16 @@ fn println(str as *u8, len as i64) as void {
 // important line the kernel ever prints is the one it dies on, and it would
 // otherwise sit in a buffer nobody flushes.
 fn flush() as void {
-    let is i64 as flags = lock.acquire_irq(&serial_lock);
+    let is i64 as flags = out_lock();
     flush_locked(which_cpu());
-    lock.release_irq(&serial_lock, flags);
+    out_unlock(flags);
     return;
 }
 
 // Panic path: dump every cpu's partial line, not just this one. Whatever the
 // other cpus were saying when the world stopped is evidence.
 fn flush_all() as void {
-    let is i64 as flags = lock.acquire_irq(&serial_lock);
+    let is i64 as flags = out_lock();
     let is i64 as i with mut = 0;
     while (i < MAX_LINE_CPUS) {
         if (line_len[i] > 0) {
@@ -165,6 +234,6 @@ fn flush_all() as void {
         }
         i = i + 1;
     }
-    lock.release_irq(&serial_lock, flags);
+    out_unlock(flags);
     return;
 }

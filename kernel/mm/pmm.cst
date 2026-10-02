@@ -363,16 +363,63 @@ fn align_up(addr as i64, align as i64) as i64 {
     return (addr + align - 1) & (0 - align);
 }
 
-fn panic(msg as *u8, len as i64) as void {
+// Panic hooks, installed by main once the machine can run them (pmm sits at the
+// bottom of the import graph and reaches neither the LAPIC nor the screen):
+//   stop_others_fn()           NMI every other cpu into a halt loop
+//   screen_fn(msg, len)        draw the panic screen
+let is i64 as panic_stop_others_fn with mut = 0;
+let is i64 as panic_screen_fn with mut = 0;
+// Set once a panic has begun. A second cpu panicking at the same moment, or a
+// fault inside the panic path itself, halts instead of starting over.
+let is i64 as panicking with mut = 0;
+
+fn set_panic_hooks(stop_others as i64, screen as i64) as void {
+    panic_stop_others_fn = stop_others;
+    panic_screen_fn = screen;
+}
+
+fn is_panicking() as i64 { return panicking; }
+
+// A panic in two halves, for callers that have more to say than one line —
+// the kernel exception handler prints the vector, rip and stack words between
+// them, with the rest of the machine already stopped.
+//
+// panic_begin: interrupts off; the first cpu in carries on, any later one (a
+// second cpu panicking at the same moment, or a fault inside the panic path)
+// halts. Then every other cpu is stopped — a panic used to halt only the cpu
+// that hit it, and the others kept running on whatever state was broken,
+// writing to disk, redrawing over the evidence — and the log stops taking its
+// lock: whoever held it may be one of the cpus just stopped, or this one.
+fn panic_begin() as void {
+    asm("cli\n");
+    let is i64 as first = lock.atomic_add(&panicking, 1);
+    if (first != 0) {
+        while (1 == 1) { asm(".byte 0xF4\n"); }
+    }
+    if (panic_stop_others_fn != 0) {
+        call(cast(fn() as void, panic_stop_others_fn));
+    }
+    serial.enter_panic_mode();
     // Whatever any cpu was midway through saying is evidence, and serial
     // output is buffered per line — without this the last thing each cpu was
     // writing when the world stopped dies in a buffer nobody flushes.
     serial.flush_all();
+}
+
+// panic_end: the line it dies on, the panic screen, and halt. Never returns.
+fn panic_end(msg as *u8, len as i64) as void {
     serial.print("PANIC: ", 7);
     serial.println(msg, len);
     serial.flush();
-    asm("cli\n");
+    if (panic_screen_fn != 0) {
+        call(cast(fn(*u8, i64) as void, panic_screen_fn), msg, len);
+    }
     while (1 == 1) { asm(".byte 0xF4\n"); }
+}
+
+fn panic(msg as *u8, len as i64) as void {
+    panic_begin();
+    panic_end(msg, len);
 }
 
 // IRQ save/restore for buddy ops (Bug #2 fix)

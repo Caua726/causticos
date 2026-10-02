@@ -1,6 +1,7 @@
 // idt.cst — Interrupt Descriptor Table
 
 use "serial.cst" as serial;
+use "pmm.cst" as pmm;
 use "port.cst" as port;
 use "timer.cst" as timer;
 use "sched.cst" as sched;
@@ -126,6 +127,22 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
         return;
     }
 
+    // NMI (2) is not a fault of the code it interrupted. While a panic is in
+    // progress it is the stop signal another cpu sent (pmm.panic): halt here,
+    // for good. Otherwise it is the platform reporting something (a parity or
+    // watchdog NMI) — log it and carry on rather than killing whatever thread
+    // happened to be running.
+    if (vector == 2) {
+        if (pmm.is_panicking() != 0) {
+            asm("cli\n");
+            while (1 == 1) { asm(".byte 0xF4\n"); }
+        }
+        serial.print("nmi: unexpected NMI at rip=", 27);
+        print_hex(rip);
+        serial.println("", 0);
+        return;
+    }
+
     // #PF (14): route through the L4 policy seam BEFORE the generic kill/panic.
     // CR2 (the faulting linear address) holds its value until the next #PF, so
     // capture it as the FIRST op of this branch — before any call that could
@@ -160,13 +177,17 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
             serial.print(" cr2=", 5);
             print_hex(fault_cr2);
         }
-        serial.println(" — terminating the process", 28);
+        serial.println(" - terminating the process", 26);
         // The whole process goes, from the thread's own kernel stack (we are on
         // this cpu's IST stack). Never returns.
         lifecycle.user_fault();
         while (1 == 1) { asm(".byte 0xF4\n"); }
     }
 
+    // A kernel fault: stop the machine first, then describe it. The other cpus
+    // halt before they can run on into whatever this fault broke, and the log
+    // no longer waits for its lock — this cpu may have faulted holding it.
+    pmm.panic_begin();
     serial.println("", 0);
     serial.print("EXCEPTION #", 11);
     print_num(vector);
@@ -217,10 +238,33 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
         }
     }
 
-    asm("cli\n");
-    while (1 == 1) {
-        asm(".byte 0xF4\n");
-    }
+    // The detail (vector, rip, symbol, stack words) is in the lines just
+    // printed, which the panic screen shows under this one.
+    let is [80]u8 as m;
+    let is i64 as ml = exception_message(vector, cast(*u8, &m[0]));
+    pmm.panic_end(cast(*u8, &m[0]), ml);
+}
+
+// "CPU exception #14 (page fault) in the kernel" into out; returns the length.
+fn exception_message(vector as i64, out as *u8) as i64 {
+    let is *u8 as head = cast(*u8, "CPU exception #");
+    let is i64 as n with mut = 0;
+    while (n < 15) { out[n] = head[n]; n = n + 1; }
+    if (vector >= 10) { out[n] = cast(u8, 48 + vector / 10); n = n + 1; }
+    out[n] = cast(u8, 48 + vector % 10); n = n + 1;
+    let is *u8 as what with mut = cast(*u8, "");
+    let is i64 as wl with mut = 0;
+    if (vector == 0)  { what = cast(*u8, " (divide error)"); wl = 15; }
+    if (vector == 6)  { what = cast(*u8, " (invalid opcode)"); wl = 17; }
+    if (vector == 8)  { what = cast(*u8, " (double fault)"); wl = 15; }
+    if (vector == 13) { what = cast(*u8, " (general protection)"); wl = 21; }
+    if (vector == 14) { what = cast(*u8, " (page fault)"); wl = 13; }
+    let is i64 as k with mut = 0;
+    while (k < wl) { out[n] = what[k]; n = n + 1; k = k + 1; }
+    let is *u8 as tail = cast(*u8, " in the kernel");
+    k = 0;
+    while (k < 14) { out[n] = tail[k]; n = n + 1; k = k + 1; }
+    return n;
 }
 
 fn irq_handler(irq as i64) as void {
