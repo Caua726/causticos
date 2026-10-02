@@ -144,7 +144,13 @@ fn forward_mouse_btn(t as *term.Term, newmask as i64, px as i64, py as i64) as v
 
 // A wheel notch arrived (MSG_MOUSE_WHEEL). Wheel is a press-only button 64/65.
 fn forward_mouse_wheel(t as *term.Term, delta as i64, px as i64, py as i64) as void {
-    if (s.fg_job < 0 || t.mouse_mode == 0) { return; }
+    // Nobody asked for the wheel: it scrolls the terminal's own history,
+    // three lines a notch (delta > 0 is a notch up, toward older lines).
+    if (s.fg_job < 0 || t.mouse_mode == 0) {
+        term.scroll_view(t, delta * 3);
+        g.show(t);
+        return;
+    }
     let is i64 as cin = jobs.get(s.fg_job).in_fd;
     if (cin < 0) { return; }
     let is i64 as col = px_to_cell_col(t, px);
@@ -292,6 +298,22 @@ fn clear_screen(t as *term.Term) as void {
 fn handle_key(t as *term.Term, keysym as i64, kb as i64, sc as i64) as void {
     let is i64 as pressed = cp.key_pressed(kb);
     if (pressed != 1) { return; }
+    // Shift+PgUp/PgDn page through the history, whoever has the keys — the
+    // terminal's own, never passed on.
+    if ((cp.key_mods(kb) & cp.MOD_SHIFT) != 0 && (keysym == cp.KEY_PGUP || keysym == cp.KEY_PGDN)) {
+        let is i64 as page with mut = t.rows - 1;
+        if (page < 1) { page = 1; }
+        if (keysym == cp.KEY_PGUP) { term.scroll_view(t, page); } else { term.scroll_view(t, 0 - page); }
+        g.show(t);
+        return;
+    }
+    // Any other key brings the live screen back first: what it does shows
+    // there. (Output does the same in term.putc; a key that only moves the
+    // cursor did not, and moved it out of sight.)
+    if (keysym != 0 && t.view_off != 0) {
+        term.scroll_view(t, 0 - t.view_off);
+        g.show(t);
+    }
     if (s.fg_job >= 0) {
         // Ctrl+C ends the job instead of being forwarded to it. The terminal
         // spawned it and holds the only key to it, so this is the ONLY way out
@@ -435,7 +457,11 @@ fn main() as i32 {
     let is i64 as win_w = wmp.unpack_w(welcome_m[3]);
     let is i64 as win_h = wmp.unpack_h(welcome_m[3]);
 
-    s.seg_cap_cells = s.GRID_STRIDE * s.GRID_ROWS;
+    // The most rows a window on this screen can show: the text segment the
+    // compositor reads holds that many, and the ring that many more than the
+    // scrollback. The segment used to be as big as the whole ring.
+    let is i64 as vis_max = welcome_m[2] / 16 + 1;
+    s.seg_cap_cells = s.GRID_STRIDE * vis_max;
     let is i64 as npages with mut = (8 + s.seg_cap_cells) * 8;
     npages = (npages + 4095) / 4096;
     let is i64 as seg = sys.seg_create(npages, 0);
@@ -449,8 +475,12 @@ fn main() as i32 {
                  wmp.hello_c(wmp.PROTO_VER, wmp.SURFACE_TEXT));
     cli.set_title(cast(*u8, "wterm"), 5);
 
+    s.grid_rows = s.SCROLLBACK + vis_max;
+    let is i64 as gbytes = ((s.GRID_STRIDE * s.grid_rows * 8 + 4095) / 4096) * 4096;
+    let is i64 as gva = sys.reserve(0, gbytes, sys.PROT_READ | sys.PROT_WRITE);
+    if (gva < 0) { return 2; }
     let is term.Term as t = term.init_text(win_w, win_h);
-    term.attach_grid(&t, &s.gridbuf[0], s.GRID_STRIDE, s.GRID_ROWS);
+    if (term.attach_grid_lazy(&t, cast(*i64, gva), s.GRID_STRIDE, s.grid_rows) != 0) { return 2; }
     g._col(&t, s.C_TITLE);
     g.puts(&t, "Caustic Terminal\n");
     g._col(&t, s.C_DIM);
