@@ -776,15 +776,104 @@ fn dl_remove(cpu as i64, tid as i64) as void {
 // EEVDF helpers
 // ============================================================
 
+// band_min_vruntime is a monotonic floor under every vruntime in the band —
+// the base the average below is taken against, so its sums stay small. It
+// follows the smallest vruntime actually queued, never moves backwards, and
+// is advanced past an emptied band by the thread that ran last.
 fn update_band_min_vruntime(cpu as i64, band as i64) as void {
-    let is i64 as lm = rb.rb_leftmost(band_root(cpu, band));
-    if (lm != 0) {
-        let is i64 as tid = rb.nd_val(lm);
-        let is i64 as hv = thr_vruntime(tid);
-        if (hv > band_min_vruntime(cpu, band)) {
-            band_set_min_vruntime(cpu, band, hv);
-        }
+    let is i64 as n with mut = rb.rb_leftmost(band_root(cpu, band));
+    if (n == 0) { return; }
+    let is i64 as lo with mut = thr_vruntime(rb.nd_val(n));
+    n = rb.rb_next(n);
+    while (n != 0) {
+        let is i64 as v = thr_vruntime(rb.nd_val(n));
+        if (v < lo) { lo = v; }
+        n = rb.rb_next(n);
     }
+    if (lo > band_min_vruntime(cpu, band)) {
+        band_set_min_vruntime(cpu, band, lo);
+    }
+}
+
+// V: the weighted average vruntime of the band — the virtual time a thread
+// would have if every runnable thread had received exactly its share. EEVDF's
+// eligibility rule is measured against it: a thread is owed cpu (eligible)
+// while its own vruntime is at or behind V.
+//
+// It used to be a per-thread `lag` stored when the thread was last charged
+// and never refreshed while it waited. A thread charged while ahead kept a
+// negative lag frozen in place — ineligible no matter how far behind the
+// others it later fell — and a stream of waking threads (placed with lag 0)
+// could keep it off the cpu indefinitely: the user thread of the in-kernel
+// smoke sat a full second unscheduled on one cpu. Computed here from the
+// live vruntimes at the moment of the decision, nothing can go stale.
+//
+// `extra_tid` (or -1) is a RUNNING thread of this band that is not in the
+// tree — a waker placing a thread must count the one on the cpu. O(n) over the
+// band, which is a handful of threads; schedule() already walks every thread
+// twice per switch.
+fn band_avg_vruntime(cpu as i64, band as i64, extra_tid as i64) as i64 {
+    let is i64 as base = band_min_vruntime(cpu, band);
+    let is i64 as sum_w with mut = 0;
+    let is i64 as sum_wv with mut = 0;
+    let is i64 as n with mut = rb.rb_leftmost(band_root(cpu, band));
+    while (n != 0) {
+        let is i64 as tid = rb.nd_val(n);
+        let is i64 as w = thr_weight(tid);
+        sum_w = sum_w + w;
+        sum_wv = sum_wv + w * (thr_vruntime(tid) - base);
+        n = rb.rb_next(n);
+    }
+    if (extra_tid >= 0) {
+        let is i64 as we = thr_weight(extra_tid);
+        sum_w = sum_w + we;
+        sum_wv = sum_wv + we * (thr_vruntime(extra_tid) - base);
+    }
+    if (sum_w <= 0) { return base; }
+    // Floor division of a possibly negative sum: a thread exactly at the
+    // average must come out eligible, never one ns short of it.
+    let is i64 as q with mut = sum_wv / sum_w;
+    if (sum_wv < 0 && q * sum_w != sum_wv) { q = q - 1; }
+    return base + q;
+}
+
+// The thread RUNNING on `cpu` if it competes in `band` (so it counts toward V
+// while it is out of the tree), else -1. Caller holds that cpu's sched_lock.
+fn running_in_band(cpu as i64, band as i64) as i64 {
+    let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
+    if (cast(i64, pc) == 0) { return 0 - 1; }
+    let is i64 as cur = pc.current_tid;
+    if (cur < 0) { return 0 - 1; }
+    if (thread_ptr(cur) == 0) { return 0 - 1; }
+    if (thr_state(cur) != THREAD_RUNNING) { return 0 - 1; }
+    if (thr_class(cur) != SCHED_CLASS_QOS) { return 0 - 1; }
+    if (thr_band(cur) != band) { return 0 - 1; }
+    return cur;
+}
+
+// Re-place a thread about to be queued again after time off the run queue,
+// and refresh its deadline to match. Caller holds `cpu`'s sched_lock.
+fn place_requeue(cpu as i64, band as i64, tid as i64) as void {
+    let is i64 as v = place_vruntime(cpu, band, tid, 0);
+    let is i64 as w with mut = thr_weight(tid);
+    let is i64 as sl with mut = thr_slice(tid);
+    if (w <= 0) { w = BASE_WEIGHT; }
+    if (sl <= 0) { sl = DEFAULT_SLICE_NS; }
+    thr_set(tid, 48, v);
+    thr_set(tid, 56, v + sl * BASE_WEIGHT / w);
+}
+
+// Where a thread entering the band (created, or waking) starts. Never ahead of
+// what it already earned — a thread that slept a moment after using more than
+// its share keeps that debt — and never more than SLEEPER_BONUS_NS of credit
+// behind V, so sleeping cannot be banked into a monopoly afterwards.
+fn place_vruntime(cpu as i64, band as i64, tid as i64, fresh as i64) as i64 {
+    let is i64 as v = band_avg_vruntime(cpu, band, running_in_band(cpu, band));
+    if (fresh != 0) { return v; }
+    let is i64 as floor = v - SLEEPER_BONUS_NS;
+    let is i64 as old = thr_vruntime(tid);
+    if (old > floor) { return old; }
+    return floor;
 }
 
 fn update_vruntime(cpu as i64, tid as i64, elapsed_ns as i64) as void {
@@ -794,8 +883,9 @@ fn update_vruntime(cpu as i64, tid as i64, elapsed_ns as i64) as void {
     thr_set(tid, 48, new_vrt);
     thr_set(tid, 56, new_vrt + (thr_slice(tid) * BASE_WEIGHT / w));
     thr_set(tid, 88, thr_runtime(tid) + elapsed_ns);
-    let is i64 as lag = band_min_vruntime(cpu, thr_band(tid)) - new_vrt;
-    thr_set(tid, 112, lag);
+    // lag (offset 112) is kept for the monitors only — V - v at the moment of
+    // this charge. The scheduler never decides on it (band_avg_vruntime).
+    thr_set(tid, 112, band_avg_vruntime(cpu, thr_band(tid), tid) - new_vrt);
 }
 
 // ============================================================
@@ -1161,9 +1251,10 @@ fn create_thread(entry as i64, band as i64) as i64 {
         while (fzi < FPU_STATE_SIZE) { fz[fzi] = 0; fzi = fzi + 1; }
     }
 
-    // EEVDF starts at THIS cpu's band min_vruntime.
+    // EEVDF: a new thread starts at the band's average — owed exactly its
+    // share from here on, no credit and no debt.
     let is i64 as w = band_weight(band);
-    let is i64 as mvrt = band_min_vruntime(home_cpu, band);
+    let is i64 as mvrt = place_vruntime(home_cpu, band, tid, 1);
     let is i64 as vd = mvrt + (DEFAULT_SLICE_NS * BASE_WEIGHT / w);
     let is i64 as now = timer.current_time_ns();
 
@@ -1258,7 +1349,7 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
     }
 
     let is i64 as w = band_weight(band);
-    let is i64 as mvrt = band_min_vruntime(home_cpu, band);
+    let is i64 as mvrt = place_vruntime(home_cpu, band, tid, 1);
     let is i64 as vd = mvrt + (DEFAULT_SLICE_NS * BASE_WEIGHT / w);
     let is i64 as now = timer.current_time_ns();
 
@@ -1321,6 +1412,9 @@ fn make_runnable(tid as i64) as void {
     let is i64 as band = thr_band(tid);
     let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
     if (thr_state(tid) == THREAD_SUSPENDED) {
+        // Re-placed against the band as it is NOW: the average has moved on
+        // since the thread was created suspended.
+        place_requeue(cpu, band, tid);
         thr_set(tid, 8, THREAD_RUNNABLE);
         runlist_insert(cpu, band, tid);
         set_nr_running(cpu, nr_running(cpu) + 1);
@@ -1632,9 +1726,11 @@ fn wakeup_thread(tid as i64) as void {
 
     let is i64 as band = thr_band(tid);
     let is i64 as w with mut = thr_weight(tid);
-    let is i64 as mvrt = band_min_vruntime(cpu, band);
-    // place_entity recipe — see prior commit message.
-    let is i64 as new_vrt = mvrt;
+    // Placement keeps what the thread earned before it slept, bounded by the
+    // sleeper bonus (place_vruntime). It used to reset every waker to the
+    // band's minimum, which handed a thread that slept for a microsecond the
+    // same head start as one that slept for a minute.
+    let is i64 as new_vrt = place_vruntime(cpu, band, tid, 0);
     let is i64 as slice with mut = thr_slice(tid);
     if (w <= 0) { w = BASE_WEIGHT; }
     if (slice <= 0) { slice = DEFAULT_SLICE_NS; }
@@ -1703,8 +1799,9 @@ fn resume_thread(tid as i64) as void {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    thr_set(tid, 8, THREAD_RUNNABLE);
     let is i64 as band = thr_band(tid);
+    if (thr_class(tid) == SCHED_CLASS_QOS) { place_requeue(cpu, band, tid); }
+    thr_set(tid, 8, THREAD_RUNNABLE);
     if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dl_insert(cpu, tid); }
     else { runlist_insert(cpu, band, tid); }
     set_nr_running(cpu, nr_running(cpu) + 1);
@@ -1754,23 +1851,22 @@ fn pick_next_deadline(cpu as i64) as i64 {
     return 0 - 1;
 }
 
+// EEVDF: of the threads owed cpu (vruntime <= V), the one whose virtual
+// deadline comes first. The tree is ordered by deadline, so that is the first
+// eligible node. One always exists: the smallest vruntime is never above the
+// average. (schedule() re-inserts the outgoing thread before it gets here, so
+// every competitor is in the tree.)
 fn pick_next_in_band(cpu as i64, band as i64) as i64 {
+    let is i64 as v = band_avg_vruntime(cpu, band, 0 - 1);
     let is i64 as n with mut = rb.rb_leftmost(band_root(cpu, band));
+    let is i64 as lowest with mut = 0 - 1;
     while (n != 0) {
         let is i64 as tid = rb.nd_val(n);
-        if (thr_lag(tid) >= 0) { return tid; }
+        if (thr_vruntime(tid) <= v) { return tid; }
+        if (lowest < 0 || thr_vruntime(tid) < thr_vruntime(lowest)) { lowest = tid; }
         n = rb.rb_next(n);
     }
-
-    let is i64 as lm = rb.rb_leftmost(band_root(cpu, band));
-    if (lm != 0) {
-        let is i64 as tid = rb.nd_val(lm);
-        band_set_min_vruntime(cpu, band, thr_vruntime(tid));
-        thr_set(tid, 112, 0);
-        return tid;
-    }
-
-    return 0 - 1;
+    return lowest;
 }
 
 fn pick_next(cpu as i64) as i64 {
@@ -2176,6 +2272,41 @@ fn watchdog_check() as void {
     // -smp 2 verify timing budget. Disabled until / unless we move
     // last_run_ns into a per-cpu cache that doesn't need a hash
     // lookup per scan.
+}
+
+// Every thread's scheduling state on one line each — for a test that just saw
+// a thread fail to make progress, so the log says who had the cpu instead.
+fn dump_threads() as void {
+    let is i64 as now = timer.current_time_ns();
+    let is i64 as ntid = next_tid;
+    let is i64 as tid with mut = 0;
+    while (tid < ntid) {
+        if (thread_ptr(tid) != 0) {
+            serial.print("  tid=", 6);
+            util.print_num(tid);
+            serial.print(" state=", 7);
+            util.print_num(thr_state(tid));
+            serial.print(" class=", 7);
+            util.print_num(thr_class(tid));
+            serial.print(" band=", 6);
+            util.print_num(thr_band(tid));
+            serial.print(" home=", 6);
+            util.print_num(thr_home_cpu(tid));
+            serial.print(" vrt_ms=", 8);
+            util.print_num(thr_vruntime(tid) / 1000000);
+            serial.print(" run_ms=", 8);
+            util.print_num(thr_runtime(tid) / 1000000);
+            let is i64 as lr = thr_last_run_ns(tid);
+            if (lr > 0) {
+                serial.print(" idle_ms=", 9);
+                util.print_num((now - lr) / 1000000);
+            } else {
+                serial.print(" never-ran", 10);
+            }
+            serial.println("", 0);
+        }
+        tid = tid + 1;
+    }
 }
 
 fn starvation_dump_and_halt(starved_tid as i64, age_ns as i64) as void {
