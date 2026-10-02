@@ -189,21 +189,47 @@ fn current_cpu_id() as i64 {
 let is i64 as LINE_OWNER_IRQ = 0x10000000000;
 
 fn current_line_owner() as i64 {
-    let is *PerCpu as p = current_cpu();
-    if (cast(i64, p) == 0) { return 0; }
-    if (p.in_irq_context != 0) { return LINE_OWNER_IRQ + p.cpu_id; }
-    return p.current_tid + 1;
+    if (lock.gs_load(0) == 0) { return 0; }
+    if (lock.gs_load(OFF_IN_IRQ) != 0) { return LINE_OWNER_IRQ + lock.gs_load(OFF_CPU_ID); }
+    return lock.gs_load(OFF_CURRENT_TID) + 1;
 }
 
 // Per-CPU scheduler-state accessors. These are thin enough that the
 // scheduler calls them by name — keeps the hot paths readable and
-// isolates the PerCpu struct layout from sched.cst. All reads/writes
-// happen on whichever cpu is currently executing, so there is no
-// cross-cpu cache coherence concern here (each cpu owns its own slot).
+// isolates the PerCpu struct layout from sched.cst.
+//
+// What a running thread reads about ITSELF — its tid, whether it may be
+// preempted, whether it is in an interrupt, whether a reschedule is pending —
+// is read with ONE gs-relative load. current_cpu() and then a field is two
+// steps, and a thread preempted between them and resumed on another cpu
+// (steal_work) finishes the read on the cpu it left: it gets what runs THERE
+// now. current_tid() returned another thread's tid; schedule() read another
+// cpu's preempt count, held by that cpu's spinlock, and stopped the kernel
+// with "sleeping while atomic" (and printed count=0, read again on its own
+// cpu). A single load cannot be split by a migration. The offsets are checked
+// against the struct at boot (check_offsets).
+let is i64 as OFF_CPU_ID       = 0x08;
+let is i64 as OFF_CURRENT_TID  = 0x30;
+let is i64 as OFF_NEED_RESCHED = 0x50;
+let is i64 as OFF_IN_IRQ       = 0x70;
+let is i64 as OFF_PREEMPT      = 0x78;
+
+fn check_offsets() as void {
+    let is *PerCpu as p = &per_cpus[0];
+    let is i64 as b = cast(i64, p);
+    if (cast(i64, &p.cpu_id) - b != OFF_CPU_ID
+        || cast(i64, &p.current_tid) - b != OFF_CURRENT_TID
+        || cast(i64, &p.need_resched) - b != OFF_NEED_RESCHED
+        || cast(i64, &p.in_irq_context) - b != OFF_IN_IRQ
+        || cast(i64, &p.preempt_count) - b != OFF_PREEMPT
+        || cast(i64, &p.syscall_user_rsp) - b != 0x88
+        || cast(i64, &p.syscall_kstack) - b != 0x90) {
+        pmm.panic("smp: PerCpu layout does not match its gs: offsets", 49);
+    }
+}
 
 fn this_cpu_current_tid() as i64 {
-    let is *PerCpu as p = current_cpu();
-    return p.current_tid;
+    return lock.gs_load(OFF_CURRENT_TID);
 }
 
 fn this_cpu_set_current_tid(v as i64) as void {
@@ -295,8 +321,7 @@ fn this_cpu_set_fpu_owner_tid(v as i64) as void {
 }
 
 fn this_cpu_need_resched() as i64 {
-    let is *PerCpu as p = current_cpu();
-    return p.need_resched;
+    return lock.gs_load(OFF_NEED_RESCHED);
 }
 
 fn this_cpu_set_need_resched(v as i64) as void {
@@ -343,8 +368,7 @@ fn call_ptr(target as i64) as void {
 }
 
 fn this_cpu_in_irq_context() as i64 {
-    let is *PerCpu as p = current_cpu();
-    return p.in_irq_context;
+    return lock.gs_load(OFF_IN_IRQ);
 }
 
 fn this_cpu_set_in_irq_context(v as i64) as void {
@@ -353,13 +377,7 @@ fn this_cpu_set_in_irq_context(v as i64) as void {
 }
 
 fn this_cpu_preempt_count() as i64 {
-    let is *PerCpu as p = current_cpu();
-    return p.preempt_count;
-}
-
-fn this_cpu_set_preempt_count(v as i64) as void {
-    let is *PerCpu as p = current_cpu();
-    p.preempt_count = v;
+    return lock.gs_load(OFF_PREEMPT);
 }
 
 fn this_cpu_heap_saved_flags() as i64 {
@@ -484,6 +502,7 @@ fn init_bsp_early() as void {
 }
 
 fn init() as void {
+    check_offsets();
     let is *u8 as resp = limine.get_smp_response();
     if (cast(i64, resp) == 0) {
         serial.println("smp: no Limine SMP response - uniprocessor", 42);
