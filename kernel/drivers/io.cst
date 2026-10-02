@@ -79,10 +79,22 @@ struct BlockIOProvider {
     // two cpus concurrently doing pending_push/pending_remove could
     // lose entries or corrupt the chain. Ticket lock serialises.
     pending_lock as lock.TicketLock;
+    // Optional. Called from a waiter's thread (it may sleep) when a request
+    // has outlived any sane completion time: stop the device's DMA engine,
+    // fail every outstanding request through fail_request(), and get the
+    // device accepting commands again. Returns 0 once nothing is in flight —
+    // a failed buffer may then be freed — or nonzero if the device would not
+    // stop, in which case it is marked dead and its buffers are never freed.
+    abort_io as fn(*BlockIOProvider) as i32;
+    dead as i64;                    // 1 once abort_io could not stop the device
 }
 
 let is i64 as providers with mut = 0;
 let is i64 as provider_count with mut = 0;
+// Guards the provider list. It was "locked" with preempt_disable, which keeps
+// only this cpu from interleaving — two cpus registering at once would each
+// link their provider in on top of the same old head.
+let is lock.TicketLock as providers_lk with mut;
 
 // Called by drivers in on_bind. The provider struct is typically
 // .bss-allocated by the driver and passed by pointer here so we can
@@ -92,11 +104,12 @@ fn register(p as *BlockIOProvider) as i32 {
     if (cast(i64, p.submit_io) == 0) { return driver.INVALID_ARGUMENT; }
     if (cast(i64, p.harvest_io) == 0) { return driver.INVALID_ARGUMENT; }
 
-    sched.preempt_disable();
+    let is i64 as fl = lock.acquire_irq(&providers_lk);
+    p.dead = 0;
     p.next = cast(*BlockIOProvider, providers);
     providers = cast(i64, p);
     provider_count = provider_count + 1;
-    sched.preempt_enable();
+    lock.release_irq(&providers_lk, fl);
 
     serial.print("io: block provider registered dev=", 34);
     util.print_hex(cast(i64, p.device));
@@ -107,11 +120,16 @@ fn register(p as *BlockIOProvider) as i32 {
 // Find the first provider bound to a given Hardware. For V1 there is
 // at most one block provider per device; this becomes a hash later.
 fn find_provider(dev as *driver.Hardware) as *BlockIOProvider {
+    let is i64 as fl = lock.acquire_irq(&providers_lk);
     let is *BlockIOProvider as p with mut = cast(*BlockIOProvider, providers);
     while (cast(i64, p) != 0) {
-        if (cast(i64, p.device) == cast(i64, dev)) { return p; }
+        if (cast(i64, p.device) == cast(i64, dev)) {
+            lock.release_irq(&providers_lk, fl);
+            return p;
+        }
         p = p.next;
     }
+    lock.release_irq(&providers_lk, fl);
     return cast(*BlockIOProvider, 0);
 }
 
@@ -206,6 +224,11 @@ fn harvest_one(p as *BlockIOProvider) as i32 {
     if (rc != 1) { return 0; }
     if (cast(i64, r) == 0) { return 0; }
 
+    complete(p, r);
+    return 1;
+}
+
+fn complete(p as *BlockIOProvider, r as *BlockRequest) as void {
     let is i64 as pflags = lock.acquire_irq(&p.pending_lock);
     pending_remove(p, r);
     lock.release_irq(&p.pending_lock, pflags);
@@ -214,7 +237,13 @@ fn harvest_one(p as *BlockIOProvider) as i32 {
     if (r.waiter_tid >= 0) {
         sched.wakeup_thread(r.waiter_tid);
     }
-    return 1;
+}
+
+// For a driver's abort_io: this request will never complete in hardware.
+// Hand it back to its waiter as failed.
+fn fail_request(p as *BlockIOProvider, r as *BlockRequest) as void {
+    r.status = cast(i64, 0 - 1);
+    complete(p, r);
 }
 
 // Harvest loop — drivers call this from IRQ handler until it returns 0.
@@ -251,41 +280,86 @@ fn wait_complete(p as *BlockIOProvider, r as *BlockRequest) as void {
     // indefinite sleep_locked_and_yield primitive. The root SMP failure was a
     // LOST AHCI completion IRQ: the hardware finished the command (PX_CI bit
     // cleared) but the IRQ on another cpu was missed, so the IRQ-only harvest
-    // never ran, r.state never reached COMPLETE, and the waiter slept forever —
-    // the 5 s timeout never fired because the thread never woke to check it (the
-    // silent residual smp>1 boot stall). Here each poll we drive harvest_all
-    // ourselves: ahci_harvest reads PX_CI under the port lock, so a completion
-    // the IRQ missed is picked up within one poll. A genuinely stuck request
-    // still surfaces loudly at 5 s. The submit path's wakeup_thread stays as an
-    // early-wake optimisation.
+    // never ran, r.state never reached COMPLETE, and the waiter slept forever.
+    // Here each poll we drive harvest_all ourselves: ahci_harvest reads PX_CI
+    // under the port lock, so a completion the IRQ missed is picked up within
+    // one poll. The submit path's wakeup_thread stays as an early-wake
+    // optimisation.
+    //
+    // A request that has not finished in STALL_NS is aborted, not waited on
+    // forever and not answered with a halted machine: this used to print the
+    // stall and `cli; hlt` the whole system over one slow sector. The driver's
+    // abort_io stops the device's DMA and fails everything outstanding, and
+    // the caller gets an I/O error it can report.
     let is i64 as wait_start = timer.current_time_ns();
-    let is i64 as bail_at    = wait_start + 5000000000;   // 5 s hard timeout
+    let is i64 as bail_at    = wait_start + STALL_NS;
     while (r.state != REQ_COMPLETE) {
         harvest_all(p);                              // active poll — covers a lost completion IRQ
         if (r.state == REQ_COMPLETE) { return; }
         if (timer.current_time_ns() > bail_at) {
-            serial.println("", 0);
-            serial.println("=== wait_complete STALLED ===", 29);
-            serial.print("waiter_tid=", 11);
-            util.print_num(r.waiter_tid);
-            serial.print(" req_state=", 11);
-            util.print_num(r.state);
-            serial.print(" op=", 4);
+            serial.print("io: request stalled op=", 23);
             util.print_num(r.op);
             serial.print(" lba=", 5);
             util.print_num(r.lba);
             serial.print(" count=", 7);
             util.print_num(r.count);
-            serial.println("", 0);
-            serial.print("waited_ms=", 10);
+            serial.print(" waited_ms=", 11);
             util.print_num((timer.current_time_ns() - wait_start) / 1000000);
-            serial.println("", 0);
-            serial.println("=== STALL halt ===", 18);
-            asm("cli\n");
-            while (1 == 1) { asm(".byte 0xF4\n"); }
+            serial.println(" — aborting", 13);
+            abort(p);
+            if (r.state == REQ_COMPLETE) { return; }
+            // The device would not let go of it. Its DMA may still land in
+            // r.buf, so neither the request nor (by contract) the buffer may
+            // be reused; the caller sees REQ_CANCELLED and must not free them.
+            r.state = REQ_CANCELLED;
+            r.status = cast(i64, 0 - 1);
+            return;
         }
         sched.sleep_for_ns(500000);   // 0.5 ms poll — robust to a missed completion wakeup
     }
+}
+
+// How long a request may take before it is aborted. Generous on purpose: a
+// spinning disk recovering a bad sector can take seconds, and an abort throws
+// away every other request in flight with it.
+let is i64 as STALL_NS = 5000000000;   // 5 s
+
+fn abort(p as *BlockIOProvider) as void {
+    if (p.dead != 0) { return; }
+    if (cast(i64, p.abort_io) == 0) {
+        serial.println("io: device has no abort — marking it dead", 41);
+        p.dead = 1;
+        return;
+    }
+    if (call(p.abort_io, p) != 0) {
+        serial.println("io: device did not stop on abort — marking it dead", 50);
+        p.dead = 1;
+    }
+}
+
+// The sync wrappers below share this: one request, submitted, waited for,
+// and freed — unless the device never let go of it (see wait_complete).
+fn run_sync(dev as *driver.Hardware, op as i64, port as i64, lba as i64,
+            count as i64, buf as *u8) as i32 {
+    let is *BlockIOProvider as p = find_provider(dev);
+    if (cast(i64, p) == 0) { return driver.DEVICE_NOT_PRESENT; }
+    if (p.dead != 0) { return driver.DEVICE_NOT_PRESENT; }
+
+    let is *BlockRequest as r = new_request(op, port, lba, count, buf);
+    if (cast(i64, r) == 0) { return driver.OUT_OF_MEMORY; }
+    r.waiter_tid = sched.current_tid();
+
+    let is i32 as rc = submit(p, r);
+    if (rc != 0) { free_request(r); return rc; }
+
+    wait_complete(p, r);
+    let is i32 as status = cast(i32, r.status);
+    if (r.state == REQ_CANCELLED) {
+        // Never freed: the device may still write into it.
+        return cast(i32, 0 - 1);
+    }
+    free_request(r);
+    return status;
 }
 
 // Blocking read. Creates a request, submits, and sleeps the caller
@@ -294,53 +368,14 @@ fn wait_complete(p as *BlockIOProvider, r as *BlockRequest) as void {
 // size is driver-specific and opaque here.
 fn read_sync(dev as *driver.Hardware, port as i64, lba as i64,
              count as i64, buf as *u8) as i32 {
-    let is *BlockIOProvider as p = find_provider(dev);
-    if (cast(i64, p) == 0) { return driver.DEVICE_NOT_PRESENT; }
-
-    let is *BlockRequest as r = new_request(OP_READ, port, lba, count, buf);
-    if (cast(i64, r) == 0) { return driver.OUT_OF_MEMORY; }
-    r.waiter_tid = sched.current_tid();
-
-    let is i32 as rc = submit(p, r);
-    if (rc != 0) { free_request(r); return rc; }
-
-    wait_complete(p, r);
-    let is i32 as status = cast(i32, r.status);
-    free_request(r);
-    return status;
+    return run_sync(dev, OP_READ, port, lba, count, buf);
 }
 
 fn write_sync(dev as *driver.Hardware, port as i64, lba as i64,
               count as i64, buf as *u8) as i32 {
-    let is *BlockIOProvider as p = find_provider(dev);
-    if (cast(i64, p) == 0) { return driver.DEVICE_NOT_PRESENT; }
-
-    let is *BlockRequest as r = new_request(OP_WRITE, port, lba, count, buf);
-    if (cast(i64, r) == 0) { return driver.OUT_OF_MEMORY; }
-    r.waiter_tid = sched.current_tid();
-
-    let is i32 as rc = submit(p, r);
-    if (rc != 0) { free_request(r); return rc; }
-
-    wait_complete(p, r);
-    let is i32 as status = cast(i32, r.status);
-    free_request(r);
-    return status;
+    return run_sync(dev, OP_WRITE, port, lba, count, buf);
 }
 
 fn flush_sync(dev as *driver.Hardware, port as i64) as i32 {
-    let is *BlockIOProvider as p = find_provider(dev);
-    if (cast(i64, p) == 0) { return driver.DEVICE_NOT_PRESENT; }
-
-    let is *BlockRequest as r = new_request(OP_FLUSH, port, 0, 0, cast(*u8, 0));
-    if (cast(i64, r) == 0) { return driver.OUT_OF_MEMORY; }
-    r.waiter_tid = sched.current_tid();
-
-    let is i32 as rc = submit(p, r);
-    if (rc != 0) { free_request(r); return rc; }
-
-    wait_complete(p, r);
-    let is i32 as status = cast(i32, r.status);
-    free_request(r);
-    return status;
+    return run_sync(dev, OP_FLUSH, port, 0, 0, cast(*u8, 0));
 }

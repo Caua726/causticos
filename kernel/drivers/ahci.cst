@@ -20,6 +20,9 @@ use "pmm.cst" as pmm;
 use "pci.cst" as pci;
 use "storage.cst" as storage;
 use "lock.cst" as lock;
+use "sched.cst" as sched;
+use "mutex.cst" as mutex;
+use "cmdline.cst" as cmdline;
 
 // HBA register offsets (ABAR + N)
 let is i64 as HBA_CAP  = 0x00;
@@ -45,6 +48,18 @@ let is i64 as TIMEOUT_HBA_RESET_NS = 1000000000;      //  1 s
 let is i64 as TIMEOUT_LINK_NS      = 1000000000;      //  1 s
 let is i64 as TIMEOUT_PORT_IDLE_NS =  500000000;      // 500 ms
 let is i64 as TIMEOUT_COMMAND_NS   = 30000000000;     // 30 s (ATA IDENTIFY can be slow)
+// An implemented port whose phy still reports no device this long after reset
+// is empty. A present device shows DET=1 within milliseconds of COMRESET; the
+// link may take the rest of TIMEOUT_LINK_NS to reach DET=3.
+let is i64 as LINK_DEBOUNCE_NS     =   50000000;      // 50 ms
+// Register polls spin this long before each further poll sleeps 1 ms.
+let is i64 as TIGHT_POLL_NS        =     100000;      // 100 us
+
+// PxSIG after the device's first D2H FIS (AHCI 1.3 §3.3.9, SATA signatures).
+let is i64 as SIG_ATA   = 0x00000101;   // a disk — the only kind this driver drives
+let is i64 as SIG_ATAPI = 0xEB140101;   // packet device: optical drive, the boot CD
+let is i64 as SIG_SEMB  = 0xC33C0101;   // enclosure bridge
+let is i64 as SIG_PM    = 0x96690101;   // port multiplier
 
 // Port register offsets (relative to port base = ABAR + 0x100 + port*0x80)
 let is i64 as PX_CLB  = 0x00;
@@ -63,6 +78,7 @@ let is i64 as PX_CI   = 0x38;
 
 // Port CMD bits
 let is i64 as CMD_ST  = 1;
+let is i64 as CMD_SUD = 2;           // spin-up device (staggered spin-up HBAs)
 let is i64 as CMD_FRE = 0x10;
 let is i64 as CMD_FR  = 0x4000;
 let is i64 as CMD_CR  = 0x8000;
@@ -116,6 +132,13 @@ struct AhciCtx {
     // held by the harvest path so it can read slot_requests_raw
     // + zero the entry without tearing against a fresh submit.
     port_lock as lock.TicketLock;
+    // A task-file error stops the port. Recovering it means waiting on the
+    // HBA for up to a second, which the interrupt path (where the error is
+    // seen) cannot do with interrupts off — so harvest only fails the
+    // orphaned requests and raises this, and the next submit, or an abort,
+    // runs the recovery from thread context under recover_lk.
+    recover_pending as i64;
+    recover_lk as mutex.Mutex;
     provider as io.BlockIOProvider;     // embedded; registered with io
     binding as *spec.Binding;           // kept so on_irq can find the provider
     storage_dev as storage.StorageDevice; // embedded; registered with storage
@@ -165,6 +188,30 @@ fn deadline_expired(deadline as i64) as i32 {
     return 0;
 }
 
+// One step of a register poll. Every wait here is bounded by an ns deadline,
+// but a bound of a second is a second of cpu if the loop spins it: an empty
+// port's link timeout, a slow IDENTIFY, a port stop. Spinning those starved
+// every thread below the probe's band — on one cpu the in-kernel smoke's user
+// thread sat a full second unscheduled while the AHCI probe polled. So: spin
+// TIGHT_POLL_NS for the common fast answer, then sleep 1 ms per poll. Where
+// sleeping is not allowed (interrupts off, a spinlock held, before the
+// scheduler) it stays a polite spin.
+fn may_sleep() as i64 {
+    if (sched.is_active() == 0) { return 0; }
+    if (lock.preempt_count() != 0) { return 0; }
+    if (lock.gs_load(0x70) != 0) { return 0; }
+    if (lock.interrupts_enabled() == 0) { return 0; }
+    return 1;
+}
+
+fn poll_pause(start as i64) as void {
+    if (timer.current_time_ns() - start >= TIGHT_POLL_NS && may_sleep() != 0) {
+        sched.sleep_for_ns(1000000);
+    } else {
+        asm(".byte 0xF3, 0x90\n");   // pause
+    }
+}
+
 // ============================================================
 // HBA reset — scrub any state left by firmware. GHC.HR self-clears
 // when the HBA is ready again; spec allows up to 1s.
@@ -173,9 +220,11 @@ fn deadline_expired(deadline as i64) as i32 {
 fn hba_reset(abar as *u8) as i32 {
     let is i64 as ghc = mmio_read32(abar, HBA_GHC);
     mmio_write32(abar, HBA_GHC, ghc | GHC_AE | GHC_HR);
+    let is i64 as t0 = timer.current_time_ns();
     let is i64 as dl = deadline_ns(TIMEOUT_HBA_RESET_NS);
     while (deadline_expired(dl) == 0) {
         if ((mmio_read32(abar, HBA_GHC) & GHC_HR) == 0) { return 0; }
+        poll_pause(t0);
     }
     return cast(i32, 0 - 1);
 }
@@ -190,16 +239,20 @@ fn hba_reset(abar as *u8) as i32 {
 fn port_stop(pb as *u8) as i32 {
     let is i64 as cmd with mut = mmio_read32(pb, PX_CMD);
     mmio_write32(pb, PX_CMD, cmd & (0 - 1 - CMD_ST));
+    let is i64 as t1 = timer.current_time_ns();
     let is i64 as dl1 with mut = deadline_ns(TIMEOUT_PORT_IDLE_NS);
     while (deadline_expired(dl1) == 0) {
         if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { dl1 = 0 - 1; }
+        else { poll_pause(t1); }
     }
     if ((mmio_read32(pb, PX_CMD) & CMD_CR) != 0) { return cast(i32, 0 - 1); }
     cmd = mmio_read32(pb, PX_CMD);
     mmio_write32(pb, PX_CMD, cmd & (0 - 1 - CMD_FRE));
+    let is i64 as t2 = timer.current_time_ns();
     let is i64 as dl2 with mut = deadline_ns(TIMEOUT_PORT_IDLE_NS);
     while (deadline_expired(dl2) == 0) {
         if ((mmio_read32(pb, PX_CMD) & CMD_FR) == 0) { dl2 = 0 - 1; }
+        else { poll_pause(t2); }
     }
     if ((mmio_read32(pb, PX_CMD) & CMD_FR) != 0) { return cast(i32, 0 - 1); }
     return 0;
@@ -207,9 +260,11 @@ fn port_stop(pb as *u8) as i32 {
 
 fn port_start(pb as *u8) as i32 {
     // Must have CR=0 (port not running) before setting FRE/ST.
+    let is i64 as t0 = timer.current_time_ns();
     let is i64 as dl with mut = deadline_ns(TIMEOUT_PORT_IDLE_NS);
     while (deadline_expired(dl) == 0) {
         if ((mmio_read32(pb, PX_CMD) & CMD_CR) == 0) { dl = 0 - 1; }
+        else { poll_pause(t0); }
     }
     if ((mmio_read32(pb, PX_CMD) & CMD_CR) != 0) { return cast(i32, 0 - 1); }
     let is i64 as cmd = mmio_read32(pb, PX_CMD);
@@ -224,11 +279,31 @@ fn port_wait_link(abar as *u8, port as i64) as i32 {
     let is i64 as pi = mmio_read32(abar, HBA_PI);
     if ((pi & (cast(i64, 1) << port)) == 0) { return cast(i32, 0 - 2); }
     let is *u8 as pb = port_base(abar, port);
+    let is i64 as t0 = timer.current_time_ns();
     let is i64 as dl = deadline_ns(TIMEOUT_LINK_NS);
     while (deadline_expired(dl) == 0) {
         if ((mmio_read32(pb, PX_SSTS) & 0xF) == 3) { return 0; }
+        poll_pause(t0);
     }
     return cast(i32, 0 - 1);
+}
+
+// COMRESET (AHCI §10.4.2): hold PxSCTL.DET=1 for at least 1 ms, release it,
+// and wait for the link to come back. What recovery needs when a device is
+// still BSY/DRQ after the port was stopped. Port must be stopped (ST=0).
+fn port_comreset(abar as *u8, port as i64) as i32 {
+    let is *u8 as pb = port_base(abar, port);
+    let is i64 as sctl = mmio_read32(pb, PX_SCTL);
+    mmio_write32(pb, PX_SCTL, (sctl & (0 - 1 - 0xF)) | 1);
+    let is i64 as hold = timer.current_time_ns() + 2000000;
+    while (timer.current_time_ns() < hold) {
+        if (may_sleep() != 0) { sched.sleep_for_ns(1000000); }
+        else { asm(".byte 0xF3, 0x90\n"); }
+    }
+    mmio_write32(pb, PX_SCTL, sctl & (0 - 1 - 0xF));
+    let is i32 as rc = port_wait_link(abar, port);
+    mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
+    return rc;
 }
 
 // Build IDENTIFY command table in slot 0's command-table area.
@@ -252,22 +327,26 @@ fn build_identify_ct(c as *AhciCtx) as void {
 
 // Wait until BSY + DRQ clear. Polling; AHCI irq not yet wired here.
 fn wait_ready(pb as *u8) as i32 {
+    let is i64 as t0 = timer.current_time_ns();
     let is i64 as dl = deadline_ns(TIMEOUT_PORT_IDLE_NS);
     while (deadline_expired(dl) == 0) {
         let is i64 as tfd = mmio_read32(pb, PX_TFD);
         if ((tfd & (TFD_BSY | TFD_DRQ)) == 0) { return 0; }
+        poll_pause(t0);
     }
     return cast(i32, 0 - 1);
 }
 
 fn wait_ci_clear(pb as *u8, slot as i64) as i32 {
     let is i64 as mask = cast(i64, 1) << slot;
+    let is i64 as t0 = timer.current_time_ns();
     let is i64 as dl = deadline_ns(TIMEOUT_COMMAND_NS);
     while (deadline_expired(dl) == 0) {
         let is i64 as ci = mmio_read32(pb, PX_CI);
         if ((ci & mask) == 0) { return 0; }
         let is i64 as tfd = mmio_read32(pb, PX_TFD);
         if ((tfd & TFD_ERR) != 0) { return cast(i32, 0 - 2); }
+        poll_pause(t0);
     }
     return cast(i32, 0 - 1);
 }
@@ -299,6 +378,101 @@ fn print_identify_model(id as *u8) as void {
         i = i + 2;
     }
     serial.println("", 0);
+}
+
+// ============================================================
+// Port discovery
+// ============================================================
+
+// PxSIG is loaded from the device's first D2H Register FIS, and the HBA only
+// takes FISes in while PxCMD.FRE is set (AHCI §10.1.2 sets FRE on every port
+// for exactly this). With FRE off the register still reads its reset value,
+// 0xFFFFFFFF. So: point the port's FIS area at the scratch buffer, enable FIS
+// receive, wait for BSY to clear (the same FIS clears it), read, and turn FIS
+// receive off again — the port that is kept is set up properly afterwards.
+fn read_signature(pb as *u8, fis_phys as i64) as i64 {
+    if (port_stop(pb) != 0) { return 0 - 1; }
+    mmio_write32(pb, PX_FB,  fis_phys & 0xFFFFFFFF);
+    mmio_write32(pb, PX_FBU, (fis_phys >> 32) & 0xFFFFFFFF);
+    mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
+    mmio_write32(pb, PX_CMD, mmio_read32(pb, PX_CMD) | CMD_FRE);
+    wait_ready(pb);
+    let is i64 as sig = mmio_read32(pb, PX_SIG);
+    port_stop(pb);
+    return sig;
+}
+
+// Bring up every implemented port's link at once and pick the first ATA
+// disk. It used to wait up to a second on each port in turn and take the
+// first one with ANY link — which on a machine booted from an optical drive
+// is the drive: IDENTIFY DEVICE aborts on a packet device (tfd 0x441), the
+// probe failed, and every boot logged an AHCI error. The signature says what
+// is attached before any command is sent; a packet device is somebody
+// else's to drive.
+fn pick_disk_port(abar as *u8, cap as i64, pi as i64, fis_phys as i64) as i64 {
+    // Staggered spin-up: such an HBA leaves each device spun down, and its
+    // link down, until software sets PxCMD.SUD.
+    let is i64 as p with mut = 0;
+    if ((cap & CAP_SSS) != 0) {
+        while (p < 32) {
+            if ((pi & (cast(i64, 1) << p)) != 0) {
+                let is *u8 as spb = port_base(abar, p);
+                mmio_write32(spb, PX_CMD, mmio_read32(spb, PX_CMD) | CMD_SUD);
+            }
+            p = p + 1;
+        }
+    }
+    // One wait for all ports: done when each is either up (DET=3) or has shown
+    // no device at all (DET=0) for LINK_DEBOUNCE_NS. A port mid-negotiation
+    // (DET=1) keeps the wait going, up to TIMEOUT_LINK_NS.
+    let is i64 as t0 = timer.current_time_ns();
+    let is i64 as settled with mut = 0;
+    while (settled == 0) {
+        let is i64 as now = timer.current_time_ns();
+        settled = 1;
+        p = 0;
+        while (p < 32) {
+            if ((pi & (cast(i64, 1) << p)) != 0) {
+                let is i64 as det = mmio_read32(port_base(abar, p), PX_SSTS) & 0xF;
+                if (det != 3) {
+                    if (det != 0 || now - t0 < LINK_DEBOUNCE_NS) { settled = 0; }
+                }
+            }
+            p = p + 1;
+        }
+        if (settled == 0) {
+            if (now - t0 >= TIMEOUT_LINK_NS) { settled = 1; }
+            else { poll_pause(t0); }
+        }
+    }
+    let is i64 as found with mut = cast(i64, 0 - 1);
+    p = 0;
+    while (p < 32) {
+        if ((pi & (cast(i64, 1) << p)) != 0) {
+            let is *u8 as pb = port_base(abar, p);
+            if ((mmio_read32(pb, PX_SSTS) & 0xF) == 3) {
+                let is i64 as sig = read_signature(pb, fis_phys);
+                serial.print("ahci: port ", 11);
+                util.print_num(p);
+                if (sig == SIG_ATA) {
+                    serial.println(": ATA disk", 10);
+                    if (found < 0) { found = p; }
+                } else if (sig == SIG_ATAPI) {
+                    serial.println(": packet device (optical) — not a disk, skipped", 49);
+                } else if (sig == SIG_SEMB) {
+                    serial.println(": enclosure bridge — skipped", 28);
+                } else if (sig == SIG_PM) {
+                    serial.println(": port multiplier — not supported, skipped", 43);
+                } else {
+                    serial.print(": unknown signature ", 20);
+                    util.print_hex(sig);
+                    serial.println(" — skipped", 12);
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return found;
 }
 
 // ============================================================
@@ -355,24 +529,14 @@ fn ahci_bind(b as *spec.Binding) as i32 {
         serial.println("ahci: 32-bit-only HBA (S64A=0)", 30);
     }
 
-    // Find first port with an implemented slot that has a live link.
-    // port_wait_link gives the phy up to TIMEOUT_LINK_NS to come up.
-    let is i64 as port with mut = cast(i64, 0 - 1);
-    let is i64 as pp with mut = 0;
-    while (pp < 32) {
-        if ((pi & (cast(i64, 1) << pp)) != 0) {
-            if (port_wait_link(abar, pp) == 0) {
-                port = pp;
-                pp = 32;
-            } else {
-                pp = pp + 1;
-            }
-        } else {
-            pp = pp + 1;
-        }
-    }
+    // The received-FIS area comes first: classifying a port means turning on
+    // its FIS receive, and that needs somewhere for the FIS to land.
+    let is i32 as rcf = driver.dma_alloc(b.hardware, cast(u64, 256), cast(u64, 256),
+                                          cast(u32, 1), &ctx.fis_base);
+    if (rcf != driver.OK) { serial.println("ahci: fis alloc fail", 20); return rcf; }
+    let is i64 as port = pick_disk_port(abar, cap, pi, ctx.fis_base.phys);
     if (port < 0) {
-        serial.println("ahci: no device linked on any port", 34);
+        serial.println("ahci: no ATA disk on any port", 29);
         return 0;
     }
     ctx.port = port;
@@ -408,9 +572,6 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     let is i32 as rc1 = driver.dma_alloc(b.hardware, cast(u64, 1024), cast(u64, 1024),
                                           cast(u32, 1), &ctx.cmd_list);
     if (rc1 != driver.OK) { serial.println("ahci: cmd_list alloc fail", 25); return rc1; }
-    let is i32 as rc2 = driver.dma_alloc(b.hardware, cast(u64, 256), cast(u64, 256),
-                                          cast(u32, 1), &ctx.fis_base);
-    if (rc2 != driver.OK) { serial.println("ahci: fis alloc fail", 20); return rc2; }
     let is u64 as ct_total = cast(u64, ctx.ncs) * cast(u64, 1024);
     let is i32 as rc3 = driver.dma_alloc(b.hardware, ct_total, cast(u64, 128),
                                           cast(u32, 1), &ctx.cmd_tables);
@@ -511,6 +672,9 @@ fn ahci_bind(b as *spec.Binding) as i32 {
     ctx.provider.device      = b.hardware;
     ctx.provider.submit_io   = fn_ptr(ahci_submit);
     ctx.provider.harvest_io  = fn_ptr(ahci_harvest);
+    ctx.provider.abort_io    = fn_ptr(ahci_abort);
+    ctx.recover_pending      = 0;
+    mutex.name(&ctx.recover_lk, "ahci.recover", 12);
     ctx.provider.private     = cast(*u8, &ctx);
     ctx.provider.pending_head = cast(*io.BlockRequest, 0);
     ctx.provider.pending_count = 0;
@@ -534,11 +698,11 @@ fn ahci_bind(b as *spec.Binding) as i32 {
         return cast(i32, 0 - 7);
     }
 
-    // End-to-end self-test: write pattern / flush / read / verify.
-    // Exercises all three op kinds (OP_WRITE/OP_FLUSH/OP_READ), the
-    // PRDT/no-PRDT command table variants, and the race-free
-    // wait_complete path.
-    self_test_io(&ctx);
+    // End-to-end self-test: write pattern / flush / read / verify. It WRITES
+    // to the disk, so it runs only under the `selftest` command line — on
+    // every boot it used to scribble on LBA 100 of whatever disk was attached,
+    // which on these FAT32 volumes is inside the first FAT.
+    if (cmdline.selftest() != 0) { self_test_io(&ctx); }
     ctx_bound = 1;
     return driver.OK;
 }
@@ -647,6 +811,9 @@ fn slot_request_set(c as *AhciCtx, slot as i64, r as *io.BlockRequest) as void {
 fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
     let is *AhciCtx as c = cast(*AhciCtx, p.private);
     let is *u8 as pb = port_base(c.abar, c.port);
+    // A task-file error stopped the port since the last command: restart it
+    // before handing it another (see recover_pending).
+    if (c.recover_pending != 0 && may_sleep() != 0) { recover_port(c); }
 
     let is i64 as is_write with mut = 0;
     let is i64 as is_data with mut = 0;
@@ -739,29 +906,87 @@ fn ahci_submit(p as *io.BlockIOProvider, r as *io.BlockRequest) as i32 {
     return 0;
 }
 
-// Per-port error recovery when TFES fires. AHCI §6.2.2.1: after a
-// task-file error the port stops accepting commands; all outstanding
-// slots are orphaned and must be drained. Spec-required recovery:
-//   1. Clear PxCMD.ST and wait for CR=0 (port_stop handles this).
-//   2. Write-1-clear PxSERR so the error bit doesn't re-trigger.
-//   3. Re-enable CMD.FRE and CMD.ST (port_start).
-// Remaining slots (CI bits that are still set) are reported with an
-// error status to their waiters — they will never complete naturally
-// because the HBA dropped them when the error occurred. port_stop /
-// port_start are time-bound (500ms each) so total recovery latency is
-// ≤ ~1s even if one side misbehaves. If the restart itself fails we
-// log and leave the port stopped; future submits will get DEVICE_BUSY
-// until a driver-level reset is wired in.
-fn recover_tfes(c as *AhciCtx, pb as *u8) as void {
-    serial.println("ahci: TFES — port recovery", 28);
-    if (port_stop(pb) != 0) {
-        serial.println("ahci: recovery port_stop timeout", 32);
+// Per-port error recovery, AHCI §6.2.2.1. After a task-file error the port
+// stops processing commands; every outstanding slot is orphaned (harvest has
+// already failed them). Recovery: stop the port (ST=0, wait CR=0), clear
+// PxSERR/PxIS, COMRESET if the device is still BSY or DRQ, start it again.
+// Thread context only — each step waits on the HBA for up to a second.
+fn recover_port(c as *AhciCtx) as i32 {
+    mutex.acquire(&c.recover_lk);
+    let is *u8 as pb = port_base(c.abar, c.port);
+    let is i32 as rc with mut = 0;
+    if (c.recover_pending != 0 || (mmio_read32(pb, PX_CMD) & CMD_ST) == 0
+        || (mmio_read32(pb, PX_TFD) & TFD_ERR) != 0) {
+        serial.println("ahci: port recovery", 19);
+        if (port_stop(pb) != 0) {
+            serial.println("ahci: recovery: port did not stop — COMRESET", 46);
+        }
+        mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
+        mmio_write32(pb, PX_IS,   cast(i64, 0 - 1));
+        let is i64 as tfd = mmio_read32(pb, PX_TFD);
+        if ((tfd & (TFD_BSY | TFD_DRQ)) != 0 || (mmio_read32(pb, PX_CMD) & CMD_CR) != 0) {
+            if (port_comreset(c.abar, c.port) != 0) {
+                serial.println("ahci: recovery: no link after COMRESET", 38);
+                rc = cast(i32, 0 - 1);
+            }
+            port_stop(pb);
+        }
+        if (rc == 0 && port_start(pb) != 0) {
+            serial.println("ahci: recovery: port_start failed", 33);
+            rc = cast(i32, 0 - 1);
+        }
+        c.recover_pending = 0;
+    }
+    mutex.release(&c.recover_lk);
+    return rc;
+}
+
+// io.BlockIOProvider.abort_io: a request has outlived STALL_NS. Stop the
+// port — once CR reads 0 the HBA has dropped every command and no DMA is in
+// flight — fail everything outstanding, and bring the port back. Nonzero if
+// the port would not stop even after a COMRESET: then DMA may still land, and
+// io marks the device dead rather than free a buffer it could write into.
+fn ahci_abort(p as *io.BlockIOProvider) as i32 {
+    let is *AhciCtx as c = cast(*AhciCtx, p.private);
+    let is *u8 as pb = port_base(c.abar, c.port);
+    mutex.acquire(&c.recover_lk);
+    serial.println("ahci: abort — stopping the port", 33);
+    let is i32 as stopped with mut = port_stop(pb);
+    if (stopped != 0) {
+        port_comreset(c.abar, c.port);
+        stopped = port_stop(pb);
+    }
+    if (stopped != 0) {
+        mutex.release(&c.recover_lk);
+        return cast(i32, 0 - 1);
+    }
+    // No command is running any more: hand every slot back as failed.
+    let is i64 as pflags = lock.acquire_irq(&c.port_lock);
+    let is [32]i64 as failed;
+    let is i64 as nf with mut = 0;
+    let is i64 as slot with mut = 0;
+    while (slot < c.ncs) {
+        let is *io.BlockRequest as r = slot_request_get(c, slot);
+        if (cast(i64, r) != 0) {
+            slot_request_set(c, slot, cast(*io.BlockRequest, 0));
+            failed[nf] = cast(i64, r);
+            nf = nf + 1;
+        }
+        slot = slot + 1;
+    }
+    lock.release_irq(&c.port_lock, pflags);
+    let is i64 as k with mut = 0;
+    while (k < nf) {
+        io.fail_request(p, cast(*io.BlockRequest, failed[k]));
+        k = k + 1;
     }
     mmio_write32(pb, PX_SERR, cast(i64, 0 - 1));
     mmio_write32(pb, PX_IS,   cast(i64, 0 - 1));
-    if (port_start(pb) != 0) {
-        serial.println("ahci: recovery port_start failed", 32);
-    }
+    c.recover_pending = 0;
+    let is i32 as src = port_start(pb);
+    mutex.release(&c.recover_lk);
+    if (src != 0) { serial.println("ahci: abort: port did not restart", 33); }
+    return 0;
 }
 
 fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
@@ -801,23 +1026,10 @@ fn ahci_harvest(p as *io.BlockIOProvider, out as **io.BlockRequest) as i32 {
             if (return_this == 1) {
                 slot_request_set(c, slot, cast(*io.BlockRequest, 0));
                 *out = r;
-                // If this was the last error-triggered completion to
-                // drain, do the port restart now so the next submit
-                // finds a live port. We detect "last" by re-scanning
-                // after clearing the slot; if nothing else pending,
-                // recover. This keeps recovery latency paid once.
                 if (has_err == 1) {
-                    let is i64 as scan with mut = 0;
-                    let is i32 as any_left with mut = 0;
-                    while (scan < c.ncs) {
-                        if (cast(i64, slot_request_get(c, scan)) != 0) {
-                            any_left = 1;
-                            scan = c.ncs;
-                        } else {
-                            scan = scan + 1;
-                        }
-                    }
-                    if (any_left == 0) { recover_tfes(c, pb); }
+                    // Recovery waits on the HBA; it is not for an interrupt
+                    // handler with interrupts off. The next submit runs it.
+                    c.recover_pending = 1;
                 }
                 lock.release_irq(&c.port_lock, pflags);
                 return 1;
@@ -856,14 +1068,10 @@ fn ahci_irq(hw as *driver.Hardware, context as *u8) as i32 {
 }
 
 // ============================================================
-// Post-IDENTIFY self-test: write known pattern, flush, read back,
-// verify. Exercises submit/harvest/wait_complete for all three op
-// kinds (OP_WRITE, OP_FLUSH, OP_READ) and the AHCI FIS builders.
-//
-// Uses LBA 100 so we don't stomp on anything a real disk image would
-// keep at LBA 0 (MBR / GPT header). For the 1MB build/disk.img this
-// is well inside bounds; callers pointing at a different image with
-// less than ~52KB should tune the LBA.
+// Post-IDENTIFY self-test (`selftest` command line only): write known
+// pattern, flush, read back, verify, then restore the sector's original
+// bytes. Exercises submit/harvest/wait_complete for all three op kinds
+// (OP_WRITE, OP_FLUSH, OP_READ) and the AHCI FIS builders.
 // ============================================================
 
 fn self_test_io(c as *AhciCtx) as void {
@@ -897,23 +1105,42 @@ fn self_test_io(c as *AhciCtx) as void {
         i = i + 1;
     }
 
+    // Keep what is there, and put it back afterwards: the scratch disks the
+    // suites boot are FAT32 volumes, and LBA 100 lies inside the first FAT.
+    let is *driver.DmaBuffer as sbuf;
+    let is i32 as rc3 = driver.dma_alloc(c.binding.hardware, cast(u64, SECTOR),
+                                          cast(u64, 2), cast(u32, 1), &sbuf);
+    if (rc3 != driver.OK) {
+        driver.dma_free(c.binding.hardware, wbuf);
+        driver.dma_free(c.binding.hardware, rbuf);
+        return;
+    }
+    let is *u8 as sp = cast(*u8, sbuf.virt);
+    if (io.read_sync(c.binding.hardware, c.port, TEST_LBA, 1, sp) != 0) {
+        serial.println("ahci.self_test: cannot read LBA 100 to preserve it — skipped", 61);
+        driver.dma_free(c.binding.hardware, sbuf);
+        driver.dma_free(c.binding.hardware, wbuf);
+        driver.dma_free(c.binding.hardware, rbuf);
+        return;
+    }
+
     let is i32 as wrc = io.write_sync(c.binding.hardware, c.port, TEST_LBA, 1, wp);
     serial.print("ahci.self_test: write LBA 100 status=", 37);
     util.print_num(cast(i64, wrc));
     serial.println("", 0);
-    if (wrc != 0) { driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
+    if (wrc != 0) { driver.dma_free(c.binding.hardware, sbuf); driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
 
     let is i32 as frc = io.flush_sync(c.binding.hardware, c.port);
     serial.print("ahci.self_test: flush status=", 29);
     util.print_num(cast(i64, frc));
     serial.println("", 0);
-    if (frc != 0) { driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
+    if (frc != 0) { io.write_sync(c.binding.hardware, c.port, TEST_LBA, 1, sp); driver.dma_free(c.binding.hardware, sbuf); driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
 
     let is i32 as rrc = io.read_sync(c.binding.hardware, c.port, TEST_LBA, 1, rp);
     serial.print("ahci.self_test: read LBA 100 status=", 36);
     util.print_num(cast(i64, rrc));
     serial.println("", 0);
-    if (rrc != 0) { driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
+    if (rrc != 0) { io.write_sync(c.binding.hardware, c.port, TEST_LBA, 1, sp); driver.dma_free(c.binding.hardware, sbuf); driver.dma_free(c.binding.hardware, wbuf); driver.dma_free(c.binding.hardware, rbuf); return; }
 
     // Verify byte-for-byte.
     let is i64 as mismatches with mut = 0;
@@ -936,6 +1163,11 @@ fn self_test_io(c as *AhciCtx) as void {
         serial.println("", 0);
     }
 
+    let is i32 as prc = io.write_sync(c.binding.hardware, c.port, TEST_LBA, 1, sp);
+    io.flush_sync(c.binding.hardware, c.port);
+    if (prc != 0) { serial.println("ahci.self_test: FAILED TO RESTORE LBA 100", 41); }
+
+    driver.dma_free(c.binding.hardware, sbuf);
     driver.dma_free(c.binding.hardware, wbuf);
     driver.dma_free(c.binding.hardware, rbuf);
 }
