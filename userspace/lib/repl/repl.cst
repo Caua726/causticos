@@ -29,12 +29,24 @@ struct Repl {
     ksize as i64;              // kill ring: entries stored
     knav as i64;               // how far back the last yank reached
     above as i64;              // cells of the line above the top row, past the cursor (see _goto)
+    shown_len as i64;          // what is on screen from the line's start: its length...
+    shown_cur as i64;          // ...and where the cursor is in it
+    srch as i64;               // 1 = a Ctrl+R search is running
+    sqlen as i64;              // bytes in `sq`
+    shit as i64;               // history age (1 = newest) of the line found, 0 = none
+    sfail as i64;              // 1 = the query is in no line from there back
+    sllen as i64;              // the line as it was when the search began
+    slcur as i64;
     hlen as [16]i64;
     hbuf as [4096]u8;          // HIST_N * LINE_CAP
     line as [256]u8;
     klen as [8]i64;
     kbuf as [2048]u8;          // KILL_N * LINE_CAP
+    sq as [64]u8;              // the search query
+    sline as [256]u8;
 }
+
+let is i64 as SQ_CAP with imut = 64;
 
 let is i64 as KILL_N with imut = 8;
 
@@ -43,6 +55,8 @@ fn init(r as *Repl) as void {
     r.npush = 0; r.npush_load = 0;
     r.khead = 0; r.ksize = 0; r.knav = 0;
     r.above = 0;
+    r.shown_len = 0; r.shown_cur = 0;
+    r.srch = 0; r.sqlen = 0; r.shit = 0; r.sfail = 0; r.sllen = 0; r.slcur = 0;
     let is i64 as i with mut = 0;
     while (i < HIST_N) { r.hlen[i] = 0; i = i + 1; }
     i = 0;
@@ -52,7 +66,14 @@ fn init(r as *Repl) as void {
 
 fn line_ptr(r as *Repl) as *u8 { return cast(*u8, &r.line[0]); }
 fn line_len(r as *Repl) as i64 { return r.llen; }
-fn line_clear(r as *Repl) as void { r.llen = 0; r.cur = 0; r.hnav = 0; r.knav = 0; r.above = 0; return; }
+// A fresh line, after the caller has put up a new prompt: nothing of it is on
+// screen yet.
+fn line_clear(r as *Repl) as void {
+    r.llen = 0; r.cur = 0; r.hnav = 0; r.knav = 0; r.above = 0;
+    r.shown_len = 0; r.shown_cur = 0;
+    r.srch = 0;
+    return;
+}
 
 // ---- editing ---------------------------------------------------------------
 //
@@ -128,16 +149,29 @@ fn _goto(r as *Repl, t as *term.Term, to as i64) as void {
     return;
 }
 
-fn redraw(r as *Repl, t as *term.Term, prev_len as i64, prev_cur as i64) as void {
-    let is i64 as start = _here(r, t) - prev_cur;          // where offset 0 is
+// _paint — make the screen show buf[0..len] from the line's start, with the
+// cursor at `cur` in it, over whatever was shown there before.
+fn _paint(r as *Repl, t as *term.Term, buf as *u8, len as i64, cur as i64) as void {
+    let is i64 as start = _here(r, t) - r.shown_cur;       // where offset 0 is
     let is i64 as first with mut = 0;                       // first offset on screen
     if (start < 0) { first = 0 - start; }
     _goto(r, t, start + first);
     let is i64 as pos with mut = first;
-    while (pos < r.llen) { term.putc(t, cast(i64, r.line[pos])); pos = pos + 1; }
-    // Blank whatever the line used to be longer by.
-    while (pos < prev_len) { term.putc(t, 0x20); pos = pos + 1; }
-    _goto(r, t, _here(r, t) - (pos - r.cur));
+    while (pos < len) { term.putc(t, cast(i64, buf[pos])); pos = pos + 1; }
+    // Blank whatever was shown longer than this.
+    while (pos < r.shown_len) { term.putc(t, 0x20); pos = pos + 1; }
+    _goto(r, t, _here(r, t) - (pos - cur));
+    r.shown_len = len;
+    r.shown_cur = cur;
+    return;
+}
+
+// redraw — the screen brought in step with the line after an edit. The repl
+// keeps what it last put there (shown_len/shown_cur), so callers do not have
+// to remember what the line was before they changed it.
+fn redraw(r as *Repl, t as *term.Term) as void {
+    if (r.srch == 1) { _paint_search(r, t); return; }
+    _paint(r, t, cast(*u8, &r.line[0]), r.llen, r.cur);
     return;
 }
 
@@ -147,9 +181,10 @@ fn redraw(r as *Repl, t as *term.Term, prev_len as i64, prev_cur as i64) as void
 // that ends exactly at the right edge has already wrapped, and a newline on top
 // of that would leave an empty row.
 fn finish(r as *Repl, t as *term.Term) as void {
-    _goto(r, t, _here(r, t) + (r.llen - r.cur));
+    _goto(r, t, _here(r, t) + (r.shown_len - r.shown_cur));
     _park(r, t, 0);
-    if (t.cx != 0 || r.llen == 0) { term.putc(t, 0x0A); }
+    if (t.cx != 0 || r.shown_len == 0) { term.putc(t, 0x0A); }
+    r.shown_len = 0; r.shown_cur = 0;
     return;
 }
 
@@ -157,7 +192,149 @@ fn finish(r as *Repl, t as *term.Term) as void {
 // cursor where it was in it.
 fn reprint(r as *Repl, t as *term.Term) as void {
     _park(r, t, 0);
-    redraw(r, t, 0, 0);
+    r.shown_len = 0; r.shown_cur = 0;
+    redraw(r, t);
+    return;
+}
+
+// ---- reverse search (Ctrl+R) -------------------------------------------------
+//
+// Ctrl+R looks back through the history for the newest line that contains what
+// is typed after it, and Ctrl+R again looks further back. While it runs, the
+// line reads
+//     (reverse-i-search)`query': the line found
+// Enter runs the line found, Escape or Ctrl+G puts back the line there was
+// before, and any other key keeps the line found and is then taken as usual.
+// The line found is the edit buffer itself, so "keep" is just stopping.
+
+fn searching(r as *Repl) as i64 { return r.srch; }
+
+// Where needle[0..nl] first occurs in hay[0..hl], or -1.
+fn _index_of(hay as *u8, hl as i64, needle as *u8, nl as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i + nl <= hl) {
+        let is i64 as k with mut = 0;
+        while (k < nl && hay[i + k] == needle[k]) { k = k + 1; }
+        if (k == nl) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The age (1 = newest) of the newest history line, `from` or older, holding
+// the query; 0 if none does.
+fn _find(r as *Repl, from as i64) as i64 {
+    let is i64 as k with mut = from;
+    if (k < 1) { k = 1; }
+    while (k <= r.hsize) {
+        let is i64 as slot = slot_of(r, k);
+        if (slot >= 0 && _index_of(hist_ptr(r, slot), r.hlen[slot],
+                                   cast(*u8, &r.sq[0]), r.sqlen) >= 0) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The history line of age k becomes the line, the cursor on the match.
+fn _take(r as *Repl, k as i64) as void {
+    let is i64 as slot = slot_of(r, k);
+    if (slot < 0) { return; }
+    let is *u8 as h = hist_ptr(r, slot);
+    let is i64 as n = r.hlen[slot];
+    let is i64 as i with mut = 0;
+    while (i < n && i < LINE_CAP - 1) { r.line[i] = h[i]; i = i + 1; }
+    r.llen = i;
+    r.cur = _index_of(cast(*u8, &r.line[0]), r.llen, cast(*u8, &r.sq[0]), r.sqlen);
+    if (r.cur < 0) { r.cur = r.llen; }
+    r.shit = k;
+    r.sfail = 0;
+    return;
+}
+
+fn _restore(r as *Repl) as void {
+    let is i64 as i with mut = 0;
+    while (i < r.sllen) { r.line[i] = r.sline[i]; i = i + 1; }
+    r.llen = r.sllen;
+    r.cur = r.slcur;
+    return;
+}
+
+// The query changed: the newest line from `from` back that has it. When none
+// does, the line found so far stays and the search says it failed.
+fn _research(r as *Repl, from as i64) as void {
+    if (r.sqlen == 0) { _restore(r); r.shit = 0; r.sfail = 0; return; }
+    let is i64 as k = _find(r, from);
+    if (k > 0) { _take(r, k); } else { r.sfail = 1; }
+    return;
+}
+
+fn _paint_search(r as *Repl, t as *term.Term) as void {
+    let is [400]u8 as d;
+    let is i64 as n with mut = 0;
+    let is *u8 as pre with mut = "(reverse-i-search)`";
+    if (r.sfail == 1) { pre = "(failed reverse-i-search)`"; }
+    let is i64 as i with mut = 0;
+    while (pre[i] != 0) { d[n] = pre[i]; n = n + 1; i = i + 1; }
+    i = 0;
+    while (i < r.sqlen) { d[n] = r.sq[i]; n = n + 1; i = i + 1; }
+    d[n] = cast(u8, 39); d[n + 1] = cast(u8, 58); d[n + 2] = cast(u8, 32);   // "': "
+    n = n + 3;
+    let is i64 as at = n;
+    i = 0;
+    while (i < r.llen) { d[n] = r.line[i]; n = n + 1; i = i + 1; }
+    _paint(r, t, cast(*u8, &d[0]), n, at + r.cur);
+    return;
+}
+
+// search_next — Ctrl+R: start a search, or look further back for the query.
+fn search_next(r as *Repl, t as *term.Term) as void {
+    if (r.srch == 0) {
+        let is i64 as i with mut = 0;
+        while (i < r.llen) { r.sline[i] = r.line[i]; i = i + 1; }
+        r.sllen = r.llen;
+        r.slcur = r.cur;
+        r.srch = 1;
+        r.sqlen = 0;
+        r.shit = 0;
+        r.sfail = 0;
+        redraw(r, t);
+        return;
+    }
+    if (r.sqlen == 0) { return; }
+    let is i64 as k = _find(r, r.shit + 1);
+    if (k > 0) { _take(r, k); } else { r.sfail = 1; }
+    redraw(r, t);
+    return;
+}
+
+// search_key — a typed character narrows the query. The line found so far is
+// looked at first: it may still match.
+fn search_key(r as *Repl, t as *term.Term, c as i64) as void {
+    if (r.sqlen >= SQ_CAP) { return; }
+    r.sq[r.sqlen] = cast(u8, c);
+    r.sqlen = r.sqlen + 1;
+    _research(r, r.shit);
+    redraw(r, t);
+    return;
+}
+
+// search_back — Backspace shortens the query and looks again from the newest.
+fn search_back(r as *Repl, t as *term.Term) as void {
+    if (r.sqlen == 0) { return; }
+    r.sqlen = r.sqlen - 1;
+    _research(r, 1);
+    redraw(r, t);
+    return;
+}
+
+// search_end — stop searching: keep = 1 keeps the line found (and Up goes on
+// from it), 0 puts back the line from before the search.
+fn search_end(r as *Repl, t as *term.Term, keep as i64) as void {
+    if (r.srch == 0) { return; }
+    r.srch = 0;
+    if (keep == 0) { _restore(r); r.hnav = 0; }
+    else { r.hnav = r.shit; }
+    redraw(r, t);
     return;
 }
 
@@ -197,7 +374,7 @@ fn line_delete(r as *Repl) as i64 {
 // cancel — Ctrl+C at the prompt: the line is dropped, not run and not kept in
 // the history, with ^C left where it ended; the caller starts a fresh prompt.
 fn cancel(r as *Repl, t as *term.Term) as void {
-    _goto(r, t, _here(r, t) + (r.llen - r.cur));
+    _goto(r, t, _here(r, t) + (r.shown_len - r.shown_cur));
     _park(r, t, 0);
     term.putc(t, 0x5E); term.putc(t, 0x43);        // ^C
     term.putc(t, 0x0A);
@@ -340,13 +517,11 @@ fn hist_push(r as *Repl, src as *u8, len as i64) as void {
 // recall — replace what is on screen with src[0..srclen]: rub out the typed
 // characters, then echo the recalled ones. The caller flushes.
 fn recall(r as *Repl, t as *term.Term, src as *u8, srclen as i64) as void {
-    let is i64 as prev_len = r.llen;
-    let is i64 as prev_cur = r.cur;
     let is i64 as i with mut = 0;
     while (i < srclen && i < LINE_CAP - 1) { r.line[i] = src[i]; i = i + 1; }
     r.llen = i;
     r.cur = i;                       // a recalled line is ready to be extended
-    redraw(r, t, prev_len, prev_cur);
+    redraw(r, t);
     return;
 }
 
@@ -671,14 +846,12 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
     }
     if (nmatch == 0) { return; }
 
-    let is i64 as prev_len = r.llen;
-    let is i64 as prev_cur = r.cur;
     let is i64 as i with mut = plen;
     while (i < acclen) {
         if (line_push(r, cast(i64, acc[i])) == 0) { i = acclen; }
         else { i = i + 1; }
     }
     if (nmatch == 1) { line_push(r, 32); }               // sole match -> trailing space
-    redraw(r, t, prev_len, prev_cur);
+    redraw(r, t);
     return;
 }
