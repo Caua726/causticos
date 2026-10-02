@@ -135,13 +135,14 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 304  aspace_ptr       i64   (*vma.Aspace; 0 for kernel threads)
 // 312  kstack_va        i64   (guarded kvmap VA — kvunmap'd by the reaper)
 // 320  io_buf           i64   (lazy 4 KiB syscall-I/O staging — kfree'd by the reaper)
-// 328  kill_pending     i64   (SYS_PROC_KILL marked this thread; the scheduler
-//                              never resumes it again — see kill_finalize)
+// 328  kill_pending     i64   (the process is terminating: leave at the next
+//                              user boundary — see kill_kick)
 // 336  initial_rdi      i64   (ring-3 rdi of a SYS_THREAD_SPAWN worker)
 // 344  poll_parked      i64   (1 while parked in poll_park_seq)
 // 352  wait_next        i64   (mutex wait queue link: next waiter tid + 1)
 // 360  wait_granted     i64   (1 once a mutex release handed this thread the lock)
-// 368  reserved         16 bytes
+// 368  intr_sleep       i64   (1 while in a sleep a kill may cut short)
+// 376  reserved         8 bytes
 // Total: 384
 
 let is i64 as THREAD_SIZE = 384;
@@ -152,6 +153,8 @@ let is i64 as THREAD_SIZE = 384;
 let is i64 as THR_INITIAL_RDI  = 336;
 let is i64 as THR_WAIT_NEXT    = 352;
 let is i64 as THR_WAIT_GRANTED = 360;
+let is i64 as THR_KILL         = 328;
+let is i64 as THR_INTR_SLEEP   = 368;
 // Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
 // Created lazily on first use under heap_lock (SMP-safe), so there is no
 // init-order dependency between sched.init and per_cpu_init / AP bring-up.
@@ -386,55 +389,54 @@ fn thr_user_rsp(tid as i64) as i64      { return thr_get(tid, 296); }
 // at create time, before the thread becomes runnable. 0 for kernel threads.
 fn thr_aspace_ptr(tid as i64) as i64    { return thr_get(tid, 304); }
 
-// ---- SYS_PROC_KILL support (the sched-side half) ----
-// Marking is one store; the scheduler reacts in two places: a preempted
-// RUNNING thread is parked SUSPENDED instead of re-queued, and a marked
-// thread surfacing from pick_next is unqueued+parked instead of resumed.
-// Either way it never executes again; kill_finalize then moves the parked
-// corpse to the reaper. The killer (syshandlers.sys_proc_kill) owns the
-// process-side teardown (zombify + fd drain) — done BEFORE finalize, while
-// the thread is provably off-cpu and barred from returning.
-fn thr_mark_kill(tid as i64) as void    { thr_set(tid, 328, 1); }
+// ---- Termination (the sched-side half) ----
+// A thread is never stopped where it stands. Stopping one mid-syscall leaves
+// whatever it holds held forever — the Ctrl+C freeze was exactly that: a writer
+// parked inside fat32 with the file system lock, and every later file operation
+// on the machine spinning behind it. Termination is a REQUEST instead: the
+// flag below, honoured by the thread itself at the next point where it holds
+// nothing — on its way back to ring 3 (syscall return, interrupt return), or
+// out of an interruptible sleep, which hands the syscall an E_INTR to unwind
+// with. lifecycle.cst owns what happens at that point.
+fn thr_kill_pending(tid as i64) as i64  { return thr_get(tid, THR_KILL); }
+fn kill_requested() as i64 {
+    let is i64 as tid = current_tid();
+    if (tid < 0) { return 0; }
+    return thr_get(tid, THR_KILL);
+}
 fn thr_is_running(tid as i64) as i64 {
     if (thr_state(tid) == THREAD_RUNNING) { return 1; }
     return 0;
 }
 
-// Finalize a marked thread once it is off-cpu: detach it from whatever
-// scheduler structure still references it and queue it for the deferred
-// reaper. Returns 0 = finalized now, 1 = it had already died on its own
-// (THREAD_DEAD), -1 = still RUNNING (caller retries).
-fn kill_finalize(tid as i64) as i64 {
+// Mark `tid` for termination and make sure it gets to a boundary promptly:
+//   SUSPENDED (created, never started) → started, so its trampoline sees the flag
+//   SLEEPING interruptibly             → woken; the sleep returns "killed"
+//   RUNNING on another cpu             → an interrupt, whose return to ring 3
+//                                        checks the flag (a pure user spin has
+//                                        no other way out)
+//   RUNNABLE, or RUNNING right here    → nothing; it reaches a boundary itself
+// The state is read under the thread's run-queue lock — the lock its own sleep
+// takes to check the flag — so a sleeper either saw the flag and did not sleep,
+// or is SLEEPING with intr_sleep set by the time we look.
+fn kill_kick(tid as i64) as void {
+    if (thread_ptr(tid) == 0) { return; }
+    thr_set(tid, THR_KILL, 1);
     let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as fl = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
     let is i64 as st = thr_state(tid);
-    if (st == THREAD_RUNNING) {
-        lock.release_irq(sched_lock_ptr(cpu), fl);
-        return 0 - 1;
+    let is i64 as intr = thr_get(tid, THR_INTR_SLEEP);
+    let is i64 as lapic_id with mut = 0 - 1;
+    if (st == THREAD_RUNNING && cpu != this_cpu()) {
+        let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
+        if (cast(i64, pc) != 0) { lapic_id = pc.lapic_id; }
     }
-    if (st == THREAD_DEAD) {
-        lock.release_irq(sched_lock_ptr(cpu), fl);
-        return 1;
-    }
-    if (st == THREAD_SLEEPING) {
-        if (thr_get(tid, 272) > 0) {
-            thr_set(tid, 272, 0);
-            timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
-        }
-    }
-    if (st == THREAD_RUNNABLE) {
-        // runnable ⇔ sitting in a run structure: pull it out
-        if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dl_remove(cpu, tid); }
-        if (thr_class(tid) == SCHED_CLASS_QOS) { runlist_remove(cpu, thr_band(tid), tid); }
-        set_nr_running(cpu, nr_running(cpu) - 1);
-    }
-    // SUSPENDED: schedule() already detached + uncounted it
-    thr_set(tid, 8, THREAD_DEAD);
-    thr_set(tid, 96, cpu_reap_head(cpu));
-    set_cpu_reap_head(cpu, tid);
-    lock.release_irq(sched_lock_ptr(cpu), fl);
-    return 0;
+    lock.release_irq(sched_lock_ptr(cpu), f);
+    if (st == THREAD_SUSPENDED) { make_runnable(tid); return; }
+    if (st == THREAD_SLEEPING && intr != 0) { wakeup_thread(tid); return; }
+    if (lapic_id >= 0) { lapic.send_resched_ipi_to(lapic_id); }
 }
+
 // *process.Process owning this thread (as i64; 0 for kernel threads).
 // The thread is execution; the Process is isolation/identity/lineage.
 fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
@@ -457,36 +459,6 @@ fn process_has_live_thread(proc_ptr as i64) as i64 {
         tid = tid + 1;
     }
     return 0;
-}
-
-// Terminate every live thread of `proc_ptr` except `except_tid` (-1 = none
-// spared). Marks each, waits it off-cpu (the 1ms tick preempts even a pure
-// user spin, and the scheduler parks marked threads), then finalizes it to
-// the deferred reaper. Shared by whole-process exit (except = the caller) and
-// SYS_PROC_KILL of a multi-thread child (except = -1). Runs from syscall
-// context (it sleeps), never from an IRQ.
-fn kill_process_threads(proc_ptr as i64, except_tid as i64) as void {
-    let is i64 as tid with mut = 0;
-    while (tid < next_tid) {
-        if (tid != except_tid && thread_ptr(tid) != 0
-            && thr_process_ptr(tid) == proc_ptr && thr_state(tid) != THREAD_DEAD) {
-            thr_mark_kill(tid);
-            let is i64 as deadline = timer.current_time_ns() + 2000000000;
-            let is i64 as waiting with mut = 1;
-            while (waiting == 1) {
-                if (thr_is_running(tid) == 0) { waiting = 0; }
-                else if (timer.current_time_ns() >= deadline) { waiting = 0; }
-                else { sleep_for_ns(1000000); }
-            }
-            let is i64 as tries with mut = 0;
-            while (tries < 2000) {
-                let is i64 as rc = kill_finalize(tid);
-                if (rc >= 0) { tries = 2000; }
-                else { sleep_for_ns(1000000); tries = tries + 1; }
-            }
-        }
-        tid = tid + 1;
-    }
 }
 
 // Is `tid` still a live scheduler object? Returns 0 once the deferred
@@ -1409,6 +1381,37 @@ fn sleep_for_ns(ns as i64) as void {
     schedule();
 }
 
+// The same sleep, but one a kill may cut short. Returns 1 if the thread is
+// being terminated (now, or it was woken for that), 0 if the time passed. A
+// caller in a syscall path returns E_INTR on 1 and lets the boundary finish it.
+// Plain sleep_for_ns stays uninterruptible on purpose: a driver polling its
+// hardware must finish the poll, killed or not.
+fn sleep_interruptible(ns as i64) as i64 {
+    let is i64 as tid = current_tid();
+    if (tid < 0) { return 0; }
+    if (thr_get(tid, THR_KILL) != 0) { return 1; }
+    if (ns <= 0) { yield_cpu(); return thr_get(tid, THR_KILL); }
+    let is i64 as cpu = thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    // Checked again under the lock kill_kick reads our state with: either it
+    // already set the flag and we do not sleep, or it will see us SLEEPING with
+    // intr_sleep set and wake us.
+    if (thr_get(tid, THR_KILL) != 0 || thr_state(tid) != THREAD_RUNNING) {
+        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        return thr_get(tid, THR_KILL);
+    }
+    let is i64 as wake_at = timer.current_time_ns() + ns;
+    thr_set(tid, 272, wake_at);
+    thr_set(tid, THR_INTR_SLEEP, 1);
+    thr_set(tid, 8, THREAD_SLEEPING);
+    set_nr_running(cpu, nr_running(cpu) - 1);
+    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
+    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    schedule();
+    thr_set(tid, THR_INTR_SLEEP, 0);
+    return thr_get(tid, THR_KILL);
+}
+
 // Called from on_timer_tick on each cpu. Walks threads homed on
 // this cpu that are SLEEPING with a non-zero sleep_until_ns; wakes
 // any whose deadline has passed. Cheap fast path: the
@@ -1560,18 +1563,22 @@ fn poll_park_seq(deadline as i64, seq as i64) as void {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    if (thr_state(tid) != THREAD_RUNNING) {
+    // A park is interruptible: a thread being terminated does not go to sleep,
+    // and its caller sees kill_requested() on the way round its loop.
+    if (thr_state(tid) != THREAD_RUNNING || thr_get(tid, THR_KILL) != 0) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
     }
     thr_set(tid, 272, wake_at);                 // sleep_until_ns
     thr_set(tid, THR_POLL_PARKED, 1);
+    thr_set(tid, THR_INTR_SLEEP, 1);
     thr_set(tid, 8, THREAD_SLEEPING);
     set_nr_running(cpu, nr_running(cpu) - 1);
     timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
     thr_set(tid, THR_POLL_PARKED, 0);
+    thr_set(tid, THR_INTR_SLEEP, 0);
 }
 
 // Legacy shape, for callers with no readiness check to have raced.
@@ -1860,19 +1867,12 @@ fn schedule() as void {
                 account_runtime(cpu, prev, elapsed);
             }
             if (thr_state(prev) == THREAD_RUNNING) {
-                if (thr_get(prev, 328) != 0) {
-                    // marked by SYS_PROC_KILL: park it instead of re-queuing —
-                    // this preemption was its last instruction ever
-                    thr_set(prev, 8, THREAD_SUSPENDED);
-                    set_nr_running(cpu, nr_running(cpu) - 1);
-                } else {
-                    thr_set(prev, 8, THREAD_RUNNABLE);
-                    if (thr_class(prev) == SCHED_CLASS_DEADLINE) {
-                        dl_insert(cpu, prev);
-                    }
-                    if (thr_class(prev) == SCHED_CLASS_QOS) {
-                        runlist_insert(cpu, thr_band(prev), prev);
-                    }
+                thr_set(prev, 8, THREAD_RUNNABLE);
+                if (thr_class(prev) == SCHED_CLASS_DEADLINE) {
+                    dl_insert(cpu, prev);
+                }
+                if (thr_class(prev) == SCHED_CLASS_QOS) {
+                    runlist_insert(cpu, thr_band(prev), prev);
                 }
             }
         }
@@ -2376,6 +2376,18 @@ fn reap_drain(cpu as i64) as void {
             lock.release_irq(sched_lock_ptr(cpu), f);
             more = 0;
         } else {
+            // A tid on this list that is no longer a live object means the list
+            // is corrupt — the same thread queued twice, or freed behind our
+            // back. Following it would "pop" thr_get's 0-for-missing and free
+            // tid 0, the boot cpu's idle thread, which is precisely the panic
+            // the audit caught (a write to 0x40 inside schedule()). Stop here.
+            if (thread_ptr(tid) == 0 || thr_state(tid) != THREAD_DEAD) {
+                serial.print("sched: reap list holds tid=", 27);
+                util.print_num(tid);
+                serial.print(" which is not a dead thread", 27);
+                serial.println("", 0);
+                pmm.panic("reap list corrupt", 17);
+            }
             set_cpu_reap_head(cpu, thr_get(tid, 96));   // pop
             lock.release_irq(sched_lock_ptr(cpu), f);
             reap_one(tid);

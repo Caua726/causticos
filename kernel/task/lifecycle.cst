@@ -1,0 +1,280 @@
+// lifecycle.cst — how a process stops: exit, kill, crash. One path for all three.
+//
+// The rule this file exists to keep: a thread is never stopped where it stands.
+// The old kill marked a thread and had the scheduler park it at its next
+// preemption — wherever that was. A writer killed inside fat32's cluster
+// allocator went to sleep forever holding the file system lock, and every file
+// operation on the machine after it spun behind that lock: Ctrl+C on a program
+// writing a file froze the whole system.
+//
+// So termination is a request, and the thread carries it out itself, at a
+// BOUNDARY — a point where it holds nothing:
+//
+//   - on the way back to ring 3 from a syscall (the dispatch hook),
+//   - on the way back to ring 3 from an interrupt (the IDT stubs), which is how
+//     a thread spinning in user code with no syscall in sight still goes,
+//   - at its very first instruction, if it was killed before it ever ran,
+//   - and a thread asleep in the kernel in an interruptible wait is woken; the
+//     wait returns, the syscall unwinds with E_INTR and drops what it holds,
+//     and the return-to-user boundary finishes the job.
+//
+// Uninterruptible waits — a disk transfer, a mutex — finish first. They are
+// bounded, and abandoning them would leave a DMA landing in freed memory or a
+// lock held by nobody.
+//
+// Leaving is thread_leave(): the thread counts itself out of its process, and
+// the LAST one out drains the fd table (every peer sees EOF/CLOSED at once) and
+// publishes the zombie for the parent's wait(). Exit, kill and crash differ only
+// in who calls terminate() and with which code; the first code recorded stands.
+
+use "serial.cst"  as serial;
+use "util.cst"    as util;
+use "lock.cst"    as lock;
+use "sched.cst"   as sched;
+use "process.cst" as proc;
+use "vma.cst"     as vma;
+use "abi.cst"     as abi;
+use "timer.cst"   as timer;
+
+// ============================================================
+// Starting a termination
+// ============================================================
+
+// Mark every live thread of `p` and get each one to a boundary (sched.kill_kick).
+// Caller holds proc.tree_lock: that is what keeps `p` from being collected,
+// freed and reused by another process while we compare thread owners against it.
+fn kick_threads_locked(p as i64) as void {
+    let is i64 as n = sched.next_tid;
+    let is i64 as tid with mut = 0;
+    while (tid < n) {
+        if (sched.thread_ptr(tid) != 0) {
+            if (sched.thr_process_ptr(tid) == p && sched.thr_state(tid) != sched.THREAD_DEAD) {
+                sched.kill_kick(tid);
+            }
+        }
+        tid = tid + 1;
+    }
+}
+
+// ALIVE -> EXITING with `code`, then kick its threads. Asynchronous: returns as
+// soon as they are marked. 1 if this call started it, 0 if the process was
+// already on its way out (its first code stands, and its threads are already
+// marked).
+fn terminate(p as i64, code as i64) as i64 {
+    if (p == 0) { return 0; }
+    proc.tree_lock();
+    if (proc.proc_state(p) != proc.PROC_ALIVE) {
+        proc.tree_unlock();
+        return 0;
+    }
+    proc.begin_exit_locked(p, code);
+    kick_threads_locked(p);
+    proc.tree_unlock();
+    return 1;
+}
+
+// SYS_PROC_KILL: terminate the child `pid` of `parent`. The lookup and the
+// marking happen under one hold of the tree lock, so a sibling thread of the
+// parent collecting the same child at that moment cannot free it in between.
+fn terminate_child(parent as i64, pid as i64, code as i64) as i64 {
+    proc.tree_lock();
+    let is i64 as child with mut = proc.proc_first_child(parent);
+    while (child != 0 && proc.proc_pid(child) != pid) { child = proc.proc_next_sib(child); }
+    if (child == 0 || proc.proc_collected(child) != 0) {
+        proc.tree_unlock();
+        return abi.E_NOENT;
+    }
+    if (proc.proc_state(child) == proc.PROC_ALIVE) {
+        proc.begin_exit_locked(child, code);
+        kick_threads_locked(child);
+    }
+    proc.tree_unlock();
+    return abi.E_OK;
+}
+
+// A thread just created in `p` (SYS_THREAD_SPAWN, still suspended). Count it
+// in, and if the process is already terminating, mark it too: a termination
+// that scanned the threads a moment before this one existed would otherwise
+// leave it running in a process that is gone. Same lock as terminate(), so the
+// two cannot interleave. The caller starts the thread afterwards either way —
+// a marked thread leaves at its first instruction.
+fn adopt_thread(p as i64, tid as i64) as void {
+    proc.tree_lock();
+    proc.proc_inc_threads(p);
+    if (proc.proc_state(p) != proc.PROC_ALIVE) {
+        sched.thr_set(tid, sched.THR_KILL, 1);
+    }
+    proc.tree_unlock();
+}
+
+// ============================================================
+// Leaving
+// ============================================================
+
+// The calling thread leaves its process. Never returns. If it is the last
+// thread out, the process finishes exiting: fds drained, zombie published.
+// `code` matters only when nothing terminated the process first — a last
+// worker calling SYS_THREAD_EXIT.
+fn thread_leave(code as i64) as void {
+    // From an interrupt stub's return path interrupts are still off, and what
+    // follows may sleep (closing a file takes the file system lock).
+    asm(".byte 0xFB\n");    // sti
+    let is i64 as tid = sched.current_tid();
+    let is i64 as p = sched.thr_process_ptr(tid);
+    if (p != 0) {
+        if (proc.proc_dec_threads(p) <= 0) {
+            proc.begin_exit(p, code);
+            // Close this process's fds NOW, not at reap (aspace_destroy): a
+            // parent that pumps a child's console channel to EOF and only then
+            // wait()s would otherwise deadlock — the write end would stay open
+            // until a reap that comes after the pump. Drained BEFORE the zombie
+            // is published, so a parent that wakes on the exit never finds the
+            // child's end of a pipe still open. Idempotent: the reap-time drain
+            // then finds nothing.
+            let is i64 as asp = sched.thr_aspace_ptr(tid);
+            if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
+            proc.finish_exit(p);
+            wake_orphan_reaper();
+        }
+    }
+    sched.exit_current_thread();
+}
+
+// SYS_PROC_EXIT: the whole process, with `code`. Siblings are marked and leave
+// at their own boundaries; whichever thread is last finishes the exit.
+fn exit_process(code as i64) as void {
+    let is i64 as p = sched.thr_process_ptr(sched.current_tid());
+    terminate(p, code);
+    thread_leave(code);
+}
+
+// The boundary check. Called on every return to ring 3 — from the syscall
+// dispatcher and from the interrupt stubs — and at a new thread's first
+// instruction. One load when there is nothing to do.
+fn at_user_boundary() as void {
+    if (sched.kill_requested() != 0) { thread_leave(abi.EXIT_KILLED); }
+}
+
+fn at_user_boundary_ptr() as i64 { return cast(i64, fn_ptr(at_user_boundary)); }
+
+// ============================================================
+// Crashes
+// ============================================================
+
+// A CPU exception in ring 3 the memory policy did not service. The whole
+// process goes, not just the faulting thread — a process with a dead main
+// thread and nobody to notice used to leave its terminal waiting forever.
+//
+// We arrive on the exception's IST stack with interrupts off. Leaving sleeps
+// (fd drain), and sleeping on a per-cpu IST stack would hand it to the next
+// exception on this cpu while we are still on it. The thread's own kernel
+// stack is empty — it came from ring 3 — so we move there first and leave from
+// it; the IST frame is simply abandoned.
+fn user_fault() as void {
+    let is i64 as tid = sched.current_tid();
+    terminate(sched.thr_process_ptr(tid), abi.EXIT_FAULT);
+    let is i64 as top = sched.thr_kstack_base(tid) + sched.KSTACK_SIZE;
+    run_on_stack(top, cast(i64, fn_ptr(fault_leave)));
+}
+
+fn fault_leave() as void {
+    thread_leave(abi.EXIT_FAULT);
+}
+
+fn run_on_stack(top as i64, entry as i64) as void {
+    asm("call smp_run_on_stack\n");
+}
+
+// ============================================================
+// Orphans
+// ============================================================
+
+// A process whose parent exited first is reparented to init (pid 1), and init
+// runs no code — so without this, every orphan that later exits is a zombie
+// forever, holding its address space. The reaper collects exactly the
+// FLAG_ORPHAN children of init; init's own children (the boot spawn, the kernel
+// smokes) are waited for by whoever spawned them.
+//
+// It sleeps until an exit gives it something to look at. A zombie is collected
+// once its last thread is off-cpu and freed by the scheduler's deferred reaper,
+// which can trail the exit by a moment; while one is waiting for that, the
+// reaper re-checks every 20 ms instead of sleeping.
+let is i64 as reaper_tid with mut = 0 - 1;
+let is i64 as reaper_seq with mut = 0;
+
+fn wake_orphan_reaper() as void {
+    lock.atomic_add(&reaper_seq, 1);
+    if (reaper_tid >= 0) { sched.wakeup_thread(reaper_tid); }
+}
+
+fn threads_gone(p as i64) as i64 {
+    if (sched.process_has_live_thread(p) == 0) { return 1; }
+    return 0;
+}
+
+fn orphan_ready(p as i64) as i64 {
+    if ((proc.proc_flags(p) & proc.FLAG_ORPHAN) == 0) { return 0; }
+    return threads_gone(p);
+}
+
+fn collect(parent as i64, child as i64) as i64 {
+    let is i64 as code = proc.proc_exit_code(child);
+    let is i64 as casp = proc.proc_aspace(child);
+    if (casp != 0) { vma.aspace_destroy(cast(*vma.Aspace, casp)); }
+    proc.process_free(parent, child);
+    return code;
+}
+
+fn orphan_reaper() as void {
+    let is i64 as seen with mut = 0;
+    while (1 == 1) {
+        let is i64 as busy with mut = 1;
+        while (busy == 1) {
+            let is i64 as c = proc.claim_zombie_child(proc.init_proc, 0,
+                                                      cast(i64, fn_ptr(orphan_ready)));
+            if (c != 0) {
+                serial.print("lifecycle: reaped orphan pid=", 29);
+                util.print_num(proc.proc_pid(c));
+                serial.println("", 0);
+                collect(proc.init_proc, c);
+            } else { busy = 0; }
+        }
+        if (proc.has_orphan_zombie(proc.init_proc) != 0) {
+            sched.sleep_for_ns(20000000);
+        } else {
+            // Park until an exit bumps reaper_seq. Checked under this cpu's run-
+            // queue lock, which wakeup_thread also takes: an exit landing between
+            // the check and the sleep finds us SLEEPING and wakes us.
+            let is i64 as f = sched.take_lock();
+            if (lock.load_word(&reaper_seq) == seen) {
+                sched.sleep_locked_and_yield(f);
+            } else {
+                sched.drop_lock(f);
+            }
+            seen = lock.load_word(&reaper_seq);
+        }
+    }
+}
+
+fn init() as void {
+    reaper_tid = sched.create_thread(cast(i64, fn_ptr(orphan_reaper)), sched.QOS_BATCH);
+}
+
+// ============================================================
+// wait()
+// ============================================================
+
+// Wait for a child (pid > 0; <= 0 = any) to exit, collect it, return its code.
+// A zombie is taken only once all its threads are off-cpu and freed — its
+// aspace is still the CR3 of a thread finishing its last schedule() until then.
+// E_AGAIN if no such child exits within the window, E_INTR if the caller is
+// itself being terminated meanwhile.
+fn wait_child(parent as i64, pid as i64, window_ns as i64) as i64 {
+    let is i64 as deadline = timer.current_time_ns() + window_ns;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as c = proc.claim_zombie_child(parent, pid, cast(i64, fn_ptr(threads_gone)));
+        if (c != 0) { return collect(parent, c); }
+        if (sched.sleep_interruptible(10000000) != 0) { return abi.E_INTR; }
+    }
+    return abi.E_AGAIN;
+}

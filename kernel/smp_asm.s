@@ -167,3 +167,52 @@ smp_rflags_into:
     .byte   0x8F, 0x07                    # pop QWORD PTR [rdi]
     ret
 
+# void smp_run_on_stack(uint64_t top /*rdi*/, uint64_t entry /*rsi*/) — never returns.
+# Switch to the stack whose top is `top`, enable interrupts and call `entry`,
+# abandoning the current stack. lifecycle.user_fault uses it to leave the
+# per-cpu IST stack an exception arrived on before doing anything that sleeps.
+.globl smp_run_on_stack
+smp_run_on_stack:
+    mov     rsp, rdi
+    .byte   0x48, 0x31, 0xED              # xor rbp, rbp (end of the frame chain)
+    mov     rax, rsi
+    .byte   0xFB                          # sti
+    call    rax
+.Lrun_on_stack_hang:
+    .byte   0xF4                          # hlt — entry never returns
+    jmp     .Lrun_on_stack_hang
+
+# void smp_enter_user(uint64_t rip /*rdi*/, uint64_t rsp /*rsi*/, uint64_t arg /*rdx*/)
+# Never returns: iretq into ring 3 at rip with stack rsp and rdi = arg, every
+# other general register zeroed (no kernel pointer may leak into user state).
+# Built from registers only. The previous spelling passed rip/rsp/rdi through
+# module globals, and two cpus starting user threads at once — or one thread
+# preempted between the stores and the loads — could hand a thread another
+# thread's entry point and stack.
+.globl smp_enter_user
+smp_enter_user:
+    .byte   0xFA                          # cli — iretq restores IF from the frame
+    mov     rax, 0x23
+    push    rax                           # SS  = USER_DS_SEL
+    push    rsi                           # RSP (user)
+    mov     rax, 0x202
+    push    rax                           # RFLAGS = IF | reserved bit 1
+    mov     rax, 0x2B
+    push    rax                           # CS  = USER_CS64_SEL
+    push    rdi                           # RIP (user)
+    mov     rdi, rdx                      # the thread's argument (0 for a main thread)
+    .byte   0x48, 0x31, 0xDB              # xor rbx, rbx
+    .byte   0x48, 0x31, 0xC9              # xor rcx, rcx
+    .byte   0x48, 0x31, 0xD2              # xor rdx, rdx
+    .byte   0x48, 0x31, 0xF6              # xor rsi, rsi
+    .byte   0x48, 0x31, 0xED              # xor rbp, rbp
+    .byte   0x4D, 0x31, 0xC0              # xor r8, r8
+    .byte   0x4D, 0x31, 0xC9              # xor r9, r9
+    .byte   0x4D, 0x31, 0xD2              # xor r10, r10
+    .byte   0x4D, 0x31, 0xDB              # xor r11, r11
+    .byte   0x4D, 0x31, 0xE4              # xor r12, r12
+    .byte   0x4D, 0x31, 0xED              # xor r13, r13
+    .byte   0x4D, 0x31, 0xF6              # xor r14, r14
+    .byte   0x4D, 0x31, 0xFF              # xor r15, r15
+    .byte   0x48, 0x31, 0xC0              # xor rax, rax
+    .byte   0x48, 0xCF                    # iretq

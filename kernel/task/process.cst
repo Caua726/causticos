@@ -26,6 +26,7 @@ use "heap.cst" as heap;
 use "util.cst" as util;
 use "timer.cst" as timer;
 use "abi.cst" as abi;
+use "lock.cst" as lock;
 
 // ============================================================
 // Process states
@@ -36,7 +37,9 @@ let is i64 as PROC_ZOMBIE  = 3;   // dead, exit_code valid, awaiting wait()
 let is i64 as PROC_DEAD    = 4;   // collected; struct about to be freed
 
 // Flags
-let is i64 as FLAG_INIT = 1;      // pid 1: root of the tree, reaps orphans, cannot exit
+let is i64 as FLAG_INIT   = 1;    // pid 1: root of the tree, reaps orphans, cannot exit
+let is i64 as FLAG_ORPHAN = 2;    // reparented to init when its parent exited — nobody
+                                  // will wait() for it, so lifecycle's orphan reaper does
 
 // ============================================================
 // Process struct (128 bytes). Raw-offset accessors (same style the
@@ -96,8 +99,15 @@ fn proc_flags(proc as i64) as i64        { return proc_get(proc, 88); }
 fn proc_collected(proc as i64) as i64    { return proc_get(proc, 96); }
 fn proc_reap_done(proc as i64) as i64    { return proc_get(proc, 104); }
 
-fn proc_inc_threads(proc as i64) as void { proc_set(proc, 72, proc_thread_count(proc) + 1); }
-fn proc_dec_threads(proc as i64) as void { proc_set(proc, 72, proc_thread_count(proc) - 1); }
+// Atomic: threads of one process start and leave on different cpus at once,
+// and "was I the last one out?" must have exactly one yes.
+fn proc_inc_threads(proc as i64) as void {
+    lock.atomic_add(cast(*i64, proc + 72), 1);
+}
+// Returns the count AFTER the decrement.
+fn proc_dec_threads(proc as i64) as i64 {
+    return lock.atomic_add(cast(*i64, proc + 72), 0 - 1) - 1;
+}
 
 fn proc_set_state(proc as i64, v as i64) as void     { proc_set(proc, 40, v); }
 fn proc_set_aspace(proc as i64, v as i64) as void    { proc_set(proc, 56, v); }
@@ -150,10 +160,17 @@ fn proc_set_name_default(proc as i64, pid as i64, flags as i64) as void {
 }
 
 // ============================================================
-// Hierarchy (caller serialises; today only the boot/smoke path and
-// single-threaded exit touch these — a global proc lock lands with the
-// userspace spawn syscalls).
+// Hierarchy. Every link in the tree, and every state transition, is made
+// under tree_lock: spawns, exits, waits and the proc_list snapshot run on
+// different cpus at once, and an unlocked walk could follow a sibling pointer
+// into a Process being freed. A plain spinlock — every section is a few
+// pointer moves, never a sleep.
 // ============================================================
+
+let is lock.TicketLock as tree_lk with mut;
+
+fn tree_lock() as void   { lock.acquire(&tree_lk); }
+fn tree_unlock() as void { lock.release(&tree_lk); }
 
 fn add_child(parent as i64, child as i64) as void {
     proc_set(child, 8, parent);                 // child.parent = parent
@@ -181,14 +198,17 @@ fn remove_child(parent as i64, child as i64) as void {
     proc_set(child, 32, 0);
 }
 
-// Orphans go to init (pid 1), which reaps them. No cascade-kill flag in
-// v0 — that's a sandbox/job-tree feature, deferred.
+// Orphans go to init (pid 1). Init runs no code, so "init reaps them" means
+// lifecycle's orphan reaper, which collects exactly the FLAG_ORPHAN ones —
+// init's own children (the boot spawn, the kernel smokes) are waited for by
+// whoever spawned them. Caller holds tree_lock.
 fn reparent_children_to_init(proc as i64) as void {
     let is i64 as child with mut = proc_first_child(proc);
     while (child != 0) {
         let is i64 as next = proc_next_sib(child);
         remove_child(proc, child);
         add_child(init_proc, child);
+        proc_set(child, 88, proc_flags(child) | FLAG_ORPHAN);
         child = next;
     }
 }
@@ -224,7 +244,11 @@ fn process_create(parent as i64, aspace as i64, flags as i64) as i64 {
     // blank row in ps — a nameless process appears AS such, never hidden.
     proc_set_name_default(proc, pid, flags);
 
-    if (parent != 0) { add_child(parent, proc); }
+    if (parent != 0) {
+        tree_lock();
+        add_child(parent, proc);
+        tree_unlock();
+    }
 
     serial.print("proc: created pid=", 18);
     util.print_num(pid);
@@ -236,58 +260,78 @@ fn process_create(parent as i64, aspace as i64, flags as i64) as i64 {
 // right after create_user_thread_ex has set the thread's process_ptr).
 fn attach_main_thread(proc as i64, tid as i64) as void {
     proc_set(proc, 64, tid);                    // first_tid
-    proc_set(proc, 72, proc_thread_count(proc) + 1);
+    proc_inc_threads(proc);
 }
 
-// Called from the exiting thread's SYS_PROC_EXIT path (syshandlers),
-// BEFORE the thread schedules away. Records the exit code and publishes
-// the zombie; does NOT free the aspace (the thread still runs on it until
-// schedule() switches) — reclamation is the reaper's / wait()'s job.
-fn zombify(proc as i64, code as i64) as void {
-    if (proc == 0) { return; }
-    if (proc_state(proc) != PROC_ALIVE) { return; }
+// Exit is two steps, because a process with several threads finishes leaving
+// only when its last thread does (see lifecycle.cst):
+//
+//   begin_exit   ALIVE -> EXITING, recording the code. The FIRST code stands:
+//                a process killed while it was calling exit reports whichever
+//                happened first, never a mix.
+//   finish_exit  EXITING -> ZOMBIE, by the last thread out once the fd table is
+//                drained: children go to init, the parent's subscribers hear.
+//
+// begin_exit returns 1 if this call started the exit, 0 if it was already on
+// its way (or gone).
+fn begin_exit(proc as i64, code as i64) as i64 {
+    if (proc == 0) { return 0; }
+    tree_lock();
+    let is i64 as r = begin_exit_locked(proc, code);
+    tree_unlock();
+    return r;
+}
+
+// The same, for a caller already holding tree_lock.
+fn begin_exit_locked(proc as i64, code as i64) as i64 {
     if ((proc_flags(proc) & FLAG_INIT) != 0) {
         pmm.panic("init process exited", 19);
     }
-    proc_set(proc, 40, PROC_EXITING);
+    if (proc_state(proc) != PROC_ALIVE) { return 0; }
     proc_set(proc, 48, code);                   // exit_code
+    proc_set(proc, 40, PROC_EXITING);
+    return 1;
+}
+
+fn finish_exit(proc as i64) as void {
+    if (proc == 0) { return; }
+    tree_lock();
+    if (proc_state(proc) != PROC_EXITING) {
+        tree_unlock();
+        return;
+    }
     reparent_children_to_init(proc);
     proc_set(proc, 40, PROC_ZOMBIE);
+    let is i64 as parent = proc_get(proc, 8);
+    let is i64 as parent_pid with mut = 0;
+    if (parent != 0) { parent_pid = proc_pid(parent); }
+    let is i64 as pid = proc_pid(proc);
+    let is i64 as code = proc_exit_code(proc);
+    tree_unlock();
 
     // Signal-replacement: post {child pid, EVENT_EXIT, code} to the parent's
     // event subscribers. No-op before main wires event_post_fn (early boot).
-    let is i64 as parent = proc_get(proc, 8);
+    // Outside the tree lock: posting wakes pollers through the scheduler.
     if (parent != 0) {
         if (event_post_fn != 0) {
             let is fn(i64,i64,i64,i64) as void as fp =
                 cast(fn(i64,i64,i64,i64) as void, event_post_fn);
-            call(fp, proc_pid(parent), proc_pid(proc), abi.EVENT_EXIT, code);
+            call(fp, parent_pid, pid, abi.EVENT_EXIT, code);
         }
     }
 }
 
-// Find a zombie child of `parent` (matching `pid` if pid > 0, else any).
-// Returns the child Process ptr, or 0 if none ready.
-// Find a child of `parent` by pid, in ANY state (the kill path needs the
-// living ones; find_zombie_child below stays the wait() helper).
+// Find a child of `parent` by pid, in ANY state. The pointer is only good
+// while the caller keeps the child from being collected; the kill path does
+// its whole job under tree_lock instead (lifecycle.terminate_child).
 fn find_child(parent as i64, pid as i64) as i64 {
+    tree_lock();
     let is i64 as child with mut = proc_first_child(parent);
     while (child != 0) {
-        if (proc_pid(child) == pid) { return child; }
+        if (proc_pid(child) == pid) { tree_unlock(); return child; }
         child = proc_next_sib(child);
     }
-    return 0;
-}
-
-fn find_zombie_child(parent as i64, pid as i64) as i64 {
-    let is i64 as child with mut = proc_first_child(parent);
-    while (child != 0) {
-        if (proc_state(child) == PROC_ZOMBIE) {
-            if (pid <= 0) { return child; }
-            if (proc_pid(child) == pid) { return child; }
-        }
-        child = proc_next_sib(child);
-    }
+    tree_unlock();
     return 0;
 }
 
@@ -296,9 +340,69 @@ fn find_zombie_child(parent as i64, pid as i64) as i64 {
 // child's thread + aspace (see the spawn/reap path). Marks DEAD first so
 // a racing scanner never sees a half-freed struct as a zombie.
 fn process_free(parent as i64, child as i64) as void {
+    tree_lock();
     proc_set(child, 40, PROC_DEAD);
-    remove_child(parent, child);
+    remove_child(proc_parent(child), child);
+    tree_unlock();
     heap.kpool_free(proc_pool, child);
+}
+
+// Claim a zombie child for collection: the first caller to find it marks it
+// collected under the lock, so two threads of one parent waiting at once can
+// never both tear the same child down. `ready` decides whether a found zombie
+// may be taken yet (its threads must all be off-cpu) — it is called under the
+// tree lock, so it must not sleep. Returns the child, or 0.
+fn claim_zombie_child(parent as i64, pid as i64, ready as i64) as i64 {
+    tree_lock();
+    let is i64 as child with mut = proc_first_child(parent);
+    while (child != 0) {
+        if (proc_state(child) == PROC_ZOMBIE && proc_collected(child) == 0) {
+            if (pid <= 0 || proc_pid(child) == pid) {
+                let is fn(i64) as i64 as rf = cast(fn(i64) as i64, ready);
+                if (call(rf, child) != 0) {
+                    proc_set(child, 96, 1);     // collected
+                    tree_unlock();
+                    return child;
+                }
+            }
+        }
+        child = proc_next_sib(child);
+    }
+    tree_unlock();
+    return 0;
+}
+
+// Is an orphan zombie of `parent` still waiting to be collected? The orphan
+// reaper polls while one is, and parks when none is.
+fn has_orphan_zombie(parent as i64) as i64 {
+    tree_lock();
+    let is i64 as child with mut = proc_first_child(parent);
+    while (child != 0) {
+        if (proc_state(child) == PROC_ZOMBIE && proc_collected(child) == 0
+            && (proc_flags(child) & FLAG_ORPHAN) != 0) {
+            tree_unlock();
+            return 1;
+        }
+        child = proc_next_sib(child);
+    }
+    tree_unlock();
+    return 0;
+}
+
+// Is there a child matching pid at all (in any state)? wait() uses it to
+// tell "nothing to wait for" from "not exited yet".
+fn has_child(parent as i64, pid as i64) as i64 {
+    tree_lock();
+    let is i64 as child with mut = proc_first_child(parent);
+    while (child != 0) {
+        if (proc_collected(child) == 0 && (pid <= 0 || proc_pid(child) == pid)) {
+            tree_unlock();
+            return 1;
+        }
+        child = proc_next_sib(child);
+    }
+    tree_unlock();
+    return 0;
 }
 
 // ============================================================

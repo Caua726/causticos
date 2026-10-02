@@ -2,7 +2,7 @@
 //
 // What this gives us, building on the gdt + per-thread aspace work:
 //
-//   - enter_user(rip, rsp): the asm sequence that flips the CPU into
+//   - enter_user(rip, rsp, arg): the asm sequence that flips the CPU into
 //     ring 3 via IRETQ. Pushes the (SS, RSP, RFLAGS, CS, RIP) frame
 //     in the order IRETQ pops them, then iretq.
 //   - user_thread_trampoline(): kernel-side stub installed as a
@@ -35,6 +35,7 @@ use "cse.cst" as cse;
 use "imgcache.cst" as imgcache;
 use "abi.cst" as abi;
 use "process.cst" as proc;
+use "lifecycle.cst" as lifecycle;
 use "fb.cst" as fb;
 use "channel.cst" as channel;
 use "segment.cst" as segment;
@@ -58,89 +59,20 @@ let is i64 as USER_STACK2_VA  = 0x0000000000610000;   // 2nd thread's stack (thr
 // most-used combinations short names.
 
 // ----------------------------------------------------------------
-// Ring-3 entry asm.
+// Ring-3 entry: smp_asm.s:smp_enter_user builds the iretq frame
+// (RIP, CS 0x2B, RFLAGS 0x202 = IF, RSP, SS 0x23) from its argument
+// registers, zeroes every other general register so no kernel pointer
+// leaks into user state, and iretqs. GS is left alone: loading it in
+// 64-bit mode would clobber GSBASE (the per-cpu pointer).
 //
-// Caustic prologue clobbers rdi/rsi before any inline asm runs (it
-// stashes args to spill slots), so the iretq frame can't be built
-// directly from registers — we shuttle through module globals.
-// Concurrent enter_user calls would race on these slots, but ring-3
-// entry is rare (once per user-thread spawn) and serialised by the
-// thread doing it. If a future workload spawns user threads on
-// multiple cpus simultaneously this needs to move to per-cpu
-// storage.
-//
-// IRETQ pops in order (low → high on stack):
-//   RIP, CS, RFLAGS, RSP, SS
-//
-// We push them in the reverse order. RFLAGS = 0x202 sets IF=1 (so
-// the LAPIC timer can preempt the user thread) and the always-set
-// reserved bit 1.
-//
-// DS/ES/FS get reloaded to USER_DS_SEL (0x23) so any user code that
-// reads a segment register sees a ring-3 selector. GS is left alone:
-// loading it in 64-bit mode would clobber GSBASE (per-cpu pointer)
-// and anyway iretq doesn't pop GS.
+// It is hand assembly taking its arguments in registers, not a Caustic
+// body staging them through module globals as it used to: those globals
+// were shared by every cpu, so two threads starting at once — or one
+// preempted between the stores and the asm that read them — could enter
+// ring 3 at another thread's entry point on another thread's stack.
 // ----------------------------------------------------------------
-let is i64 as enter_user_rip with mut = 0;
-let is i64 as enter_user_rsp with mut = 0;
-// Initial ring-3 rdi. 0 for a process main thread (args on the stack); the
-// arg SYS_THREAD_SPAWN hands its worker for a spawned thread. Set by
-// user_thread_trampoline from the thread's Thread+336 slot before enter_user.
-let is i64 as enter_user_rdi with mut = 0;
-
-fn enter_user(rip as i64, rsp as i64) as void {
-    enter_user_rip = rip;
-    enter_user_rsp = rsp;
-
-    // Build the iretq frame. Pull rip/rsp from the shuttle globals
-    // since rdi/rsi are unreliable here. iretq with a CS DPL change
-    // also reloads SS for us, so we don't need to mov ss/ds/es/fs
-    // ourselves; the SS reload by iretq tags DS/ES/FS as null
-    // implicitly in 64-bit mode (segment regs are mostly ignored).
-    asm("mov rax, 0x23\n");      // SS  = USER_DS_SEL
-    asm("push rax\n");
-    asm("lea rax, [rip+_kernel_sys_userspace_cst_enter_user_rsp]\n");
-    asm("mov rax, QWORD PTR [rax]\n");
-    asm("push rax\n");           // RSP (user)
-    asm("mov rax, 0x202\n");     // RFLAGS = IF | reserved
-    asm("push rax\n");
-    asm("mov rax, 0x2B\n");      // CS  = USER_CS64_SEL
-    asm("push rax\n");
-    asm("lea rax, [rip+_kernel_sys_userspace_cst_enter_user_rip]\n");
-    asm("mov rax, QWORD PTR [rax]\n");
-    asm("push rax\n");           // RIP (user)
-
-    // Zero every GP register before crossing into ring 3. Otherwise the new
-    // user context inherits whatever the kernel left in them — including kernel
-    // .text/.data pointers. That LEAKS kernel addresses to userspace (a security
-    // hole), and turns any uninitialised-register read in the user program into
-    // garbage that varies per boot instead of the clean 0 a register-clearing OS
-    // gives: it desynced the self-host compiler's output run-to-run and now and
-    // then faulted it by calling through a leaked kernel pointer
-    // (rip=cr2=0xffffffff8000xxxx). Entry args arrive on the stack
-    // (build_initial_stack), so no GP register carries process-entry state. rax
-    // built the iretq frame, so it is zeroed last; iretq pops from the stack.
-    asm(".byte 0x48, 0x31, 0xDB\n");   // xor rbx, rbx
-    asm(".byte 0x48, 0x31, 0xC9\n");   // xor rcx, rcx
-    asm(".byte 0x48, 0x31, 0xD2\n");   // xor rdx, rdx
-    asm(".byte 0x48, 0x31, 0xF6\n");   // xor rsi, rsi
-    asm(".byte 0x48, 0x31, 0xED\n");   // xor rbp, rbp
-    asm(".byte 0x4D, 0x31, 0xC0\n");   // xor r8, r8
-    asm(".byte 0x4D, 0x31, 0xC9\n");   // xor r9, r9
-    asm(".byte 0x4D, 0x31, 0xD2\n");   // xor r10, r10
-    asm(".byte 0x4D, 0x31, 0xDB\n");   // xor r11, r11
-    asm(".byte 0x4D, 0x31, 0xE4\n");   // xor r12, r12
-    asm(".byte 0x4D, 0x31, 0xED\n");   // xor r13, r13
-    asm(".byte 0x4D, 0x31, 0xF6\n");   // xor r14, r14
-    asm(".byte 0x4D, 0x31, 0xFF\n");   // xor r15, r15
-    // rdi = enter_user_rdi (0 for a main thread; SYS_THREAD_SPAWN's arg for a
-    // worker). Loaded from a kernel global we own, so it never leaks a kernel
-    // pointer — it is either 0 or the user's own arg value. rax is the scratch,
-    // cleared right after.
-    asm("lea rax, [rip+_kernel_sys_userspace_cst_enter_user_rdi]\n");
-    asm("mov rdi, QWORD PTR [rax]\n");
-    asm(".byte 0x48, 0x31, 0xC0\n");   // xor rax, rax (built the frame — clear last)
-    asm(".byte 0x48, 0xCF\n");   // iretq (caustic-as drops the mnemonic)
+fn enter_user(rip as i64, rsp as i64, arg as i64) as void {
+    asm("call smp_enter_user\n");
 }
 
 // First instructions of every ring-3 thread. Runs in ring 0 with
@@ -154,8 +86,10 @@ fn user_thread_trampoline() as void {
         serial.println("userspace: trampoline tid has no user_entry", 43);
         return;
     }
-    enter_user_rdi = sched.thr_initial_rdi(tid);   // 0 for a main thread
-    enter_user(rip, rsp);
+    // A thread killed before it ever ran (its process was terminated while it
+    // was still suspended) leaves here, at its first instruction.
+    lifecycle.at_user_boundary();
+    enter_user(rip, rsp, sched.thr_initial_rdi(tid));   // rdi = 0 for a main thread
 }
 
 // ----------------------------------------------------------------
@@ -3041,24 +2975,7 @@ fn proc_start(p as i64) as void {
 // it off-cpu and the aspace safe to tear down. Frees the aspace + Process
 // struct and detaches from the parent. Returns the exit code, or E_AGAIN.
 fn proc_wait(parent as i64, pid as i64) as i64 {
-    let is i64 as deadline = timer.current_time_ns() + 5000000000;
-    while (timer.current_time_ns() < deadline) {
-        let is i64 as child = proc.find_zombie_child(parent, pid);
-        if (child != 0) {
-            // Wait until EVERY thread of the child is reaped (not just the main
-            // one) — a multi-thread process may still have a worker off-cpu but
-            // not yet freed, and its aspace CR3 must be idle before destroy.
-            if (sched.process_has_live_thread(child) == 0) {
-                let is i64 as code = proc.proc_exit_code(child);
-                let is i64 as casp = proc.proc_aspace(child);
-                if (casp != 0) { vma.aspace_destroy(cast(*vma.Aspace, casp)); }
-                proc.process_free(parent, child);
-                return code;
-            }
-        }
-        sched.sleep_for_ns(10000000);
-    }
-    return abi.E_AGAIN;
+    return lifecycle.wait_child(parent, pid, 5000000000);
 }
 
 fn spawn_user_proc_smoke() as void {

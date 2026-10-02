@@ -27,6 +27,7 @@ use "netdev.cst" as netdev;
 use "audio.cst" as audio;
 use "random.cst" as random;
 use "process.cst" as proc;
+use "lifecycle.cst" as lifecycle;
 use "heap.cst" as heap;
 use "vmm.cst" as vmm;
 use "segment.cst" as segment;
@@ -88,43 +89,22 @@ fn sys_time_now_ns(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) a
 
 fn sys_time_sleep_ns(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     if (a < 0) { return abi.E_INVAL; }
-    sched.sleep_for_ns(a);
+    // Interruptible: `sleep 100` killed with Ctrl+C goes now, not in 100 s.
+    if (sched.sleep_interruptible(a) != 0) { return abi.E_INTR; }
     return abi.E_OK;
 }
 
 // ============================================================
-// SYS_PROC_EXIT — terminate the WHOLE process. Never returns.
-// If the thread belongs to a Process, first force-kill every sibling thread
-// (SYS_THREAD_SPAWN may have started some) so the process leaves no live
-// thread behind, THEN publish the zombie (exit code + reparent children)
-// BEFORE scheduling away, so the parent's wait() can collect the status.
-// Killing the siblings before zombify keeps the invariant proc_wait relies on:
-// once a process is a zombie, all its threads are off-cpu (or racing to the
-// reaper), so aspace_destroy at reap is safe. Resource reclamation
-// (kstack/aspace/struct) is the reaper's / wait()'s job.
+// SYS_PROC_EXIT — terminate the WHOLE process. Never returns. Sibling threads
+// (SYS_THREAD_SPAWN) are marked and leave at their own next boundary; the last
+// thread out drains the fd table and publishes the zombie. See lifecycle.cst.
 // ============================================================
 
 fn sys_proc_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     serial.print("sys.proc_exit: code=", 20);
     util.print_num(a);
     serial.println("", 0);
-    let is i64 as tid = sched.current_tid();
-    let is i64 as p = sched.thr_process_ptr(tid);
-    if (p != 0) {
-        if (proc.proc_state(p) == proc.PROC_ALIVE) {
-            sched.kill_process_threads(p, tid);   // reap siblings (spare self)
-            proc.zombify(p, a);
-        }
-    }
-    // Close this process's fds NOW, at exit — not later at reap (aspace_destroy).
-    // A channel/pipe peer must see EOF the moment the writer exits: a parent that
-    // pumps a child's console channel to EOF and only THEN wait()s would otherwise
-    // deadlock, since the write end stays open until reap, which comes after the
-    // pump. fd_table_drain is idempotent (clears slots), so the reap-time drain is
-    // a harmless no-op.
-    let is i64 as asp = sched.thr_aspace_ptr(tid);
-    if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
-    sched.exit_current_thread();
+    lifecycle.exit_process(a);
     return 0;
 }
 
@@ -354,32 +334,17 @@ fn sys_fd_recv(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i6
 
 // ============================================================
 // SYS_PROC_KILL(pid) — forced termination of a CHILD. The spawn key is the
-// kill authority: only the parent that holds the relationship may use it
-// (no ambient pid namespace to attack). The scheduler half (thr_mark_kill /
-// kill_finalize) guarantees the target never executes again before we touch
-// its process state; teardown then runs FROM THIS CONTEXT — zombify(137),
-// fd-table drain (peers see EOF/CLOSED immediately, exactly like a
-// voluntary exit) — and the corpse goes to the deferred reaper. wait()
-// collects the zombie as usual.
+// kill authority: only the parent that holds the relationship may use it (no
+// ambient pid namespace to attack). Asynchronous: the child's threads are
+// marked and each leaves at its next boundary — never inside a syscall holding
+// a lock, which is what froze the system when Ctrl+C landed on a program
+// writing a file. The parent's wait() collects the zombie as usual.
 // ============================================================
 
 fn sys_proc_kill(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is i64 as me = sched.thr_process_ptr(sched.current_tid());
     if (me == 0) { return abi.E_PERM; }
-    let is i64 as child = proc.find_child(me, a);
-    if (child == 0) { return abi.E_NOENT; }
-    if (proc.proc_state(child) != proc.PROC_ALIVE) { return abi.E_OK; }   // already dying/dead
-
-    // Kill EVERY thread of the child — a multi-thread process (SYS_THREAD_SPAWN)
-    // has more than first_tid. Each is marked, waited off-cpu (the 1ms tick
-    // preempts even a pure user spin; the scheduler parks marked threads), then
-    // finalized to the deferred reaper. All threads are off-cpu when this
-    // returns, so the teardown below is safe.
-    sched.kill_process_threads(child, 0 - 1);
-    proc.zombify(child, 137);
-    let is i64 as asp = proc.proc_aspace(child);
-    if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
-    return abi.E_OK;
+    return lifecycle.terminate_child(me, a, abi.EXIT_KILLED);
 }
 
 // ============================================================
@@ -436,7 +401,7 @@ fn sys_thread_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) 
         sched.QOS_NORMAL, pml4, entry, stack_top, asp, me, 1);   // suspended
     if (ntid < 0) { return abi.E_NOMEM; }
     sched.thr_set_initial_rdi(ntid, arg);
-    proc.proc_inc_threads(me);
+    lifecycle.adopt_thread(me, ntid);
     sched.make_runnable(ntid);
     return ntid;
 }
@@ -450,19 +415,7 @@ fn sys_thread_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) 
 // ============================================================
 
 fn sys_thread_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
-    let is i64 as tid = sched.current_tid();
-    let is i64 as p = sched.thr_process_ptr(tid);
-    if (p != 0) {
-        proc.proc_dec_threads(p);
-        if (proc.proc_thread_count(p) <= 0) {
-            if (proc.proc_state(p) == proc.PROC_ALIVE) {
-                proc.zombify(p, a);
-                let is i64 as asp = sched.thr_aspace_ptr(tid);
-                if (asp != 0) { vma.fd_table_drain(cast(*vma.Aspace, asp)); }
-            }
-        }
-    }
-    sched.exit_current_thread();
+    lifecycle.thread_leave(a);
     return 0;
 }
 
@@ -470,10 +423,9 @@ fn sys_thread_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) a
 // SYS_PROC_LIST(entries_uptr, max) — snapshot the process tree into a
 // caller array of ProcInfo (6 i64 each), up to `max`. Returns the TOTAL
 // live count so a truncated snapshot is detectable. DFS from init over an
-// explicit worklist (no kernel-stack recursion). Read-only and quick; like
-// the other process paths it runs without a global proc lock (none exists
-// yet) — a concurrent spawn/reap can make the snapshot momentarily
-// inconsistent, acceptable for a monitor.
+// explicit worklist (no kernel-stack recursion), under the process tree lock:
+// a sibling pointer followed without it could land in a Process that a
+// concurrent wait() has just freed. The copy-out happens after the lock drops.
 // ============================================================
 
 fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
@@ -518,6 +470,7 @@ fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
     let is [256]i64 as stk;             // DFS worklist of *Process
     let is i64 as sp with mut = 0;
     if (proc.init_proc != 0) { stk[0] = proc.init_proc; sp = 1; }
+    proc.tree_lock();
     while (sp > 0) {
         sp = sp - 1;
         let is i64 as p = stk[sp];
@@ -554,6 +507,7 @@ fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as 
             if (ch != 0 && sp < 256) { stk[sp] = ch; sp = sp + 1; }
         }
     }
+    proc.tree_unlock();
     if (n > 0) {
         if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), n * abi.PROC_INFO_WORDS * 8) != 0) { return abi.E_FAULT; }
     }
@@ -671,6 +625,7 @@ fn sys_mem_info(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i
     let is i64 as sp with mut = 0;
     if (proc.init_proc != 0) { stk[0] = proc.init_proc; sp = 1; }
     let is i64 as committed with mut = 0;
+    proc.tree_lock();
     while (sp > 0) {
         sp = sp - 1;
         let is i64 as p = stk[sp];
@@ -686,6 +641,7 @@ fn sys_mem_info(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i
             if (ch != 0 && sp < 256) { stk[sp] = ch; sp = sp + 1; }
         }
     }
+    proc.tree_unlock();
     kbuf[3] = committed;
     if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), 32) != 0) { return abi.E_FAULT; }
     return abi.E_OK;
@@ -783,6 +739,7 @@ fn sys_poll(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
             let is i64 as park with mut = 0;
             if (infinite == 0) { park = deadline; }
             sched.poll_park_seq(park, seq);
+            if (sched.kill_requested() != 0) { return abi.E_INTR; }
         }
     }
 
@@ -942,6 +899,9 @@ fn sys_read(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     let is *u8 as kp = cast(*u8, iobuf);
     let is i64 as total with mut = 0;
     while (total < n) {
+        // A process being terminated stops between pages; the rest of a large
+        // transfer would only delay the exit it is no longer around for.
+        if (total > 0 && sched.kill_requested() != 0) { return total; }
         let is i64 as chunk with mut = n - total;
         if (chunk > IO_PAGE_BYTES) { chunk = IO_PAGE_BYTES; }
         let is i64 as got = kobject.ko_read(ko, cast(i64, kp), chunk);
@@ -978,6 +938,7 @@ fn sys_write(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     let is *u8 as kp = cast(*u8, iobuf);
     let is i64 as total with mut = 0;
     while (total < n) {
+        if (total > 0 && sched.kill_requested() != 0) { return total; }   // see sys_read
         let is i64 as chunk with mut = n - total;
         if (chunk > IO_PAGE_BYTES) { chunk = IO_PAGE_BYTES; }
         let is i32 as rrc = userspace.copy_from_user(pml4, kp, b + total, chunk);
@@ -1348,8 +1309,9 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
 // exits, reap it, and return its exit code. If status_ptr != 0 the code
 // is also written there (i64). Returns E_AGAIN if no such child exits
 // within the wait window. Reaping (free aspace + Process struct) is
-// race-free: proc_wait blocks until the deferred reaper has the thread
-// off-cpu before tearing down the address space.
+// race-free: lifecycle.wait_child only takes a zombie once the deferred
+// reaper has every thread of it off-cpu, and claims it under the tree lock
+// so two waiting threads can never both collect it.
 // ============================================================
 
 fn sys_wait(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
@@ -1360,7 +1322,7 @@ fn sys_wait(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     if (parent == 0) { return abi.E_PERM; }
 
     let is i64 as code = userspace.proc_wait(parent, pid);
-    if (code == abi.E_AGAIN) { return abi.E_AGAIN; }
+    if (code < 0) { return code; }                // E_AGAIN, or E_INTR (being killed)
 
     if (status_uptr != 0) {
         let is i64 as pml4 = sched.thr_aspace_pml4(tid);
