@@ -69,6 +69,29 @@ let is i64 as MAX_LINE_CPUS = 16;      // == smp.MAX_CPUS
 let is [16]i64 as line_len with mut;
 let is [3840]u8 as line_buf with mut;   // MAX_LINE_CPUS * LINE_CAP
 
+// A cpu's buffer holds ONE writer's line at a time. Per cpu was not enough on
+// its own: a thread preempted halfway through a line left its first half in
+// the buffer, the next thread on that cpu wrote its own line after it, and the
+// log read "Be1000: mac=52:54:..." — thread B's "B:" glued to the e1000's
+// line, and B's number turning up later on a line of its own. The same
+// happened to an interrupt handler logging over the line of the thread it
+// interrupted, and to a thread that migrated to another cpu mid-line.
+//
+// So each buffer records whose line it holds (smp.current_line_owner: tid + 1,
+// or an interrupt context), and a different writer first sets the half line
+// aside in a parking slot. The owner gets it back wherever it next writes —
+// from a slot, or from another cpu's buffer if it moved — and finishes it.
+// Fixed slots, no allocation: this runs under the allocator too. When every
+// slot is taken the oldest parked line is written out as it stands, so a
+// thread that died mid-line costs a slot only until it is needed.
+let is [16]i64 as line_owner with mut;      // owner of line_buf[c]; 0 = no line
+let is i64 as PARK_SLOTS = 32;
+let is [32]i64 as park_owner with mut;      // 0 = slot free
+let is [32]i64 as park_len with mut;
+let is [32]i64 as park_seq with mut;        // when it was parked, to evict the oldest
+let is [7680]u8 as park_buf with mut;       // PARK_SLOTS * LINE_CAP
+let is i64 as park_clock with mut = 0;
+
 // The last HIST_LINES complete lines, whoever printed them. The panic screen
 // shows them: a machine that dies with its log only on a serial port nobody
 // has attached tells its user nothing at all. Kept as text without the CRLF.
@@ -122,6 +145,95 @@ fn set_cpu_id_fn(f as i64) as void {
     return;
 }
 
+// Who is writing (smp.current_line_owner). Injected for the same reason as the
+// cpu id. Never 0, which marks an empty buffer or a free slot: a writer nobody
+// can name — before main.cst wires this up, or a cpu that has not scheduled
+// yet — is the one anonymous writer ANON.
+let is i64 as owner_fn with mut = 0;
+let is i64 as ANON = 0 - 1;
+
+fn set_owner_fn(f as i64) as void {
+    owner_fn = f;
+    return;
+}
+
+fn who() as i64 {
+    if (owner_fn == 0) { return ANON; }
+    let is i64 as w = call(cast(fn() as i64, owner_fn));
+    if (w == 0) { return ANON; }
+    return w;
+}
+
+fn copy_bytes(dst as *u8, src as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[i] = src[i]; i = i + 1; }
+}
+
+// Caller holds serial_lock. Set cpu c's half line aside.
+fn park_line(c as i64) as void {
+    let is i64 as s with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (k < PARK_SLOTS) {
+        if (park_owner[k] == 0 && s < 0) { s = k; }
+        k = k + 1;
+    }
+    if (s < 0) {
+        // Full: write the oldest parked line out as it stands.
+        s = 0;
+        k = 1;
+        while (k < PARK_SLOTS) {
+            if (park_seq[k] < park_seq[s]) { s = k; }
+            k = k + 1;
+        }
+        let is i64 as j with mut = 0;
+        while (j < park_len[s]) { putc_raw(cast(i64, park_buf[s * LINE_CAP + j])); j = j + 1; }
+        putc_raw(CR);
+        putc_raw(LF);
+    }
+    copy_bytes(cast(*u8, cast(i64, &park_buf[0]) + s * LINE_CAP),
+               cast(*u8, cast(i64, &line_buf[0]) + c * LINE_CAP), line_len[c]);
+    park_len[s] = line_len[c];
+    park_owner[s] = line_owner[c];
+    park_clock = park_clock + 1;
+    park_seq[s] = park_clock;
+    line_len[c] = 0;
+    line_owner[c] = 0;
+}
+
+// Caller holds serial_lock. Make cpu c's buffer `me`'s, with me's own half
+// line in it if me has one anywhere.
+fn claim_line(c as i64, me as i64) as void {
+    if (line_len[c] > 0) {
+        if (line_owner[c] == me) { return; }
+        park_line(c);
+    }
+    line_owner[c] = me;
+    let is i64 as k with mut = 0;
+    while (k < PARK_SLOTS) {
+        if (park_owner[k] == me) {
+            copy_bytes(cast(*u8, cast(i64, &line_buf[0]) + c * LINE_CAP),
+                       cast(*u8, cast(i64, &park_buf[0]) + k * LINE_CAP), park_len[k]);
+            line_len[c] = park_len[k];
+            park_owner[k] = 0;
+            return;
+        }
+        k = k + 1;
+    }
+    // It migrated with a line half-written on the cpu it left.
+    let is i64 as d with mut = 0;
+    while (d < MAX_LINE_CPUS) {
+        if (d != c && line_len[d] > 0 && line_owner[d] == me) {
+            copy_bytes(cast(*u8, cast(i64, &line_buf[0]) + c * LINE_CAP),
+                       cast(*u8, cast(i64, &line_buf[0]) + d * LINE_CAP), line_len[d]);
+            line_len[c] = line_len[d];
+            line_len[d] = 0;
+            line_owner[d] = 0;
+            return;
+        }
+        d = d + 1;
+    }
+}
+
 fn which_cpu() as i64 {
     if (cpu_id_fn == 0) { return 0; }
     let is i64 as c = call(cast(fn() as i64, cpu_id_fn));
@@ -169,6 +281,7 @@ fn flush_locked(c as i64) as void {
 fn emit(ch as i64) as void {
     let is i64 as flags = out_lock();
     let is i64 as c = which_cpu();
+    claim_line(c, who());
     if (ch == LF) {
         // Normalise to CRLF at the boundary, so callers keep writing '\n'.
         if (line_len[c] < LINE_CAP) {
@@ -181,6 +294,7 @@ fn emit(ch as i64) as void {
         }
         hist_record(c);
         flush_locked(c);
+        line_owner[c] = 0;
     } else if (ch != CR) {
         line_buf[c * LINE_CAP + line_len[c]] = cast(u8, ch);
         line_len[c] = line_len[c] + 1;
@@ -233,6 +347,17 @@ fn flush_all() as void {
             putc_raw(LF);
         }
         i = i + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < PARK_SLOTS) {
+        if (park_owner[k] != 0) {
+            let is i64 as j with mut = 0;
+            while (j < park_len[k]) { putc_raw(cast(i64, park_buf[k * LINE_CAP + j])); j = j + 1; }
+            putc_raw(CR);
+            putc_raw(LF);
+            park_owner[k] = 0;
+        }
+        k = k + 1;
     }
     out_unlock(flags);
     return;

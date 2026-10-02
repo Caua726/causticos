@@ -32,8 +32,8 @@
 # direct child (never wrapped in `timeout`, so the kill reaps qemu itself and
 # releases the image lock — otherwise the next run inherits a locked file and
 # reports a spurious timeout), and the serial log is stripped of NUL bytes before
-# grep, because the kernel's output interleaves them and a raw grep misses every
-# marker.
+# grep — the kernel's output used to interleave them (miscounted string lengths,
+# now checked before every sweep), and a raw grep missed every marker.
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$(dirname "$0")")"
@@ -122,6 +122,12 @@ SMOKE_MARKERS=(
 )
 # On the smoke boot a FAIL from any smoke fails the gate.
 SMOKE_FAIL_PATTERN="$FAIL_PATTERN|FAIL"
+
+# Hand-counted string lengths first. One counted long sends the literal's NUL
+# and whatever follows it in rodata to the console — the NUL bytes this log
+# used to be full of — and one counted short cuts a message; neither shows up
+# as a failed boot, so no gate below would ever see it.
+"$PY" scripts/check-str-lens.py || { echo "verify: a string length is miscounted (scripts/check-str-lens.py --fix)" >&2; exit 1; }
 
 echo "verify: building the images under test"
 caustic-mk build kernel >/dev/null 2>&1 || { echo "verify: kernel build failed" >&2; exit 1; }
