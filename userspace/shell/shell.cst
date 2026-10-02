@@ -86,6 +86,7 @@ fn read_file(path as *u8, out_len as *i64) as *u8 {
 let is i64 as g_kfd with mut = 0;
 let is i64 as g_shift with mut = 0;
 let is i64 as g_ctrl with mut = 0;
+let is i64 as SCROLLBACK with imut = 2000;
 
 // Reply to a TUI child's CSI 18t query: report the grid as ESC[8;rows;cols t on
 // the child's stdin — the same in-band, no-ioctl size protocol the wterm uses.
@@ -301,6 +302,10 @@ fn finish_job(t as *term.Term, slot as i64) as void {
     let is i64 as unread with mut = 0;
     if (fg_job == slot) {
         was_fg = 1;
+        // A program that ended without putting the terminal back (killed,
+        // or an error on the way out) does not leave its screen, a hidden
+        // cursor or mouse reporting behind it.
+        term.end_program(t);
         fg_job = 0 - 1;
         // What it was sent and never read: the channel still counts it after
         // the job's end closed. Saved before release closes ours.
@@ -519,6 +524,17 @@ fn main() as i32 {
     let is gfx.Framebuffer as fb = gfx.open();
     if (fb.ok == 0) { sys.write_serial("shell: NO FB\n", 13); sys.exit(cast(i32, 1)); }
     let is term.Term as t = term.init(fb.base, fb.fd, fb.width, fb.height, fb.pitch, fb.bpp);
+    // A grid behind the screen: what scrolls off is kept (Shift+PgUp/PgDn page
+    // back through it) and a full-screen program's own screen can be put away
+    // again when it exits. Reserved for SCROLLBACK lines and committed as they
+    // are used. Without it the shell still works, as it used to: no history,
+    // and a program's screen is just cleared when it leaves.
+    let is i64 as grows = SCROLLBACK + t.rows;
+    let is i64 as gbytes = ((t.cols * grows * 8 + 4095) / 4096) * 4096;
+    let is i64 as gva = sys.reserve(0, gbytes, sys.PROT_READ | sys.PROT_WRITE);
+    if (gva >= 0) {
+        if (term.attach_grid_lazy(&t, cast(*i64, gva), t.cols, grows) != 0) { sys.munmap(gva, gbytes); }
+    }
     _col(&t, C_TITLE);
     puts(&t, "Caustic Shell  v0.1\n");
     _col(&t, C_DIM);
@@ -602,7 +618,17 @@ fn main() as i32 {
                 if (input.is_shift(ev.scancode) == 1) { g_shift = ev.pressed; }
                 else if (input.is_ctrl(ev.scancode) == 1) { g_ctrl = ev.pressed; }
                 else if (ev.pressed == 1) {
-                    if (fg_job >= 0) { key_to_fg(&ev); } else { key_to_line(&t, &ev); }
+                    // Shift+PgUp/PgDn page through the history, whoever has the
+                    // keys; any other key brings the live screen back first.
+                    if (g_shift == 1 && ev.extended == 1 && (ev.scancode == 0x49 || ev.scancode == 0x51)) {
+                        let is i64 as page with mut = t.rows - 1;
+                        if (page < 1) { page = 1; }
+                        if (ev.scancode == 0x49) { term.scroll_view(&t, page); } else { term.scroll_view(&t, 0 - page); }
+                        term.flush(&t);
+                    } else {
+                        if (t.view_off != 0) { term.scroll_view(&t, 0 - t.view_off); term.flush(&t); }
+                        if (fg_job >= 0) { key_to_fg(&ev); } else { key_to_line(&t, &ev); }
+                    }
                 }
             }
         }
