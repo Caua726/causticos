@@ -129,6 +129,8 @@ fn spawn_client_path(cpath as *u8, cname as *u8, cnlen as i64,
     s.wins[i].pend_focus = 0 - 1;
     s.wins[i].pend_close = 0;
     s.wins[i].hello_deadline = sys.time_ns() + s.HELLO_NS;
+    s.wins[i].surf_pend = 0;
+    s.wins[i].surf_fd = 0;
     s.wins[i].mb_fill = 0;
     s.wins[i].maximized = 0;
     s.wins[i].minimized = 0;
@@ -250,6 +252,10 @@ fn reap_window_final(i as i64, do_wait as i64) as void {
     if (s.wins[i].state == 2) {
         cp.msg_send(s.wc_fd, cp.MSG_WC_DETACH_SURFACE, i, 0, 0);
     }
+    if (s.wins[i].surf_pend == 1) {
+        sys.close(s.wins[i].surf_fd);
+        s.wins[i].surf_pend = 0;
+    }
     if (s.wins[i].dec_fd != 0) {
         cp.msg_send(s.wc_fd, cp.MSG_WC_DEC_DETACH, i, 0, 0);
         sys.munmap(s.wins[i].dec_base, s.wins[i].dec_pages * 4096);
@@ -293,10 +299,67 @@ fn reap_window_final(i as i64, do_wait as i64) as void {
     return;
 }
 
+// surface_handoff — pass window i's surface to the compositor; the window goes
+// on screen with it. The WM channel to the compositor carries one fd at a time,
+// and the one before (another window's surface, a decoration) may not have
+// been taken yet — the compositor can be in the middle of a frame. Then this
+// is tried again on the next pass of the loop, never waited for.
+//
+// It used to be waited for, up to a thousand times with a 200 us "sleep" in
+// between — a poll of no entries, which the kernel refuses at once. The
+// thousand tries took a millisecond or two, and a window whose surface met a
+// busy slot was killed: the launcher, on about one boot in twenty.
+fn surface_handoff(i as i64) as void {
+    let is i64 as fr = sys.fd_send(s.wc_fd, s.wins[i].surf_fd);
+    if (fr == sys.E_AGAIN) { s.surf_waiting = 1; return; }
+    sys.close(s.wins[i].surf_fd);
+    s.wins[i].surf_pend = 0;
+    if (fr != 0) {
+        wmp.log_kv(cast(*u8, "wm: closed: surface not handed over rc="), 39, fr);
+        reap_window(i, 0);
+        return;
+    }
+    cp.msg_send(s.wc_fd, cp.MSG_WC_ATTACH_SURFACE, i, s.wins[i].seg_pages,
+                 (s.wins[i].is_text & 1) | ((s.wins[i].seg_stride & 0xFFFFFFFF) << 32));
+    s.wins[i].seg_fd = 0;
+    s.wins[i].seg_base = 0;
+    s.wins[i].state = 2;
+    // The window becomes visible exactly here — its surface just arrived —
+    // so this is where it grows and fades in.
+    wan.open_start(i, sys.time_ns());
+    wan.task_start(i, sys.time_ns());
+    dmg.dmg_frame(i);
+    dmg.dmg_taskbar();
+    s.scene_dirty = 1;
+    s.deco_dirty = 1;
+    // It only joins the layout now: a window with no surface has nothing
+    // to show in a column.
+    s.arrange_dirty = 1;
+    s.layout_dirty = 1;
+    return;
+}
+
+// surface_handoffs — one more try for every surface still waiting, each pass.
+// Leaves s.surf_waiting set while any is, so the loop keeps the frame clock.
+fn surface_handoffs() as void {
+    let is i64 as waiting with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.MAX_WIN) {
+        if (s.wins[i].used == 1 && s.wins[i].state == 1 && s.wins[i].surf_pend == 1) {
+            surface_handoff(i);
+            if (s.wins[i].used == 1 && s.wins[i].surf_pend == 1) { waiting = 1; }
+        }
+        i = i + 1;
+    }
+    s.surf_waiting = waiting;
+    return;
+}
+
 fn handle_msg(i as i64, m as *i64) as void {
-    if (m[0] == wmp.MSG_HELLO && s.wins[i].state == 1) {
+    if (m[0] == wmp.MSG_HELLO && s.wins[i].state == 1 && s.wins[i].surf_pend == 0) {
         let is i64 as seg = sys.fd_recv(s.wins[i].chan);
         if (seg < 0) {
+            wmp.log_kv(cast(*u8, "wm: closed: HELLO had no surface rc="), 36, seg);
             reap_window(i, 0);
             return;
         }
@@ -304,36 +367,9 @@ fn handle_msg(i as i64, m as *i64) as void {
         if (wmp.hello_kind(m[3]) == wmp.SURFACE_TEXT) { s.wins[i].is_text = 1; }
         s.wins[i].seg_pages = m[1];
         s.wins[i].seg_stride = m[2];
-        let is i64 as tries with mut = 0;
-        let is i64 as sent with mut = 0;
-        while (tries < 1000 && sent == 0) {
-            let is i64 as fr = sys.fd_send(s.wc_fd, seg);
-            if (fr == 0) { sent = 1; }
-            else if (fr == sys.E_AGAIN) { tries = tries + 1; sys.poll(cast(*i64, 0), 0, 200000); }
-            else { sent = 0 - 1; tries = 1000; }
-        }
-        sys.close(seg);
-        if (sent != 1) {
-            reap_window(i, 0);
-            return;
-        }
-        cp.msg_send(s.wc_fd, cp.MSG_WC_ATTACH_SURFACE, i, m[1],
-                     (s.wins[i].is_text & 1) | ((m[2] & 0xFFFFFFFF) << 32));
-        s.wins[i].seg_fd = 0;
-        s.wins[i].seg_base = 0;
-        s.wins[i].state = 2;
-        // The window becomes visible exactly here — its surface just arrived —
-        // so this is where it grows and fades in.
-        wan.open_start(i, sys.time_ns());
-        wan.task_start(i, sys.time_ns());
-        dmg.dmg_frame(i);
-        dmg.dmg_taskbar();
-        s.scene_dirty = 1;
-        s.deco_dirty = 1;
-        // It only joins the layout now: a window with no surface has nothing
-        // to show in a column.
-        s.arrange_dirty = 1;
-        s.layout_dirty = 1;
+        s.wins[i].surf_fd = seg;
+        s.wins[i].surf_pend = 1;
+        surface_handoff(i);
     } else if (m[0] == wmp.MSG_COMMIT) {
         if (s.wins[i].state != 2) { return; }
         if (s.wins[i].is_text == 1) {
