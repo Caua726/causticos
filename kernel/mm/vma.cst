@@ -770,6 +770,11 @@ fn mmap_pages_at(a as *Aspace, va_hint as i64, pfns_ptr as i64, npages as i64,
 // The first descriptor a caller may be handed without asking for it.
 let is i64 as FD_FIRST_DYNAMIC = 3;
 
+// The object at `fd`, WITHOUT a reference: only for an aspace no other thread
+// can be using (a process still being built, a smoke test). A syscall uses
+// fd_hold or fd_take — between this load and the use, a sibling thread can
+// close the fd and drop the last reference, and the kernel would be using a
+// freed object.
 fn fd_get(a as *Aspace, fd as i64) as i64 {
     if (cast(i64, a) == 0) { return 0; }
     if (fd < 0) { return 0; }
@@ -784,6 +789,75 @@ fn fd_set(a as *Aspace, fd as i64, file as i64) as void {
     if (fd >= FD_TABLE_CAP) { return; }
     let is *i64 as t = cast(*i64, &a.fd_entries[0]);
     t[fd] = file;
+}
+
+// The object at `fd` with a reference taken for the caller, under the table
+// lock — so a close racing it either happens first (0, E_BADF) or leaves the
+// object alive until the caller's kobject.ko_unref. 0 for an empty slot.
+fn fd_take(a as *Aspace, fd as i64) as i64 {
+    if (cast(i64, a) == 0) { return 0; }
+    if (fd < 0) { return 0; }
+    if (fd >= FD_TABLE_CAP) { return 0; }
+    lock.acquire(lk_ptr(a));
+    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    let is i64 as ko = t[fd];
+    if (ko != 0) { kobject.ko_ref(ko); }
+    lock.release(lk_ptr(a));
+    return ko;
+}
+
+// fd_take for the length of the current syscall: the reference is parked in
+// the calling thread (THR_HELD0/1) and dropped by fd_release_held on the way
+// back to ring 3 (lifecycle.at_user_boundary), so a handler with a dozen exits
+// cannot leak it on one. Two per syscall (sys_fd_send needs a channel and the
+// object it sends); asking for a third is a kernel bug and gets 0 — the
+// caller's E_BADF — rather than an untracked reference.
+fn fd_hold(a as *Aspace, fd as i64) as i64 {
+    let is i64 as tid = sched.current_tid();
+    let is i64 as slot with mut = 0;
+    if (sched.thr_get(tid, sched.THR_HELD0) == 0) { slot = sched.THR_HELD0; }
+    else if (sched.thr_get(tid, sched.THR_HELD1) == 0) { slot = sched.THR_HELD1; }
+    else {
+        serial.println("vma: fd_hold: a third fd held in one syscall - refused", 54);
+        return 0;
+    }
+    let is i64 as ko = fd_take(a, fd);
+    if (ko != 0) { sched.thr_set(tid, slot, ko); }
+    return ko;
+}
+
+// Drop whatever the current syscall held. Two loads when there is nothing.
+fn fd_release_held() as void {
+    let is i64 as tid = sched.current_tid();
+    let is i64 as k0 = sched.thr_get(tid, sched.THR_HELD0);
+    if (k0 != 0) {
+        sched.thr_set(tid, sched.THR_HELD0, 0);
+        kobject.ko_unref(k0);
+    }
+    let is i64 as k1 = sched.thr_get(tid, sched.THR_HELD1);
+    if (k1 != 0) {
+        sched.thr_set(tid, sched.THR_HELD1, 0);
+        kobject.ko_unref(k1);
+    }
+}
+
+// Take the object out of `fd` and hand the caller the table's reference: the
+// slot is emptied and the object returned in one hold of the lock. Two threads
+// closing one fd used to both read the object, both clear the slot, and both
+// drop "the" reference — one more than there was. 0 if the slot was empty.
+fn fd_remove(a as *Aspace, fd as i64) as i64 {
+    if (cast(i64, a) == 0) { return 0; }
+    if (fd < 0) { return 0; }
+    if (fd >= FD_TABLE_CAP) { return 0; }
+    lock.acquire(lk_ptr(a));
+    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    let is i64 as ko = t[fd];
+    if (ko != 0) {
+        t[fd] = 0;
+        a.fd_count = a.fd_count - 1;
+    }
+    lock.release(lk_ptr(a));
+    return ko;
 }
 
 // Find the lowest empty slot at or above FD_FIRST_DYNAMIC, install `file`,

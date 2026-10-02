@@ -91,7 +91,7 @@ let is i64 as MAX_THREADS      = 64;
 let is i64 as FPU_STATE_SIZE   = 512;
 
 // ============================================================
-// Thread struct — 384 bytes
+// Thread struct — 400 bytes
 // ============================================================
 // 0    tid              i64
 // 8    state            i64
@@ -146,10 +146,12 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 352  wait_next        i64   (mutex wait queue link: next waiter tid + 1)
 // 360  wait_granted     i64   (1 once a mutex release handed this thread the lock)
 // 368  intr_sleep       i64   (1 while in a sleep a kill may cut short)
-// 376  reserved         8 bytes
-// Total: 384
+// 376  held_ko0         i64   (a KObject this syscall holds a reference to —
+// 384  held_ko1         i64    vma.fd_hold; dropped on the way back to ring 3)
+// 392  queued_band      i64   (band + 1 while in a run-queue tree, 0 when not)
+// Total: 400
 
-let is i64 as THREAD_SIZE = 384;
+let is i64 as THREAD_SIZE = 400;
 
 // Named slots used outside this file. initial_rdi and poll_parked used to
 // share 336; they never collided only because a worker reads its rdi before
@@ -159,18 +161,14 @@ let is i64 as THR_WAIT_NEXT    = 352;
 let is i64 as THR_WAIT_GRANTED = 360;
 let is i64 as THR_KILL         = 328;
 let is i64 as THR_INTR_SLEEP   = 368;
+let is i64 as THR_HELD0        = 376;
+let is i64 as THR_HELD1        = 384;
+let is i64 as THR_QUEUED       = 392;
 // Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
 // Created lazily on first use under heap_lock (SMP-safe), so there is no
 // init-order dependency between sched.init and per_cpu_init / AP bring-up.
 let is i64 as thread_pool with mut = 0;
 let is i64 as fpu_pool with mut = 0;
-
-// TID → Thread* hash table (open addressing, power-of-2 size)
-// Each slot: [tid (i64), ptr (i64)] = 16 bytes. tid = -1 means empty.
-let is i64 as tid_ht_buf with mut = 0;     // kmalloc'd buffer
-let is i64 as tid_ht_cap with mut = 0;     // capacity (power of 2)
-let is i64 as tid_ht_count with mut = 0;   // entries used
-let is i64 as TID_HT_EMPTY = 0 - 1;       // sentinel for empty slot
 
 let is i64 as thread_count with mut = 0;
 let is i64 as next_tid with mut = 0;
@@ -183,142 +181,230 @@ let is i64 as next_tid with mut = 0;
 // per-cpu sched_lock. Order: sched_lock(cpu) > tid_lock > heap_lock.
 let is lock.TicketLock as tid_lock with mut;
 
-fn tid_ht_init(cap as i64) as void {
-    let is i64 as size = cap * 16;
-    tid_ht_buf = heap.kmalloc(size, pmm.ALLOC_ZERO);
-    if (tid_ht_buf == 0) { pmm.panic("tid_ht alloc fail", 17); }
-    tid_ht_cap = cap;
-    tid_ht_count = 0;
-    // Mark all slots empty
+// TID -> Thread* table. Every scheduler path reads it, on every cpu, with no
+// lock (thread_ptr, under thr_get/thr_set); it is written under tid_lock. The
+// first version was an ordinary open-addressing table, and three things in it
+// were unsafe for a reader running alongside a writer:
+//   - growing published the new, still-EMPTY buffer before copying into it,
+//     and cap and buffer as two separate stores, so a lookup during a grow
+//     found nothing or probed with the wrong mask;
+//   - the old buffer was freed while lookups could still be inside it;
+//   - deleting shifted later entries back into the hole (backward-shift
+//     deletion), so a lookup could meet the transient EMPTY and conclude a
+//     live thread did not exist.
+// A lookup that comes back empty reads every field as 0 (thr_get's guard), and
+// "band 0" is QOS_INPUT: make_runnable queued a new thread in the highest band
+// under the wrong number, leaving a ghost node that pick_next chose forever
+// over every real thread below it. That was the hang.
+//
+// So now:
+//   - one allocation {cap, used, live, -, slots[cap]{tid, ptr}} behind one
+//     pointer, tid_tab: a reader loads it once and sees a matching cap;
+//   - a deleted entry becomes TID_TOMB and never moves; lookups probe past it;
+//     an insert reuses the first tombstone on its path;
+//   - an entry is written pointer first, tid second, so a reader that sees the
+//     tid sees its pointer;
+//   - a full table (live + tombstones past 3/4) is rebuilt complete, then
+//     published with one store; the old one is retired, and freed only once
+//     every cpu has since passed a quiescent point — schedule() past its
+//     preemption gate, or the top of its idle loop — which a lookup cannot
+//     span, because thread_ptr holds preemption off while it reads.
+let is i64 as TID_EMPTY = 0 - 1;
+let is i64 as TID_TOMB  = 0 - 2;
+let is i64 as TID_HDR_WORDS = 4;          // cap, used, live, reserved
+let is i64 as tid_tab with mut = 0;
+
+// Retired tables waiting for their grace period: the table, and each cpu's
+// quiescent count when it was retired.
+let is i64 as TID_RETIRE_MAX = 8;
+let is [8]i64 as tid_retired with mut;
+let is [128]i64 as tid_retired_seen with mut;     // TID_RETIRE_MAX * 16 cpus
+let is [16]i64 as cpu_quiesce with mut;           // per-cpu quiescent count
+
+fn tid_tab_alloc(cap as i64) as i64 {
+    let is i64 as t = heap.kmalloc((TID_HDR_WORDS + cap * 2) * 8, pmm.ALLOC_ZERO);
+    if (t == 0) { pmm.panic("tid table alloc failed", 22); }
+    let is *i64 as h = cast(*i64, t);
+    h[0] = cap;
+    h[1] = 0;
+    h[2] = 0;
     let is i64 as i with mut = 0;
     while (i < cap) {
-        let is *i64 as slot = cast(*i64, tid_ht_buf + i * 16);
-        slot[0] = TID_HT_EMPTY;
+        h[TID_HDR_WORDS + i * 2] = TID_EMPTY;
         i = i + 1;
     }
+    return t;
 }
 
-fn tid_ht_grow() as void {
-    let is i64 as old_buf = tid_ht_buf;
-    let is i64 as old_cap = tid_ht_cap;
-    let is i64 as new_cap = old_cap * 2;
-    let is i64 as new_buf = heap.kmalloc(new_cap * 16, pmm.ALLOC_ZERO);
-    if (new_buf == 0) { pmm.panic("tid_ht grow fail", 16); }
-
-    // Mark new slots empty
-    let is i64 as i with mut = 0;
-    while (i < new_cap) {
-        let is *i64 as slot = cast(*i64, new_buf + i * 16);
-        slot[0] = TID_HT_EMPTY;
-        i = i + 1;
-    }
-
-    // Rehash old entries
-    tid_ht_buf = new_buf;
-    tid_ht_cap = new_cap;
-    tid_ht_count = 0;
-    i = 0;
-    while (i < old_cap) {
-        let is *i64 as slot = cast(*i64, old_buf + i * 16);
-        if (slot[0] != TID_HT_EMPTY) {
-            tid_set_ptr(slot[0], slot[1]);
-        }
-        i = i + 1;
-    }
-    heap.kfree(old_buf);
+fn tid_ht_init(cap as i64) as void {
+    tid_tab = tid_tab_alloc(cap);
 }
 
-fn tid_set_ptr(tid as i64, ptr as i64) as void {
-    // Grow if > 75% full
-    if (tid_ht_count * 4 >= tid_ht_cap * 3) {
-        tid_ht_grow();
-    }
-    let is i64 as mask = tid_ht_cap - 1;
+// Store order matters to a reader on another cpu: the pointer has to be in the
+// slot before the tid that makes the slot match. x86 keeps stores in order; the
+// empty asm keeps the compiler from reordering them.
+fn tid_slot_publish(slot as *i64, tid as i64, ptr as i64) as void {
+    slot[1] = ptr;
+    asm("\n");
+    slot[0] = tid;
+}
+
+// Put (tid, ptr) into table t, which has room. Caller holds tid_lock.
+fn tid_tab_put(t as i64, tid as i64, ptr as i64) as void {
+    let is *i64 as h = cast(*i64, t);
+    let is i64 as cap = h[0];
+    let is i64 as mask = cap - 1;
     let is i64 as idx with mut = tid & mask;
-    let is i64 as done with mut = 0;
-    while (done == 0) {
-        let is *i64 as slot = cast(*i64, tid_ht_buf + idx * 16);
-        if (slot[0] == TID_HT_EMPTY) {
-            slot[0] = tid;
-            slot[1] = ptr;
-            tid_ht_count = tid_ht_count + 1;
-            done = 1;
-        } else {
-            if (slot[0] == tid) {
-                slot[1] = ptr;  // update existing
-                done = 1;
+    let is i64 as tomb with mut = 0 - 1;
+    let is i64 as steps with mut = 0;
+    while (steps < cap) {
+        let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
+        if (slot[0] == tid) { slot[1] = ptr; return; }
+        if (slot[0] == TID_TOMB && tomb < 0) { tomb = idx; }
+        if (slot[0] == TID_EMPTY) {
+            if (tomb >= 0) {
+                tid_slot_publish(cast(*i64, t + (TID_HDR_WORDS + tomb * 2) * 8), tid, ptr);
             } else {
-                idx = (idx + 1) & mask;  // linear probe
+                tid_slot_publish(slot, tid, ptr);
+                h[1] = h[1] + 1;                      // an EMPTY became used
+            }
+            h[2] = h[2] + 1;
+            return;
+        }
+        idx = (idx + 1) & mask;
+        steps = steps + 1;
+    }
+    if (tomb >= 0) {
+        tid_slot_publish(cast(*i64, t + (TID_HDR_WORDS + tomb * 2) * 8), tid, ptr);
+        h[2] = h[2] + 1;
+        return;
+    }
+    pmm.panic("tid table full", 14);
+}
+
+// This cpu is at a point where it holds no table pointer. Called from
+// schedule() past the preemption gate and from the top of the idle loop.
+fn tid_quiesce(cpu as i64) as void {
+    cpu_quiesce[cpu] = cpu_quiesce[cpu] + 1;
+}
+
+// Free the retired tables whose grace period is over: every cpu that is up has
+// been quiescent since they were retired. Caller holds tid_lock.
+fn tid_reclaim_locked() as void {
+    let is i64 as ncpu = smp.get_cpu_count();
+    let is i64 as r with mut = 0;
+    while (r < TID_RETIRE_MAX) {
+        if (tid_retired[r] != 0) {
+            let is i64 as all with mut = 1;
+            let is i64 as c with mut = 0;
+            while (c < ncpu) {
+                if (cpu_quiesce[c] == tid_retired_seen[r * 16 + c]) { all = 0; }
+                c = c + 1;
+            }
+            if (all == 1) {
+                heap.kfree(tid_retired[r]);
+                tid_retired[r] = 0;
             }
         }
+        r = r + 1;
     }
+}
+
+fn tid_retire_locked(t as i64) as void {
+    tid_reclaim_locked();
+    let is i64 as ncpu = smp.get_cpu_count();
+    let is i64 as r with mut = 0;
+    while (r < TID_RETIRE_MAX) {
+        if (tid_retired[r] == 0) {
+            let is i64 as c with mut = 0;
+            while (c < ncpu) {
+                tid_retired_seen[r * 16 + c] = cpu_quiesce[c];
+                c = c + 1;
+            }
+            tid_retired[r] = t;
+            return;
+        }
+        r = r + 1;
+    }
+    // Eight rebuilds inside one grace period: something keeps every cpu from
+    // ever reaching schedule() or its idle loop, and the table cannot be
+    // replaced safely. Say so rather than free memory that may be in use.
+    pmm.panic("tid table: no retire slot (a cpu never quiesces)", 48);
+}
+
+// Caller holds tid_lock.
+fn tid_set_ptr(tid as i64, ptr as i64) as void {
+    let is *i64 as h = cast(*i64, tid_tab);
+    let is i64 as cap = h[0];
+    if ((h[1] + 1) * 4 > cap * 3) {
+        // Rebuild: double when live threads fill half of it, otherwise the
+        // same size, which clears the tombstones.
+        let is i64 as new_cap with mut = cap;
+        if ((h[2] + 1) * 2 > cap) { new_cap = cap * 2; }
+        let is i64 as nt = tid_tab_alloc(new_cap);
+        let is i64 as i with mut = 0;
+        while (i < cap) {
+            let is *i64 as slot = cast(*i64, tid_tab + (TID_HDR_WORDS + i * 2) * 8);
+            if (slot[0] >= 0) { tid_tab_put(nt, slot[0], slot[1]); }
+            i = i + 1;
+        }
+        let is i64 as old = tid_tab;
+        asm("\n");
+        tid_tab = nt;                                 // one store publishes it
+        tid_retire_locked(old);
+    }
+    tid_tab_put(tid_tab, tid, ptr);
 }
 
 fn thread_ptr(tid as i64) as i64 {
-    let is i64 as mask = tid_ht_cap - 1;
-    let is i64 as idx with mut = tid & mask;
-    let is i64 as checked with mut = 0;
-    while (checked < tid_ht_cap) {
-        let is *i64 as slot = cast(*i64, tid_ht_buf + idx * 16);
-        if (slot[0] == TID_HT_EMPTY) { return 0; }  // not found
-        if (slot[0] == tid) { return slot[1]; }
-        idx = (idx + 1) & mask;
-        checked = checked + 1;
-    }
-    return 0;  // not found
-}
-
-// Remove tid from the open-addressing table (backward-shift deletion,
-// Knuth 6.4 alg R). Keeps the no-tombstone invariant: thread_ptr's
-// stop-at-EMPTY probe stays correct and the table doesn't accumulate
-// dead slots under spawn/exit churn. Called by the reaper once a thread
-// is fully off-cpu. No-op if tid isn't present.
-fn tid_ht_remove(tid as i64) as void {
-    if (tid_ht_buf == 0) { return; }
-    let is i64 as mask = tid_ht_cap - 1;
-    let is i64 as i with mut = tid & mask;
-    let is i64 as steps with mut = 0;
+    // Preemption off while the table pointer is in hand: the grace period that
+    // frees a retired table counts on no lookup spanning a switch.
+    let is i64 as track = lock.preempt_track;
+    if (track != 0) { lock.preempt_inc(); }
+    let is i64 as t = tid_tab;
     let is i64 as found with mut = 0;
-    while (steps < tid_ht_cap) {
-        let is *i64 as slot = cast(*i64, tid_ht_buf + i * 16);
-        if (slot[0] == TID_HT_EMPTY) { return; }       // not present
-        if (slot[0] == tid) { found = 1; steps = tid_ht_cap; }   // found at i
-        else { i = (i + 1) & mask; steps = steps + 1; }
-    }
-    if (found == 0) { return; }
-    // Gap at i. Walk forward; pull back any entry whose home slot is not
-    // cyclically within (i, j], closing the gap so no live key is left
-    // unreachable past an EMPTY.
-    let is i64 as done with mut = 0;
-    while (done == 0) {
-        let is *i64 as si = cast(*i64, tid_ht_buf + i * 16);
-        si[0] = TID_HT_EMPTY;
-        let is i64 as j with mut = (i + 1) & mask;
-        let is i64 as inner with mut = 0;
-        while (inner == 0) {
-            let is *i64 as sj = cast(*i64, tid_ht_buf + j * 16);
-            if (sj[0] == TID_HT_EMPTY) { inner = 1; done = 1; }
+    if (t != 0 && tid >= 0) {
+        let is *i64 as h = cast(*i64, t);
+        let is i64 as cap = h[0];
+        let is i64 as mask = cap - 1;
+        let is i64 as idx with mut = tid & mask;
+        let is i64 as checked with mut = 0;
+        while (checked < cap) {
+            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
+            let is i64 as st = slot[0];
+            if (st == tid) { found = slot[1]; checked = cap; }
+            else if (st == TID_EMPTY) { checked = cap; }
             else {
-                let is i64 as home = sj[0] & mask;
-                let is i64 as keep with mut = 0;        // 1 = leave in place
-                if (i <= j) {
-                    if (i < home) { if (home <= j) { keep = 1; } }
-                } else {
-                    if (i < home) { keep = 1; }
-                    if (home <= j) { keep = 1; }
-                }
-                if (keep == 1) {
-                    j = (j + 1) & mask;
-                } else {
-                    si[0] = sj[0];
-                    si[1] = sj[1];
-                    i = j;
-                    inner = 1;       // gap moved to j; restart outer
-                }
+                idx = (idx + 1) & mask;
+                checked = checked + 1;
             }
         }
     }
-    tid_ht_count = tid_ht_count - 1;
+    if (track != 0) { lock.preempt_dec(); }
+    return found;
+}
+
+// Remove tid: its slot becomes a tombstone, nothing moves. Caller holds
+// tid_lock. No-op if tid is not present.
+fn tid_ht_remove(tid as i64) as void {
+    let is i64 as t = tid_tab;
+    if (t == 0) { return; }
+    let is *i64 as h = cast(*i64, t);
+    let is i64 as cap = h[0];
+    let is i64 as mask = cap - 1;
+    let is i64 as idx with mut = tid & mask;
+    let is i64 as steps with mut = 0;
+    while (steps < cap) {
+        let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
+        if (slot[0] == TID_EMPTY) { return; }
+        if (slot[0] == tid) {
+            slot[0] = TID_TOMB;
+            h[2] = h[2] - 1;
+            return;
+        }
+        idx = (idx + 1) & mask;
+        steps = steps + 1;
+    }
 }
 
 // thr_get/thr_set go through thread_ptr which returns 0 when the
@@ -859,17 +945,54 @@ fn cond_resched() as void {
 
 // RB tree insert/remove for QoS bands (keyed by virtual_deadline).
 // Per-cpu: caller passes cpu_id of the runqueue that owns tid.
+// A thread is in at most one run-queue tree, and only while queued. Each
+// thread records which (THR_QUEUED: band + 1), and both operations check it:
+// a thread queued twice, or removed from a band it is not in, leaves a node
+// behind that pick_next keeps choosing — a "ghost" of a thread that is running
+// elsewhere or is dead, ahead of every real one in lower bands. That is a
+// corrupted run queue, and it stops the kernel saying so, rather than leaving
+// a cpu picking the ghost forever.
 fn runlist_insert(cpu as i64, band as i64, tid as i64) as void {
+    if (thr_get(tid, THR_QUEUED) != 0) {
+        runq_corrupt("inserting a thread that is already queued", 41, cpu, band, tid);
+    }
+    if (band != thr_band(tid)) {
+        runq_corrupt("inserting a thread into a band that is not its own", 50, cpu, band, tid);
+    }
     rb.rb_insert(band_root_ptr(cpu, band), thr_vdeadline(tid), tid);
     band_set_count(cpu, band, band_count(cpu, band) + 1);
+    thr_set(tid, THR_QUEUED, band + 1);
 }
 
 fn runlist_remove(cpu as i64, band as i64, tid as i64) as void {
     let is i64 as node = rb.rb_find_by_val(band_root(cpu, band), tid);
-    if (node != 0) {
-        rb.rb_delete(band_root_ptr(cpu, band), node);
-        band_set_count(cpu, band, band_count(cpu, band) - 1);
+    if (node == 0) {
+        runq_corrupt("removing a thread from a band it is not in", 42, cpu, band, tid);
     }
+    rb.rb_delete(band_root_ptr(cpu, band), node);
+    band_set_count(cpu, band, band_count(cpu, band) - 1);
+    thr_set(tid, THR_QUEUED, 0);
+}
+
+fn runq_corrupt(what as *u8, len as i64, cpu as i64, band as i64, tid as i64) as void {
+    serial.print("sched: run queue: ", 18);
+    serial.print(what, len);
+    serial.print(" - cpu=", 7);
+    util.print_num(cpu);
+    serial.print(" band=", 6);
+    util.print_num(band);
+    serial.print(" tid=", 5);
+    util.print_num(tid);
+    serial.print(" queued_band+1=", 15);
+    util.print_num(thr_get(tid, THR_QUEUED));
+    serial.print(" state=", 7);
+    util.print_num(thr_state(tid));
+    serial.print(" home=", 6);
+    util.print_num(thr_home_cpu(tid));
+    serial.print(" this_cpu=", 10);
+    util.print_num(this_cpu());
+    serial.println("", 0);
+    pmm.panic("scheduler run queue corrupted", 29);
 }
 
 // ============================================================
@@ -1537,9 +1660,9 @@ fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
 // runqueue. The process spawn path calls this (proc_start) after the
 // child's fd table is set up. No-op if the thread isn't suspended.
 fn make_runnable(tid as i64) as void {
-    let is i64 as band = thr_band(tid);
     let is i64 as cpu with mut = 0;
     let is i64 as f = lock_home(tid, &cpu);
+    let is i64 as band = thr_band(tid);
     if (thr_state(tid) == THREAD_SUSPENDED) {
         // Re-placed against the band as it is NOW: the average has moved on
         // since the thread was created suspended.
@@ -2190,6 +2313,7 @@ fn schedule() as void {
     let is i64 as now = timer.current_time_ns();
     heartbeat_set(cpu, now);
     switch_set(cpu, now);
+    tid_quiesce(cpu);
     let is i64 as prev = current_tid();
 
     // Charge the slice that just ended to this cpu's busy or idle total. Done
@@ -2784,7 +2908,11 @@ fn reap_one(tid as i64) as void {
     let is i64 as kstack_va = thr_get(tid, 312);    // guarded kstack VA (0 if none)
     let is i64 as io_buf = thr_get(tid, 320);       // per-thread I/O staging (0 if never used)
     let is i64 as fpu = thr_get(tid, 240);    // fpu_state_addr
+    // Under tid_lock: a thread being created on another cpu writes the same
+    // table, and this ran without it.
+    let is i64 as tf = lock.acquire_irq(&tid_lock);
     tid_ht_remove(tid);
+    lock.release_irq(&tid_lock, tf);
     thread_count = thread_count - 1;
     if (fpu != 0) { heap.kpool_free(fpu_pool, fpu); }
     if (io_buf != 0) { heap.kfree(io_buf); }
@@ -2833,6 +2961,7 @@ fn idle_fn() as void {
     // already; the sti here is a harmless no-op for it.
     asm(".byte 0xFB\n");   // sti
     while (1 == 1) {
+        tid_quiesce(this_cpu());    // holding no tid-table pointer here
         // Nothing of our own to run: take queued work from a busier cpu.
         if (nr_running(this_cpu()) == 0) { steal_work(); }
         if (smp.this_cpu_need_resched() != 0) { schedule(); }

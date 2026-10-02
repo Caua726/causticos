@@ -169,12 +169,137 @@ fn test_fd_reservation() as void {
     return;
 }
 
+// ------------------------------------------------------------------
+// Descriptor races between threads of one process.
+//
+// The kernel looked an fd up and then used the object with no reference of
+// its own, so a sibling thread closing the fd in between could free it under
+// a syscall that was still using it. And close itself read the object, then
+// cleared the slot, then dropped the reference — two threads closing one fd
+// could both get that far and drop it twice.
+// ------------------------------------------------------------------
+
+let is i64 as race_fd with mut = 0 - 1;
+let is i64 as race_go with mut = 0;
+let is i64 as race_rc with mut = 0;
+let is i64 as race_done with mut = 0;
+
+fn closer(arg as i64) as void {
+    // getpid in the spin: a call the compiler cannot hoist the load out of.
+    while (race_go == 0) { sys.getpid(); }
+    race_rc = cast(i64, sys.close(race_fd));
+    race_done = 1;
+    sys.thread_exit(0);
+    return;
+}
+
+let is i64 as reader_fd with mut = 0 - 1;
+let is i64 as reader_n with mut = 0;
+let is i64 as reader_done with mut = 0;
+let is [8]u8 as reader_buf with mut;
+
+fn reader(arg as i64) as void {
+    reader_n = sys.read(reader_fd, cast(*u8, &reader_buf[0]), 8);
+    reader_done = 1;
+    sys.thread_exit(0);
+    return;
+}
+
+fn wait_flag(flag as *i64, ms as i64) as i64 {
+    let is i64 as spins with mut = 0;
+    while (flag[0] == 0 && spins < ms) { sys.sleep_ns(1000000); spins = spins + 1; }
+    return flag[0];
+}
+
+fn test_fd_races() as void {
+    say("descriptor races:\n");
+    // Three stacks: the closers alternate between two, so a round's thread
+    // never starts on the stack the previous one may still be leaving on; the
+    // reader gets the third.
+    let is i64 as STACK = 65536;
+    let is i64 as sp = sys.mmap(cast(i64, 0), STACK * 3, sys.PROT_READ | sys.PROT_WRITE);
+    if (sp < 0) { check(cast(*u8, "race stacks"), 0, sp, 0); return; }
+
+    // Two threads close one fd at the same moment, many times over: exactly
+    // one close may succeed, every time.
+    let is i64 as ROUNDS = 200;
+    let is i64 as bad_rounds with mut = 0;
+    let is i64 as both_ok with mut = 0;
+    let is i64 as r with mut = 0;
+    while (r < ROUNDS) {
+        let is [2]i64 as ch;
+        if (sys.channel_create(cast(*i64, &ch[0])) != 0) { bad_rounds = bad_rounds + 1; r = ROUNDS; }
+        else {
+            race_fd = ch[0];
+            race_go = 0;
+            race_done = 0;
+            race_rc = 99;
+            let is i64 as top = (sp + STACK * ((r & 1) + 1)) & (0 - 16);
+            if (sys.thread_spawn(cast(i64, fn_ptr(closer)), 0, top) <= 0) { bad_rounds = bad_rounds + 1; }
+            sys.sleep_ns(200000);
+            race_go = 1;
+            let is i64 as mine = cast(i64, sys.close(ch[0]));
+            if (wait_flag(&race_done, 2000) == 0) {
+                say("    round "); say_num(r); say(": the closer never finished\n");
+                bad_rounds = bad_rounds + 1;
+                r = ROUNDS;
+            }
+            let is i64 as wins with mut = 0;
+            if (mine == 0) { wins = wins + 1; }
+            if (race_rc == 0) { wins = wins + 1; }
+            if (wins == 2) { both_ok = both_ok + 1; }
+            if (wins != 1) {
+                bad_rounds = bad_rounds + 1;
+                say("    round "); say_num(r); say(": mine="); say_num(mine);
+                say(" theirs="); say_num(race_rc); say(" done="); say_num(race_done); say("\n");
+            }
+            sys.close(ch[1]);
+        }
+        r = r + 1;
+    }
+    check(cast(*u8, "a racing double close succeeds exactly once"), bad_rounds == 0, bad_rounds, 0);
+    check(cast(*u8, "never both"), both_ok == 0, both_ok, 0);
+
+    // A thread blocked reading an fd that another thread closes: the read
+    // still holds the object, so it completes when data comes — on memory
+    // that is still the channel — and the endpoint goes away once it returns.
+    let is [2]i64 as c2;
+    if (sys.channel_create(cast(*i64, &c2[0])) != 0) { check(cast(*u8, "channel"), 0, 0, 1); sys.munmap(sp, STACK * 3); return; }
+    reader_fd = c2[0];
+    reader_done = 0;
+    reader_n = 0;
+    let is i64 as rt = sys.thread_spawn(cast(i64, fn_ptr(reader)), 0, (sp + STACK * 3) & (0 - 16));
+    check(cast(*u8, "reader thread"), rt > 0, rt, 1);
+    sys.sleep_ns(30000000);                       // let it block in read
+    let is i64 as cr = cast(i64, sys.close(c2[0]));
+    check(cast(*u8, "close under a blocked read"), cr == 0, cr, 0);
+    let is i64 as wr = sys.write(c2[1], cast(*u8, "x"), 1);
+    check(cast(*u8, "the held endpoint still takes a write"), wr == 1, wr, 1);
+    wait_flag(&reader_done, 2000);
+    check(cast(*u8, "the blocked read completes with it"), reader_n == 1, reader_n, 1);
+    // The read returned, its reference went with it, and that was the last:
+    // the peer now finds the other side gone.
+    let is i64 as gone with mut = 0;
+    let is i64 as tries with mut = 0;
+    while (gone == 0 && tries < 200) {
+        if (sys.write(c2[1], cast(*u8, "y"), 1) == sys.E_PIPE) { gone = 1; }
+        else { sys.sleep_ns(1000000); }
+        tries = tries + 1;
+    }
+    check(cast(*u8, "and the endpoint is released after"), gone == 1, gone, 1);
+    sys.close(c2[1]);
+    sys.sleep_ns(10000000);                       // the last threads finish leaving
+    sys.munmap(sp, STACK * 3);
+    return;
+}
+
 fn main() as i32 {
     say("kabi: phase-A syscalls from ring 3\n");
     test_thread();
     test_events();
     test_devs();
     test_fd_reservation();
+    test_fd_races();
     if (fails == 0) { say("kabi: PASS\n"); return cast(i32, 0); }
     say("kabi: FAIL n="); say_num(fails); say("\n");
     return cast(i32, 1);
