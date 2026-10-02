@@ -466,11 +466,25 @@ fn flush(f as *VfsFile) as i64 {
     return e;
 }
 
-// Shutdown: whatever is waiting to the filesystem, before the disks are told
-// to flush their own caches.
-fn sync_all_files() as void {
+// Shutdown: whatever is waiting to the filesystem, and each filesystem's own
+// state (FAT32's FSInfo) to its disk — and from then on, no change at all.
+// Processes are still running when the machine powers off, and one writing a
+// file after the last sync (a terminal saving its history) changed the FAT or
+// a directory on its way to a power cut: the disk came up with what fsck
+// calls a damaged volume. After this, an operation that would change the disk
+// fails with E_IO; reading still works. Set under fs_lock, so an operation
+// already inside finishes first and is in the sync.
+let is i64 as frozen with mut = 0;
+
+fn shutdown() as void {
     mutex.acquire(&fs_lock);
     wb_flush();
+    let is *VfsMount as m with mut = mount_head();
+    while (cast(i64, m) != 0) {
+        if (cast(i64, m.ops) != 0 && cast(i64, m.ops.sync) != 0) { call(m.ops.sync, m.priv); }
+        m = m.next;
+    }
+    frozen = 1;
     mutex.release(&fs_lock);
 }
 
@@ -849,6 +863,10 @@ fn err_to_abi(rc as i64) as i64 {
 // ============================================================
 fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     mutex.acquire(&fs_lock);
+    if (frozen != 0 && (flags & (O_CREAT | O_TRUNC)) != 0) {
+        mutex.release(&fs_lock);
+        return cast(*VfsFile, 0);
+    }
     wb_flush();
     let is *VfsFile as r = open_inner(path, path_len, flags);
     mutex.release(&fs_lock);
@@ -868,6 +886,7 @@ fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
 }
 fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
     mutex.acquire(&fs_lock);
+    if (frozen != 0) { mutex.release(&fs_lock); return cast(i64, VFS_EIO); }
     let is i64 as r = write_inner(f, buf, n);
     mutex.release(&fs_lock);
     return r;
@@ -907,6 +926,7 @@ fn statx_path_inner(path as *u8, path_len as i64, out as *abi.Statx) as i32 {
 }
 fn unlink(path as *u8, path_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    if (frozen != 0) { mutex.release(&fs_lock); return VFS_EIO; }
     wb_flush();
     let is i32 as r = unlink_inner(path, path_len);
     mutex.release(&fs_lock);
@@ -914,6 +934,7 @@ fn unlink(path as *u8, path_len as i64) as i32 {
 }
 fn mkdir(path as *u8, path_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    if (frozen != 0) { mutex.release(&fs_lock); return VFS_EIO; }
     wb_flush();
     let is i32 as r = mkdir_inner(path, path_len);
     mutex.release(&fs_lock);
@@ -921,6 +942,7 @@ fn mkdir(path as *u8, path_len as i64) as i32 {
 }
 fn rmdir(path as *u8, path_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    if (frozen != 0) { mutex.release(&fs_lock); return VFS_EIO; }
     wb_flush();
     let is i32 as r = rmdir_inner(path, path_len);
     mutex.release(&fs_lock);
@@ -928,6 +950,7 @@ fn rmdir(path as *u8, path_len as i64) as i32 {
 }
 fn rename(src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    if (frozen != 0) { mutex.release(&fs_lock); return VFS_EIO; }
     wb_flush();
     let is i32 as r = rename_inner(src, src_len, dst, dst_len);
     mutex.release(&fs_lock);
