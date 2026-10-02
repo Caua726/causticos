@@ -30,3 +30,19 @@ cos_rebuild() {
     echo "build: kernel + userspace + iso (profile $profile)"
     caustic-mk run build -- "${args[@]}"
 }
+
+# cos_persist_iso <out> [cmdline]
+#
+# The ISO a disk-rooted boot needs: the same kernel and bootloader, and NO live
+# root. The live root outranks every disk (root_pick prefers the module), so
+# booting the ordinary ISO with a disk attached mounts the RAM copy and leaves
+# the disk untouched — which is what `--persist` used to do while announcing
+# "persistent". This is packaging only, from what is already built, so it runs
+# even under --no-build; and qemu.sh, libvirt.sh and verify.sh all go through
+# it, so the boot a user gets and the boot the suite checks are the same image.
+cos_persist_iso() {
+    local out="$1" cmdline="${2:-}"
+    local args=(--no-live --out "$out")
+    [ -n "$cmdline" ] && args+=(--cmdline "$cmdline")
+    bash "$(dirname "${BASH_SOURCE[0]}")/mkiso.sh" "${args[@]}" >/dev/null
+}

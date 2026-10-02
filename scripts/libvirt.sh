@@ -157,6 +157,14 @@ fi
 
 # ── What it boots ────────────────────────────────────────────────────
 
+# A disk root needs an ISO without the live root, or the RAM copy wins and the
+# disk is never read. Not when an ISO was named: then that file is the answer.
+if [ -n "$PERSIST" ] && [ "$ISO_GIVEN" = 0 ]; then
+    source "$(dirname "$0")/rebuild.sh"
+    ISO="build/causticos-persist.iso"
+    cos_persist_iso "$ISO" "$CMDLINE"
+fi
+
 [ -f "$ISO" ] || { echo "libvirt: $ISO missing — run 'caustic-mk run build'" >&2; exit 1; }
 
 # Stopped BEFORE the disk work, not after: a running domain holds a write lock on

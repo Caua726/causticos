@@ -119,7 +119,8 @@ case " $GATES " in *" persist "*)
     # selftest runs the FAT32 write suite AND still boots userspace, which is
     # what "the disk path works end to end" actually means. No root= either —
     # letting root_pick choose is the behaviour under test.
-    bash scripts/mkiso.sh --no-live --cmdline "selftest" --out "$WORK/persist.iso" >/dev/null
+    source scripts/rebuild.sh
+    cos_persist_iso "$WORK/persist.iso" "selftest"
     "$PY" scripts/mkroot.py --profile verify --img "$WORK/pristine.img" -q ;;
 esac
 

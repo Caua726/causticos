@@ -91,6 +91,14 @@ if [ "$BUILD" = 1 ]; then
     cos_rebuild "$PROFILE" "$CMDLINE"
 fi
 
+# A disk root needs an ISO without the live root, or the RAM copy wins and the
+# disk is never read. Not when an ISO was named: then that file is the answer.
+if [ -n "$PERSIST" ] && [ "$ISO_GIVEN" = 0 ]; then
+    source "$(dirname "$0")/rebuild.sh"
+    ISO="build/causticos-persist.iso"
+    cos_persist_iso "$ISO" "$CMDLINE"
+fi
+
 [ -f "$ISO" ] || { echo "run: $ISO missing — run 'caustic-mk run iso'" >&2; exit 1; }
 
 # KVM when it is actually usable. Passing -enable-kvm unconditionally simply
