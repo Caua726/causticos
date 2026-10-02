@@ -7,11 +7,18 @@
 //   x delete char · dd delete line · Esc -> command · :w :q :wq :q!
 use "std/os/causticos.cst" as sys;
 
-let is i64 as TEXT_CAP with imut = 65536;
+// The text lives in an anonymous mapping that doubles as it grows. It was a
+// fixed 64 KiB array, read with one read() of at most 64 KiB - 1: a larger
+// file came in cut, and :w wrote the cut copy back over it without a word.
+let is i64 as TEXT_MIN with imut = 65536;
 let is i64 as C_FG = 0x00d3d7cf; let is i64 as C_BG = 0x00121417;
 let is i64 as C_BAR = 0x002a2e34; let is i64 as C_BARFG = 0x008bbf63; let is i64 as C_CYAN = 0x0073d0ff;
 
-let is [65536]u8 as text with mut;
+let is *u8 as text with mut;
+let is i64 as tcap with mut = 0;
+// The file could not be read whole (too big for memory, or a read error):
+// what is here is not the file, and :w would destroy the rest of it.
+let is i64 as g_partial with mut = 0;
 let is i64 as tend with mut = 0; let is i64 as dot with mut = 0; let is i64 as topln with mut = 0;
 let is i64 as mode with mut = 0; let is i64 as modified with mut = 0; let is i64 as quit with mut = 0;
 let is i64 as pend_d with mut = 0;
@@ -51,8 +58,25 @@ fn setmsg(s as *u8) as void { let is i64 as n with mut = slen(s); if (n > 79) { 
 // ---- buffer / line navigation + editing (reused, framebuffer-free) ----
 fn bol(p as i64) as i64 { let is i64 as i with mut = p; while (i > 0 && text[i - 1] != 0x0A) { i = i - 1; } return i; }
 fn eol(p as i64) as i64 { let is i64 as i with mut = p; while (i < tend && text[i] != 0x0A) { i = i + 1; } return i; }
+// Room for `need` bytes of text. 0, or -1 when there is no memory for it.
+fn reserve(need as i64) as i64 {
+    if (need <= tcap) { return 0; }
+    let is i64 as ncap with mut = tcap * 2;
+    if (ncap < TEXT_MIN) { ncap = TEXT_MIN; }
+    while (ncap < need) { ncap = ncap * 2; }
+    let is i64 as nva = sys.mmap(0, ncap, sys.PROT_READ | sys.PROT_WRITE);
+    if (nva < 0) { return 0 - 1; }
+    let is *u8 as nt = cast(*u8, nva);
+    let is i64 as k with mut = 0;
+    while (k < tend) { nt[k] = text[k]; k = k + 1; }
+    if (tcap > 0) { sys.munmap(cast(i64, text), tcap); }
+    text = nt;
+    tcap = ncap;
+    return 0;
+}
+
 fn insert_byte(c as i64) as void {
-    if (tend >= TEXT_CAP - 1) { return; }
+    if (reserve(tend + 1) != 0) { setmsg("out of memory - not inserted"); return; }
     let is i64 as i with mut = tend;
     while (i > dot) { text[i] = text[i - 1]; i = i - 1; }
     text[dot] = cast(u8, c); tend = tend + 1; dot = dot + 1; modified = 1;
@@ -73,9 +97,15 @@ fn delete_line() as void {
 }
 fn m_left()  as void { if (dot > 0 && text[dot - 1] != 0x0A) { dot = dot - 1; } }
 fn m_right() as void { if (dot < tend && text[dot] != 0x0A) { dot = dot + 1; } }
+// The newline that ends the last line ends it — it does not open one more,
+// empty line after it (vi never goes there; o on the last line adds a line).
+fn last_line() as i64 {
+    if (tend > 0 && text[tend - 1] == 0x0A) { return bol(tend - 1); }
+    return bol(tend);
+}
 fn m_down() as void {
     let is i64 as col with mut = dot - bol(dot);
-    let is i64 as e = eol(dot); if (e >= tend) { return; }
+    let is i64 as e = eol(dot); if (e >= tend || bol(dot) >= last_line()) { return; }
     let is i64 as nb = e + 1; let is i64 as ne = eol(nb); let is i64 as nlen = ne - nb;
     if (col > nlen) { col = nlen; } dot = nb + col;
 }
@@ -84,17 +114,60 @@ fn m_up() as void {
     let is i64 as col with mut = dot - b; let is i64 as pb = bol(b - 1); let is i64 as pe = b - 1; let is i64 as plen = pe - pb;
     if (col > plen) { col = plen; } dot = pb + col;
 }
+// The whole file, however long, or a message saying why not (and :w refused).
 fn load_file() as void {
+    tend = 0; dot = 0; topln = 0; modified = 0;
+    if (reserve(TEXT_MIN) != 0) { g_partial = 1; setmsg("out of memory - read-only"); return; }
+    let is [4]i64 as st;                                  // VfsStat: size at 0
+    if (sys.stat(g_path, cast(*u8, &st[0])) != 0) { setmsg("(new file)"); return; }
+    let is i64 as size = st[0];
+    if (reserve(size + 1) != 0) { g_partial = 1; setmsg("file too big for memory - read-only"); return; }
     let is i64 as fd = sys.open_read(g_path);
-    if (fd < 0) { tend = 0; setmsg("(new file)"); return; }
-    let is i64 as n with mut = sys.read(fd, cast(*u8, &text[0]), TEXT_CAP - 1);
-    sys.close(fd); if (n < 0) { n = 0; }
-    tend = n; dot = 0; topln = 0; modified = 0;
+    if (fd < 0) { g_partial = 1; setmsg("cannot open the file - read-only"); return; }
+    let is i64 as got with mut = 0;
+    let is i64 as going with mut = 1;
+    while (going == 1 && got < size) {
+        let is i64 as r = sys.read(fd, cast(*u8, cast(i64, text) + got), size - got);
+        if (r < 0) { g_partial = 1; going = 0; }
+        else if (r == 0) { going = 0; }
+        else { got = got + r; }
+    }
+    sys.close(fd);
+    tend = got;
+    if (g_partial == 1) { setmsg("read error - only part of the file is here, read-only"); }
 }
+
+// Write the text to a temporary file beside the original, check every write
+// and the close (a write the filesystem deferred reports its failure there),
+// and only then put it in the original's place. On any failure the original
+// is untouched and the text stays marked modified. It used to open the file
+// for writing — truncating it — write once, ignore the result, and say
+// "written".
 fn save_file() as void {
-    let is i64 as fd = sys.open_write(g_path);
-    if (fd < 0) { setmsg("write failed"); return; }
-    sys.write(fd, cast(*u8, &text[0]), tend); sys.close(fd); modified = 0; setmsg("written");
+    if (g_partial == 1) { setmsg("not written: the file was not read whole"); return; }
+    let is [140]u8 as tmp;
+    let is i64 as pl = slen(g_path);
+    if (pl > 130) { setmsg("not written: path too long"); return; }
+    let is i64 as k with mut = 0;
+    while (k < pl) { tmp[k] = g_path[k]; k = k + 1; }
+    let is *u8 as sfx = cast(*u8, ".vic~");
+    let is i64 as j with mut = 0;
+    while (j < 5) { tmp[pl + j] = sfx[j]; j = j + 1; }
+    tmp[pl + 5] = cast(u8, 0);
+    let is *u8 as tp = cast(*u8, &tmp[0]);
+    let is i64 as fd = sys.open_write(tp);
+    if (fd < 0) { setmsg("write failed: cannot create a file there"); return; }
+    let is i64 as off with mut = 0;
+    let is i64 as ok with mut = 1;
+    while (ok == 1 && off < tend) {
+        let is i64 as w = sys.write(fd, cast(*u8, cast(i64, text) + off), tend - off);
+        if (w <= 0) { ok = 0; } else { off = off + w; }
+    }
+    if (sys.close(fd) != 0) { ok = 0; }
+    if (ok == 0) { sys.unlink(tp); setmsg("write failed (disk full?) - file unchanged"); return; }
+    if (sys.rename(tp, g_path) != 0) { sys.unlink(tp); setmsg("write failed: could not replace the file"); return; }
+    modified = 0;
+    setmsg("written");
 }
 fn scroll_to_dot() as void {
     let is i64 as db = bol(dot);
@@ -147,8 +220,11 @@ fn run_ex() as void {
     let is i64 as wantw with mut = 0; let is i64 as wantq with mut = 0; let is i64 as force with mut = 0;
     let is i64 as i with mut = 0;
     while (i < g_exlen) { let is i64 as c = cast(i64, g_exbuf[i]); if (c == 119) { wantw = 1; } if (c == 113) { wantq = 1; } if (c == 33) { force = 1; } i = i + 1; }
-    if (wantw == 1) { save_file(); }
-    if (wantq == 1) { if (modified != 0 && force == 0 && wantw == 0) { setmsg("no write since change (:q! to force)"); } else { quit = 1; } }
+    if (wantw == 1) {
+        save_file();
+        if (modified != 0) { return; }        // :wq whose write failed stays, with the reason shown
+    }
+    if (wantq == 1) { if (modified != 0 && force == 0) { setmsg("no write since change (:q! to force)"); } else { quit = 1; } }
 }
 fn cmd_key(c as i64) as void {
     if (pend_d == 1) { pend_d = 0; if (c == 100) { delete_line(); } return; }
@@ -156,7 +232,7 @@ fn cmd_key(c as i64) as void {
     else if (c == 106) { m_down(); } else if (c == 107) { m_up(); }
     else if (c == 48) { dot = bol(dot); }
     else if (c == 36) { dot = eol(dot); if (dot > bol(dot)) { dot = dot - 1; } }
-    else if (c == 71) { dot = tend; dot = bol(dot); }
+    else if (c == 71) { dot = last_line(); }
     else if (c == 120) { if (dot < tend && text[dot] != 0x0A) { delete_at(dot); } }
     else if (c == 100) { pend_d = 1; }
     else if (c == 105) { mode = 1; }
