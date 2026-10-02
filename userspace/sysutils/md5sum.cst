@@ -1,8 +1,11 @@
 // md5sum — compute / check MD5 (RFC 1321). `md5sum [FILE...]`  ·  `md5sum -c FILE`
 //   no FILE (or "-") reads stdin; -c reads "HASH  NAME" lines and verifies them.
-// Streaming implementation — no file-size limit.
+// Streaming implementation — no file-size limit. Files are read like stdin, a
+// block at a time: hashing a file went through mmap_fd, which the kernel does
+// not offer for ordinary files, so every `md5sum FILE` said "cannot hash".
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
 
 let is [64]i64 as K; let is [4]i64 as state;
 let is [64]u8 as g_block; let is i64 as g_bufn with mut = 0; let is i64 as g_total with mut = 0;
@@ -37,7 +40,15 @@ fn md5_block(msg as *u8, off as i64) as void {
 fn md5_init() as void { state[0] = 0x67452301; state[1] = 0xefcdab89; state[2] = 0x98badcfe; state[3] = 0x10325476; g_bufn = 0; g_total = 0; }
 fn md5_update(data as *u8, n as i64) as void {
     g_total = g_total + n; let is i64 as i with mut = 0;
-    while (i < n) { g_block[g_bufn] = data[i]; g_bufn = g_bufn + 1; i = i + 1; if (g_bufn == 64) { md5_block(cast(*u8, &g_block[0]), 0); g_bufn = 0; } }
+    while (i < n) {
+        // Whole blocks straight from the caller's buffer; only the ragged
+        // ends go through g_block.
+        if (g_bufn == 0 && n - i >= 64) { md5_block(data, i); i = i + 64; }
+        else {
+            g_block[g_bufn] = data[i]; g_bufn = g_bufn + 1; i = i + 1;
+            if (g_bufn == 64) { md5_block(cast(*u8, &g_block[0]), 0); g_bufn = 0; }
+        }
+    }
 }
 fn md5_final(out as *u8) as void {
     let is i64 as bits = g_total * 8;
@@ -61,83 +72,85 @@ fn init_K() as void {
     let is i64 as i with mut = 0; while (i < 64) { K[i] = kv[i]; i = i + 1; }
 }
 
-// Round `n` up to the next 4096-byte page boundary. The kernel only
-// honours page-aligned munmap ranges, so callers must round before
-// releasing a mmap_fd mapping.
-fn page_round(n as i64) as i64 {
-    return (n + 4095) & 0xFFFFF000;
-}
-
-// hash_path(path, out): stat → mmap_fd → md5 → munmap. ONE syscall per
-// operation instead of N read syscalls for big files. Returns 0 on
-// success, errno on stat/open/mmap failure (caller prints the error).
-fn hash_path(path as *u8, out as *u8) as i64 {
-    let is [4]i64 as st;
-    if (sys.stat(path, cast(*u8, &st[0])) != 0) { return 0 - 9; }
-    let is i64 as sz = st[0];
-    if (sz < 0) { return 0 - 22; }
-    if (sz == 0) { md5_init(); md5_final(out); return 0; }
-    let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { return 0 - 9; }
-    let is i64 as va = sys.mmap_fd(sys.PROT_READ, fd);
-    sys.close(fd);
-    if (va <= 0) { return 0 - 5; }
+// hash_fd(fd, out): the MD5 of everything fd yields, read 64 KiB at a time.
+// 0, or the read error (a failed read used to pass for the end of the data,
+// and print the hash of a prefix as if it were the file's).
+fn hash_fd(fd as i64, out as *u8) as i64 {
     md5_init();
-    md5_update(cast(*u8, va), sz);
-    sys.munmap(va, page_round(sz));
-    md5_final(out);
+    let is [65536]u8 as buf;
+    while (1 == 1) {
+        let is i64 as r = sys.read(fd, cast(*u8, &buf[0]), 65536);
+        if (r < 0) { return r; }
+        if (r == 0) { md5_final(out); return 0; }
+        md5_update(cast(*u8, &buf[0]), r);
+    }
     return 0;
 }
 
-// hash_fd(fd, out): streaming hash for fds that don't have a backing
-// path (stdin = 0, pipes). One 64 KiB read loop — no mmap possible.
-fn hash_fd(fd as i64, out as *u8) as void {
-    md5_init();
-    let is [65536]u8 as buf;
-    let is i64 as r with mut = sys.read(fd, cast(*u8, &buf[0]), 65536);
-    while (r > 0) { md5_update(cast(*u8, &buf[0]), r); r = sys.read(fd, cast(*u8, &buf[0]), 65536); }
-    md5_final(out);
+// hash_path(path, out): 0, or a message saying why not.
+fn hash_path(path as *u8, out as *u8, why as **u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { why[0] = cast(*u8, "cannot open"); return fd; }
+    let is i64 as rc = hash_fd(fd, out);
+    sys.close(fd);
+    if (rc < 0) { why[0] = cast(*u8, "read error"); }
+    return rc;
 }
-fn put_hex(out as *u8) as void { let is *u8 as H = "0123456789abcdef"; let is i64 as i with mut = 0; let is [1]u8 as ch; while (i < 16) { ch[0] = H[(cast(i64, out[i]) >> 4) & 15]; prog.out(cast(*u8, &ch[0]), 1); ch[0] = H[cast(i64, out[i]) & 15]; prog.out(cast(*u8, &ch[0]), 1); i = i + 1; } }
+
+fn hex_of(dig as *u8, out as *u8) as void {
+    let is *u8 as H = "0123456789abcdef";
+    let is i64 as g with mut = 0;
+    while (g < 16) { out[g * 2] = H[(cast(i64, dig[g]) >> 4) & 15]; out[g * 2 + 1] = H[cast(i64, dig[g]) & 15]; g = g + 1; }
+    out[32] = cast(u8, 0);
+}
+fn put_hex(dig as *u8) as void { let is [33]u8 as h; hex_of(dig, cast(*u8, &h[0])); prog.out(cast(*u8, &h[0]), 32); }
 fn streq(a as *u8, b as *u8) as i64 { let is i64 as i with mut = 0; while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; } if (a[i] == b[i]) { return 1; } return 0; }
 
 fn hash_one(name as *u8) as i64 {
     let is [16]u8 as dig;
     if (cast(i64, name) == 0 || streq(name, "-") == 1) {
-        hash_fd(cast(i64, 0), cast(*u8, &dig[0]));
+        if (hash_fd(cast(i64, 0), cast(*u8, &dig[0])) != 0) { prog.outs("md5sum: -: read error\n"); return 1; }
     } else {
         let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
-        let is i64 as rc = hash_path(path, cast(*u8, &dig[0]));
-        if (rc != 0) { prog.outs("md5sum: "); prog.outs(name); prog.outs(": cannot hash\n"); return 1; }
+        let is *u8 as why with mut = cast(*u8, "");
+        if (hash_path(path, cast(*u8, &dig[0]), &why) != 0) {
+            prog.outs("md5sum: "); prog.outs(name); prog.outs(": "); prog.outs(why); prog.outs("\n"); return 1;
+        }
     }
     put_hex(cast(*u8, &dig[0])); prog.outs("  "); if (cast(i64, name) != 0) { prog.outs(name); } else { prog.outs("-"); } prog.out("\n", 1);
     return 0;
 }
 
-// -c: parse "HASH  NAME" lines from a checklist file, recompute, report.
+// -c: "HASH  NAME" lines from a checklist, recomputed and reported, read a line
+// at a time (it was read into 128 KiB and the rest of a longer list ignored).
 fn check(listpath as *u8) as i32 {
-    let is [256]u8 as lpb; let is i64 as fd = sys.open_read(prog.abspath(listpath, cast(*u8, &lpb[0])));
-    if (fd < 0) { prog.outs("md5sum: "); prog.outs(listpath); prog.outs(": cannot open\n"); return cast(i32, 1); }
-    let is [131072]u8 as data; let is i64 as n with mut = 0;
-    let is i64 as r with mut = sys.read(fd, cast(*u8, cast(i64, &data[0]) + n), 65536);
-    while (r > 0) { n = n + r; if (n + 65536 > 131072) { break; } r = sys.read(fd, cast(*u8, cast(i64, &data[0]) + n), 65536); }
-    sys.close(fd);
-    let is i32 as rc with mut = 0; let is i64 as i with mut = 0;
-    while (i < n) {
-        let is i64 as ls = i; while (i < n && data[i] != 0x0A) { i = i + 1; }
-        let is i64 as le = i; if (i < n) { i = i + 1; }
-        if (le - ls < 34) { } else {
-            let is [40]u8 as want; let is i64 as k with mut = 0; while (k < 32) { want[k] = data[ls + k]; k = k + 1; } want[32] = cast(u8, 0);
-            let is i64 as np with mut = ls + 32; while (np < le && (data[np] == 32 || data[np] == 42)) { np = np + 1; }   // skip "  " or " *"
+    let is [256]u8 as lpb;
+    let is [4096]u8 as stage;
+    let is fu.Reader as r;
+    if (fu.rd_open(&r, prog.abspath(listpath, cast(*u8, &lpb[0])), cast(*u8, &stage[0]), 4096) < 0) {
+        prog.outs("md5sum: "); prog.outs(listpath); prog.outs(": cannot open\n"); return cast(i32, 1);
+    }
+    let is fu.Line as ln;
+    ln.va = 0; ln.cap = 0; ln.len = 0; ln.nl = 0;
+    let is i32 as rc with mut = 0;
+    while (1 == 1) {
+        let is i64 as got = fu.rd_line(&r, &ln);
+        if (got < 0) { prog.outs("md5sum: "); prog.outs(listpath); prog.outs(": read error\n"); fu.rd_close(&r); return cast(i32, 1); }
+        if (got == 0) { fu.rd_close(&r); return rc; }
+        let is *u8 as data = cast(*u8, ln.va);
+        let is i64 as le = ln.len;
+        if (le >= 34) {
+            let is [40]u8 as want; let is i64 as k with mut = 0; while (k < 32) { want[k] = data[k]; k = k + 1; } want[32] = cast(u8, 0);
+            let is i64 as np with mut = 32; while (np < le && (data[np] == 32 || data[np] == 42)) { np = np + 1; }   // skip "  " or " *"
             let is [256]u8 as nm; let is i64 as m with mut = 0; while (np < le && m < 255) { nm[m] = data[np]; m = m + 1; np = np + 1; } nm[m] = cast(u8, 0);
             let is [256]u8 as cpb; let is *u8 as cpath = prog.abspath(cast(*u8, &nm[0]), cast(*u8, &cpb[0]));
             prog.outs(cast(*u8, &nm[0])); prog.outs(": ");
             let is [16]u8 as dig;
-            if (hash_path(cpath, cast(*u8, &dig[0])) != 0) { prog.outs("FAILED open\n"); rc = cast(i32, 1); }
+            let is *u8 as why with mut = cast(*u8, "");
+            if (hash_path(cpath, cast(*u8, &dig[0]), &why) != 0) { prog.outs("FAILED ("); prog.outs(why); prog.outs(")\n"); rc = cast(i32, 1); }
             else {
-                let is *u8 as H = "0123456789abcdef"; let is [33]u8 as got; let is i64 as g with mut = 0;
-                while (g < 16) { got[g * 2] = H[(cast(i64, dig[g]) >> 4) & 15]; got[g * 2 + 1] = H[(cast(i64, dig[g]) & 15)]; g = g + 1; } got[32] = cast(u8, 0);
-                if (streq(cast(*u8, &got[0]), cast(*u8, &want[0])) == 1) { prog.outs("OK\n"); } else { prog.outs("FAILED\n"); rc = cast(i32, 1); }
+                let is [33]u8 as hx; hex_of(cast(*u8, &dig[0]), cast(*u8, &hx[0]));
+                if (streq(cast(*u8, &hx[0]), cast(*u8, &want[0])) == 1) { prog.outs("OK\n"); } else { prog.outs("FAILED\n"); rc = cast(i32, 1); }
             }
         }
     }
