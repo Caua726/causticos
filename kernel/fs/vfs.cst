@@ -29,6 +29,7 @@ use "abi.cst"    as abi;
 use "kobject.cst" as kobject;
 use "lock.cst"    as lock;
 use "mutex.cst"   as mutex;
+use "heap.cst"    as heap;
 
 // Serialises filesystem operations. The backing FS (fat32) keeps shared
 // scratch buffers with no internal lock, so two processes doing file I/O on
@@ -138,12 +139,14 @@ struct FileSystemOps {
     // (sys_statx) returns E_NOSYS in that case so old callers that don't
     // care about mtime keep using SYS_STAT untouched.
     statx as fn(*u8, *u8, i64, *abi.Statx) as i32;
-    // read/write by first_cluster + size — O(1) from already-open file.
-    read as fn(*u8, i64, i64, i64, *u8, i64) as i64;
+    // read/write by first_cluster + size, plus the open file's position
+    // cursor (VfsFile.hint0..3): opaque to the VFS, kept by the filesystem so
+    // sequential I/O does not re-walk the file from its start on every call.
+    read as fn(*u8, i64, i64, i64, *u8, i64, *i64) as i64;
     // write_at may relocate the head (empty file → allocated chain)
     // and always returns the new file size. *out_first_cluster is set
     // even on success so callers can detect relocation.
-    write_at as fn(*u8, i64, i64, i64, *u8, i64, *i64) as i64;
+    write_at as fn(*u8, i64, i64, i64, *u8, i64, *i64, *i64) as i64;
     // truncate to exactly new_size. May shrink by freeing clusters or
     // grow by allocating zeroed clusters. *out_first_cluster reflects
     // the (possibly new) head.
@@ -203,6 +206,16 @@ struct VfsFile {
     is_dir as i64;
     // readdir cursor — only meaningful for directories.
     readdir_idx as i64;
+    // The filesystem's cursor into this file (see FileSystemOps.read). Four
+    // consecutive words, passed as &hint0; zeroed at open.
+    hint0 as i64;
+    hint1 as i64;
+    hint2 as i64;
+    hint3 as i64;
+    // Write-behind (see wb_flush). `size` above is the size the file has
+    // once its waiting bytes land; disk_size is what the filesystem holds now.
+    wb_err as i64;           // a deferred write that failed, not yet reported
+    disk_size as i64;
 }
 
 // ============================================================
@@ -351,6 +364,12 @@ fn pool_alloc() as *VfsFile {
             file_pool[i].attr = 0;
             file_pool[i].is_dir = 0;
             file_pool[i].readdir_idx = 0;
+            file_pool[i].hint0 = 0;
+            file_pool[i].hint1 = 0;
+            file_pool[i].hint2 = 0;
+            file_pool[i].hint3 = 0;
+            file_pool[i].wb_err = 0;
+            file_pool[i].disk_size = 0;
             return &file_pool[i];
         }
         i = i + 1;
@@ -362,9 +381,97 @@ fn pool_release(f as *VfsFile) as void {
     if (cast(i64, f) == 0) { return; }
     f.ref_count = f.ref_count - 1;
     if (f.ref_count <= 0) {
+        if (wb_file == cast(i64, f)) { wb_flush(); }
         f.in_use = 0;
         f.mount = cast(*VfsMount, 0);
     }
+}
+
+// ============================================================
+// Write-behind
+// ============================================================
+//
+// Every write went straight to the filesystem: for FAT32 a read-modify-write of
+// the cluster and a rewrite of the directory entry, per call. A program that
+// prints a number at a time into a file (`seq 1 300000 > f`: 600,000 writes of
+// one to seven bytes) paid that 600,000 times. Small writes that continue where
+// the last one stopped now collect in a buffer and reach the filesystem a
+// buffer at a time.
+//
+// Nobody can observe the difference. There is one buffer, and the bytes in it
+// belong to one open file at a time (wb_file). They are written out when the
+// buffer is full, when that file does anything but another contiguous small
+// write (a read, a large or out-of-place write, close), and before any other
+// operation at all — a read or write through another handle, open, stat,
+// readdir, unlink, rename, mkdir, rmdir — so every other view of the file sees
+// them, and in the order they were written. A deferred write that fails is
+// kept on its file and returned by that file's next read, write, or close,
+// which is where a program finds out on any system that buffers. Shutdown
+// writes them out first.
+let is i64 as WB_CAP = 4096;
+let is i64 as WB_SMALL = 1024;           // larger writes go straight through
+let is i64 as wb_file with mut = 0;      // *VfsFile whose bytes are waiting; 0 = none
+let is i64 as wb_buf with mut = 0;       // WB_CAP-byte kmalloc, allocated on first use
+let is i64 as wb_off with mut = 0;       // file offset of wb_buf[0]
+let is i64 as wb_len with mut = 0;       // bytes waiting
+
+// The waiting bytes, if any, to the filesystem. A failure is recorded on the
+// file they belong to (wb_err) and returned. Caller holds fs_lock.
+fn wb_flush() as i64 {
+    if (wb_file == 0) { return 0; }
+    let is *VfsFile as f = cast(*VfsFile, wb_file);
+    let is i64 as len = wb_len;
+    wb_file = 0;
+    wb_len = 0;
+    let is i64 as new_first with mut = f.first_cluster;
+    let is i64 as new_size = call(f.mount.ops.write_at,
+                                  f.mount.priv,
+                                  f.first_cluster, f.disk_size,
+                                  wb_off, cast(*u8, wb_buf), len, &new_first, &f.hint0);
+    if (new_size < 0) {
+        if (f.wb_err == 0) { f.wb_err = new_size; }
+        return new_size;
+    }
+    let is i32 as ue = call(f.mount.ops.update_entry,
+                            f.mount.priv, f.ent_cluster, f.ent_off,
+                            new_first, new_size);
+    f.first_cluster = new_first;
+    f.disk_size = new_size;
+    if (ue != 0) {
+        if (f.wb_err == 0) { f.wb_err = cast(i64, ue); }
+        return cast(i64, ue);
+    }
+    return 0;
+}
+
+// Before f reads or writes: everything waiting reaches the filesystem first —
+// f's own bytes only when `own` is 1. Returns f's deferred-write error, once
+// (it is cleared as it is reported); another file's error stays with that
+// file. Caller holds fs_lock.
+fn wb_settle(f as *VfsFile, own as i64) as i64 {
+    if (wb_file != 0 && (wb_file != cast(i64, f) || own == 1)) { wb_flush(); }
+    let is i64 as e = f.wb_err;
+    f.wb_err = 0;
+    return e;
+}
+
+// Every write made so far to the filesystem, for a caller about to use f's
+// identity (first cluster, size) straight from its handle. Returns f's
+// deferred-write error, if it had one.
+fn flush(f as *VfsFile) as i64 {
+    if (cast(i64, f) == 0 || f.in_use == 0) { return cast(i64, VFS_EBADF); }
+    mutex.acquire(&fs_lock);
+    let is i64 as e = wb_settle(f, 1);
+    mutex.release(&fs_lock);
+    return e;
+}
+
+// Shutdown: whatever is waiting to the filesystem, before the disks are told
+// to flush their own caches.
+fn sync_all_files() as void {
+    mutex.acquire(&fs_lock);
+    wb_flush();
+    mutex.release(&fs_lock);
 }
 
 // ============================================================
@@ -465,6 +572,7 @@ fn open_inner(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     f.ent_off = ent_off;
     f.first_cluster = first_cluster;
     f.size = size;
+    f.disk_size = size;
     f.attr = attr;
     if ((attr & ATTR_DIR) != 0) { f.is_dir = 1; } else { f.is_dir = 0; }
     f.offset = 0;
@@ -486,6 +594,7 @@ fn open_inner(path as *u8, path_len as i64, flags as i32) as *VfsFile {
             }
             f.first_cluster = new_first;
             f.size = 0;
+            f.disk_size = 0;
         } else {
             pool_release(f);
             return cast(*VfsFile, 0);
@@ -501,12 +610,14 @@ fn open_inner(path as *u8, path_len as i64, flags as i32) as *VfsFile {
 fn close_inner(f as *VfsFile) as i32 {
     if (cast(i64, f) == 0) { return VFS_EBADF; }
     if (f.in_use == 0)     { return VFS_EBADF; }
+    let is i64 as deferred = wb_settle(f, 1);
     // Reader/writer synchronisation barrier — let the FS flush any
     // per-mount caches before the handle dissolves.
     if (cast(i64, f.mount) != 0 && cast(i64, f.mount.ops.sync) != 0) {
         call(f.mount.ops.sync, f.mount.priv);
     }
     pool_release(f);
+    if (deferred != 0) { return cast(i32, deferred); }
     return VFS_OK;
 }
 
@@ -515,13 +626,15 @@ fn read_inner(f as *VfsFile, buf as *u8, n as i64) as i64 {
     if (f.is_dir == 1)                       { return cast(i64, VFS_EISDIR); }
     if ((f.flags & O_ACCMODE) == O_WRONLY)   { return cast(i64, VFS_EBADF); }
     if (n <= 0)                              { return 0; }
+    let is i64 as werr = wb_settle(f, 1);
+    if (werr < 0)                            { return werr; }
     if (f.offset >= f.size)                  { return 0; }
     let is i64 as to_read with mut = n;
     if (f.offset + to_read > f.size) { to_read = f.size - f.offset; }
     let is i64 as got = call(f.mount.ops.read,
                              f.mount.priv,
                              f.first_cluster, f.size, f.offset,
-                             buf, to_read);
+                             buf, to_read, &f.hint0);
     if (got < 0) { return got; }
     f.offset = f.offset + got;
     return got;
@@ -536,11 +649,37 @@ fn write_inner(f as *VfsFile, buf as *u8, n as i64) as i64 {
     let is i64 as write_off with mut = f.offset;
     if ((f.flags & O_APPEND) != 0) { write_off = f.size; }
 
+    // A small write that continues f's buffered run joins it; anything else
+    // lands after whatever is waiting.
+    let is i64 as joins with mut = 0;
+    if (n <= WB_SMALL && wb_file == cast(i64, f)
+        && write_off == wb_off + wb_len && wb_len + n <= WB_CAP) { joins = 1; }
+    let is i64 as werr = wb_settle(f, 1 - joins);
+    if (werr < 0) { return werr; }
+
+    if (n <= WB_SMALL) {
+        if (wb_buf == 0) { wb_buf = heap.kmalloc(WB_CAP, 0); }
+        if (wb_buf != 0) {
+            if (wb_file == 0) {
+                wb_file = cast(i64, f);
+                wb_off = write_off;
+                wb_len = 0;
+            }
+            let is *u8 as wb = cast(*u8, wb_buf + wb_len);
+            let is i64 as k with mut = 0;
+            while (k < n) { wb[k] = buf[k]; k = k + 1; }
+            wb_len = wb_len + n;
+            f.offset = write_off + n;
+            if (f.offset > f.size) { f.size = f.offset; }
+            return n;
+        }
+    }
+
     let is i64 as new_first with mut = f.first_cluster;
     let is i64 as new_size = call(f.mount.ops.write_at,
                                   f.mount.priv,
-                                  f.first_cluster, f.size,
-                                  write_off, buf, n, &new_first);
+                                  f.first_cluster, f.disk_size,
+                                  write_off, buf, n, &new_first, &f.hint0);
     if (new_size < 0) { return new_size; }
 
     // Persist the new (first_cluster, size) into our directory entry's
@@ -551,7 +690,8 @@ fn write_inner(f as *VfsFile, buf as *u8, n as i64) as i64 {
     if (ue != 0) { return cast(i64, ue); }
 
     f.first_cluster = new_first;
-    f.size = new_size;
+    f.disk_size = new_size;
+    if (new_size > f.size) { f.size = new_size; }
     f.offset = write_off + n;
     return n;
 }
@@ -709,6 +849,7 @@ fn err_to_abi(rc as i64) as i64 {
 // ============================================================
 fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is *VfsFile as r = open_inner(path, path_len, flags);
     mutex.release(&fs_lock);
     return r;
@@ -733,6 +874,7 @@ fn write(f as *VfsFile, buf as *u8, n as i64) as i64 {
 }
 fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = stat_path_inner(path, path_len, out);
     mutex.release(&fs_lock);
     return r;
@@ -743,6 +885,7 @@ fn stat_path(path as *u8, path_len as i64, out as *VfsStat) as i32 {
 // timestamp support (or new ones in development) keep working.
 fn statx_path(path as *u8, path_len as i64, out as *abi.Statx) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = statx_path_inner(path, path_len, out);
     mutex.release(&fs_lock);
     return r;
@@ -764,30 +907,35 @@ fn statx_path_inner(path as *u8, path_len as i64, out as *abi.Statx) as i32 {
 }
 fn unlink(path as *u8, path_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = unlink_inner(path, path_len);
     mutex.release(&fs_lock);
     return r;
 }
 fn mkdir(path as *u8, path_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = mkdir_inner(path, path_len);
     mutex.release(&fs_lock);
     return r;
 }
 fn rmdir(path as *u8, path_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = rmdir_inner(path, path_len);
     mutex.release(&fs_lock);
     return r;
 }
 fn rename(src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = rename_inner(src, src_len, dst, dst_len);
     mutex.release(&fs_lock);
     return r;
 }
 fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {
     mutex.acquire(&fs_lock);
+    wb_flush();
     let is i32 as r = readdir_inner(f, out);
     mutex.release(&fs_lock);
     return r;
@@ -1030,6 +1178,88 @@ fn self_test() as void {
     }
     close(a);
     serial.println("vfs.test: O_APPEND OK", 21);
+
+    // --- a write past the end leaves a hole that reads as zeros ---
+    let is *VfsFile as hf = open(cast(*u8, "/vfs-hole.bin"), 13, O_RDWR | O_CREAT | O_TRUNC);
+    if (cast(i64, hf) == 0) { test_fail("open /vfs-hole.bin", 18); return; }
+    lseek(hf, cast(i64, 3000), SEEK_SET);
+    let is *u8 as tailb = cast(*u8, "END");
+    if (write(hf, tailb, 3) != 3 || hf.size != 3003) { test_fail("write past the end", 18); return; }
+    lseek(hf, cast(i64, 0), SEEK_SET);
+    let is i64 as holebad with mut = 0;
+    let is i64 as hoff with mut = 0;
+    while (hoff < 3000) {
+        let is i64 as hn = read(hf, cast(*u8, &test_buf[0]), 1000);
+        if (hn != 1000) { holebad = holebad + 1; hoff = 3000; }
+        else {
+            let is i64 as hk with mut = 0;
+            while (hk < 1000) { if (test_buf[hk] != cast(u8, 0)) { holebad = holebad + 1; } hk = hk + 1; }
+            hoff = hoff + 1000;
+        }
+    }
+    if (holebad != 0) { test_fail("a hole reads as zeros", 21); return; }
+    close(hf);
+    unlink(cast(*u8, "/vfs-hole.bin"), 13);
+    serial.println("vfs.test: hole reads zeros OK", 29);
+
+    // --- many small sequential writes read back whole ---
+    let is *VfsFile as sf = open(cast(*u8, "/vfs-seq.bin"), 12, O_RDWR | O_CREAT | O_TRUNC);
+    if (cast(i64, sf) == 0) { test_fail("open /vfs-seq.bin", 17); return; }
+    let is i64 as si with mut = 0;
+    while (si < 4000) {
+        test_payload[0] = cast(u8, si & 0xFF);
+        test_payload[1] = cast(u8, (si >> 8) & 0xFF);
+        test_payload[2] = cast(u8, 0x5A);
+        if (write(sf, cast(*u8, &test_payload[0]), 3) != 3) { test_fail("small sequential write", 22); return; }
+        si = si + 1;
+    }
+    lseek(sf, cast(i64, 0), SEEK_SET);
+    let is i64 as seqbad with mut = 0;
+    si = 0;
+    while (si < 4000) {
+        if (read(sf, cast(*u8, &test_payload[0]), 3) != 3) { seqbad = seqbad + 1; si = 4000; }
+        else {
+            if (test_payload[0] != cast(u8, si & 0xFF) || test_payload[1] != cast(u8, (si >> 8) & 0xFF)
+                || test_payload[2] != cast(u8, 0x5A)) { seqbad = seqbad + 1; }
+            si = si + 1;
+        }
+    }
+    if (seqbad != 0 || sf.size != 12000) { test_fail("small sequential writes read back whole", 39); return; }
+    close(sf);
+    unlink(cast(*u8, "/vfs-seq.bin"), 12);
+    serial.println("vfs.test: small sequential writes OK", 36);
+
+    // --- two handles on one file see each other's writes, in order ---
+    let is *VfsFile as wa = open(cast(*u8, "/vfs-two.bin"), 12, O_RDWR | O_CREAT | O_TRUNC);
+    if (cast(i64, wa) == 0) { test_fail("open /vfs-two.bin", 17); return; }
+    if (write(wa, cast(*u8, "........"), 8) != 8) { test_fail("write /vfs-two.bin", 18); return; }
+    let is *VfsFile as wb2 = open(cast(*u8, "/vfs-two.bin"), 12, O_RDWR);
+    if (cast(i64, wb2) == 0) { test_fail("second open /vfs-two.bin", 24); return; }
+    lseek(wa, cast(i64, 0), SEEK_SET);
+    write(wa, cast(*u8, "AAAA"), 4);
+    // B reads what A wrote, though A has not closed or read.
+    if (read(wb2, cast(*u8, &test_buf[0]), 8) != 8
+        || bytes_equal(cast(*u8, &test_buf[0]), cast(*u8, "AAAA...."), 8) == 0) {
+        test_fail("a second handle reads the first one's write", 43); return;
+    }
+    // A's bytes, then B's over part of them, then A's again: the last one wins.
+    lseek(wa, cast(i64, 4), SEEK_SET);
+    write(wa, cast(*u8, "CC"), 2);
+    lseek(wb2, cast(i64, 5), SEEK_SET);
+    write(wb2, cast(*u8, "DD"), 2);
+    lseek(wa, cast(i64, 6), SEEK_SET);
+    write(wa, cast(*u8, "E"), 1);
+    close(wb2);
+    close(wa);
+    let is *VfsFile as wc = open(cast(*u8, "/vfs-two.bin"), 12, O_RDONLY);
+    if (cast(i64, wc) == 0) { test_fail("reopen /vfs-two.bin", 19); return; }
+    if (read(wc, cast(*u8, &test_buf[0]), 8) != 8
+        || bytes_equal(cast(*u8, &test_buf[0]), cast(*u8, "AAAACDE."), 8) == 0) {
+        test_fail("writes through two handles land in order", 40); return;
+    }
+    close(wc);
+    unlink(cast(*u8, "/vfs-two.bin"), 12);
+    serial.println("vfs.test: two handles OK", 24);
 
     // --- mkdir + readdir + rmdir ---
     if (mkdir(cast(*u8, "/vfs-dir"), 8) != 0) {

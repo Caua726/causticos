@@ -69,6 +69,9 @@ struct Fat32Volume {
     fat_start_lba      as i64;   // reserved_sectors
     data_start_lba     as i64;   // reserved + num_fats * fat_size
     cluster_count      as i64;   // (total - data_start) / sectors_per_clus
+    // Allocation state, kept by cluster_alloc/cluster_free.
+    alloc_next         as i64;   // where the next free-cluster search starts
+    free_clusters      as i64;   // FAT entries == 0; -1 until first counted
     is_mounted         as i32;   // 1 if valid, 0 otherwise
 }
 
@@ -329,6 +332,8 @@ fn mount(dev as *storage.StorageDevice) as *Fat32Volume {
         i = i + 1;
     }
     vol.volume_label[11] = cast(u8, 0);
+    vol.alloc_next = 3;
+    vol.free_clusters = 0 - 1;
     vol.is_mounted = 1;
 
     // Log concise summary.
@@ -877,28 +882,108 @@ fn fat_write(v as *Fat32Volume, cluster as i64, value as i64) as i32 {
     return 0;
 }
 
-// Linear scan for a free FAT entry starting at cluster 3 (reserve 2
-// for the root). Returns the cluster number or -1 on ENOSPC.
+// A free FAT entry, marked end-of-chain so a second alloc cannot pick it
+// before the caller links it. Returns the cluster number, -1 on ENOSPC.
+//
+// The search resumes where the last one stopped (wrapping once), the way
+// FAT's own FSInfo "next free" hint works. It used to start at cluster 3
+// every time, so allocation cost grew with every cluster in use: a file
+// growing a cluster at a time scanned past everything before it, again, for
+// each cluster — quadratic in the size of the disk's contents.
 fn cluster_alloc(v as *Fat32Volume) as i64 {
     if (cast(i64, v) == 0) { return 0 - 1; }
     let is i64 as max_c = v.cluster_count + 2;
-    let is i64 as c with mut = 3;
-    while (c < max_c) {
+    let is i64 as c with mut = v.alloc_next;
+    if (c < 3 || c >= max_c) { c = 3; }
+    let is i64 as looked with mut = 0;
+    while (looked < max_c - 3) {
         let is i64 as entry = fat_read(v, c);
         if (entry == 0) {
-            // Mark as end-of-chain so a second alloc can't pick it
-            // before the caller chains further.
             if (fat_write(v, c, 0x0FFFFFFF) != 0) { return 0 - 2; }
+            v.alloc_next = c + 1;
+            if (v.free_clusters > 0) { v.free_clusters = v.free_clusters - 1; }
             return c;
         }
         if (entry < 0) { return 0 - 2; }   // I/O
         c = c + 1;
+        if (c >= max_c) { c = 3; }
+        looked = looked + 1;
     }
     return 0 - 1;
 }
 
+// Freeing a cluster can make any open file's chain cursor (FileHint) point
+// at a cluster that is no longer that file's, so it bumps chain_gen and every
+// cursor taken before it is ignored.
 fn cluster_free(v as *Fat32Volume, cluster as i64) as i32 {
-    return fat_write(v, cluster, 0);
+    let is i32 as rc = fat_write(v, cluster, 0);
+    if (rc == 0) {
+        if (v.free_clusters >= 0) { v.free_clusters = v.free_clusters + 1; }
+        chain_gen = chain_gen + 1;
+    }
+    return rc;
+}
+
+// ============================================================
+// Chain cursors
+// ============================================================
+//
+// Finding a byte in a FAT file means following the chain from its first
+// cluster: one FAT read per cluster. Every read and write did that from the
+// head, so writing a file in small pieces cost O(size) per write, O(size^2)
+// in all — `seq 1 9999999 > f` wrote at about 90 KB/s and slowed as it went.
+//
+// The VFS keeps four words per open file (VfsFile.hint0..3) and hands them in;
+// only this module reads or writes them:
+//   [0] a cluster index in the file    [1] that index's cluster
+//   [2] the first cluster of the chain they belong to
+//   [3] chain_gen when they were taken
+// A cursor for another chain, or older than the last freed cluster, is
+// ignored: the walk starts from the head as before.
+let is i64 as chain_gen with mut = 1;
+
+fn hint_usable(h as *i64, first as i64, idx as i64) as i64 {
+    if (cast(i64, h) == 0) { return 0; }
+    if (h[2] != first || h[3] != chain_gen || h[1] < 2) { return 0; }
+    if (h[0] > idx) { return 0; }
+    return 1;
+}
+
+fn hint_set(h as *i64, first as i64, idx as i64, cluster as i64) as void {
+    if (cast(i64, h) == 0) { return; }
+    h[0] = idx;
+    h[1] = cluster;
+    h[2] = first;
+    h[3] = chain_gen;
+}
+
+// The cluster at index `idx` of the chain starting at `first`, from the cursor
+// when it is at or before idx. With extend=1 a chain that ends early is
+// lengthened (new clusters linked, contents left as they are — callers write
+// them or never expose them). Negative on I/O error, or past the end with
+// extend=0.
+fn walk_to(v as *Fat32Volume, first as i64, idx as i64, h as *i64, extend as i64) as i64 {
+    if (first < 2) { return 0 - 1; }
+    let is i64 as c with mut = first;
+    let is i64 as i with mut = 0;
+    if (hint_usable(h, first, idx) == 1) {
+        c = h[1];
+        i = h[0];
+    }
+    while (i < idx) {
+        let is i64 as nxt with mut = fat_read(v, c);
+        if (nxt < 0) { return 0 - 2; }
+        if (cluster_is_eof(nxt) == 1) {
+            if (extend == 0) { return 0 - 3; }
+            nxt = cluster_alloc(v);
+            if (nxt < 0) { return 0 - 4; }
+            if (fat_write(v, c, nxt) != 0) { return 0 - 5; }
+        }
+        c = nxt;
+        i = i + 1;
+    }
+    hint_set(h, first, idx, c);
+    return c;
 }
 
 // statfs_fill: write [total_bytes, free_bytes, cluster_size_bytes] for the
@@ -919,16 +1004,22 @@ fn statfs_fill(out as *i64) as i64 {
     let is *Fat32Volume as v = &vol;
     if (v.is_mounted == 0) { return 0 - 1; }
     vfs.fs_lock_acquire();
-    let is i64 as max_c = v.cluster_count + 2;
-    let is i64 as free_c with mut = 0;
-    let is i64 as c with mut = 2;
-    while (c < max_c) {
-        let is i64 as entry = fat_read(v, c);
-        if (entry == 0) { free_c = free_c + 1; }
-        c = c + 1;
+    // Counted once, by walking the FAT; from then on cluster_alloc and
+    // cluster_free keep the count, so a monitor polling statfs every second
+    // costs nothing instead of a full FAT walk each time.
+    if (v.free_clusters < 0) {
+        let is i64 as max_c = v.cluster_count + 2;
+        let is i64 as free_c with mut = 0;
+        let is i64 as c with mut = 2;
+        while (c < max_c) {
+            let is i64 as entry = fat_read(v, c);
+            if (entry == 0) { free_c = free_c + 1; }
+            c = c + 1;
+        }
+        v.free_clusters = free_c;
     }
     out[0] = v.cluster_count * v.cluster_size_bytes;
-    out[1] = free_c * v.cluster_size_bytes;
+    out[1] = v.free_clusters * v.cluster_size_bytes;
     out[2] = v.cluster_size_bytes;
     vfs.fs_lock_release();
     return 0;
@@ -2006,39 +2097,55 @@ fn chain_ensure_length(v as *Fat32Volume, first_cluster as i64,
 // the chain when offset+data_len exceeds current size. Returns the
 // new file size (>= offset+data_len, never shrinks) or a negative
 // errno on failure. Callers must persist the new (first_cluster, size)
-// via dir_update_entry.
+// via dir_update_entry. `h` is the open file's chain cursor (or null).
+//
+// Writing past the end leaves a hole between the old size and `offset`, and
+// a hole reads as zeros: it is written as zeros first. It used to be left as
+// whatever the newly allocated clusters held — someone else's deleted data.
 // ============================================================
+let is [512]u8 as zero_block;      // .bss: zero
+
 fn file_write_at(v as *Fat32Volume,
                  first_cluster as i64, old_size as i64,
                  offset as i64, data as *u8, data_len as i64,
-                 out_first_cluster as *i64) as i64 {
+                 out_first_cluster as *i64, h as *i64) as i64 {
     if (cast(i64, v) == 0) { return 0 - 1; }
     if (offset < 0 || data_len < 0) { return 0 - 1; }
+    let is i64 as first with mut = first_cluster;
+    let is i64 as size with mut = old_size;
     if (data_len == 0) {
-        *out_first_cluster = first_cluster;
-        if (offset > old_size) { return offset; }
-        return old_size;
+        *out_first_cluster = first;
+        return size;
     }
     if (ensure_scratch() != 0) { return 0 - 2; }
 
-    let is i64 as end = offset + data_len;
-    let is i64 as cbytes = v.cluster_size_bytes;
-    let is i64 as clusters_needed = (end + cbytes - 1) / cbytes;
-
-    let is i64 as new_first with mut = first_cluster;
-    if (chain_ensure_length(v, first_cluster, clusters_needed, &new_first) != 0) {
-        return 0 - 3;
+    while (size < offset) {
+        let is i64 as z with mut = offset - size;
+        if (z > 512) { z = 512; }
+        let is i64 as zr = file_write_at(v, first, size, size,
+                                         cast(*u8, &zero_block[0]), z, out_first_cluster, h);
+        if (zr < 0) { return zr; }
+        first = *out_first_cluster;
+        size = zr;
     }
-    *out_first_cluster = new_first;
+
+    if (first == 0) {
+        first = cluster_alloc(v);
+        if (first < 0) { return 0 - 3; }
+    }
+    *out_first_cluster = first;
+
+    let is i64 as cbytes = v.cluster_size_bytes;
+    let is i64 as end = offset + data_len;
+    let is i64 as idx with mut = offset / cbytes;
+    let is i64 as cur_cluster with mut = walk_to(v, first, idx, h, 1);
+    if (cur_cluster < 2) { return 0 - 4; }
 
     let is *u8 as buf = cast(*u8, clus_scratch_virt);
     let is i64 as written with mut = 0;
     let is i64 as cur_off with mut = offset;
-    let is i64 as start_idx = offset / cbytes;
-    let is i64 as cur_cluster with mut = chain_advance(v, new_first, start_idx);
-    if (cur_cluster < 2) { return 0 - 4; }
-
-    while (written < data_len) {
+    let is i64 as going with mut = 1;
+    while (going == 1) {
         let is i64 as in_clus_off = cur_off % cbytes;
         let is i64 as chunk with mut = cbytes - in_clus_off;
         if (chunk > data_len - written) { chunk = data_len - written; }
@@ -2061,17 +2168,24 @@ fn file_write_at(v as *Fat32Volume,
 
         written = written + chunk;
         cur_off = cur_off + chunk;
-        if (written >= data_len) { break; }
-
-        // Advance.
-        let is i64 as nxt = fat_read(v, cur_cluster);
-        if (nxt < 0) { return 0 - 7; }
-        if (cluster_is_eof(nxt) == 1) { return 0 - 8; }
-        cur_cluster = nxt;
+        if (written >= data_len) { going = 0; }
+        else {
+            // Next cluster, linking a new one when the chain ends here.
+            let is i64 as nxt with mut = fat_read(v, cur_cluster);
+            if (nxt < 0) { return 0 - 7; }
+            if (cluster_is_eof(nxt) == 1) {
+                nxt = cluster_alloc(v);
+                if (nxt < 0) { return 0 - 8; }
+                if (fat_write(v, cur_cluster, nxt) != 0) { return 0 - 9; }
+            }
+            cur_cluster = nxt;
+            idx = idx + 1;
+        }
     }
+    hint_set(h, first, idx, cur_cluster);
 
-    if (end > old_size) { return end; }
-    return old_size;
+    if (end > size) { return end; }
+    return size;
 }
 
 // file_truncate — adjust a file to exactly `new_size` bytes. Shrinks
@@ -2418,16 +2532,16 @@ fn statx_fill(priv as *u8, path as *u8, path_len as i64,
 // file_read's copy-from-start model so seek + read stays O(n) in
 // bytes requested, not file size.
 fn vfs_read(priv as *u8, first_cluster as i64, size as i64,
-            offset as i64, dst as *u8, n as i64) as i64 {
+            offset as i64, dst as *u8, n as i64, h as *i64) as i64 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
     if (cast(i64, v) == 0) { return 0 - 1; }
     if (offset >= size || n <= 0 || first_cluster < 2) { return 0; }
 
     if (ensure_scratch() != 0) { return 0 - 2; }
     let is i64 as cbytes = v.cluster_size_bytes;
-    let is i64 as cluster_idx = offset / cbytes;
+    let is i64 as cluster_idx with mut = offset / cbytes;
     let is i64 as in_off with mut = offset % cbytes;
-    let is i64 as cluster with mut = chain_advance(v, first_cluster, cluster_idx);
+    let is i64 as cluster with mut = walk_to(v, first_cluster, cluster_idx, h, 0);
     if (cluster < 2) { return 0 - 3; }
 
     let is i64 as want with mut = n;
@@ -2435,7 +2549,8 @@ fn vfs_read(priv as *u8, first_cluster as i64, size as i64,
     let is *u8 as buf = cast(*u8, clus_scratch_virt);
     let is i64 as copied with mut = 0;
 
-    while (copied < want) {
+    let is i64 as going with mut = 1;
+    while (going == 1 && copied < want) {
         if (cluster_read(v, cluster, buf) != 0) { return 0 - 4; }
         let is i64 as chunk with mut = cbytes - in_off;
         if (chunk > want - copied) { chunk = want - copied; }
@@ -2446,21 +2561,26 @@ fn vfs_read(priv as *u8, first_cluster as i64, size as i64,
         }
         copied = copied + chunk;
         in_off = 0;   // subsequent clusters start fresh
-        if (copied >= want) { break; }
-        let is i64 as nxt = fat_read(v, cluster);
-        if (nxt < 0) { return 0 - 5; }
-        if (cluster_is_eof(nxt) == 1) { return copied; }
-        cluster = nxt;
+        if (copied < want) {
+            let is i64 as nxt = fat_read(v, cluster);
+            if (nxt < 0) { return 0 - 5; }
+            if (cluster_is_eof(nxt) == 1) { going = 0; }
+            else {
+                cluster = nxt;
+                cluster_idx = cluster_idx + 1;
+            }
+        }
     }
+    hint_set(h, first_cluster, cluster_idx, cluster);
     return copied;
 }
 
 fn vfs_write_at(priv as *u8, first_cluster as i64, size as i64,
                 offset as i64, data as *u8, data_len as i64,
-                out_first_cluster as *i64) as i64 {
+                out_first_cluster as *i64, h as *i64) as i64 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
     return file_write_at(v, first_cluster, size, offset,
-                         data, data_len, out_first_cluster);
+                         data, data_len, out_first_cluster, h);
 }
 
 fn vfs_truncate(priv as *u8, first_cluster as i64, old_size as i64,
