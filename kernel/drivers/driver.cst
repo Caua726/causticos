@@ -121,7 +121,7 @@ struct Hardware {
     prev_sibling as *Hardware;
     bus as *Bus;
     private as *u8;
-    lock as i64;                 // spinlock stub; single-CPU for now
+    lock as i64;                 // unused; the framework's lists are under fw_lk
     mmio_list as *MmioRegion;
     irq_list as *IrqBinding;
     dma_list as *DmaBuffer;
@@ -139,7 +139,14 @@ struct BusNode {
 let is i64 as root_hardware with mut = 0;
 let is i64 as buses with mut = 0;
 let is i32 as bus_count with mut = 0;
-let is i32 as driver_tree_lock with mut = 0;
+// The framework lock: the hardware tree's links, each bus's node list, and each
+// device's MMIO and DMA lists. These were "locked" with preempt_disable, which
+// keeps this cpu from switching and does nothing about another cpu — fine while
+// the framework ran only on the boot cpu before SMP, wrong since binding moved
+// to a phase-2 thread with every cpu up. Held for pointer updates only, never
+// across a callback, so a spinlock is the right kind. The IRQ chain has its own
+// irq-safe lock (irq_tbl_lock): it is walked from interrupt context.
+let is lock.TicketLock as fw_lk with mut;
 
 // ============================================================
 // Init
@@ -428,20 +435,16 @@ fn device_open(class as i64, index as i64) as i64 {
 }
 
 // ============================================================
-// Tree lock — single-CPU: block preemption, don't touch IRQ flag.
-// Composable: preempt_count is a counter, nested locks are safe.
-// Lock ordering (for future bus-type lock): always acquire tree_lock
-// BEFORE any bus-specific lock.
+// Tree lock — fw_lk (see there). Not nestable: nothing that holds it calls
+// back into the framework.
 // ============================================================
 
 fn tree_lock() as void {
-    sched.preempt_disable();
-    driver_tree_lock = 1;
+    lock.acquire(&fw_lk);
 }
 
 fn tree_unlock() as void {
-    driver_tree_lock = 0;
-    sched.preempt_enable();
+    lock.release(&fw_lk);
 }
 
 // ============================================================
@@ -594,12 +597,11 @@ fn bus_node_register(bi as *BusNode, parent as *Hardware) as i32 {
     let is i32 as rc = hardware_register(cast(*Hardware, bi), parent);
     if (rc != OK) { return rc; }
 
-    // Single-CPU: preempt_disable doubles as bt.lock.
-    sched.preempt_disable();
+    tree_lock();
     bi.next = bt.nodes;
     bt.nodes = bi;
     bt.node_count = bt.node_count + cast(u32, 1);
-    sched.preempt_enable();
+    tree_unlock();
 
     return OK;
 }
@@ -612,11 +614,13 @@ fn bus_node_register(bi as *BusNode, parent as *Hardware) as i32 {
 // hardware_unregister drains all three in order IRQ -> DMA -> MMIO
 // per spec §Cleanup Ordering.
 //
-// Limitations for V1:
-//   - dma_alloc supports up to one page (PAGE_SIZE = 4096). Multi-page
-//     contiguous allocations need alloc_pages with order>0; added later.
-//   - irq_register tracks the binding but does not yet program the IDT or
-//     LAPIC — that wiring lives in the IRQ subsystem commit.
+//   - dma_alloc takes physically contiguous pages from the buddy allocator,
+//     rounded up to a power of two (dma_order_for), zeroed, and below 4 GiB
+//     when the device asks for it.
+//   - irq_register links a handler into its vector's chain. Every vector has
+//     an IDT stub that ends in driver_irq_dispatch, which walks the chain, so
+//     nothing about the IDT changes here; routing a device's line to the
+//     vector (IOAPIC) is the bus's job (spec.cst, platform.cst).
 // ============================================================
 
 fn mmio_map(dev as *Hardware, phys as u64, size as u64, flags as u32, out as **u8) as i32 {
@@ -638,10 +642,10 @@ fn mmio_map(dev as *Hardware, phys as u64, size as u64, flags as u32, out as **u
     r.flags = cast(i64, flags);
     r.mapped_at = cast(*u8, vaddr);
 
-    sched.preempt_disable();
+    tree_lock();
     r.next = dev.mmio_list;
     dev.mmio_list = r;
-    sched.preempt_enable();
+    tree_unlock();
 
     *out = r.mapped_at;
     return OK;
@@ -651,14 +655,14 @@ fn mmio_unmap(dev as *Hardware, region as *MmioRegion) as void {
     if (cast(i64, dev) == 0) { return; }
     if (cast(i64, region) == 0) { return; }
 
-    sched.preempt_disable();
+    tree_lock();
     let is *MmioRegion as cur with mut = dev.mmio_list;
     let is *MmioRegion as prev with mut = cast(*MmioRegion, 0);
     while (cast(i64, cur) != 0) {
         if (cast(i64, cur) == cast(i64, region)) {
             if (cast(i64, prev) == 0) { dev.mmio_list = cur.next; }
             else                       { prev.next = cur.next; }
-            sched.preempt_enable();
+            tree_unlock();
             vmm.kvunmap(cast(i64, cur.mapped_at));
             heap.kfree(cast(i64, cur));
             return;
@@ -666,7 +670,7 @@ fn mmio_unmap(dev as *Hardware, region as *MmioRegion) as void {
         prev = cur;
         cur = cur.next;
     }
-    sched.preempt_enable();
+    tree_unlock();
 }
 
 // Compute smallest buddy order (power-of-2 pages) that fits `size` bytes.
@@ -716,10 +720,10 @@ fn dma_alloc(dev as *Hardware, size as u64, align as u64, flags as u32, out as *
     b.size = cast(i64, size);
     b.order = cast(i64, order);
 
-    sched.preempt_disable();
+    tree_lock();
     b.next = dev.dma_list;
     dev.dma_list = b;
-    sched.preempt_enable();
+    tree_unlock();
 
     *out = b;
     return OK;
@@ -729,14 +733,14 @@ fn dma_free(dev as *Hardware, buffer as *DmaBuffer) as void {
     if (cast(i64, dev) == 0) { return; }
     if (cast(i64, buffer) == 0) { return; }
 
-    sched.preempt_disable();
+    tree_lock();
     let is *DmaBuffer as cur with mut = dev.dma_list;
     let is *DmaBuffer as prev with mut = cast(*DmaBuffer, 0);
     while (cast(i64, cur) != 0) {
         if (cast(i64, cur) == cast(i64, buffer)) {
             if (cast(i64, prev) == 0) { dev.dma_list = cur.next; }
             else                       { prev.next = cur.next; }
-            sched.preempt_enable();
+            tree_unlock();
             let is i32 as pfn = cast(i32, cast(i64, cur.phys) / pmm.PAGE_SIZE);
             pmm.free_pages(pfn, cast(i32, cur.order));
             heap.kfree(cast(i64, cur));
@@ -745,7 +749,7 @@ fn dma_free(dev as *Hardware, buffer as *DmaBuffer) as void {
         prev = cur;
         cur = cur.next;
     }
-    sched.preempt_enable();
+    tree_unlock();
 }
 
 // Per-vector dispatch chain. Each vector slot holds the head of a
@@ -951,7 +955,7 @@ fn bus_node_unregister(bi as *BusNode) as i32 {
     let is *Bus as bt = d.bus;
     if (cast(i64, bt) == 0) { return INVALID_ARGUMENT; }
 
-    sched.preempt_disable();
+    tree_lock();
     let is *BusNode as cur with mut = bt.nodes;
     let is *BusNode as prev with mut = cast(*BusNode, 0);
     let is i32 as found with mut = 0;
@@ -968,7 +972,7 @@ fn bus_node_unregister(bi as *BusNode) as i32 {
             cur = cur.next;
         }
     }
-    sched.preempt_enable();
+    tree_unlock();
     if (found == 0) { return NOT_FOUND; }
 
     hardware_unregister(d);
