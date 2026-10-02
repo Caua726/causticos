@@ -12,11 +12,16 @@
 // linker-provided __start_/__stop_ markers — infrastructure intentionally
 // kept simple for now.
 //
-// Secondary use: panic backtrace / kdebug can consume the same table
-// to render return addresses as names (future work).
+// The panic path does NOT use this list to name addresses: it holds a few
+// driver callbacks, and "the nearest of those below the rip" named a fault in
+// main.cst after ahci_irq, 360 KB away. Names for the panic path come from the
+// whole-kernel table below (load_table / describe).
 
 use "sched.cst" as sched;
 use "serial.cst" as serial;
+use "util.cst" as util;
+use "limine.cst" as limine;
+use "pmm.cst" as pmm;
 
 // --- Symbol kinds ---
 let is i64 as KIND_FUNC = 1;
@@ -35,12 +40,19 @@ let is i64 as ksym_count with mut = 0;
 
 // Register a symbol. `s` must be a statically-allocated KSym (BSS or
 // with section) so the pointer stays valid for the lifetime of the kernel.
-// Returns 0 on success, negative on invalid input. Duplicate names are
-// allowed for now (caller responsibility); future lookup wins the
-// most-recently-registered entry (LIFO list order).
+// Returns 0 on success, -1 on invalid input, -2 for a name that is already
+// registered. A duplicate used to be accepted and to win every later lookup —
+// a second driver reusing a name silently took over the first one's spec
+// callbacks — so it is refused, by name, and the first registration stands.
 fn register(s as *KSym) as i32 {
     if (cast(i64, s) == 0) { return cast(i32, 0 - 1); }
     if (cast(i64, s.name_ptr) == 0) { return cast(i32, 0 - 1); }
+    if (lookup(s.name_ptr, s.name_len) != 0) {
+        serial.print("ksym: duplicate symbol ", 23);
+        serial.print(s.name_ptr, s.name_len);
+        serial.println(" - refused, the first registration stands", 41);
+        return cast(i32, 0 - 2);
+    }
 
     sched.preempt_disable();
     s.next = cast(*KSym, ksyms);
@@ -88,29 +100,135 @@ fn lookup_cstr(name as *u8) as i64 {
     return lookup(name, len);
 }
 
-// nearest(rip): linear search for the highest registered symbol whose
-// address is <= rip. Used by the kernel panic path to render a faulting
-// RIP as "<sym>+<offset>" instead of a bare hex address. Returns:
-//   rip==0          → 0 (no match)
-//   found candidate → (*KSym) as i64
-//   no candidate    → 0 (no symbol registered below rip)
-// The KSym's `addr` field is the start of the function; the caller
-// computes (rip - ksym->addr) as the offset to print.
-fn nearest(rip as i64) as i64 {
-    if (rip == 0) { return 0; }
-    let is *KSym as best with mut = cast(*KSym, 0);
-    let is *KSym as s with mut = cast(*KSym, ksyms);
-    while (cast(i64, s) != 0) {
-        // Same-kind only: a function RIP shouldn't resolve to a data
-        // symbol just because its address happens to be lower.
-        if (s.kind == KIND_FUNC && s.addr != 0 && s.addr <= rip) {
-            if (cast(i64, best) == 0 || s.addr > best.addr) {
-                best = s;
-            }
-        }
-        s = s.next;
+// ============================================================
+// The whole-kernel table (scripts/mksym.py → /boot/kernel.sym)
+// ============================================================
+//
+// Every function's address and name, from the linker map, loaded by Limine as
+// a module beside the kernel. Read-only after load_table, and read without a
+// lock — by the panic path, after every other cpu has stopped.
+
+let is i64 as TAB_HDR = 32;
+let is i64 as TAB_ENTRY = 16;
+let is i64 as tab_base with mut = 0;      // HHDM address of the module; 0 = none
+let is i64 as tab_size with mut = 0;
+let is i64 as tab_count with mut = 0;
+let is i64 as tab_text_end with mut = 0;
+
+fn rd64(p as i64) as i64 {
+    let is *i64 as q = cast(*i64, p);
+    return q[0];
+}
+
+fn rd32(p as i64) as i64 {
+    let is *u8 as b = cast(*u8, p);
+    return cast(i64, b[0]) | (cast(i64, b[1]) << 8) | (cast(i64, b[2]) << 16) | (cast(i64, b[3]) << 24);
+}
+
+fn is_table(a as i64, size as i64) as i64 {
+    if (size < TAB_HDR) { return 0; }
+    let is *u8 as m = cast(*u8, a);
+    let is *u8 as want = cast(*u8, "CKSYMTAB");
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        if (m[i] != want[i]) { return 0; }
+        i = i + 1;
     }
-    return cast(i64, best);
+    return 1;
+}
+
+// Index of the last entry at or below addr, -1 if none. Binary search.
+fn entry_at_or_below(addr as i64) as i64 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = tab_count - 1;
+    let is i64 as best with mut = 0 - 1;
+    while (lo <= hi) {
+        let is i64 as mid = lo + (hi - lo) / 2;
+        if (rd64(tab_base + TAB_HDR + mid * TAB_ENTRY) <= addr) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
+fn entry_name_eq(e as i64, lit as *u8, lit_len as i64) as i64 {
+    let is i64 as ep = tab_base + TAB_HDR + e * TAB_ENTRY;
+    if (rd32(ep + 12) != lit_len) { return 0; }
+    let is *u8 as nm = cast(*u8, tab_base + rd32(ep + 8));
+    return cast(i64, names_eq(nm, lit_len, lit, lit_len));
+}
+
+// Find the table among the boot modules (by content, like ramvol: the order
+// modules arrive in is the bootloader's business), check it is whole, and
+// check it belongs to THIS kernel — the entry at load_table's own address must
+// be named load_table. A table from another build would name every address
+// wrongly, which is worse than naming none.
+fn load_table() as void {
+    let is i64 as n = limine.module_count();
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as f = limine.module_at(i);
+        let is i64 as a = pmm.to_hhdm(limine.file_address(f));
+        let is i64 as size = limine.file_size(f);
+        if (a != 0 && pmm.is_hhdm_mapped(a) != 0 && is_table(a, size) != 0) {
+            let is i64 as count = rd64(a + 16);
+            if (rd64(a + 8) != 1 || count <= 0 || TAB_HDR + count * TAB_ENTRY > size) {
+                serial.println("ksym: kernel.sym is malformed - ignored", 39);
+                return;
+            }
+            tab_base = a;
+            tab_size = size;
+            tab_count = count;
+            tab_text_end = rd64(a + 24);
+            let is i64 as me = cast(i64, fn_ptr(load_table));
+            let is i64 as e = entry_at_or_below(me);
+            if (e < 0 || rd64(tab_base + TAB_HDR + e * TAB_ENTRY) != me
+                || entry_name_eq(e, cast(*u8, "ksym.load_table"), 15) == 0) {
+                tab_base = 0;
+                tab_count = 0;
+                serial.println("ksym: kernel.sym is from a different build - ignored", 52);
+                return;
+            }
+            serial.print("ksym: ", 6);
+            util.print_num(count);
+            serial.println(" function names from kernel.sym", 31);
+            return;
+        }
+        i = i + 1;
+    }
+    serial.println("ksym: no kernel.sym module - faults will show bare addresses", 60);
+}
+
+// The function containing addr: its name (pointer and length into the table)
+// and addr's offset into it. 1 if found; 0 when there is no table or addr is
+// not in kernel text.
+fn describe(addr as i64, name_out as *i64, len_out as *i64, off_out as *i64) as i64 {
+    if (tab_base == 0 || addr >= tab_text_end) { return 0; }
+    let is i64 as e = entry_at_or_below(addr);
+    if (e < 0) { return 0; }
+    let is i64 as ep = tab_base + TAB_HDR + e * TAB_ENTRY;
+    let is i64 as no = rd32(ep + 8);
+    let is i64 as nl = rd32(ep + 12);
+    if (no + nl > tab_size) { return 0; }
+    name_out[0] = tab_base + no;
+    len_out[0] = nl;
+    off_out[0] = addr - rd64(ep);
+    return 1;
+}
+
+// " name+0xoff" for addr, or nothing when it cannot be named.
+fn print_symbol(addr as i64) as void {
+    let is i64 as np with mut = 0;
+    let is i64 as nl with mut = 0;
+    let is i64 as off with mut = 0;
+    if (describe(addr, &np, &nl, &off) == 0) { return; }
+    serial.print(" ", 1);
+    serial.print(cast(*u8, np), nl);
+    serial.print("+", 1);
+    util.print_hex_short(off);
 }
 
 fn dump() as void {

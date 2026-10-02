@@ -38,6 +38,14 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f build/kernel.elf ] || { echo "mkiso: build/kernel.elf missing — run 'caustic-mk build kernel'" >&2; exit 1; }
+# The symbol table comes from the map the same link wrote. One older than the
+# kernel describes a different kernel; the kernel would refuse it at boot, but a
+# build that ships it has already gone wrong, so say so here.
+[ -f build/kernel.elf.map ] || { echo "mkiso: build/kernel.elf.map missing — run 'caustic-mk build kernel'" >&2; exit 1; }
+if [ "$(( $(stat -c %Y build/kernel.elf) - $(stat -c %Y build/kernel.elf.map) ))" -gt 5 ]; then
+    echo "mkiso: build/kernel.elf.map is older than build/kernel.elf — run 'caustic-mk build kernel --force'" >&2
+    exit 1
+fi
 
 for f in limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin BOOTX64.EFI; do
     [ -f "$LIMINE_DIR/$f" ] || { echo "mkiso: $LIMINE_DIR/$f missing — install limine, or set LIMINE_DIR" >&2; exit 1; }
@@ -46,6 +54,8 @@ done
 rm -rf build/iso
 mkdir -p build/iso/boot/limine build/iso/EFI/BOOT "$(dirname "$OUT")"
 cp build/kernel.elf build/iso/boot/
+# Every function's name, for the panic path's backtrace (scripts/mksym.py).
+"$PY" scripts/mksym.py build/kernel.elf.map build/iso/boot/kernel.sym
 cp "$LIMINE_DIR/limine-bios.sys"     build/iso/boot/limine/
 cp "$LIMINE_DIR/limine-bios-cd.bin"  build/iso/boot/limine/
 cp "$LIMINE_DIR/limine-uefi-cd.bin"  build/iso/boot/limine/
@@ -72,6 +82,8 @@ fi
     echo "/causticos"
     echo "    protocol: limine"
     echo "    kernel_path: boot():/boot/kernel.elf"
+    echo "    # Function names for the panic screen's backtrace (scripts/mksym.py)."
+    echo "    module_path: boot():/boot/kernel.sym"
     if [ -n "$CMDLINE" ]; then
         # The kernel command line comes from HERE, not from QEMU's -append:
         # -append only reaches a kernel loaded with -kernel, and this one is

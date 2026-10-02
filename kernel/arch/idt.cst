@@ -195,23 +195,7 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
     print_num(error_code);
     serial.print(" rip=", 5);
     print_hex(rip);
-    // Resolve RIP to a registered symbol when possible — kernel faults
-    // without this just show a hex address; with it, "near=kbd.kbd_irq+0x42"
-    // tells you which line blew up before the post-mortem log runs out.
-    let is i64 as kp = ksym.nearest(rip);
-    if (kp != 0) {
-        let is *ksym.KSym as k = cast(*ksym.KSym, kp);
-        serial.print(" near=", 6);
-        // The symbol name is a non-NUL-terminated slice (length in
-        // k.name_len) — print it byte by byte to avoid walking past it.
-        let is i64 as ni with mut = 0;
-        while (ni < k.name_len) {
-            serial.putc(cast(i64, k.name_ptr[ni]));
-            ni = ni + 1;
-        }
-        serial.print("+", 1);
-        util.print_hex(rip - k.addr);
-    }
+    ksym.print_symbol(rip);          // " sched.schedule+0x25", from kernel.sym
     serial.print(" rsp=", 5);
     print_hex(fault_rsp);
     serial.print(" cs=", 4);
@@ -222,10 +206,14 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
     }
     serial.println(" (kernel)", 9);
 
-    // Kernel-mode fault. Dump a few words from the kstack so the
-    // caller chain is recoverable from the serial log when post-
-    // mortem debugging.
-    if (fault_rsp >= 0xFFFF800000000000) {
+    // The call chain that led here. Without the symbol table the frames would
+    // be bare addresses, so a few raw stack words are printed instead, as
+    // before.
+    let is i64 as gprs with mut = 0;
+    saved_gprs_into(&gprs);
+    if (ksym.tab_base != 0) {
+        backtrace(gprs, fault_rsp);
+    } else if (fault_rsp >= 0xFFFF800000000000) {
         let is *i64 as sp = cast(*i64, fault_rsp);
         let is i64 as i with mut = 0;
         while (i < 8) {
@@ -243,6 +231,44 @@ fn exception_handler(vector as i64, error_code as i64, rip as i64,
     let is [80]u8 as m;
     let is i64 as ml = exception_message(vector, cast(*u8, &m[0]));
     pmm.panic_end(cast(*u8, &m[0]), ml);
+}
+
+// The GPRs .Lisr_common saved, as an address: the stub points rbp at them before
+// it calls exception_handler, so they are what exception_handler's prologue
+// saved as its caller's frame pointer. Call it from exception_handler only —
+// it reads one frame up.
+fn saved_gprs_into(out as *i64) as void {
+    asm("mov rax, QWORD PTR [rbp]\n");      // exception_handler's frame
+    asm("mov rax, QWORD PTR [rax]\n");      // its saved rbp: the stub's, = the GPR area
+    asm("mov QWORD PTR [rdi], rax\n");
+}
+
+// Every Caustic function keeps a frame pointer (push rbp; mov rbp, rsp), so the
+// saved rbps are the call chain: [rbp] is the caller's rbp and [rbp+8] the
+// return address into it. It starts from the interrupted code's rbp, which
+// .Lisr_common saved at +48 (rax rbx rcx rdx rsi rdi rbp from the bottom). Each
+// frame has to lie above the last and within 64 KB of the faulting rsp — on
+// that stack — so a corrupt chain ends the walk instead of faulting inside the
+// panic.
+fn backtrace(gprs as i64, fault_rsp as i64) as void {
+    let is *i64 as g = cast(*i64, gprs);
+    let is i64 as fp with mut = g[6];
+    serial.println("call chain:", 11);
+    let is i64 as depth with mut = 0;
+    while (depth < 12 && fp >= fault_rsp && fp < fault_rsp + 65536 && (fp & 7) == 0) {
+        let is *i64 as fr = cast(*i64, fp);
+        let is i64 as ret = fr[1];
+        if (ret == 0) { depth = 12; }
+        else {
+            serial.print("  ", 2);
+            print_hex(ret);
+            ksym.print_symbol(ret);
+            serial.println("", 0);
+            let is i64 as next = fr[0];
+            if (next <= fp) { depth = 12; }
+            else { fp = next; depth = depth + 1; }
+        }
+    }
 }
 
 // "CPU exception #14 (page fault) in the kernel" into out; returns the length.
