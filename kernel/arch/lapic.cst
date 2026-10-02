@@ -282,6 +282,64 @@ fn ap_init() as void {
     program_tick_ms(5);
 }
 
+// Every IPI goes through here. Bit 12 of ICR_LO (delivery status) stays set
+// while the LAPIC is still sending the previous command, and writing the ICR
+// then would clobber it. On any cpu made this century it clears within a
+// microsecond, but a wedged LAPIC holds it forever, and these waits run in the
+// scheduler and the TLB shootdown with interrupts off: an unbounded spin there
+// is a frozen machine with nothing in the log. So each wait is bounded; when
+// one runs out the LAPIC's own state is logged — once, not per IPI — and the
+// command goes out anyway. An IPI attempted beats one silently dropped, and the
+// callers that depend on delivery (the shootdown waiting for its acks) have
+// deadlines of their own that report a lost one.
+let is i64 as ICR_BUDGET_NS = 10000000;
+let is i64 as LAPIC_ESR = 0x280;
+let is i64 as icr_stuck_reported with mut = 0;
+
+fn icr_send(hi as i64, lo as i64) as void {
+    if (icr_wait_idle(ICR_BUDGET_NS) == 0) { icr_report_stuck(lo); }
+    lapic_write(LAPIC_ICR_HI, hi);
+    lapic_write(LAPIC_ICR_LO, lo);
+    if (icr_wait_idle(ICR_BUDGET_NS) == 0) { icr_report_stuck(lo); }
+}
+
+// 1 once the delivery-status bit is clear, 0 if budget_ns ran out first.
+// Timed on the HPET; without one nothing that works with interrupts off can
+// tell time, and the wait is a fixed number of reads instead.
+fn icr_wait_idle(budget_ns as i64) as i64 {
+    if (hpet.available() == 1) {
+        let is i64 as deadline = hpet.current_ns() + budget_ns;
+        while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) {
+            if (hpet.current_ns() >= deadline) { return 0; }
+            asm("pause\n");
+        }
+        return 1;
+    }
+    let is i64 as reads with mut = 0;
+    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) {
+        if (reads >= 1000000) { return 0; }
+        asm("pause\n");
+        reads = reads + 1;
+    }
+    return 1;
+}
+
+fn icr_report_stuck(lo as i64) as void {
+    if (icr_stuck_reported != 0) { return; }
+    icr_stuck_reported = 1;
+    lapic_write(LAPIC_ESR, 0);                 // latch the error bits, then read them
+    let is i64 as esr = lapic_read(LAPIC_ESR);
+    serial.print("lapic: ICR still busy after 10 ms sending ICR_LO=", 49);
+    util.print_hex(lo);
+    serial.print(" (ICR_LO now ", 13);
+    util.print_hex(lapic_read(LAPIC_ICR_LO));
+    serial.print(", ICR_HI ", 9);
+    util.print_hex(lapic_read(LAPIC_ICR_HI));
+    serial.print(", ESR ", 6);
+    util.print_hex(esr);
+    serial.println(") - sending anyway; reported once", 33);
+}
+
 // Broadcast a reschedule IPI to every cpu except the sender. Target
 // cpus take vector RESCHED_VECTOR on their IDT; the handler for that
 // vector does nothing but the IDT stub's shared tail checks
@@ -294,12 +352,6 @@ fn ap_init() as void {
 // in-flight one.
 fn send_resched_ipi_all_except_self() as void {
     if (lapic_base == 0) { return; }
-    // Wait for any prior IPI to finish delivery.
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
-    // Dest field unused with all-except-self shorthand but the
-    // write-order matters on Intel: ICR_HI first (even when
-    // ignored), then ICR_LO which commits the send.
-    lapic_write(LAPIC_ICR_HI, 0);
     // ICR_LO bit layout for a fixed-vector IPI (Intel SDM §10.6.1):
     //   [0:7]   vector
     //   [8:10]  delivery mode (000 = fixed)
@@ -308,8 +360,8 @@ fn send_resched_ipi_all_except_self() as void {
     //           on newer Intel parts — SDM recommends always 1)
     //   [15]    trigger (0 = edge)
     //   [18:19] dest shorthand (11 = all excluding self)
-    lapic_write(LAPIC_ICR_LO, RESCHED_VECTOR | 0x4000 | 0xC0000);
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
+    // The destination field is unused with a shorthand.
+    icr_send(0, RESCHED_VECTOR | 0x4000 | 0xC0000);
 }
 
 // Halt every other cpu (shutdown step 6). An INIT IPI broadcast (all-except-
@@ -317,10 +369,7 @@ fn send_resched_ipi_all_except_self() as void {
 // them back. ICR_LO: delivery mode 101 (INIT) | level assert | all-except-self.
 fn halt_aps() as void {
     if (lapic_base == 0) { return; }
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
-    lapic_write(LAPIC_ICR_HI, 0);
-    lapic_write(LAPIC_ICR_LO, 0x500 | 0x4000 | 0xC0000);
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
+    icr_send(0, 0x500 | 0x4000 | 0xC0000);
 }
 
 // Targeted reschedule IPI — send the same RESCHED_VECTOR to a
@@ -335,41 +384,16 @@ fn halt_aps() as void {
 // honours ICR_HI.
 fn send_resched_ipi_to(target_lapic_id as i64) as void {
     if (lapic_base == 0) { return; }
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
-    lapic_write(LAPIC_ICR_HI, (target_lapic_id & 0xFF) << 24);
-    lapic_write(LAPIC_ICR_LO, RESCHED_VECTOR | 0x4000);
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
+    icr_send((target_lapic_id & 0xFF) << 24, RESCHED_VECTOR | 0x4000);
 }
 
 // Panic: an NMI to every other cpu. Unlike any vector it gets through a cpu
 // spinning with interrupts off — which is exactly the cpu most likely to be
 // part of whatever went wrong — and the NMI handler halts it for good
-// (idt.exception_handler, vector 2 while pmm.is_panicking()). The ICR waits are
-// bounded: the panic path must not hang on a wedged LAPIC.
+// (idt.exception_handler, vector 2 while pmm.is_panicking()).
 fn send_nmi_all_except_self() as void {
     if (lapic_base == 0) { return; }
-    icr_wait_idle_bounded(10000000);
-    lapic_write(LAPIC_ICR_HI, 0);
-    lapic_write(LAPIC_ICR_LO, 0x400 | 0x4000 | 0xC0000);   // NMI | assert | all-except-self
-    icr_wait_idle_bounded(10000000);
-}
-
-// Wait up to budget_ns for the ICR's delivery-status bit to clear. Timed on the
-// HPET when there is one; without it nothing that does not need interrupts can
-// tell time, so the wait falls back to a fixed number of reads.
-fn icr_wait_idle_bounded(budget_ns as i64) as void {
-    if (hpet.available() == 1) {
-        let is i64 as deadline = hpet.current_ns() + budget_ns;
-        while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0 && hpet.current_ns() < deadline) {
-            asm("pause\n");
-        }
-        return;
-    }
-    let is i64 as reads with mut = 0;
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0 && reads < 1000000) {
-        asm("pause\n");
-        reads = reads + 1;
-    }
+    icr_send(0, 0x400 | 0x4000 | 0xC0000);   // NMI | assert | all-except-self
 }
 
 fn send_nmi_all_except_self_ptr() as i64 { return cast(i64, fn_ptr(send_nmi_all_except_self)); }
@@ -381,16 +405,10 @@ fn send_nmi_all_except_self_ptr() as i64 { return cast(i64, fn_ptr(send_nmi_all_
 // another cpu can't outlive the page it pointed at.
 fn send_tlb_shootdown_ipi_to(target_lapic_id as i64) as void {
     if (lapic_base == 0) { return; }
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
-    lapic_write(LAPIC_ICR_HI, (target_lapic_id & 0xFF) << 24);
-    lapic_write(LAPIC_ICR_LO, TLB_SHOOTDOWN_VECTOR | 0x4000);
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
+    icr_send((target_lapic_id & 0xFF) << 24, TLB_SHOOTDOWN_VECTOR | 0x4000);
 }
 
 fn send_tlb_shootdown_ipi_all_except_self() as void {
     if (lapic_base == 0) { return; }
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
-    lapic_write(LAPIC_ICR_HI, 0);
-    lapic_write(LAPIC_ICR_LO, TLB_SHOOTDOWN_VECTOR | 0x4000 | 0xC0000);
-    while ((lapic_read(LAPIC_ICR_LO) & 0x1000) != 0) { }
+    icr_send(0, TLB_SHOOTDOWN_VECTOR | 0x4000 | 0xC0000);
 }
