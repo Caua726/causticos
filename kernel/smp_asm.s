@@ -216,3 +216,18 @@ smp_enter_user:
     .byte   0x4D, 0x31, 0xFF              # xor r15, r15
     .byte   0x48, 0x31, 0xC0              # xor rax, rax
     .byte   0x48, 0xCF                    # iretq
+
+# void smp_flush_tlb_local(void) — reload CR3, dropping this cpu's non-global
+# TLB entries. Register-only: nothing shared is touched, so two cpus flushing
+# at once cannot interfere.
+.globl smp_flush_tlb_local
+smp_flush_tlb_local:
+    .byte   0x0F, 0x20, 0xD8              # mov rax, cr3
+    .byte   0x0F, 0x22, 0xD8              # mov cr3, rax
+    ret
+
+# void smp_invlpg(uint64_t va /*rdi*/)
+.globl smp_invlpg
+smp_invlpg:
+    .byte   0x0F, 0x01, 0x3F              # invlpg [rdi]
+    ret

@@ -678,52 +678,150 @@ fn preempt_resched() as void {
 
 // ============================================================
 // TLB shootdown — invalidate stale TLB entries on the OTHER cpus after a
-// present page is unmapped, before the freed frame is reused. The initiator
-// (vma.decommit / vma.release through here) has already cleared the PTE +
-// invlpg'd locally; this makes the remote cpus catch up.
+// present page was unmapped, before its frame is reused. The initiator has
+// already cleared the PTE and invalidated its own entry.
+//
+// The request names what changed (an address space, a range); only cpus that
+// can hold an entry for it are interrupted, and a short range is invalidated
+// page by page instead of throwing away every cpu's whole TLB:
+//
+//   pml4 == 0   a kernel mapping: every other cpu
+//   pml4 != 0   a user address space: the cpus whose CR3 it is now. Without
+//               PCIDs a CR3 load drops every non-global entry, so a cpu that
+//               switched away holds nothing for it.
+//
+// The frames are freed only after every target acknowledged. This used to give
+// up after 100 ms and free them anyway — the one outcome a shootdown exists to
+// prevent: a cpu still translating through a stale entry into a frame that now
+// belongs to someone else. A target that does not answer is a wedged cpu, and
+// the kernel says so and stops.
+//
+// Interrupts may be off on a target (it is spinning on a lock with them
+// disabled) — so a pending request is also served by anyone spinning for
+// tlb_lock (acquire_polling) and by the initiator itself while it waits, and
+// the request is recorded per cpu before the IPI goes out.
 // ============================================================
 
-// Serialises shooters so they share one ack counter cleanly. A PLAIN spinlock
-// (no IRQ disable): a shooter waiting for acks must keep IRQs enabled so it can
-// still service an incoming shootdown IPI from another shooter — that's what
-// breaks the mutual two-shooter deadlock. Preemption is disabled around the
-// critical section instead, so the holder isn't switched off mid-shootdown.
 let is lock.TicketLock as tlb_lock with mut;
 let is i64 as tlb_ack with mut = 0;
+let is i64 as tlb_gen with mut = 0;
+let is i64 as tlb_req_va with mut = 0;
+let is i64 as tlb_req_pages with mut = 0;     // 0 = flush everything
+// A range longer than this is cheaper to drop wholesale than page by page.
+let is i64 as TLB_INVLPG_MAX = 32;
 
-// Called by the TLB-shootdown IPI handler (idt) on each target cpu AFTER it has
-// flushed its TLB. Atomic so the initiator's wait reads a consistent count.
-fn tlb_shootdown_ack() as void {
+fn tlb_flush_local() as void { asm("call smp_flush_tlb_local\n"); }
+fn tlb_invlpg(va as i64) as void { asm("call smp_invlpg\n"); }
+
+// Serve this cpu's pending request, if any. From the IPI handler, and from any
+// spin that might otherwise keep this cpu from answering.
+fn tlb_serve_pending() as void {
+    let is *smp.PerCpu as me = smp.current_cpu();
+    if (me.tlb_pending == 0) { return; }
+    let is i64 as pages = tlb_req_pages;
+    if (pages > 0 && pages <= TLB_INVLPG_MAX) {
+        let is i64 as i with mut = 0;
+        while (i < pages) {
+            tlb_invlpg(tlb_req_va + i * pmm.PAGE_SIZE);
+            i = i + 1;
+        }
+    } else {
+        tlb_flush_local();
+    }
+    me.tlb_pending = 0;
     lock.atomic_add(&tlb_ack, 1);
 }
 
-// Flush the OTHER cpus' TLBs (this cpu already did its local invlpg). No-op on
-// a uniprocessor. Full-flush broadcast: reset the ack, send the IPI to all-
-// except-self, spin until every other cpu acks or a bounded deadline elapses (a
-// wedged cpu must not hang the unmapper). IRQs stay ENABLED while waiting so a
-// concurrent shooter's IPI is serviced (no deadlock); preemption is off so we
-// keep tlb_lock for the whole short window.
-fn tlb_shootdown_all() as void {
-    let is i64 as others = smp.cpu_count - 1;
-    if (others <= 0) { return; }
+fn tlb_serve_pending_ptr() as i64 { return cast(i64, fn_ptr(tlb_serve_pending)); }
+
+// Called by the TLB-shootdown IPI handler (idt).
+fn tlb_shootdown_ack() as void {
+    tlb_serve_pending();
+}
+
+fn tlb_shootdown(pml4 as i64, va as i64, pages as i64) as void {
+    let is i64 as cpus = smp.cpu_count;
+    if (cpus <= 1) { return; }
+    if (sched_active == 0) { return; }       // APs are not running anything yet
     preempt_disable();
-    lock.acquire(&tlb_lock);
-    // Reset the ack counter before sending. A 64-bit aligned store is atomic on
-    // x86 and visible to the targets via cache coherency; it happens-before the
-    // IPI send (and the prior shooter already drained under tlb_lock), so the
-    // only writers after this point are the targets of the IPI we send next.
+    lock.acquire_polling(&tlb_lock, tlb_serve_pending_ptr());
+    let is i64 as self = this_cpu();
+    tlb_gen = tlb_gen + 1;
+    tlb_req_va = va;
+    tlb_req_pages = pages;
     tlb_ack = 0;
-    lapic.send_tlb_shootdown_ipi_all_except_self();
-    let is i64 as deadline = timer.current_time_ns() + 100000000;   // 100 ms
-    let is i64 as done with mut = 0;
-    while (done == 0) {
-        if (lock.atomic_add(&tlb_ack, 0) >= others) { done = 1; }
-        else if (timer.current_time_ns() >= deadline) { done = 1; }
-        else { asm(".byte 0xF3, 0x90\n"); }   // pause
+    // The caller's PTE store must be visible before we read any cpu's CR3: a
+    // cpu that loads this address space after we looked walks the cleared PTE.
+    lock.mfence();
+    let is i64 as targets with mut = 0;
+    let is i64 as c with mut = 0;
+    while (c < cpus) {
+        if (c != self) {
+            let is *smp.PerCpu as pc = smp.get_per_cpu(c);
+            if (cast(i64, pc) != 0 && pc.is_online != 0) {
+                if (pml4 == 0 || (pc.cur_pml4 & 0xFFFFFFFFFFFFF000) == (pml4 & 0xFFFFFFFFFFFFF000)) {
+                    pc.tlb_pending = tlb_gen;
+                    targets = targets + 1;
+                }
+            }
+        }
+        c = c + 1;
+    }
+    if (targets > 0) {
+        lock.mfence();
+        c = 0;
+        while (c < cpus) {
+            let is *smp.PerCpu as pt = smp.get_per_cpu(c);
+            if (c != self && cast(i64, pt) != 0 && pt.tlb_pending == tlb_gen) {
+                lapic.send_tlb_shootdown_ipi_to(pt.lapic_id);
+            }
+            c = c + 1;
+        }
+        let is i64 as t0 = timer.current_time_ns();
+        let is i64 as warned with mut = 0;
+        while (lock.atomic_add(&tlb_ack, 0) < targets) {
+            let is i64 as waited = timer.current_time_ns() - t0;
+            if (warned == 0 && waited > 100000000) {
+                serial.println("tlb: a cpu is slow to acknowledge a shootdown (100 ms)", 54);
+                warned = 1;
+            }
+            if (waited > 5000000000) { tlb_wedged(targets); }
+            asm(".byte 0xF3, 0x90\n");   // pause
+        }
     }
     lock.release(&tlb_lock);
     preempt_enable();
 }
+
+fn tlb_wedged(targets as i64) as void {
+    serial.print("tlb: shootdown gen=", 19);
+    util.print_num(tlb_gen);
+    serial.print(" got ", 5);
+    util.print_num(lock.atomic_add(&tlb_ack, 0));
+    serial.print(" of ", 4);
+    util.print_num(targets);
+    serial.println(" acknowledgements after 5 s; still pending on:", 46);
+    let is i64 as c with mut = 0;
+    while (c < smp.cpu_count) {
+        let is *smp.PerCpu as pc = smp.get_per_cpu(c);
+        if (cast(i64, pc) != 0 && pc.tlb_pending != 0) {
+            serial.print("  cpu", 5);
+            util.print_num(c);
+            serial.print(" current_tid=", 13);
+            util.print_num(pc.current_tid);
+            serial.println("", 0);
+        }
+        c = c + 1;
+    }
+    pmm.panic("TLB shootdown not acknowledged", 30);
+}
+
+// A kernel mapping went away (vmm.kvunmap). Installed into vmm by main.
+fn tlb_shootdown_kernel(va as i64, pages as i64) as void {
+    tlb_shootdown(0, va, pages);
+}
+
+fn tlb_shootdown_kernel_ptr() as i64 { return cast(i64, fn_ptr(tlb_shootdown_kernel)); }
 
 fn cond_resched() as void {
     if (smp.this_cpu_preempt_count() > 0) { return; }
@@ -2046,6 +2144,14 @@ fn schedule() as void {
             // on a CR3 that maps it.
             let is i64 as next_pml4 = thr_aspace_pml4(next);
             if (next_pml4 != 0) {
+                // Published BEFORE the load (the CR3 write is serialising, so
+                // the store is visible first). A shootdown that misses the new
+                // value read it before we loaded — and its PTE was cleared
+                // before that read — so this cpu walks the cleared PTE, never
+                // a stale one. Switching away, the old space is still loaded
+                // for a few instructions after we stop advertising it, but
+                // only scheduler code runs there, which touches no user page.
+                smp.this_cpu_set_cur_pml4(next_pml4);
                 vmm.cr3_load_if_different(next_pml4);
             }
 
