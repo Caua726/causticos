@@ -2,10 +2,14 @@
 // no heap and no String struct, just raw (*u8, len), so every little tool stays
 // cheap and self-contained. Two ways to read a file:
 //   - Reader: a buffered byte stream over an fd, for filters that scan once
-//     front-to-back (wc, grep, head, rev, cut, fold, hexdump).
+//     front-to-back (wc, grep, head, rev, uniq, cut, fold, hexdump). rd_line
+//     hands it out a line at a time. A filter on a pipe must work this way:
+//     it prints as its input arrives, and it stops when it has what it needs
+//     — `yes | head -n 3` ends because head exits, and yes then finds its
+//     reader gone.
 //   - slurp:  map the whole file into one anonymous mapping, for tools that
-//     need random access or reverse order (tail, tac, sort). Sized to the file
-//     via stat — no silent truncation.
+//     need random access or the end before the start (tail, tac, sort). Sized
+//     to the file via stat — no silent truncation.
 use "std/os/causticos.cst" as sys;
 
 // ---- buffered reader ----
@@ -18,6 +22,7 @@ struct Reader {
     fill as i64;    // valid bytes currently in buf
     pos  as i64;    // cursor within [0, fill)
     eofd as i64;    // 1 once the fd is drained
+    err  as i64;    // the read error that ended it (negative errno), 0 if none
 }
 
 // rd_open: open `path` (already absolute) for reading, staging through `buf`.
@@ -30,6 +35,7 @@ fn rd_open(r as *Reader, path as *u8, buf as *u8, cap as i64) as i64 {
     r.fill = 0;
     r.pos = 0;
     r.eofd = 0;
+    r.err = 0;
     return r.fd;
 }
 
@@ -38,13 +44,113 @@ fn rd_byte(r as *Reader) as i64 {
     if (r.pos >= r.fill) {
         if (r.eofd == 1) { return 0 - 1; }
         let is i64 as n = sys.read(r.fd, cast(*u8, r.buf), r.cap);
-        if (n <= 0) { r.eofd = 1; return 0 - 1; }
+        if (n <= 0) {
+            r.eofd = 1;
+            if (n < 0) { r.err = n; }
+            return 0 - 1;
+        }
         r.fill = n;
         r.pos = 0;
     }
     let is *u8 as p = cast(*u8, r.buf + r.pos);
     r.pos = r.pos + 1;
     return cast(i64, p[0]);
+}
+
+// ---- a line at a time ----
+// A line's bytes, in a buffer that grows (an anonymous mapping, doubled as
+// needed) so a line is never cut short however long it is. Zero-initialised
+// is an empty Line with no buffer yet.
+struct Line {
+    va  as i64;     // *u8, held as an address; 0 until the first byte
+    cap as i64;
+    len as i64;     // bytes of the line, without its newline
+    nl  as i64;     // 1 if a newline ended it (0: the input's last line had none)
+}
+
+// Room for `need` bytes in l, keeping what is there. 0, or E_NOMEM.
+fn line_reserve(l as *Line, need as i64) as i64 {
+    if (need <= l.cap) { return 0; }
+    let is i64 as ncap with mut = l.cap * 2;
+    if (ncap < 4096) { ncap = 4096; }
+    while (ncap < need) { ncap = ncap * 2; }
+    let is i64 as nva = sys.mmap(0, ncap, sys.PROT_READ | sys.PROT_WRITE);
+    if (nva < 0) { return sys.E_NOMEM; }
+    if (l.va != 0) {
+        let is *u8 as src = cast(*u8, l.va);
+        let is *u8 as dst = cast(*u8, nva);
+        let is i64 as k with mut = 0;
+        while (k < l.len) { dst[k] = src[k]; k = k + 1; }
+        sys.munmap(l.va, l.cap);
+    }
+    l.va = nva;
+    l.cap = ncap;
+    return 0;
+}
+
+// Make `dst` a copy of `src`. 0, or E_NOMEM.
+fn line_copy(dst as *Line, src as *Line) as i64 {
+    dst.len = 0;
+    if (line_reserve(dst, src.len) != 0) { return sys.E_NOMEM; }
+    let is *u8 as d = cast(*u8, dst.va);
+    let is *u8 as s = cast(*u8, src.va);
+    let is i64 as k with mut = 0;
+    while (k < src.len) { d[k] = s[k]; k = k + 1; }
+    dst.len = src.len;
+    dst.nl = src.nl;
+    return 0;
+}
+
+fn line_free(l as *Line) as void {
+    if (l.va != 0) { sys.munmap(l.va, l.cap); }
+    l.va = 0;
+    l.cap = 0;
+    l.len = 0;
+}
+
+// The next line of r into l. 1 = a line (perhaps empty), 0 = end of input,
+// negative = an error: the read failed (r.err), or no memory for the line.
+// Scans the staging buffer for the newline and copies the run in one go.
+fn rd_line(r as *Reader, l as *Line) as i64 {
+    l.len = 0;
+    l.nl = 0;
+    let is i64 as any with mut = 0;
+    while (1 == 1) {
+        if (r.pos >= r.fill) {
+            if (r.eofd == 1) {
+                if (r.err != 0 && any == 0) { return r.err; }
+                return any;
+            }
+            let is i64 as n = sys.read(r.fd, cast(*u8, r.buf), r.cap);
+            if (n <= 0) {
+                r.eofd = 1;
+                if (n < 0) { r.err = n; }
+            } else {
+                r.fill = n;
+                r.pos = 0;
+            }
+        } else {
+            any = 1;
+            let is *u8 as p = cast(*u8, r.buf);
+            let is i64 as i with mut = r.pos;
+            while (i < r.fill && p[i] != cast(u8, 10)) { i = i + 1; }
+            let is i64 as run = i - r.pos;
+            if (run > 0) {
+                if (line_reserve(l, l.len + run) != 0) { return sys.E_NOMEM; }
+                let is *u8 as d = cast(*u8, l.va + l.len);
+                let is i64 as k with mut = 0;
+                while (k < run) { d[k] = p[r.pos + k]; k = k + 1; }
+                l.len = l.len + run;
+            }
+            if (i < r.fill) {
+                r.pos = i + 1;
+                l.nl = 1;
+                return 1;
+            }
+            r.pos = r.fill;
+        }
+    }
+    return 0;
 }
 
 fn rd_close(r as *Reader) as void {
@@ -196,9 +302,16 @@ fn read_dir(path as *u8, names as *u8, names_cap as i64, off as *i64, nlen as *i
 }
 
 // ---- stdin / whole-fd ----
+// An operand of "-" names standard input.
+fn is_dash(s as *u8) as i64 {
+    if (s[0] == cast(u8, 45) && s[1] == cast(u8, 0)) { return 1; }
+    return 0;
+}
+
+
 // rd_open_fd: a Reader over an already-open fd (e.g. 0 = stdin), no path.
 fn rd_open_fd(r as *Reader, fd as i64, buf as *u8, cap as i64) as void {
-    r.fd = fd; r.buf = cast(i64, buf); r.cap = cap; r.fill = 0; r.pos = 0; r.eofd = 0;
+    r.fd = fd; r.buf = cast(i64, buf); r.cap = cap; r.fill = 0; r.pos = 0; r.eofd = 0; r.err = 0;
 }
 
 // slurp_fd: read an entire fd (stdin) into a fresh mapping that grows as needed

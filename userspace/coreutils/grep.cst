@@ -13,6 +13,11 @@
 //   -e PAT  add a pattern (repeatable)
 //
 // Exit 0 if a line matched, 1 if none, 2 on error.
+//
+// Input is read a line at a time and matches are written as they are found:
+// grep on a pipe prints as its input arrives (and -m, -q, -l stop reading once
+// the answer is known). It used to read each input whole before looking at the
+// first line.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
@@ -31,13 +36,17 @@ let is i64 as G_multi with mut = 0; let is i64 as G_any with mut = 0; let is i64
 let is [8192]u8 as G_PAT;
 let is i64 as G_PATLEN with mut = 0;
 
-// before-context ring (offsets into the current buffer)
-let is [64]i64 as RB_OFF;
-let is [64]i64 as RB_LEN;
+// The line being looked at, and the before-context ring: copies of the last
+// G_B lines that did not match, G_B Lines in one mapping. (It held offsets into
+// the whole input, which had to be in memory for that; and it was capped at 64
+// lines without a word — -B 100 printed 64.)
+let is fu.Line as G_LN;
+let is i64 as RB_VA with mut = 0;           // [G_B]fu.Line
 let is i64 as RB_N with mut = 0;
 let is i64 as RB_HEAD with mut = 0;
-let is i64 as G_CAP with mut = 0;           // ring capacity = B
 let is i64 as G_GROUPED with mut = 0;       // 1 if A or B > 0 (print "--" separators)
+
+fn rb_line(i as i64) as *fu.Line { return cast(*fu.Line, RB_VA + i * sizeof(fu.Line)); }
 
 fn word_char(c as i64) as i64 {
     if (c >= 48 && c <= 57) { return 1; }
@@ -108,61 +117,62 @@ fn print_line(name as *u8, lineno as i64, s as *u8, llen as i64, sep as i64) as 
     prog.out(s, llen); prog.out("\n", 1);
 }
 
-// process one whole buffer (a file or stdin) for matches, with context.
-fn grep_buf(name as *u8, buf as i64, len as i64) as void {
-    let is *u8 as b = cast(*u8, buf);
+// Every line of fd, for matches, with context. 0, or the error that stopped it
+// (a read error, or no memory for a line).
+fn grep_fd(name as *u8, fd as i64) as i64 {
+    let is [4096]u8 as stage;
+    let is fu.Reader as r;
+    fu.rd_open_fd(&r, fd, cast(*u8, &stage[0]), 4096);
     RB_N = 0; RB_HEAD = 0;
-    let is i64 as pos with mut = 0;
     let is i64 as lineno with mut = 0;
     let is i64 as after with mut = 0;            // remaining after-context lines to print
     let is i64 as last_end with mut = 0 - 1;     // lineno last printed (for "--")
     let is i64 as fcount with mut = 0;           // matches in this file
-    while (pos < len || (pos == len && lineno == 0 && len == 0)) {
-        if (pos >= len) { break; }
-        let is i64 as start = pos;
-        while (pos < len && cast(i64, b[pos]) != 0x0A) { pos = pos + 1; }
-        let is i64 as llen = pos - start;
-        if (pos < len) { pos = pos + 1; }
-        lineno = lineno + 1;
-        let is *u8 as ls = cast(*u8, buf + start);
-        let is i64 as hit with mut = line_hit(ls, llen);
-        if (G_v != 0) { if (hit == 0) { hit = 1; } else { hit = 0; } }
-        if (hit != 0) {
-            G_any = 1; fcount = fcount + 1;
-            // quiet / list modes short-circuit
-            if (G_q != 0 || G_l != 0 || G_L != 0) { if (G_q != 0) { return; } }
-            if (G_c == 0 && G_l == 0 && G_L == 0) {
-                if (G_o != 0) { print_only(name, lineno, ls, llen); }
-                else {
-                    // before-context: print the ring, with a "--" if there is a gap
-                    if (G_GROUPED != 0 && last_end >= 0) {
-                        let is i64 as firstctx with mut = lineno - RB_N;
-                        if (firstctx > last_end + 1) { prog.outs("--\n"); }
+    let is i64 as going with mut = 1;
+    while (going == 1) {
+        let is i64 as got = fu.rd_line(&r, &G_LN);
+        if (got < 0) { return got; }
+        if (got == 0) { going = 0; }
+        else {
+            lineno = lineno + 1;
+            let is *u8 as ls = cast(*u8, G_LN.va);
+            let is i64 as llen = G_LN.len;
+            let is i64 as hit with mut = line_hit(ls, llen);
+            if (G_v != 0) { if (hit == 0) { hit = 1; } else { hit = 0; } }
+            if (hit != 0) {
+                G_any = 1; fcount = fcount + 1;
+                if (G_q != 0) { return 0; }                  // the exit status is decided
+                if (G_c == 0 && G_l == 0 && G_L == 0) {
+                    if (G_o != 0) { print_only(name, lineno, ls, llen); }
+                    else {
+                        // before-context: print the ring, with a "--" if there is a gap
+                        if (G_GROUPED != 0 && last_end >= 0) {
+                            let is i64 as firstctx with mut = lineno - RB_N;
+                            if (firstctx > last_end + 1) { prog.outs("--\n"); }
+                        }
+                        let is i64 as k with mut = 0;
+                        while (k < RB_N) {
+                            let is *fu.Line as cl = rb_line((RB_HEAD - RB_N + k + G_B) % G_B);
+                            print_line(name, lineno - RB_N + k, cast(*u8, cl.va), cl.len, 45);
+                            k = k + 1;
+                        }
+                        print_line(name, lineno, ls, llen, 58);
+                        last_end = lineno;
+                        after = G_A;
                     }
-                    let is i64 as k with mut = 0;
-                    while (k < RB_N) {
-                        let is i64 as idx = (RB_HEAD - RB_N + k + 128) % 64;
-                        let is i64 as dash = 45;
-                        print_line(name, lineno - RB_N + k, cast(*u8, buf + RB_OFF[idx]), RB_LEN[idx], dash);
-                        k = k + 1;
-                    }
-                    let is i64 as colon = 58;
-                    print_line(name, lineno, ls, llen, colon);
-                    last_end = lineno;
-                    after = G_A;
+                    RB_N = 0; RB_HEAD = 0;            // ring consumed
                 }
-                RB_N = 0; RB_HEAD = 0;            // ring consumed
-            }
-            if (G_m != 0 && fcount >= G_m) { break; }
-        } else {
-            if (after > 0 && G_o == 0 && G_c == 0 && G_l == 0 && G_L == 0) {
-                let is i64 as dash = 45;
-                print_line(name, lineno, ls, llen, dash);
-                last_end = lineno; after = after - 1;
-            } else if (G_B > 0 && G_o == 0) {
-                RB_OFF[RB_HEAD] = start; RB_LEN[RB_HEAD] = llen;
-                RB_HEAD = (RB_HEAD + 1) % 64;
-                if (RB_N < G_CAP) { RB_N = RB_N + 1; }
+                if (G_l != 0 || G_L != 0) { going = 0; }   // this file's answer is in
+                if (G_m != 0 && fcount >= G_m) { going = 0; }
+            } else {
+                if (after > 0 && G_o == 0 && G_c == 0 && G_l == 0 && G_L == 0) {
+                    print_line(name, lineno, ls, llen, 45);
+                    last_end = lineno; after = after - 1;
+                } else if (G_B > 0 && G_o == 0) {
+                    if (fu.line_copy(rb_line(RB_HEAD), &G_LN) != 0) { return sys.E_NOMEM; }
+                    RB_HEAD = (RB_HEAD + 1) % G_B;
+                    if (RB_N < G_B) { RB_N = RB_N + 1; }
+                }
             }
         }
     }
@@ -174,17 +184,27 @@ fn grep_buf(name as *u8, buf as i64, len as i64) as void {
     } else if (G_L != 0) {
         if (fcount == 0) { prog.outs(name); prog.out("\n", 1); }
     }
+    return 0;
+}
+
+fn read_failed(name as *u8, rc as i64) as void {
+    if (G_s == 0) {
+        prog.outs("grep: "); prog.outs(name);
+        if (rc == sys.E_NOMEM) { prog.outs(": out of memory\n"); } else { prog.outs(": read error\n"); }
+    }
+    G_exit = 2;
 }
 
 fn do_path(name as *u8, path as *u8) as void {
-    let is i64 as len with mut = 0;
-    let is i64 as buf = fu.slurp(path, &len);
-    if (len < 0) {
+    let is i64 as fd with mut = 0;
+    if (fu.is_dash(name) == 0) { fd = sys.open_read(path); }
+    if (fd < 0) {
         if (G_s == 0) { prog.outs("grep: "); prog.outs(name); prog.outs(": cannot open\n"); }
         G_exit = 2; return;
     }
-    grep_buf(name, buf, len);
-    if (buf != 0) { fu.unslurp(buf, len); }
+    let is i64 as rc = grep_fd(name, fd);
+    if (fd > 0) { sys.close(fd); }
+    if (rc < 0) { read_failed(name, rc); }
 }
 
 // a path is a directory iff opening it and calling readdir succeeds (a regular
@@ -257,8 +277,11 @@ fn main(argc as i64, argv as *u8) as i32 {
     if (want_C > 0) { if (G_A == 0) { G_A = want_C; } if (G_B == 0) { G_B = want_C; } }
     // -C/-A/-B sanity
     if (G_A < 0) { G_A = 0; } if (G_B < 0) { G_B = 0; }
-    G_CAP = G_B; if (G_CAP > 64) { G_CAP = 64; }
     if (G_A > 0 || G_B > 0) { G_GROUPED = 1; }
+    if (G_B > 0) {
+        RB_VA = sys.mmap(0, fu.page_round(G_B * sizeof(fu.Line)), sys.PROT_READ | sys.PROT_WRITE);
+        if (RB_VA < 0) { prog.outs("grep: out of memory for -B/-C\n"); return cast(i32, 2); }
+    }
 
     // pattern: from -e (already collected) or the first operand
     if (npat == 0) {
@@ -272,9 +295,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as nfiles = argc - o.ind;
     if (nfiles <= 0 && G_r == 0) {
         // stdin
-        let is i64 as len with mut = 0;
-        let is i64 as buf = fu.slurp_fd(cast(i64, 0), &len);
-        if (len > 0) { grep_buf("(standard input)", buf, len); }
+        let is i64 as rc0 = grep_fd("(standard input)", cast(i64, 0));
+        if (rc0 < 0) { read_failed("(standard input)", rc0); }
     } else {
         if (nfiles > 1 || G_r != 0) { G_multi = 1; }
         if (G_H != 0) { G_multi = 1; }
@@ -289,6 +311,7 @@ fn main(argc as i64, argv as *u8) as i32 {
             let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
             if (G_r != 0) { do_recursive(name, path); } else { do_path(name, path); }
             i = i + 1;
+            if (G_q != 0 && G_any != 0) { i = argc; }        // -q: the status is decided
         }
     }
 

@@ -3,7 +3,11 @@
 // -c prefix repeat count   -d only duplicated (one per group)   -D all duplicated
 // -u only unique           -i ignore case
 // -f N skip the first N fields   -s N skip N chars (after fields)   -w N compare N chars
-// One input (a file or stdin) -> stdout.
+// One input (a file, stdin, or `-`) -> stdout.
+//
+// A line at a time: a group is written out as soon as the line after it shows
+// that it ended, so uniq on a pipe keeps up with its input. It used to read all
+// of its input first, and index every line.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
@@ -11,19 +15,17 @@ use "../lib/futil/futil.cst" as fu;
 let is i64 as g_c with mut = 0; let is i64 as g_d with mut = 0; let is i64 as g_D with mut = 0;
 let is i64 as g_u with mut = 0; let is i64 as g_i with mut = 0;
 let is i64 as g_f with mut = 0; let is i64 as g_s with mut = 0; let is i64 as g_w with mut = 0 - 1;
-let is i64 as g_base with mut = 0;
 
 fn is_blank(c as i64) as i64 { if (c == 32 || c == 9) { return 1; } return 0; }
 fn lc(c as i64) as i64 { if (c >= 65 && c <= 90) { return c + 32; } return c; }
 
-// start offset of the comparison key within line [lo,lo+ll): skip g_f fields then g_s chars.
-fn key_start(lo as i64, ll as i64) as i64 {
-    let is *u8 as p = cast(*u8, g_base);
+// start offset of the comparison key within line p[0..ll): skip g_f fields then g_s chars.
+fn key_start(p as *u8, ll as i64) as i64 {
     let is i64 as pos with mut = 0;
     let is i64 as f with mut = 0;
     while (f < g_f && pos < ll) {
-        while (pos < ll && is_blank(cast(i64, p[lo + pos])) != 0) { pos = pos + 1; }
-        while (pos < ll && is_blank(cast(i64, p[lo + pos])) == 0) { pos = pos + 1; }
+        while (pos < ll && is_blank(cast(i64, p[pos])) != 0) { pos = pos + 1; }
+        while (pos < ll && is_blank(cast(i64, p[pos])) == 0) { pos = pos + 1; }
         f = f + 1;
     }
     let is i64 as k with mut = 0;
@@ -32,14 +34,15 @@ fn key_start(lo as i64, ll as i64) as i64 {
 }
 
 // are lines a and b equal under the active field/char/case rules?
-fn key_eq(ao as i64, al as i64, bo as i64, bl as i64) as i64 {
-    let is *u8 as p = cast(*u8, g_base);
-    let is i64 as as0 = key_start(ao, al); let is i64 as bs0 = key_start(bo, bl);
-    let is i64 as ae with mut = al; let is i64 as be with mut = bl;
+fn key_eq(a as *fu.Line, b as *fu.Line) as i64 {
+    let is *u8 as pa = cast(*u8, a.va);
+    let is *u8 as pb = cast(*u8, b.va);
+    let is i64 as as0 = key_start(pa, a.len); let is i64 as bs0 = key_start(pb, b.len);
+    let is i64 as ae with mut = a.len; let is i64 as be with mut = b.len;
     if (g_w >= 0) { if (as0 + g_w < ae) { ae = as0 + g_w; } if (bs0 + g_w < be) { be = bs0 + g_w; } }
     let is i64 as ai with mut = as0; let is i64 as bi with mut = bs0;
     while (ai < ae && bi < be) {
-        let is i64 as ca with mut = cast(i64, p[ao + ai]); let is i64 as cb with mut = cast(i64, p[bo + bi]);
+        let is i64 as ca with mut = cast(i64, pa[ai]); let is i64 as cb with mut = cast(i64, pb[bi]);
         if (g_i != 0) { ca = lc(ca); cb = lc(cb); }
         if (ca != cb) { return 0; }
         ai = ai + 1; bi = bi + 1;
@@ -48,7 +51,47 @@ fn key_eq(ao as i64, al as i64, bo as i64, bl as i64) as i64 {
     return 1;
 }
 
-fn put_line(lo as i64, ll as i64) as void { prog.out(cast(*u8, g_base + lo), ll); prog.out("\n", 1); }
+fn put_line(l as *fu.Line) as void { prog.out(cast(*u8, l.va), l.len); prog.out("\n", 1); }
+
+// A group of cnt adjacent equal lines, `first` the first of them, has ended.
+fn finish(first as *fu.Line, cnt as i64) as void {
+    if (cnt <= 0 || g_D != 0) { return; }          // -D printed its lines as they came
+    if (g_d != 0 && cnt < 2) { return; }
+    if (g_u != 0 && cnt > 1) { return; }
+    if (g_c != 0) { prog.pad_num(cnt, 7); prog.outs(" "); }
+    put_line(first);
+}
+
+// Every group of fd. 0, or the error that stopped it.
+fn uniq_fd(fd as i64) as i64 {
+    let is [4096]u8 as stage;
+    let is fu.Reader as r;
+    fu.rd_open_fd(&r, fd, cast(*u8, &stage[0]), 4096);
+    let is fu.Line as first;
+    let is fu.Line as cur;
+    first.va = 0; first.cap = 0; first.len = 0; first.nl = 0;
+    cur.va = 0; cur.cap = 0; cur.len = 0; cur.nl = 0;
+    let is i64 as cnt with mut = 0;
+    while (1 == 1) {
+        let is i64 as got = fu.rd_line(&r, &cur);
+        if (got <= 0) {
+            finish(&first, cnt);
+            return got;
+        }
+        if (cnt > 0 && key_eq(&first, &cur) != 0) {
+            cnt = cnt + 1;
+            if (g_D != 0) {
+                if (cnt == 2) { put_line(&first); }
+                put_line(&cur);
+            }
+        } else {
+            finish(&first, cnt);
+            if (fu.line_copy(&first, &cur) != 0) { return sys.E_NOMEM; }
+            cnt = 1;
+        }
+    }
+    return 0;
+}
 
 fn main(argc as i64, argv as *u8) as i32 {
     let is fu.Opt as o;
@@ -64,50 +107,22 @@ fn main(argc as i64, argv as *u8) as i32 {
         else { prog.outs("usage: uniq [-cdDui] [-f N] [-s N] [-w N] [file]\n"); return cast(i32, 1); }
     }
 
-    let is i64 as len with mut = 0;
-    let is i64 as buf with mut = 0;
-    if (argc - o.ind <= 0) { buf = fu.slurp_fd(cast(i64, 0), &len); }
-    else {
-        let is *u8 as name = prog.arg(argv, o.ind);
-        let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
-        buf = fu.slurp(path, &len);
-        if (len < 0) { prog.outs("uniq: "); prog.outs(name); prog.outs(": cannot open\n"); return cast(i32, 1); }
-    }
-    g_base = buf;
-    if (len <= 0) { return 0; }
-    let is *u8 as p = cast(*u8, buf);
-
-    // index lines
-    let is i64 as nl with mut = 0; let is i64 as t with mut = 0;
-    while (t < len) { if (cast(i64, p[t]) == 0x0A) { nl = nl + 1; } t = t + 1; }
-    if (cast(i64, p[len - 1]) != 0x0A) { nl = nl + 1; }
-    let is i64 as isz = fu.page_round(nl * 16);
-    let is i64 as iva = sys.mmap(cast(i64, 0), isz, sys.PROT_READ | sys.PROT_WRITE);
-    if (iva < 0) { prog.outs("uniq: out of memory\n"); return cast(i32, 1); }
-    let is *i64 as idx = cast(*i64, iva);
-    let is i64 as li with mut = 0; let is i64 as start with mut = 0;
-    t = 0;
-    while (t < len) { if (cast(i64, p[t]) == 0x0A) { idx[li * 2] = start; idx[li * 2 + 1] = t - start; li = li + 1; start = t + 1; } t = t + 1; }
-    if (start < len) { idx[li * 2] = start; idx[li * 2 + 1] = len - start; li = li + 1; }
-
-    // walk groups of adjacent equal lines
-    let is i64 as i with mut = 0;
-    while (i < li) {
-        let is i64 as j with mut = i + 1;
-        while (j < li && key_eq(idx[i * 2], idx[i * 2 + 1], idx[j * 2], idx[j * 2 + 1]) != 0) { j = j + 1; }
-        let is i64 as cnt = j - i;
-        if (g_D != 0) {
-            if (cnt > 1) { let is i64 as k with mut = i; while (k < j) { put_line(idx[k * 2], idx[k * 2 + 1]); k = k + 1; } }
-        } else {
-            let is i64 as show with mut = 1;
-            if (g_d != 0 && cnt < 2) { show = 0; }
-            if (g_u != 0 && cnt > 1) { show = 0; }
-            if (show != 0) {
-                if (g_c != 0) { prog.pad_num(cnt, 7); prog.outs(" "); }
-                put_line(idx[i * 2], idx[i * 2 + 1]);
-            }
+    let is i64 as fd with mut = 0;
+    let is *u8 as name with mut = cast(*u8, "standard input");
+    if (argc - o.ind > 0) {
+        name = prog.arg(argv, o.ind);
+        if (fu.is_dash(name) == 0) {
+            let is [256]u8 as pb; let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
+            fd = sys.open_read(path);
+            if (fd < 0) { prog.outs("uniq: "); prog.outs(name); prog.outs(": cannot open\n"); return cast(i32, 1); }
         }
-        i = j;
+    }
+    let is i64 as rc = uniq_fd(fd);
+    if (fd > 0) { sys.close(fd); }
+    if (rc < 0) {
+        prog.outs("uniq: "); prog.outs(name);
+        if (rc == sys.E_NOMEM) { prog.outs(": out of memory\n"); } else { prog.outs(": read error\n"); }
+        return cast(i32, 1);
     }
     return 0;
 }
