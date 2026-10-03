@@ -73,6 +73,23 @@ fn terminate(p as i64, code as i64) as i64 {
     return 1;
 }
 
+// The same, for a crash: what the CPU said is kept with the exit, under the
+// same hold, so a kill that got there first leaves no fault record behind it
+// that the exit code then contradicts.
+fn terminate_fault(p as i64, vector as i64, err as i64, rip as i64, addr as i64) as i64 {
+    if (p == 0) { return 0; }
+    proc.tree_lock();
+    if (proc.proc_state(p) != proc.PROC_ALIVE) {
+        proc.tree_unlock();
+        return 0;
+    }
+    proc.proc_set_fault(p, vector, err, rip, addr);
+    proc.begin_exit_locked(p, abi.EXIT_FAULT);
+    kick_threads_locked(p);
+    proc.tree_unlock();
+    return 1;
+}
+
 // SYS_PROC_KILL: terminate the child `pid` of `parent`. The lookup and the
 // marking happen under one hold of the tree lock, so a sibling thread of the
 // parent collecting the same child at that moment cannot free it in between.
@@ -174,9 +191,9 @@ fn at_user_boundary_ptr() as i64 { return cast(i64, fn_ptr(at_user_boundary)); }
 // exception on this cpu while we are still on it. The thread's own kernel
 // stack is empty — it came from ring 3 — so we move there first and leave from
 // it; the IST frame is simply abandoned.
-fn user_fault() as void {
+fn user_fault(vector as i64, err as i64, rip as i64, addr as i64) as void {
     let is i64 as tid = sched.current_tid();
-    terminate(sched.thr_process_ptr(tid), abi.EXIT_FAULT);
+    terminate_fault(sched.thr_process_ptr(tid), vector, err, rip, addr);
     let is i64 as top = sched.thr_kstack_base(tid) + sched.KSTACK_SIZE;
     run_on_stack(top, cast(i64, fn_ptr(fault_leave)));
 }
@@ -274,11 +291,37 @@ fn init() as void {
 // E_AGAIN if no such child exits within the window, E_INTR if the caller is
 // itself being terminated meanwhile.
 fn wait_child(parent as i64, pid as i64, window_ns as i64) as i64 {
+    return wait_child_info(parent, pid, window_ns, cast(*i64, 0));
+}
+
+// The same, and how the child ended, into out (abi.WAIT_INFO_WORDS; out may be
+// 0): [exit code, crashed (1/0), vector, error code, rip, addr, name bytes
+// 0-7, name bytes 8-15]. Read off the zombie in the moment it is collected —
+// after that there is nothing left to ask.
+fn wait_child_info(parent as i64, pid as i64, window_ns as i64, out as *i64) as i64 {
     let is i64 as deadline = timer.current_time_ns() + window_ns;
     while (timer.current_time_ns() < deadline) {
         let is i64 as c = proc.claim_zombie_child(parent, pid, cast(i64, fn_ptr(threads_gone)));
-        if (c != 0) { return collect(parent, c); }
+        if (c != 0) {
+            if (cast(i64, out) != 0) { exit_info(c, out); }
+            return collect(parent, c);
+        }
         if (sched.sleep_interruptible(10000000) != 0) { return abi.E_INTR; }
     }
     return abi.E_AGAIN;
+}
+
+fn exit_info(c as i64, out as *i64) as void {
+    out[0] = proc.proc_exit_code(c);
+    out[1] = 0;
+    out[2] = 0; out[3] = 0; out[4] = 0; out[5] = 0;
+    if ((proc.proc_flags(c) & proc.FLAG_FAULTED) != 0) {
+        out[1] = 1;
+        out[2] = proc.proc_get(c, 128);         // vector
+        out[3] = proc.proc_get(c, 136);         // error code
+        out[4] = proc.proc_get(c, 144);         // rip
+        out[5] = proc.proc_get(c, 152);         // addr
+    }
+    out[6] = proc.proc_get(c, 112);             // name (argv[0])
+    out[7] = proc.proc_get(c, 120);
 }

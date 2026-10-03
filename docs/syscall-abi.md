@@ -102,6 +102,7 @@ whatever struct it fills.
 | 54 | `CHAN_INFO` | chan_fd, out | 0 \| errno |
 | 55 | `POWER_REQUEST` | kind | 0 \| `E_INVAL` — asks for `POWER_OFF`/`POWER_REBOOT` the way the power button does: a listening desktop closes its windows first; with none, or asked twice, the kernel acts at once |
 | 56 | `POWER_CANCEL` | | 0 — the pending request is dropped (a window would not close) |
+| 57 | `PROC_WAIT_INFO` | pid, out | as `WAIT` (15), and fills `[code, crashed, vector, error_code, rip, addr, name[16]]` — how the child ended, read as it is collected |
 
 **Pointers are user virtual addresses**; the kernel copies in/out and
 validates them (bad pointer → `E_FAULT`). All sizes/counts are bytes unless

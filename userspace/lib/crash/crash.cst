@@ -1,0 +1,136 @@
+// lib/crash/crash.cst — "it crashed", in words.
+//
+// A program that takes a CPU exception in ring 3 is ended by the kernel, and
+// the one who collects it (sys.wait_info) gets what the CPU reported. Saying
+// that to a person is the collector's job — the shell under the prompt, `run`
+// after its program, the desktop on the taskbar — and they all say it the same
+// way, from here:
+//
+//   prog: crashed: page fault writing 0x0 (nothing is mapped there) at 0x4011c2
+//
+// The address of the faulting instruction is the one to look up in the
+// program's map; the access address says what it was reaching for (0 or near
+// it is a null pointer).
+
+use "std/os/causticos.cst" as sys;
+
+let is i64 as PF_PRESENT with imut = 1;     // page-fault error code bits
+let is i64 as PF_WRITE   with imut = 2;
+let is i64 as PF_FETCH   with imut = 16;
+
+fn _put(out as *u8, n as i64, cap as i64, s as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as m with mut = n;
+    while (s[k] != cast(u8, 0) && m < cap) { out[m] = s[k]; m = m + 1; k = k + 1; }
+    return m;
+}
+
+fn _hex(out as *u8, n as i64, cap as i64, v as i64) as i64 {
+    let is i64 as m with mut = _put(out, n, cap, "0x");
+    let is [16]u8 as d;
+    let is i64 as nd with mut = 0;
+    let is i64 as x with mut = v;
+    while (nd < 16) {
+        let is i64 as h = x & 15;
+        if (h < 10) { d[nd] = cast(u8, 48 + h); } else { d[nd] = cast(u8, 87 + h); }
+        nd = nd + 1;
+        x = (x >> 4) & 0x0FFFFFFFFFFFFFFF;
+        if (x == 0) { break; }
+    }
+    while (nd > 0 && m < cap) { nd = nd - 1; out[m] = d[nd]; m = m + 1; }
+    return m;
+}
+
+fn _num(out as *u8, n as i64, cap as i64, v as i64) as i64 {
+    let is [20]u8 as d;
+    let is i64 as nd with mut = 0;
+    let is i64 as x with mut = v;
+    if (x < 0) { x = 0; }
+    while (nd < 20) {
+        d[nd] = cast(u8, 48 + x % 10);
+        nd = nd + 1;
+        x = x / 10;
+        if (x == 0) { break; }
+    }
+    let is i64 as m with mut = n;
+    while (nd > 0 && m < cap) { nd = nd - 1; out[m] = d[nd]; m = m + 1; }
+    return m;
+}
+
+// What the exception is called, by vector.
+fn _vector_name(v as i64) as *u8 {
+    if (v == 0)  { return cast(*u8, "division by zero"); }
+    if (v == 3)  { return cast(*u8, "breakpoint"); }
+    if (v == 4)  { return cast(*u8, "overflow"); }
+    if (v == 5)  { return cast(*u8, "bound range exceeded"); }
+    if (v == 6)  { return cast(*u8, "invalid instruction"); }
+    if (v == 7)  { return cast(*u8, "no FPU"); }
+    if (v == 11) { return cast(*u8, "segment not present"); }
+    if (v == 12) { return cast(*u8, "stack segment fault"); }
+    if (v == 13) { return cast(*u8, "general protection fault"); }
+    if (v == 14) { return cast(*u8, "page fault"); }
+    if (v == 16) { return cast(*u8, "x87 floating-point error"); }
+    if (v == 17) { return cast(*u8, "alignment check"); }
+    if (v == 19) { return cast(*u8, "SIMD floating-point error"); }
+    if (v == 21) { return cast(*u8, "control protection fault"); }
+    return cast(*u8, "");
+}
+
+// describe — info as sys.wait_info filled it, into out (at most cap bytes, no
+// newline). Returns the length, or 0 when the child did not crash.
+fn describe(info as *i64, out as *u8, cap as i64) as i64 {
+    if (info[1] != 1) { return 0; }
+    let is i64 as vec = info[2];
+    let is i64 as err = info[3];
+    let is i64 as n with mut = 0;
+    // The program's name, as it was started: argv[0], without the ".cse" the
+    // desktop starts programs by.
+    let is *u8 as name = cast(*u8, &info[6]);
+    let is i64 as nl with mut = 0;
+    while (nl < 16 && name[nl] != cast(u8, 0)) { nl = nl + 1; }
+    if (nl > 4 && name[nl - 4] == cast(u8, 46) && name[nl - 3] == cast(u8, 99)
+        && name[nl - 2] == cast(u8, 115) && name[nl - 1] == cast(u8, 101)) { nl = nl - 4; }   // ".cse"
+    let is i64 as k with mut = 0;
+    while (k < nl && n < cap) { out[n] = name[k]; n = n + 1; k = k + 1; }
+    if (n > 0) { n = _put(out, n, cap, ": "); }
+    n = _put(out, n, cap, "crashed: ");
+    let is *u8 as what = _vector_name(vec);
+    if (what[0] != cast(u8, 0)) { n = _put(out, n, cap, what); }
+    else { n = _put(out, n, cap, "CPU exception "); n = _num(out, n, cap, vec); }
+    if (vec == 14) {
+        if ((err & PF_FETCH) != 0) { n = _put(out, n, cap, " executing "); }
+        else if ((err & PF_WRITE) != 0) { n = _put(out, n, cap, " writing "); }
+        else { n = _put(out, n, cap, " reading "); }
+        n = _hex(out, n, cap, info[5]);
+        if ((err & PF_PRESENT) == 0) { n = _put(out, n, cap, " (nothing is mapped there)"); }
+        else if ((err & PF_FETCH) != 0) { n = _put(out, n, cap, " (not executable)"); }
+        else if ((err & PF_WRITE) != 0) { n = _put(out, n, cap, " (read-only)"); }
+        else { n = _put(out, n, cap, " (not allowed)"); }
+    }
+    n = _put(out, n, cap, " at ");
+    n = _hex(out, n, cap, info[4]);
+    return n;
+}
+
+// wait — sys.wait for a program that runs a child as part of its own work
+// (`run`, `cc`, `make`): until the child is gone, and if it crashed, say so on
+// fd 1 before returning its exit code (or the errno).
+fn wait(pid as i64) as i64 {
+    let is [8]i64 as wi;
+    let is i64 as r with mut = sys.E_AGAIN;
+    while (r == sys.E_AGAIN) { r = sys.wait_info(pid, cast(*i64, &wi[0])); }
+    if (r < 0) { return r; }
+    let is [192]u8 as b;
+    let is i64 as n with mut = describe(cast(*i64, &wi[0]), cast(*u8, &b[0]), 190);
+    if (n > 0) {
+        b[n] = cast(u8, 10);
+        n = n + 1;
+        let is i64 as done with mut = 0;
+        while (done < n) {
+            let is i64 as w = sys.write(1, cast(*u8, cast(i64, &b[0]) + done), n - done);
+            if (w <= 0) { break; }
+            done = done + w;
+        }
+    }
+    return r;
+}
