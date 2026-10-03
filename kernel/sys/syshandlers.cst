@@ -704,6 +704,9 @@ fn sys_poll(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     // 64 entries × 3 i64 = 1536 B on the kstack (32 KiB; sys_spawn stages
     // more). Layout per entry: [i*3+0]=fd, [i*3+1]=want, [i*3+2]=got.
     let is [192]i64 as ents;
+    // What each fd's object is woken by (kobject.ko_wait_key), filled by the
+    // sweep and handed to the park: only a change to one of these wakes us.
+    let is [64]i64 as keys;
     let is i64 as nbytes = n * 24;
     if (userspace.copy_from_user(pml4, cast(*u8, &ents[0]), uptr, nbytes) != 0) {
         return abi.E_FAULT;
@@ -723,7 +726,7 @@ fn sys_poll(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
     while (sweeping == 1) {
         // Read the wake counter BEFORE asking, and hand it to the park below.
         // An event that lands while this sweep is running would otherwise be
-        // lost: poll_wake looks for parked threads and this one is still
+        // lost: poll_wake_key looks for parked threads and this one is still
         // running, so it would find nobody and the sweep would then sleep out
         // the full park cap having already been told what it was waiting for.
         let is i64 as seq = sched.poll_seq_read();
@@ -736,8 +739,10 @@ fn sys_poll(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
             // A reference per look, dropped right after: a sweep can repeat
             // many times, more than a syscall's two holds.
             let is i64 as ko = vma.fd_take(cast(*vma.Aspace, asp), fd);
+            keys[i] = 0;
             if (ko == 0) { got = abi.POLL_ERROR; }
             else {
+                keys[i] = kobject.ko_wait_key(ko);
                 let is i64 as st = kobject.ko_poll(ko);
                 kobject.ko_unref(ko);
                 if (st < 0) { got = abi.POLL_ERROR; }
@@ -753,10 +758,10 @@ fn sys_poll(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
         else {
             // Park until an event says a readiness answer changed, or until
             // the caller's own deadline. Re-asking on a timer was the idle
-            // cost of the whole system (see sched.poll_park).
+            // cost of the whole system (see sched.poll_park_keys).
             let is i64 as park with mut = 0;
             if (infinite == 0) { park = deadline; }
-            sched.poll_park_seq(park, seq);
+            sched.poll_park_keys(park, seq, cast(*i64, &keys[0]), n);
             if (sched.kill_requested() != 0) { return abi.E_INTR; }
         }
     }

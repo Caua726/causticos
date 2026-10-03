@@ -88,10 +88,15 @@ fn tab_ring_clear() as void {
     return;
 }
 
+// Every holder waits on the one ring, named by its grab stack (priv is only a
+// token).
+fn tab_wait_key(priv as i64) as i64 { return cast(i64, &tab_gs); }
+
 fn vtablet_init() as void {
     TAB_OPS.read  = fn_ptr(tab_read);
     TAB_OPS.close = fn_ptr(tab_close);
     TAB_OPS.poll  = fn_ptr(tab_poll);
+    TAB_OPS.wait_key = fn_ptr(tab_wait_key);
     // write/mmap/present/lseek/readdir stay null — a tablet is a read-only
     // raw-event stream.
 }
@@ -178,6 +183,7 @@ fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
     let is i64 as isr = virtio.vio_isr_read(&vdev);
     if ((isr & 1) == 0) { return 0; }
     let is i64 as fl = lock.acquire_irq(&tab_lk);
+    let is i64 as before = tab_count;
     let is i64 as harvested with mut = 0;
     let is i64 as more with mut = 1;
     while (more == 1) {
@@ -193,8 +199,13 @@ fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
             harvested = harvested + 1;
         }
     }
+    let is i64 as pushed = tab_count - before;
     lock.release_irq(&tab_lk, fl);
     if (harvested > 0) { virtio.vio_publish(&vdev, &evq, 0); }
+    // A finished record is news for whoever polls the tablet. This driver never
+    // said so: the compositor saw the pointer move only when some unrelated
+    // event happened to wake every poller, or when its own park ran out.
+    if (pushed > 0) { sched.poll_wake_key(cast(i64, &tab_gs)); }
     return 0;
 }
 
@@ -244,12 +255,16 @@ fn inject_event(x as i64, y as i64, buttons as i64, wheel as i64) as void {
     let is i64 as fl = lock.acquire_irq(&tab_lk);
     push_record_locked(x, y, buttons, wheel);
     lock.release_irq(&tab_lk, fl);
+    sched.poll_wake_key(cast(i64, &tab_gs));
 }
 
 fn inject_evdev(etype as i64, code as i64, value as i64) as void {
     let is i64 as fl = lock.acquire_irq(&tab_lk);
+    let is i64 as before = tab_count;
     fold_event_locked(etype, code, value);
+    let is i64 as pushed = tab_count - before;
     lock.release_irq(&tab_lk, fl);
+    if (pushed > 0) { sched.poll_wake_key(cast(i64, &tab_gs)); }
 }
 
 // Test-only: deterministic decode check through the exact IRQ fold path.

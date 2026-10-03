@@ -142,16 +142,21 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 328  kill_pending     i64   (the process is terminating: leave at the next
 //                              user boundary — see kill_kick)
 // 336  initial_rdi      i64   (ring-3 rdi of a SYS_THREAD_SPAWN worker)
-// 344  poll_parked      i64   (1 while parked in poll_park_seq)
+// 344  poll_parked      i64   (1 while on a cpu's parked list — poll_park_keys)
 // 352  wait_next        i64   (mutex wait queue link: next waiter tid + 1)
 // 360  wait_granted     i64   (1 once a mutex release handed this thread the lock)
 // 368  intr_sleep       i64   (1 while in a sleep a kill may cut short)
 // 376  held_ko0         i64   (a KObject this syscall holds a reference to —
 // 384  held_ko1         i64    vma.fd_hold; dropped on the way back to ring 3)
 // 392  queued_band      i64   (band + 1 while in a run-queue tree, 0 when not)
-// Total: 400
+// 400  park_keys        i64   (*i64: what a parked poller waits on — see poll_park_keys)
+// 408  park_nkeys       i64
+// 416  park_next        i64   (parked-list link: next tid + 1, 0 = end)
+// 424  park_prev        i64   (previous tid + 1, 0 = head)
+// 432  park_cpu         i64   (the cpu whose parked list holds it)
+// Total: 440
 
-let is i64 as THREAD_SIZE = 400;
+let is i64 as THREAD_SIZE = 440;
 
 // Named slots used outside this file. initial_rdi and poll_parked used to
 // share 336; they never collided only because a worker reads its rdi before
@@ -164,6 +169,11 @@ let is i64 as THR_INTR_SLEEP   = 368;
 let is i64 as THR_HELD0        = 376;
 let is i64 as THR_HELD1        = 384;
 let is i64 as THR_QUEUED       = 392;
+let is i64 as THR_PARK_KEYS    = 400;
+let is i64 as THR_PARK_NKEYS   = 408;
+let is i64 as THR_PARK_NEXT    = 416;
+let is i64 as THR_PARK_PREV    = 424;
+let is i64 as THR_PARK_CPU     = 432;
 // Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
 // Created lazily on first use under heap_lock (SMP-safe), so there is no
 // init-order dependency between sched.init and per_cpu_init / AP bring-up.
@@ -1845,7 +1855,7 @@ fn sleep_locked_and_yield(saved_flags as i64) as void {
 //
 // Now a waiter PARKS and whoever changes a readiness answer wakes it. The park
 // still carries a deadline, and that deadline is capped: it bounds a wakeup
-// that never comes (a future object whose writer forgets to call poll_wake) to
+// that never comes (a future object whose writer forgets to call poll_wake_key) to
 // one cap instead of a hang. The cap is a safety net on a liveness hazard, not
 // the mechanism — events wake a parked poller immediately.
 let is i64 as POLL_PARK_CAP_NS = 50000000;      // 50 ms
@@ -1888,34 +1898,69 @@ fn kernel_cpu_ns() as i64 {
     return sum;
 }
 
-// Bumped by every poll_wake. A poller reads it BEFORE asking whether its fds
-// are ready and hands the value back to poll_park, which refuses to sleep if
-// the count moved in between.
+// Bumped by every poll_wake_key. A poller reads it BEFORE asking whether its
+// fds are ready and hands the value back to poll_park_keys, which refuses to
+// sleep if the count moved in between.
 //
 // Without it there is a window with a name: a thread sweeps its fds, finds
-// nothing, and is still RUNNING when the interrupt arrives. poll_wake looks
+// nothing, and is still RUNNING when the interrupt arrives. poll_wake_key looks
 // for parked threads, sees none, and the wakeup is lost — the thread then
 // parks and sleeps out the full POLL_PARK_CAP_NS. That cap exists precisely
 // as the backstop for this, so nothing hangs, but 50 ms of latency on a link
 // whose round trip is 0.1 ms is not a backstop anyone should be hitting: ping
 // measured 52 ms on three runs in five, and TCP would pay it per round trip.
-//
-// Starts at 1, not 0, and that is not cosmetic: 0 is poll_park_seq's "I have
-// no check to have raced" sentinel. Starting at 0 meant the first reader to
-// call poll_seq_read before anything in the system had ever woken a poller got
-// back the opt-out value and parked with its race check silently disabled —
-// rare, boot-only, and exactly the kind of hole that shows up once a year as
-// an unreproducible 50 ms stall. A counter that never yields the sentinel
-// cannot do that.
 let is i64 as poll_seq with mut = 1;
 
 fn poll_seq_read() as i64 {
     return lock.load_word(&poll_seq);
 }
 
-// `seq` is what poll_seq_read returned before the caller checked readiness.
-// Passing 0 opts out of the check (nothing to have missed).
-fn poll_park_seq(deadline as i64, seq as i64) as void {
+// Who is parked, per cpu: a doubly-linked list through the thread struct
+// (park_next/park_prev, tid + 1 so 0 can mean "none"), touched only under that
+// cpu's sched_lock. poll_wake_key walks these instead of every tid the system
+// ever handed out — next_tid only grows, so a sweep over it got slower with
+// every command run, while the parked set is the handful of threads actually
+// waiting.
+let is [16]i64 as park_heads with mut;
+
+fn park_link(cpu as i64, tid as i64) as void {
+    let is i64 as head = park_heads[cpu];
+    thr_set(tid, THR_PARK_NEXT, head);
+    thr_set(tid, THR_PARK_PREV, 0);
+    if (head != 0) { thr_set(head - 1, THR_PARK_PREV, tid + 1); }
+    park_heads[cpu] = tid + 1;
+    thr_set(tid, THR_PARK_CPU, cpu);
+    thr_set(tid, THR_POLL_PARKED, 1);
+}
+
+fn park_unlink(cpu as i64, tid as i64) as void {
+    let is i64 as nx = thr_get(tid, THR_PARK_NEXT);
+    let is i64 as pv = thr_get(tid, THR_PARK_PREV);
+    if (pv != 0) { thr_set(pv - 1, THR_PARK_NEXT, nx); }
+    else { park_heads[cpu] = nx; }
+    if (nx != 0) { thr_set(nx - 1, THR_PARK_PREV, pv); }
+    thr_set(tid, THR_PARK_NEXT, 0);
+    thr_set(tid, THR_PARK_PREV, 0);
+    thr_set(tid, THR_PARK_KEYS, 0);
+    thr_set(tid, THR_PARK_NKEYS, 0);
+    thr_set(tid, THR_POLL_PARKED, 0);
+}
+
+// Park until something this thread waits on changes, the deadline passes, or
+// the thread is killed. `keys` names what it waits on — one key per object,
+// kobject.ko_wait_key — and only a poll_wake_key for one of them wakes it; the
+// array lives in the caller's frame, which stays put for as long as the thread
+// is asleep in here.
+//
+// `seq` is what poll_seq_read returned before the caller checked readiness: if
+// any wake happened since, the news may be the caller's, so it goes round and
+// asks again instead of sleeping. The thread goes on the list FIRST and reads
+// the counter after, with a fence between: a waker bumps the counter and then
+// looks at the list, so of the two, at least one sees the other — the waker
+// finds this thread listed, or this thread finds the counter moved. Read in
+// the other order, a waker could look at an empty list just before this thread
+// joined it, and the thread would then sleep through the wake that was its own.
+fn poll_park_keys(deadline as i64, seq as i64, keys as *i64, nkeys as i64) as void {
     let is i64 as tid = current_tid();
     if (tid < 0) { return; }
     let is i64 as now = timer.current_time_ns();
@@ -1923,71 +1968,95 @@ fn poll_park_seq(deadline as i64, seq as i64) as void {
     if (deadline > 0 && deadline < wake_at) { wake_at = deadline; }
     let is i64 as cpu = thr_home_cpu(tid);
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
-    // Under the lock, with interrupts off: an event that arrived any time
-    // since the caller's check has already moved the counter, so going to
-    // sleep now would be sleeping through news we have already been told.
-    if (seq != 0 && lock.load_word(&poll_seq) != seq) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return;
-    }
     // A park is interruptible: a thread being terminated does not go to sleep,
     // and its caller sees kill_requested() on the way round its loop.
     if (thr_state(tid) != THREAD_RUNNING || thr_get(tid, THR_KILL) != 0) {
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
     }
+    thr_set(tid, THR_PARK_KEYS, cast(i64, keys));
+    thr_set(tid, THR_PARK_NKEYS, nkeys);
+    park_link(cpu, tid);
+    asm(".byte 0x0F, 0xAE, 0xF0\n");     // mfence: the link is visible before the read
+    if (lock.load_word(&poll_seq) != seq) {
+        park_unlink(cpu, tid);
+        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        return;
+    }
     thr_set(tid, 272, wake_at);                 // sleep_until_ns
-    thr_set(tid, THR_POLL_PARKED, 1);
     thr_set(tid, THR_INTR_SLEEP, 1);
     thr_set(tid, 8, THREAD_SLEEPING);
     set_nr_running(cpu, nr_running(cpu) - 1);
     timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
-    thr_set(tid, THR_POLL_PARKED, 0);
+    // Back. A key's waker took this thread off the list; the deadline and a
+    // kill did not, and the list is the cpu's it parked on, whatever cpu runs
+    // it now.
+    let is i64 as pcpu = thr_get(tid, THR_PARK_CPU);
+    let is i64 as f2 = lock.acquire_irq(sched_lock_ptr(pcpu));
+    if (thr_get(tid, THR_POLL_PARKED) == 1) { park_unlink(pcpu, tid); }
+    lock.release_irq(sched_lock_ptr(pcpu), f2);
     thr_set(tid, THR_INTR_SLEEP, 0);
 }
 
-// Legacy shape, for callers with no readiness check to have raced.
-fn poll_park(deadline as i64) as void {
-    poll_park_seq(deadline, 0);
-}
-
-// poll_wake — something happened that a poll could be waiting on: bytes into a
-// channel, an event posted, a device ring filled, an endpoint closed. Wakes
-// every parked poller; they re-ask and go back to sleep if it was not theirs.
-// A broadcast is right here: the waiters are a handful of desktop processes,
-// and per-object wait lists would buy nothing at this scale.
+// poll_wake_key — something `key` names changed: bytes into a channel, an
+// event posted, a device ring filled, an endpoint closed. Wakes the parked
+// threads waiting on that key and nobody else.
 //
-// Safe from an IRQ handler: wakeup_thread takes the target cpu's sched_lock
-// with acquire_irq, and a cpu holding that lock runs with interrupts off, so
-// the handler cannot have preempted a holder on this cpu.
-fn poll_wake() as void {
-    // Bump FIRST, wake second. A thread between its readiness check and its
-    // park is not findable by the sweep below — it is still RUNNING — and the
-    // counter is what it notices instead of sleeping through this.
+// It used to wake EVERY parked thread, on the theory that the waiters were a
+// handful of desktop processes and per-object lists would buy nothing. Every
+// byte written into a pipe then woke the compositor, the window manager, netd,
+// soundd, the launcher and every terminal, each to re-check its fds and park
+// again: `seq 1 100000 | wc -l` took 84 seconds, two cpus busy waking the
+// wrong threads, against under one to write the same lines to a file.
+//
+// Bump FIRST, look second — the other half of poll_park_keys' ordering: a
+// thread not on a list yet notices the counter instead. An empty list is
+// skipped without its lock, which that ordering is what makes safe. Safe from
+// an IRQ handler: each cpu's lock is taken with acquire_irq, one at a time,
+// and a cpu holding its own runs with interrupts off, so the handler cannot
+// have preempted a holder on this cpu.
+fn poll_wake_key(key as i64) as void {
     lock.atomic_add(&poll_seq, 1);
-    let is i64 as ntid = next_tid;
-    let is i64 as tid with mut = 0;
-    while (tid < ntid) {
-        if (thread_ptr(tid) != 0) {
-            if (thr_get(tid, THR_POLL_PARKED) == 1 && thr_state(tid) == THREAD_SLEEPING) {
-                thr_set(tid, THR_POLL_PARKED, 0);
-                wakeup_thread(tid);
+    let is i64 as nc = num_cpus();
+    let is i64 as cpu with mut = 0;
+    while (cpu < nc) {
+        if (park_heads[cpu] != 0) {
+            let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+            let is i64 as woke with mut = 0;
+            let is i64 as lid with mut = 0 - 1;
+            let is i64 as t with mut = park_heads[cpu];
+            while (t != 0) {
+                let is i64 as tid = t - 1;
+                t = thr_get(tid, THR_PARK_NEXT);
+                let is *i64 as keys = cast(*i64, thr_get(tid, THR_PARK_KEYS));
+                let is i64 as nk = thr_get(tid, THR_PARK_NKEYS);
+                let is i64 as hit with mut = 0;
+                let is i64 as k with mut = 0;
+                while (k < nk) {
+                    if (keys[k] == key) { hit = 1; k = nk; } else { k = k + 1; }
+                }
+                if (hit == 1 && thr_state(tid) == THREAD_SLEEPING) {
+                    park_unlink(cpu, tid);
+                    let is i64 as l = wake_locked(tid, cpu);
+                    if (l >= 0) { lid = l; }
+                    woke = 1;
+                }
             }
+            lock.release_irq(sched_lock_ptr(cpu), f);
+            if (woke == 1) { wake_finish(cpu, lid); }
         }
-        tid = tid + 1;
+        cpu = cpu + 1;
     }
     return;
 }
 
-fn wakeup_thread(tid as i64) as void {
-    let is i64 as cpu with mut = 0;
-    let is i64 as saved_flags = lock_home(tid, &cpu);
-    if (thr_state(tid) != THREAD_SLEEPING) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return;
-    }
+// Make a SLEEPING thread runnable on `cpu`, whose sched_lock the caller holds.
+// Returns the lapic id to send a reschedule IPI to once that lock is dropped,
+// or -1 when none is due (the home is this cpu, or the thread was not asleep).
+fn wake_locked(tid as i64, cpu as i64) as i64 {
+    if (thr_state(tid) != THREAD_SLEEPING) { return 0 - 1; }
 
     // If this thread had a timed sleep pending, clear it and
     // decrement the cpu's timed-sleeper count so on_timer_tick's
@@ -2032,25 +2101,34 @@ fn wakeup_thread(tid as i64) as void {
         if (cpu != this_cpu()) { is_remote = 1; }
     }
 
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    if (is_remote == 0) { return 0 - 1; }
+    return target_lapic_id;
+}
 
-    // Targeted reschedule IPI — wake the home cpu's idle/HLT (or
-    // preempt whatever lower-priority thread it's running) so the
-    // freshly-runnable thread starts in microseconds instead of
-    // waiting for the home cpu's next 5 ms timer tick. We only
-    // fire when the home is a *different* cpu; if we're already
-    // on it the local need_resched flag plus the in-flight
-    // schedule()/return path picks the wakeup up without an IRQ
-    // round-trip. The broadcast variant that this replaces was
-    // dangerous on -smp 4 pre-per-cpu-runqueue (cross-cpu lock
-    // contention exposed a codegen race); a single targeted
-    // delivery to a runqueue we don't own has none of that.
-    if (is_remote != 0) {
-        if (target_lapic_id >= 0) {
-            lapic.send_resched_ipi_to(target_lapic_id);
-        }
-    }
+// After wake_locked, with the lock dropped. Targeted reschedule IPI — wake the
+// home cpu's idle/HLT (or preempt whatever lower-priority thread it's running)
+// so the freshly-runnable thread starts in microseconds instead of waiting for
+// the home cpu's next timer tick. Only for a home that is a *different* cpu:
+// on this one the local need_resched flag plus the in-flight schedule()/return
+// path picks the wakeup up without an IRQ round-trip. The broadcast variant
+// this replaces was dangerous on -smp 4 pre-per-cpu-runqueue (cross-cpu lock
+// contention exposed a codegen race); a single targeted delivery to a
+// runqueue we don't own has none of that.
+fn wake_finish(cpu as i64, lapic_id as i64) as void {
+    if (lapic_id >= 0) { lapic.send_resched_ipi_to(lapic_id); }
     kick_idle_for(cpu);
+}
+
+fn wakeup_thread(tid as i64) as void {
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = lock_home(tid, &cpu);
+    if (thr_state(tid) != THREAD_SLEEPING) {
+        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        return;
+    }
+    let is i64 as lid = wake_locked(tid, cpu);
+    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    wake_finish(cpu, lid);
 }
 
 // Work just became runnable on `cpu`. If that cpu is already busy and another

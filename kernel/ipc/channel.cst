@@ -9,8 +9,8 @@
 // SYS_READ/SYS_WRITE drive a channel fd for free.
 //
 // Blocking is by PARKING, not polling. A blocked endpoint sleeps until the
-// peer's write, read or close says a readiness answer changed (sched.poll_wake),
-// and the counter it reads before looking (sched.poll_seq_read) closes the
+// peer's write, read or close says a readiness answer changed
+// (sched.poll_wake_key, keyed on the Channel both endpoints share), and the counter it reads before looking (sched.poll_seq_read) closes the
 // lost-wakeup window that made polling look like the safe choice. The park
 // still carries sched's 50 ms cap, but that is a backstop for a wakeup that
 // never comes — not the mechanism.
@@ -35,7 +35,7 @@
 // The win here is latency, not idle cost — the claim that this was burning a
 // quarter of a core was about SYS_POLL's waiters, and that one was already fixed.
 //
-// The wake side needed nothing: every mutator below has called poll_wake since
+// The wake side needed nothing: every mutator below has woken its waiters since
 // SYS_POLL landed. Only the wait side was still asking on a timer.
 
 use "kobject.cst" as kobject;
@@ -88,7 +88,17 @@ fn init() as void {
     CHANNEL_OPS.write = fn_ptr(chan_write);
     CHANNEL_OPS.close = fn_ptr(chan_close);
     CHANNEL_OPS.poll  = fn_ptr(chan_poll);
+    CHANNEL_OPS.wait_key = fn_ptr(chan_wait_key);
     // mmap/present/lseek/readdir stay null — a channel is a byte stream.
+}
+
+// Both endpoints wait on the Channel they share: every mutator below has the
+// Channel in hand, and a change in one direction is news for both sides (bytes
+// in for the reader, room freed for the writer, a close for either).
+fn chan_wait_key(priv as i64) as i64 {
+    if (priv == 0) { return 0; }
+    let is *ChannelEndpoint as ep = cast(*ChannelEndpoint, priv);
+    return ep.channel;
 }
 
 // ============================================================
@@ -149,7 +159,7 @@ fn chan_read(priv as i64, buf as i64, n as i64) as i64 {
     while (done == 0) {
         // Read the wake counter BEFORE looking at the ring. A byte that lands
         // in the window between the look and the park finds this thread still
-        // RUNNING, so poll_wake's sweep cannot see it — the counter is what it
+        // RUNNING, so poll_wake_key cannot find it — the counter is what it
         // notices instead of sleeping out the cap.
         let is i64 as seq = sched.poll_seq_read();
         let is i64 as fl = lock.acquire_irq(&ch.lk);
@@ -165,18 +175,20 @@ fn chan_read(priv as i64, buf as i64, n as i64) as i64 {
         if (got > 0) {
             result = got;
             done = 1;
-            sched.poll_wake();        // space freed: a writer may be parked
+            sched.poll_wake_key(ep.channel);   // space freed: a writer may be parked
         }
         else if (other_closed != 0) { result = 0;   done = 1; }   // EOF
         // Nothing to read: park until the writer says otherwise. Deadline 0 is
         // "no deadline of my own" — a blocking read has none; sched applies its
         // cap. If the counter moved since `seq` the park returns at once and
         // the loop re-asks, which is the whole point of carrying it.
-        // A thread being terminated is not parked (poll_park_seq refuses), so
+        // A thread being terminated is not parked (poll_park_keys refuses), so
         // without this check it would spin here instead of unwinding to the
         // boundary where it leaves.
         else {
-            sched.poll_park_seq(0, seq);
+            let is [1]i64 as key;
+            key[0] = ep.channel;
+            sched.poll_park_keys(0, seq, cast(*i64, &key[0]), 1);
             if (sched.kill_requested() != 0) { result = abi.E_INTR; done = 1; }
         }
     }
@@ -214,10 +226,12 @@ fn chan_write(priv as i64, buf as i64, n as i64) as i64 {
         else if (put > 0) {
             result = put;
             done = 1;
-            sched.poll_wake();        // a reader may have been parked on this
+            sched.poll_wake_key(ep.channel);   // a reader may have been parked on this
         }
         else {                                   // ring full
-            sched.poll_park_seq(0, seq);
+            let is [1]i64 as key;
+            key[0] = ep.channel;
+            sched.poll_park_keys(0, seq, cast(*i64, &key[0]), 1);
             if (sched.kill_requested() != 0) { result = abi.E_INTR; done = 1; }
         }
     }
@@ -345,14 +359,12 @@ fn chan_close(priv as i64) as i64 {
     // A close is a readiness change too: the peer's blocked read must see EOF
     // and its poll must report CLOSED now, not in fifty milliseconds.
     //
-    // OUTSIDE the channel lock, unlike the other two mutators' wakes which
-    // were already there. poll_wake takes a cpu's sched_lock per parked thread,
-    // and now that a blocked endpoint parks rather than naps, this used to be
-    // the one place in the file that held ch.lk across that — a nesting with no
-    // reason to exist. The flag is published by the release above, and poll_wake
-    // bumps the counter before it sweeps, so a peer racing between its check and
-    // its park still sees the news.
-    sched.poll_wake();
+    // OUTSIDE the channel lock, like the other two mutators' wakes.
+    // poll_wake_key takes each cpu's sched_lock, and holding ch.lk across that
+    // would be a nesting with no reason to exist. The flag is published by the
+    // release above, and the wake bumps the counter before it looks, so a peer
+    // racing between its check and its park still sees the news.
+    sched.poll_wake_key(cast(i64, ch));
     let is i64 as old = lock.atomic_add(&ch.refcount, cast(i64, 0 - 1));
     if (old == 1) {
         // Last endpoint: drop any never-received in-flight references so they

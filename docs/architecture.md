@@ -339,9 +339,12 @@ in a swappable userspace program.
   byte ring buffers; read/write are honest ops (dispatch via ko_read/ko_write, so
   SYS_READ/SYS_WRITE drive a channel fd), no framing/handle-passing in the kernel.
   `SYS_CHANNEL_CREATE` mints a pair. **Blocking parks, it does not poll**: a blocked
-  endpoint sleeps until the peer's write/read/close calls `poll_wake`, and the readiness
-  counter it reads first closes the lost-wakeup window — the same mechanism `SYS_POLL`,
-  netdev and audio use. Measured on a two-thread ping-pong, the round trip went from
+  endpoint sleeps until the peer's write/read/close calls `poll_wake_key` on the channel
+  they share, and the readiness counter it reads first closes the lost-wakeup window —
+  the same mechanism `SYS_POLL`, netdev and audio use. A wake reaches only the threads
+  parked on that key (`ko_wait_key`: what each kind of object's waiters wait on), never
+  every poller: when it reached them all, `seq 1 100000 | wc -l` took 84 s and an idle
+  desktop cost 22% of a host core, against under a second and 9%. Measured on a two-thread ping-pong, the round trip went from
   5.39 ms (1 ms poll on both sides, compounding) to 52–890 µs; what is left is the
   scheduler's context-switch cost, not the channel's. The KObject **refcount is atomic**
   (lock xadd) so two aspaces can share an endpoint.
