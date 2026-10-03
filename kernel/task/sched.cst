@@ -154,9 +154,14 @@ let is i64 as FPU_STATE_SIZE   = 512;
 // 416  park_next        i64   (parked-list link: next tid + 1, 0 = end)
 // 424  park_prev        i64   (previous tid + 1, 0 = head)
 // 432  park_cpu         i64   (the cpu whose parked list holds it)
-// Total: 440
+// 440  tsleep_next      i64   (timed-sleeper list link: next tid + 1, 0 = end)
+// 448  tsleep_prev      i64   (previous tid + 1, 0 = head)
+// 456  dlt_next         i64   (budget-throttled deadline list: next tid + 1)
+// 464  dlt_prev         i64   (previous tid + 1, 0 = head)
+// 472  dlt_on           i64   (1 while on that list)
+// Total: 480
 
-let is i64 as THREAD_SIZE = 440;
+let is i64 as THREAD_SIZE = 480;
 
 // Named slots used outside this file. initial_rdi and poll_parked used to
 // share 336; they never collided only because a worker reads its rdi before
@@ -174,6 +179,11 @@ let is i64 as THR_PARK_NKEYS   = 408;
 let is i64 as THR_PARK_NEXT    = 416;
 let is i64 as THR_PARK_PREV    = 424;
 let is i64 as THR_PARK_CPU     = 432;
+let is i64 as THR_TSLEEP_NEXT  = 440;
+let is i64 as THR_TSLEEP_PREV  = 448;
+let is i64 as THR_DLT_NEXT     = 456;
+let is i64 as THR_DLT_PREV     = 464;
+let is i64 as THR_DLT_ON       = 472;
 // Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
 // Created lazily on first use under heap_lock (SMP-safe), so there is no
 // init-order dependency between sched.init and per_cpu_init / AP bring-up.
@@ -423,9 +433,9 @@ fn tid_ht_remove(tid as i64) as void {
 // dereference turns `0 + off` into a low-address read/write and page-
 // faults. The usual trigger was a LAPIC timer IRQ landing inside
 // create_thread / sched.init between `next_tid = next_tid + 1` and
-// the matching `tid_set_ptr`: scanners like dl_check_replenish and
-// program_next_tick iterate `tid < next_tid` and hit the half-
-// published slot. Returning 0 / no-op is the correct fallback — the
+// the matching `tid_set_ptr`: a scanner iterating `tid < next_tid`
+// (the per-tick ones did, before they kept lists of their own) hit the
+// half-published slot. Returning 0 / no-op is the correct fallback — the
 // slot is transiently invalid, not corrupt.
 fn thr_get(tid as i64, off as i64) as i64 {
     let is i64 as base = thread_ptr(tid);
@@ -1229,34 +1239,62 @@ fn dl_account(cpu as i64, tid as i64, elapsed_ns as i64) as void {
         thr_set(tid, 8, THREAD_SUSPENDED);
         dl_remove(cpu, tid);
         set_nr_running(cpu, nr_running(cpu) - 1);
+        dlt_link(cpu, tid);
     }
+}
+
+// The deadline threads that ran out of budget, per cpu, under that cpu's
+// sched_lock: what dl_check_replenish and program_next_tick look at. Both run
+// on every schedule(), and both used to walk every tid ever handed out for
+// these — three table lookups per tid, per context switch, for a list that is
+// almost always empty. Deadline threads are never stolen, so the cpu they were
+// throttled on stays theirs.
+let is [16]i64 as dlt_heads with mut;
+
+fn dlt_link(cpu as i64, tid as i64) as void {
+    if (thr_get(tid, THR_DLT_ON) != 0) { return; }
+    let is i64 as head = dlt_heads[cpu];
+    thr_set(tid, THR_DLT_NEXT, head);
+    thr_set(tid, THR_DLT_PREV, 0);
+    if (head != 0) { thr_set(head - 1, THR_DLT_PREV, tid + 1); }
+    dlt_heads[cpu] = tid + 1;
+    thr_set(tid, THR_DLT_ON, 1);
+}
+
+fn dlt_unlink(cpu as i64, tid as i64) as void {
+    if (thr_get(tid, THR_DLT_ON) == 0) { return; }
+    let is i64 as nx = thr_get(tid, THR_DLT_NEXT);
+    let is i64 as pv = thr_get(tid, THR_DLT_PREV);
+    if (pv != 0) { thr_set(pv - 1, THR_DLT_NEXT, nx); }
+    else { dlt_heads[cpu] = nx; }
+    if (nx != 0) { thr_set(nx - 1, THR_DLT_PREV, pv); }
+    thr_set(tid, THR_DLT_NEXT, 0);
+    thr_set(tid, THR_DLT_PREV, 0);
+    thr_set(tid, THR_DLT_ON, 0);
 }
 
 // Period replenishment (§6.4) — runs under THIS cpu's sched_lock,
 // only replenishes deadline threads whose home is this cpu.
 fn dl_check_replenish(cpu as i64) as void {
+    if (dlt_heads[cpu] == 0) { return; }
     let is i64 as now = timer.current_time_ns();
-    let is i64 as tid with mut = 0;
-    while (tid < next_tid) {
-        if (thr_home_cpu(tid) == cpu) {
-            if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
-                if (thr_state(tid) == THREAD_SUSPENDED) {
-                    let is i64 as period_start = thr_get(tid, 168);
-                    let is i64 as period_ns = thr_get(tid, 144);
-                    if (now >= period_start + period_ns) {
-                        // New period: replenish budget
-                        thr_set(tid, 168, now);                          // new period_start
-                        thr_set(tid, 160, thr_get(tid, 136));            // budget = runtime
-                        thr_set(tid, 176, now + thr_get(tid, 152));      // new abs_deadline
-                        thr_set(tid, 8, THREAD_RUNNABLE);
-                        dl_insert(cpu, tid);
-                        set_nr_running(cpu, nr_running(cpu) + 1);
-                        smp.this_cpu_set_need_resched(1);
-                    }
-                }
-            }
+    let is i64 as t with mut = dlt_heads[cpu];
+    while (t != 0) {
+        let is i64 as tid = t - 1;
+        t = thr_get(tid, THR_DLT_NEXT);
+        let is i64 as period_start = thr_get(tid, 168);
+        let is i64 as period_ns = thr_get(tid, 144);
+        if (now >= period_start + period_ns) {
+            // New period: replenish budget
+            dlt_unlink(cpu, tid);
+            thr_set(tid, 168, now);                          // new period_start
+            thr_set(tid, 160, thr_get(tid, 136));            // budget = runtime
+            thr_set(tid, 176, now + thr_get(tid, 152));      // new abs_deadline
+            thr_set(tid, 8, THREAD_RUNNABLE);
+            dl_insert(cpu, tid);
+            set_nr_running(cpu, nr_running(cpu) + 1);
+            smp.this_cpu_set_need_resched(1);
         }
-        tid = tid + 1;
     }
 }
 
@@ -1679,11 +1717,18 @@ fn make_runnable(tid as i64) as void {
     let is i64 as f = lock_home(tid, &cpu);
     let is i64 as band = thr_band(tid);
     if (thr_state(tid) == THREAD_SUSPENDED) {
-        // Re-placed against the band as it is NOW: the average has moved on
-        // since the thread was created suspended.
-        place_requeue(cpu, band, tid);
         thr_set(tid, 8, THREAD_RUNNABLE);
-        runlist_insert(cpu, band, tid);
+        if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
+            // Out of budget and being killed: it runs to its exit now, off the
+            // throttled list and back in the deadline tree it came from.
+            dlt_unlink(cpu, tid);
+            dl_insert(cpu, tid);
+        } else {
+            // Re-placed against the band as it is NOW: the average has moved
+            // on since the thread was created suspended.
+            place_requeue(cpu, band, tid);
+            runlist_insert(cpu, band, tid);
+        }
         set_nr_running(cpu, nr_running(cpu) + 1);
         let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
         if (cast(i64, pc) != 0) { pc.need_resched = 1; }
@@ -1711,6 +1756,44 @@ fn timed_sleepers_get(cpu as i64) as i64 {
 fn timed_sleepers_set(cpu as i64, v as i64) as void {
     let is *i64 as p = cast(*i64, &cpu_timed_sleepers);
     p[cpu] = v;
+}
+
+// Who sleeps with a deadline, per cpu: a list through the thread struct, under
+// that cpu's sched_lock, and the earliest deadline on it. tick_wake used to
+// look at every tid ever handed out, on every tick of every cpu that had any
+// timed sleeper — and every parked poller is one, for its cap — so a tick cost
+// more with each command the session had run. Now a tick that has nothing due
+// compares one number, and one that has walks only the sleepers.
+//
+// A sleeper is on the list of the cpu it slept on, which stays its home: only
+// runnable threads move (steal_work).
+let is [16]i64 as tsleep_heads with mut;
+let is [16]i64 as tsleep_min with mut;      // earliest wake_at listed, 0 = none
+
+fn tsleep_add(cpu as i64, tid as i64, wake_at as i64) as void {
+    thr_set(tid, 272, wake_at);                 // sleep_until_ns
+    let is i64 as head = tsleep_heads[cpu];
+    thr_set(tid, THR_TSLEEP_NEXT, head);
+    thr_set(tid, THR_TSLEEP_PREV, 0);
+    if (head != 0) { thr_set(head - 1, THR_TSLEEP_PREV, tid + 1); }
+    tsleep_heads[cpu] = tid + 1;
+    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
+    if (tsleep_min[cpu] == 0 || wake_at < tsleep_min[cpu]) { tsleep_min[cpu] = wake_at; }
+}
+
+// Off the list, if on it. The earliest-deadline mark may now be early; the next
+// tick that reaches it finds nothing due and recomputes it.
+fn tsleep_remove(cpu as i64, tid as i64) as void {
+    if (thr_sleep_until_ns(tid) <= 0) { return; }
+    let is i64 as nx = thr_get(tid, THR_TSLEEP_NEXT);
+    let is i64 as pv = thr_get(tid, THR_TSLEEP_PREV);
+    if (pv != 0) { thr_set(pv - 1, THR_TSLEEP_NEXT, nx); }
+    else { tsleep_heads[cpu] = nx; }
+    if (nx != 0) { thr_set(nx - 1, THR_TSLEEP_PREV, pv); }
+    thr_set(tid, THR_TSLEEP_NEXT, 0);
+    thr_set(tid, THR_TSLEEP_PREV, 0);
+    thr_set(tid, 272, 0);
+    timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
 }
 
 // sleep_for_ns: park the current thread until at least `ns` from
@@ -1750,10 +1833,9 @@ fn sleep_unless(word as *i64, value as i64, ns as i64) as void {
         return;
     }
     let is i64 as wake_at = timer.current_time_ns() + ns;
-    thr_set(tid, 272, wake_at);                              // sleep_until_ns
+    tsleep_add(cpu, tid, wake_at);
     thr_set(tid, 8, THREAD_SLEEPING);
     set_nr_running(cpu, nr_running(cpu) - 1);
-    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
@@ -1778,43 +1860,49 @@ fn sleep_interruptible(ns as i64) as i64 {
         return thr_get(tid, THR_KILL);
     }
     let is i64 as wake_at = timer.current_time_ns() + ns;
-    thr_set(tid, 272, wake_at);
+    tsleep_add(cpu, tid, wake_at);
     thr_set(tid, THR_INTR_SLEEP, 1);
     thr_set(tid, 8, THREAD_SLEEPING);
     set_nr_running(cpu, nr_running(cpu) - 1);
-    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
     thr_set(tid, THR_INTR_SLEEP, 0);
     return thr_get(tid, THR_KILL);
 }
 
-// Called from on_timer_tick on each cpu. Walks threads homed on
-// this cpu that are SLEEPING with a non-zero sleep_until_ns; wakes
-// any whose deadline has passed. Cheap fast path: the
-// timed_sleepers counter lets us skip the walk entirely when no
-// thread on this cpu is in a timed sleep (the common case).
+// Called from on_timer_tick on each cpu: wake this cpu's sleepers whose
+// deadline has passed. Nothing due — the common case, since a parked poller's
+// deadline is its 50 ms cap — costs one comparison and no lock.
 fn tick_wake(cpu as i64, now as i64) as void {
     if (timed_sleepers_get(cpu) <= 0) { return; }
-    let is i64 as ntid with mut = next_tid;
-    let is i64 as tid with mut = 0;
-    while (tid < ntid) {
-        if (thread_ptr(tid) != 0) {
-            if (thr_home_cpu(tid) == cpu) {
-                if (thr_state(tid) == THREAD_SLEEPING) {
-                    let is i64 as wake_at = thr_sleep_until_ns(tid);
-                    if (wake_at > 0) {
-                        if (now >= wake_at) {
-                            thr_set(tid, 272, 0);   // clear deadline
-                            timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
-                            wakeup_thread(tid);
-                        }
-                    }
-                }
+    let is i64 as m = tsleep_min[cpu];
+    if (m == 0 || now < m) { return; }
+    let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as next_min with mut = 0;
+    let is i64 as woke with mut = 0;
+    let is i64 as lid with mut = 0 - 1;
+    let is i64 as t with mut = tsleep_heads[cpu];
+    while (t != 0) {
+        let is i64 as tid = t - 1;
+        t = thr_get(tid, THR_TSLEEP_NEXT);
+        let is i64 as wake_at = thr_sleep_until_ns(tid);
+        if (now >= wake_at) {
+            // wake_locked takes it off the list; a sleeper that is somehow not
+            // SLEEPING any more still has to leave it.
+            if (thr_state(tid) == THREAD_SLEEPING) {
+                let is i64 as l = wake_locked(tid, cpu);
+                if (l >= 0) { lid = l; }
+                woke = 1;
+            } else {
+                tsleep_remove(cpu, tid);
             }
+        } else if (next_min == 0 || wake_at < next_min) {
+            next_min = wake_at;
         }
-        tid = tid + 1;
     }
+    tsleep_min[cpu] = next_min;
+    lock.release_irq(sched_lock_ptr(cpu), f);
+    if (woke == 1) { wake_finish(cpu, lid); }
 }
 
 fn sleep_thread(tid as i64) as void {
@@ -1983,11 +2071,10 @@ fn poll_park_keys(deadline as i64, seq as i64, keys as *i64, nkeys as i64) as vo
         lock.release_irq(sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    thr_set(tid, 272, wake_at);                 // sleep_until_ns
+    tsleep_add(cpu, tid, wake_at);
     thr_set(tid, THR_INTR_SLEEP, 1);
     thr_set(tid, 8, THREAD_SLEEPING);
     set_nr_running(cpu, nr_running(cpu) - 1);
-    timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
     schedule();
     // Back. A key's waker took this thread off the list; the deadline and a
@@ -2058,13 +2145,8 @@ fn poll_wake_key(key as i64) as void {
 fn wake_locked(tid as i64, cpu as i64) as i64 {
     if (thr_state(tid) != THREAD_SLEEPING) { return 0 - 1; }
 
-    // If this thread had a timed sleep pending, clear it and
-    // decrement the cpu's timed-sleeper count so on_timer_tick's
-    // fast path can skip the per-thread scan again.
-    if (thr_sleep_until_ns(tid) > 0) {
-        thr_set(tid, 272, 0);
-        timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
-    }
+    // A timed sleep pending: off the cpu's timed-sleeper list.
+    tsleep_remove(cpu, tid);
 
     let is i64 as band = thr_band(tid);
     let is i64 as w with mut = thr_weight(tid);
@@ -2287,7 +2369,7 @@ fn resume_thread(tid as i64) as void {
     let is i64 as band = thr_band(tid);
     if (thr_class(tid) == SCHED_CLASS_QOS) { place_requeue(cpu, band, tid); }
     thr_set(tid, 8, THREAD_RUNNABLE);
-    if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dl_insert(cpu, tid); }
+    if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dlt_unlink(cpu, tid); dl_insert(cpu, tid); }
     else { runlist_insert(cpu, band, tid); }
     set_nr_running(cpu, nr_running(cpu) + 1);
     lock.release_irq(sched_lock_ptr(cpu), saved_flags);
@@ -2691,18 +2773,13 @@ fn program_next_tick(cpu as i64) as void {
         }
     }
 
-    // Walk this cpu's deadline-suspended threads only.
-    let is i64 as tid with mut = 0;
-    while (tid < next_tid) {
-        if (thr_home_cpu(tid) == cpu) {
-            if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
-                if (thr_state(tid) == THREAD_SUSPENDED) {
-                    let is i64 as replenish_at = thr_get(tid, 168) + thr_get(tid, 144);
-                    if (replenish_at < next_event) { next_event = replenish_at; }
-                }
-            }
-        }
-        tid = tid + 1;
+    // This cpu's budget-throttled deadline threads: the next replenishment.
+    let is i64 as t with mut = dlt_heads[cpu];
+    while (t != 0) {
+        let is i64 as tid = t - 1;
+        t = thr_get(tid, THR_DLT_NEXT);
+        let is i64 as replenish_at = thr_get(tid, 168) + thr_get(tid, 144);
+        if (replenish_at < next_event) { next_event = replenish_at; }
     }
 
     let is i64 as delta with mut = next_event - now;
