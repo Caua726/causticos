@@ -130,6 +130,10 @@ yielding raw event streams. The set stays small on purpose: one new concept, the
   KObject. `close` — and process exit, when the address space is torn down — drops the
   reference; the object's `close` op runs at the last reference. Clearing a slot
   *anywhere* must `ko_unref`.
+- **No fixed number of fds.** The table's first 64 slots live in the address space;
+  past them it moves to the kernel heap and doubles as it fills, charged to the
+  process's bookkeeping and held to its budget like any memory it has. `POLL` takes
+  as many entries as the caller's table has slots.
 - Syscalls: `SYS_SPAWN`, `SYS_WAIT`, `SYS_PROC_KILL` (forced, cross-cpu — marks the
   threads and each leaves at its next boundary; it kills every thread of a
   multi-thread process. Only an ancestor may kill, and the target's whole subtree

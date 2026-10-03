@@ -79,7 +79,7 @@ whatever struct it fills.
 | 31 | `SEG_COPY` | fd, off, ubuf, len, dir | 0 \| errno; dir 0 = seg→buf, 1 = buf→seg |
 | 32 | `FD_SEND` | chan_fd, fd | 0 \| `E_AGAIN` (slot busy) — one-slot SCM_RIGHTS |
 | 33 | `FD_RECV` | chan_fd | fd \| `E_AGAIN` (nothing pending) |
-| 34 | `POLL` | entries, n, timeout_ns | n_ready \| errno (§5 `PollEntry`) |
+| 34 | `POLL` | entries, n, timeout_ns | n_ready \| errno (§5 `PollEntry`); n up to the caller's fd-table size (64, more once it has grown) |
 | 35 | `PROC_KILL` | pid | 0 \| `E_NOENT` (not your descendant) — ends it and everything it started |
 | 36 | `PROC_LIST` | entries, max | total live count (may exceed `max`) |
 | 37 | `MEM_INFO` | out | 0; `[total_pages, free_pages, page_size, committed]` |

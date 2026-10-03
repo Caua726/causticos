@@ -68,20 +68,25 @@ struct Vma {
     // policy is fixed in mem_handle_fault, not delegated per-VMA.)
 }
 
-// Per-aspace file descriptor table. POSIX-style: small int → *VfsFile.
-// Fixed capacity for now (matches the FD_MAX_DEFAULT typical in Unix
-// hobby kernels); real `setrlimit(RLIMIT_NOFILE)` lands when the
-// resource-limits work does.
+// Per-aspace file descriptor table: small int → KObject. The first
+// FD_TABLE_CAP slots are inline in the Aspace, which is all most processes
+// ever use; past them the table moves to the kernel heap and doubles as it
+// fills (fd_grow). It was a fixed 64, and a shell running a dozen jobs —
+// three or four channels each — ran out of descriptors, which it had to
+// report as a full job table. What bounds it now is what bounds everything
+// else a process holds: memory, charged to the process (bookkeeping_bytes)
+// and checked against its budget like any other.
 let is i64 as FD_TABLE_CAP = 64;
+let is i64 as FD_INDEX_LIMIT = 67108864;    // 2^26 slots = 512 MiB of table
 
 struct Aspace {
     pml4_phys as i64;
     vma_head as *Vma;
     vma_count as i64;
     lk as lock.TicketLock;
-    // FD table stored inline as 64 * i64 entries; index is the fd
-    // number, value is the *VfsFile cast to i64 (0 = closed).
-    // Dynamic-resize for >FD_TABLE_CAP comes later.
+    // FD table: the first FD_TABLE_CAP slots inline; index is the fd
+    // number, value is the KObject cast to i64 (0 = closed). Once it grows,
+    // the whole table lives at fd_ext (see fd_grow) and this one is unused.
     fd_count as i64;
     fd_entries as [64]i64;
     // Accounting (Phase E), NOT a quota. committed_bytes = anon RAM backed;
@@ -113,6 +118,11 @@ struct Aspace {
     // owned by the cache; teardown drops the reference so the cache can
     // eventually take them back. Appended last.
     img_ref as i64;
+    // The fd table once it has outgrown fd_entries: a kernel-heap array of
+    // fd_ext_cap slots (0 = still inline). Charged to bookkeeping_bytes.
+    // Appended last.
+    fd_ext as i64;
+    fd_ext_cap as i64;
 }
 
 fn lk_ptr(a as *Aspace) as *lock.TicketLock {
@@ -804,6 +814,61 @@ fn mmap_pages_at(a as *Aspace, va_hint as i64, pfns_ptr as i64, npages as i64,
 // The first descriptor a caller may be handed without asking for it.
 let is i64 as FD_FIRST_DYNAMIC = 3;
 
+// The table and how many slots it has, wherever it lives now. A table only
+// moves under the aspace lock, so a caller reading either without it may only
+// be one no other thread can race (a process being built, teardown).
+fn _fdt(a as *Aspace) as *i64 {
+    if (a.fd_ext != 0) { return cast(*i64, a.fd_ext); }
+    return cast(*i64, &a.fd_entries[0]);
+}
+fn fd_capacity(a as *Aspace) as i64 {
+    if (a.fd_ext != 0) { return a.fd_ext_cap; }
+    return FD_TABLE_CAP;
+}
+
+// fd_grow — make the table hold slot `need`: double it (at least) onto the
+// kernel heap, copy, and swap it in under the lock. Called WITHOUT the lock
+// (the allocation can take time); a table some other thread grew meanwhile
+// is fine as long as it now holds `need`. 0, or E_NOMEM — out of memory, or
+// past the budget the process was granted.
+fn fd_grow(a as *Aspace, need as i64) as i64 {
+    let is i64 as cur = fd_capacity(a);
+    if (need < cur) { return 0; }
+    // A slot this far up would take a table of half a gigabyte: no machine
+    // this runs on has that to give, and doubling toward it must not overflow.
+    if (need >= FD_INDEX_LIMIT) { return abi.E_NOMEM; }
+    let is i64 as ncap with mut = cur * 2;
+    while (ncap <= need) { ncap = ncap * 2; }
+    let is i64 as nbytes = ncap * 8;
+    let is i64 as obytes with mut = 0;
+    if (a.fd_ext != 0) { obytes = a.fd_ext_cap * 8; }
+    if (a.budget != 0 && a.committed_bytes + a.bookkeeping_bytes + nbytes - obytes > a.budget) {
+        return abi.E_NOMEM;
+    }
+    let is i64 as nt = heap.kmalloc(nbytes, pmm.ALLOC_ZERO);
+    if (nt == 0) { return abi.E_NOMEM; }
+    lock.acquire(lk_ptr(a));
+    let is i64 as now_cap = fd_capacity(a);
+    if (need < now_cap) {                            // grown meanwhile
+        lock.release(lk_ptr(a));
+        heap.kfree(nt);
+        return 0;
+    }
+    let is *i64 as src = _fdt(a);
+    let is *i64 as dst = cast(*i64, nt);
+    let is i64 as i with mut = 0;
+    while (i < now_cap) { dst[i] = src[i]; i = i + 1; }
+    let is i64 as old = a.fd_ext;
+    let is i64 as old_bytes with mut = 0;
+    if (old != 0) { old_bytes = a.fd_ext_cap * 8; }
+    a.fd_ext = nt;
+    a.fd_ext_cap = ncap;
+    a.bookkeeping_bytes = a.bookkeeping_bytes + nbytes - old_bytes;
+    lock.release(lk_ptr(a));
+    if (old != 0) { heap.kfree(old); }
+    return 0;
+}
+
 // The object at `fd`, WITHOUT a reference: only for an aspace no other thread
 // can be using (a process still being built, a smoke test). A syscall uses
 // fd_hold or fd_take — between this load and the use, a sibling thread can
@@ -812,16 +877,16 @@ let is i64 as FD_FIRST_DYNAMIC = 3;
 fn fd_get(a as *Aspace, fd as i64) as i64 {
     if (cast(i64, a) == 0) { return 0; }
     if (fd < 0) { return 0; }
-    if (fd >= FD_TABLE_CAP) { return 0; }
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    if (fd >= fd_capacity(a)) { return 0; }
+    let is *i64 as t = _fdt(a);
     return t[fd];
 }
 
 fn fd_set(a as *Aspace, fd as i64, file as i64) as void {
     if (cast(i64, a) == 0) { return; }
     if (fd < 0) { return; }
-    if (fd >= FD_TABLE_CAP) { return; }
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    if (fd >= fd_capacity(a)) { return; }
+    let is *i64 as t = _fdt(a);
     t[fd] = file;
 }
 
@@ -831,9 +896,9 @@ fn fd_set(a as *Aspace, fd as i64, file as i64) as void {
 fn fd_take(a as *Aspace, fd as i64) as i64 {
     if (cast(i64, a) == 0) { return 0; }
     if (fd < 0) { return 0; }
-    if (fd >= FD_TABLE_CAP) { return 0; }
     lock.acquire(lk_ptr(a));
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    if (fd >= fd_capacity(a)) { lock.release(lk_ptr(a)); return 0; }
+    let is *i64 as t = _fdt(a);
     let is i64 as ko = t[fd];
     if (ko != 0) { kobject.ko_ref(ko); }
     lock.release(lk_ptr(a));
@@ -882,9 +947,9 @@ fn fd_release_held() as void {
 fn fd_remove(a as *Aspace, fd as i64) as i64 {
     if (cast(i64, a) == 0) { return 0; }
     if (fd < 0) { return 0; }
-    if (fd >= FD_TABLE_CAP) { return 0; }
     lock.acquire(lk_ptr(a));
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    if (fd >= fd_capacity(a)) { lock.release(lk_ptr(a)); return 0; }
+    let is *i64 as t = _fdt(a);
     let is i64 as ko = t[fd];
     if (ko != 0) {
         t[fd] = 0;
@@ -895,23 +960,28 @@ fn fd_remove(a as *Aspace, fd as i64) as i64 {
 }
 
 // Find the lowest empty slot at or above FD_FIRST_DYNAMIC, install `file`,
-// return the fd. -1 on table-exhausted.
+// return the fd — growing the table when every slot is taken. -1 when it
+// cannot grow (no memory, or past the process's budget).
 fn fd_alloc(a as *Aspace, file as i64) as i64 {
     if (cast(i64, a) == 0) { return cast(i64, 0 - 1); }
     if (file == 0) { return cast(i64, 0 - 1); }
-    lock.acquire(lk_ptr(a));
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
-    let is i64 as i with mut = FD_FIRST_DYNAMIC;
-    while (i < FD_TABLE_CAP) {
-        if (t[i] == 0) {
-            t[i] = file;
-            a.fd_count = a.fd_count + 1;
-            lock.release(lk_ptr(a));
-            return i;
+    while (1 == 1) {
+        lock.acquire(lk_ptr(a));
+        let is *i64 as t = _fdt(a);
+        let is i64 as cap = fd_capacity(a);
+        let is i64 as i with mut = FD_FIRST_DYNAMIC;
+        while (i < cap) {
+            if (t[i] == 0) {
+                t[i] = file;
+                a.fd_count = a.fd_count + 1;
+                lock.release(lk_ptr(a));
+                return i;
+            }
+            i = i + 1;
         }
-        i = i + 1;
+        lock.release(lk_ptr(a));
+        if (fd_grow(a, cap) != 0) { return cast(i64, 0 - 1); }
     }
-    lock.release(lk_ptr(a));
     return cast(i64, 0 - 1);
 }
 
@@ -921,9 +991,9 @@ fn fd_alloc(a as *Aspace, file as i64) as i64 {
 fn fd_install(a as *Aspace, fd as i64, file as i64) as i32 {
     if (cast(i64, a) == 0) { return cast(i32, 0 - 1); }
     if (fd < 0) { return cast(i32, 0 - 1); }
-    if (fd >= FD_TABLE_CAP) { return cast(i32, 0 - 1); }
+    if (fd_grow(a, fd) != 0) { return cast(i32, 0 - 1); }
     lock.acquire(lk_ptr(a));
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    let is *i64 as t = _fdt(a);
     if (t[fd] != 0) {
         lock.release(lk_ptr(a));
         return cast(i32, 0 - 1);
@@ -937,9 +1007,9 @@ fn fd_install(a as *Aspace, fd as i64, file as i64) as i32 {
 fn fd_close(a as *Aspace, fd as i64) as i32 {
     if (cast(i64, a) == 0) { return cast(i32, 0 - 1); }
     if (fd < 0) { return cast(i32, 0 - 1); }
-    if (fd >= FD_TABLE_CAP) { return cast(i32, 0 - 1); }
     lock.acquire(lk_ptr(a));
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    if (fd >= fd_capacity(a)) { lock.release(lk_ptr(a)); return cast(i32, 0 - 1); }
+    let is *i64 as t = _fdt(a);
     if (t[fd] == 0) {
         lock.release(lk_ptr(a));
         return cast(i32, 0 - 1);
@@ -959,9 +1029,10 @@ fn fd_close(a as *Aspace, fd as i64) as i32 {
 // runs against this aspace.
 fn fd_table_drain(a as *Aspace) as void {
     if (cast(i64, a) == 0) { return; }
-    let is *i64 as t = cast(*i64, &a.fd_entries[0]);
+    let is *i64 as t = _fdt(a);
+    let is i64 as cap = fd_capacity(a);
     let is i64 as i with mut = 0;
-    while (i < FD_TABLE_CAP) {
+    while (i < cap) {
         if (t[i] != 0) {
             kobject.ko_unref(t[i]);
             t[i] = 0;
@@ -969,6 +1040,12 @@ fn fd_table_drain(a as *Aspace) as void {
         i = i + 1;
     }
     a.fd_count = 0;
+    if (a.fd_ext != 0) {
+        heap.kfree(a.fd_ext);
+        a.bookkeeping_bytes = a.bookkeeping_bytes - a.fd_ext_cap * 8;
+        a.fd_ext = 0;
+        a.fd_ext_cap = 0;
+    }
 }
 
 // ============================================================
