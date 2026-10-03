@@ -33,7 +33,12 @@ use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/sndproto/sndproto.cst" as sp;
 
-let is i64 as MAX_CLIENTS = 8;
+// Every window on the desktop holds one (the WM hands each an endpoint) and
+// every command a terminal runs gets one more, so eight ran out with a few
+// windows open. A client costs two words here; what bounds this is poll —
+// clients + the device + the control channel must stay within
+// POLL_MAX_ENTRIES (64).
+let is i64 as MAX_CLIENTS = 32;
 let is i64 as MAX_STREAMS = 16;
 
 // Per-stream staging, in FRAMES. Two device buffers deep: enough that a client
@@ -79,8 +84,8 @@ let is i64 as buffer_frames with mut = 0;
 // ---- clients ----
 // All flat arrays rather than an array of structs: the tables are small, every
 // field is an i64, and this sidesteps the mixed-width struct trap entirely.
-let is [8]i64 as cl_fd with mut;            // == MAX_CLIENTS, 0 = free
-let is [8]i64 as cl_live with mut;
+let is [32]i64 as cl_fd with mut;           // == MAX_CLIENTS, 0 = free
+let is [32]i64 as cl_live with mut;
 let is [16]i64 as st_client with mut;       // == MAX_STREAMS; owning client slot + 1, 0 = free
 let is [16]i64 as st_id with mut;           // the client's own stream number
 let is [16]i64 as st_gain with mut;
@@ -288,6 +293,43 @@ fn client_drop(cslot as i64) as void {
     return;
 }
 
+// Mint a client and send its far end over `reply_fd`, the channel that asked.
+// Any holder may: the compositor mints the WM's, the WM a window's, a terminal
+// a command's — authority handed down the way netd's is, each level giving
+// its children what it was given. With no slot free, or no channel to be
+// had, it says so at once rather than leave the asker waiting for an fd that
+// is not coming.
+fn mint(reply_fd as i64) as void {
+    let is [2]i64 as ch;
+    if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
+        sp.send(reply_fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
+        return;
+    }
+    let is i64 as slot with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (k < MAX_CLIENTS) {
+        if (cl_live[k] == 0 && slot < 0) { slot = k; }
+        k = k + 1;
+    }
+    if (slot < 0) {
+        sys.close(ch[0]); sys.close(ch[1]);
+        say("soundd: no client slot free\n");
+        sp.send(reply_fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
+        return;
+    }
+    cl_fd[slot] = ch[0];
+    cl_live[slot] = 1;
+    say("soundd: client "); say(num(slot)); say(" minted\n");
+    // The far end goes back over the asking channel; the spawner installs it
+    // at SND_FD in the child.
+    if (sys.fd_send(reply_fd, ch[1]) != 0) {
+        client_drop(slot);
+        sp.send(reply_fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
+    }
+    sys.close(ch[1]);
+    return;
+}
+
 // One message. Returns 0, or -1 when the client is gone.
 fn handle(cslot as i64) as i64 {
     let is i64 as fd = cl_fd[cslot];
@@ -297,7 +339,11 @@ fn handle(cslot as i64) as i64 {
     let is i64 as id = m[1];
 
     if (mtype == sp.SREQ_HELLO) {
-        sp.send(fd, sp.SEV_HELLO, 0, rate, (channels << 32) | frame_bytes);
+        sp.send(fd, sp.SEV_HELLO, sp.SND_MAGIC, rate, (channels << 32) | frame_bytes);
+        return 0;
+    }
+    if (mtype == sp.SREQ_NEW_CLIENT) {
+        mint(fd);
         return 0;
     }
     if (mtype == sp.SREQ_OPEN) {
@@ -509,35 +555,15 @@ fn main(argc as i64, argv as *u8) as i32 {
             sys.audio_ctl_publish(map, sys.AUDIO_W_APP_PTR, cursor);
         }
 
-        // Answer anyone who spoke. The control channel mints endpoints; a
-        // client channel carries stream work.
+        // Answer anyone who spoke. The control channel and every client
+        // channel can mint endpoints; a client channel also carries streams.
         if ((pollbuf[5] & sys.POLL_READABLE) != 0) {
             let is [4]i64 as m;
             if (sp.recv(ctl_fd, cast(*i64, &m[0])) > 0) {
                 if (m[0] == sp.SREQ_NEW_CLIENT) {
-                    let is [2]i64 as ch;
-                    if (sys.channel_create(cast(*i64, &ch[0])) == 0) {
-                        let is i64 as slot with mut = 0 - 1;
-                        let is i64 as k with mut = 0;
-                        while (k < MAX_CLIENTS) {
-                            if (cl_live[k] == 0 && slot < 0) { slot = k; }
-                            k = k + 1;
-                        }
-                        if (slot < 0) { sys.close(ch[0]); sys.close(ch[1]); }
-                        else {
-                            cl_fd[slot] = ch[0];
-                            cl_live[slot] = 1;
-                            say("soundd: client "); say(num(slot)); say(" minted\n");
-                            // The far end goes back over the control channel;
-                            // the spawner installs it at SND_FD in the child.
-                            if (sys.fd_send(ctl_fd, ch[1]) != 0) {
-                                client_drop(slot);
-                                sys.close(ch[1]);
-                            } else { sys.close(ch[1]); }
-                        }
-                    }
+                    mint(ctl_fd);
                 } else if (m[0] == sp.SREQ_HELLO) {
-                    sp.send(ctl_fd, sp.SEV_HELLO, 0, rate,
+                    sp.send(ctl_fd, sp.SEV_HELLO, sp.SND_MAGIC, rate,
                             (channels << 32) | frame_bytes);
                 }
             }
