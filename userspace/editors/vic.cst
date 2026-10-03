@@ -1,33 +1,80 @@
-// vic.cst — Visual Interface Caustic: a tiny modal (vi-style) text editor, as a
-// terminal TUI. The text is ONE flat byte buffer with embedded '\n'; the cursor
-// is an index `dot`; `tend` is the byte count. Two modes (command / insert).
-// It writes text + ANSI to stdout and reads keys from stdin — the TERMINAL
-// renders it (wterm in the WM, or the shell), never the framebuffer.
-//   h j k l (+ arrows) move · 0 $ line ends · G last line · i a o insert
-//   x delete char · dd delete line · Esc -> command · :w :q :wq :q!
+// vic.cst — Visual Interface Caustic: a modal, vi-style text editor in the
+// terminal. It writes text + ANSI to stdout and reads keys from stdin — the
+// TERMINAL renders it (wterm in the WM, or the shell), never the framebuffer.
+//
+//   vic FILE
+//
+// NORMAL mode (the status line names the mode, the line and the column):
+//   h j k l, arrows   left, down, up, right
+//   w b e             next word, back a word, end of the word
+//   W B E             the same, a word being anything between blanks
+//   0 ^ $             start of the line, first non-blank, end of the line
+//   gg G NG           first line, last line, line N
+//   Ctrl+F Ctrl+B     a page down, up (PgDn, PgUp)   Ctrl+D Ctrl+U  half a page
+//   i a I A o O       insert before / after the cursor, at the line's start /
+//                     end, on a new line below / above
+//   x X               delete the character under / before the cursor
+//   r C               replace the character under the cursor with C
+//   J                 join the next line onto this one
+//   d{motion} dd D    delete (dd: whole lines; D: to the end of the line)
+//   c{motion} cc C    change: delete, then insert
+//   y{motion} yy      yank (copy)          p P   put after / before
+//   u  Ctrl+R         undo, redo (any number of steps)
+//   /RE  n N          search forward (basic regular expressions), again,
+//                     again backwards
+//   A count before a command repeats it: 3dd, 5j, 2dw, 10G.
+// INSERT mode: text goes in as typed, UTF-8 included; Backspace, Enter, Tab,
+// arrows, Home, End, Delete; Esc goes back to NORMAL.
+// Ex commands: :w [FILE]  :q  :q!  :wq  :x  ZZ  :N  :$
+//
+// The text is one flat byte buffer with embedded '\n'; the cursor is a byte
+// index that always sits at the start of a character. Long lines wrap.
 use "std/os/causticos.cst" as sys;
+use "std/unicode/utf8.cst" as utf8;
+use "std/unicode/cpwidth.cst" as cpw;
 use "../lib/ttyproto/ttyproto.cst" as tty;
+use "../lib/regex/regex.cst" as re;
 
-// The text lives in an anonymous mapping that doubles as it grows. It was a
-// fixed 64 KiB array, read with one read() of at most 64 KiB - 1: a larger
-// file came in cut, and :w wrote the cut copy back over it without a word.
 let is i64 as TEXT_MIN with imut = 65536;
 let is i64 as C_FG = 0x00d3d7cf; let is i64 as C_BG = 0x00121417;
-let is i64 as C_BAR = 0x002a2e34; let is i64 as C_BARFG = 0x008bbf63; let is i64 as C_CYAN = 0x0073d0ff;
+let is i64 as C_BAR = 0x002a2e34; let is i64 as C_BARFG = 0x00d3d7cf; let is i64 as C_CYAN = 0x0073d0ff;
+let is i64 as C_INS = 0x008bbf63; let is i64 as C_NOR = 0x0073d0ff; let is i64 as C_DIM = 0x00707880;
 
+let is i64 as M_NORMAL with imut = 0;
+let is i64 as M_INSERT with imut = 1;
+
+// ---- the text ----
 let is *u8 as text with mut;
 let is i64 as tcap with mut = 0;
+let is i64 as tend with mut = 0;
+let is i64 as dot with mut = 0;           // the cursor
+let is i64 as want_col with mut = 0;      // the column j and k try to keep
+let is i64 as top with mut = 0;           // the first line on the screen
+let is i64 as mode with mut = 0;
+let is i64 as modified with mut = 0;
+let is i64 as quit with mut = 0;
 // The file could not be read whole (too big for memory, or a read error):
 // what is here is not the file, and :w would destroy the rest of it.
 let is i64 as g_partial with mut = 0;
-let is i64 as tend with mut = 0; let is i64 as dot with mut = 0; let is i64 as topln with mut = 0;
-let is i64 as mode with mut = 0; let is i64 as modified with mut = 0; let is i64 as quit with mut = 0;
-let is i64 as pend_d with mut = 0;
-let is i64 as g_cols with mut = 80; let is i64 as g_rows with mut = 23;   // text rows (status bar extra)
-let is *u8 as g_path with mut; let is [128]u8 as g_pathbuf;
-let is [80]u8 as g_msg; let is i64 as g_msglen with mut = 0;
-let is i64 as g_ex with mut = 0; let is [64]u8 as g_exbuf; let is i64 as g_exlen with mut = 0;
+let is i64 as g_cols with mut = 80;
+let is i64 as g_rows with mut = 24;       // the whole screen; the last row is the status line
+let is [256]u8 as g_path;
+let is [512]u8 as g_msg; let is i64 as g_msglen with mut = 0;
+
+// a prompt being typed on the status line: ':' or '/'
+let is i64 as g_prompt with mut = 0;
+let is i64 as g_plen with mut = 0;        // its text is PB's, below
+
+// normal mode: a count, an operator waiting for its motion, a 'g' or 'Z' or
+// 'r' waiting for its second key
+let is i64 as g_count with mut = 0;
+let is i64 as g_opcount with mut = 0;
+let is i64 as g_op with mut = 0;
+let is i64 as g_pre with mut = 0;
+
+// input: an escape sequence being read
 let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
+let is i64 as g_tty with mut = 0;
 
 // ---- output buffer + ANSI ----
 let is [32768]u8 as obuf; let is i64 as olen with mut = 0;
@@ -42,7 +89,8 @@ fn flush_ob() as void {
 }
 fn ob(c as i64) as void { if (olen >= 32700) { flush_ob(); } obuf[olen] = cast(u8, c); olen = olen + 1; }
 fn obs(s as *u8) as void { let is i64 as i with mut = 0; while (s[i] != 0) { ob(cast(i64, s[i])); i = i + 1; } }
-fn obnum(v as i64) as void { let is i64 as x with mut = v; if (x == 0) { ob(48); return; } let is [24]u8 as b; let is i64 as n with mut = 0; while (x > 0) { b[n] = cast(u8, 48 + x - (x / 10) * 10); x = x / 10; n = n + 1; } while (n > 0) { n = n - 1; ob(cast(i64, b[n])); } }
+fn obn(s as *u8, n as i64) as void { let is i64 as i with mut = 0; while (i < n) { ob(cast(i64, s[i])); i = i + 1; } }
+fn obnum(v as i64) as void { let is i64 as x with mut = v; if (x == 0) { ob(48); return; } let is [24]u8 as b; let is i64 as n with mut = 0; while (x > 0) { b[n] = cast(u8, 48 + x % 10); x = x / 10; n = n + 1; } while (n > 0) { n = n - 1; ob(cast(i64, b[n])); } }
 fn esc() as void { ob(0x1B); ob(0x5B); }
 fn cup(row as i64, col as i64) as void { esc(); obnum(row); ob(59); obnum(col); ob(72); }
 fn ceol() as void { esc(); ob(75); }
@@ -53,17 +101,207 @@ fn hidec() as void { esc(); ob(63); obnum(25); ob(108); }
 fn showc() as void { esc(); ob(63); obnum(25); ob(104); }
 fn clr() as void { esc(); ob(50); ob(74); }
 // The terminal's alternate screen: this program draws on a screen of its own,
-// and the one with the prompt and the commands before it comes back on exit
-// (it used to be cleared).
+// and the one with the prompt and the commands before it comes back on exit.
 fn alt_on() as void { esc(); ob(63); obnum(1049); ob(104); }
 fn alt_off() as void { esc(); ob(63); obnum(1049); ob(108); }
 
 fn slen(s as *u8) as i64 { let is i64 as n with mut = 0; while (s[n] != 0) { n = n + 1; } return n; }
-fn setmsg(s as *u8) as void { let is i64 as n with mut = slen(s); if (n > 79) { n = 79; } let is i64 as i with mut = 0; while (i < n) { g_msg[i] = s[i]; i = i + 1; } g_msglen = n; }
+fn setmsg(s as *u8) as void { let is i64 as n with mut = slen(s); if (n > 511) { n = 511; } let is i64 as i with mut = 0; while (i < n) { g_msg[i] = s[i]; i = i + 1; } g_msglen = n; }
+fn addmsg(s as *u8) as void { let is i64 as i with mut = 0; while (s[i] != 0 && g_msglen < 511) { g_msg[g_msglen] = s[i]; g_msglen = g_msglen + 1; i = i + 1; } }
+fn addnum(v as i64) as void {
+    let is [24]u8 as b; let is i64 as n with mut = 0; let is i64 as x with mut = v;
+    if (x == 0) { b[0] = cast(u8, 48); n = 1; }
+    while (x > 0) { b[n] = cast(u8, 48 + x % 10); x = x / 10; n = n + 1; }
+    while (n > 0 && g_msglen < 511) { n = n - 1; g_msg[g_msglen] = b[n]; g_msglen = g_msglen + 1; }
+}
 
-// ---- buffer / line navigation + editing (reused, framebuffer-free) ----
+// ---- characters and lines ----
 fn bol(p as i64) as i64 { let is i64 as i with mut = p; while (i > 0 && text[i - 1] != 0x0A) { i = i - 1; } return i; }
 fn eol(p as i64) as i64 { let is i64 as i with mut = p; while (i < tend && text[i] != 0x0A) { i = i + 1; } return i; }
+// A character, as the cursor moves over it and x deletes it, is a code point
+// with the marks written after it that combine with it ("e" + U+0301 is one
+// "é"), the way the terminal draws them in one cell. Widths are the
+// terminal's (std/unicode/cpwidth.cst), so what is counted is what is drawn.
+let is i64 as K_TEXT with imut = 0;       // drawn as itself, 1 or 2 columns
+let is i64 as K_MARK with imut = 1;       // combines with the character before it
+let is i64 as K_TAB  with imut = 2;
+let is i64 as K_CTRL with imut = 3;       // shown ^X
+let is i64 as K_HEX  with imut = 4;       // shown <hex>: a byte that is not UTF-8, a C1
+                                          // control, an invisible format character
+
+// The code point at p in *c and its length; 0 for a byte that does not start
+// well-formed UTF-8.
+fn dec(p as i64, c as *i32) as i64 {
+    if (p >= tend) { return 0; }
+    let is i64 as k = utf8.decode1(text, tend, p, c);
+    if (k <= 0) { return 0; }
+    return k;
+}
+
+// The format characters (general category Cf) that take no columns: the
+// terminal draws nothing for them, so they are shown as <200b> — an
+// invisible character in a file is one an editor has to show.
+fn is_format(c as i64) as i64 {
+    if (c < 0xAD) { return 0; }
+    if (c == 0xAD || (c >= 0x600 && c <= 0x605) || c == 0x61C || c == 0x6DD || c == 0x70F) { return 1; }
+    if (c == 0x890 || c == 0x891 || c == 0x8E2 || c == 0x180E) { return 1; }
+    if ((c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E)) { return 1; }
+    if ((c >= 0x2060 && c <= 0x2064) || (c >= 0x2066 && c <= 0x206F)) { return 1; }
+    if (c == 0xFEFF || (c >= 0xFFF9 && c <= 0xFFFB)) { return 1; }
+    if (c == 0x110BD || c == 0x110CD || (c >= 0x13430 && c <= 0x1343F)) { return 1; }
+    if ((c >= 0x1BCA0 && c <= 0x1BCA3) || (c >= 0x1D173 && c <= 0x1D17A)) { return 1; }
+    if (c == 0xE0001 || (c >= 0xE0020 && c <= 0xE007F)) { return 1; }
+    return 0;
+}
+fn ckind(c as i64) as i64 {
+    if (c == 0x09) { return K_TAB; }
+    if (c < 32 || c == 127) { return K_CTRL; }
+    if (c >= 0x80 && c <= 0x9F) { return K_HEX; }
+    if (is_format(c) == 1) { return K_HEX; }
+    if (cpw.cp_width(cast(i32, c)) == 0) { return K_MARK; }
+    return K_TEXT;
+}
+fn mark_at(p as i64) as i64 {
+    let is i32 as c with mut = 0;
+    if (dec(p, &c) == 0) { return 0; }
+    if (ckind(cast(i64, c)) == K_MARK) { return 1; }
+    return 0;
+}
+// Hex digits <hex> shows c with (2 for a byte or a C1 control).
+fn hex_digits(c as i64) as i64 {
+    let is i64 as d with mut = 2;
+    while (d < 6 && (c >> (d * 4)) != 0) { d = d + 1; }
+    return d;
+}
+
+// The character at p: its length in bytes (1 for a malformed byte).
+fn clen(p as i64) as i64 {
+    if (p >= tend) { return 1; }
+    let is i32 as c with mut = 0;
+    let is i64 as k = dec(p, &c);
+    if (k == 0) { return 1; }
+    let is i64 as kind = ckind(cast(i64, c));
+    if (kind != K_TEXT && kind != K_MARK) { return k; }      // marks after a tab are on their own
+    let is i64 as q with mut = p + k;
+    while (q < tend && mark_at(q) == 1) {
+        let is i32 as c2 with mut = 0;
+        q = q + dec(q, &c2);
+    }
+    return q - p;
+}
+fn next_ch(p as i64) as i64 { if (p >= tend) { return tend; } return p + clen(p); }
+// The code point that ends at p (a lone byte when that is not UTF-8).
+fn prev_cp(p as i64) as i64 {
+    if (p <= 0) { return 0; }
+    let is i64 as i with mut = p - 1;
+    let is i64 as back with mut = 0;
+    while (i > 0 && back < 3 && (cast(i64, text[i]) & 0xC0) == 0x80) { i = i - 1; back = back + 1; }
+    let is i32 as c with mut = 0;
+    if (i + dec(i, &c) == p) { return i; }
+    return p - 1;
+}
+fn prev_ch(p as i64) as i64 {
+    if (p <= 0) { return 0; }
+    // back over the marks to what they combine with
+    let is i64 as i with mut = prev_cp(p);
+    while (i > 0 && mark_at(i) == 1) { i = prev_cp(i); }
+    if (i + clen(i) == p) { return i; }
+    // they follow a tab, a newline or a control, and are a character of their own
+    let is i64 as q with mut = i + clen(i);
+    while (q < p) {
+        let is i64 as nq = q + clen(q);
+        if (nq >= p) { return q; }
+        q = nq;
+    }
+    return prev_cp(p);
+}
+// Columns the character at p takes, at column col.
+fn cwidth(p as i64, col as i64) as i64 {
+    let is i32 as c with mut = 0;
+    if (dec(p, &c) == 0) { return 4; }                       // <e4>
+    let is i64 as kind = ckind(cast(i64, c));
+    if (kind == K_TAB) { return 8 - col % 8; }
+    if (kind == K_CTRL) { return 2; }                        // ^X
+    if (kind == K_HEX) { return 2 + hex_digits(cast(i64, c)); }
+    if (kind == K_MARK) { return 1; }                        // on its own: drawn on a space
+    return cpw.cp_width(c);
+}
+// The column p is at, in its line.
+fn col_of(p as i64) as i64 {
+    let is i64 as i with mut = bol(p);
+    let is i64 as col with mut = 0;
+    while (i < p) { col = col + cwidth(i, col); i = next_ch(i); }
+    return col;
+}
+// The character of the line starting at b that covers column col (its end
+// when the line is shorter; in NORMAL mode the last character, not the end).
+fn at_col(b as i64, col as i64) as i64 {
+    let is i64 as i with mut = b;
+    let is i64 as c with mut = 0;
+    let is i64 as e = eol(b);
+    while (i < e) {
+        let is i64 as w = cwidth(i, c);
+        if (c + w > col) { return i; }
+        c = c + w;
+        i = next_ch(i);
+    }
+    if (mode == M_NORMAL && e > b) { return prev_ch(e); }
+    return e;
+}
+// The start of the character p falls in (p, when it starts one).
+fn char_start(p as i64) as i64 {
+    let is i64 as i with mut = bol(p);
+    while (i < p) {
+        let is i64 as nx = next_ch(i);
+        if (nx > p) { return i; }
+        i = nx;
+    }
+    return p;
+}
+// In NORMAL mode the cursor is on a character, never past the line's last one;
+// in any mode, at a character's start (a search can match at a mark or a byte
+// inside one).
+fn clamp() as void {
+    if (dot > tend) { dot = tend; }
+    if (dot > 0 && dot < tend && (mark_at(dot) == 1 || (cast(i64, text[dot]) & 0xC0) == 0x80)) { dot = char_start(dot); }
+    if (mode == M_NORMAL) {
+        let is i64 as b = bol(dot);
+        let is i64 as e = eol(dot);
+        if (dot >= e && e > b) { dot = prev_ch(e); }
+    }
+}
+fn line_no(p as i64) as i64 {
+    let is i64 as n with mut = 1; let is i64 as i with mut = 0;
+    while (i < p && i < tend) { if (text[i] == 0x0A) { n = n + 1; } i = i + 1; }
+    return n;
+}
+fn lines_total() as i64 {
+    let is i64 as n with mut = 1; let is i64 as i with mut = 0;
+    while (i < tend) { if (text[i] == 0x0A && i + 1 < tend) { n = n + 1; } i = i + 1; }
+    return n;
+}
+// The start of line n (1-based), or of the last line.
+fn line_start(n as i64) as i64 {
+    let is i64 as k with mut = 1; let is i64 as i with mut = 0;
+    while (k < n && i < tend) {
+        let is i64 as e = eol(i);
+        if (e + 1 >= tend) { return i; }                     // the newline that ends the last line opens none
+        i = e + 1; k = k + 1;
+    }
+    return i;
+}
+fn last_line() as i64 {
+    if (tend > 0 && text[tend - 1] == 0x0A) { return bol(tend - 1); }
+    return bol(tend);
+}
+fn first_nonblank(b as i64) as i64 {
+    let is i64 as i with mut = b;
+    let is i64 as e = eol(b);
+    while (i < e && (text[i] == 0x20 || text[i] == 0x09)) { i = i + 1; }
+    return i;
+}
+
+// ---- memory ----
 // Room for `need` bytes of text. 0, or -1 when there is no memory for it.
 fn reserve(need as i64) as i64 {
     if (need <= tcap) { return 0; }
@@ -81,54 +319,157 @@ fn reserve(need as i64) as i64 {
     return 0;
 }
 
-fn insert_byte(c as i64) as void {
-    if (reserve(tend + 1) != 0) { setmsg("out of memory - not inserted"); return; }
-    let is i64 as i with mut = tend;
-    while (i > dot) { text[i] = text[i - 1]; i = i - 1; }
-    text[dot] = cast(u8, c); tend = tend + 1; dot = dot + 1; modified = 1;
+// A byte buffer that grows (the register, the undo history's bytes).
+struct Buf { va as i64; cap as i64; len as i64; }
+let is Buf as PB;                         // the prompt's text, g_plen bytes
+fn pbuf() as *u8 { return cast(*u8, PB.va); }
+fn b_room(b as *Buf, need as i64) as i64 {
+    if (need <= b.cap) { return 0; }
+    let is i64 as nc with mut = b.cap * 2;
+    if (nc < 4096) { nc = 4096; }
+    while (nc < need) { nc = nc * 2; }
+    let is i64 as va = sys.mmap(0, nc, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { return 0 - 1; }
+    let is *u8 as d = cast(*u8, va);
+    let is *u8 as s = cast(*u8, b.va);
+    let is i64 as i with mut = 0;
+    while (i < b.len) { d[i] = s[i]; i = i + 1; }
+    if (b.cap > 0) { sys.munmap(b.va, b.cap); }
+    b.va = va; b.cap = nc;
+    return 0;
 }
-fn delete_at(p as i64) as void {
-    if (p >= tend) { return; }
-    let is i64 as i with mut = p;
-    while (i < tend - 1) { text[i] = text[i + 1]; i = i + 1; }
-    tend = tend - 1; modified = 1;
+
+// ---- undo ----
+// Every change is an insert or a delete of bytes at a position, logged with the
+// group it belongs to: a NORMAL command, or a whole stay in INSERT mode. u takes
+// back the last group, Ctrl+R puts it back; a new change after u forgets the
+// undone ones. Entries: kind (1 insert, 2 delete), pos, bytes (off, len) in
+// UBYTES, group, the cursor before.
+struct Change { kind as i64; pos as i64; off as i64; len as i64; group as i64; cursor as i64; }
+let is Buf as ULOG;                       // [n]Change
+let is Buf as UBYTES;
+let is i64 as u_n with mut = 0;           // entries that are done
+let is i64 as u_max with mut = 0;         // entries there are (those past u_n are undone, for redo)
+let is i64 as u_group with mut = 0;
+let is i64 as u_replay with mut = 0;      // changes made by undo/redo are not logged
+let is i64 as u_saved with mut = 0;       // u_n when the text was last as the file has it; -1 once
+                                          // that state can no longer be undone or redone back to
+fn change(i as i64) as *Change { return cast(*Change, ULOG.va + i * sizeof(Change)); }
+
+fn new_group() as void { u_group = u_group + 1; }
+
+fn log_change(kind as i64, pos as i64, p as *u8, n as i64) as void {
+    if (u_replay == 1) { return; }
+    if (u_saved > u_n) { u_saved = 0 - 1; }   // the saved state was among the undone: gone now
+    if (b_room(&ULOG, (u_n + 1) * sizeof(Change)) != 0) { u_saved = 0 - 1; return; }
+    let is i64 as off = UBYTES.len;
+    if (b_room(&UBYTES, off + n) != 0) { u_saved = 0 - 1; return; }
+    let is *u8 as d = cast(*u8, UBYTES.va);
+    let is i64 as i with mut = 0;
+    while (i < n) { d[off + i] = p[i]; i = i + 1; }
+    UBYTES.len = off + n;
+    let is *Change as c = change(u_n);
+    c.kind = kind; c.pos = pos; c.off = off; c.len = n; c.group = u_group; c.cursor = dot;
+    u_n = u_n + 1;
+    u_max = u_n;
+    ULOG.len = u_n * sizeof(Change);
 }
-fn delete_line() as void {
-    let is i64 as a = bol(dot); let is i64 as b with mut = eol(dot);
-    if (b < tend) { b = b + 1; }
-    let is i64 as n = b - a; let is i64 as i with mut = a;
+
+// The primitives every edit goes through.
+fn ins(pos as i64, p as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (reserve(tend + n) != 0) { setmsg("out of memory - nothing inserted"); return 0 - 1; }
+    log_change(1, pos, p, n);
+    let is i64 as i with mut = tend - 1;
+    while (i >= pos) { text[i + n] = text[i]; i = i - 1; }
+    let is i64 as k with mut = 0;
+    while (k < n) { text[pos + k] = p[k]; k = k + 1; }
+    tend = tend + n;
+    modified = 1;
+    return 0;
+}
+fn del(pos as i64, n0 as i64) as void {
+    let is i64 as n with mut = n0;
+    if (pos + n > tend) { n = tend - pos; }
+    if (n <= 0) { return; }
+    log_change(2, pos, cast(*u8, cast(i64, text) + pos), n);
+    let is i64 as i with mut = pos;
     while (i + n < tend) { text[i] = text[i + n]; i = i + 1; }
-    tend = tend - n; modified = 1;
-    if (dot > tend) { dot = tend; } dot = bol(dot);
+    tend = tend - n;
+    modified = 1;
 }
-fn m_left()  as void { if (dot > 0 && text[dot - 1] != 0x0A) { dot = dot - 1; } }
-fn m_right() as void { if (dot < tend && text[dot] != 0x0A) { dot = dot + 1; } }
-// The newline that ends the last line ends it — it does not open one more,
-// empty line after it (vi never goes there; o on the last line adds a line).
-fn last_line() as i64 {
-    if (tend > 0 && text[tend - 1] == 0x0A) { return bol(tend - 1); }
-    return bol(tend);
+
+fn undo() as void {
+    if (u_n == 0) { setmsg("already at the oldest change"); return; }
+    let is i64 as g = change(u_n - 1).group;
+    u_replay = 1;
+    while (u_n > 0 && change(u_n - 1).group == g) {
+        let is *Change as c = change(u_n - 1);
+        let is *u8 as bytes = cast(*u8, UBYTES.va + c.off);
+        if (c.kind == 1) { del(c.pos, c.len); } else { ins(c.pos, bytes, c.len); }
+        dot = c.cursor;
+        u_n = u_n - 1;
+    }
+    u_replay = 0;
+    modified = 1;
+    if (u_n == u_saved) { modified = 0; }      // back to what the file holds
+    clamp();
+    want_col = col_of(dot);
 }
-fn m_down() as void {
-    let is i64 as col with mut = dot - bol(dot);
-    let is i64 as e = eol(dot); if (e >= tend || bol(dot) >= last_line()) { return; }
-    let is i64 as nb = e + 1; let is i64 as ne = eol(nb); let is i64 as nlen = ne - nb;
-    if (col > nlen) { col = nlen; } dot = nb + col;
+fn redo() as void {
+    if (u_n >= u_max) { setmsg("already at the newest change"); return; }
+    let is i64 as g = change(u_n).group;
+    u_replay = 1;
+    while (u_n < u_max && change(u_n).group == g) {
+        let is *Change as c = change(u_n);
+        let is *u8 as bytes = cast(*u8, UBYTES.va + c.off);
+        dot = c.cursor;
+        if (c.kind == 1) { ins(c.pos, bytes, c.len); } else { del(c.pos, c.len); }
+        u_n = u_n + 1;
+    }
+    u_replay = 0;
+    modified = 1;
+    if (u_n == u_saved) { modified = 0; }      // back to what the file holds
+    clamp();
+    want_col = col_of(dot);
 }
-fn m_up() as void {
-    let is i64 as b = bol(dot); if (b == 0) { return; }
-    let is i64 as col with mut = dot - b; let is i64 as pb = bol(b - 1); let is i64 as pe = b - 1; let is i64 as plen = pe - pb;
-    if (col > plen) { col = plen; } dot = pb + col;
+
+// ---- the register (what d, c and y take, what p puts) ----
+let is Buf as REG;
+let is i64 as reg_lines with mut = 0;     // it holds whole lines
+fn yank(a as i64, b as i64, lines as i64) as void {
+    REG.len = 0;
+    if (b_room(&REG, b - a) != 0) { setmsg("out of memory - not yanked"); return; }
+    let is *u8 as d = cast(*u8, REG.va);
+    let is i64 as i with mut = 0;
+    while (i < b - a) { d[i] = text[a + i]; i = i + 1; }
+    REG.len = b - a;
+    reg_lines = lines;
+}
+
+// ---- the file ----
+let is i64 as PATH_LIMIT with imut = 255;     // the longest path the system takes
+
+// src (n bytes) as an absolute path in dst ([256]u8): a name without a leading
+// / is taken from the root. 0, or -1 when it is longer than the system allows.
+fn make_path(dst as *u8, src as *u8, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    if (n > 0 && src[0] != cast(u8, 47)) { dst[0] = cast(u8, 47); k = 1; }
+    if (k + n > PATH_LIMIT) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[k] = src[i]; k = k + 1; i = i + 1; }
+    dst[k] = cast(u8, 0);
+    return 0;
 }
 // The whole file, however long, or a message saying why not (and :w refused).
 fn load_file() as void {
-    tend = 0; dot = 0; topln = 0; modified = 0;
+    tend = 0; dot = 0; top = 0; modified = 0;
     if (reserve(TEXT_MIN) != 0) { g_partial = 1; setmsg("out of memory - read-only"); return; }
     let is [4]i64 as st;                                  // VfsStat: size at 0
-    if (sys.stat(g_path, cast(*u8, &st[0])) != 0) { setmsg("(new file)"); return; }
+    if (sys.stat(cast(*u8, &g_path[0]), cast(*u8, &st[0])) != 0) { setmsg("(new file)"); return; }
     let is i64 as size = st[0];
     if (reserve(size + 1) != 0) { g_partial = 1; setmsg("file too big for memory - read-only"); return; }
-    let is i64 as fd = sys.open_read(g_path);
+    let is i64 as fd = sys.open_read(cast(*u8, &g_path[0]));
     if (fd < 0) { g_partial = 1; setmsg("cannot open the file - read-only"); return; }
     let is i64 as got with mut = 0;
     let is i64 as going with mut = 1;
@@ -140,29 +481,28 @@ fn load_file() as void {
     }
     sys.close(fd);
     tend = got;
-    if (g_partial == 1) { setmsg("read error - only part of the file is here, read-only"); }
+    if (g_partial == 1) { setmsg("read error - only part of the file is here, read-only"); return; }
+    g_msglen = 0;
+    addmsg("\""); addmsg(cast(*u8, &g_path[0])); addmsg("\" "); addnum(lines_total()); addmsg(" lines, "); addnum(tend); addmsg(" bytes");
 }
 
-// Write the text to a temporary file beside the original, check every write
-// and the close (a write the filesystem deferred reports its failure there),
-// and only then put it in the original's place. On any failure the original
-// is untouched and the text stays marked modified. It used to open the file
-// for writing — truncating it — write once, ignore the result, and say
-// "written".
-fn save_file() as void {
-    if (g_partial == 1) { setmsg("not written: the file was not read whole"); return; }
-    let is [140]u8 as tmp;
-    let is i64 as pl = slen(g_path);
-    if (pl > 130) { setmsg("not written: path too long"); return; }
+// Write the text to a temporary file beside path, check every write and the
+// close, and only then put it in path's place. On any failure the original is
+// untouched and the text stays marked modified. 0 when written.
+fn save_to(path as *u8, is_own as i64) as i64 {
+    if (g_partial == 1 && is_own == 1) { setmsg("not written: the file was not read whole"); return 0 - 1; }
+    let is [272]u8 as tmp;
+    let is i64 as pl = slen(path);
+    if (pl + 5 > PATH_LIMIT) { setmsg("not written: the path leaves no room for the temporary file beside it"); return 0 - 1; }
     let is i64 as k with mut = 0;
-    while (k < pl) { tmp[k] = g_path[k]; k = k + 1; }
-    let is *u8 as sfx = cast(*u8, ".vic~");
+    while (k < pl) { tmp[k] = path[k]; k = k + 1; }
+    let is *u8 as sfx = ".vic~";
     let is i64 as j with mut = 0;
     while (j < 5) { tmp[pl + j] = sfx[j]; j = j + 1; }
     tmp[pl + 5] = cast(u8, 0);
     let is *u8 as tp = cast(*u8, &tmp[0]);
     let is i64 as fd = sys.open_write(tp);
-    if (fd < 0) { setmsg("write failed: cannot create a file there"); return; }
+    if (fd < 0) { setmsg("write failed: cannot create a file there"); return 0 - 1; }
     let is i64 as off with mut = 0;
     let is i64 as ok with mut = 1;
     while (ok == 1 && off < tend) {
@@ -170,115 +510,880 @@ fn save_file() as void {
         if (w <= 0) { ok = 0; } else { off = off + w; }
     }
     if (sys.close(fd) != 0) { ok = 0; }
-    if (ok == 0) { sys.unlink(tp); setmsg("write failed (disk full?) - file unchanged"); return; }
-    if (sys.rename(tp, g_path) != 0) { sys.unlink(tp); setmsg("write failed: could not replace the file"); return; }
-    modified = 0;
-    setmsg("written");
+    if (ok == 0) { sys.unlink(tp); setmsg("write failed (disk full?) - file unchanged"); return 0 - 1; }
+    if (sys.rename(tp, path) != 0) { sys.unlink(tp); setmsg("write failed: could not replace the file"); return 0 - 1; }
+    if (is_own == 1) { modified = 0; u_saved = u_n; }
+    g_msglen = 0;
+    addmsg("\""); addmsg(path); addmsg("\" "); addnum(lines_total()); addmsg(" lines, "); addnum(tend); addmsg(" bytes written");
+    return 0;
+}
+
+// ---- motions ----
+// What w, b and e take as a word: a run of characters of one class. 0 is
+// blank; 1 punctuation; 2 letters, digits and _. Past Latin-1, vim's classes:
+// punctuation and symbols of every script are 1, and each of CJK ideographs,
+// kana, hangul, braille, super- and subscripts, emoji is a class of its own —
+// "ab中文" is two words. W, B and E (g_big) take any non-blank run.
+let is i64 as g_big with mut = 0;
+fn uclass(c as i64) as i64 {
+    if (c < 0x100) {
+        if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0 || c == 0xA0) { return 0; }
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) { return 2; }
+        if (c >= 0xC0) { return 2; }
+        return 1;
+    }
+    if (c == 0x037E || c == 0x0387 || (c >= 0x055A && c <= 0x055F) || c == 0x0589) { return 1; }
+    if (c == 0x05BE || c == 0x05C0 || c == 0x05C3 || c == 0x05F3 || c == 0x05F4) { return 1; }
+    if (c == 0x060C || c == 0x061B || c == 0x061F || (c >= 0x066A && c <= 0x066D) || c == 0x06D4) { return 1; }
+    if ((c >= 0x0700 && c <= 0x070D) || c == 0x0964 || c == 0x0965 || c == 0x0970) { return 1; }
+    if (c == 0x0DF4 || c == 0x0E4F || c == 0x0E5A || c == 0x0E5B) { return 1; }
+    if ((c >= 0x0F04 && c <= 0x0F12) || (c >= 0x0F3A && c <= 0x0F3D) || c == 0x0F85) { return 1; }
+    if ((c >= 0x104A && c <= 0x104F) || c == 0x10FB || (c >= 0x1361 && c <= 0x1368)) { return 1; }
+    if (c == 0x166D || c == 0x166E || c == 0x169B || c == 0x169C) { return 1; }
+    if ((c >= 0x16EB && c <= 0x16ED) || c == 0x1735 || c == 0x1736) { return 1; }
+    if ((c >= 0x17D4 && c <= 0x17DC) || (c >= 0x1800 && c <= 0x180A)) { return 1; }
+    if (c == 0x1680 || (c >= 0x2000 && c <= 0x200B) || c == 0x2028 || c == 0x2029) { return 0; }
+    if (c == 0x202F || c == 0x205F || c == 0x3000) { return 0; }
+    if (c >= 0x2070 && c <= 0x207F) { return 0x2070; }      // superscripts
+    if (c >= 0x2080 && c <= 0x2094) { return 0x2080; }      // subscripts
+    if (c >= 0x200C && c <= 0x27FF) { return 1; }           // punctuation and symbols
+    if (c >= 0x2800 && c <= 0x28FF) { return 0x2800; }      // braille
+    if ((c >= 0x2900 && c <= 0x2998) || (c >= 0x29D8 && c <= 0x29DB) || c == 0x29FC || c == 0x29FD) { return 1; }
+    if (c >= 0x2E00 && c <= 0x2E7F) { return 1; }
+    if ((c >= 0x3001 && c <= 0x3020) || c == 0x3030 || c == 0x303D) { return 1; }
+    if (c >= 0x3040 && c <= 0x309F) { return 0x3040; }     // hiragana
+    if (c >= 0x30A0 && c <= 0x30FF) { return 0x30A0; }     // katakana
+    if (c >= 0x3300 && c <= 0x9FFF) { return 0x4E00; }     // CJK ideographs
+    if (c >= 0xAC00 && c <= 0xD7A3) { return 0xAC00; }     // hangul syllables
+    if (c >= 0xF900 && c <= 0xFAFF) { return 0x4E00; }
+    if (c == 0xFD3E || c == 0xFD3F || (c >= 0xFE30 && c <= 0xFE6B)) { return 1; }
+    if ((c >= 0xFF00 && c <= 0xFF0F) || (c >= 0xFF1A && c <= 0xFF20)) { return 1; }
+    if ((c >= 0xFF3B && c <= 0xFF40) || (c >= 0xFF5B && c <= 0xFF65)) { return 1; }
+    if ((c >= 0x1D000 && c <= 0x1D24F) || (c >= 0x1D400 && c <= 0x1D7FF)) { return 1; }
+    if (c >= 0x1F000 && c <= 0x1F2FF) { return 1; }
+    if (c >= 0x1F300 && c <= 0x1FAFF) { return 3; }         // emoji
+    if (c >= 0x20000 && c <= 0x2FA1F) { return 0x4E00; }
+    return 2;
+}
+fn wclass(p as i64) as i64 {
+    if (p >= tend) { return 0; }
+    let is i32 as c with mut = 0;
+    let is i64 as cl with mut = 1;                           // a byte that is not UTF-8
+    if (dec(p, &c) > 0) { cl = uclass(cast(i64, c)); }
+    if (g_big == 1 && cl != 0) { return 1; }
+    return cl;
+}
+fn word_fwd(p0 as i64) as i64 {
+    let is i64 as p with mut = p0;
+    let is i64 as k = wclass(p);
+    if (k != 0) { while (p < tend && wclass(p) == k) { p = next_ch(p); } }
+    while (p < tend && wclass(p) == 0) {
+        if (text[p] == 0x0A && p + 1 < tend && text[p + 1] == 0x0A) { return p + 1; }   // an empty line is a word
+        p = next_ch(p);
+    }
+    return p;
+}
+fn word_back(p0 as i64) as i64 {
+    let is i64 as p with mut = p0;
+    if (p == 0) { return 0; }
+    p = prev_ch(p);
+    while (p > 0 && wclass(p) == 0) { p = prev_ch(p); }
+    let is i64 as k = wclass(p);
+    while (p > 0 && wclass(prev_ch(p)) == k && k != 0) { p = prev_ch(p); }
+    return p;
+}
+fn word_end(p0 as i64) as i64 {
+    let is i64 as p with mut = next_ch(p0);
+    while (p < tend && wclass(p) == 0) { p = next_ch(p); }
+    let is i64 as k = wclass(p);
+    while (p < tend && wclass(next_ch(p)) == k && next_ch(p) < tend) { p = next_ch(p); }
+    return p;
+}
+
+// The screen's text rows.
+fn text_rows() as i64 { let is i64 as r with mut = g_rows - 1; if (r < 1) { r = 1; } return r; }
+
+// A motion from the cursor: where it goes (*to), and whether it takes whole
+// lines (*lines) or includes the character it lands on (*incl). 0, or -1 when
+// the key is not a motion.
+fn motion(key as i64, count as i64, to as *i64, lines as *i64, incl as *i64) as i64 {
+    g_big = 0;
+    if (key == 87 || key == 66 || key == 69) { g_big = 1; }  // W B E
+    let is i64 as rv = motion1(key, count, to, lines, incl);
+    g_big = 0;
+    return rv;
+}
+fn motion1(key as i64, count as i64, to as *i64, lines as *i64, incl as *i64) as i64 {
+    let is i64 as n with mut = count; if (n < 1) { n = 1; }
+    let is i64 as p with mut = dot;
+    lines[0] = 0; incl[0] = 0;
+    let is i64 as k with mut = 0;
+    if (key == 104 || key == 1001) {                         // h, left
+        while (k < n && p > bol(dot)) { p = prev_ch(p); k = k + 1; }
+    } else if (key == 108 || key == 32 || key == 1002) {     // l, space, right
+        let is i64 as e = eol(dot);
+        while (k < n && next_ch(p) <= e && p < e) { p = next_ch(p); k = k + 1; }
+        if (g_op == 0 && mode == M_NORMAL && p >= e && e > bol(dot)) { p = prev_ch(e); }
+    } else if (key == 106 || key == 1003 || key == 14) {     // j, down, Ctrl+N
+        let is i64 as b with mut = bol(dot);
+        while (k < n && b < last_line()) { b = eol(b) + 1; k = k + 1; }
+        p = at_col(b, want_col); lines[0] = 1;
+    } else if (key == 107 || key == 1004 || key == 16) {     // k, up, Ctrl+P
+        let is i64 as b with mut = bol(dot);
+        while (k < n && b > 0) { b = bol(b - 1); k = k + 1; }
+        p = at_col(b, want_col); lines[0] = 1;
+    } else if (key == 48 || key == 1005) {                   // 0, Home
+        p = bol(dot);
+    } else if (key == 94) {                                  // ^
+        p = first_nonblank(bol(dot));
+    } else if (key == 36 || key == 1006) {                   // $, End
+        let is i64 as b with mut = bol(dot);
+        while (k < n - 1 && b < last_line()) { b = eol(b) + 1; k = k + 1; }
+        p = eol(b);
+        if (p > b) { p = prev_ch(p); }
+        incl[0] = 1;
+    } else if ((key == 119 || key == 87) && g_op == 99 && wclass(dot) != 0) {
+        // cw on a word changes the word, not the blanks after it (vi's rule):
+        // to the end of this word — staying on its last letter — and n-1 more
+        let is i64 as cl = wclass(p);
+        while (next_ch(p) < tend && wclass(next_ch(p)) == cl) { p = next_ch(p); }
+        k = 1;
+        while (k < n) { p = word_end(p); k = k + 1; }
+        incl[0] = 1;
+    } else if (key == 119 || key == 87) {                    // w W
+        while (k < n) { p = word_fwd(p); k = k + 1; }
+        // cw, dw at the last word of a line stop at its end, not on the next line
+        if (g_op != 0 && p > eol(dot)) { p = eol(dot); }
+    } else if (key == 98 || key == 66) {                     // b B
+        while (k < n) { p = word_back(p); k = k + 1; }
+    } else if (key == 101 || key == 69) {                    // e E
+        while (k < n) { p = word_end(p); k = k + 1; }
+        incl[0] = 1;
+    } else if (key == 71) {                                  // G, NG
+        if (count > 0) { p = line_start(count); } else { p = last_line(); }
+        p = first_nonblank(p); lines[0] = 1;
+    } else if (key == 1103) {                                // gg, Ngg
+        if (count > 0) { p = line_start(count); } else { p = 0; }
+        p = first_nonblank(p); lines[0] = 1;
+    } else {
+        return 0 - 1;
+    }
+    to[0] = p;
+    return 0;
+}
+
+// ---- searching ----
+let is re.Regex as g_re;
+let is i64 as g_have_re with mut = 0;
+
+// The next (dir 1) or previous (-1) match from the cursor, wrapping around.
+fn search(dir as i64) as void {
+    if (g_have_re == 0) { setmsg("no previous search"); return; }
+    let is [2]i64 as m;
+    if (dir > 0) {
+        let is i64 as from with mut = next_ch(dot);
+        if (from > tend) { from = tend; }
+        let is i64 as pass with mut = 0;
+        while (pass < 2) {
+            let is i64 as b with mut = bol(from);
+            while (b <= tend) {
+                let is i64 as e = eol(b);
+                let is i64 as start with mut = 0;
+                if (from > b) { start = from - b; }
+                let is i64 as rc = re.search(&g_re, cast(*u8, cast(i64, text) + b), e - b, start, 0, cast(*i64, &m[0]), 1);
+                if (rc == 1) {
+                    dot = b + m[0]; clamp(); want_col = col_of(dot);
+                    if (pass == 1) { setmsg("search hit BOTTOM, continuing at TOP"); }
+                    return;
+                }
+                if (e >= tend) { b = tend + 1; } else { b = e + 1; }
+                from = b;
+            }
+            from = 0; pass = pass + 1;
+        }
+        setmsg("pattern not found");
+        return;
+    }
+    // backwards: the last match before the cursor, line by line up
+    let is i64 as b with mut = bol(dot);
+    let is i64 as limit with mut = dot - b;                  // matches must start before this, on the first line
+    let is i64 as lines_seen with mut = 0;
+    let is i64 as total = lines_total() + 1;
+    while (lines_seen <= total) {
+        let is i64 as e = eol(b);
+        let is i64 as best with mut = 0 - 1;
+        let is i64 as at with mut = 0;
+        while (at <= e - b) {
+            let is i64 as rc = re.search(&g_re, cast(*u8, cast(i64, text) + b), e - b, at, 0, cast(*i64, &m[0]), 1);
+            if (rc != 1 || m[0] >= limit) { at = e - b + 1; }
+            else { best = m[0]; at = m[0] + 1; }
+        }
+        if (best >= 0) {
+            dot = b + best; clamp(); want_col = col_of(dot);
+            if (lines_seen > lines_total()) { setmsg("search hit TOP, continuing at BOTTOM"); }
+            return;
+        }
+        if (b == 0) { b = last_line(); } else { b = bol(b - 1); }
+        limit = tend + 1;
+        lines_seen = lines_seen + 1;
+    }
+    setmsg("pattern not found");
+}
+
+fn run_search() as void {
+    if (g_plen == 0) { search(1); return; }
+    if (g_have_re == 1) { re.release(&g_re); g_have_re = 0; }
+    let is i64 as rc = re.compile(&g_re, pbuf(), g_plen, 0);
+    if (rc != 0) { setmsg(re.err_text(rc)); return; }
+    g_have_re = 1;
+    search(1);
+}
+
+// ---- editing commands ----
+fn enter_insert() as void { mode = M_INSERT; new_group(); }
+
+// Delete [a, b) (or the lines it spans, when lines), into the register. Lines
+// go into it each with its newline, the last one too.
+fn cut(a0 as i64, b0 as i64, lines as i64) as void {
+    let is i64 as a with mut = a0; let is i64 as b with mut = b0;
+    if (a > b) { let is i64 as t = a; a = b; b = t; }
+    if (lines == 1) {
+        let is i64 as la = bol(a);
+        let is i64 as le = eol(b);
+        // the register: the lines' text, then a newline
+        REG.len = 0;
+        if (b_room(&REG, le - la + 1) != 0) { setmsg("out of memory - not deleted"); return; }
+        let is *u8 as rb = cast(*u8, REG.va);
+        let is i64 as i with mut = 0;
+        while (i < le - la) { rb[i] = text[la + i]; i = i + 1; }
+        rb[le - la] = cast(u8, 10);
+        REG.len = le - la + 1;
+        reg_lines = 1;
+        // what goes from the text: the lines and the newline after them, or,
+        // for the last line, the newline before it
+        if (le < tend) { del(la, le + 1 - la); dot = la; }
+        else if (la > 0) { del(la - 1, le - la + 1); dot = bol(la - 1); }
+        else { del(0, tend); dot = 0; }
+        if (dot > tend) { dot = tend; }
+        dot = first_nonblank(bol(dot));
+        return;
+    }
+    yank(a, b, 0);
+    del(a, b - a);
+    dot = a;
+}
+
+fn put(after as i64, count as i64) as void {
+    if (REG.len == 0) { setmsg("nothing to put"); return; }
+    let is i64 as n with mut = count; if (n < 1) { n = 1; }
+    let is *u8 as r = cast(*u8, REG.va);
+    if (reg_lines == 1) {
+        let is i64 as at with mut = bol(dot);
+        if (after == 1) {
+            at = eol(dot);
+            if (at >= tend) {
+                // past the last line: it needs its newline first
+                if (tend > 0 && text[tend - 1] != 0x0A) { let is [1]u8 as nl; nl[0] = cast(u8, 10); ins(tend, cast(*u8, &nl[0]), 1); }
+                at = tend;
+            } else { at = at + 1; }
+        }
+        let is i64 as k with mut = 0;
+        let is i64 as p with mut = at;
+        while (k < n) { if (ins(p, r, REG.len) != 0) { return; } p = p + REG.len; k = k + 1; }
+        dot = first_nonblank(at);
+        return;
+    }
+    let is i64 as at2 with mut = dot;
+    if (after == 1 && dot < eol(dot)) { at2 = next_ch(dot); }
+    let is i64 as k2 with mut = 0;
+    let is i64 as p2 with mut = at2;
+    while (k2 < n) { if (ins(p2, r, REG.len) != 0) { return; } p2 = p2 + REG.len; k2 = k2 + 1; }
+    dot = prev_ch(p2);
+}
+
+fn join_lines(count as i64) as void {
+    let is i64 as n with mut = count; if (n < 2) { n = 2; }
+    let is i64 as k with mut = 1;
+    while (k < n) {
+        let is i64 as e = eol(dot);
+        if (e >= tend || e + 1 >= tend) { return; }
+        // the newline and the next line's leading blanks become one space
+        let is i64 as nb = e + 1;
+        let is i64 as fb = first_nonblank(nb);
+        del(e, fb - e);
+        if (e > bol(e) && text[e - 1] != 0x20 && e < tend && text[e] != 0x0A && text[e] != 0x29) {
+            let is [1]u8 as sp; sp[0] = cast(u8, 32);
+            ins(e, cast(*u8, &sp[0]), 1);
+        }
+        dot = e;
+        k = k + 1;
+    }
+}
+
+fn open_line(below as i64) as void {
+    let is [1]u8 as nl; nl[0] = cast(u8, 10);
+    if (below == 1) {
+        let is i64 as e = eol(dot);
+        ins(e, cast(*u8, &nl[0]), 1);
+        dot = e + 1;
+    } else {
+        let is i64 as b = bol(dot);
+        ins(b, cast(*u8, &nl[0]), 1);
+        dot = b;
+    }
+}
+
+// ---- ex commands ----
+fn run_ex() as void {
+    if (b_room(&PB, g_plen + 1) != 0) { setmsg("out of memory - command not run"); return; }
+    let is *u8 as c = pbuf();
+    let is i64 as n = g_plen;
+    c[n] = cast(u8, 0);
+    let is i64 as i with mut = 0;
+    while (i < n && c[i] == 32) { i = i + 1; }
+    if (i >= n) { return; }
+    // :N and :$ go to a line
+    if (c[i] == cast(u8, 36)) { dot = first_nonblank(last_line()); want_col = col_of(dot); return; }
+    if (c[i] >= cast(u8, 48) && c[i] <= cast(u8, 57)) {
+        let is i64 as v with mut = 0;
+        while (i < n && c[i] >= cast(u8, 48) && c[i] <= cast(u8, 57)) { v = v * 10 + cast(i64, c[i]) - 48; i = i + 1; }
+        if (v < 1) { v = 1; }
+        dot = first_nonblank(line_start(v)); want_col = col_of(dot);
+        return;
+    }
+    // w, q, wq, x, with ! and a file name
+    let is i64 as w with mut = 0; let is i64 as q with mut = 0; let is i64 as force with mut = 0;
+    let is i64 as start = i;
+    while (i < n && c[i] != 32 && c[i] != 33) {
+        if (c[i] == cast(u8, 119)) { w = 1; }
+        else if (c[i] == cast(u8, 113)) { q = 1; }
+        else if (c[i] == cast(u8, 120)) { w = 2; q = 1; }
+        else { setmsg("not an editor command (try :w :q :q! :wq :x :N)"); return; }
+        i = i + 1;
+    }
+    if (i == start) { setmsg("not an editor command (try :w :q :q! :wq :x :N)"); return; }
+    if (i < n && c[i] == cast(u8, 33)) { force = 1; i = i + 1; }
+    while (i < n && c[i] == 32) { i = i + 1; }
+    if (i < n) {
+        if (w == 0) { setmsg("a file name only goes with :w"); return; }
+        // :w FILE writes the text there; the buffer's own file stays as it was
+        let is [256]u8 as pb;
+        if (make_path(cast(*u8, &pb[0]), cast(*u8, cast(i64, c) + i), n - i) != 0) { setmsg("not written: path too long"); return; }
+        if (save_to(cast(*u8, &pb[0]), 0) != 0) { return; }
+        if (q == 1 && (modified == 0 || force == 1)) { quit = 1; }
+        return;
+    }
+    if (w == 1 || (w == 2 && modified != 0)) {
+        if (save_to(cast(*u8, &g_path[0]), 1) != 0) { return; }   // :wq whose write failed stays, with the reason shown
+    }
+    if (q == 1) {
+        if (modified != 0 && force == 0) { setmsg("no write since the last change (:q! quits anyway, :wq saves)"); }
+        else { quit = 1; }
+    }
+}
+
+// ---- NORMAL mode ----
+let is [8]u8 as r_u8; let is i64 as r_n with mut = 0; let is i64 as r_want with mut = 0;
+
+// r{char}: the character under the cursor becomes c (a UTF-8 one arrives a
+// byte at a time and is put in whole).
+fn replace_key(c as i64) as void {
+    if (r_n == 0) {
+        if (c == 0x1B || dot >= eol(dot)) { g_pre = 0; return; }
+        r_want = 0;
+        if (c >= 0xC0) { r_want = 1; }
+        if (c >= 0xE0) { r_want = 2; }
+        if (c >= 0xF0) { r_want = 3; }
+        if (c >= 0x80 && c < 0xC0) { g_pre = 0; return; }
+    }
+    r_u8[r_n] = cast(u8, c); r_n = r_n + 1;
+    if (r_n < r_want + 1) { return; }
+    g_pre = 0;
+    new_group();
+    del(dot, clen(dot));
+    ins(dot, cast(*u8, &r_u8[0]), r_n);
+    r_n = 0;
+}
+
+fn normal_key(c0 as i64) as void {
+    let is i64 as c with mut = c0;
+    // a second key: r{char}, g{g}, Z{Z}
+    if (g_pre == 114) { replace_key(c); return; }            // r
+    if (g_pre == 103) {                                      // g
+        g_pre = 0;
+        if (c != 103) { g_count = 0; g_op = 0; return; }
+        c = 1103;                                            // gg, as a motion
+    }
+    if (g_pre == 90) {                                       // Z
+        g_pre = 0;
+        if (c == 90 && b_room(&PB, 2) == 0) {                // ZZ = :x
+            let is *u8 as zb = pbuf(); zb[0] = cast(u8, 120); g_plen = 1; run_ex();
+        }
+        return;
+    }
+    // a count
+    if ((c >= 49 && c <= 57) || (c == 48 && g_count > 0)) {
+        if (g_count < 100000000) { g_count = g_count * 10 + c - 48; }
+        return;
+    }
+    if (c == 103 || c == 90 || c == 114) { g_pre = c; r_n = 0; return; }
+    let is i64 as count = g_count;
+    g_count = 0;
+    // an operator waiting for its motion
+    if (g_op != 0) {
+        let is i64 as op = g_op;
+        g_op = 0;
+        let is i64 as total with mut = count;
+        if (g_opcount > 0) { if (total > 0) { total = total * g_opcount; } else { total = g_opcount; } }
+        g_opcount = 0;
+        if (c == 0x1B) { return; }
+        new_group();
+        if (c == op) {                                       // dd cc yy: whole lines
+            let is i64 as n with mut = total; if (n < 1) { n = 1; }
+            let is i64 as b with mut = bol(dot);
+            let is i64 as k with mut = 1;
+            while (k < n && b < last_line()) { b = eol(b) + 1; k = k + 1; }
+            if (op == 121) { let is i64 as e with mut = eol(b); if (e < tend) { e = e + 1; } yank(bol(dot), e, 1); return; }
+            if (op == 99) {                                  // cc: the lines' text goes, the line stays
+                let is i64 as a2 = first_nonblank(bol(dot));
+                let is i64 as e2 = eol(b);
+                yank(bol(dot), e2, 1);
+                del(a2, e2 - a2);
+                dot = a2;
+                mode = M_INSERT;
+                return;
+            }
+            cut(dot, b, 1);
+            want_col = col_of(dot);
+            return;
+        }
+        let is [1]i64 as to; let is [1]i64 as lines; let is [1]i64 as incl;
+        g_op = op;
+        let is i64 as mr = motion(c, total, cast(*i64, &to[0]), cast(*i64, &lines[0]), cast(*i64, &incl[0]));
+        g_op = 0;
+        if (mr != 0) { return; }
+        let is i64 as a = dot;
+        let is i64 as b with mut = to[0];
+        if (incl[0] == 1 && lines[0] == 0) { if (b >= a) { b = next_ch(b); } }
+        if (op == 121) {
+            if (lines[0] == 1) {
+                let is i64 as la with mut = a; let is i64 as lb with mut = b;
+                if (la > lb) { let is i64 as t = la; la = lb; lb = t; }
+                let is i64 as le with mut = eol(lb); if (le < tend) { le = le + 1; }
+                yank(bol(la), le, 1);
+            } else if (b >= a) { yank(a, b, 0); } else { yank(b, a, 0); dot = b; }
+            return;
+        }
+        g_op = op;
+        cut(a, b, lines[0]);
+        g_op = 0;
+        if (op == 99) { mode = M_INSERT; return; }
+        clamp();
+        want_col = col_of(dot);
+        return;
+    }
+    if (c == 100 || c == 99 || c == 121) { g_op = c; g_opcount = count; return; }   // d c y
+    // the motions
+    let is [1]i64 as to2; let is [1]i64 as lines2; let is [1]i64 as incl2;
+    if (motion(c, count, cast(*i64, &to2[0]), cast(*i64, &lines2[0]), cast(*i64, &incl2[0])) == 0) {
+        dot = to2[0];
+        clamp();
+        if (lines2[0] == 0 || c == 71 || c == 1103) { want_col = col_of(dot); }
+        if (c == 36 || c == 1006) { want_col = 1000000000; }
+        return;
+    }
+    let is i64 as n with mut = count; if (n < 1) { n = 1; }
+    let is i64 as rows = text_rows();
+    if (c == 105) { enter_insert(); }                                      // i
+    else if (c == 97) { enter_insert(); if (dot < eol(dot)) { dot = next_ch(dot); } }   // a
+    else if (c == 73) { enter_insert(); dot = first_nonblank(bol(dot)); }  // I
+    else if (c == 65) { enter_insert(); dot = eol(dot); }                  // A
+    else if (c == 111) { enter_insert(); open_line(1); }                   // o
+    else if (c == 79) { enter_insert(); open_line(0); }                    // O
+    else if (c == 120) {                                                   // x
+        new_group();
+        let is i64 as e = eol(dot);
+        let is i64 as b with mut = dot; let is i64 as k with mut = 0;
+        while (k < n && b < e) { b = next_ch(b); k = k + 1; }
+        if (b > dot) { yank(dot, b, 0); del(dot, b - dot); clamp(); }
+    }
+    else if (c == 88) {                                                    // X
+        new_group();
+        let is i64 as a = bol(dot);
+        let is i64 as p with mut = dot; let is i64 as k with mut = 0;
+        while (k < n && p > a) { p = prev_ch(p); k = k + 1; }
+        if (p < dot) { yank(p, dot, 0); del(p, dot - p); dot = p; }
+    }
+    else if (c == 68) { new_group(); let is i64 as e = eol(dot); if (e > dot) { yank(dot, e, 0); del(dot, e - dot); } clamp(); }   // D
+    else if (c == 67) { new_group(); let is i64 as e2 = eol(dot); if (e2 > dot) { yank(dot, e2, 0); del(dot, e2 - dot); } mode = M_INSERT; }   // C
+    else if (c == 74) { new_group(); join_lines(n); }                      // J
+    else if (c == 112) { new_group(); put(1, n); clamp(); }                // p
+    else if (c == 80) { new_group(); put(0, n); clamp(); }                 // P
+    else if (c == 117) { undo(); }                                         // u
+    else if (c == 18) { redo(); }                                          // Ctrl+R
+    else if (c == 110) { search(1); }                                      // n
+    else if (c == 78) { search(0 - 1); }                                   // N
+    else if (c == 6 || c == 1008) { let is i64 as k with mut = 0; let is i64 as b with mut = bol(dot); while (k < n * (rows - 2) && b < last_line()) { b = eol(b) + 1; k = k + 1; } dot = at_col(b, want_col); top = b; }   // Ctrl+F, PgDn
+    else if (c == 2 || c == 1007) { let is i64 as k with mut = 0; let is i64 as b with mut = bol(dot); while (k < n * (rows - 2) && b > 0) { b = bol(b - 1); k = k + 1; } dot = at_col(b, want_col); }   // Ctrl+B, PgUp
+    else if (c == 4) { let is i64 as k with mut = 0; let is i64 as b with mut = bol(dot); while (k < rows / 2 && b < last_line()) { b = eol(b) + 1; k = k + 1; } dot = at_col(b, want_col); }   // Ctrl+D
+    else if (c == 21) { let is i64 as k with mut = 0; let is i64 as b with mut = bol(dot); while (k < rows / 2 && b > 0) { b = bol(b - 1); k = k + 1; } dot = at_col(b, want_col); }   // Ctrl+U
+    else if (c == 7) {                                                     // Ctrl+G
+        g_msglen = 0; addmsg("\""); addmsg(cast(*u8, &g_path[0])); addmsg("\" ");
+        if (modified != 0) { addmsg("[modified] "); }
+        addmsg("line "); addnum(line_no(dot)); addmsg(" of "); addnum(lines_total());
+    }
+    else if (c == 58 || c == 47) { g_prompt = c; g_plen = 0; }            // : /
+    else if (c == 0x1B) { }
+    else { setmsg("not a vic command (Ctrl+G for where you are, :q to quit)"); }
+}
+
+// ---- INSERT mode ----
+let is [8]u8 as in_u8; let is i64 as in_u8n with mut = 0; let is i64 as in_u8want with mut = 0;
+fn insert_key(c as i64) as void {
+    if (c == 1001) { if (dot > bol(dot)) { dot = prev_ch(dot); } want_col = col_of(dot); return; }
+    if (c == 1002) { if (dot < eol(dot)) { dot = next_ch(dot); } want_col = col_of(dot); return; }
+    if (c == 1003) { if (bol(dot) < last_line()) { dot = at_col(eol(dot) + 1, want_col); } return; }
+    if (c == 1004) { if (bol(dot) > 0) { dot = at_col(bol(bol(dot) - 1), want_col); } return; }
+    if (c == 1005) { dot = bol(dot); want_col = 0; return; }
+    if (c == 1006) { dot = eol(dot); want_col = col_of(dot); return; }
+    if (c == 1009) { if (dot < tend) { del(dot, clen(dot)); } return; }      // Delete
+    if (c == 0x08 || c == 0x7F) {
+        if (dot > 0) { let is i64 as p = prev_ch(dot); del(p, dot - p); dot = p; }
+        want_col = col_of(dot);
+        return;
+    }
+    let is [4]u8 as b;
+    if (c == 0x0A || c == 0x0D) { b[0] = cast(u8, 10); }
+    else if (c == 0x09) { b[0] = cast(u8, 9); }
+    else if (c >= 32 && c < 127) { b[0] = cast(u8, c); }
+    else if (c >= 0x80 && c < 0x100) {
+        // a UTF-8 character arrives a byte at a time: gather it, then insert it whole
+        if (c >= 0xC0) {
+            in_u8n = 0; in_u8want = 1;
+            if (c >= 0xE0) { in_u8want = 2; }
+            if (c >= 0xF0) { in_u8want = 3; }
+            in_u8[0] = cast(u8, c); in_u8n = 1;
+            return;
+        }
+        if (in_u8n == 0) { return; }
+        in_u8[in_u8n] = cast(u8, c); in_u8n = in_u8n + 1;
+        if (in_u8n == in_u8want + 1) {
+            ins(dot, cast(*u8, &in_u8[0]), in_u8n);
+            dot = dot + in_u8n;
+            in_u8n = 0;
+            want_col = col_of(dot);
+        }
+        return;
+    }
+    else { return; }
+    ins(dot, cast(*u8, &b[0]), 1);
+    dot = dot + 1;
+    want_col = col_of(dot);
+}
+
+fn prompt_key(c as i64) as void {
+    if (c == 0x0A || c == 0x0D) {
+        let is i64 as k = g_prompt;
+        g_prompt = 0;
+        if (k == 58) { run_ex(); } else { run_search(); }
+        return;
+    }
+    if (c == 0x1B) { g_prompt = 0; g_plen = 0; return; }
+    if (c == 0x08 || c == 0x7F) {                            // a whole character goes
+        if (g_plen == 0) { g_prompt = 0; return; }
+        let is *u8 as bb = pbuf();
+        g_plen = g_plen - 1;
+        while (g_plen > 0 && (cast(i64, bb[g_plen]) & 0xC0) == 0x80) { g_plen = g_plen - 1; }
+        return;
+    }
+    if (c >= 32 && c != 127 && c < 0x100) {
+        if (b_room(&PB, g_plen + 2) != 0) { setmsg("out of memory - the prompt is as long as it gets"); return; }
+        let is *u8 as ab = pbuf();
+        ab[g_plen] = cast(u8, c); g_plen = g_plen + 1;
+    }
+}
+
+fn key(c as i64) as void {
+    if (g_prompt != 0) { prompt_key(c); return; }
+    if (mode == M_INSERT) {
+        if (c == 0x1B) {
+            mode = M_NORMAL;
+            if (dot > bol(dot)) { dot = prev_ch(dot); }
+            clamp(); want_col = col_of(dot);
+            return;
+        }
+        insert_key(c);
+        return;
+    }
+    g_msglen = 0;
+    normal_key(c);
+}
+
+// Bytes from the terminal: CSI sequences become key codes (1001 left, 1002
+// right, 1003 down, 1004 up, 1005 Home, 1006 End, 1007 PgUp, 1008 PgDn, 1009
+// Delete); a lone Esc is Esc.
+fn feed(c as i64) as void {
+    if (in_esc == 2) {
+        if (c >= 0x30 && c <= 0x39) { in_p[in_np] = in_p[in_np] * 10 + (c - 0x30); return; }
+        if (c == 0x3B) { if (in_np < 7) { in_np = in_np + 1; in_p[in_np] = 0; } return; }
+        in_esc = 0;
+        if (c == 68) { key(1001); } else if (c == 67) { key(1002); }
+        else if (c == 66) { key(1003); } else if (c == 65) { key(1004); }
+        else if (c == 72) { key(1005); } else if (c == 70) { key(1006); }
+        else if (c == 126) {
+            if (in_p[0] == 1 || in_p[0] == 7) { key(1005); }
+            else if (in_p[0] == 4 || in_p[0] == 8) { key(1006); }
+            else if (in_p[0] == 5) { key(1007); }
+            else if (in_p[0] == 6) { key(1008); }
+            else if (in_p[0] == 3) { key(1009); }
+        }
+        else if (c == 116) { if (in_p[0] == 8 && in_p[1] > 1) { g_rows = in_p[1]; g_cols = in_p[2]; } }   // a size report
+        return;
+    }
+    if (in_esc == 1) {
+        if (c == 0x5B || c == 0x4F) { in_esc = 2; in_np = 0; in_p[0] = 0; return; }
+        in_esc = 0;
+        key(0x1B);
+        feed(c);
+        return;
+    }
+    if (c == 0x1B) { in_esc = 1; return; }
+    key(c);
+}
+
+// ---- render ----
+// Rows the line starting at b takes on the screen (it wraps at g_cols).
+fn line_rows(b as i64) as i64 {
+    let is i64 as w = col_of(eol(b));
+    if (w == 0) { return 1; }
+    return (w + g_cols - 1) / g_cols + 0;
+}
+// The screen row (from 0) and column of the cursor, from top. -1 when it is
+// below the screen.
+fn cursor_screen(row as *i64, col as *i64) as i64 {
+    let is i64 as b with mut = top;
+    let is i64 as r with mut = 0;
+    let is i64 as db = bol(dot);
+    let is i64 as rows = text_rows();
+    while (b < db) {
+        r = r + line_rows(b);
+        if (r >= rows) { return 0 - 1; }
+        let is i64 as e = eol(b);
+        if (e >= tend) { return 0 - 1; }
+        b = e + 1;
+    }
+    let is i64 as c = col_of(dot);
+    // a cursor at the very end of a full row is shown at the start of the next
+    row[0] = r + c / g_cols;
+    col[0] = c % g_cols;
+    if (row[0] >= rows) { return 0 - 1; }
+    return 0;
 }
 fn scroll_to_dot() as void {
     let is i64 as db = bol(dot);
-    if (db < topln) { topln = db; return; }
-    let is i64 as cnt with mut = 0; let is i64 as i with mut = topln;
-    while (cnt < g_rows && i <= tend) { if (db <= eol(i)) { return; } i = eol(i) + 1; cnt = cnt + 1; }
-    while (db > eol(topln) || db < topln) {
-        let is i64 as e = eol(topln); if (e >= tend) { return; } topln = e + 1;
-        let is i64 as c2 with mut = 0; let is i64 as j with mut = topln; let is i64 as ok with mut = 0;
-        while (c2 < g_rows && j <= tend) { if (db <= eol(j)) { ok = 1; j = tend + 1; } else { j = eol(j) + 1; c2 = c2 + 1; } }
-        if (ok == 1) { return; }
+    if (db < top) { top = db; return; }
+    let is [1]i64 as r; let is [1]i64 as c;
+    while (cursor_screen(cast(*i64, &r[0]), cast(*i64, &c[0])) != 0) {
+        if (top >= db) { return; }                           // one line bigger than the screen: show its start
+        top = eol(top) + 1;
     }
 }
 
-// ---- render: text rows + a cursor block + status bar ----
-fn render() as void {
-    scroll_to_dot();
-    let is i64 as row with mut = 0; let is i64 as i with mut = topln;
-    while (row < g_rows) {
-        cup(row + 1, 1);
-        if (i <= tend) {
-            let is i64 as col with mut = 0; let is i64 as j with mut = i; let is i64 as hl with mut = 0;
-            while (j < tend && text[j] != 0x0A && col < g_cols) {
-                let is i64 as cur with mut = 0; if (j == dot) { cur = 1; }
-                if (cur != hl) { if (cur == 1) { bgc(C_FG); fgc(C_BG); } else { sgr0(); } hl = cur; }
-                let is i64 as ch = cast(i64, text[j]);
-                if (ch == 0x09) { ob(32); col = col + 1; } else { if (ch < 32) { ob(46); } else { ob(ch); } col = col + 1; }
-                j = j + 1;
-            }
-            if (hl == 1) { sgr0(); hl = 0; }
-            if (j == dot && col < g_cols) { bgc(C_FG); ob(32); sgr0(); }     // cursor past line end
-            while (j < tend && text[j] != 0x0A) { j = j + 1; }              // skip the rest of a long line
-            i = j + 1;
-        }
-        ceol(); row = row + 1;
-    }
-    // status bar
-    cup(g_rows + 1, 1); bgc(C_BAR);
-    if (g_ex == 1) { fgc(C_FG); ob(58); let is i64 as k with mut = 0; while (k < g_exlen) { ob(cast(i64, g_exbuf[k])); k = k + 1; } }
-    else {
-        fgc(C_BARFG); if (mode == 1) { obs("-- INSERT --  "); }
-        obs(cast(*u8, g_path)); if (modified != 0) { ob(42); }
-        if (g_msglen > 0) { obs("   "); fgc(C_CYAN); let is i64 as m with mut = 0; while (m < g_msglen) { ob(cast(i64, g_msg[m])); m = m + 1; } }
-    }
-    ceol(); sgr0();
+// The length of the code point at s (1 for a byte that is not UTF-8).
+fn utf8_len(s as *u8, n as i64) as i64 {
+    let is i32 as c with mut = 0;
+    let is i64 as k = utf8.decode1(s, n, 0, &c);
+    if (k <= 0) { return 1; }
+    return k;
 }
-
-// ---- input ----
-fn run_ex() as void {
-    let is i64 as wantw with mut = 0; let is i64 as wantq with mut = 0; let is i64 as force with mut = 0;
+// The columns of the n bytes at s, as ob_fit shows them.
+fn str_cols(s as *u8, n as i64) as i64 {
     let is i64 as i with mut = 0;
-    while (i < g_exlen) { let is i64 as c = cast(i64, g_exbuf[i]); if (c == 119) { wantw = 1; } if (c == 113) { wantq = 1; } if (c == 33) { force = 1; } i = i + 1; }
-    if (wantw == 1) {
-        save_file();
-        if (modified != 0) { return; }        // :wq whose write failed stays, with the reason shown
+    let is i64 as w with mut = 0;
+    while (i < n) {
+        let is i32 as c with mut = 0;
+        let is i64 as k with mut = utf8.decode1(s, n, i, &c);
+        if (k <= 0) { k = 1; w = w + 1; }
+        else {
+            let is i64 as kind = ckind(cast(i64, c));
+            if (kind == K_TEXT) { w = w + cpw.cp_width(c); }
+            else if (kind != K_MARK) { w = w + 1; }
+        }
+        i = i + k;
     }
-    if (wantq == 1) { if (modified != 0 && force == 0) { setmsg("no write since change (:q! to force)"); } else { quit = 1; } }
+    return w;
 }
-fn cmd_key(c as i64) as void {
-    if (pend_d == 1) { pend_d = 0; if (c == 100) { delete_line(); } return; }
-    if (c == 104) { m_left(); } else if (c == 108) { m_right(); }
-    else if (c == 106) { m_down(); } else if (c == 107) { m_up(); }
-    else if (c == 48) { dot = bol(dot); }
-    else if (c == 36) { dot = eol(dot); if (dot > bol(dot)) { dot = dot - 1; } }
-    else if (c == 71) { dot = last_line(); }
-    else if (c == 120) { if (dot < tend && text[dot] != 0x0A) { delete_at(dot); } }
-    else if (c == 100) { pend_d = 1; }
-    else if (c == 105) { mode = 1; }
-    else if (c == 97) { m_right(); mode = 1; }
-    else if (c == 111) { dot = eol(dot); insert_byte(0x0A); mode = 1; }
-    else if (c == 58) { g_ex = 1; g_exlen = 0; }
+// As much of the n bytes at s as fits in room columns, whole characters; the
+// ones that would not print (controls, bytes that are not UTF-8) as '?'. The
+// columns written.
+fn ob_fit(s as *u8, n as i64, room as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as used with mut = 0;
+    while (i < n) {
+        let is i32 as c with mut = 0;
+        let is i64 as k with mut = utf8.decode1(s, n, i, &c);
+        let is i64 as w with mut = 1;
+        let is i64 as shown with mut = 1;
+        if (k <= 0) { k = 1; shown = 0; }
+        else {
+            let is i64 as kind = ckind(cast(i64, c));
+            if (kind == K_TEXT) { w = cpw.cp_width(c); }
+            else if (kind == K_MARK) { w = 0; }
+            else { shown = 0; }
+        }
+        if (used + w > room) { return used; }
+        if (shown == 1) { obn(cast(*u8, cast(i64, s) + i), k); } else { ob(63); }
+        used = used + w;
+        i = i + k;
+    }
+    return used;
 }
-fn feed(c as i64) as void {
-    if (g_ex == 1) {
-        if (c == 0x0A || c == 0x0D) { run_ex(); g_ex = 0; return; }
-        if (c == 0x1B) { g_ex = 0; g_exlen = 0; return; }
-        if (c == 0x08 || c == 0x7F) { if (g_exlen > 0) { g_exlen = g_exlen - 1; } return; }
-        if (c >= 32 && c < 127 && g_exlen < 63) { g_exbuf[g_exlen] = cast(u8, c); g_exlen = g_exlen + 1; }
-        return;
+fn ob_hex(v as i64, digits as i64) as void {
+    let is i64 as d with mut = digits;
+    while (d > 0) {
+        d = d - 1;
+        let is i64 as h = (v >> (d * 4)) & 15;
+        if (h < 10) { ob(48 + h); } else { ob(87 + h); }
     }
-    if (in_esc == 2) {                                       // inside a CSI (arrow) sequence
-        if (c >= 0x30 && c <= 0x39) { in_p[in_np] = in_p[in_np] * 10 + (c - 0x30); return; }
-        if (c == 0x3B) { if (in_np < 7) { in_np = in_np + 1; in_p[in_np] = 0; } return; }
-        if (c == 65) { m_up(); } else if (c == 66) { m_down(); } else if (c == 67) { m_right(); } else if (c == 68) { m_left(); }
-        else if (c == 116) { if (in_p[0] == 8) { g_rows = in_p[1] - 1; g_cols = in_p[2]; } }
-        in_esc = 0; return;
-    }
-    if (in_esc == 1) {                                       // saw ESC; '[' = CSI, else lone Esc
-        if (c == 0x5B) { in_esc = 2; in_np = 0; in_p[0] = 0; return; }
-        in_esc = 0; mode = 0; pend_d = 0; feed(c); return;   // ESC then a key: leave insert, run the key
-    }
-    if (c == 0x1B) { in_esc = 1; return; }
-    if (mode == 1) {                                          // INSERT
-        if (c == 0x08 || c == 0x7F) { if (dot > 0) { dot = dot - 1; delete_at(dot); } }
-        else if (c == 0x0A || c == 0x0D) { insert_byte(0x0A); }
-        else if (c == 0x09) { insert_byte(0x09); }
-        else if (c >= 32 && c < 127) { insert_byte(c); }
-        return;
-    }
-    cmd_key(c);                                              // COMMAND
 }
+fn draw_char(p as i64, col as i64) as i64 {
+    let is i32 as cp with mut = 0;
+    if (dec(p, &cp) == 0) {                                  // not UTF-8: the byte, in hex
+        fgc(C_DIM); ob(60); ob_hex(cast(i64, text[p]), 2); ob(62); fgc(C_FG);
+        return 4;
+    }
+    let is i64 as c = cast(i64, cp);
+    let is i64 as kind = ckind(c);
+    if (kind == K_TAB) {
+        let is i64 as w = 8 - col % 8;
+        let is i64 as k with mut = 0;
+        while (k < w) { ob(32); k = k + 1; }
+        return w;
+    }
+    if (kind == K_CTRL) {
+        fgc(C_DIM); ob(94);
+        if (c == 127) { ob(63); } else { ob(c + 64); }
+        fgc(C_FG);
+        return 2;
+    }
+    if (kind == K_HEX) {
+        let is i64 as d = hex_digits(c);
+        fgc(C_DIM); ob(60); ob_hex(c, d); ob(62); fgc(C_FG);
+        return 2 + d;
+    }
+    if (kind == K_MARK) { ob(32); }                          // a mark with nothing to sit on
+    obn(cast(*u8, cast(i64, text) + p), clen(p));
+    if (kind == K_MARK) { return 1; }
+    return cpw.cp_width(cp);
+}
+
+fn render() as void {
+    clamp();
+    scroll_to_dot();
+    let is i64 as rows = text_rows();
+    let is i64 as row with mut = 0;
+    let is i64 as b with mut = top;
+    let is i64 as more with mut = 1;
+    fgc(C_FG);
+    while (row < rows) {
+        cup(row + 1, 1);
+        if (more == 1) {
+            let is i64 as e = eol(b);
+            let is i64 as i with mut = b;
+            let is i64 as col with mut = 0;
+            while (i < e && row < rows) {
+                let is i64 as w = cwidth(i, col);
+                if (col + w > g_cols && col > 0) {
+                    // a full row is left alone: erasing at the last column
+                    // takes its character with it (the cursor stays there)
+                    if (col < g_cols) { ceol(); }
+                    row = row + 1; col = 0;
+                    if (row >= rows) { i = e; } else { cup(row + 1, 1); }
+                }
+                if (row < rows) { col = col + draw_char(i, col); i = next_ch(i); }
+            }
+            if (row < rows && col < g_cols) { ceol(); }
+            row = row + 1;
+            if (e >= tend || e + 1 >= tend) { more = 0; } else { b = e + 1; }
+        } else {
+            fgc(C_DIM); ob(126); fgc(C_FG); ceol();          // past the end of the text, as vi shows it
+            row = row + 1;
+        }
+    }
+    // the status line, the whole width: the mode, the file, the message;
+    // line:column on the right
+    cup(g_rows, 1); bgc(C_BAR);
+    let is i64 as used with mut = 0;
+    let is i64 as pcol with mut = 0;                         // the prompt's cursor
+    // line:col, for the right edge
+    let is [48]u8 as rt; let is i64 as rn with mut = 0;
+    let is [24]u8 as d; let is i64 as dn with mut = 0;
+    let is i64 as v with mut = col_of(dot) + 1;
+    while (v > 0) { d[dn] = cast(u8, 48 + v % 10); v = v / 10; dn = dn + 1; }
+    let is [24]u8 as d2; let is i64 as dn2 with mut = 0;
+    let is i64 as v2 with mut = line_no(dot);
+    while (v2 > 0) { d2[dn2] = cast(u8, 48 + v2 % 10); v2 = v2 / 10; dn2 = dn2 + 1; }
+    while (dn2 > 0) { dn2 = dn2 - 1; rt[rn] = d2[dn2]; rn = rn + 1; }
+    rt[rn] = cast(u8, 58); rn = rn + 1;
+    while (dn > 0) { dn = dn - 1; rt[rn] = d[dn]; rn = rn + 1; }
+    rt[rn] = cast(u8, 32); rn = rn + 1;
+    if (g_prompt != 0) {
+        // the prompt, its end in view when it is longer than the line
+        let is *u8 as pb = pbuf();
+        let is i64 as st with mut = 0;
+        while (st < g_plen && 1 + str_cols(cast(*u8, cast(i64, pb) + st), g_plen - st) > g_cols - 1) {
+            st = st + utf8_len(cast(*u8, cast(i64, pb) + st), g_plen - st);
+        }
+        fgc(C_FG); ob(g_prompt); used = 1;
+        used = used + ob_fit(cast(*u8, cast(i64, pb) + st), g_plen - st, g_cols - used);
+        pcol = used + 1;
+        rn = 0;                                              // no line:col beside a prompt
+    } else {
+        // the mode, the file, [+], a message — the message before the file
+        // when both do not fit; line:col at the right
+        let is i64 as avail with mut = g_cols - rn;
+        if (avail < 0) { avail = 0; }
+        if (mode == M_INSERT) { fgc(C_INS); used = ob_fit(" INSERT ", 8, g_cols); }
+        else { fgc(C_NOR); used = ob_fit(" NORMAL ", 8, g_cols); }
+        fgc(C_BARFG);
+        if (used < avail) { ob(32); used = used + 1; }
+        let is i64 as pl = slen(cast(*u8, &g_path[0]));
+        let is i64 as plus with mut = 0; if (modified != 0) { plus = 4; }
+        let is i64 as mw with mut = 0;
+        if (g_msglen > 0) { mw = 2 + str_cols(cast(*u8, &g_msg[0]), g_msglen); }
+        if (mw == 0 || used + str_cols(cast(*u8, &g_path[0]), pl) + plus + mw <= avail) {
+            let is i64 as proom with mut = avail - used - plus;
+            if (proom > 0) { used = used + ob_fit(cast(*u8, &g_path[0]), pl, proom); }
+        }
+        if (plus > 0 && used + 4 <= avail) { obs(" [+]"); used = used + 4; }
+        if (g_msglen > 0 && used + 2 < avail) {
+            obs("  "); used = used + 2; fgc(C_CYAN);
+            used = used + ob_fit(cast(*u8, &g_msg[0]), g_msglen, avail - used);
+        }
+    }
+    fgc(C_BARFG);
+    while (used < g_cols - rn) { ob(32); used = used + 1; }
+    if (rn > 0 && used + rn <= g_cols) { obn(cast(*u8, &rt[0]), rn); used = used + rn; }
+    while (used < g_cols) { ob(32); used = used + 1; }
+    sgr0();
+    // the cursor: the terminal's own, where the text cursor is (or on the prompt)
+    if (g_prompt != 0) { cup(g_rows, pcol); }
+    else {
+        let is [1]i64 as cr; let is [1]i64 as cc;
+        if (cursor_screen(cast(*i64, &cr[0]), cast(*i64, &cc[0])) == 0) { cup(cr[0] + 1, cc[0] + 1); }
+    }
+    showc();
+}
+
+// ---- the terminal ----
+fn ask_size() as void {
+    let is i64 as c with mut = 0; let is i64 as r with mut = 0;
+    if (tty.size(&c, &r) == 0 && c > 0 && r > 1) { g_cols = c; g_rows = r; }
+}
+
 // The terminal's events (ttyproto), asked for in main: Ctrl+C does not end the
 // editor with the text in it, and closing its window does not either while
-// there is unsaved text. Both used to throw the edit away without a word.
-let is i64 as g_tty with mut = 0;
+// there is unsaved text; a new size lays the screen out again.
 fn tty_events() as void {
     let is i64 as ev = tty.next_event();
     if ((ev & tty.EV_INTR) != 0) { setmsg("type :q! to quit without saving, :wq to save and quit"); }
@@ -286,7 +1391,9 @@ fn tty_events() as void {
         if (modified == 0) { quit = 1; }
         else { setmsg("closing: unsaved changes - :wq saves, :q! discards"); }
     }
+    if ((ev & tty.EV_WINCH) != 0) { ask_size(); clr(); }
 }
+
 fn drain_input(timeout as i64) as void {
     let is [6]i64 as pe; pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0;
     let is i64 as np with mut = 1;
@@ -300,30 +1407,29 @@ fn drain_input(timeout as i64) as void {
         let is i64 as i with mut = 0; while (i < r) { feed(cast(i64, buf[i])); i = i + 1; }
         pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0; sys.poll(cast(*i64, &pe[0]), 1, 0);
     }
-    if (in_esc == 1) { in_esc = 0; mode = 0; pend_d = 0; }   // a lone Esc that drained alone
+    if (in_esc == 1) { in_esc = 0; key(0x1B); }             // a lone Esc that drained alone
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
-    if (argc < 2) { sys.write_serial("vic: usage: vic <file>\n", 23); sys.exit(cast(i32, 1)); }
+    if (argc < 2) { sys.write(2, "usage: vic FILE\n", 16); sys.exit(cast(i32, 2)); }
     let is *u8 as raw = cast(*u8, cast(*i64, argv)[1]);
-    if (raw[0] == cast(u8, 47)) { g_path = raw; }
-    else {
-        g_pathbuf[0] = cast(u8, 47);
-        let is i64 as pi with mut = 0;
-        while (raw[pi] != 0 && pi < 126) { g_pathbuf[1 + pi] = raw[pi]; pi = pi + 1; }
-        g_pathbuf[1 + pi] = cast(u8, 0); g_path = cast(*u8, &g_pathbuf[0]);
+    if (make_path(cast(*u8, &g_path[0]), raw, slen(raw)) != 0) {
+        sys.write(2, "vic: ", 5); sys.write(2, raw, slen(raw));
+        sys.write(2, ": path too long (the system takes 255 bytes)\n", 45);
+        sys.exit(cast(i32, 1));
     }
     load_file();
-    if (tty.catch(tty.EV_INTR | tty.EV_HUP) == 0) { g_tty = 1; }
-    alt_on(); hidec(); clr(); flush_ob();
-    esc(); obnum(18); ob(116); flush_ob();          // CSI 18t size query
-    drain_input(300000000);
+    if (tty.catch(tty.EV_INTR | tty.EV_HUP | tty.EV_WINCH) == 0) { g_tty = 1; ask_size(); }
+    alt_on(); clr();
+    if (g_tty == 0) { esc(); obnum(18); ob(116); flush_ob(); drain_input(300000000); }   // no ttyproto: ask with CSI 18t
+    new_group();
     while (quit == 0) {
+        hidec();
         render();
         flush_ob();
         drain_input(0 - 1);
     }
-    sgr0(); showc(); alt_off(); flush_ob();
+    sgr0(); showc(); clr(); alt_off(); flush_ob();
     sys.exit(cast(i32, 0));
     return 0;
 }
