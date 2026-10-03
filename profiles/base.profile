@@ -90,6 +90,9 @@ bin  ping
 bin  nslookup
 bin  arp
 bin  wget
+# The trust store wget (and anything else speaking TLS) checks a server's
+# certificate against. Without it every https:// is refused.
+file userspace/lib/x509/ca.pem  /etc/ca.pem
 bin  nc
 bin  httpd
 bin  netsnoop
