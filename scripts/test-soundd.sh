@@ -39,7 +39,14 @@ LOG=/tmp/causticos-soundd.log
 MIXHZ=1000
 MIXHZ2=1500
 PREEMPTHZ=400
-SECS=2
+# Long enough that both voices are heard together for well over a measuring
+# window before the preemption, and both resume after it. At 2 s with the
+# device taken 0.8 s after the second client, that second voice had about
+# 0.25 s at full level before it was cut — one 0.2 s window's worth of margin
+# — and a slow start on a loaded host read as a quiet mix (0.04-0.2) though
+# the mixer was summing both at 0.30 the whole time, as the after-segment of
+# the same failing runs showed.
+SECS=4
 
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
 [ -f userspace/build/soundd.cse ] || { echo "soundd not built"; exit 1; }
@@ -122,7 +129,7 @@ sleep 0.3
 type_line "aplay -m /mix2.wav &"
 
 # Let the mix establish itself, then take the device away from underneath it.
-sleep 0.8
+sleep 1.5
 type_line "aplay /low.wav"
 
 # And wait for the whole thing to finish.
