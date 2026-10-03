@@ -30,6 +30,8 @@ invocations, of which more than half the wall time was interpreter startup.
 import io
 import struct
 import sys
+import os
+import subprocess
 import time
 
 SECTOR = 512
@@ -232,18 +234,42 @@ def build_lfn_entries(name, short11):
     return entries
 
 
-# Fixed timestamp. A build that runs twice on the same inputs should produce the
-# same bytes — the CSVI container's checksum and any "did the image actually
-# change" check both depend on it — and a wall-clock stamp in every directory
-# entry would break that for no gain. 1980-01-01 00:00:00 is the FAT epoch.
-FAT_EPOCH_DATE = (0 << 9) | (1 << 5) | 1
-FAT_EPOCH_TIME = 0
+# The timestamp every entry gets. A build that runs twice on the same inputs
+# should produce the same bytes — the CSVI container's checksum and any "did the
+# image actually change" check both depend on it — so it is not the wall clock:
+# it is SOURCE_DATE_EPOCH when that is set (the reproducible-builds convention),
+# else the time of the commit the tree is at, else the FAT epoch (1980-01-01).
+# It was always the FAT epoch, at 00:00, which the kernel took for "no date":
+# every file the system came with showed "????-??-?? ??:??" in ls -l.
+_SOURCE_EPOCH = None
+
+
+def source_epoch():
+    global _SOURCE_EPOCH
+    if _SOURCE_EPOCH is not None:
+        return _SOURCE_EPOCH
+    v = os.environ.get("SOURCE_DATE_EPOCH")
+    if v and v.strip().isdigit():
+        _SOURCE_EPOCH = int(v.strip())
+        return _SOURCE_EPOCH
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(["git", "-C", here, "log", "-1", "--format=%ct"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            _SOURCE_EPOCH = int(out.stdout.strip())
+            return _SOURCE_EPOCH
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _SOURCE_EPOCH = 315532800          # 1980-01-01 00:00:00 UTC, the FAT epoch
+    return _SOURCE_EPOCH
 
 
 def fat_date_time(deterministic=True):
     if deterministic:
-        return FAT_EPOCH_DATE, FAT_EPOCH_TIME
-    t = time.localtime()
+        t = time.gmtime(max(source_epoch(), 315532800))
+    else:
+        t = time.localtime()
     date = ((t.tm_year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday
     time16 = (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)
     return date, time16
