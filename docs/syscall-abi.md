@@ -88,7 +88,7 @@ whatever struct it fills.
 | 40 | `TIME_WALL` | out | 0; raw RTC `[year,month,day,hour,min,sec]` |
 | 41 | `POWEROFF` | | does not return — ACPI S5 |
 | 42 | `REBOOT` | | does not return |
-| 43 | `POWER_PENDING` | | 1 if the power button was pressed (the WM polls this) |
+| 43 | `POWER_PENDING` | | what is asked of the power: 0, `POWER_OFF` (1), `POWER_REBOOT` (2); polling it is the desktop listening |
 | 44 | `STATX` | path, len, out | 0 \| errno — `stat` plus mtime |
 | 45 | `EVENT_SUBSCRIBE` | pid, mask | fd \| errno — the signal replacement |
 | 46 | `THREAD_SPAWN` | entry, arg, stack_top | tid \| errno (same aspace) |
@@ -100,6 +100,8 @@ whatever struct it fills.
 | 52 | `RANDOM_QUALITY` | | `RANDOM_*` — says when the machine has no real entropy |
 | 53 | `AUDIO_INFO` | audio_fd, out | 0 \| errno — the geometry the stream opened with |
 | 54 | `CHAN_INFO` | chan_fd, out | 0 \| errno |
+| 55 | `POWER_REQUEST` | kind | 0 \| `E_INVAL` — asks for `POWER_OFF`/`POWER_REBOOT` the way the power button does: a listening desktop closes its windows first; with none, or asked twice, the kernel acts at once |
+| 56 | `POWER_CANCEL` | | 0 — the pending request is dropped (a window would not close) |
 
 **Pointers are user virtual addresses**; the kernel copies in/out and
 validates them (bad pointer → `E_FAULT`). All sizes/counts are bytes unless
