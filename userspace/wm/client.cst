@@ -9,6 +9,7 @@ use "wanim.cst" as wan;
 use "config.cst" as cfg;
 use "persist.cst" as pst;
 use "decoration.cst" as dec;
+use "clipboard.cst" as clip;
 use "../lib/crash/crash.cst" as crash;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
@@ -145,6 +146,8 @@ fn spawn_client_path(cpath as *u8, cname as *u8, cnlen as i64,
     s.wins[i].pend_resize_w = 0; s.wins[i].pend_resize_h = 0;
     s.wins[i].pend_focus = 0 - 1;
     s.wins[i].pend_close = 0;
+    s.wins[i].pend_move = 0;
+    s.wins[i].pend_clip = 0 - 1;
     s.wins[i].hello_deadline = sys.time_ns() + s.HELLO_NS;
     s.wins[i].surf_pend = 0;
     s.wins[i].surf_fd = 0;
@@ -371,6 +374,7 @@ fn reap_window_final(i as i64, do_wait as i64) as void {
         s.wins[i].dec_attached = 0;
     }
     sys.close(s.wins[i].chan);
+    if (s.ptr_grab == i) { s.ptr_grab = 0 - 1; }
     unswallow(i);
     // A window this one was standing in for outlives it as an ordinary
     // window: the placeholder is gone, so nothing is waiting to come back.
@@ -531,6 +535,10 @@ fn handle_msg(i as i64, m as *i64) as void {
         let is i64 as krc = sys.kill(m[1]);
         wmp.log_kv(cast(*u8, "wm: kill for the user, pid="), 27, m[1]);
         queue_msg(i, wmp.MSG_KILL_RES, m[1], krc, m[2]);
+    } else if (m[0] == wmp.MSG_CLIP_SET) {
+        clip.set_from(i, m[1]);
+    } else if (m[0] == wmp.MSG_CLIP_GET) {
+        clip.get_for(i);
     }
     return;
 }
@@ -606,7 +614,7 @@ fn queue_msg(i as i64, mtype as i64, a as i64, b as i64, c as i64) as void {
 // Anything owed to window i's client: a control message or queued input.
 fn has_output(i as i64) as i64 {
     if (s.outq_n[i] > 0 || s.wins[i].pend_close == 1 || s.wins[i].pend_resize_w > 0
-        || s.wins[i].pend_focus >= 0) { return 1; }
+        || s.wins[i].pend_focus >= 0 || s.wins[i].pend_clip >= 0 || s.wins[i].pend_move == 1) { return 1; }
     return 0;
 }
 
@@ -636,6 +644,11 @@ fn flush_out(i as i64) as void {
         s.wins[i].pend_focus = 0 - 1;
         room = room - 1;
     }
+    if (room > 0 && s.wins[i].pend_clip >= 0) {
+        wmp.msg_send(s.wins[i].chan, wmp.MSG_CLIP_DATA, s.wins[i].pend_clip, 0, 0);
+        s.wins[i].pend_clip = 0 - 1;
+        room = room - 1;
+    }
     while (room > 0 && s.outq_n[i] > 0) {
         let is i64 as base = (i * s.OUTQ + s.outq_head[i]) * 4;
         wmp.msg_send(s.wins[i].chan, s.outq[base], s.outq[base + 1], s.outq[base + 2], s.outq[base + 3]);
@@ -643,6 +656,33 @@ fn flush_out(i as i64) as void {
         s.outq_n[i] = s.outq_n[i] - 1;
         room = room - 1;
     }
+    // The pointer's latest position, after everything queued before it.
+    if (room > 0 && s.wins[i].pend_move == 1) {
+        wmp.msg_send(s.wins[i].chan, wmp.MSG_MOUSE_MOVE, mouse_a(s.mbuttons), rel_x(i), rel_y(i));
+        s.wins[i].pend_move = 0;
+    }
+    return;
+}
+
+// MOUSE_BTN / MOUSE_MOVE field a: the buttons, and the modifiers held (the
+// keysym MOD_* bits) — a terminal extends a selection on Shift+click.
+fn mouse_a(buttons as i64) as i64 {
+    let is i64 as mods = s.mod_shift | (s.mod_ctrl << 1) | (s.mod_alt << 2) | (s.mod_super << 3);
+    return (buttons & 0xFF) | (mods << 8);
+}
+
+// The pointer relative to window i's content.
+fn rel_x(i as i64) as i64 { return s.mx - (s.wins[i].x + s.BORDER); }
+fn rel_y(i as i64) as i64 { return s.my - (s.wins[i].y + s.BORDER + s.TITLE_H); }
+
+// A queued pointer event for window i goes after the motion owed before it,
+// or the window sees the button come up before the drag that led there.
+fn queue_mouse(i as i64, mtype as i64, a as i64, x as i64, y as i64) as void {
+    if (s.wins[i].pend_move == 1) {
+        queue_msg(i, wmp.MSG_MOUSE_MOVE, mouse_a(s.mbuttons), x, y);
+        s.wins[i].pend_move = 0;
+    }
+    queue_msg(i, mtype, a, x, y);
     return;
 }
 

@@ -1,0 +1,110 @@
+// wm/clipboard.cst — the clipboard: one text, UTF-8, that any window may set
+// and any may ask for (wmproto MSG_CLIP_SET / MSG_CLIP_GET / MSG_CLIP_DATA).
+//
+// Text never rides in the 32-byte messages. A window sends it in a segment of
+// its own; the WM copies it into one of ITS own and lets the window's go, so
+// the window cannot change what others paste after the fact, and its memory
+// is not held for as long as the clipboard is. A window asking for it gets a
+// fresh copy, for the same reason in the other direction. The copying is
+// through a small buffer (SYS_SEG_COPY, bounds-checked by the kernel), so a
+// window claiming more text than its segment holds gets nothing taken from
+// it, and the WM keeps no clipboard-sized buffer of its own.
+use "state.cst" as s;
+use "../lib/wmproto/wmproto.cst" as wmp;
+use "std/os/causticos.cst" as sys;
+
+fn _log(m as *u8, n as i64) as void { sys.write_serial(m, n); }
+
+// n bytes from segment src to segment dst. 0, or the errno.
+fn _seg_copy(src as i64, dst as i64, n as i64) as i64 {
+    let is [2048]u8 as b;
+    let is i64 as off with mut = 0;
+    while (off < n) {
+        let is i64 as k with mut = n - off;
+        if (k > 2048) { k = 2048; }
+        let is i64 as r = sys.seg_read(src, off, cast(*u8, &b[0]), k);
+        if (r < 0) { return r; }
+        let is i64 as w = sys.seg_write(dst, off, cast(*u8, &b[0]), k);
+        if (w < 0) { return w; }
+        off = off + k;
+    }
+    return 0;
+}
+
+// How much of the text in fd to keep when it is longer than cap: cap, moved
+// back off the middle of a character.
+fn _cut(fd as i64, cap as i64) as i64 {
+    let is [1]u8 as b;
+    let is i64 as k with mut = cap;
+    while (k > 0 && k > cap - 4) {
+        if (sys.seg_read(fd, k, cast(*u8, &b[0]), 1) < 0) { return k; }
+        if ((cast(i64, b[0]) & 0xC0) != 0x80) { return k; }
+        k = k - 1;
+    }
+    return k;
+}
+
+fn _drop() as void {
+    if (s.clip_fd >= 0) { sys.close(s.clip_fd); }
+    s.clip_fd = 0 - 1;
+    s.clip_len = 0;
+    return;
+}
+
+// MSG_CLIP_SET{a=n} from window i: n bytes of text, in the segment it sent
+// just before; n = 0 empties the clipboard. Text over CLIP_MAX is kept up to
+// the last whole character before it.
+fn set_from(i as i64, n as i64) as void {
+    if (n <= 0) { _drop(); return; }
+    let is i64 as fd = sys.fd_recv(s.wins[i].chan);
+    if (fd < 0) {
+        _log(cast(*u8, "wm: clipboard: MSG_CLIP_SET came without its text\n"), 50);
+        return;
+    }
+    let is i64 as len with mut = n;
+    if (len > s.CLIP_MAX) { len = _cut(fd, s.CLIP_MAX); }
+    let is i64 as nf = sys.seg_create((len + 4095) / 4096, 0);
+    if (nf < 0) {
+        sys.close(fd);
+        _log(cast(*u8, "wm: clipboard: no memory for the text\n"), 38);
+        return;
+    }
+    let is i64 as rc = _seg_copy(fd, nf, len);
+    sys.close(fd);
+    if (rc < 0) {
+        sys.close(nf);
+        _log(cast(*u8, "wm: clipboard: the text was shorter than the window said\n"), 57);
+        return;
+    }
+    _drop();
+    s.clip_fd = nf;
+    s.clip_len = len;
+    return;
+}
+
+// MSG_CLIP_GET from window i: owe it MSG_CLIP_DATA (client.flush_out sends
+// it), with a copy of the text sent ahead of it. An answer already on its way
+// stands for this one too: its segment is in the channel's one slot, and a
+// second could not be sent until the window takes the first.
+fn get_for(i as i64) as void {
+    if (s.wins[i].pend_clip >= 0) { return; }
+    if (s.clip_len == 0) { s.wins[i].pend_clip = 0; return; }
+    let is i64 as nf = sys.seg_create((s.clip_len + 4095) / 4096, 0);
+    if (nf < 0) { s.wins[i].pend_clip = 0; return; }
+    if (_seg_copy(s.clip_fd, nf, s.clip_len) < 0) {
+        sys.close(nf);
+        s.wins[i].pend_clip = 0;
+        return;
+    }
+    let is i64 as rc = sys.fd_send(s.wins[i].chan, nf);
+    sys.close(nf);
+    if (rc < 0) {
+        // The window has not taken an object sent to it before: it gets an
+        // empty answer rather than none.
+        wmp.log_kv(cast(*u8, "wm: clipboard: could not hand the text over rc="), 47, rc);
+        s.wins[i].pend_clip = 0;
+        return;
+    }
+    s.wins[i].pend_clip = s.clip_len;
+    return;
+}
