@@ -395,7 +395,7 @@ fn close_window(t as *term.Term) as void {
     }
     if (waiting == 1) { s.close_wait_until = sys.time_ns() + s.CLOSE_WAIT_NS; return; }
     term.putc(t, 0x0A); g.show(t);
-    wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+    leave();
     return;
 }
 
@@ -411,7 +411,7 @@ fn close_check() as void {
     }
     if (running == 0) {
         s.close_wait_until = 0;
-        wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+        leave();
         return;
     }
     if (sys.time_ns() >= s.close_wait_until) { s.close_wait_until = 0; }
@@ -423,6 +423,17 @@ fn quit() as void {
     while (jk < jobs.max_jobs()) {
         if (jobs.get(jk).status == jobs.JOB_RUN) { jobs.kill_job(jk); }
         jk = jk + 1;
+    }
+    leave();
+    return;
+}
+
+// Every way out comes through here. The WM ends the process when it reads
+// MSG_CLOSE, so the history thread is asked to write what it still has and
+// waited for first — up to HIST_WAIT_NS.
+fn leave() as void {
+    if (repl.sync_stop(&s.hs, &s.rl, s.HIST_WAIT_NS) != 0) {
+        g._log("wterm: history: the disk did not answer; the last commands may be missing from /var/history\n");
     }
     wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
     return;
@@ -463,10 +474,10 @@ fn submit(t as *term.Term) as void {
     repl.finish(&s.rl, t);
     g.show(t);
     repl.hist_push(&s.rl, repl.line_ptr(&s.rl), repl.line_len(&s.rl));
-    // Persisted before the command runs, not on exit: a terminal is closed
-    // by the window manager as often as by `exit`, and a killed window owes
-    // its history just the same.
-    repl.file_save(&s.rl, cast(*u8, "/var/history"));
+    // Handed to the history thread before the command runs, and nothing here
+    // waits for the disk: the thread writes it while the command starts. A
+    // window that is closed asks the thread to finish first (leave).
+    repl.sync(&s.hs, &s.rl);
     let is i64 as leave = r.run_line(t, repl.line_ptr(&s.rl), repl.line_len(&s.rl));
     repl.line_clear(&s.rl);
     if (leave == 1) { quit(); return; }
@@ -706,6 +717,9 @@ fn main(argc as i64, argv as *u8) as i32 {
     repl.init(&s.rl);
     sys.mkdir("/var");
     repl.file_load(&s.rl, cast(*u8, "/var/history"));
+    if (repl.sync_start(&s.hs, &s.rl, cast(*u8, "/var/history")) != 0) {
+        g._log("wterm: history: no thread for it; saved on Enter instead\n");
+    }
     jobs.init();
     bi.init();
     // Adopt the endpoint the WM handed down. Not start: the compositor is
@@ -732,9 +746,10 @@ fn main(argc as i64, argv as *u8) as i32 {
         }
     }
     // The fixed entries (the WM channel or the keyboard, exit events, a paste
-    // waiting on its program), then one per running job's output and one per
-    // job asking the terminal its size (ttyproto). The buffer is the job
-    // table's (jobs.poll_buf): it grows with it.
+    // waiting on its program, the history thread wanting room), then one per
+    // running job's output and one per job asking the terminal its size
+    // (ttyproto). The buffer is the job table's (jobs.poll_buf): it grows
+    // with it.
     while (1 == 1) {
         let is *i64 as pe = jobs.poll_buf();
         let is i64 as n with mut = 0;
@@ -801,7 +816,14 @@ fn main(argc as i64, argv as *u8) as i32 {
             pe[n*3+0] = pw; pe[n*3+1] = sys.POLL_WRITABLE; pe[n*3+2] = 0;
             n = n + 1;
         }
+        // History lines the thread had no room for yet: woken when it has.
+        let is i64 as hist_e with mut = 0 - 1;
+        if (repl.sync_waiting(&s.hs) == 1) {
+            pe[n*3+0] = repl.sync_fd(&s.hs); pe[n*3+1] = sys.POLL_WRITABLE; pe[n*3+2] = 0;
+            hist_e = n; n = n + 1;
+        }
         sys.poll(pe, n, ptmo);
+        if (hist_e >= 0 && (pe[hist_e*3+2] & sys.POLL_WRITABLE) != 0) { repl.sync(&s.hs, &s.rl); }
 
         let is i64 as pk with mut = 0;
         while (pk < njp) {

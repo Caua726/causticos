@@ -803,12 +803,11 @@ fn _put_u32le(b as *u8, off as i64, v as i64) as void {
     return;
 }
 
-// _scan — walk the records in fbuf[0..n], writing each record's offset and
+// _scan — walk the records in b[0..n], writing each record's offset and
 // length into offs/lens. Returns how many were well-formed; a record that
 // runs past the end ends the scan rather than reading rubbish.
-fn _scan(n as i64, offs as *i64, lens as *i64, max as i64) as i64 {
+fn _scan(b as *u8, n as i64, offs as *i64, lens as *i64, max as i64) as i64 {
     if (n < 8) { return 0; }
-    let is *u8 as b = cast(*u8, &fbuf[0]);
     if (b[0] != cast(u8, 72) || b[1] != cast(u8, 73)
         || b[2] != cast(u8, 83) || b[3] != cast(u8, 84)) { return 0; }   // "HIST"
     let is i64 as count = _u32le(b, 4);
@@ -841,7 +840,7 @@ fn file_load(r as *Repl, path as *u8) as i64 {
     if (n <= 0) { return 0; }
     let is [128]i64 as offs;
     let is [128]i64 as lens;
-    let is i64 as got = _scan(n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
+    let is i64 as got = _scan(cast(*u8, &fbuf[0]), n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
     // Only the newest HIST_N reach the ring — pushing all of them would just
     // overwrite the same slots and cost the loop.
     let is i64 as first with mut = got - HIST_N;
@@ -855,31 +854,35 @@ fn file_load(r as *Repl, path as *u8) as i64 {
     return got;
 }
 
-// file_save — rewrite the file as (what was already on disk) + (what this
-// session added since the last load/save), capped at FILE_MAX.
+// _save — rewrite the file at `path` as what is on it now plus the n lines at
+// ptrs/lens (oldest first), keeping the newest FILE_MAX: written to
+// <path>.tmp and renamed over it. `buf` (FILE_CAP bytes) holds the old file
+// while it is copied — the caller's, so two threads saving never share one.
+// The records written, or -1.
 //
-// Only the new pushes are appended, so a session that loaded 40 entries does
-// not write them back a second time. Several shells share one file: the last
-// writer wins the tail, which loses interleaving but never corrupts — the
-// rename is the whole transaction.
-fn file_save(r as *Repl, path as *u8) as i64 {
-    let is i64 as fresh with mut = r.npush - r.npush_load;
-    if (fresh <= 0) { return 0; }
-    if (fresh > HIST_N) { fresh = HIST_N; }                 // older ones fell out of the ring
-
+// Only lines new since the last save come in, so a session that loaded 40
+// entries does not write them back a second time. Several shells share one
+// file: the last writer wins the tail, which loses interleaving but never
+// corrupts — the rename is the whole transaction.
+fn _save(path as *u8, buf as *u8, ptrs as *i64, lens as *i64, n as i64) as i64 {
+    if (n <= 0) { return 0; }
     // Read the current file first: the new records are appended to it.
     let is i64 as old_n with mut = 0;
-    let is i64 as fd with mut = sys.open_read(path);
+    let is i64 as fd = sys.open_read(path);
     if (fd >= 0) {
-        old_n = sys.read(fd, cast(*u8, &fbuf[0]), FILE_CAP);
+        old_n = sys.read(fd, buf, FILE_CAP);
         sys.close(fd);
         if (old_n < 0) { old_n = 0; }
     }
     let is [128]i64 as offs;
-    let is [128]i64 as lens;
-    let is i64 as old_got = _scan(old_n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
+    let is [128]i64 as olens;
+    let is i64 as old_got = _scan(buf, old_n, cast(*i64, &offs[0]), cast(*i64, &olens[0]), FILE_MAX);
 
-    // Drop the oldest so old + new fits the cap.
+    // Drop the oldest so old + new fits the cap; more new lines than that
+    // and only their newest go in.
+    let is i64 as first with mut = 0;
+    if (n > FILE_MAX) { first = n - FILE_MAX; }
+    let is i64 as fresh = n - first;
     let is i64 as skip with mut = old_got + fresh - FILE_MAX;
     if (skip < 0) { skip = 0; }
     let is i64 as keep = old_got - skip;
@@ -903,29 +906,274 @@ fn file_save(r as *Repl, path as *u8) as i64 {
     let is [4]u8 as lb;
     let is i64 as i with mut = skip;
     while (i < old_got) {
-        _put_u32le(cast(*u8, &lb[0]), 0, lens[i]);
+        _put_u32le(cast(*u8, &lb[0]), 0, olens[i]);
         sys.write(out, cast(*u8, &lb[0]), 4);
-        sys.write(out, cast(*u8, &fbuf[offs[i]]), lens[i]);
+        sys.write(out, cast(*u8, cast(i64, buf) + offs[i]), olens[i]);
         i = i + 1;
     }
-    // The fresh ones, oldest first: ring index `fresh` back to 1.
-    let is i64 as j with mut = fresh;
-    while (j >= 1) {
-        let is i64 as slot = slot_of(r, j);
-        if (slot >= 0) {
-            _put_u32le(cast(*u8, &lb[0]), 0, r.hlen[slot]);
-            sys.write(out, cast(*u8, &lb[0]), 4);
-            sys.write(out, hist_ptr(r, slot), r.hlen[slot]);
-        }
-        j = j - 1;
+    i = first;
+    while (i < n) {
+        _put_u32le(cast(*u8, &lb[0]), 0, lens[i]);
+        sys.write(out, cast(*u8, &lb[0]), 4);
+        sys.write(out, cast(*u8, ptrs[i]), lens[i]);
+        i = i + 1;
     }
     sys.close(out);
     if (cast(i64, sys.rename(cast(*u8, &tmp[0]), path)) != 0) {
         sys.unlink(cast(*u8, &tmp[0]));                      // no half-file left behind
         return 0 - 1;
     }
-    r.npush_load = r.npush;
     return keep + fresh;
+}
+
+// file_save — the lines this session added since the last load or save, from
+// the ring, written now on the caller's thread. A shell with a HistSync
+// running hands its lines to that instead (sync); this is what is left when it
+// could not start one.
+fn file_save(r as *Repl, path as *u8) as i64 {
+    let is i64 as fresh with mut = r.npush - r.npush_load;
+    if (fresh <= 0) { return 0; }
+    if (fresh > r.hsize) { fresh = r.hsize; }                // older ones fell out of the ring
+    let is [16]i64 as ptrs;                                 // HIST_N
+    let is [16]i64 as lens;
+    let is i64 as n with mut = 0;
+    let is i64 as age with mut = fresh;                     // oldest first
+    while (age >= 1) {
+        let is i64 as slot = slot_of(r, age);
+        if (slot >= 0) {
+            ptrs[n] = cast(i64, hist_ptr(r, slot));
+            lens[n] = r.hlen[slot];
+            n = n + 1;
+        }
+        age = age - 1;
+    }
+    let is i64 as rc = _save(path, cast(*u8, &fbuf[0]), cast(*i64, &ptrs[0]), cast(*i64, &lens[0]), n);
+    if (rc >= 0) { r.npush_load = r.npush; }
+    return rc;
+}
+
+// ---- keeping the file without waiting for it ------------------------------
+//
+// Saving is a read of the whole file, a write of it to <path>.tmp and a rename
+// — on a disk, behind every other program's file I/O. It was done on Enter,
+// before the command ran, so the command waited for it, and a terminal whose
+// disk was busy did not answer at all until it was done.
+//
+// A HistSync is a thread of the shell's own that does the saving. Enter hands
+// it the line through a channel and goes on to run the command; the thread
+// gathers what has come in — several lines if the disk kept it — and saves
+// them in one go. The hand-over never waits either: a line goes only when the
+// channel has room for it, and while one is held back the shell polls the
+// channel for room (sync_waiting, sync_fd) and calls sync again. The ring
+// keeps HIST_N lines, so a disk that stays stuck for more than that many
+// commands loses the oldest of them, as file_save always did.
+//
+// The thread shares nothing with the shell but the channel and what it was
+// given before it started (the path, its end of the channel): its buffers are
+// on its own stack.
+
+let is i64 as SYNC_STOP with imut = 0xFFFFFFFF;   // a record length meaning "save what you have, answer, end"
+let is i64 as SYNC_PEND with imut = 16;           // lines the thread gathers before it saves regardless
+// Its stack: reserved for 128 KiB, 32 KiB of it committed — its buffers and
+// the save's frames take about 24. A dynamic-stack program's probes commit
+// more if a deeper path ever needs it; a static one has to fit in the 32.
+let is i64 as SYNC_STACK with imut = 131072;
+let is i64 as SYNC_COMMIT with imut = 32768;
+
+struct HistSync {
+    on as i64;               // 1 = the thread is running
+    fd as i64;               // the shell's end of the channel
+    tfd as i64;              // the thread's end
+    sent as i64;             // r.npush up to which lines were handed over
+    held as i64;             // 1 = a line is waiting for room in the channel
+    ts as sys.ThreadStack;
+    path as [128]u8;
+}
+
+// The thread. Reads records — u32 length, then the line — and saves when what
+// it has read is all there is for now, when it has gathered SYNC_PEND lines,
+// and when told to stop; on SYNC_STOP it answers one byte once the save is
+// done, and ends. EOF (the shell gone without stopping it) also ends it, after
+// a last save.
+fn _sync_thread(h as *HistSync) as i64 {
+    let is [2048]u8 as rbuf;
+    let is [4096]u8 as pbuf;               // SYNC_PEND * LINE_CAP
+    let is [16]i64 as plen;
+    let is [16]i64 as pptr;
+    let is [16384]u8 as fb;                // FILE_CAP: the old file while it is copied
+    let is [4]u8 as lenb;
+    let is i64 as lfill with mut = 0;      // bytes of the length read so far
+    let is i64 as want with mut = 0 - 1;   // the line's length once known
+    let is i64 as got with mut = 0;        // bytes of the line read so far
+    let is i64 as pn with mut = 0;
+    let is i64 as stop with mut = 0;       // 1 = EOF, 2 = asked to stop
+    let is [3]i64 as pe;
+    while (stop == 0) {
+        let is i64 as n = sys.read(h.tfd, cast(*u8, &rbuf[0]), 2048);
+        if (n <= 0) { stop = 1; }
+        let is i64 as i with mut = 0;
+        while (i < n && stop == 0) {
+            let is u8 as c = rbuf[i];
+            i = i + 1;
+            if (want < 0) {
+                lenb[lfill] = c;
+                lfill = lfill + 1;
+                if (lfill == 4) {
+                    lfill = 0;
+                    let is i64 as l = _u32le(cast(*u8, &lenb[0]), 0);
+                    if (l == SYNC_STOP) { stop = 2; }
+                    else if (l > 0 && l < LINE_CAP) {
+                        if (pn == SYNC_PEND) {
+                            _save(cast(*u8, &h.path[0]), cast(*u8, &fb[0]), cast(*i64, &pptr[0]), cast(*i64, &plen[0]), pn);
+                            pn = 0;
+                        }
+                        want = l; got = 0;
+                    }
+                }
+            } else {
+                pbuf[pn * LINE_CAP + got] = c;
+                got = got + 1;
+                if (got == want) {
+                    pptr[pn] = cast(i64, &pbuf[pn * LINE_CAP]);
+                    plen[pn] = want;
+                    pn = pn + 1;
+                    want = 0 - 1;
+                }
+            }
+        }
+        // More already waiting is read before saving: a burst is one save.
+        if (stop == 0) {
+            pe[0] = h.tfd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+            sys.poll(cast(*i64, &pe[0]), 1, 0);
+            if ((pe[2] & sys.POLL_READABLE) != 0) { continue; }
+        }
+        if (pn > 0) {
+            _save(cast(*u8, &h.path[0]), cast(*u8, &fb[0]), cast(*i64, &pptr[0]), cast(*i64, &plen[0]), pn);
+            pn = 0;
+        }
+    }
+    if (stop == 2) {
+        let is [1]u8 as ack;
+        ack[0] = cast(u8, 1);
+        sys.write(h.tfd, cast(*u8, &ack[0]), 1);
+    }
+    sys.close(h.tfd);
+    return 0;
+}
+
+// sync_start — start the thread that keeps `path` up to date with r's new
+// lines. 0, or the errno with nothing started; then sync saves on the
+// caller's thread, as before (file_save).
+fn sync_start(h as *HistSync, r as *Repl, path as *u8) as i64 {
+    h.on = 0; h.held = 0;
+    h.fd = 0 - 1; h.tfd = 0 - 1;
+    h.sent = r.npush;                      // what was loaded is on disk already
+    h.path[0] = cast(u8, 0);
+    let is i64 as pl = slen(path);
+    if (pl > 120) { return sys.E_INVAL; }
+    let is i64 as k with mut = 0;
+    while (k <= pl) { h.path[k] = path[k]; k = k + 1; }
+    let is [2]i64 as ch;
+    let is i64 as rc with mut = sys.channel_create(cast(*i64, &ch[0]));
+    if (rc != 0) { return rc; }
+    h.fd = ch[0];
+    h.tfd = ch[1];
+    rc = sys.thread_start(&h.ts, cast(i64, fn_ptr(_sync_thread)), cast(i64, h), SYNC_STACK, SYNC_COMMIT);
+    if (rc != 0) {
+        sys.close(ch[0]); sys.close(ch[1]);
+        h.fd = 0 - 1; h.tfd = 0 - 1;
+        return rc;
+    }
+    h.on = 1;
+    return 0;
+}
+
+// sync — after hist_push: hand the thread every line it has not had yet, as
+// far as the channel has room, without waiting. With no thread, save here.
+fn sync(h as *HistSync, r as *Repl) as void {
+    if (h.on == 0) {
+        file_save(r, cast(*u8, &h.path[0]));
+        return;
+    }
+    _send(h, r);
+    return;
+}
+
+// Every line not handed over yet, while the channel has room for it; h.held
+// says whether one is left waiting.
+fn _send(h as *HistSync, r as *Repl) as void {
+    h.held = 0;
+    let is [4]i64 as ci;
+    let is [260]u8 as rec;                 // 4 + LINE_CAP
+    while (h.sent < r.npush) {
+        let is i64 as age = r.npush - h.sent;          // of the oldest not sent: 1 = newest
+        if (age > r.hsize) { h.sent = r.npush - r.hsize; }   // fell out of the ring
+        else {
+            let is i64 as slot = slot_of(r, age);
+            let is i64 as len = r.hlen[slot];
+            if (sys.chan_info(h.fd, cast(*i64, &ci[0])) != 0) { h.held = 0; return; }
+            if (ci[2] < 4 + len) { h.held = 1; return; }
+            _put_u32le(cast(*u8, &rec[0]), 0, len);
+            let is *u8 as src = hist_ptr(r, slot);
+            let is i64 as k with mut = 0;
+            while (k < len) { rec[4 + k] = src[k]; k = k + 1; }
+            if (sys.write(h.fd, cast(*u8, &rec[0]), 4 + len) != 4 + len) { h.held = 0; return; }
+            h.sent = h.sent + 1;
+        }
+    }
+    return;
+}
+
+// While this is 1, poll sync_fd for POLL_WRITABLE and call sync when it is.
+fn sync_waiting(h as *HistSync) as i64 { return h.held; }
+fn sync_fd(h as *HistSync) as i64 { return h.fd; }
+
+// sync_stop — on the way out: hand over what is left, ask the thread to save
+// and stop, and wait for it to say it has — up to `wait_ns`, because a disk
+// that does not answer must not keep the shell from leaving. 0, or E_AGAIN
+// when the wait ran out (the newest lines may then not be in the file).
+fn sync_stop(h as *HistSync, r as *Repl, wait_ns as i64) as i64 {
+    if (h.on == 0) { file_save(r, cast(*u8, &h.path[0])); return 0; }
+    h.on = 0;
+    let is i64 as until = sys.time_ns() + wait_ns;
+    let is [3]i64 as pe;
+    let is i64 as rc with mut = sys.E_AGAIN;
+    let is i64 as phase with mut = 0;        // 0 lines, 1 the stop record, 2 the answer
+    while (phase < 3) {
+        let is i64 as left = until - sys.time_ns();
+        if (left <= 0) { phase = 3; }
+        else if (phase == 0) {
+            _send(h, r);
+            if (h.held == 0) { phase = 1; }
+            else {
+                pe[0] = h.fd; pe[1] = sys.POLL_WRITABLE; pe[2] = 0;
+                sys.poll(cast(*i64, &pe[0]), 1, left);
+            }
+        } else if (phase == 1) {
+            let is [4]i64 as ci;
+            sys.chan_info(h.fd, cast(*i64, &ci[0]));
+            if (ci[2] >= 4) {
+                let is [4]u8 as stop;
+                _put_u32le(cast(*u8, &stop[0]), 0, SYNC_STOP);
+                sys.write(h.fd, cast(*u8, &stop[0]), 4);
+                phase = 2;
+            } else {
+                pe[0] = h.fd; pe[1] = sys.POLL_WRITABLE; pe[2] = 0;
+                sys.poll(cast(*i64, &pe[0]), 1, left);
+            }
+        } else {
+            pe[0] = h.fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+            sys.poll(cast(*i64, &pe[0]), 1, left);
+            if ((pe[2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                let is [1]u8 as ack;
+                if (sys.read(h.fd, cast(*u8, &ack[0]), 1) == 1) { rc = 0; }
+                phase = 3;
+            }
+        }
+    }
+    sys.close(h.fd);
+    h.fd = 0 - 1;
+    return rc;
 }
 
 // ---- tokenising ------------------------------------------------------------

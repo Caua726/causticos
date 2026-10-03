@@ -37,6 +37,34 @@ let is u32 as C_BG     with imut = 0x00121417;   // background
 // The edit buffer, the history ring, recall and completion are lib/repl —
 // the same code the windowed wterm runs.
 let is repl.Repl as rl with mut;
+// The thread that keeps /var/history: Enter hands it the line and goes on.
+let is repl.HistSync as hs with mut;
+// How long power-off waits for it to say the file is written, before going
+// anyway: a disk that stopped answering must not keep the machine up.
+let is i64 as HIST_WAIT_NS with imut = 3000000000;
+// As the boot process this shell is what listens for the power button and
+// `poweroff`: the kernel counts a SYS_POWER_PENDING at least once a second
+// as someone listening, and goes down by itself when nobody is.
+let is i64 as POWER_LISTEN_NS with imut = 250000000;
+
+// power_down — the power button, or `poweroff`/`reboot`, asked: the last
+// commands go to /var/history (the thread is asked to finish, up to
+// HIST_WAIT_NS) and then the machine goes, the way the desktop takes it down
+// once its windows are closed. Does not return.
+fn power_down(t as *term.Term, kind as i64) as void {
+    // `poweroff` has said what is happening; the button has not, and the save
+    // can take a moment on a slow disk.
+    _col(t, C_DIM);
+    puts(t, "\nSaving the command history...\n");
+    _col(t, C_TEXT);
+    term.flush(t);
+    if (repl.sync_stop(&hs, &rl, HIST_WAIT_NS) != 0) {
+        _log("shell: history: the disk did not answer; the last commands may be missing from /var/history\n");
+    }
+    if (kind == sys.POWER_REBOOT) { sys.reboot(); }
+    sys.poweroff();
+    return;
+}
 
 // --- small helpers ---
 fn slen(s as *u8) as i64 { return repl.slen(s); }
@@ -539,10 +567,11 @@ fn line_char(t as *term.Term, c as i64) as void {
     if (c == 0x0A) {
         repl.finish(&rl, t); term.flush(t);
         repl.hist_push(&rl, repl.line_ptr(&rl), repl.line_len(&rl));
-        // Persisted BEFORE running: this shell is /init and has no exit path,
-        // so "save on quit" would never fire, and a command that wedges the
-        // machine is exactly the one worth having in the file afterwards.
-        repl.file_save(&rl, cast(*u8, "/var/history"));
+        // Handed to the history thread before running, and nothing here waits
+        // for the disk: the thread writes it while the command starts. This
+        // shell is /init and has no exit path; what ends it is the power,
+        // and power_down has the thread finish first.
+        repl.sync(&hs, &rl);
         run_line(t, repl.line_ptr(&rl), repl.line_len(&rl));
         repl.line_clear(&rl);
         if (fg_job < 0) { prompt(t); }      // a foreground job prints it when it ends
@@ -619,6 +648,9 @@ fn main() as i32 {
     // as good as having created it.
     sys.mkdir("/var");
     repl.file_load(&rl, cast(*u8, "/var/history"));
+    if (repl.sync_start(&hs, &rl, cast(*u8, "/var/history")) != 0) {
+        _log("shell: history: no thread for it; saved on Enter instead\n");
+    }
     jobs.init();
     bi.init();
     bi.bind_repl(&rl);
@@ -657,10 +689,10 @@ fn main() as i32 {
     prompt(&t);
     term.flush(&t);
 
-    // The fixed entries (the WM channel or the keyboard, exit events, a paste
-    // waiting on its program), then one per running job's output and one per
-    // job asking the terminal its size (ttyproto). The buffer is the job
-    // table's (jobs.poll_buf): it grows with it.
+    // The fixed entries (the keyboard, exit events, the history thread wanting
+    // room), then one per running job's output and one per job asking the
+    // terminal its size (ttyproto). The buffer is the job table's
+    // (jobs.poll_buf): it grows with it.
     while (1 == 1) {
         let is *i64 as pe = jobs.poll_buf();
         let is i64 as n with mut = 0;
@@ -704,7 +736,20 @@ fn main() as i32 {
             }
             jj = jj + 1;
         }
-        sys.poll(pe, n, 0 - 1);
+        // History lines the thread had no room for yet: woken when it has.
+        let is i64 as hist_e with mut = 0 - 1;
+        if (repl.sync_waiting(&hs) == 1) {
+            pe[n*3+0] = repl.sync_fd(&hs); pe[n*3+1] = sys.POLL_WRITABLE; pe[n*3+2] = 0;
+            hist_e = n; n = n + 1;
+        }
+        let is i64 as ptmo with mut = 0 - 1;
+        if (boot == 1) { ptmo = POWER_LISTEN_NS; }
+        sys.poll(pe, n, ptmo);
+        if (hist_e >= 0 && (pe[hist_e*3+2] & sys.POLL_WRITABLE) != 0) { repl.sync(&hs, &rl); }
+        if (boot == 1) {
+            let is i64 as pkind = sys.power_pending();
+            if (pkind != 0) { power_down(&t, pkind); }
+        }
 
         if ((pe[2] & sys.POLL_READABLE) != 0) {
             if (input.read_event(g_kfd, &ev) == 1) {
