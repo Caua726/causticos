@@ -1,0 +1,284 @@
+// cmdt.cst — run command-line tools against cases whose answers came from
+// GNU's: the same arguments, input and files, the same output and exit code.
+//
+// The cases are written on the host by scripts/gen-cmdt.py, which runs the GNU
+// tools to get each answer, into /cmdt/cases. One case:
+//
+//   T name            P /prog.cse        A <len>\n<arg bytes>\n   (repeated)
+//   I <len>\n<stdin>\n                    F path\n<len>\n<bytes>\n  (a file to make first)
+//   O <len>\n<stdout>\n                   C <exit code>    E  (it writes to stderr)
+//   G path\n<len>\n<bytes>\n  (what a file holds afterwards)      .  (run it)
+//
+// "%D" in an argument, a path or an expected text is /cmdt/d, the directory a
+// case's files live in. stdin, stdout and stderr are files, so nothing can
+// fill a pipe and stall; stderr is only checked for being empty or not (the
+// words differ from GNU's on purpose: they are this system's).
+
+use "std/causticos/prog.cst" as prog;
+use "std/os/causticos.cst" as sys;
+use "../lib/futil/futil.cst" as fu;
+
+let is i64 as SRC with mut = 0;
+let is i64 as SLEN with mut = 0;
+let is i64 as POS with mut = 0;
+
+let is i64 as checks with mut = 0;
+let is i64 as bad with mut = 0;
+
+// the case being read
+let is [64]u8 as NAME;
+let is [64]u8 as PROGP;
+let is [64]i64 as AV;              // (ptr, len) pairs: the arguments after argv[0]
+let is i64 as AC with mut = 0;
+let is i64 as IN_P with mut = 0; let is i64 as IN_N with mut = 0;
+let is i64 as OUT_P with mut = 0; let is i64 as OUT_N with mut = 0;
+let is i64 as CODE with mut = 0;
+let is i64 as WANT_ERR with mut = 0;
+let is [16]i64 as GP; let is [16]i64 as GPL; let is [16]i64 as GC; let is [16]i64 as GCL;   // expected files
+let is i64 as NG with mut = 0;
+
+// %D expanded: a scratch arena the arguments and paths are built in
+let is [65536]u8 as ARENA;
+let is i64 as AP with mut = 0;
+
+fn say(s as *u8) as void { prog.outs(s); }
+
+fn at() as i64 { let is *u8 as s = cast(*u8, SRC); return cast(i64, s[POS]); }
+
+fn rd_num() as i64 {
+    let is i64 as v with mut = 0;
+    while (POS < SLEN && at() >= 48 && at() <= 57) { v = v * 10 + at() - 48; POS = POS + 1; }
+    return v;
+}
+fn skip_nl() as void { if (POS < SLEN && at() == 10) { POS = POS + 1; } }
+fn skip_sp() as void { while (POS < SLEN && at() == 32) { POS = POS + 1; } }
+
+// "<len>\n<bytes>\n": the bytes' address, their length in n.
+fn rd_blob(n as *i64) as i64 {
+    skip_sp();
+    let is i64 as len = rd_num();
+    skip_nl();
+    let is i64 as p = SRC + POS;
+    POS = POS + len;
+    skip_nl();
+    n[0] = len;
+    return p;
+}
+
+// The rest of the line.
+fn rd_line(n as *i64) as i64 {
+    skip_sp();
+    let is i64 as p = SRC + POS;
+    let is i64 as st = POS;
+    while (POS < SLEN && at() != 10) { POS = POS + 1; }
+    n[0] = POS - st;
+    skip_nl();
+    return p;
+}
+
+// p[0..n) with every "%D" made "/cmdt/d", into the arena (NUL-terminated).
+// (Big texts without a %D are used where they are: the arena is for names
+// and short texts.)
+fn expand(p as *u8, n as i64, outn as *i64) as *u8 {
+    if (n >= 4096) {
+        let is i64 as j with mut = 0;
+        let is i64 as has with mut = 0;
+        while (j + 1 < n) { if (p[j] == cast(u8, 37) && p[j + 1] == cast(u8, 68)) { has = 1; } j = j + 1; }
+        if (has == 0) { outn[0] = n; return p; }
+    }
+    let is i64 as start = AP;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (i + 1 < n && p[i] == cast(u8, 37) && p[i + 1] == cast(u8, 68)) {
+            let is *u8 as d = "/cmdt/d";
+            let is i64 as k with mut = 0;
+            while (d[k] != 0) { ARENA[AP] = d[k]; AP = AP + 1; k = k + 1; }
+            i = i + 2;
+        } else {
+            ARENA[AP] = p[i]; AP = AP + 1; i = i + 1;
+        }
+    }
+    ARENA[AP] = cast(u8, 0);
+    AP = AP + 1;
+    outn[0] = AP - 1 - start;
+    return cast(*u8, &ARENA[start]);
+}
+
+fn write_file(path as *u8, p as *u8, n as i64) as i64 {
+    let is i64 as fd = sys.open_write(path);
+    if (fd < 0) { return fd; }
+    let is i64 as off with mut = 0;
+    while (off < n) {
+        let is i64 as r = sys.write(fd, cast(*u8, cast(i64, p) + off), n - off);
+        if (r <= 0) { sys.close(fd); return 0 - 1; }
+        off = off + r;
+    }
+    sys.close(fd);
+    return 0;
+}
+
+// Bytes for a log line: control characters as \n \t \xHH.
+fn show(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    say("\"");
+    while (i < n && i < 400) {
+        let is i64 as c = cast(i64, p[i]);
+        if (c == 10) { say("\\n"); }
+        else if (c == 9) { say("\\t"); }
+        else if (c == 92) { say("\\\\"); }
+        else if (c < 32 || c == 127) {
+            let is [4]u8 as h; let is *u8 as hx = "0123456789abcdef";
+            h[0] = cast(u8, 92); h[1] = cast(u8, 120); h[2] = hx[(c >> 4) & 15]; h[3] = hx[c & 15];
+            prog.out(cast(*u8, &h[0]), 4);
+        }
+        else { prog.out(cast(*u8, &p[i]), 1); }
+        i = i + 1;
+    }
+    if (n > 400) { say("..."); }
+    say("\"");
+}
+
+fn same(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn failed(what as *u8) as void {
+    bad = bad + 1;
+    say("  FAIL "); say(cast(*u8, &NAME[0])); say(": "); say(what); say("\n");
+}
+
+fn run_case() as void {
+    checks = checks + 1;
+    // the files, the input
+    sys.mkdir("/cmdt/d");
+    let is i64 as rc = write_file("/cmdt/in", cast(*u8, IN_P), IN_N);
+    if (rc != 0) { failed("cannot write /cmdt/in"); return; }
+    let is i64 as in_fd = sys.open_read("/cmdt/in");
+    let is i64 as out_fd = sys.open_write("/cmdt/out");
+    let is i64 as err_fd = sys.open_write("/cmdt/err");
+    if (in_fd < 0 || out_fd < 0 || err_fd < 0) { failed("cannot open the case's stdin/stdout/stderr"); return; }
+    let is [6]i64 as fa;
+    fa[0] = 0; fa[1] = in_fd; fa[2] = 1; fa[3] = out_fd; fa[4] = 2; fa[5] = err_fd;
+    let is i64 as pid = sys.spawn_path(cast(*u8, &PROGP[0]), cast(*u8, &fa[0]), 3, cast(*u8, &AV[0]), AC);
+    sys.close(in_fd); sys.close(out_fd); sys.close(err_fd);
+    if (pid < 0) { failed("spawn failed"); say("    "); say(sys.err_text(pid)); say("\n"); return; }
+    let is [1]i64 as code;
+    sys.wait(pid, cast(*i64, &code[0]));
+    let is [1]i64 as on; let is [1]i64 as en;
+    let is i64 as ov = fu.slurp("/cmdt/out", cast(*i64, &on[0]));
+    let is i64 as ev = fu.slurp("/cmdt/err", cast(*i64, &en[0]));
+    if (on[0] < 0) { on[0] = 0; }
+    if (en[0] < 0) { en[0] = 0; }
+    let is i64 as ok with mut = 1;
+    let is i64 as wn with mut = 0;
+    let is *u8 as want = expand(cast(*u8, OUT_P), OUT_N, &wn);
+    if (same(cast(*u8, ov), on[0], want, wn) == 0) {
+        failed("stdout differs");
+        say("    want "); show(want, wn); say("\n");
+        say("    got  "); show(cast(*u8, ov), on[0]); say("\n");
+        ok = 0;
+    }
+    if (code[0] != CODE) {
+        if (ok == 1) { failed("exit code differs"); }
+        say("    exit "); prog.out_num(code[0]); say(", want "); prog.out_num(CODE); say("\n");
+        ok = 0;
+    }
+    if ((en[0] > 0 && WANT_ERR == 0) || (en[0] == 0 && WANT_ERR == 1)) {
+        if (ok == 1) { failed("stderr differs"); }
+        if (WANT_ERR == 1) { say("    stderr is empty, GNU's says something\n"); }
+        else { say("    stderr: "); show(cast(*u8, ev), en[0]); say("\n"); }
+        ok = 0;
+    }
+    let is i64 as g with mut = 0;
+    while (g < NG) {
+        let is i64 as pn with mut = 0;
+        let is *u8 as path = expand(cast(*u8, GP[g]), GPL[g], &pn);
+        let is [1]i64 as fnl;
+        let is i64 as fv = fu.slurp(path, cast(*i64, &fnl[0]));
+        let is i64 as cn with mut = 0;
+        let is *u8 as content = expand(cast(*u8, GC[g]), GCL[g], &cn);
+        if (fnl[0] < 0) {
+            if (ok == 1) { failed("a file is missing afterwards"); }
+            say("    "); say(path); say(" is not there\n");
+            ok = 0;
+        } else if (same(cast(*u8, fv), fnl[0], content, cn) == 0) {
+            if (ok == 1) { failed("a file differs afterwards"); }
+            say("    "); say(path); say(": want "); show(content, cn); say("\n");
+            say("    got "); show(cast(*u8, fv), fnl[0]); say("\n");
+            ok = 0;
+        }
+        if (fv != 0) { fu.unslurp(fv, fnl[0]); }
+        g = g + 1;
+    }
+    if (ov != 0) { fu.unslurp(ov, on[0]); }
+    if (ev != 0) { fu.unslurp(ev, en[0]); }
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is [1]i64 as n;
+    SRC = fu.slurp("/cmdt/cases", cast(*i64, &n[0]));
+    if (n[0] <= 0) { say("cmdt: no /cmdt/cases\n"); return cast(i32, 1); }
+    SLEN = n[0];
+    sys.mkdir("/cmdt/d");
+    while (POS < SLEN) {
+        let is i64 as k = at();
+        POS = POS + 1;
+        if (k == 84) {                                                    // T name
+            let is i64 as ln with mut = 0;
+            let is *u8 as p = cast(*u8, rd_line(&ln));
+            let is i64 as i with mut = 0;
+            while (i < ln && i < 63) { NAME[i] = p[i]; i = i + 1; }
+            NAME[i] = cast(u8, 0);
+            AC = 0; IN_P = 0; IN_N = 0; OUT_P = 0; OUT_N = 0; CODE = 0; WANT_ERR = 0; NG = 0; AP = 0;
+        } else if (k == 80) {                                             // P /prog.cse
+            let is i64 as ln with mut = 0;
+            let is *u8 as p = cast(*u8, rd_line(&ln));
+            let is i64 as i with mut = 0;
+            while (i < ln && i < 63) { PROGP[i] = p[i]; i = i + 1; }
+            PROGP[i] = cast(u8, 0);
+            // argv[0]: the program's name
+            AV[0] = cast(i64, &PROGP[1]); AV[1] = ln - 5;
+            AC = 1;
+        } else if (k == 65) {                                             // A arg
+            let is i64 as ln with mut = 0;
+            let is i64 as p = rd_blob(&ln);
+            let is i64 as en with mut = 0;
+            let is *u8 as e = expand(cast(*u8, p), ln, &en);
+            if (AC < 32) { AV[AC * 2] = cast(i64, e); AV[AC * 2 + 1] = en; AC = AC + 1; }
+        } else if (k == 73) {                                             // I stdin
+            let is i64 as ln with mut = 0;
+            IN_P = rd_blob(&ln); IN_N = ln;
+        } else if (k == 70) {                                             // F path, content
+            let is i64 as ln with mut = 0;
+            let is *u8 as p = cast(*u8, rd_line(&ln));
+            let is i64 as pn with mut = 0;
+            let is *u8 as path = expand(p, ln, &pn);
+            let is i64 as cl with mut = 0;
+            let is i64 as cp = rd_blob(&cl);
+            let is i64 as xn with mut = 0;
+            let is *u8 as content = expand(cast(*u8, cp), cl, &xn);
+            sys.mkdir("/cmdt/d");
+            if (write_file(path, content, xn) != 0) { say("cmdt: cannot write "); say(path); say("\n"); }
+        } else if (k == 79) {                                             // O stdout
+            let is i64 as ln with mut = 0;
+            OUT_P = rd_blob(&ln); OUT_N = ln;
+        } else if (k == 67) { skip_sp(); CODE = rd_num(); skip_nl(); }    // C code
+        else if (k == 69) { WANT_ERR = 1; skip_nl(); }                    // E
+        else if (k == 71) {                                               // G path, content
+            let is i64 as ln with mut = 0;
+            let is i64 as p = rd_line(&ln);
+            let is i64 as cl with mut = 0;
+            let is i64 as cp = rd_blob(&cl);
+            if (NG < 16) { GP[NG] = p; GPL[NG] = ln; GC[NG] = cp; GCL[NG] = cl; NG = NG + 1; }
+        } else if (k == 46) { skip_nl(); run_case(); }                    // . run
+        else if (k == 10) { }
+        else { say("cmdt: bad case file\n"); return cast(i32, 1); }
+    }
+    prog.outs("cmdt: "); prog.out_num(checks); prog.outs(" checks, "); prog.out_num(bad); prog.outs(" failed\n");
+    sys.write_serial(cast(*u8, "cmdt: done\n"), 11);
+    if (bad == 0) { return cast(i32, 0); }
+    return cast(i32, 1);
+}

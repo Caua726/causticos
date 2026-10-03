@@ -1,16 +1,20 @@
-// grep — print lines matching a pattern, with real POSIX-ERE regular
-// expressions (regex.cst, a linear Thompson NFA — no backtracking blow-up).
+// grep — print lines matching a pattern: POSIX regular expressions, basic
+// unless -E, through lib/regex (linear time for anything without \1).
 //
 //   grep [options] PATTERN [file ...]
-//   grep [options] -e PAT [-e PAT ...] [file ...]
+//   grep [options] -e PAT [-e PAT ...] [-f FILE] [file ...]
 //
-//   -E  extended regexp (the default)        -F  fixed strings (no metachars)
+//   -G  basic regexp (the default)   -E  extended regexp   -F  fixed strings
 //   -i  ignore case        -v  invert        -w  whole word    -x  whole line
 //   -n  line numbers       -o  only matches  -c  count         -m N  stop after N
 //   -l  files with matches -L  files without -H  show filename -h  hide filename
 //   -r  recurse into dirs  -s  no error msgs -q  quiet (exit only)
 //   -A N after  -B N before  -C N around (context, groups split by "--")
-//   -e PAT  add a pattern (repeatable)
+//   -e PAT  a pattern (repeatable)   -f FILE  a pattern per line of FILE
+//
+// A line matches if any pattern does. Each pattern is its own expression — a
+// \1 in one refers to its own group — and one with newlines in it is one
+// pattern per line, as GNU's.
 //
 // Exit 0 if a line matched, 1 if none, 2 on error.
 //
@@ -28,13 +32,19 @@ let is i64 as G_i with mut = 0; let is i64 as G_v with mut = 0; let is i64 as G_
 let is i64 as G_l with mut = 0; let is i64 as G_L with mut = 0; let is i64 as G_n with mut = 0;
 let is i64 as G_H with mut = 0; let is i64 as G_h with mut = 0; let is i64 as G_o with mut = 0;
 let is i64 as G_w with mut = 0; let is i64 as G_x with mut = 0; let is i64 as G_q with mut = 0;
-let is i64 as G_s with mut = 0; let is i64 as G_r with mut = 0; let is i64 as G_fixed with mut = 0;
+let is i64 as G_s with mut = 0; let is i64 as G_r with mut = 0;
 let is i64 as G_A with mut = 0; let is i64 as G_B with mut = 0; let is i64 as G_m with mut = 0;
 let is i64 as G_multi with mut = 0; let is i64 as G_any with mut = 0; let is i64 as G_exit with mut = 0;
 
-// combined pattern buffer (patterns joined by '|', metachars escaped under -F)
-let is [8192]u8 as G_PAT;
-let is i64 as G_PATLEN with mut = 0;
+// The patterns as given: (address, length) pairs in a mapping that grows, and
+// then each one compiled.
+let is i64 as P_VA with mut = 0;           // [P_CAP][2]i64
+let is i64 as P_CAP with mut = 0;
+let is i64 as P_N with mut = 0;
+let is i64 as RX_VA with mut = 0;          // [P_N]re.Regex
+let is i64 as G_SYNTAX with mut = 0;       // re.RE_EXTENDED / re.RE_FIXED, or 0 for BRE
+let is i64 as G_XF with mut = 0;           // the search flags -w and -x make
+let is i64 as G_SEARCH_ERR with mut = 0;   // a search failed (said once)
 
 // The line being looked at, and the before-context ring: copies of the last
 // G_B lines that did not match, G_B Lines in one mapping. (It held offsets into
@@ -48,43 +58,53 @@ let is i64 as G_GROUPED with mut = 0;       // 1 if A or B > 0 (print "--" separ
 
 fn rb_line(i as i64) as *fu.Line { return cast(*fu.Line, RB_VA + i * sizeof(fu.Line)); }
 
-fn word_char(c as i64) as i64 {
-    if (c >= 48 && c <= 57) { return 1; }
-    if (c >= 65 && c <= 90) { return 1; }
-    if (c >= 97 && c <= 122) { return 1; }
-    if (c == 95) { return 1; }
-    return 0;
-}
-fn is_meta(c as i64) as i64 {
-    if (c == 46 || c == 42 || c == 43 || c == 63 || c == 91 || c == 93 || c == 40 || c == 41) { return 1; }
-    if (c == 123 || c == 125 || c == 124 || c == 94 || c == 36 || c == 92) { return 1; }
-    return 0;
-}
-// append one pattern to G_PAT, escaping metachars when -F.
-fn pat_append(p as *u8, plen as i64) as void {
-    if (G_PATLEN > 0 && G_PATLEN < 8190) { G_PAT[G_PATLEN] = cast(u8, 124); G_PATLEN = G_PATLEN + 1; }   // '|'
-    let is i64 as i with mut = 0;
-    while (i < plen && G_PATLEN < 8189) {
-        let is i64 as c = cast(i64, p[i]);
-        if (G_fixed != 0 && is_meta(c) != 0) { G_PAT[G_PATLEN] = cast(u8, 92); G_PATLEN = G_PATLEN + 1; }
-        G_PAT[G_PATLEN] = cast(u8, c); G_PATLEN = G_PATLEN + 1;
-        i = i + 1;
+fn rx(i as i64) as *re.Regex { return cast(*re.Regex, RX_VA + i * sizeof(re.Regex)); }
+
+// Add the pattern p[0..n) — one per line of it.
+fn pat_add(p as *u8, n as i64) as i64 {
+    let is i64 as a with mut = 0;
+    while (1 == 1) {
+        let is i64 as b with mut = a;
+        while (b < n && p[b] != cast(u8, 10)) { b = b + 1; }
+        if (P_N == P_CAP) {
+            let is i64 as nc with mut = P_CAP * 2; if (nc < 64) { nc = 64; }
+            let is i64 as va = sys.mmap(0, fu.page_round(nc * 16), sys.PROT_READ | sys.PROT_WRITE);
+            if (va < 0) { return sys.E_NOMEM; }
+            let is *i64 as d = cast(*i64, va);
+            let is i64 as k with mut = 0;
+            if (P_VA != 0) {
+                let is *i64 as o = cast(*i64, P_VA);
+                while (k < P_N * 2) { d[k] = o[k]; k = k + 1; }
+                sys.munmap(P_VA, fu.page_round(P_CAP * 16));
+            }
+            P_VA = va; P_CAP = nc;
+        }
+        let is *i64 as pl = cast(*i64, P_VA);
+        pl[P_N * 2] = cast(i64, p) + a; pl[P_N * 2 + 1] = b - a;
+        P_N = P_N + 1;
+        if (b >= n) { return 0; }
+        a = b + 1;
+        if (a == n) { return 0; }            // a final newline ends the last pattern, it does not start one
     }
+    return 0;
 }
 
-// does s[0..llen) match? honours -w (word boundaries) and -x (whole line).
+// A search that failed (back-references on a line too long to search, or no
+// memory): said once; the line counts as not matching and grep exits 2.
+fn search_failed(rc as i64) as void {
+    if (G_SEARCH_ERR == 0) { prog.errs("grep: "); prog.errs(re.err_text(rc)); prog.errs("\n"); }
+    G_SEARCH_ERR = 1;
+    G_exit = 2;
+}
+
+// Does s[0..llen) match any pattern? -w and -x are search flags (G_XF).
 fn line_hit(s as *u8, llen as i64) as i64 {
-    if (G_x != 0) { if (re.re_match_at(s, llen, 0) == llen) { return 1; } return 0; }
-    if (G_w == 0) { return re.re_match(s, llen); }
+    let is [2]i64 as m;
     let is i64 as i with mut = 0;
-    while (i <= llen) {
-        let is i64 as e = re.re_match_at(s, llen, i);
-        if (e >= 0) {
-            let is i64 as lok with mut = 1; let is i64 as rok with mut = 1;
-            if (i > 0 && word_char(cast(i64, s[i - 1])) != 0) { lok = 0; }
-            if (e < llen && word_char(cast(i64, s[e])) != 0) { rok = 0; }
-            if (lok != 0 && rok != 0) { return 1; }
-        }
+    while (i < P_N) {
+        let is i64 as rc = re.search(rx(i), s, llen, 0, G_XF, cast(*i64, &m[0]), 1);
+        if (rc == 1) { return 1; }
+        if (rc < 0) { search_failed(rc); }
         i = i + 1;
     }
     return 0;
@@ -95,20 +115,34 @@ fn put_prefix(name as *u8, lineno as i64, sep as i64) as void {
     if (G_n != 0) { prog.out_num(lineno); prog.out(cast(*u8, &sep), 1); }
 }
 
-// -o: print every (non-overlapping, boundary-valid under -w) match on the line.
+// -o: every match on the line, left to right, without overlaps: at each point
+// the leftmost of all the patterns' matches, the longest of those. Empty
+// matches are not printed.
 fn print_only(name as *u8, lineno as i64, s as *u8, llen as i64) as void {
+    if (G_x != 0) {                     // the match is the line
+        if (llen > 0) { let is i64 as colon0 = 58; put_prefix(name, lineno, colon0); prog.out(s, llen); prog.out("\n", 1); }
+        return;
+    }
     let is i64 as pos with mut = 0;
-    let is [1]i64 as ms; let is [1]i64 as me;
+    let is [2]i64 as m;
     while (pos <= llen) {
-        if (re.re_search(cast(*u8, &s[pos]), llen - pos, cast(*i64, &ms[0]), cast(*i64, &me[0])) == 0) { break; }
-        let is i64 as a = pos + ms[0]; let is i64 as b = pos + me[0];
-        let is i64 as ok with mut = 1;
-        if (G_w != 0) {
-            if (a > 0 && word_char(cast(i64, s[a - 1])) != 0) { ok = 0; }
-            if (b < llen && word_char(cast(i64, s[b])) != 0) { ok = 0; }
+        let is i64 as a with mut = 0 - 1; let is i64 as b with mut = 0 - 1;
+        let is i64 as i with mut = 0;
+        while (i < P_N) {
+            let is i64 as rc = re.search(rx(i), s, llen, pos, G_XF & re.X_WORDS, cast(*i64, &m[0]), 1);
+            if (rc < 0) { search_failed(rc); }
+            if (rc == 1 && (a < 0 || m[0] < a || (m[0] == a && m[1] > b))) { a = m[0]; b = m[1]; }
+            i = i + 1;
         }
-        if (ok != 0 && b > a) { let is i64 as colon = 58; put_prefix(name, lineno, colon); prog.out(cast(*u8, &s[a]), b - a); prog.out("\n", 1); }
-        if (b > pos) { pos = b; } else { pos = pos + 1; }
+        if (a < 0) { return; }
+        if (b > a) {
+            let is i64 as colon = 58; put_prefix(name, lineno, colon);
+            prog.out(cast(*u8, &s[a]), b - a); prog.out("\n", 1);
+            pos = b;
+        } else {
+            if (a >= llen) { return; }
+            pos = re.char_end(s, llen, a);
+        }
     }
 }
 
@@ -188,10 +222,7 @@ fn grep_fd(name as *u8, fd as i64) as i64 {
 }
 
 fn read_failed(name as *u8, rc as i64) as void {
-    if (G_s == 0) {
-        prog.outs("grep: "); prog.outs(name);
-        if (rc == sys.E_NOMEM) { prog.outs(": out of memory\n"); } else { prog.outs(": read error\n"); }
-    }
+    if (G_s == 0) { prog.errs("grep: "); prog.errs(name); prog.errs(": "); prog.errs(sys.err_text(rc)); prog.errs("\n"); }
     G_exit = 2;
 }
 
@@ -199,7 +230,7 @@ fn do_path(name as *u8, path as *u8) as void {
     let is i64 as fd with mut = 0;
     if (fu.is_dash(name) == 0) { fd = sys.open_read(path); }
     if (fd < 0) {
-        if (G_s == 0) { prog.outs("grep: "); prog.outs(name); prog.outs(": cannot open\n"); }
+        if (G_s == 0) { prog.errs("grep: "); prog.errs(name); prog.errs(": "); prog.errs(sys.err_text(fd)); prog.errs("\n"); }
         G_exit = 2; return;
     }
     let is i64 as rc = grep_fd(name, fd);
@@ -223,7 +254,7 @@ fn path_is_dir(path as *u8) as i64 {
 fn do_recursive(name as *u8, path as *u8) as void {
     let is i64 as d = path_is_dir(path);
     if (d < 0) {
-        if (G_s == 0) { prog.outs("grep: "); prog.outs(name); prog.outs(": no such file\n"); }
+        if (G_s == 0) { prog.errs("grep: "); prog.errs(name); prog.errs(": "); prog.errs(sys.err_text(sys.E_NOENT)); prog.errs("\n"); }
         G_exit = 2; return;
     }
     if (d == 0) { do_path(name, path); return; }
@@ -239,7 +270,7 @@ fn do_recursive(name as *u8, path as *u8) as void {
     }
 }
 
-fn usage() as i32 { prog.outs("usage: grep [-EFivwxnoclLHhrsq] [-A n] [-B n] [-C n] [-m n] [-e pat] PATTERN [file ...]\n"); return cast(i32, 2); }
+fn usage() as i32 { prog.errs("usage: grep [-GEFivwxnoclLHhrsq] [-A n] [-B n] [-C n] [-m n] [-e pat] [-f file] PATTERN [file ...]\n"); return cast(i32, 2); }
 
 fn main(argc as i64, argv as *u8) as i32 {
     let is fu.Opt as o;
@@ -247,10 +278,11 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as npat with mut = 0;
     let is i64 as want_C with mut = 0;
     while (1 == 1) {
-        let is i64 as f = fu.opt_next(&o, "EFivwxnoclLHhrsqA:B:C:m:e:");
+        let is i64 as f = fu.opt_next(&o, "GEFivwxnoclLHhrsqA:B:C:m:e:f:");
         if (f < 0) { break; }
-        if (f == 69) { G_fixed = 0; }                                        // -E
-        else if (f == 70) { G_fixed = 1; }                                   // -F
+        if (f == 71) { G_SYNTAX = 0; }                                       // -G
+        else if (f == 69) { G_SYNTAX = re.RE_EXTENDED; }                     // -E
+        else if (f == 70) { G_SYNTAX = re.RE_FIXED; }                        // -F
         else if (f == 105) { G_i = 1; }
         else if (f == 118) { G_v = 1; }
         else if (f == 119) { G_w = 1; }
@@ -270,7 +302,28 @@ fn main(argc as i64, argv as *u8) as i32 {
         else if (f == 67) { want_C = fu.parse_uint(cast(*u8, o.optarg), 19); } // -C
         else if (f == 109) { G_m = fu.parse_uint(cast(*u8, o.optarg), 19); }  // -m
         else if (f == 101) {                                                 // -e
-            let is *u8 as p = cast(*u8, o.optarg); pat_append(p, prog.slen(p)); npat = npat + 1;
+            let is *u8 as p = cast(*u8, o.optarg);
+            if (pat_add(p, prog.slen(p)) != 0) { prog.errs("grep: out of memory\n"); return cast(i32, 2); }
+            npat = npat + 1;
+        }
+        else if (f == 102) {                                                 // -f
+            let is *u8 as fname = cast(*u8, o.optarg);
+            let is [256]u8 as fpb;
+            let is [1]i64 as flen;
+            let is i64 as fva with mut = 0;
+            let is *u8 as fpath = prog.abspath(fname, cast(*u8, &fpb[0]));
+            if (fu.is_dash(fname) == 1) { fva = fu.slurp_fd(0, cast(*i64, &flen[0])); }
+            else { fva = fu.slurp(fpath, cast(*i64, &flen[0])); }
+            if (flen[0] < 0) {
+                // slurp keeps no error code: opening again names what is wrong
+                let is i64 as why with mut = sys.E_IO;
+                if (fu.is_dash(fname) == 0) { let is i64 as fd = sys.open_read(fpath); if (fd < 0) { why = fd; } else { sys.close(fd); } }
+                prog.errs("grep: "); prog.errs(fname); prog.errs(": "); prog.errs(sys.err_text(why)); prog.errs("\n");
+                return cast(i32, 2);
+            }
+            // an empty file is no patterns at all (it matches nothing), not one empty pattern
+            if (flen[0] > 0 && pat_add(cast(*u8, fva), flen[0]) != 0) { prog.errs("grep: out of memory\n"); return cast(i32, 2); }
+            npat = npat + 1;
         }
         else { return usage(); }
     }
@@ -286,10 +339,24 @@ fn main(argc as i64, argv as *u8) as i32 {
     // pattern: from -e (already collected) or the first operand
     if (npat == 0) {
         if (o.ind >= argc) { return usage(); }
-        let is *u8 as p = prog.arg(argv, o.ind); pat_append(p, prog.slen(p)); o.ind = o.ind + 1;
+        let is *u8 as p = prog.arg(argv, o.ind);
+        if (pat_add(p, prog.slen(p)) != 0) { prog.errs("grep: out of memory\n"); return cast(i32, 2); }
+        o.ind = o.ind + 1;
     }
-    if (re.re_compile(cast(*u8, &G_PAT[0]), G_PATLEN, G_i, 0) != 0) {
-        prog.outs("grep: bad pattern\n"); return cast(i32, 2);
+    let is i64 as cfl with mut = G_SYNTAX;
+    if (G_i != 0) { cfl = cfl | re.RE_ICASE; }
+    if (G_w != 0) { G_XF = G_XF | re.X_WORDS; }
+    if (G_x != 0) { G_XF = G_XF | re.X_ANCHOR | re.X_FULL; }
+    if (P_N > 0) {
+        RX_VA = sys.mmap(0, fu.page_round(P_N * sizeof(re.Regex)), sys.PROT_READ | sys.PROT_WRITE);
+        if (RX_VA < 0) { prog.errs("grep: out of memory\n"); return cast(i32, 2); }
+    }
+    let is i64 as pi with mut = 0;
+    while (pi < P_N) {
+        let is *i64 as pl = cast(*i64, P_VA);
+        let is i64 as rc = re.compile(rx(pi), cast(*u8, pl[pi * 2]), pl[pi * 2 + 1], cfl);
+        if (rc != 0) { prog.errs("grep: "); prog.errs(re.err_text(rc)); prog.errs("\n"); return cast(i32, 2); }
+        pi = pi + 1;
     }
 
     let is i64 as nfiles = argc - o.ind;

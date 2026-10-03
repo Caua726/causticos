@@ -1,409 +1,1486 @@
-// regex.cst — a small but real POSIX-ERE engine for the CausticOS tools.
+// regex.cst — POSIX regular expressions, basic and extended: the one engine
+// grep, sed, expr and the pager share.
 //
-// It compiles a pattern to a bytecode program and runs it as a Thompson NFA
-// (the Pike VM): a set of threads advanced in lockstep over the input, so there
-// is NO backtracking and no pathological blow-up — matching is O(text * prog).
-// This is the same construction Russ Cox documents in "Regular Expression
-// Matching Can Be Simple And Fast"; here it is a freestanding port (no heap,
-// fixed pools) usable by grep, the pager, and anything else.
+//                    BRE (the default)          ERE (RE_EXTENDED)
+//   group            \( \)                      ( )
+//   either           \|                         |
+//   repeat           *  \+  \?  \{m,n\}         *  +  ?  {m,n}
+//   ({m} is exactly m, {m,} m or more, {,n} at most n; up to 32767.)
 //
-// Supported ERE: literals, '.', anchors '^' '$', '*' '+' '?', '{n,m}', union
-// '|', groups '( )', bracket classes '[...]' / '[^...]' with a-z ranges, and the
-// \d \w \s (and \D \W \S) shorthands. Escapes \. \* \\ \n \t etc. are literals.
-// Flags: case-insensitive, and a fixed-string mode (treat the pattern verbatim).
-use "std/causticos/prog.cst" as prog;
+//   x              a character: a UTF-8 code point, not a byte
+//   .              any character
+//   [set]          one of a set: [abc], [a-z] (code point order), [^abc] none
+//                  of them; [[:alpha:]] and alnum digit upper lower space
+//                  blank punct print graph cntrl xdigit, for all of Unicode;
+//                  [[=c=]] and [[.c.]] are c. A ']' first is a member, so is
+//                  a '-' first or last. A backslash is an ordinary character
+//                  in a set, except \n \t \\ with RE_ESCAPES (sed's).
+//   ^  $           start and end of the subject (and of each line in it, with
+//                  RE_NEWLINE)
+//   \`  \'         start and end of the subject, always
+//   \b \B \< \>    a word boundary, no boundary, the start and the end of a word
+//   \w \W \s \S \d \D   a word character (letter, digit, '_'), a space, a
+//                  digit, and the opposites
+//   \n \t          newline and tab; \xHH the byte HH (a run of them that spells
+//                  a UTF-8 sequence is that character)
+//   \1 .. \9       the text group n matched (a back-reference)
+//
+// In a BRE a '*' that has nothing before it (first in the expression, after
+// \( \| or ^) is an ordinary character, '^' is an anchor only first and '$'
+// only last (in the expression, a group or an alternative), as POSIX has it.
+// In an ERE an unmatched ')' and a '{' that does not open an interval are
+// ordinary characters, as they are in GNU's.
+//
+// A match is POSIX's leftmost-longest: of the matches that start leftmost, the
+// longest. Among equally long ones the groups are those of the path a
+// backtracking search would try first. POSIX ranks the groups leftmost-longest
+// too, one by one; this is the one place the engine departs from it, the same
+// place Go's POSIX mode does.
+//
+// A pattern without back-references runs on a Pike VM: every path through the
+// program advances in step, one input character at a time, so a search takes
+// time linear in the subject whatever the pattern. Back-references make the
+// language non-regular; those patterns are searched by backtracking under a
+// step budget, and a search that would run away fails with RE_ECOMPLEX
+// instead of hanging its caller.
+//
+// The input is UTF-8. A byte that does not start a valid sequence is a
+// character of its own, numbered past the end of Unicode (0x110000 + byte):
+// '.' and [^...] match it, a literal matches only the same byte.
+//
+// Nothing is fixed-size: the program, the sets and the search's state live in
+// mappings sized for the pattern. A Regex is one search at a time.
+use "std/os/causticos.cst" as sys;
+use "std/unicode/utf8.cst" as utf8;
+// The General_Category trie alone: std/unicode/props.cst would bring the
+// East_Asian_Width one too (30 KB more in every program that searches).
+use "std/unicode/tables/gc.cst" as gct;
+use "../ucase/ucase.cst" as ucase;
 
-// ---- program (bytecode) ----
-let is i64 as OP_CHAR  = 1;     // x = byte
-let is i64 as OP_ANY   = 2;     // any byte
-let is i64 as OP_CLASS = 3;     // x = class index
-let is i64 as OP_MATCH = 4;     // accept
-let is i64 as OP_JMP   = 5;     // x = target
-let is i64 as OP_SPLIT = 6;     // x, y = targets (x has priority = greedy/leftmost)
-let is i64 as OP_BOL   = 7;     // anchor: start of line
-let is i64 as OP_EOL   = 8;     // anchor: end of line
+// ---- compile flags ----
+let is i64 as RE_EXTENDED with imut = 1;    // ERE syntax
+let is i64 as RE_ICASE    with imut = 2;    // a letter matches either case
+let is i64 as RE_FIXED    with imut = 4;    // the pattern is a plain string
+let is i64 as RE_NEWLINE  with imut = 8;    // ^ and $ also at the newlines inside the subject
+let is i64 as RE_ESCAPES  with imut = 16;   // \n \t \\ mean newline, tab, '\' inside a set
 
-let is [1024]i64 as RE_OP;
-let is [1024]i64 as RE_X;
-let is [1024]i64 as RE_Y;
-let is i64 as RE_NI with mut = 0;
+// ---- search flags ----
+let is i64 as X_NOTBOL with imut = 1;       // the subject does not start a line: no ^ there
+let is i64 as X_NOTEOL with imut = 2;       // nor end one: no $ at its end
+let is i64 as X_ANCHOR with imut = 4;       // the match must start where the search does
+let is i64 as X_FULL   with imut = 8;       // and end at the end of the subject
+let is i64 as X_WORDS  with imut = 16;      // no word character just before it or just after
 
-// character classes: a 256-bit bitmap each, four i64 words per class.
-let is [256]i64 as RE_CLS;       // 64 classes * 4 words
-let is i64 as RE_NC with mut = 0;
+// ---- errors (returned negated) ----
+let is i64 as RE_EPAREN   with imut = 1;
+let is i64 as RE_ERPAREN  with imut = 2;
+let is i64 as RE_EBRACK   with imut = 3;
+let is i64 as RE_ECTYPE   with imut = 4;
+let is i64 as RE_EBRACE   with imut = 5;
+let is i64 as RE_EBADBR   with imut = 6;
+let is i64 as RE_ERANGE   with imut = 7;
+let is i64 as RE_ESUBREG  with imut = 8;
+let is i64 as RE_EBADRPT  with imut = 9;
+let is i64 as RE_EESCAPE  with imut = 10;
+let is i64 as RE_ESIZE    with imut = 11;
+let is i64 as RE_ENOMEM   with imut = 12;
+let is i64 as RE_EDEPTH   with imut = 13;
+let is i64 as RE_ECOMPLEX with imut = 14;
 
-// ---- AST (built first, then emitted) ----
-let is i64 as A_CHAR  = 1;
-let is i64 as A_ANY   = 2;
-let is i64 as A_CLASS = 3;
-let is i64 as A_BOL   = 4;
-let is i64 as A_EOL   = 5;
-let is i64 as A_CAT   = 6;
-let is i64 as A_ALT   = 7;
-let is i64 as A_STAR  = 8;
-let is i64 as A_PLUS  = 9;
-let is i64 as A_QUEST = 10;
-let is i64 as A_EMPTY = 11;
+let is i64 as DUP_MAX with imut = 32767;      // the most an interval may count
+let is i64 as MAX_INST with imut = 200000;    // the largest program (\{1,32767\} of a big group is not a pattern)
+let is i64 as MAX_DEPTH with imut = 1000;     // groups inside groups (the parser recurses)
+let is i64 as BT_BUDGET with imut = 20000000; // backtracking steps one search may take
 
-let is [1024]i64 as AST_T;
-let is [1024]i64 as AST_C;       // literal byte for A_CHAR
-let is [1024]i64 as AST_CLS;     // class index for A_CLASS
-let is [1024]i64 as AST_L;       // left / child
-let is [1024]i64 as AST_R;       // right
-let is i64 as RE_NAST with mut = 0;
+// ---- program ----
+let is i64 as I_CHAR   with imut = 1;     // x = code point (folded with RE_ICASE)
+let is i64 as I_ANY    with imut = 2;
+let is i64 as I_CLASS  with imut = 3;     // x = the set's offset in cls
+let is i64 as I_MATCH  with imut = 4;
+let is i64 as I_JMP    with imut = 5;     // x = target
+let is i64 as I_SPLIT  with imut = 6;     // x first, then y
+let is i64 as I_SAVE   with imut = 7;     // x = capture slot
+let is i64 as I_ASSERT with imut = 8;     // x = AS_*
+let is i64 as I_BREF   with imut = 9;     // x = group
+let is i64 as I_MARK   with imut = 10;    // x = loop: where this iteration started (backtracking only)
+let is i64 as I_CHECK  with imut = 11;    // x = loop: if the iteration took nothing, go to y (out of it)
+let is i64 as INST with imut = 3;         // i64s per instruction: op, x, y
 
-// ---- parser + global state ----
-let is i64 as RE_PAT with mut = 0;     // *u8
-let is i64 as RE_PLEN with mut = 0;
-let is i64 as RE_POS with mut = 0;
-let is i64 as RE_ERR with mut = 0;
-let is i64 as RE_ICASE with mut = 0;
+let is i64 as AS_BOL  with imut = 1;
+let is i64 as AS_EOL  with imut = 2;
+let is i64 as AS_BUFS with imut = 3;
+let is i64 as AS_BUFE with imut = 4;
+let is i64 as AS_WB   with imut = 5;
+let is i64 as AS_NWB  with imut = 6;
+let is i64 as AS_WS   with imut = 7;
+let is i64 as AS_WE   with imut = 8;
 
-// ---- VM thread lists ----
-let is [1024]i64 as RE_CLIST;
-let is [1024]i64 as RE_NLIST;
-let is [1024]i64 as RE_SEEN;            // generation marks for dedup
-let is i64 as RE_GEN with mut = 0;
+// General_Category values: std/unicode/props.cst's GC_*, which are the
+// interning the generator wrote into tables/gc.cst.
+let is i64 as GC_CN with imut = 0;
+let is i64 as GC_LU with imut = 1;
+let is i64 as GC_LL with imut = 2;
+let is i64 as GC_LT with imut = 3;
+let is i64 as GC_LO with imut = 5;
+let is i64 as GC_ND with imut = 9;
+let is i64 as GC_NL with imut = 10;
+let is i64 as GC_ZS with imut = 23;
+let is i64 as GC_ZL with imut = 24;
+let is i64 as GC_ZP with imut = 25;
+let is i64 as GC_CC with imut = 26;
+let is i64 as GC_CS with imut = 28;
 
-fn re_lc(c as i64) as i64 { if (c >= 65 && c <= 90) { return c + 32; } return c; }
+// ---- sets: [neg, classes, n, lo0, hi0, lo1, hi1, ...] ----
+let is i64 as CL_ALPHA  with imut = 1;
+let is i64 as CL_DIGIT  with imut = 2;
+let is i64 as CL_ALNUM  with imut = 4;
+let is i64 as CL_UPPER  with imut = 8;
+let is i64 as CL_LOWER  with imut = 16;
+let is i64 as CL_SPACE  with imut = 32;
+let is i64 as CL_BLANK  with imut = 64;
+let is i64 as CL_PUNCT  with imut = 128;
+let is i64 as CL_PRINT  with imut = 256;
+let is i64 as CL_GRAPH  with imut = 512;
+let is i64 as CL_CNTRL  with imut = 1024;
+let is i64 as CL_XDIGIT with imut = 2048;
+let is i64 as CL_WORD   with imut = 4096;
 
-// ---- class bitmap helpers ----
-fn cls_new() as i64 {
-    if (RE_NC >= 63) { RE_ERR = 1; return 0; }
-    let is i64 as idx = RE_NC; RE_NC = RE_NC + 1;
-    RE_CLS[idx * 4] = 0; RE_CLS[idx * 4 + 1] = 0; RE_CLS[idx * 4 + 2] = 0; RE_CLS[idx * 4 + 3] = 0;
-    return idx;
+// ---- syntax tree ----
+let is i64 as N_CHAR   with imut = 1;
+let is i64 as N_ANY    with imut = 2;
+let is i64 as N_CLASS  with imut = 3;
+let is i64 as N_ASSERT with imut = 4;
+let is i64 as N_GROUP  with imut = 5;     // v = group, kid = what is inside
+let is i64 as N_CAT    with imut = 6;     // kid = first, linked by next
+let is i64 as N_ALT    with imut = 7;     // kid = first alternative, linked by next
+let is i64 as N_REP    with imut = 8;     // lo, hi (-1 = no limit), kid
+let is i64 as N_BREF   with imut = 9;
+let is i64 as N_EMPTY  with imut = 10;
+let is i64 as NODE with imut = 6;         // i64s per node: t, v, lo, hi, kid, next
+
+// A growable array of i64 in its own mapping.
+struct Vec {
+    va as i64;
+    cap as i64;      // i64s the mapping holds
+    n as i64;        // i64s in use
 }
-fn cls_bit(idx as i64, c as i64) as void {
-    let is i64 as b = c & 255;
-    RE_CLS[idx * 4 + (b >> 6)] = RE_CLS[idx * 4 + (b >> 6)] | (1 << (b & 63));
+
+struct Regex {
+    prog as Vec;     // INST i64s per instruction
+    cls as Vec;
+    ngroups as i64;
+    nloops as i64;
+    bref as i64;     // has back-references: search by backtracking
+    flags as i64;
+    lead as i64;     // the first byte every match starts with, or -1
+    bol as i64;      // every match starts at a ^ (and RE_NEWLINE is off)
+    vm as Vec;       // the search's state
+    vmcap as i64;    // what vm is laid out for (0 = not yet)
+    epoch as i64;      // the last generation the Pike VM marked
+    bt as Vec;       // the backtracking stack
 }
-fn cls_set(idx as i64, c as i64) as void {
-    cls_bit(idx, c);
-    if (RE_ICASE != 0) {
-        if (c >= 65 && c <= 90) { cls_bit(idx, c + 32); }
-        else if (c >= 97 && c <= 122) { cls_bit(idx, c - 32); }
+
+struct Parser {
+    pat as i64;
+    plen as i64;
+    pos as i64;
+    flags as i64;
+    err as i64;
+    ngroups as i64;
+    depth as i64;
+    bref as i64;
+    ast as Vec;
+    cls as Vec;
+    closed as Vec;   // closed[g] = 1 once group g has ended (a \g may refer to it)
+    nloops as i64;
+}
+
+// ======================================================================
+// growable arrays
+
+fn _vinit(v as *Vec) as void { v.va = 0; v.cap = 0; v.n = 0; }
+
+fn _vbytes(cap as i64) as i64 { return (cap * 8 + 4095) / 4096 * 4096; }
+
+fn _vgrow(v as *Vec, need as i64) as i64 {
+    if (need <= v.cap) { return 0; }
+    let is i64 as nc with mut = v.cap * 2;
+    if (nc < 512) { nc = 512; }
+    while (nc < need) { nc = nc * 2; }
+    let is i64 as bytes = _vbytes(nc);
+    let is i64 as va = sys.mmap(0, bytes, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { return 0 - 1; }
+    let is *i64 as d = cast(*i64, va);
+    let is i64 as i with mut = 0;
+    if (v.va != 0) {
+        let is *i64 as o = cast(*i64, v.va);
+        while (i < v.n) { d[i] = o[i]; i = i + 1; }
+        sys.munmap(v.va, _vbytes(v.cap));
     }
-}
-fn cls_range(idx as i64, a0 as i64, b0 as i64) as void {
-    let is i64 as a with mut = a0; let is i64 as b with mut = b0;
-    if (a > b) { let is i64 as t = a; a = b; b = t; }
-    let is i64 as c with mut = a;
-    while (c <= b) { cls_set(idx, c); c = c + 1; }
-}
-fn cls_invert(idx as i64) as void {
-    RE_CLS[idx * 4] = RE_CLS[idx * 4] ^ (0 - 1); RE_CLS[idx * 4 + 1] = RE_CLS[idx * 4 + 1] ^ (0 - 1);
-    RE_CLS[idx * 4 + 2] = RE_CLS[idx * 4 + 2] ^ (0 - 1); RE_CLS[idx * 4 + 3] = RE_CLS[idx * 4 + 3] ^ (0 - 1);
-}
-fn cls_test(idx as i64, c as i64) as i64 {
-    let is i64 as b = c & 255;
-    if ((RE_CLS[idx * 4 + (b >> 6)] & (1 << (b & 63))) != 0) { return 1; }
+    v.va = va; v.cap = bytes / 8;
     return 0;
 }
-// add a \d \w \s style set (which = the escape letter, lowercased) to a class.
-fn cls_add_named(idx as i64, which as i64) as void {
-    if (which == 100) { cls_range(idx, 48, 57); }                                   // d: 0-9
-    else if (which == 119) { cls_range(idx, 48, 57); cls_range(idx, 65, 90); cls_range(idx, 97, 122); cls_set(idx, 95); }  // w
-    else if (which == 115) { cls_set(idx, 32); cls_set(idx, 9); cls_set(idx, 10); cls_set(idx, 13); cls_set(idx, 12); cls_set(idx, 11); }  // s
+
+fn _vpush(v as *Vec, x as i64) as i64 {
+    if (v.n >= v.cap) { if (_vgrow(v, v.n + 1) != 0) { return 0 - 1; } }
+    let is *i64 as a = cast(*i64, v.va);
+    a[v.n] = x; v.n = v.n + 1;
+    return 0;
 }
 
-// ---- AST builders ----
-fn node(t as i64) as i64 {
-    if (RE_NAST >= 1022) { RE_ERR = 1; return 0; }
-    let is i64 as n = RE_NAST; RE_NAST = RE_NAST + 1;
-    AST_T[n] = t; AST_C[n] = 0; AST_CLS[n] = 0; AST_L[n] = 0 - 1; AST_R[n] = 0 - 1;
+fn _vfree(v as *Vec) as void {
+    if (v.va != 0) { sys.munmap(v.va, _vbytes(v.cap)); }
+    _vinit(v);
+}
+
+fn _vat(v as *Vec, i as i64) as i64 { let is *i64 as a = cast(*i64, v.va); return a[i]; }
+fn _vput(v as *Vec, i as i64, x as i64) as void { let is *i64 as a = cast(*i64, v.va); a[i] = x; }
+
+// ======================================================================
+// characters
+
+// The code point at s[i] and its length in len[0]; a malformed byte is
+// 0x110000 + the byte, one long.
+fn _cp(s as *u8, n as i64, i as i64, len as *i64) as i64 {
+    let is i32 as c with mut = 0;
+    let is i64 as k = utf8.decode1(s, n, i, &c);
+    if (k <= 0) { len[0] = 1; return 0x110000 + cast(i64, s[i]); }
+    len[0] = k;
+    return cast(i64, c);
+}
+
+// The code point that ends just before s[i] (i > 0).
+fn _cp_before(s as *u8, i as i64) as i64 {
+    let is i64 as j with mut = i - 1;
+    let is i64 as back with mut = 0;
+    while (j > 0 && back < 3 && (cast(i64, s[j]) & 0xC0) == 0x80) { j = j - 1; back = back + 1; }
+    let is i64 as k with mut = 0;
+    let is i64 as c = _cp(s, i, j, &k);
+    if (j + k == i) { return c; }
+    return 0x110000 + cast(i64, s[i - 1]);      // the byte before is not the end of a character
+}
+
+fn _gc(c as i64) as i64 {
+    if (c >= 0x110000) { return 0 - 1; }
+    return cast(i64, gct.gc_get(cast(i32, c)));
+}
+
+fn _is_alpha(c as i64) as i64 {
+    if (c < 0x80) {
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { return 1; }
+        return 0;
+    }
+    let is i64 as g = _gc(c);
+    if (g >= GC_LU && g <= GC_LO) { return 1; }
+    if (g == GC_NL || g == GC_ND) { return 1; }   // other scripts' digits are letters to [:alpha:], as glibc has it
+    return 0;
+}
+fn _is_digit(c as i64) as i64 { if (c >= 48 && c <= 57) { return 1; } return 0; }
+fn _is_alnum(c as i64) as i64 { if (_is_digit(c) == 1 || _is_alpha(c) == 1) { return 1; } return 0; }
+fn _is_word(c as i64) as i64 { if (c == 95 || _is_alnum(c) == 1) { return 1; } return 0; }
+
+fn _is_space(c as i64) as i64 {
+    if (c == 32 || (c >= 9 && c <= 13)) { return 1; }
+    if (c < 0x80 || c == 0xA0 || c == 0x2007 || c == 0x202F) { return 0; }   // no-break spaces are not
+    let is i64 as g = _gc(c);
+    if (g == GC_ZS || g == GC_ZL || g == GC_ZP) { return 1; }
+    return 0;
+}
+fn _is_blank(c as i64) as i64 {
+    if (c == 32 || c == 9) { return 1; }
+    if (c < 0x80 || c == 0xA0 || c == 0x2007 || c == 0x202F) { return 0; }
+    if (_gc(c) == GC_ZS) { return 1; }
+    return 0;
+}
+fn _is_cntrl(c as i64) as i64 {
+    if (c < 32 || c == 127) { return 1; }
+    if (c >= 0x80 && c < 0xA0) { return 1; }
+    if (c == 0x2028 || c == 0x2029) { return 1; }
+    return 0;
+}
+fn _is_print(c as i64) as i64 {
+    if (c >= 0x110000) { return 0; }
+    if (c < 0x80) { if (c >= 32 && c != 127) { return 1; } return 0; }
+    let is i64 as g = _gc(c);
+    if (g == GC_CN || g == GC_CC || g == GC_CS || g == GC_ZL || g == GC_ZP) { return 0; }
+    return 1;
+}
+fn _is_graph(c as i64) as i64 {
+    if (_is_print(c) == 0 || _is_space(c) == 1) { return 0; }
+    if (c >= 0x80 && _gc(c) == GC_ZS) { return 0; }   // the no-break spaces
+    return 1;
+}
+fn _is_punct(c as i64) as i64 { if (_is_graph(c) == 1 && _is_alnum(c) == 0) { return 1; } return 0; }
+fn _is_xdigit(c as i64) as i64 {
+    if (_is_digit(c) == 1 || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)) { return 1; }
+    return 0;
+}
+fn _is_upper(c as i64) as i64 {
+    if (c < 0x80) { if (c >= 65 && c <= 90) { return 1; } return 0; }
+    let is i64 as g = _gc(c);
+    if (g == GC_LU || g == GC_LT) { return 1; }
+    return 0;
+}
+fn _is_lower(c as i64) as i64 {
+    if (c < 0x80) { if (c >= 97 && c <= 122) { return 1; } return 0; }
+    if (_gc(c) == GC_LL) { return 1; }
+    return 0;
+}
+
+// Whether c is in any of the classes in mask.
+fn _in_classes(mask as i64, c as i64) as i64 {
+    if ((mask & CL_ALPHA) != 0 && _is_alpha(c) == 1) { return 1; }
+    if ((mask & CL_DIGIT) != 0 && _is_digit(c) == 1) { return 1; }
+    if ((mask & CL_ALNUM) != 0 && _is_alnum(c) == 1) { return 1; }
+    if ((mask & CL_UPPER) != 0 && _is_upper(c) == 1) { return 1; }
+    if ((mask & CL_LOWER) != 0 && _is_lower(c) == 1) { return 1; }
+    if ((mask & CL_SPACE) != 0 && _is_space(c) == 1) { return 1; }
+    if ((mask & CL_BLANK) != 0 && _is_blank(c) == 1) { return 1; }
+    if ((mask & CL_PUNCT) != 0 && _is_punct(c) == 1) { return 1; }
+    if ((mask & CL_PRINT) != 0 && _is_print(c) == 1) { return 1; }
+    if ((mask & CL_GRAPH) != 0 && _is_graph(c) == 1) { return 1; }
+    if ((mask & CL_CNTRL) != 0 && _is_cntrl(c) == 1) { return 1; }
+    if ((mask & CL_XDIGIT) != 0 && _is_xdigit(c) == 1) { return 1; }
+    if ((mask & CL_WORD) != 0 && _is_word(c) == 1) { return 1; }
+    return 0;
+}
+
+fn _set_has1(cls as *i64, off as i64, c as i64) as i64 {
+    if (_in_classes(cls[off + 1], c) == 1) { return 1; }
+    let is i64 as n = cls[off + 2];
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        if (c >= cls[off + 3 + k * 2] && c <= cls[off + 4 + k * 2]) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Whether the set at cls[off] has c (in either case, with RE_ICASE).
+fn _set_has(r as *Regex, off as i64, c as i64) as i64 {
+    let is *i64 as cls = cast(*i64, r.cls.va);
+    let is i64 as hit with mut = _set_has1(cls, off, c);
+    if (hit == 0 && (r.flags & RE_ICASE) != 0) {
+        let is i64 as lo = ucase.lower(c);
+        let is i64 as up = ucase.upper(c);
+        if (lo != c) { hit = _set_has1(cls, off, lo); }
+        if (hit == 0 && up != c) { hit = _set_has1(cls, off, up); }
+    }
+    if (cls[off] != 0) { return 1 - hit; }
+    return hit;
+}
+
+// ======================================================================
+// parser: pattern -> syntax tree
+
+fn _fail(p as *Parser, e as i64) as i64 { if (p.err == 0) { p.err = e; } return 0 - 1; }
+
+fn _peek(p as *Parser) as i64 {
+    if (p.pos >= p.plen) { return 0 - 1; }
+    let is *u8 as s = cast(*u8, p.pat);
+    return cast(i64, s[p.pos]);
+}
+fn _peek_at(p as *Parser, k as i64) as i64 {
+    if (p.pos + k >= p.plen) { return 0 - 1; }
+    let is *u8 as s = cast(*u8, p.pat);
+    return cast(i64, s[p.pos + k]);
+}
+fn _ere(p as *Parser) as i64 { if ((p.flags & RE_EXTENDED) != 0) { return 1; } return 0; }
+
+// The pattern's character at pos, consumed.
+fn _take_cp(p as *Parser) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as c = _cp(cast(*u8, p.pat), p.plen, p.pos, &k);
+    p.pos = p.pos + k;
+    return c;
+}
+
+fn _node(p as *Parser, t as i64, v as i64) as i64 {
+    let is i64 as n = p.ast.n / NODE;
+    if (_vgrow(&p.ast, p.ast.n + NODE) != 0) { return _fail(p, RE_ENOMEM); }
+    _vpush(&p.ast, t); _vpush(&p.ast, v); _vpush(&p.ast, 0); _vpush(&p.ast, 0);
+    _vpush(&p.ast, 0 - 1); _vpush(&p.ast, 0 - 1);
     return n;
 }
-fn node_cat(l as i64, r as i64) as i64 { let is i64 as n = node(A_CAT); AST_L[n] = l; AST_R[n] = r; return n; }
-fn node_wrap(t as i64, ch as i64) as i64 { let is i64 as n = node(t); AST_L[n] = ch; return n; }
+fn _nget(p as *Parser, n as i64, f as i64) as i64 { return _vat(&p.ast, n * NODE + f); }
+fn _nset(p as *Parser, n as i64, f as i64, x as i64) as void { _vput(&p.ast, n * NODE + f, x); }
 
-// ---- parser ----
-fn re_peek() as i64 { if (RE_POS < RE_PLEN) { let is *u8 as p = cast(*u8, RE_PAT); return cast(i64, p[RE_POS]); } return 0 - 1; }
-fn re_peek2() as i64 { if (RE_POS + 1 < RE_PLEN) { let is *u8 as p = cast(*u8, RE_PAT); return cast(i64, p[RE_POS + 1]); } return 0 - 1; }
-fn re_next() as i64 { let is i64 as c = re_peek(); RE_POS = RE_POS + 1; return c; }
-
-fn esc_literal(d as i64) as i64 {
-    if (d == 110) { return 10; }       // \n
-    if (d == 116) { return 9; }        // \t
-    if (d == 114) { return 13; }       // \r
-    if (d == 102) { return 12; }       // \f
-    if (d == 118) { return 11; }       // \v
-    if (d == 48) { return 0; }         // \0
-    return d;                          // \. \* \\ ... -> the char itself
-}
-fn is_named_escape(d as i64) as i64 {
-    if (d == 100 || d == 68 || d == 119 || d == 87 || d == 115 || d == 83) { return 1; }   // d D w W s S
+// Where the expression, a group or an alternative ends: the end of the
+// pattern, '|' / '\|', or ')' / '\)' inside a group.
+fn _at_end(p as *Parser) as i64 {
+    let is i64 as c = _peek(p);
+    if (c < 0) { return 1; }
+    if (_ere(p) == 1) {
+        if (c == 124) { return 1; }
+        if (c == 41 && p.depth > 0) { return 1; }
+        return 0;
+    }
+    if (c == 92) {
+        let is i64 as d = _peek_at(p, 1);
+        if (d == 124) { return 1; }
+        if (d == 41) { return 1; }      // an unmatched \) is an error, reported by the caller
+    }
     return 0;
 }
 
-// p_class: parse a [...] bracket expression at RE_POS (on '['). Returns a node.
-// (p_atom/p_class call p_alt, defined below — Caustic resolves forward refs.)
-fn p_class() as i64 {
-    re_next();                                        // [
-    let is i64 as idx = cls_new();
+// A new set at the end of cls; returns its offset.
+fn _set_new(p as *Parser, neg as i64, mask as i64) as i64 {
+    let is i64 as off = p.cls.n;
+    if (_vgrow(&p.cls, p.cls.n + 3) != 0) { return _fail(p, RE_ENOMEM); }
+    _vpush(&p.cls, neg); _vpush(&p.cls, mask); _vpush(&p.cls, 0);
+    return off;
+}
+fn _set_range(p as *Parser, off as i64, lo as i64, hi as i64) as void {
+    if (_vgrow(&p.cls, p.cls.n + 2) != 0) { _fail(p, RE_ENOMEM); return; }
+    _vpush(&p.cls, lo); _vpush(&p.cls, hi);
+    _vput(&p.cls, off + 2, _vat(&p.cls, off + 2) + 1);
+}
+
+fn _named(p as *Parser, at as i64, n as i64, lit as *u8) as i64 {
+    let is *u8 as s = cast(*u8, p.pat);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (lit[i] == cast(u8, 0) || lit[i] != s[at + i]) { return 0; }
+        i = i + 1;
+    }
+    if (lit[n] != cast(u8, 0)) { return 0; }
+    return 1;
+}
+
+fn _class_bit(p as *Parser, at as i64, n as i64) as i64 {
+    if (_named(p, at, n, "alpha") == 1) { return CL_ALPHA; }
+    if (_named(p, at, n, "digit") == 1) { return CL_DIGIT; }
+    if (_named(p, at, n, "alnum") == 1) { return CL_ALNUM; }
+    if (_named(p, at, n, "upper") == 1) { return CL_UPPER; }
+    if (_named(p, at, n, "lower") == 1) { return CL_LOWER; }
+    if (_named(p, at, n, "space") == 1) { return CL_SPACE; }
+    if (_named(p, at, n, "blank") == 1) { return CL_BLANK; }
+    if (_named(p, at, n, "punct") == 1) { return CL_PUNCT; }
+    if (_named(p, at, n, "print") == 1) { return CL_PRINT; }
+    if (_named(p, at, n, "graph") == 1) { return CL_GRAPH; }
+    if (_named(p, at, n, "cntrl") == 1) { return CL_CNTRL; }
+    if (_named(p, at, n, "xdigit") == 1) { return CL_XDIGIT; }
+    return 0;
+}
+
+// Inside [ ], at "[x" with x one of ':' '=' '.': the offset of the matching
+// "x]", or -1.
+fn _bracket_word_end(p as *Parser, kind as i64) as i64 {
+    let is *u8 as s = cast(*u8, p.pat);
+    let is i64 as i with mut = p.pos + 2;
+    while (i + 1 < p.plen) {
+        if (cast(i64, s[i]) == kind && cast(i64, s[i + 1]) == 93) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// One endpoint of a range inside [ ]: a character, [.c.] or [=c=], or an
+// escape with RE_ESCAPES. Sets *is_cls when it was [:class:] (no endpoint).
+fn _set_char(p as *Parser, off as i64, is_cls as *i64) as i64 {
+    is_cls[0] = 0;
+    let is i64 as c = _peek(p);
+    let is i64 as d = _peek_at(p, 1);
+    if (c == 91 && (d == 58 || d == 61 || d == 46)) {
+        let is i64 as e = _bracket_word_end(p, d);
+        if (e < 0) { return _fail(p, RE_EBRACK); }
+        let is i64 as at = p.pos + 2;
+        if (d == 58) {
+            let is i64 as bit = _class_bit(p, at, e - at);
+            if (bit == 0) { return _fail(p, RE_ECTYPE); }
+            _vput(&p.cls, off + 1, _vat(&p.cls, off + 1) | bit);
+            p.pos = e + 2;
+            is_cls[0] = 1;
+            return 0;
+        }
+        // [=c=] and [.c.]: one character, which is all a collating element is here
+        let is i64 as k with mut = 0;
+        if (e == at) { return _fail(p, RE_EBRACK); }
+        let is i64 as v = _cp(cast(*u8, p.pat), e, at, &k);
+        if (at + k != e) { return _fail(p, RE_EBRACK); }
+        p.pos = e + 2;
+        return v;
+    }
+    if (c == 92 && (p.flags & RE_ESCAPES) != 0 && d >= 0) {
+        if (d == 110) { p.pos = p.pos + 2; return 10; }
+        if (d == 116) { p.pos = p.pos + 2; return 9; }
+        if (d == 92) { p.pos = p.pos + 2; return 92; }
+    }
+    return _take_cp(p);
+}
+
+// A bracket expression, at its '['.
+fn _bracket(p as *Parser) as i64 {
+    p.pos = p.pos + 1;
     let is i64 as neg with mut = 0;
-    if (re_peek() == 94) { neg = 1; re_next(); }      // ^
+    if (_peek(p) == 94) { neg = 1; p.pos = p.pos + 1; }
+    let is i64 as off = _set_new(p, neg, 0);
+    if (off < 0) { return 0 - 1; }
     let is i64 as first with mut = 1;
     while (1 == 1) {
-        let is i64 as c = re_peek();
-        if (c < 0) { RE_ERR = 1; break; }
-        if (c == 93 && first == 0) { break; }         // closing ] (not if first char)
-        re_next();
+        let is i64 as c = _peek(p);
+        if (c < 0) { return _fail(p, RE_EBRACK); }
+        if (c == 93 && first == 0) { p.pos = p.pos + 1; break; }
         first = 0;
-        if (c == 92) {                                // escape inside class
-            let is i64 as d = re_next();
-            if (is_named_escape(d) != 0) { cls_add_named(idx, re_lc(d)); } else { cls_set(idx, esc_literal(d)); }
-        } else if (re_peek() == 45 && re_peek2() != 93 && re_peek2() >= 0) {   // range c-d
-            re_next();                                // -
-            let is i64 as c2v with mut = re_next();
-            if (c2v == 92) { c2v = esc_literal(re_next()); }
-            cls_range(idx, c, c2v);
-        } else {
-            cls_set(idx, c);
+        let is i64 as is_cls with mut = 0;
+        let is i64 as lo = _set_char(p, off, &is_cls);
+        if (p.err != 0) { return 0 - 1; }
+        if (is_cls == 0) {
+            if (_peek(p) == 45 && _peek_at(p, 1) != 93 && _peek_at(p, 1) >= 0) {
+                p.pos = p.pos + 1;
+                let is i64 as hi = _set_char(p, off, &is_cls);
+                if (p.err != 0) { return 0 - 1; }
+                if (is_cls == 1 || hi < lo) { return _fail(p, RE_ERANGE); }
+                _set_range(p, off, lo, hi);
+            } else {
+                _set_range(p, off, lo, lo);
+            }
         }
+        if (p.err != 0) { return 0 - 1; }
     }
-    if (re_peek() == 93) { re_next(); } else { RE_ERR = 1; }
-    if (neg != 0) { cls_invert(idx); }
-    let is i64 as n = node(A_CLASS); AST_CLS[n] = idx; return n;
+    return _node(p, N_CLASS, off);
 }
 
-fn p_atom() as i64 {
-    let is i64 as c = re_peek();
-    if (c == 40) {                                    // (
-        re_next();
-        let is i64 as inner = p_alt();
-        if (re_peek() == 41) { re_next(); } else { RE_ERR = 1; }
-        return inner;
-    }
-    if (c == 91) { return p_class(); }                // [
-    if (c == 46) { re_next(); return node(A_ANY); }   // .
-    if (c == 94) { re_next(); return node(A_BOL); }   // ^
-    if (c == 36) { re_next(); return node(A_EOL); }   // $
-    if (c == 92) {                                    // backslash
-        re_next();
-        let is i64 as d = re_next();
-        if (is_named_escape(d) != 0) {
-            let is i64 as idx = cls_new();
-            cls_add_named(idx, re_lc(d));
-            if (d == 68 || d == 87 || d == 83) { cls_invert(idx); }   // upper = negate
-            let is i64 as n = node(A_CLASS); AST_CLS[n] = idx; return n;
-        }
-        let is i64 as n = node(A_CHAR); AST_C[n] = esc_literal(d); return n;
-    }
-    re_next();
-    let is i64 as n = node(A_CHAR); AST_C[n] = c; return n;
+fn _hexval(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
 }
 
-// scan a {n,m} starting at RE_POS without consuming; 1 if well-formed.
-fn brace_ok() as i64 {
-    let is *u8 as p = cast(*u8, RE_PAT);
-    let is i64 as i with mut = RE_POS + 1;            // past '{'
-    let is i64 as digits with mut = 0;
-    while (i < RE_PLEN && cast(i64, p[i]) >= 48 && cast(i64, p[i]) <= 57) { i = i + 1; digits = digits + 1; }
-    if (i < RE_PLEN && cast(i64, p[i]) == 44) {       // ,
-        i = i + 1;
-        while (i < RE_PLEN && cast(i64, p[i]) >= 48 && cast(i64, p[i]) <= 57) { i = i + 1; digits = digits + 1; }
+// \xHH at pos (the 'x' is at pos + 1): its byte, or -1 when there are no hex
+// digits. Consumes it.
+fn _hex_byte(p as *Parser) as i64 {
+    let is i64 as h1 = _hexval(_peek_at(p, 2));
+    if (h1 < 0) { return 0 - 1; }
+    let is i64 as v with mut = h1;
+    let is i64 as h2 = _hexval(_peek_at(p, 3));
+    if (h2 >= 0) { v = v * 16 + h2; p.pos = p.pos + 4; } else { p.pos = p.pos + 3; }
+    return v;
+}
+
+// \xHH: a byte; a run of \xHH that spells one UTF-8 character is that
+// character, so "\xc3\xa7" is ç.
+fn _hex_char(p as *Parser) as i64 {
+    let is i64 as b0 = _hex_byte(p);
+    if (b0 < 0x80) { return b0; }
+    let is i64 as need with mut = 0;
+    if (b0 >= 0xC0 && b0 < 0xE0) { need = 1; }
+    else if (b0 >= 0xE0 && b0 < 0xF0) { need = 2; }
+    else if (b0 >= 0xF0 && b0 < 0xF8) { need = 3; }
+    let is [4]u8 as b;
+    b[0] = cast(u8, b0);
+    let is i64 as save = p.pos;
+    let is i64 as got with mut = 0;
+    while (got < need && _peek(p) == 92 && _peek_at(p, 1) == 120) {
+        let is i64 as at = p.pos;
+        let is i64 as v = _hex_byte(p);
+        if (v < 0 || (v & 0xC0) != 0x80) { p.pos = at; break; }
+        b[got + 1] = cast(u8, v);
+        got = got + 1;
     }
-    if (digits == 0) { return 0; }
-    if (i < RE_PLEN && cast(i64, p[i]) == 125) { return 1; }   // }
+    if (need > 0 && got == need) {
+        let is i32 as c with mut = 0;
+        if (utf8.decode1(cast(*u8, &b[0]), need + 1, 0, &c) == need + 1) { return cast(i64, c); }
+    }
+    p.pos = save;
+    return 0x110000 + b0;
+}
+
+// The escape at pos (on the '\'): a node.
+fn _escape(p as *Parser) as i64 {
+    let is i64 as d = _peek_at(p, 1);
+    if (d < 0) { return _fail(p, RE_EESCAPE); }
+    if (d >= 49 && d <= 57) {
+        let is i64 as g = d - 48;
+        if (g > p.ngroups || _vat(&p.closed, g) == 0) { return _fail(p, RE_ESUBREG); }
+        p.pos = p.pos + 2;
+        p.bref = 1;
+        return _node(p, N_BREF, g);
+    }
+    if (d == 119 || d == 87 || d == 115 || d == 83 || d == 100 || d == 68) {   // w W s S d D
+        p.pos = p.pos + 2;
+        let is i64 as neg with mut = 0;
+        if (d == 87 || d == 83 || d == 68) { neg = 1; }
+        let is i64 as mask with mut = CL_WORD;
+        if (d == 115 || d == 83) { mask = CL_SPACE; }
+        if (d == 100 || d == 68) { mask = CL_DIGIT; }
+        let is i64 as off = _set_new(p, neg, mask);
+        if (off < 0) { return 0 - 1; }
+        return _node(p, N_CLASS, off);
+    }
+    let is i64 as kind with mut = 0;
+    if (d == 98) { kind = AS_WB; }          // \b
+    else if (d == 66) { kind = AS_NWB; }    // \B
+    else if (d == 60) { kind = AS_WS; }     // \<
+    else if (d == 62) { kind = AS_WE; }     // \>
+    else if (d == 96) { kind = AS_BUFS; }   // \`
+    else if (d == 39) { kind = AS_BUFE; }   // \'
+    if (kind != 0) { p.pos = p.pos + 2; return _node(p, N_ASSERT, kind); }
+    if (d == 110) { p.pos = p.pos + 2; return _node(p, N_CHAR, 10); }
+    if (d == 116) { p.pos = p.pos + 2; return _node(p, N_CHAR, 9); }
+    if (d == 120 && _hexval(_peek_at(p, 2)) >= 0) { return _node(p, N_CHAR, _hex_char(p)); }
+    p.pos = p.pos + 1;
+    return _node(p, N_CHAR, _take_cp(p));         // \. \* \\ ...: the character itself
+}
+
+// The interval at pos, just past its '{' (ERE) or '\{' (BRE). Writes lo/hi
+// (hi -1 = no limit) and consumes through the closing brace; 0 when there is
+// no well-formed interval (nothing consumed), -1 with p.err on a bad count.
+fn _interval(p as *Parser, at as i64, lo as *i64, hi as *i64) as i64 {
+    let is *u8 as s = cast(*u8, p.pat);
+    let is i64 as i with mut = at;
+    let is i64 as a with mut = 0; let is i64 as na with mut = 0;
+    while (i < p.plen && cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) {
+        if (a <= DUP_MAX) { a = a * 10 + cast(i64, s[i]) - 48; }
+        i = i + 1; na = na + 1;
+    }
+    let is i64 as b with mut = a; let is i64 as nb with mut = 0;
+    let is i64 as comma with mut = 0;
+    if (i < p.plen && cast(i64, s[i]) == 44) {
+        comma = 1; i = i + 1; b = 0 - 1;
+        while (i < p.plen && cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) {
+            if (b < 0) { b = 0; }
+            if (b <= DUP_MAX) { b = b * 10 + cast(i64, s[i]) - 48; }
+            i = i + 1; nb = nb + 1;
+        }
+    }
+    // the closing brace: '}' in an ERE, '\}' in a BRE
+    let is i64 as close with mut = 0;
+    if (_ere(p) == 1) {
+        if (i < p.plen && cast(i64, s[i]) == 125) { close = 1; }
+    } else {
+        if (i + 1 < p.plen && cast(i64, s[i]) == 92 && cast(i64, s[i + 1]) == 125) { close = 2; }
+    }
+    if (close == 0 || (na == 0 && nb == 0)) {
+        if (_ere(p) == 1) { return 0; }           // an ordinary '{'
+        if (close == 0) { return _fail(p, RE_EBRACE); }
+        return _fail(p, RE_EBADBR);
+    }
+    if (comma == 0) { b = a; }
+    if (a > DUP_MAX || b > DUP_MAX) { return _fail(p, RE_ESIZE); }
+    if (b >= 0 && b < a) { return _fail(p, RE_EBADBR); }
+    lo[0] = a; hi[0] = b;
+    p.pos = i + close;
+    return 1;
+}
+
+// An atom: a character, '.', a set, a group, an anchor, an escape. `lead` is 1
+// where a BRE's '*' and '^' are special in a different way (first in the
+// expression, after \( or \|).
+fn _atom(p as *Parser, lead as i64) as i64 {
+    let is i64 as c = _peek(p);
+    if (c == 46) { p.pos = p.pos + 1; return _node(p, N_ANY, 0); }
+    if (c == 91) { return _bracket(p); }
+    if (_ere(p) == 1) {
+        if (c == 40) {
+            p.pos = p.pos + 1;
+            return _group(p);
+        }
+        if (c == 94) { p.pos = p.pos + 1; return _node(p, N_ASSERT, AS_BOL); }
+        if (c == 36) { p.pos = p.pos + 1; return _node(p, N_ASSERT, AS_EOL); }
+        if (c == 92) { return _escape(p); }
+        return _node(p, N_CHAR, _take_cp(p));     // a ')' with no '(', or '*' '+' '?' '{' with nothing before
+    }
+    if (c == 92) {
+        let is i64 as d = _peek_at(p, 1);
+        if (d == 40) {
+            p.pos = p.pos + 2;
+            return _group(p);
+        }
+        if (d == 41) { return _fail(p, RE_ERPAREN); }
+        if (d == 123) { return _fail(p, RE_EBADRPT); }          // \{ with nothing before
+        if (d == 43 || d == 63) { p.pos = p.pos + 2; return _node(p, N_CHAR, d); }   // \+ \? likewise
+        return _escape(p);
+    }
+    if (c == 94 && lead == 1) { p.pos = p.pos + 1; return _node(p, N_ASSERT, AS_BOL); }
+    if (c == 36) {
+        p.pos = p.pos + 1;
+        if (_at_end(p) == 1) { return _node(p, N_ASSERT, AS_EOL); }
+        return _node(p, N_CHAR, 36);
+    }
+    return _node(p, N_CHAR, _take_cp(p));
+}
+
+// A group, just past its '(' / '\('.
+fn _group(p as *Parser) as i64 {
+    if (p.depth >= MAX_DEPTH) { return _fail(p, RE_EDEPTH); }
+    p.ngroups = p.ngroups + 1;
+    let is i64 as g = p.ngroups;
+    if (_vpush(&p.closed, 0) != 0) { return _fail(p, RE_ENOMEM); }
+    p.depth = p.depth + 1;
+    let is i64 as inner = _alt(p);
+    p.depth = p.depth - 1;
+    if (inner < 0) { return 0 - 1; }
+    if (_ere(p) == 1) {
+        if (_peek(p) != 41) { return _fail(p, RE_EPAREN); }
+        p.pos = p.pos + 1;
+    } else {
+        if (_peek(p) != 92 || _peek_at(p, 1) != 41) { return _fail(p, RE_EPAREN); }
+        p.pos = p.pos + 2;
+    }
+    _vput(&p.closed, g, 1);
+    let is i64 as n = _node(p, N_GROUP, g);
+    if (n >= 0) { _nset(p, n, 4, inner); }
+    return n;
+}
+
+// The repetition operator at pos, if any: 1 with lo/hi, 0 if none.
+fn _rep_op(p as *Parser, lo as *i64, hi as *i64) as i64 {
+    let is i64 as c = _peek(p);
+    if (c == 42) { p.pos = p.pos + 1; lo[0] = 0; hi[0] = 0 - 1; return 1; }
+    if (_ere(p) == 1) {
+        if (c == 43) { p.pos = p.pos + 1; lo[0] = 1; hi[0] = 0 - 1; return 1; }
+        if (c == 63) { p.pos = p.pos + 1; lo[0] = 0; hi[0] = 1; return 1; }
+        if (c == 123) { return _interval(p, p.pos + 1, lo, hi); }
+        return 0;
+    }
+    if (c != 92) { return 0; }
+    let is i64 as d = _peek_at(p, 1);
+    if (d == 43) { p.pos = p.pos + 2; lo[0] = 1; hi[0] = 0 - 1; return 1; }
+    if (d == 63) { p.pos = p.pos + 2; lo[0] = 0; hi[0] = 1; return 1; }
+    if (d == 123) { return _interval(p, p.pos + 2, lo, hi); }
     return 0;
 }
-// parse {n}, {n,}, {n,m}, {,m}; expand by reusing child node `a`.
-fn p_brace(a as i64) as i64 {
-    re_next();                                        // {
-    let is i64 as n with mut = 0; let is i64 as haveN with mut = 0;
-    while (re_peek() >= 48 && re_peek() <= 57) { n = n * 10 + (re_next() - 48); haveN = 1; }
-    let is i64 as m with mut = n; let is i64 as inf with mut = 0;
-    if (re_peek() == 44) {                            // ,
-        re_next();
-        if (re_peek() == 125) { inf = 1; }            // {n,} -> n or more
-        else { m = 0; while (re_peek() >= 48 && re_peek() <= 57) { m = m * 10 + (re_next() - 48); } }
-    }
-    if (re_peek() == 125) { re_next(); }
-    if (n > 100 || m > 100) { RE_ERR = 1; return a; }
-    let is i64 as result with mut = node(A_EMPTY);
-    let is i64 as k with mut = 0;
-    while (k < n) { result = node_cat(result, a); k = k + 1; }
-    if (inf != 0) { result = node_cat(result, node_wrap(A_STAR, a)); }
-    else { k = n; while (k < m) { result = node_cat(result, node_wrap(A_QUEST, a)); k = k + 1; } }
-    return result;
-}
 
-fn p_rep() as i64 {
-    let is i64 as a with mut = p_atom();
-    let is i64 as go with mut = 1;
-    while (go != 0) {
-        let is i64 as c = re_peek();
-        if (c == 42) { re_next(); a = node_wrap(A_STAR, a); }
-        else if (c == 43) { re_next(); a = node_wrap(A_PLUS, a); }
-        else if (c == 63) { re_next(); a = node_wrap(A_QUEST, a); }
-        else if (c == 123 && brace_ok() != 0) { a = p_brace(a); }
-        else { go = 0; }
+// An atom and the repetitions after it.
+fn _rep(p as *Parser, lead as i64) as i64 {
+    let is i64 as c = _peek(p);
+    let is i64 as a with mut = 0 - 1;
+    // a '*' with nothing to repeat is an ordinary '*' (and in an ERE so are + ? {)
+    if (lead == 1 && c == 42) { p.pos = p.pos + 1; a = _node(p, N_CHAR, 42); }
+    else if (lead == 1 && _ere(p) == 1 && (c == 43 || c == 63 || c == 123)) { p.pos = p.pos + 1; a = _node(p, N_CHAR, c); }
+    else { a = _atom(p, lead); }
+    if (a < 0) { return 0 - 1; }
+    // a BRE's leading ^ is an anchor, and a '*' after it is a character (_cat)
+    if (_ere(p) == 0 && _nget(p, a, 0) == N_ASSERT && _nget(p, a, 1) == AS_BOL) { return a; }
+    while (1 == 1) {
+        let is i64 as lo with mut = 0; let is i64 as hi with mut = 0;
+        let is i64 as k = _rep_op(p, &lo, &hi);
+        if (k < 0) { return 0 - 1; }
+        if (k == 0) { break; }
+        let is i64 as n = _node(p, N_REP, 0);
+        if (n < 0) { return 0 - 1; }
+        _nset(p, n, 2, lo); _nset(p, n, 3, hi); _nset(p, n, 4, a);
+        a = n;
     }
     return a;
 }
 
-fn p_cat() as i64 {
-    let is i64 as c = re_peek();
-    if (c < 0 || c == 124 || c == 41) { return node(A_EMPTY); }
-    let is i64 as acc with mut = p_rep();
-    while (1 == 1) {
-        let is i64 as d = re_peek();
-        if (d < 0 || d == 124 || d == 41) { break; }
-        acc = node_cat(acc, p_rep());
+// A sequence of repetitions, up to the end of an alternative.
+fn _cat(p as *Parser) as i64 {
+    let is i64 as cat = _node(p, N_CAT, 0);
+    if (cat < 0) { return 0 - 1; }
+    let is i64 as last with mut = 0 - 1;
+    let is i64 as lead with mut = 1;
+    while (_at_end(p) == 0) {
+        let is i64 as a = _rep(p, lead);
+        if (a < 0) { return 0 - 1; }
+        // after a BRE's leading ^, a '*' still has nothing before it
+        lead = 0;
+        if (_ere(p) == 0 && _nget(p, a, 0) == N_ASSERT && _nget(p, a, 1) == AS_BOL) { lead = 1; }
+        if (last < 0) { _nset(p, cat, 4, a); } else { _nset(p, last, 5, a); }
+        last = a;
     }
-    return acc;
+    if (_ere(p) == 0 && _peek(p) == 92 && _peek_at(p, 1) == 41 && p.depth == 0) { return _fail(p, RE_ERPAREN); }
+    return cat;
 }
 
-fn p_alt() as i64 {
-    let is i64 as l with mut = p_cat();
-    while (re_peek() == 124) {                         // |
-        re_next();
-        let is i64 as r = p_cat();
-        let is i64 as n = node(A_ALT); AST_L[n] = l; AST_R[n] = r; l = n;
+// Alternatives.
+fn _alt(p as *Parser) as i64 {
+    let is i64 as first = _cat(p);
+    if (first < 0) { return 0 - 1; }
+    if (_is_bar(p) == 0) { return first; }
+    let is i64 as alt = _node(p, N_ALT, 0);
+    if (alt < 0) { return 0 - 1; }
+    _nset(p, alt, 4, first);
+    let is i64 as last with mut = first;
+    while (_is_bar(p) == 1) {
+        if (_ere(p) == 1) { p.pos = p.pos + 1; } else { p.pos = p.pos + 2; }
+        let is i64 as nx = _cat(p);
+        if (nx < 0) { return 0 - 1; }
+        _nset(p, last, 5, nx);
+        last = nx;
     }
-    return l;
+    return alt;
 }
 
-// ---- emit AST -> bytecode ----
-fn new_inst(op as i64) as i64 {
-    if (RE_NI >= 1022) { RE_ERR = 1; return 0; }
-    let is i64 as i = RE_NI; RE_OP[i] = op; RE_X[i] = 0; RE_Y[i] = 0; RE_NI = RE_NI + 1; return i;
-}
-fn emit(n as i64) as void {
-    if (RE_ERR != 0 || n < 0) { return; }
-    let is i64 as t = AST_T[n];
-    if (t == A_CHAR) { let is i64 as i = new_inst(OP_CHAR); RE_X[i] = AST_C[n]; }
-    else if (t == A_ANY) { new_inst(OP_ANY); }
-    else if (t == A_CLASS) { let is i64 as i = new_inst(OP_CLASS); RE_X[i] = AST_CLS[n]; }
-    else if (t == A_BOL) { new_inst(OP_BOL); }
-    else if (t == A_EOL) { new_inst(OP_EOL); }
-    else if (t == A_EMPTY) { }
-    else if (t == A_CAT) { emit(AST_L[n]); emit(AST_R[n]); }
-    else if (t == A_ALT) {
-        let is i64 as s = new_inst(OP_SPLIT); RE_X[s] = RE_NI;
-        emit(AST_L[n]);
-        let is i64 as j = new_inst(OP_JMP); RE_Y[s] = RE_NI;
-        emit(AST_R[n]); RE_X[j] = RE_NI;
-    }
-    else if (t == A_STAR) {
-        let is i64 as l1 = new_inst(OP_SPLIT); RE_X[l1] = RE_NI;
-        emit(AST_L[n]);
-        let is i64 as jj = new_inst(OP_JMP); RE_X[jj] = l1; RE_Y[l1] = RE_NI;
-    }
-    else if (t == A_PLUS) {
-        let is i64 as l1 = RE_NI;
-        emit(AST_L[n]);
-        let is i64 as s = new_inst(OP_SPLIT); RE_X[s] = l1; RE_Y[s] = RE_NI;
-    }
-    else if (t == A_QUEST) {
-        let is i64 as s = new_inst(OP_SPLIT); RE_X[s] = RE_NI;
-        emit(AST_L[n]); RE_Y[s] = RE_NI;
-    }
-    return;
+fn _is_bar(p as *Parser) as i64 {
+    if (_ere(p) == 1) { if (_peek(p) == 124) { return 1; } return 0; }
+    if (_peek(p) == 92 && _peek_at(p, 1) == 124) { return 1; }
+    return 0;
 }
 
-// re_compile: build the program for `pat`. icase=1 folds case; fixed=1 treats
-// the pattern as a literal string. Returns 0 on success, -1 on a malformed
-// pattern (the engine then matches nothing).
-fn re_compile(pat as *u8, plen as i64, icase as i64, fixed as i64) as i64 {
-    RE_NI = 0; RE_NC = 0; RE_NAST = 0; RE_ERR = 0; RE_ICASE = icase;
-    RE_PAT = cast(i64, pat); RE_PLEN = plen; RE_POS = 0;
-    if (fixed != 0) {
+// ======================================================================
+// syntax tree -> program
+
+fn _inst(p as *Parser, r as *Regex, op as i64, x as i64, y as i64) as i64 {
+    if (p.err != 0) { return 0 - 1; }
+    let is i64 as pc = r.prog.n / INST;
+    if (pc >= MAX_INST) { return _fail(p, RE_ESIZE); }
+    if (_vgrow(&r.prog, r.prog.n + INST) != 0) { return _fail(p, RE_ENOMEM); }
+    _vpush(&r.prog, op); _vpush(&r.prog, x); _vpush(&r.prog, y);
+    return pc;
+}
+fn _patch(r as *Regex, pc as i64, f as i64, v as i64) as void { _vput(&r.prog, pc * INST + f, v); }
+fn _pc(r as *Regex) as i64 { return r.prog.n / INST; }
+
+// `kid` repeated without limit. An iteration that takes nothing is allowed,
+// once, and ends the loop: (a*)* against "" matches with the group set to "".
+//   Pike VM:       L1: SPLIT L2, L3   L2: kid   SPLIT L1, L3   L3:
+//   backtracking:  L1: SPLIT L2, L3   L2: MARK  kid  CHECK ->L3  JMP L1   L3:
+// The VM's back edge offers L3 itself because L1 has already been seen at this
+// position when an empty iteration comes back to it; backtracking needs the
+// MARK/CHECK pair instead, or an empty iteration would loop for ever.
+fn _emit_star(p as *Parser, r as *Regex, kid as i64) as void {
+    let is i64 as l1 = _inst(p, r, I_SPLIT, 0, 0);
+    if (l1 < 0) { return; }
+    _patch(r, l1, 1, _pc(r));
+    if (p.bref == 1) {
+        let is i64 as loop = p.nloops;
+        p.nloops = p.nloops + 1;
+        _inst(p, r, I_MARK, loop, 0);
+        _emit(p, r, kid);
+        let is i64 as chk = _inst(p, r, I_CHECK, loop, 0);
+        _inst(p, r, I_JMP, l1, 0);
+        if (p.err != 0) { return; }
+        _patch(r, chk, 2, _pc(r));
+        _patch(r, l1, 2, _pc(r));
+        return;
+    }
+    _emit(p, r, kid);
+    let is i64 as back = _inst(p, r, I_SPLIT, l1, 0);
+    if (p.err != 0) { return; }
+    _patch(r, back, 2, _pc(r));
+    _patch(r, l1, 2, _pc(r));
+}
+
+fn _emit(p as *Parser, r as *Regex, n as i64) as void {
+    if (p.err != 0 || n < 0) { return; }
+    let is i64 as t = _nget(p, n, 0);
+    let is i64 as v = _nget(p, n, 1);
+    if (t == N_CHAR) {
+        if ((r.flags & RE_ICASE) != 0) { _inst(p, r, I_CHAR, ucase.lower(v), 0); } else { _inst(p, r, I_CHAR, v, 0); }
+        return;
+    }
+    if (t == N_ANY) { _inst(p, r, I_ANY, 0, 0); return; }
+    if (t == N_CLASS) { _inst(p, r, I_CLASS, v, 0); return; }
+    if (t == N_ASSERT) { _inst(p, r, I_ASSERT, v, 0); return; }
+    if (t == N_BREF) { _inst(p, r, I_BREF, v, 0); return; }
+    if (t == N_EMPTY) { return; }
+    if (t == N_GROUP) {
+        _inst(p, r, I_SAVE, v * 2, 0);
+        _emit(p, r, _nget(p, n, 4));
+        _inst(p, r, I_SAVE, v * 2 + 1, 0);
+        return;
+    }
+    if (t == N_CAT) {
+        let is i64 as k with mut = _nget(p, n, 4);
+        while (k >= 0 && p.err == 0) { _emit(p, r, k); k = _nget(p, k, 5); }
+        return;
+    }
+    if (t == N_ALT) {
+        // SPLIT a, next; a; JMP end; next: SPLIT b, next2; b; JMP end; ... last
+        let is i64 as jumps with mut = 0 - 1;      // chain of JMPs to patch, through their x
+        let is i64 as k with mut = _nget(p, n, 4);
+        while (k >= 0 && p.err == 0) {
+            let is i64 as nx = _nget(p, k, 5);
+            if (nx < 0) { _emit(p, r, k); break; }
+            let is i64 as s = _inst(p, r, I_SPLIT, 0, 0);
+            if (s < 0) { return; }
+            _patch(r, s, 1, _pc(r));
+            _emit(p, r, k);
+            let is i64 as j = _inst(p, r, I_JMP, jumps, 0);
+            if (j < 0) { return; }
+            jumps = j;
+            _patch(r, s, 2, _pc(r));
+            k = nx;
+        }
+        if (p.err != 0) { return; }
+        let is i64 as end = _pc(r);
+        while (jumps >= 0) {
+            let is i64 as nj = _vat(&r.prog, jumps * INST + 1);
+            _patch(r, jumps, 1, end);
+            jumps = nj;
+        }
+        return;
+    }
+    if (t == N_REP) {
+        let is i64 as lo = _nget(p, n, 2);
+        let is i64 as hi = _nget(p, n, 3);
+        let is i64 as kid = _nget(p, n, 4);
+        if (hi < 0) {
+            if (lo == 0) { _emit_star(p, r, kid); return; }
+            let is i64 as i with mut = 0;
+            while (i < lo - 1 && p.err == 0) { _emit(p, r, kid); i = i + 1; }
+            if (p.bref == 1) {
+                // kid kid*: the guard must not stop a first iteration that takes nothing
+                _emit(p, r, kid);
+                _emit_star(p, r, kid);
+                return;
+            }
+            let is i64 as top = _pc(r);
+            _emit(p, r, kid);
+            let is i64 as s = _inst(p, r, I_SPLIT, top, 0);
+            if (s >= 0) { _patch(r, s, 2, _pc(r)); }
+            return;
+        }
         let is i64 as i with mut = 0;
-        while (i < plen) { let is i64 as ic = new_inst(OP_CHAR); RE_X[ic] = cast(i64, pat[i]); i = i + 1; }
-    } else {
-        let is i64 as root = p_alt();
-        if (RE_POS < RE_PLEN) { RE_ERR = 1; }          // leftover ')' etc.
-        emit(root);
+        while (i < lo && p.err == 0) { _emit(p, r, kid); i = i + 1; }
+        // up to hi - lo more, nested — (x(x(x)?)?)? — so the choices do not multiply
+        let is i64 as splits with mut = 0 - 1;     // chain through y
+        i = lo;
+        while (i < hi && p.err == 0) {
+            let is i64 as s = _inst(p, r, I_SPLIT, 0, splits);
+            if (s < 0) { return; }
+            _patch(r, s, 1, _pc(r));
+            splits = s;
+            _emit(p, r, kid);
+            i = i + 1;
+        }
+        if (p.err != 0) { return; }
+        let is i64 as end = _pc(r);
+        while (splits >= 0) {
+            let is i64 as ns = _vat(&r.prog, splits * INST + 2);
+            _patch(r, splits, 2, end);
+            splits = ns;
+        }
+        return;
     }
-    new_inst(OP_MATCH);
-    if (RE_ERR != 0) { return 0 - 1; }
+}
+
+// Whether every match must begin at a ^ (no RE_NEWLINE): then a search need
+// only try the subject's start.
+fn _starts_bol(p as *Parser, n as i64) as i64 {
+    if (n < 0) { return 0; }
+    let is i64 as t = _nget(p, n, 0);
+    if (t == N_ASSERT) { if (_nget(p, n, 1) == AS_BOL) { return 1; } return 0; }
+    if (t == N_GROUP) { return _starts_bol(p, _nget(p, n, 4)); }
+    if (t == N_CAT) { return _starts_bol(p, _nget(p, n, 4)); }
+    if (t == N_ALT) {
+        let is i64 as k with mut = _nget(p, n, 4);
+        while (k >= 0) { if (_starts_bol(p, k) == 0) { return 0; } k = _nget(p, k, 5); }
+        return 1;
+    }
+    if (t == N_REP && _nget(p, n, 2) > 0) { return _starts_bol(p, _nget(p, n, 4)); }
     return 0;
 }
 
-// ---- NFA simulation ----
-fn char_eq(target as i64, c as i64) as i64 {
-    if (RE_ICASE != 0) { if (re_lc(target) == re_lc(c)) { return 1; } return 0; }
-    if (target == c) { return 1; }
-    return 0;
-}
-// add pc (following epsilon transitions: jmp/split/anchors) to `list`.
-fn addthread(list as *i64, ln as *i64, pc as i64, sp as i64, len as i64) as void {
-    if (RE_SEEN[pc] == RE_GEN) { return; }
-    RE_SEEN[pc] = RE_GEN;
-    let is i64 as op = RE_OP[pc];
-    if (op == OP_JMP) { addthread(list, ln, RE_X[pc], sp, len); return; }
-    if (op == OP_SPLIT) { addthread(list, ln, RE_X[pc], sp, len); addthread(list, ln, RE_Y[pc], sp, len); return; }
-    if (op == OP_BOL) { if (sp == 0) { addthread(list, ln, pc + 1, sp, len); } return; }
-    if (op == OP_EOL) { if (sp == len) { addthread(list, ln, pc + 1, sp, len); } return; }
-    list[ln[0]] = pc; ln[0] = ln[0] + 1;             // CHAR/ANY/CLASS/MATCH
+// The character every match starts with, or -1.
+fn _lead_char(p as *Parser, n as i64) as i64 {
+    if (n < 0) { return 0 - 1; }
+    let is i64 as t = _nget(p, n, 0);
+    if (t == N_CHAR) { return _nget(p, n, 1); }
+    if (t == N_GROUP) { return _lead_char(p, _nget(p, n, 4)); }
+    if (t == N_CAT) {
+        let is i64 as k with mut = _nget(p, n, 4);
+        while (k >= 0 && _nget(p, k, 0) == N_ASSERT) { k = _nget(p, k, 5); }   // ^ \< ... take nothing
+        return _lead_char(p, k);
+    }
+    if (t == N_REP && _nget(p, n, 2) > 0) { return _lead_char(p, _nget(p, n, 4)); }
+    return 0 - 1;
 }
 
-// step the current thread set over byte c; returns the next-list count.
-fn step(s as *u8, sp as i64, len as i64, cn as i64, restart as i64) as i64 {
-    let is i64 as c = cast(i64, s[sp]);
-    RE_GEN = RE_GEN + 1;
-    let is i64 as nn with mut = 0;
+// The byte a search can skip ahead to: the first of the lead character's
+// encoding. Only a byte that never continues a character (ASCII, or a UTF-8
+// lead byte) will do, and only a character without case when case is folded.
+fn _lead_byte(c as i64, flags as i64) as i64 {
+    if (c < 0) { return 0 - 1; }
+    if ((flags & RE_ICASE) != 0 && (ucase.lower(c) != c || ucase.upper(c) != c)) { return 0 - 1; }
+    if (c < 0x80) { return c; }
+    if (c >= 0x110000) {
+        if (c - 0x110000 >= 0xC0) { return c - 0x110000; }
+        return 0 - 1;
+    }
+    let is [4]u8 as b;
+    if (utf8.encode1(cast(i32, c), cast(*u8, &b[0])) <= 0) { return 0 - 1; }
+    return cast(i64, b[0]);
+}
+
+// compile: pattern pat[0..plen) into r. 0, or the negated RE_E* of what is
+// wrong with it (err_text says it in words). r holds mappings until release().
+fn compile(r as *Regex, pat as *u8, plen as i64, flags as i64) as i64 {
+    _vinit(&r.prog); _vinit(&r.cls); _vinit(&r.vm); _vinit(&r.bt);
+    r.ngroups = 0; r.nloops = 0; r.bref = 0; r.flags = flags; r.lead = 0 - 1; r.bol = 0; r.vmcap = 0; r.epoch = 0;
+    let is Parser as p;
+    p.pat = cast(i64, pat); p.plen = plen; p.pos = 0; p.flags = flags; p.err = 0;
+    p.ngroups = 0; p.depth = 0; p.bref = 0; p.nloops = 0;
+    _vinit(&p.ast); _vinit(&p.cls); _vinit(&p.closed);
+    _vpush(&p.closed, 0);                       // group 0, the whole match
+    let is i64 as root with mut = 0 - 1;
+    if ((flags & RE_FIXED) != 0) {
+        root = _node(&p, N_CAT, 0);
+        let is i64 as last with mut = 0 - 1;
+        while (p.pos < plen && p.err == 0) {
+            let is i64 as c = _node(&p, N_CHAR, _take_cp(&p));
+            if (c < 0) { break; }
+            if (last < 0) { _nset(&p, root, 4, c); } else { _nset(&p, last, 5, c); }
+            last = c;
+        }
+    } else {
+        root = _alt(&p);
+        if (p.err == 0 && p.pos < plen) { _fail(&p, RE_ERPAREN); }   // only a ')' stops the top level early
+    }
+    if (p.err == 0) {
+        // the program is SAVE 0, the pattern, SAVE 1, MATCH
+        r.cls.va = p.cls.va; r.cls.cap = p.cls.cap; r.cls.n = p.cls.n;
+        _vinit(&p.cls);
+        _inst(&p, r, I_SAVE, 0, 0);
+        _emit(&p, r, root);
+        _inst(&p, r, I_SAVE, 1, 0);
+        _inst(&p, r, I_MATCH, 0, 0);
+    }
+    if (p.err == 0) {
+        r.ngroups = p.ngroups; r.nloops = p.nloops; r.bref = p.bref;
+        if ((flags & RE_NEWLINE) == 0) { r.bol = _starts_bol(&p, root); }
+        r.lead = _lead_byte(_lead_char(&p, root), flags);
+    }
+    _vfree(&p.ast); _vfree(&p.cls); _vfree(&p.closed);
+    if (p.err != 0) { release(r); return 0 - p.err; }
+    return 0;
+}
+
+// release: give back what compile() took.
+fn release(r as *Regex) as void {
+    _vfree(&r.prog); _vfree(&r.cls); _vfree(&r.vm); _vfree(&r.bt);
+    r.vmcap = 0;
+}
+
+// groups: how many \( \) / ( ) groups the pattern has.
+fn groups(r as *Regex) as i64 { return r.ngroups; }
+
+// err_text: what a negated RE_E* from compile() or search() means.
+fn err_text(e as i64) as *u8 {
+    let is i64 as k with mut = e;
+    if (k < 0) { k = 0 - k; }
+    if (k == RE_EPAREN) { return "unmatched ( or \\("; }
+    if (k == RE_ERPAREN) { return "unmatched ) or \\)"; }
+    if (k == RE_EBRACK) { return "unmatched [, [^, [:, [. or [="; }
+    if (k == RE_ECTYPE) { return "invalid character class"; }
+    if (k == RE_EBRACE) { return "unmatched \\{"; }
+    if (k == RE_EBADBR) { return "invalid content of \\{\\}"; }
+    if (k == RE_ERANGE) { return "invalid range end"; }
+    if (k == RE_ESUBREG) { return "invalid back reference"; }
+    if (k == RE_EBADRPT) { return "invalid preceding regular expression"; }
+    if (k == RE_EESCAPE) { return "trailing backslash"; }
+    if (k == RE_ESIZE) { return "regular expression too big"; }
+    if (k == RE_ENOMEM) { return "out of memory"; }
+    if (k == RE_EDEPTH) { return "groups nested too deep"; }
+    if (k == RE_ECOMPLEX) { return "back-references make this search too long"; }
+    return "invalid regular expression";
+}
+
+// ======================================================================
+// searching
+
+fn _word_at(s as *u8, len as i64, i as i64) as i64 {
+    if (i >= len) { return 0; }
     let is i64 as k with mut = 0;
-    while (k < cn) {
-        let is i64 as pc = RE_CLIST[k];
-        let is i64 as op = RE_OP[pc];
-        let is i64 as hit with mut = 0;
-        if (op == OP_CHAR) { hit = char_eq(RE_X[pc], c); }
-        else if (op == OP_ANY) { hit = 1; }
-        else if (op == OP_CLASS) { hit = cls_test(RE_X[pc], c); }
-        if (hit != 0) { addthread(cast(*i64, &RE_NLIST[0]), &nn, pc + 1, sp + 1, len); }
+    return _is_word(_cp(s, len, i, &k));
+}
+fn _word_before(s as *u8, i as i64) as i64 {
+    if (i <= 0) { return 0; }
+    return _is_word(_cp_before(s, i));
+}
+
+fn _assert(r as *Regex, kind as i64, s as *u8, len as i64, i as i64, xf as i64) as i64 {
+    if (kind == AS_BOL) {
+        if (i == 0 && (xf & X_NOTBOL) == 0) { return 1; }
+        if ((r.flags & RE_NEWLINE) != 0 && i > 0 && s[i - 1] == cast(u8, 10)) { return 1; }
+        return 0;
+    }
+    if (kind == AS_EOL) {
+        if (i == len && (xf & X_NOTEOL) == 0) { return 1; }
+        if ((r.flags & RE_NEWLINE) != 0 && i < len && s[i] == cast(u8, 10)) { return 1; }
+        return 0;
+    }
+    if (kind == AS_BUFS) { if (i == 0) { return 1; } return 0; }
+    if (kind == AS_BUFE) { if (i == len) { return 1; } return 0; }
+    let is i64 as a = _word_before(s, i);
+    let is i64 as b = _word_at(s, len, i);
+    if (kind == AS_WB) { if (a != b) { return 1; } return 0; }
+    if (kind == AS_NWB) { if (a == b) { return 1; } return 0; }
+    if (kind == AS_WS) { if (a == 0 && b == 1) { return 1; } return 0; }
+    if (kind == AS_WE) { if (a == 1 && b == 0) { return 1; } return 0; }
+    return 0;
+}
+
+// Whether the consuming instruction at pc takes character c.
+fn _takes(r as *Regex, op as i64, x as i64, c as i64) as i64 {
+    if (op == I_CHAR) {
+        if (c == x) { return 1; }
+        if ((r.flags & RE_ICASE) != 0 && ucase.lower(c) == x) { return 1; }
+        return 0;
+    }
+    if (op == I_ANY) { return 1; }
+    if (op == I_CLASS) { return _set_has(r, x, c); }
+    return 0;
+}
+
+// Whether a match may start at i, and end at i.
+fn _start_ok(r as *Regex, s as *u8, len as i64, start as i64, i as i64, xf as i64) as i64 {
+    if ((xf & X_ANCHOR) != 0 && i != start) { return 0; }
+    if (r.bol == 1 && (i != 0 || (xf & X_NOTBOL) != 0)) { return 0; }
+    if ((xf & X_WORDS) != 0 && _word_before(s, i) == 1) { return 0; }
+    return 1;
+}
+fn _end_ok(s as *u8, len as i64, i as i64, xf as i64) as i64 {
+    if ((xf & X_FULL) != 0 && i != len) { return 0; }
+    if ((xf & X_WORDS) != 0 && _word_at(s, len, i) == 1) { return 0; }
+    return 1;
+}
+
+// The first offset >= i where the lead character is, or -1.
+fn _find_lead(r as *Regex, s as *u8, len as i64, i as i64) as i64 {
+    let is u8 as b = cast(u8, r.lead);
+    let is i64 as j with mut = i;
+    while (j < len) { if (s[j] == b) { return j; } j = j + 1; }
+    return 0 - 1;
+}
+
+// The search's state for ncap capture slots: two thread lists (pc, then the
+// captures, per thread), a mark per instruction, the epsilon walk's stack, and
+// the captures being built and the best match's.
+//   [0]      clist pcs        ni
+//   [ni]     clist caps       ni * ncap
+//   ...      nlist pcs, caps
+//   seen     ni
+//   stack    (2 ni + 4) * 3
+//   work     ncap
+//   best     ncap
+fn _vm_ready(r as *Regex, ncap as i64) as i64 {
+    if (r.vmcap >= ncap) { return 0; }
+    let is i64 as ni = r.prog.n / INST;
+    let is i64 as need = 2 * ni * (1 + ncap) + ni + (2 * ni + 4) * 3 + 2 * ncap;
+    _vfree(&r.vm);
+    if (_vgrow(&r.vm, need) != 0) { return 0 - RE_ENOMEM; }
+    r.vm.n = need;
+    let is *i64 as seen = cast(*i64, r.vm.va + (2 * ni * (1 + ncap)) * 8);
+    let is i64 as i with mut = 0;
+    while (i < ni) { seen[i] = 0; i = i + 1; }
+    r.vmcap = ncap;
+    return 0;
+}
+
+struct Machine {
+    prog as i64;      // *i64
+    ni as i64;
+    ncap as i64;      // slots laid out per thread
+    used as i64;      // slots actually tracked (the caller's)
+    seen as i64;      // *i64
+    epoch as i64;
+    stack as i64;     // *i64
+    work as i64;      // *i64
+}
+
+// Add the thread at pc (captures in vm.work) to the list at lpcs/lcaps, after
+// following every jump, split, save and assertion from it. Earlier additions
+// win: a pc already reached at this position is not added again.
+fn _add(v as *Machine, r as *Regex, lpcs as *i64, lcaps as *i64, ln as *i64, pc0 as i64, s as *u8, len as i64, i as i64, xf as i64) as void {
+    let is *i64 as prog = cast(*i64, v.prog);
+    let is *i64 as seen = cast(*i64, v.seen);
+    let is *i64 as st = cast(*i64, v.stack);
+    let is *i64 as work = cast(*i64, v.work);
+    let is i64 as sp with mut = 0;
+    st[0] = 0; st[1] = pc0; sp = 1;           // entries: (0, pc) visit, (1, slot, old) restore
+    while (sp > 0) {
+        sp = sp - 1;
+        let is i64 as kind = st[sp * 3];
+        if (kind == 1) { work[st[sp * 3 + 1]] = st[sp * 3 + 2]; continue; }
+        let is i64 as pc = st[sp * 3 + 1];
+        if (seen[pc] == v.epoch) { continue; }
+        seen[pc] = v.epoch;
+        let is i64 as op = prog[pc * INST];
+        let is i64 as x = prog[pc * INST + 1];
+        if (op == I_JMP) { st[sp * 3] = 0; st[sp * 3 + 1] = x; sp = sp + 1; continue; }
+        if (op == I_SPLIT) {
+            st[sp * 3] = 0; st[sp * 3 + 1] = prog[pc * INST + 2]; sp = sp + 1;
+            st[sp * 3] = 0; st[sp * 3 + 1] = x; sp = sp + 1;
+            continue;
+        }
+        if (op == I_SAVE) {
+            if (x < v.used) {
+                st[sp * 3] = 1; st[sp * 3 + 1] = x; st[sp * 3 + 2] = work[x]; sp = sp + 1;
+                work[x] = i;
+            }
+            st[sp * 3] = 0; st[sp * 3 + 1] = pc + 1; sp = sp + 1;
+            continue;
+        }
+        if (op == I_ASSERT) {
+            if (_assert(r, x, s, len, i, xf) == 1) { st[sp * 3] = 0; st[sp * 3 + 1] = pc + 1; sp = sp + 1; }
+            continue;
+        }
+        if (op == I_MARK || op == I_CHECK) { st[sp * 3] = 0; st[sp * 3 + 1] = pc + 1; sp = sp + 1; continue; }
+        // CHAR ANY CLASS MATCH: a thread
+        let is i64 as n = ln[0];
+        lpcs[n] = pc;
+        let is i64 as k with mut = 0;
+        while (k < v.used) { lcaps[n * v.ncap + k] = work[k]; k = k + 1; }
+        ln[0] = n + 1;
+    }
+}
+
+fn _pike(r as *Regex, s as *u8, len as i64, start as i64, xf as i64, m as *i64, nm as i64) as i64 {
+    let is i64 as used with mut = nm * 2;
+    if (used < 2) { used = 2; }
+    if (used > (r.ngroups + 1) * 2) { used = (r.ngroups + 1) * 2; }
+    let is i64 as ncap = (r.ngroups + 1) * 2;
+    let is i64 as rc = _vm_ready(r, ncap);
+    if (rc != 0) { return rc; }
+    let is i64 as ni = r.prog.n / INST;
+    let is i64 as base = r.vm.va;
+    let is *i64 as apcs with mut = cast(*i64, base);
+    let is *i64 as acaps with mut = cast(*i64, base + ni * 8);
+    let is *i64 as bpcs with mut = cast(*i64, base + ni * (1 + ncap) * 8);
+    let is *i64 as bcaps with mut = cast(*i64, base + (ni * (1 + ncap) + ni) * 8);
+    let is i64 as after = base + 2 * ni * (1 + ncap) * 8;
+    let is Machine as v;
+    v.prog = r.prog.va; v.ni = ni; v.ncap = ncap; v.used = used;
+    v.seen = after;
+    v.stack = after + ni * 8;
+    v.work = after + ni * 8 + (2 * ni + 4) * 3 * 8;
+    let is *i64 as best = cast(*i64, v.work + ncap * 8);
+    let is *i64 as work = cast(*i64, v.work);
+    let is *i64 as prog = cast(*i64, r.prog.va);
+    v.epoch = r.epoch + 1;          // marks older than this are from earlier steps and searches
+
+    let is i64 as matched with mut = 0;
+    let is i64 as bstart with mut = 0; let is i64 as bend with mut = 0;
+    let is i64 as cn with mut = 0;
+    let is i64 as i with mut = start;
+    let is i64 as skip with mut = 0;
+    if (r.lead >= 0 && (xf & X_ANCHOR) == 0) { skip = 1; }
+    while (1 == 1) {
+        if (matched == 0 && _start_ok(r, s, len, start, i, xf) == 1) {
+            if (cn == 0 && skip == 1) {
+                let is i64 as q = _find_lead(r, s, len, i);
+                if (q < 0) { break; }
+                if (q != i) { i = q; v.epoch = v.epoch + 1; }
+            }
+            if (_start_ok(r, s, len, start, i, xf) == 1) {
+                let is i64 as k with mut = 0;
+                while (k < used) { work[k] = 0 - 1; k = k + 1; }
+                _add(&v, r, apcs, acaps, &cn, 0, s, len, i, xf);
+            }
+        }
+        if (cn == 0) {
+            if (matched == 1 || i >= len || (xf & X_ANCHOR) != 0) { break; }
+            if (r.bol == 1) { break; }
+            let is i64 as k0 with mut = 0;
+            _cp(s, len, i, &k0);
+            i = i + k0;
+            v.epoch = v.epoch + 1;
+            continue;
+        }
+        let is i64 as c with mut = 0 - 1;
+        let is i64 as clen with mut = 0;
+        if (i < len) { c = _cp(s, len, i, &clen); }
+        v.epoch = v.epoch + 1;
+        let is i64 as nn with mut = 0;
+        let is i64 as t with mut = 0;
+        while (t < cn) {
+            let is i64 as pc = apcs[t];
+            let is i64 as tstart = acaps[t * ncap];
+            let is i64 as op = prog[pc * INST];
+            if (op == I_MATCH) {
+                if (_end_ok(s, len, i, xf) == 1) {
+                    if (matched == 0 || tstart < bstart || (tstart == bstart && i > bend)) {
+                        let is i64 as k with mut = 0;
+                        while (k < used) { best[k] = acaps[t * ncap + k]; k = k + 1; }
+                        best[1] = i;
+                        matched = 1; bstart = tstart; bend = i;
+                    }
+                }
+                t = t + 1;
+                continue;
+            }
+            if (matched == 1 && tstart > bstart) { t = t + 1; continue; }   // cannot be leftmost now
+            if (c >= 0 && _takes(r, op, prog[pc * INST + 1], c) == 1) {
+                let is i64 as k with mut = 0;
+                while (k < used) { work[k] = acaps[t * ncap + k]; k = k + 1; }
+                _add(&v, r, bpcs, bcaps, &nn, pc + 1, s, len, i + clen, xf);
+            }
+            t = t + 1;
+        }
+        if (i >= len) { break; }
+        i = i + clen;
+        let is *i64 as tp = apcs; apcs = bpcs; bpcs = tp;
+        let is *i64 as tc = acaps; acaps = bcaps; bcaps = tc;
+        cn = nn;
+    }
+    r.epoch = v.epoch;
+    if (matched == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < nm * 2) {
+        if (k < used) { m[k] = best[k]; } else { m[k] = 0 - 1; }
         k = k + 1;
     }
-    if (restart != 0) { addthread(cast(*i64, &RE_NLIST[0]), &nn, 0, sp + 1, len); }   // unanchored
-    k = 0; while (k < nn) { RE_CLIST[k] = RE_NLIST[k]; k = k + 1; }
-    return nn;
+    return 1;
 }
-fn list_has_match(cn as i64) as i64 {
+
+// ---- backtracking, for patterns with back-references ----
+
+fn _bt_push(r as *Regex, a as i64, b as i64, c as i64) as i64 {
+    if (r.bt.n + 3 > r.bt.cap) { if (_vgrow(&r.bt, r.bt.n + 3) != 0) { return 0 - 1; } }
+    let is *i64 as st = cast(*i64, r.bt.va);
+    st[r.bt.n] = a; st[r.bt.n + 1] = b; st[r.bt.n + 2] = c;
+    r.bt.n = r.bt.n + 3;
+    return 0;
+}
+
+// Whether s[i..) begins with what group g matched; its length in *n.
+fn _bref_at(r as *Regex, s as *u8, len as i64, i as i64, a as i64, b as i64, n as *i64) as i64 {
+    if (a < 0 || b < a) { return 0; }
+    if ((r.flags & RE_ICASE) == 0) {
+        if (i + (b - a) > len) { return 0; }
+        let is i64 as k with mut = 0;
+        while (k < b - a) { if (s[i + k] != s[a + k]) { return 0; } k = k + 1; }
+        n[0] = b - a;
+        return 1;
+    }
+    let is i64 as x with mut = a;
+    let is i64 as y with mut = i;
+    while (x < b) {
+        if (y >= len) { return 0; }
+        let is i64 as kx with mut = 0; let is i64 as ky with mut = 0;
+        let is i64 as cx = _cp(s, b, x, &kx);
+        let is i64 as cy = _cp(s, len, y, &ky);
+        if (ucase.lower(cx) != ucase.lower(cy)) { return 0; }
+        x = x + kx; y = y + ky;
+    }
+    n[0] = y - i;
+    return 1;
+}
+
+// Every path from start i, keeping the longest match. 1 found (best[] set),
+// 0 none, or a negated error.
+fn _bt_from(r as *Regex, s as *u8, len as i64, i0 as i64, xf as i64, caps as *i64, loops as *i64, best as *i64, ncap as i64, steps as *i64) as i64 {
+    let is *i64 as prog = cast(*i64, r.prog.va);
+    let is i64 as found with mut = 0;
+    let is i64 as bend with mut = 0 - 1;
     let is i64 as k with mut = 0;
-    while (k < cn) { if (RE_OP[RE_CLIST[k]] == OP_MATCH) { return 1; } k = k + 1; }
-    return 0;
-}
-
-// re_match: does the pattern occur anywhere in s[0..len)? Unanchored, O(len*prog).
-fn re_match(s as *u8, len as i64) as i64 {
-    RE_GEN = RE_GEN + 1;
-    let is i64 as cn with mut = 0;
-    addthread(cast(*i64, &RE_CLIST[0]), &cn, 0, 0, len);
-    let is i64 as sp with mut = 0;
-    while (1 == 1) {
-        if (list_has_match(cn) != 0) { return 1; }
-        if (sp >= len) { break; }
-        cn = step(s, sp, len, cn, 1);
-        sp = sp + 1;
+    while (k < ncap) { caps[k] = 0 - 1; k = k + 1; }
+    k = 0;
+    while (k < r.nloops) { loops[k] = 0 - 1; k = k + 1; }
+    r.bt.n = 0;
+    if (_bt_push(r, 0, 0, i0) != 0) { return 0 - RE_ENOMEM; }      // (0, pc, i) branch; (1, slot, old) capture; (2, loop, old)
+    while (r.bt.n > 0) {
+        r.bt.n = r.bt.n - 3;
+        let is *i64 as st = cast(*i64, r.bt.va);
+        let is i64 as kind = st[r.bt.n];
+        if (kind == 1) { caps[st[r.bt.n + 1]] = st[r.bt.n + 2]; continue; }
+        if (kind == 2) { loops[st[r.bt.n + 1]] = st[r.bt.n + 2]; continue; }
+        let is i64 as pc with mut = st[r.bt.n + 1];
+        let is i64 as i with mut = st[r.bt.n + 2];
+        let is i64 as alive with mut = 1;
+        while (alive == 1) {
+            steps[0] = steps[0] + 1;
+            if (steps[0] > BT_BUDGET) { return 0 - RE_ECOMPLEX; }
+            let is i64 as op = prog[pc * INST];
+            let is i64 as x = prog[pc * INST + 1];
+            if (op == I_CHAR || op == I_ANY || op == I_CLASS) {
+                if (i >= len) { alive = 0; }
+                else {
+                    let is i64 as cl with mut = 0;
+                    let is i64 as c = _cp(s, len, i, &cl);
+                    if (_takes(r, op, x, c) == 1) { i = i + cl; pc = pc + 1; } else { alive = 0; }
+                }
+            } else if (op == I_MATCH) {
+                if (_end_ok(s, len, i, xf) == 1 && i > bend) {
+                    bend = i; found = 1;
+                    let is i64 as q with mut = 0;
+                    while (q < ncap) { best[q] = caps[q]; q = q + 1; }
+                    best[1] = i;
+                    if (i == len) { return 1; }            // nothing can be longer
+                }
+                alive = 0;
+            } else if (op == I_JMP) { pc = x; }
+            else if (op == I_SPLIT) {
+                if (_bt_push(r, 0, prog[pc * INST + 2], i) != 0) { return 0 - RE_ENOMEM; }
+                pc = x;
+            } else if (op == I_SAVE) {
+                if (_bt_push(r, 1, x, caps[x]) != 0) { return 0 - RE_ENOMEM; }
+                caps[x] = i; pc = pc + 1;
+            } else if (op == I_ASSERT) {
+                if (_assert(r, x, s, len, i, xf) == 1) { pc = pc + 1; } else { alive = 0; }
+            } else if (op == I_BREF) {
+                let is i64 as n with mut = 0;
+                if (_bref_at(r, s, len, i, caps[x * 2], caps[x * 2 + 1], &n) == 1) { i = i + n; pc = pc + 1; } else { alive = 0; }
+            } else if (op == I_MARK) {
+                if (_bt_push(r, 2, x, loops[x]) != 0) { return 0 - RE_ENOMEM; }
+                loops[x] = i; pc = pc + 1;
+            } else if (op == I_CHECK) {
+                if (loops[x] == i) { pc = prog[pc * INST + 2]; } else { pc = pc + 1; }   // an empty iteration leaves the loop
+            } else { alive = 0; }
+        }
     }
-    return 0;
+    return found;
 }
 
-// re_match_at: longest match length starting exactly at s[i], or -1. Anchored.
-fn re_match_at(s as *u8, len as i64, i as i64) as i64 {
-    RE_GEN = RE_GEN + 1;
-    let is i64 as cn with mut = 0;
-    addthread(cast(*i64, &RE_CLIST[0]), &cn, 0, i, len);
-    let is i64 as sp with mut = i;
-    let is i64 as best with mut = 0 - 1;
-    while (1 == 1) {
-        if (list_has_match(cn) != 0) { best = sp; }    // longest: keep the latest accept
-        if (sp >= len || cn == 0) { break; }
-        cn = step(s, sp, len, cn, 0);
-        sp = sp + 1;
+fn _backtrack(r as *Regex, s as *u8, len as i64, start as i64, xf as i64, m as *i64, nm as i64) as i64 {
+    let is i64 as ncap = (r.ngroups + 1) * 2;
+    // caps, loops, best in vm
+    let is i64 as need = ncap * 2 + r.nloops + 1;
+    if (r.vmcap < need) {
+        _vfree(&r.vm);
+        if (_vgrow(&r.vm, need) != 0) { return 0 - RE_ENOMEM; }
+        r.vmcap = need;
     }
-    return best;
-}
-
-// re_search: leftmost-longest match; writes [*ms, *me) and returns 1, else 0.
-fn re_search(s as *u8, len as i64, ms as *i64, me as *i64) as i64 {
-    let is i64 as i with mut = 0;
+    let is *i64 as caps = cast(*i64, r.vm.va);
+    let is *i64 as best = cast(*i64, r.vm.va + ncap * 8);
+    let is *i64 as loops = cast(*i64, r.vm.va + ncap * 16);
+    let is i64 as steps with mut = 0;
+    let is i64 as i with mut = start;
     while (i <= len) {
-        let is i64 as e = re_match_at(s, len, i);
-        if (e >= 0) { ms[0] = i; me[0] = e; return 1; }
-        i = i + 1;
+        if (r.lead >= 0 && (xf & X_ANCHOR) == 0) {
+            let is i64 as q = _find_lead(r, s, len, i);
+            if (q < 0) { return 0; }
+            i = q;
+        }
+        if (_start_ok(r, s, len, start, i, xf) == 1) {
+            let is i64 as rc = _bt_from(r, s, len, i, xf, caps, loops, best, ncap, &steps);
+            if (rc < 0) { return rc; }
+            if (rc == 1) {
+                let is i64 as k with mut = 0;
+                while (k < nm * 2) {
+                    if (k < ncap) { m[k] = best[k]; } else { m[k] = 0 - 1; }
+                    k = k + 1;
+                }
+                return 1;
+            }
+        }
+        if ((xf & X_ANCHOR) != 0 || r.bol == 1 || i >= len) { return 0; }
+        let is i64 as k0 with mut = 0;
+        _cp(s, len, i, &k0);
+        i = i + k0;
     }
     return 0;
+}
+
+// search: the leftmost-longest match in s[0..len) that starts at or after
+// start. 1 with m[0..2nm) = start and end of the match and of groups 1..nm-1
+// (-1 for a group that took no part), 0 when there is none, or a negated
+// RE_E*: no memory, or (back-references only) RE_ECOMPLEX. The anchors and
+// \b look at the whole subject: a search from the middle sees the character
+// before `start`, and ^ matches only at 0.
+fn search(r as *Regex, s as *u8, len as i64, start as i64, xf as i64, m as *i64, nm as i64) as i64 {
+    if (r.prog.n == 0) { return 0 - RE_EBADRPT; }
+    if (start > len) { return 0; }
+    if (r.bref == 1) { return _backtrack(r, s, len, start, xf, m, nm); }
+    return _pike(r, s, len, start, xf, m, nm);
+}
+
+// char_end: the offset just past the character at s[i] — where a caller that
+// found an empty match resumes, so it never resumes inside a character.
+fn char_end(s as *u8, len as i64, i as i64) as i64 {
+    if (i >= len) { return len; }
+    let is i64 as k with mut = 0;
+    _cp(s, len, i, &k);
+    return i + k;
+}
+
+// matches: whether the pattern occurs in s[0..len) at all (1/0, or an error).
+fn matches(r as *Regex, s as *u8, len as i64, xf as i64) as i64 {
+    let is [2]i64 as m;
+    return search(r, s, len, 0, xf, cast(*i64, &m[0]), 1);
 }

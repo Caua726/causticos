@@ -41,7 +41,7 @@ if [ ! -f build/certs/srv.pem ]; then bash scripts/make-test-certs.sh >/dev/null
 # --add; /init is the runner itself.
 ADD=(--init runall)
 add() { ADD+=(--add "$2"); }
-for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst kmapt globt imgt; do
+for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst kmapt globt regext cmdt imgt; do
     [ -f "userspace/build/$t.cse" ] && add x "userspace/build/$t.cse"
 done
 # What the tests reach for: the daemon they spawn, the programs they drive, and
@@ -58,6 +58,8 @@ for f in userspace/build/netd.cse userspace/build/ping.cse \
          build/certs/ca.pem build/certs/empty.pem; do
     [ -f "$f" ] && add x "$f"
 done
+# cmdt's cases: command lines with GNU's answers (scripts/gen-cmdt.py).
+ADD+=(--add userspace/tests/cmdt.cases:/cmdt/cases)
 
 # One set of peers for the whole boot. Different ports, so they coexist; the
 # guest dials them one at a time.
@@ -110,7 +112,7 @@ PASS=0; FAIL=0; FAILED=""
 # and a green appt as failures. A process that returns 0 succeeded; that is
 # uniform, it is what runall already reports, and it cannot drift from what the
 # test actually decided. The printed line is kept as detail, not as evidence.
-for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst kmapt globt imgt; do
+for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst kmapt globt regext cmdt imgt; do
     printf '%-9s ' "$t"
     if echo "$RAW" | grep -q "^runall: <<< $t MISSING"; then
         echo "SKIP  (not built)"
