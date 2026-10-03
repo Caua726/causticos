@@ -12,9 +12,20 @@
 use "std/os/causticos.cst" as sys;
 use "../crash/crash.cst" as crash;
 
-let is i64 as MAX_JOBS with imut = 16;
+// The table is reserved once for JOB_LIMIT jobs and committed JOB_CHUNK at a
+// time as it fills: a shell pays for the jobs it has had at once, and the
+// table never moves, so a *Job a caller holds stays good while others start.
+// It was sixteen fixed slots — the most the 64 descriptors a process had
+// could feed (three or four channels a job) — and a shell with a dozen
+// background jobs refused the next command with "too many jobs". JOB_LIMIT
+// is address space, not memory; descriptors and memory run out long before.
+let is i64 as JOB_LIMIT with imut = 1024;
+let is i64 as JOB_CHUNK with imut = 16;
 let is i64 as MAX_PIDS with imut = 8;      // pids per pipeline
 let is i64 as CMD_CAP  with imut = 64;     // command text kept for `jobs`
+// Poll entries a shell needs besides its jobs' (the keyboard or the WM, exit
+// events, a paste waiting to be read): see poll_buf.
+let is i64 as POLL_FIXED with imut = 4;
 
 // status
 let is i64 as JOB_FREE with imut = 0;
@@ -42,38 +53,86 @@ struct Job {
     tty_fill as i64;       // bytes of a request read so far (tty_acc)
     tty_catch as i64;      // ttyproto EV_* the program asked to get as events
                            // instead of being ended (Ctrl+C, the window closing)
-    crashed as i64;        // 1 = a pid of it crashed; crash_infos holds the first
+    crashed as i64;        // 1 = a pid of it crashed; `crash` holds the first
     err_fd as i64;         // a job with no terminal ($(...)): its stages' stderr,
                            // kept apart from the stdout being captured; or -1
+    pids as [8]i64;        // MAX_PIDS
+    cmd as [64]u8;         // CMD_CAP
+    tty_acc as [32]u8;     // a ttyproto request being read
+    crash as [8]i64;       // WAIT_INFO_WORDS: how it crashed
 }
 
-let is [16]Job as tab with mut;
-let is [128]i64 as pids with mut;           // MAX_JOBS * MAX_PIDS
-let is [1024]u8 as cmds with mut;           // MAX_JOBS * CMD_CAP
-let is [512]u8 as tty_accs with mut;        // MAX_JOBS * 32: a ttyproto request being read
-let is [128]i64 as crash_infos with mut;    // MAX_JOBS * WAIT_INFO_WORDS: how it crashed
+let is i64 as tab with mut = 0;             // the reserved table
+let is i64 as cap with mut = 0;             // jobs committed in it
+let is i64 as pbuf with mut = 0;            // poll_buf, reserved likewise
+let is i64 as pmap with mut = 0;            // poll_map
 let is i64 as evfd with mut = 0 - 1;
 
 fn event_fd() as i64 { return evfd; }
-fn get(i as i64) as *Job { return &tab[i]; }
-fn tty_acc(i as i64) as *u8 { return cast(*u8, &tty_accs[i * 32]); }
-fn max_jobs() as i64 { return MAX_JOBS; }
+fn get(i as i64) as *Job { return cast(*Job, tab + i * sizeof(Job)); }
+fn tty_acc(i as i64) as *u8 { return cast(*u8, &get(i).tty_acc[0]); }
+// How many slots there are now — loops over the table go this far. It grows.
+fn max_jobs() as i64 { return cap; }
+
+// A poll set with room for every job's two fds plus POLL_FIXED more (3 i64 an
+// entry), and beside it room to note which job each entry is (2 an entry
+// per job). The shells build both each pass of their loop; they live here
+// because they grow with the table.
+fn poll_buf() as *i64 { return cast(*i64, pbuf); }
+fn poll_map() as *i64 { return cast(*i64, pmap); }
+
+fn _bytes(n as i64) as i64 { return ((n + 4095) / 4096) * 4096; }
+
+// What poll_buf has committed for `c` slots — nothing before the first.
+fn _poll_bytes(c as i64) as i64 {
+    if (c == 0) { return 0; }
+    return _bytes((POLL_FIXED + 2 * c) * 24);
+}
+
+// Commit JOB_CHUNK more slots, all free, and the poll room they need. 0, or
+// -1 when the reservation is full or memory has run out.
+fn _grow() as i64 {
+    if (cap + JOB_CHUNK > JOB_LIMIT) { return 0 - 1; }
+    let is i64 as ncap = cap + JOB_CHUNK;
+    let is i64 as had = _bytes(cap * sizeof(Job));
+    let is i64 as need = _bytes(ncap * sizeof(Job));
+    let is i64 as rw = sys.PROT_READ | sys.PROT_WRITE;
+    if (need > had && sys.commit(tab + had, need - had, rw) != 0) { return 0 - 1; }
+    let is i64 as phad = _poll_bytes(cap);
+    let is i64 as pneed = _poll_bytes(ncap);
+    if (pneed > phad && sys.commit(pbuf + phad, pneed - phad, rw) != 0) { return 0 - 1; }
+    let is i64 as mhad = _bytes(2 * cap * 8);
+    let is i64 as mneed = _bytes(2 * ncap * 8);
+    if (mneed > mhad && sys.commit(pmap + mhad, mneed - mhad, rw) != 0) { return 0 - 1; }
+    let is i64 as i with mut = cap;
+    while (i < ncap) {
+        let is *Job as jb = get(i);
+        jb.status = JOB_FREE;
+        jb.out_fd = 0 - 1;
+        jb.in_fd = 0 - 1;
+        jb.aux_fd = 0 - 1;
+        jb.tty_fd = 0 - 1;
+        jb.err_fd = 0 - 1;
+        jb.tty_fill = 0;
+        jb.tty_catch = 0;
+        i = i + 1;
+    }
+    cap = ncap;
+    return 0;
+}
 
 // init — subscribe to our own children's lifecycle. A failure is not fatal: the
 // shell falls back to reaping foreground jobs with wait(), it just cannot
 // notice a background one finishing until then.
 fn init() as i64 {
-    let is i64 as i with mut = 0;
-    while (i < MAX_JOBS) {
-        tab[i].status = JOB_FREE;
-        tab[i].out_fd = 0 - 1;
-        tab[i].in_fd = 0 - 1;
-        tab[i].aux_fd = 0 - 1;
-        tab[i].tty_fd = 0 - 1;
-        tab[i].err_fd = 0 - 1;
-        tab[i].tty_fill = 0;
-        tab[i].tty_catch = 0;
-        i = i + 1;
+    let is i64 as rw = sys.PROT_READ | sys.PROT_WRITE;
+    tab = sys.reserve(0, _bytes(JOB_LIMIT * sizeof(Job)), rw);
+    pbuf = sys.reserve(0, _bytes((POLL_FIXED + 2 * JOB_LIMIT) * 24), rw);
+    pmap = sys.reserve(0, _bytes(2 * JOB_LIMIT * 8), rw);
+    if (tab <= 0 || pbuf <= 0 || pmap <= 0 || _grow() != 0) {
+        // Without even the first slots a shell can run no command at all.
+        sys.write_serial("jobs: no memory for the job table\n", 34);
+        sys.exit(cast(i32, 1));
     }
     evfd = sys.event_subscribe(sys.getpid(), 0);
     return evfd;
@@ -81,16 +140,17 @@ fn init() as i64 {
 
 fn alloc() as i64 {
     let is i64 as i with mut = 0;
-    while (i < MAX_JOBS) {
-        if (tab[i].status == JOB_FREE) {
-            tab[i].npids = 0; tab[i].nlive = 0; tab[i].bg = 0;
-            tab[i].exit_code = 0; tab[i].cmd_len = 0;
-            tab[i].out_fd = 0 - 1; tab[i].in_fd = 0 - 1; tab[i].aux_fd = 0 - 1;
-            tab[i].tty_fd = 0 - 1; tab[i].tty_fill = 0; tab[i].tty_catch = 0;
-            tab[i].err_fd = 0 - 1;
-            tab[i].reported = 0;
-            tab[i].crashed = 0;
-            tab[i].status = JOB_RUN;
+    while (i < cap || (i == cap && _grow() == 0)) {
+        let is *Job as jb = get(i);
+        if (jb.status == JOB_FREE) {
+            jb.npids = 0; jb.nlive = 0; jb.bg = 0;
+            jb.exit_code = 0; jb.cmd_len = 0;
+            jb.out_fd = 0 - 1; jb.in_fd = 0 - 1; jb.aux_fd = 0 - 1;
+            jb.tty_fd = 0 - 1; jb.tty_fill = 0; jb.tty_catch = 0;
+            jb.err_fd = 0 - 1;
+            jb.reported = 0;
+            jb.crashed = 0;
+            jb.status = JOB_RUN;
             return i;
         }
         i = i + 1;
@@ -99,47 +159,50 @@ fn alloc() as i64 {
 }
 
 fn add_pid(j as i64, pid as i64) as void {
-    if (j < 0 || j >= MAX_JOBS) { return; }
-    if (tab[j].npids >= MAX_PIDS) { return; }
-    pids[j * MAX_PIDS + tab[j].npids] = pid;
-    tab[j].npids = tab[j].npids + 1;
-    tab[j].nlive = tab[j].nlive + 1;
+    if (j < 0 || j >= cap) { return; }
+    let is *Job as jb = get(j);
+    if (jb.npids >= MAX_PIDS) { return; }
+    jb.pids[jb.npids] = pid;
+    jb.npids = jb.npids + 1;
+    jb.nlive = jb.nlive + 1;
     return;
 }
 
-fn pid_at(j as i64, k as i64) as i64 { return pids[j * MAX_PIDS + k]; }
+fn pid_at(j as i64, k as i64) as i64 { return get(j).pids[k]; }
 fn last_pid(j as i64) as i64 {
-    if (tab[j].npids <= 0) { return 0; }
-    return pids[j * MAX_PIDS + tab[j].npids - 1];
+    let is *Job as jb = get(j);
+    if (jb.npids <= 0) { return 0; }
+    return jb.pids[jb.npids - 1];
 }
 
 fn set_cmd(j as i64, src as *u8, len as i64) as void {
     let is i64 as n with mut = len;
     if (n > CMD_CAP) { n = CMD_CAP; }
+    let is *Job as jb = get(j);
     let is i64 as i with mut = 0;
-    while (i < n) { cmds[j * CMD_CAP + i] = src[i]; i = i + 1; }
-    tab[j].cmd_len = n;
+    while (i < n) { jb.cmd[i] = src[i]; i = i + 1; }
+    jb.cmd_len = n;
     return;
 }
-fn cmd_ptr(j as i64) as *u8 { return cast(*u8, &cmds[j * CMD_CAP]); }
+fn cmd_ptr(j as i64) as *u8 { return cast(*u8, &get(j).cmd[0]); }
 
 // crash_text — "prog: crashed: ..." for job j into out (no newline), or 0 when
 // nothing in it crashed.
-fn crash_text(j as i64, out as *u8, cap as i64) as i64 {
-    if (j < 0 || j >= MAX_JOBS || tab[j].crashed != 1) { return 0; }
-    return crash.describe(cast(*i64, &crash_infos[j * 8]), out, cap);
+fn crash_text(j as i64, out as *u8, room as i64) as i64 {
+    if (j < 0 || j >= cap || get(j).crashed != 1) { return 0; }
+    return crash.describe(cast(*i64, &get(j).crash[0]), out, room);
 }
-fn cmd_len(j as i64) as i64 { return tab[j].cmd_len; }
+fn cmd_len(j as i64) as i64 { return get(j).cmd_len; }
 
 // find — which job owns `pid`? -1 when none does (a stranger's event, or an
 // already-freed slot).
 fn find(pid as i64) as i64 {
     let is i64 as j with mut = 0;
-    while (j < MAX_JOBS) {
-        if (tab[j].status != JOB_FREE) {
+    while (j < cap) {
+        if (get(j).status != JOB_FREE) {
             let is i64 as k with mut = 0;
-            while (k < tab[j].npids) {
-                if (pids[j * MAX_PIDS + k] == pid) { return j; }
+            while (k < get(j).npids) {
+                if (get(j).pids[k] == pid) { return j; }
                 k = k + 1;
             }
         }
@@ -173,16 +236,17 @@ fn poll_events() as i64 {
                         // wait cannot block once that is true. A crash is kept
                         // for the shell to report — the first one, which is
                         // the one the rest of a pipeline died of.
+                        let is *Job as jb = get(j);
                         let is [8]i64 as wi;
-                        if (sys.wait_info(pid, &wi[0]) >= 0 && wi[1] == 1 && tab[j].crashed == 0) {
+                        if (sys.wait_info(pid, &wi[0]) >= 0 && wi[1] == 1 && jb.crashed == 0) {
                             let is i64 as w with mut = 0;
-                            while (w < sys.WAIT_INFO_WORDS) { crash_infos[j * 8 + w] = wi[w]; w = w + 1; }
-                            tab[j].crashed = 1;
+                            while (w < sys.WAIT_INFO_WORDS) { jb.crash[w] = wi[w]; w = w + 1; }
+                            jb.crashed = 1;
                         }
-                        if (tab[j].nlive > 0) { tab[j].nlive = tab[j].nlive - 1; }
-                        if (pid == last_pid(j)) { tab[j].exit_code = code; }
-                        if (tab[j].nlive == 0) {
-                            tab[j].status = JOB_DONE;
+                        if (jb.nlive > 0) { jb.nlive = jb.nlive - 1; }
+                        if (pid == last_pid(j)) { jb.exit_code = code; }
+                        if (jb.nlive == 0) {
+                            jb.status = JOB_DONE;
                             finished = finished + 1;
                         }
                     }
@@ -200,22 +264,23 @@ fn poll_events() as i64 {
 // memory to hand spawn the bytes and could not drop that buffer until the child
 // was reaped. A spawn names its source now, so there is nothing left to hold.
 fn release(j as i64) as void {
-    if (j < 0 || j >= MAX_JOBS) { return; }
-    if (tab[j].out_fd >= 0) { sys.close(tab[j].out_fd); tab[j].out_fd = 0 - 1; }
-    if (tab[j].in_fd >= 0)  { sys.close(tab[j].in_fd);  tab[j].in_fd = 0 - 1; }
-    if (tab[j].aux_fd >= 0) { sys.close(tab[j].aux_fd); tab[j].aux_fd = 0 - 1; }
-    if (tab[j].tty_fd >= 0) { sys.close(tab[j].tty_fd); tab[j].tty_fd = 0 - 1; }
-    if (tab[j].err_fd >= 0) { sys.close(tab[j].err_fd); tab[j].err_fd = 0 - 1; }
-    tab[j].status = JOB_FREE;
+    if (j < 0 || j >= cap) { return; }
+    let is *Job as jb = get(j);
+    if (jb.out_fd >= 0) { sys.close(jb.out_fd); jb.out_fd = 0 - 1; }
+    if (jb.in_fd >= 0)  { sys.close(jb.in_fd);  jb.in_fd = 0 - 1; }
+    if (jb.aux_fd >= 0) { sys.close(jb.aux_fd); jb.aux_fd = 0 - 1; }
+    if (jb.tty_fd >= 0) { sys.close(jb.tty_fd); jb.tty_fd = 0 - 1; }
+    if (jb.err_fd >= 0) { sys.close(jb.err_fd); jb.err_fd = 0 - 1; }
+    jb.status = JOB_FREE;
     return;
 }
 
 // kill_job — end every pid still live. The shell spawned them and holds the
 // only keys to them, so nobody else can.
 fn kill_job(j as i64) as void {
-    if (j < 0 || j >= MAX_JOBS || tab[j].status != JOB_RUN) { return; }
+    if (j < 0 || j >= cap || get(j).status != JOB_RUN) { return; }
     let is i64 as k with mut = 0;
-    while (k < tab[j].npids) { sys.kill(pids[j * MAX_PIDS + k]); k = k + 1; }
+    while (k < get(j).npids) { sys.kill(get(j).pids[k]); k = k + 1; }
     return;
 }
 
@@ -231,8 +296,8 @@ fn parse_pct(tok as *u8, len as i64) as i64 {
         v = v * 10 + (c - 48);
         i = i + 1;
     }
-    if (v < 1 || v > MAX_JOBS) { return 0 - 1; }
-    if (tab[v - 1].status == JOB_FREE) { return 0 - 1; }
+    if (v < 1 || v > cap) { return 0 - 1; }
+    if (get(v - 1).status == JOB_FREE) { return 0 - 1; }
     return v - 1;
 }
 
@@ -256,8 +321,8 @@ fn parse_pid(tok as *u8, len as i64) as i64 {
 fn n_running() as i64 {
     let is i64 as n with mut = 0;
     let is i64 as j with mut = 0;
-    while (j < MAX_JOBS) {
-        if (tab[j].status == JOB_RUN) { n = n + 1; }
+    while (j < cap) {
+        if (get(j).status == JOB_RUN) { n = n + 1; }
         j = j + 1;
     }
     return n;
