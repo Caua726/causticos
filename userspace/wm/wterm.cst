@@ -260,6 +260,51 @@ fn type_ahead(t as *term.Term, n as i64) as void {
 // terminal holds the only keys to the jobs it started, so leaving without
 // ending them strands them with nobody to read their output and nobody able to
 // kill them.
+// close_window — the window was asked to close, and every job goes with it.
+// A job that asked for EV_HUP is told instead of ended, and the window waits
+// up to CLOSE_WAIT_NS for it (close_check): one holding unsaved work stays,
+// says so on its own screen, and the window stays with it — the close is
+// called off. Closing the window of an editor used to end it as it stood.
+fn close_window(t as *term.Term) as void {
+    let is i64 as waiting with mut = 0;
+    let is i64 as jk with mut = 0;
+    while (jk < jobs.max_jobs()) {
+        let is *jobs.Job as cj = jobs.get(jk);
+        if (cj.status == jobs.JOB_RUN) {
+            if ((cj.tty_catch & tty.EV_HUP) != 0 && cj.tty_fd >= 0) {
+                tty.send_event(cj.tty_fd, tty.EV_HUP);
+                waiting = 1;
+            } else {
+                jobs.kill_job(jk);
+            }
+        }
+        jk = jk + 1;
+    }
+    if (waiting == 1) { s.close_wait_until = sys.time_ns() + s.CLOSE_WAIT_NS; return; }
+    term.putc(t, 0x0A); g.show(t);
+    wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+    return;
+}
+
+// close_check — each pass while a close waits: the jobs it told may be gone
+// (the window closes), or the wait over (it stays open).
+fn close_check() as void {
+    if (s.close_wait_until == 0) { return; }
+    let is i64 as running with mut = 0;
+    let is i64 as jk with mut = 0;
+    while (jk < jobs.max_jobs()) {
+        if (jobs.get(jk).status == jobs.JOB_RUN) { running = 1; }
+        jk = jk + 1;
+    }
+    if (running == 0) {
+        s.close_wait_until = 0;
+        wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+        return;
+    }
+    if (sys.time_ns() >= s.close_wait_until) { s.close_wait_until = 0; }
+    return;
+}
+
 fn quit() as void {
     let is i64 as jk with mut = 0;
     while (jk < jobs.max_jobs()) {
@@ -323,9 +368,17 @@ fn handle_key(t as *term.Term, keysym as i64, kb as i64, sc as i64) as void {
         // Ctrl+C ends the job instead of being forwarded to it. The terminal
         // spawned it and holds the only key to it, so this is the ONLY way out
         // of a program that stopped reading its input — without it a runaway
-        // command could only be escaped by destroying the window.
-        if ((cp.key_mods(kb) & cp.MOD_CTRL) != 0 && sc == 0x2E) {
-            jobs.kill_job(s.fg_job);
+        // command could only be escaped by destroying the window. A program
+        // that asked for it (ttyproto EV_INTR: an editor, a recorder with a
+        // file to finish) is told instead, and decides. Ctrl+\ ends the job
+        // whatever it asked.
+        if ((cp.key_mods(kb) & cp.MOD_CTRL) != 0 && (sc == 0x2E || sc == 0x2B)) {
+            let is *jobs.Job as fj = jobs.get(s.fg_job);
+            if (sc == 0x2E && (fj.tty_catch & tty.EV_INTR) != 0 && fj.tty_fd >= 0) {
+                tty.send_event(fj.tty_fd, tty.EV_INTR);
+            } else {
+                jobs.kill_job(s.fg_job);
+            }
             sx.list_cancel();            // and the rest of its line with it
             return;
         }
@@ -437,19 +490,12 @@ fn handle_msg(t as *term.Term, m as *i64) as void {
         g.show(t);
         g.send_size(t);
     } else if (m[0] == wmp.MSG_CLOSE_REQ) {
-        // The window is being dismissed, so it goes. A running job is killed
-        // first: the wterm spawned it and holds the only key to it, so nobody
-        // else can. Ending the job without ending the window (the old
-        // behaviour) left Super+Q doing nothing at all at an idle prompt.
-        term.putc(t, 0x0A); g.show(t);
-        // Every job this terminal started dies with it, background ones too:
-        // the wterm holds the only keys to them, so nothing else could.
-        let is i64 as jk with mut = 0;
-        while (jk < jobs.max_jobs()) {
-            if (jobs.get(jk).status == jobs.JOB_RUN) { jobs.kill_job(jk); }
-            jk = jk + 1;
-        }
-        wmp.msg_send(s.WM_FD, wmp.MSG_CLOSE, 0, 0, 0);
+        // The window is being dismissed, so it goes, and every job this
+        // terminal started goes with it, background ones too: the wterm holds
+        // the only keys to them. Ending the job without ending the window (an
+        // old behaviour) left Super+Q doing nothing at an idle prompt. A job
+        // that asked to be told is told, and may keep the window (close_window).
+        if (s.close_wait_until == 0) { close_window(t); }
     } else if (m[0] == wmp.MSG_MOUSE_BTN) {
         forward_mouse_btn(t, m[1], m[2], m[3]);   // a=buttons, b=x, c=y (content-relative)
     } else if (m[0] == wmp.MSG_MOUSE_WHEEL) {
@@ -571,7 +617,13 @@ fn main() as i32 {
         // printing once a second). Nothing in this loop is periodic: keys
         // arrive on the WM channel, output on a job's fd, exits on the event
         // fd, and all three wake a blocked poll.
-        sys.poll(&pe[0], n, 0 - 1);
+        // A close waiting on its jobs needs waking when the wait is over.
+        let is i64 as ptmo with mut = 0 - 1;
+        if (s.close_wait_until > 0) {
+            ptmo = s.close_wait_until - sys.time_ns();
+            if (ptmo < 0) { ptmo = 0; }
+        }
+        sys.poll(&pe[0], n, ptmo);
 
         let is i64 as pk with mut = 0;
         while (pk < njp) {
@@ -583,7 +635,7 @@ fn main() as i32 {
         while (pk < ntp) {
             if ((pe[(te0 + pk)*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
                 let is *jobs.Job as tj = jobs.get(tty_slot[pk]);
-                if (tty.answer(tj.tty_fd, &tj.tty_fill, jobs.tty_acc(tty_slot[pk]), t.cols, t.rows) < 0) {
+                if (tty.answer(tj.tty_fd, &tj.tty_fill, jobs.tty_acc(tty_slot[pk]), t.cols, t.rows, &tj.tty_catch) < 0) {
                     sys.close(tj.tty_fd); tj.tty_fd = 0 - 1;
                 }
             }
@@ -595,6 +647,7 @@ fn main() as i32 {
             if (jobs.get(jj).status == jobs.JOB_DONE) { finish_job(&t, jj); }
             jj = jj + 1;
         }
+        close_check();
 
         if ((pe[0*3+2] & sys.POLL_READABLE) != 0) {
             let is [4]i64 as m;
