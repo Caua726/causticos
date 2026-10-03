@@ -9,6 +9,10 @@
 // scancode is which char — all userspace policy. dev_open(DEV_KEYBOARD)
 // hands back a KOBJ_DEVICE whose read drains the raw-event ring (lossless;
 // the holder sees presses AND releases). Mechanism in the kernel, policy out.
+//
+// The one thing a holder tells the keyboard is which LEDs to light. CapsLock
+// being on is a fact of the layout, which is userspace's; the keyboard only
+// shows what it is told. write() on the device takes that byte.
 
 use "driver.cst" as driver;
 use "spec.cst" as spec;
@@ -21,6 +25,7 @@ use "sched.cst" as sched;
 use "abi.cst" as abi;
 use "i8042.cst" as i8042;
 use "grab.cst" as grab;
+use "timer.cst" as timer;
 
 // 2-byte events: [scancode, flags]. flags bit0 = pressed (1) / released (0),
 // bit1 = extended (0xE0-prefixed). 256-byte ring = 128 events.
@@ -32,6 +37,13 @@ let is i64 as kbd_head with mut = 0;
 let is i64 as kbd_tail with mut = 0;
 let is i64 as kbd_count with mut = 0;
 let is i64 as kbd_e0 with mut = 0;            // 0xE0 prefix pending
+// LED command in flight. The keyboard answers each command byte with ACK
+// (0xFA) or RESEND (0xFE), and those come in on IRQ1 like keys do — but 0xFE
+// is also the release of key 0x7E (ABNT2's keypad point), so a byte is taken
+// as an answer only while one is awaited.
+let is i64 as kbd_want with mut = 0;          // 1 = a command byte awaits its answer
+let is i64 as kbd_answer with mut = 0;        // 0xFA, 0xFE, or 0 = nothing yet
+let is i64 as kbd_leds with mut = 0;          // what the LEDs show: bit0 Scroll, bit1 Num, bit2 Caps
 let is lock.TicketLock as kbd_lk;
 
 let is ksym.KSym as ksym_handler;
@@ -99,8 +111,9 @@ fn kbd_init() as void {
     KBD_OPS.close = fn_ptr(kbd_close);
     KBD_OPS.poll  = fn_ptr(kbd_poll);
     KBD_OPS.wait_key = fn_ptr(kbd_wait_key);
-    // write/mmap/present/lseek/readdir stay null — a keyboard is a read-only
-    // raw-event stream, not a byte file, not a surface.
+    KBD_OPS.write = fn_ptr(kbd_write);
+    // mmap/present/lseek/readdir stay null — a keyboard is a raw-event stream
+    // with LEDs, not a byte file, not a surface.
 }
 
 // Readiness for SYS_POLL: READABLE when at least one whole 2-byte event is
@@ -147,7 +160,17 @@ fn handler(dev as *driver.Hardware, ctx as *u8) as i32 {
         if ((st & i8042.ST_OBF) == 0) { return 0; }
         if ((st & i8042.ST_AUX) != 0) { return 0; }
         let is i64 as byte = port.inb(0x60);
-        if (byte == 0xE0) {
+        let is i64 as fa = lock.acquire_irq(&kbd_lk);
+        let is i64 as answered with mut = 0;
+        if (kbd_want == 1 && (byte == 0xFA || byte == 0xFE)) {
+            kbd_answer = byte;
+            kbd_want = 0;
+            answered = 1;
+        }
+        lock.release_irq(&kbd_lk, fa);
+        if (answered == 1) {
+            // the answer to an LED command, not a key
+        } else if (byte == 0xE0) {
             let is i64 as fl = lock.acquire_irq(&kbd_lk);
             kbd_e0 = 1;
             lock.release_irq(&kbd_lk, fl);
@@ -212,6 +235,81 @@ fn kbd_read(priv as i64, buf as i64, n as i64) as i64 {
         }
     }
     return result;
+}
+
+// Send one command byte to the keyboard and wait for its ACK, sending it again
+// when the keyboard asks (RESEND), three times at most. 0 = acknowledged;
+// -1 = the controller would not take the byte, -2 = no answer in 50 ms,
+// -3 = still RESEND after three tries. Called with the controller lock held.
+fn _kbd_send(byte as i64) as i64 {
+    let is i64 as tries with mut = 0;
+    while (tries < 3) {
+        let is i64 as fl = lock.acquire_irq(&kbd_lk);
+        kbd_want = 1;
+        kbd_answer = 0;
+        lock.release_irq(&kbd_lk, fl);
+        if (i8042.write_data(byte) != 0) {
+            let is i64 as f2 = lock.acquire_irq(&kbd_lk);
+            kbd_want = 0;
+            lock.release_irq(&kbd_lk, f2);
+            return 0 - 1;
+        }
+        // A keyboard answers in well under a millisecond; 50 ms is for one
+        // that is busy scanning. Tight first, then 1 ms naps.
+        let is i64 as start = timer.current_time_ns();
+        let is i64 as got with mut = 0;
+        while (got == 0) {
+            let is i64 as f3 = lock.acquire_irq(&kbd_lk);
+            got = kbd_answer;
+            lock.release_irq(&kbd_lk, f3);
+            if (got == 0) {
+                let is i64 as now = timer.current_time_ns();
+                if (now - start >= 50000000) { break; }
+                if (now - start >= 200000) { sched.sleep_for_ns(1000000); }
+            }
+        }
+        let is i64 as f4 = lock.acquire_irq(&kbd_lk);
+        kbd_want = 0;
+        lock.release_irq(&kbd_lk, f4);
+        if (got == 0xFA) { return 0; }
+        if (got == 0) { return 0 - 2; }
+        tries = tries + 1;                                   // RESEND
+    }
+    return 0 - 3;
+}
+
+// Device write op: the LEDs. The last byte written is what holds — bit 0
+// Scroll Lock, bit 1 Num Lock, bit 2 Caps Lock, the keyboard's own order; the
+// other bits must be 0. Only the holder on top of the grab stack lights them
+// (the one being typed at); one that is preempted gets E_AGAIN. A keyboard
+// that does not acknowledge is E_IO, and the serial line says how it failed.
+fn kbd_write(priv as i64, buf as i64, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (grab.top(&kbd_gs) != priv) { return abi.E_AGAIN; }
+    let is *u8 as b = cast(*u8, buf + n - 1);
+    let is i64 as mask = cast(i64, b[0]);
+    if ((mask & 0xF8) != 0) { return abi.E_INVAL; }
+    if (mask == kbd_leds) { return n; }
+    i8042.lock_ctl();
+    let is i64 as rc with mut = _kbd_send(0xED);
+    if (rc == 0) {
+        rc = _kbd_send(mask);
+        // The keyboard took 0xED and still waits for its argument. A command
+        // in its place ends the wait; enable-scanning (0xF4) is one it always
+        // takes and that changes nothing.
+        if (rc != 0) { _kbd_send(0xF4); }
+    }
+    i8042.unlock_ctl();
+    if (rc != 0) {
+        serial.print("kbd: LED command failed (", 25);
+        if (rc == 0 - 1) { serial.print("controller busy", 15); }
+        else if (rc == 0 - 2) { serial.print("no answer in 50 ms", 18); }
+        else { serial.print("RESEND three times", 18); }
+        serial.println(")", 1);
+        return abi.E_IO;
+    }
+    kbd_leds = mask;
+    return n;
 }
 
 fn kbd_close(priv as i64) as i64 {
