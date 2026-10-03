@@ -1,62 +1,868 @@
-// find — walk directory trees, printing paths that pass the tests.
-//   find [path ...] [-name PAT] [-type f|d]
-// -name = substring match on the entry name, -type f (file) / d (directory).
-// Default path is /. (Tests combine with AND, like find's defaults.)
+// find — walk directory trees and act on the names that pass an expression.
+//
+//   find [PATH...] [EXPRESSION]
+//
+// PATHs come first, up to the first word that starts with '-', '(' or '!'; with
+// none the walk starts at ".". Each is printed as it was given, then everything
+// under it — a directory before what is in it, or after it with -depth. (A
+// relative PATH is resolved the way every program here resolves one: against
+// /, since a program is not told the shell's directory.)
+//
+// The expression is GNU find's:
+//   ( EXPR )   ! EXPR   -not EXPR   EXPR [-a|-and] EXPR   EXPR -o|-or EXPR
+// Options, anywhere, for the whole walk:
+//   -maxdepth N   -mindepth N   -depth
+// Tests:
+//   -name PATTERN  -iname PATTERN   the last component, a shell pattern
+//   -path PATTERN  -ipath PATTERN   the path as printed ('*' takes '/' too)
+//   -type T          f (file) or d (directory); several as f,d
+//   -size [+|-]N[c|w|b|k|M|G]   the size in those units, rounded up (b = 512
+//                    bytes, the default); +N more than N, -N fewer
+//   -empty           an empty file, or a directory with nothing in it
+//   -newer FILE      modified after FILE was
+//   -mtime [+|-]N    modified N whole days ago; -mmin [+|-]N in minutes
+//   -true  -false
+// Actions — with none in the expression, -print is done for what passes:
+//   -print  -print0  -prune  -quit  -delete
+//   -exec COMMAND ... ;      run it for each, every {} the path; true if it
+//                            exits 0
+//   -exec COMMAND ... {} +   run it with as many paths at once as fit
+//   -ok COMMAND ... ;        as -exec ..., ;, but asks first
+//
+// Exit status 1 when a path could not be read or an action failed, 0 else.
+//
+// This replaces a find whose -name was a substring search (so "*.txt" looked
+// for a literal star), which did not print the PATH it started from, and which
+// stopped at 256 names a directory.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
+use "../lib/glob/glob.cst" as glob;
+use "../lib/crash/crash.cst" as crash;
 
-let is i64 as g_namep with mut = 0;   // *u8 (held as address); 0 = no -name
-let is i64 as g_nlen with mut = 0;
-let is i64 as g_type with mut = 0;    // 0 any, 1 file, 2 dir
+// ---- the expression ----------------------------------------------------------
+
+let is i64 as K_AND     with imut = 1;
+let is i64 as K_OR      with imut = 2;
+let is i64 as K_NOT     with imut = 3;
+let is i64 as K_TRUE    with imut = 4;
+let is i64 as K_FALSE   with imut = 5;
+let is i64 as K_NAME    with imut = 6;    // nv = glob flags
+let is i64 as K_PATH    with imut = 7;    // nv = glob flags
+let is i64 as K_TYPE    with imut = 8;    // nv = mask: 1 file, 2 directory
+let is i64 as K_SIZE    with imut = 9;    // nv = N, nw = sign, nu = unit
+let is i64 as K_EMPTY   with imut = 10;
+let is i64 as K_NEWER   with imut = 11;   // nv = the other file's mtime
+let is i64 as K_AGE     with imut = 12;   // nv = N, nw = sign, nu = seconds a unit
+let is i64 as K_PRINT   with imut = 13;
+let is i64 as K_PRINT0  with imut = 14;
+let is i64 as K_PRUNE   with imut = 15;
+let is i64 as K_QUIT    with imut = 16;
+let is i64 as K_DELETE  with imut = 17;
+let is i64 as K_EXEC    with imut = 18;   // na = first word, nb = how many
+let is i64 as K_EXECALL with imut = 19;   // the same, {} + form; nv = its batch
+let is i64 as K_OK      with imut = 20;
+
+// The kernel copies at most this many arguments into a child, and their bytes
+// into one page with the rest of what starts it; -exec stays inside both.
+let is i64 as ARG_MAX   with imut = 32;
+let is i64 as ARG_BYTES with imut = 2800;
+
+// A node per word is the most an expression can have, and the shell hands a
+// program at most 32 words: these hold any expression it can be given.
+let is i64 as MAXN with imut = 128;
+let is [128]i64 as nk with mut;
+let is [128]i64 as na with mut;
+let is [128]i64 as nb with mut;
+let is [128]i64 as nv with mut;
+let is [128]i64 as nw with mut;
+let is [128]i64 as nu with mut;
+let is [128]i64 as np with mut;           // a pattern: its word
+let is i64 as nn with mut = 0;
+
+let is i64 as g_argv with mut = 0;
+let is i64 as g_argc with mut = 0;
+let is i64 as g_pos with mut = 0;         // the parser's next word
+
+let is i64 as g_maxdepth with mut = 0x7FFFFFFF;
+let is i64 as g_mindepth with mut = 0;
+let is i64 as g_post with mut = 0;        // -depth: a directory after its contents
+let is i64 as g_action with mut = 0;      // the expression has an action of its own
+let is i64 as g_quit with mut = 0;
+let is i64 as g_status with mut = 0;
+let is i64 as g_now with mut = 0;
+
+fn word(i as i64) as *u8 { return prog.arg(cast(*u8, g_argv), i); }
 
 fn streq(a as *u8, b as *u8) as i64 {
     let is i64 as i with mut = 0;
-    while (cast(i64, a[i]) != 0 && cast(i64, b[i]) != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; }
-    if (cast(i64, a[i]) == 0 && cast(i64, b[i]) == 0) { return 1; }
+    while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    if (a[i] == 0 && b[i] == 0) { return 1; }
     return 0;
 }
 
-fn matches(name as *u8, nl as i64, isdir as i64) as i64 {
-    if (g_nlen > 0) { if (fu.mem_find(name, nl, cast(*u8, g_namep), g_nlen) < 0) { return 0; } }
-    if (g_type == 1 && isdir != 0) { return 0; }
-    if (g_type == 2 && isdir == 0) { return 0; }
-    return 1;
+fn die(a as *u8, b as *u8, c as *u8) as void {
+    flush();
+    prog.errs("find: "); prog.errs(a); prog.errs(b); prog.errs(c); prog.errs("\n");
+    sys.exit(cast(i32, 1));
 }
 
-fn find_walk(path as *u8, plen as i64) as void {
-    let is [8192]u8 as names;
-    let is [256]i64 as off; let is [256]i64 as nl; let is [256]i64 as isd;
-    let is i64 as cnt = fu.read_dir(path, cast(*u8, &names[0]), 8192, cast(*i64, &off[0]), cast(*i64, &nl[0]), cast(*i64, &isd[0]), 256);
-    let is i64 as k with mut = 0;
-    while (k < cnt) {
-        let is *u8 as nm = cast(*u8, cast(i64, &names[0]) + off[k]);
-        let is [512]u8 as child;
-        let is i64 as clen = fu.path_join(cast(*u8, &child[0]), path, plen, nm, nl[k]);
-        if (matches(nm, nl[k], isd[k]) == 1) { prog.out(cast(*u8, &child[0]), clen); prog.out("\n", 1); }
-        if (isd[k] != 0) { find_walk(cast(*u8, &child[0]), clen); }
-        k = k + 1;
+fn node(k as i64) as i64 {
+    if (nn >= MAXN) { die("the expression is too long", "", ""); }
+    nk[nn] = k; na[nn] = 0; nb[nn] = 0; nv[nn] = 0; nw[nn] = 0; nu[nn] = 0; np[nn] = 0;
+    nn = nn + 1;
+    return nn - 1;
+}
+
+fn bin(k as i64, l as i64, r as i64) as i64 {
+    let is i64 as n = node(k);
+    na[n] = l; nb[n] = r;
+    return n;
+}
+
+// The word after an option that needs one.
+fn operand(opt as *u8) as *u8 {
+    if (g_pos >= g_argc) { die("missing argument to '", opt, "'"); }
+    let is *u8 as w = word(g_pos);
+    g_pos = g_pos + 1;
+    return w;
+}
+
+// [+|-]N, with an optional unit letter when units is 1: returns N, sets sign
+// (1 more, -1 less, 0 exactly) and the unit's letter (0 if none).
+fn number(opt as *u8, w as *u8, sign as *i64, unit as *i64, units as i64) as i64 {
+    let is i64 as i with mut = 0;
+    sign[0] = 0; unit[0] = 0;
+    if (w[0] == cast(u8, 43)) { sign[0] = 1; i = 1; }
+    else if (w[0] == cast(u8, 45)) { sign[0] = 0 - 1; i = 1; }
+    let is i64 as v with mut = 0;
+    let is i64 as digits with mut = 0;
+    while (w[i] >= cast(u8, 48) && w[i] <= cast(u8, 57)) {
+        v = v * 10 + (cast(i64, w[i]) - 48);
+        i = i + 1; digits = digits + 1;
     }
+    if (units == 1 && w[i] != 0 && w[i + 1] == 0) { unit[0] = cast(i64, w[i]); i = i + 1; }
+    if (digits == 0 || w[i] != 0) { die("invalid argument '", w, "' to that option"); }
+    return v;
+}
+
+fn _ends(w as *u8, lit as *u8) as i64 {
+    if (streq(w, lit) == 1) { return 1; }
+    return 0;
+}
+
+// -exec / -ok: the words up to ';' (or "{} +"), and checks on them.
+fn exec_words(k as i64, opt as *u8) as i64 {
+    let is i64 as start = g_pos;
+    while (g_pos < g_argc) {
+        let is *u8 as w = word(g_pos);
+        if (streq(w, ";") == 1) {
+            if (g_pos == start) { die("missing command for '", opt, "'"); }
+            let is i64 as n = node(k);
+            na[n] = start; nb[n] = g_pos - start;
+            g_pos = g_pos + 1;
+            return n;
+        }
+        if (streq(w, "+") == 1 && k == K_EXEC && g_pos > start && streq(word(g_pos - 1), "{}") == 1) {
+            if (g_pos - 1 == start) { die("missing command for '", opt, "'"); }
+            let is i64 as n = node(K_EXECALL);
+            na[n] = start; nb[n] = g_pos - 1 - start;        // the command, without the {}
+            nv[n] = batch_new(n);
+            g_pos = g_pos + 1;
+            return n;
+        }
+        g_pos = g_pos + 1;
+    }
+    die("missing ';' after '", opt, "' (or {} + at the end)");
+    return 0 - 1;
+}
+
+fn primary() as i64 {
+    if (g_pos >= g_argc) { die("an expression ends where it needs more", "", ""); }
+    let is *u8 as w = word(g_pos);
+    g_pos = g_pos + 1;
+    if (streq(w, "(") == 1) {
+        let is i64 as e = parse_or();
+        if (g_pos >= g_argc || streq(word(g_pos), ")") == 0) { die("missing ')'", "", ""); }
+        g_pos = g_pos + 1;
+        return e;
+    }
+    if (streq(w, ")") == 1) { die("')' with no '(' before it", "", ""); }
+    if (streq(w, "-name") == 1 || streq(w, "-iname") == 1) {
+        let is i64 as n = node(K_NAME);
+        np[n] = cast(i64, operand(w));
+        if (w[1] == cast(u8, 105)) { nv[n] = glob.FL_CASEFOLD; }
+        return n;
+    }
+    if (streq(w, "-path") == 1 || streq(w, "-ipath") == 1 || streq(w, "-wholename") == 1 || streq(w, "-iwholename") == 1) {
+        let is i64 as n = node(K_PATH);
+        np[n] = cast(i64, operand(w));
+        if (w[1] == cast(u8, 105)) { nv[n] = glob.FL_CASEFOLD; }
+        return n;
+    }
+    if (streq(w, "-type") == 1) {
+        let is *u8 as t = operand(w);
+        let is i64 as n = node(K_TYPE);
+        let is i64 as i with mut = 0;
+        while (t[i] != 0) {
+            let is i64 as c = cast(i64, t[i]);
+            if (c == 102) { nv[n] = nv[n] | 1; }                       // f
+            else if (c == 100) { nv[n] = nv[n] | 2; }                  // d
+            else if (c == 108 || c == 98 || c == 99 || c == 112 || c == 115 || c == 68) { }  // l b c p s D: none here
+            else { die("unknown type '", t, "' for -type (f or d)"); }
+            i = i + 1;
+            if (t[i] == cast(u8, 44)) { i = i + 1; }                   // f,d
+            else if (t[i] != 0) { die("unknown type '", t, "' for -type (f or d)"); }
+        }
+        return n;
+    }
+    if (streq(w, "-size") == 1) {
+        let is *u8 as v = operand(w);
+        let is [1]i64 as sg; let is [1]i64 as un;
+        let is i64 as n = node(K_SIZE);
+        nv[n] = number(w, v, cast(*i64, &sg[0]), cast(*i64, &un[0]), 1);
+        nw[n] = sg[0];
+        let is i64 as u = un[0];
+        if (u == 0 || u == 98) { nu[n] = 512; }
+        else if (u == 99) { nu[n] = 1; }
+        else if (u == 119) { nu[n] = 2; }
+        else if (u == 107) { nu[n] = 1024; }
+        else if (u == 77) { nu[n] = 1048576; }
+        else if (u == 71) { nu[n] = 1073741824; }
+        else { die("invalid unit in '", v, "' for -size (c w b k M G)"); }
+        return n;
+    }
+    if (streq(w, "-empty") == 1) { return node(K_EMPTY); }
+    if (streq(w, "-newer") == 1) {
+        let is *u8 as f = operand(w);
+        let is [256]u8 as fb;
+        let is *u8 as fp = prog.abspath(f, cast(*u8, &fb[0]));
+        let is [5]i64 as sx;
+        if (sys.statx(fp, cast(*u8, &sx[0])) != 0) { die("'", f, "': no such file, for -newer"); }
+        let is i64 as n = node(K_NEWER);
+        nv[n] = sx[4];
+        return n;
+    }
+    if (streq(w, "-mtime") == 1 || streq(w, "-mmin") == 1) {
+        let is *u8 as v = operand(w);
+        let is [1]i64 as sg; let is [1]i64 as un;
+        let is i64 as n = node(K_AGE);
+        nv[n] = number(w, v, cast(*i64, &sg[0]), cast(*i64, &un[0]), 0);
+        nw[n] = sg[0];
+        if (w[2] == cast(u8, 109) && w[3] == cast(u8, 105)) { nu[n] = 60; } else { nu[n] = 86400; }   // -mmin
+        if (g_now == 0) { g_now = fu.epoch_now(); }
+        return n;
+    }
+    if (streq(w, "-maxdepth") == 1 || streq(w, "-mindepth") == 1) {
+        let is *u8 as v = operand(w);
+        let is [1]i64 as sg; let is [1]i64 as un;
+        let is i64 as d = number(w, v, cast(*i64, &sg[0]), cast(*i64, &un[0]), 0);
+        if (sg[0] != 0) { die("'", v, "' is not a depth"); }
+        if (w[2] == cast(u8, 97)) { g_maxdepth = d; } else { g_mindepth = d; }
+        return node(K_TRUE);
+    }
+    if (streq(w, "-depth") == 1 || streq(w, "-d") == 1) { g_post = 1; return node(K_TRUE); }
+    if (streq(w, "-true") == 1) { return node(K_TRUE); }
+    if (streq(w, "-false") == 1) { return node(K_FALSE); }
+    if (streq(w, "-print") == 1) { g_action = 1; return node(K_PRINT); }
+    if (streq(w, "-print0") == 1) { g_action = 1; return node(K_PRINT0); }
+    if (streq(w, "-prune") == 1) { return node(K_PRUNE); }
+    if (streq(w, "-quit") == 1) { g_action = 1; return node(K_QUIT); }
+    if (streq(w, "-delete") == 1) { g_action = 1; g_post = 1; return node(K_DELETE); }
+    if (streq(w, "-exec") == 1) { g_action = 1; return exec_words(K_EXEC, w); }
+    if (streq(w, "-ok") == 1) { g_action = 1; return exec_words(K_OK, w); }
+    if (w[0] == cast(u8, 45)) { die("unknown predicate '", w, "'"); }
+    die("paths must come before the expression: '", w, "'");
+    return 0 - 1;
+}
+
+fn parse_not() as i64 {
+    if (g_pos < g_argc && (streq(word(g_pos), "!") == 1 || streq(word(g_pos), "-not") == 1)) {
+        g_pos = g_pos + 1;
+        return bin(K_NOT, parse_not(), 0);
+    }
+    return primary();
+}
+
+fn parse_and() as i64 {
+    let is i64 as l with mut = parse_not();
+    while (g_pos < g_argc) {
+        let is *u8 as w = word(g_pos);
+        if (streq(w, "-o") == 1 || streq(w, "-or") == 1 || streq(w, ")") == 1) { return l; }
+        if (streq(w, "-a") == 1 || streq(w, "-and") == 1) { g_pos = g_pos + 1; }
+        l = bin(K_AND, l, parse_not());
+    }
+    return l;
+}
+
+fn parse_or() as i64 {
+    let is i64 as l with mut = parse_and();
+    while (g_pos < g_argc && (streq(word(g_pos), "-o") == 1 || streq(word(g_pos), "-or") == 1)) {
+        g_pos = g_pos + 1;
+        l = bin(K_OR, l, parse_and());
+    }
+    return l;
+}
+
+// ---- output ------------------------------------------------------------------
+
+let is [8192]u8 as obuf with mut;
+let is i64 as ofill with mut = 0;
+
+fn flush() as void {
+    if (ofill > 0) { prog.out(cast(*u8, &obuf[0]), ofill); ofill = 0; }
+    return;
+}
+
+fn put(p as *u8, n as i64) as void {
+    if (ofill + n > 8192) { flush(); }
+    if (n > 8192) { prog.out(p, n); return; }
+    let is i64 as i with mut = 0;
+    while (i < n) { obuf[ofill + i] = p[i]; i = i + 1; }
+    ofill = ofill + n;
+    return;
+}
+
+// ---- the entry being looked at -----------------------------------------------
+
+let is [4096]u8 as sbuf with mut;         // its path as printed
+let is i64 as slen with mut = 0;
+let is [4096]u8 as abuf with mut;         // and as the filesystem knows it
+let is i64 as alen with mut = 0;
+let is i64 as e_name with mut = 0;        // *u8, its last component
+let is i64 as e_nlen with mut = 0;
+let is i64 as e_dir with mut = 0;
+let is i64 as e_size with mut = 0;
+let is i64 as e_mtime with mut = 0 - 1;   // -1 = not asked yet
+let is i64 as e_prune with mut = 0;
+let is i64 as e_start with mut = 0;       // 1 = a PATH from the command line
+
+fn mtime() as i64 {
+    if (e_mtime < 0) { e_mtime = fu.statx_mtime(cast(*u8, &abuf[0])); }
+    return e_mtime;
+}
+
+// Nothing in a directory but "." and "..".
+fn dir_empty() as i64 {
+    let is i64 as fd = sys.open_read(cast(*u8, &abuf[0]));
+    if (fd < 0) { return 0; }
+    let is [320]u8 as de;
+    let is i64 as empty with mut = 1;
+    while (empty == 1 && sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+        if (fu.is_dot(cast(*u8, &de[0]), fu.de_name_len(cast(*u8, &de[0]))) == 0) { empty = 0; }
+    }
+    sys.close(fd);
+    return empty;
+}
+
+fn cmp(have as i64, want as i64, sign as i64) as i64 {
+    if (sign > 0) { if (have > want) { return 1; } return 0; }
+    if (sign < 0) { if (have < want) { return 1; } return 0; }
+    if (have == want) { return 1; }
+    return 0;
+}
+
+fn eval(n as i64) as i64 {
+    let is i64 as k = nk[n];
+    // After -quit nothing more of the expression runs: `-quit -print` prints
+    // nothing, `-print -quit` the one name.
+    if (k == K_AND) {
+        if (eval(na[n]) == 0) { return 0; }
+        if (g_quit == 1) { return 1; }
+        return eval(nb[n]);
+    }
+    if (k == K_OR) {
+        if (eval(na[n]) == 1) { return 1; }
+        if (g_quit == 1) { return 0; }
+        return eval(nb[n]);
+    }
+    if (k == K_NOT) { return 1 - eval(na[n]); }
+    if (k == K_TRUE) { return 1; }
+    if (k == K_FALSE) { return 0; }
+    if (k == K_NAME) {
+        let is *u8 as pat = cast(*u8, np[n]);
+        return glob.fnmatch(pat, prog.slen(pat), cast(*u8, e_name), e_nlen, nv[n]);
+    }
+    if (k == K_PATH) {
+        let is *u8 as pat = cast(*u8, np[n]);
+        return glob.fnmatch(pat, prog.slen(pat), cast(*u8, &sbuf[0]), slen, nv[n]);
+    }
+    if (k == K_TYPE) {
+        if (e_dir != 0) { if ((nv[n] & 2) != 0) { return 1; } return 0; }
+        if ((nv[n] & 1) != 0) { return 1; }
+        return 0;
+    }
+    if (k == K_SIZE) {
+        let is i64 as u = nu[n];
+        let is i64 as units with mut = e_size;
+        if (u > 1) { units = (e_size + u - 1) / u; }
+        return cmp(units, nv[n], nw[n]);
+    }
+    if (k == K_EMPTY) {
+        if (e_dir != 0) { return dir_empty(); }
+        if (e_size == 0) { return 1; }
+        return 0;
+    }
+    if (k == K_NEWER) {
+        let is i64 as t = mtime();
+        if (t <= 0 || nv[n] <= 0) { return 0; }   // no stamp: not after anything
+        if (t > nv[n]) { return 1; }
+        return 0;
+    }
+    if (k == K_AGE) {
+        let is i64 as t = mtime();
+        if (t <= 0 || g_now <= 0) { return 0; }   // no stamp, or no clock: no age
+        let is i64 as age with mut = g_now - t;
+        if (age < 0) { age = 0; }
+        return cmp(age / nu[n], nv[n], nw[n]);
+    }
+    if (k == K_PRINT) {
+        put(cast(*u8, &sbuf[0]), slen); put("\n", 1);
+        return 1;
+    }
+    if (k == K_PRINT0) {
+        put(cast(*u8, &sbuf[0]), slen);
+        let is [1]u8 as z; z[0] = cast(u8, 0);
+        put(cast(*u8, &z[0]), 1);
+        return 1;
+    }
+    if (k == K_PRUNE) { e_prune = 1; return 1; }
+    if (k == K_QUIT) { g_quit = 1; return 1; }
+    if (k == K_DELETE) { return remove(); }
+    if (k == K_EXEC) { return run_each(n, 0); }
+    if (k == K_OK) { return run_each(n, 1); }
+    if (k == K_EXECALL) { batch_add(n); return 1; }
+    return 0;
+}
+
+// -delete. The directory itself after what was in it (-delete implies -depth),
+// and never "." or "/": GNU find does not remove the place it started from.
+fn remove() as i64 {
+    if (e_start == 1 && (streq(cast(*u8, &sbuf[0]), ".") == 1 || streq(cast(*u8, &abuf[0]), "/") == 1)) { return 1; }
+    let is i32 as rc with mut = cast(i32, 0);
+    if (e_dir != 0) { rc = sys.rmdir(cast(*u8, &abuf[0])); } else { rc = sys.unlink(cast(*u8, &abuf[0])); }
+    if (cast(i64, rc) == 0) { return 1; }
+    flush();
+    prog.errs("find: cannot delete '"); prog.err(cast(*u8, &sbuf[0]), slen);
+    prog.errs("': "); prog.errs(sys.err_text(cast(i64, rc))); prog.errs("\n");
+    g_status = 1;
+    return 0;
+}
+
+// ---- running commands ----------------------------------------------------------
+
+// Where a command word's program is: a bare name where programs live
+// ("/name.cse"), a word with a '/' as the path it is, with ".cse" tried after
+// it — the shell's rule, so -exec runs what typing the name would.
+fn prog_path(cmd as *u8, out as *u8) as i64 {
+    let is i64 as n = prog.slen(cmd);
+    let is i64 as slash with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) { if (cmd[i] == cast(u8, 47)) { slash = 1; } i = i + 1; }
+    let is [4]i64 as st;
+    if (slash == 0) {
+        if (n > 240) { return 0; }
+        out[0] = cast(u8, 47);
+        i = 0;
+        while (i < n) { out[1 + i] = cmd[i]; i = i + 1; }
+        out[1 + n] = cast(u8, 46); out[2 + n] = cast(u8, 99); out[3 + n] = cast(u8, 115); out[4 + n] = cast(u8, 101);
+        out[5 + n] = cast(u8, 0);
+        if (sys.stat(out, cast(*u8, &st[0])) == 0) { return 1; }
+        return 0;
+    }
+    let is [256]u8 as tmp;
+    let is *u8 as p = prog.abspath(cmd, cast(*u8, &tmp[0]));
+    let is i64 as pl = prog.slen(p);
+    if (pl > 240) { return 0; }
+    i = 0;
+    while (i <= pl) { out[i] = p[i]; i = i + 1; }
+    if (sys.stat(out, cast(*u8, &st[0])) == 0 && st[3] == 0) { return 1; }
+    out[pl] = cast(u8, 46); out[pl + 1] = cast(u8, 99); out[pl + 2] = cast(u8, 115); out[pl + 3] = cast(u8, 101);
+    out[pl + 4] = cast(u8, 0);
+    if (sys.stat(out, cast(*u8, &st[0])) == 0) { return 1; }
+    return 0;
+}
+
+// Start argv (pairs of pointer and length) with our stdin, stdout and stderr,
+// and wait: 1 when it exited 0.
+fn run(av as *i64, ac as i64) as i64 {
+    let is [256]u8 as path;
+    let is *u8 as cmd = cast(*u8, av[0]);
+    if (prog_path(cmd, cast(*u8, &path[0])) == 0) {
+        flush();
+        prog.errs("find: '"); prog.errs(cmd); prog.errs("': no such command\n");
+        g_status = 1;
+        return 0;
+    }
+    flush();                                         // what we printed comes first
+    let is [6]i64 as fda;
+    fda[0] = 0; fda[1] = 0; fda[2] = 1; fda[3] = 1; fda[4] = 2; fda[5] = 2;
+    let is i64 as pid = sys.spawn_path(cast(*u8, &path[0]), cast(*u8, &fda[0]), 3, cast(*u8, av), ac);
+    if (pid < 0) {
+        prog.errs("find: cannot start '"); prog.errs(cmd); prog.errs("': "); prog.errs(sys.err_text(pid)); prog.errs("\n");
+        g_status = 1;
+        return 0;
+    }
+    if (crash.wait(pid) == 0) { return 1; }
+    return 0;
+}
+
+let is [4096]u8 as xbuf with mut;         // -exec ... ; arguments with {} replaced
+
+// -exec / -ok, once for this entry. Every "{}" in a word becomes the path.
+fn run_each(n as i64, ask as i64) as i64 {
+    if (nb[n] > ARG_MAX) { return too_long(); }
+    let is [64]i64 as av;
+    let is i64 as ac with mut = 0;
+    let is i64 as used with mut = 0;
+    let is i64 as w with mut = 0;
+    while (w < nb[n]) {
+        let is *u8 as src = word(na[n] + w);
+        let is i64 as start = used;
+        let is i64 as i with mut = 0;
+        while (src[i] != 0) {
+            if (src[i] == cast(u8, 123) && src[i + 1] == cast(u8, 125)) {      // {}
+                if (used + slen >= ARG_BYTES) { return too_long(); }
+                let is i64 as k with mut = 0;
+                while (k < slen) { xbuf[used] = sbuf[k]; used = used + 1; k = k + 1; }
+                i = i + 2;
+            } else {
+                if (used + 1 >= ARG_BYTES) { return too_long(); }
+                xbuf[used] = src[i]; used = used + 1; i = i + 1;
+            }
+        }
+        xbuf[used] = cast(u8, 0); used = used + 1;
+        av[ac * 2] = cast(i64, &xbuf[start]); av[ac * 2 + 1] = used - 1 - start;
+        ac = ac + 1;
+        w = w + 1;
+    }
+    if (ask == 1) {
+        flush();
+        prog.errs("< ");
+        let is i64 as j with mut = 0;
+        while (j < ac) { prog.err(cast(*u8, av[j * 2]), av[j * 2 + 1]); prog.errs(" "); j = j + 1; }
+        prog.errs("> ? ");
+        let is [16]u8 as ans;
+        let is i64 as got = prog.getline(cast(*u8, &ans[0]), 16);
+        prog.errs("\n");
+        if (got <= 0 || (ans[0] != cast(u8, 121) && ans[0] != cast(u8, 89))) { return 0; }
+    }
+    return run(cast(*i64, &av[0]), ac);
+}
+
+fn too_long() as i64 {
+    flush();
+    prog.errs("find: the command for '"); prog.err(cast(*u8, &sbuf[0]), slen); prog.errs("' is too long to run\n");
+    g_status = 1;
+    return 0;
+}
+
+// -exec ... {} +: paths gathered per such action, and run whenever the next
+// would not fit — in the kernel's argument count or in its page of bytes.
+let is i64 as MAXB with imut = 8;
+let is [32768]u8 as bbuf with mut;        // MAXB * 4096: each batch's paths
+let is [8]i64 as bused with mut;
+let is [8]i64 as bcount with mut;
+let is [256]i64 as boff with mut;         // MAXB * ARG_MAX: where each path is
+let is [8]i64 as bnode with mut;
+let is i64 as nbatch with mut = 0;
+
+fn batch_new(n as i64) as i64 {
+    if (nbatch >= MAXB) { die("too many -exec ... + actions", "", ""); }
+    bused[nbatch] = 0; bcount[nbatch] = 0; bnode[nbatch] = n;
+    nbatch = nbatch + 1;
+    return nbatch - 1;
+}
+
+// The command's own words and its bytes.
+fn batch_fixed(n as i64, bytes as *i64) as i64 {
+    let is i64 as w with mut = 0;
+    let is i64 as b with mut = 0;
+    while (w < nb[n]) { b = b + prog.slen(word(na[n] + w)) + 1; w = w + 1; }
+    bytes[0] = b;
+    return nb[n];
+}
+
+fn batch_add(n as i64) as void {
+    let is i64 as bi = nv[n];
+    let is [1]i64 as fb;
+    let is i64 as fixed = batch_fixed(n, cast(*i64, &fb[0]));
+    if (fixed + 1 > ARG_MAX || fb[0] + slen + 1 > ARG_BYTES || slen + 1 > 4096) { too_long(); return; }
+    if (fixed + bcount[bi] + 1 > ARG_MAX || fb[0] + bused[bi] + slen + 1 > ARG_BYTES) { batch_run(n); }
+    let is i64 as base = bi * 4096;
+    boff[bi * ARG_MAX + bcount[bi]] = bused[bi];
+    let is i64 as k with mut = 0;
+    while (k < slen) { bbuf[base + bused[bi] + k] = sbuf[k]; k = k + 1; }
+    bbuf[base + bused[bi] + slen] = cast(u8, 0);
+    bused[bi] = bused[bi] + slen + 1;
+    bcount[bi] = bcount[bi] + 1;
+    return;
+}
+
+fn batch_run(n as i64) as void {
+    let is i64 as bi = nv[n];
+    if (bcount[bi] == 0) { return; }
+    let is [64]i64 as av;
+    let is i64 as ac with mut = 0;
+    while (ac < nb[n]) {
+        let is *u8 as w = word(na[n] + ac);
+        av[ac * 2] = cast(i64, w); av[ac * 2 + 1] = prog.slen(w);
+        ac = ac + 1;
+    }
+    let is i64 as j with mut = 0;
+    while (j < bcount[bi]) {
+        let is *u8 as p = cast(*u8, cast(i64, &bbuf[bi * 4096]) + boff[bi * ARG_MAX + j]);
+        av[ac * 2] = cast(i64, p); av[ac * 2 + 1] = prog.slen(p);
+        ac = ac + 1; j = j + 1;
+    }
+    if (run(cast(*i64, &av[0]), ac) == 0) { g_status = 1; }
+    bused[bi] = 0; bcount[bi] = 0;
+    return;
+}
+
+// ---- the walk ------------------------------------------------------------------
+
+// A directory's names are read into this before any is looked at — a -delete
+// while the directory is still being read would move what is left of it — and
+// the walk uses it as a stack: a directory's names sit above its parent's
+// until it is done. Reserved once and committed as it fills, so a directory
+// may hold any number of names.
+let is i64 as ARENA with imut = 268435456;
+let is i64 as a_base with mut = 0;
+let is i64 as a_top with mut = 0;
+let is i64 as a_commit with mut = 0;
+
+fn arena_need(n as i64) as void {
+    while (a_top + n > a_commit) {
+        if (a_commit + 65536 > ARENA ||
+            sys.commit(a_base + a_commit, 65536, sys.PROT_READ | sys.PROT_WRITE) != 0) {
+            die("out of memory for the names of a directory", "", "");
+        }
+        a_commit = a_commit + 65536;
+    }
+    return;
+}
+
+// Records: name length, is-directory, size, then the name and its NUL, padded
+// to 8 bytes.
+fn list(dir_fd as i64) as i64 {
+    let is [320]u8 as de;
+    let is i64 as count with mut = 0;
+    while (sys.readdir(dir_fd, cast(*u8, &de[0])) == 0) {
+        let is i64 as nl = fu.de_name_len(cast(*u8, &de[0]));
+        if (fu.is_dot(cast(*u8, &de[0]), nl) == 0) {
+            let is i64 as rec = 24 + ((nl + 8) / 8) * 8;
+            arena_need(rec);
+            let is *i64 as r = cast(*i64, a_base + a_top);
+            r[0] = nl;
+            r[1] = fu.de_is_dir(cast(*u8, &de[0]));
+            r[2] = fu.de_size(cast(*u8, &de[0]));
+            let is *u8 as nm = cast(*u8, a_base + a_top + 24);
+            let is i64 as k with mut = 0;
+            while (k < nl) { nm[k] = de[k]; k = k + 1; }
+            nm[nl] = cast(u8, 0);
+            a_top = a_top + rec;
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+// Append "/name" to both paths; returns where they were, for truncate().
+fn push_name(nm as *u8, nl as i64) as i64 {
+    if (slen + nl + 2 >= 4096 || alen + nl + 2 >= 4096) { return 0 - 1; }
+    let is i64 as was = slen * 65536 + alen;
+    if (slen == 0 || sbuf[slen - 1] != cast(u8, 47)) { sbuf[slen] = cast(u8, 47); slen = slen + 1; }
+    if (alen == 0 || abuf[alen - 1] != cast(u8, 47)) { abuf[alen] = cast(u8, 47); alen = alen + 1; }
+    let is i64 as k with mut = 0;
+    while (k < nl) { sbuf[slen + k] = nm[k]; abuf[alen + k] = nm[k]; k = k + 1; }
+    slen = slen + nl; alen = alen + nl;
+    sbuf[slen] = cast(u8, 0); abuf[alen] = cast(u8, 0);
+    return was;
+}
+
+fn truncate(was as i64) as void {
+    slen = was / 65536; alen = was - slen * 65536;
+    sbuf[slen] = cast(u8, 0); abuf[alen] = cast(u8, 0);
+    return;
+}
+
+// Look at the entry now in sbuf/abuf (its facts in e_*), then into it.
+fn visit(root as i64, depth as i64) as void {
+    let is i64 as name = e_name;
+    let is i64 as nlen = e_nlen;
+    let is i64 as isdir = e_dir;
+    let is i64 as size = e_size;
+    let is i64 as start = e_start;
+    e_prune = 0;
+    e_mtime = 0 - 1;
+    if (g_post == 0 && depth >= g_mindepth) { eval(root); }
+    let is i64 as pruned = e_prune;
+    if (isdir != 0 && depth < g_maxdepth && (pruned == 0 || g_post == 1) && g_quit == 0) {
+        let is i64 as fd = sys.open_read(cast(*u8, &abuf[0]));
+        if (fd < 0) {
+            flush();
+            prog.errs("find: '"); prog.err(cast(*u8, &sbuf[0]), slen); prog.errs("': ");
+            prog.errs(sys.err_text(fd)); prog.errs("\n");
+            g_status = 1;
+        } else {
+            let is i64 as mark = a_top;
+            let is i64 as count = list(fd);
+            sys.close(fd);
+            let is i64 as at with mut = mark;
+            let is i64 as i with mut = 0;
+            while (i < count && g_quit == 0) {
+                let is *i64 as r = cast(*i64, a_base + at);
+                let is i64 as nl = r[0];
+                let is i64 as was = push_name(cast(*u8, a_base + at + 24), nl);
+                if (was < 0) {
+                    flush();
+                    prog.errs("find: '"); prog.err(cast(*u8, &sbuf[0]), slen); prog.errs("/...': path too long\n");
+                    g_status = 1;
+                } else {
+                    e_name = a_base + at + 24; e_nlen = nl;
+                    e_dir = r[1]; e_size = r[2]; e_start = 0;
+                    visit(root, depth + 1);
+                    truncate(was);
+                }
+                at = at + 24 + ((nl + 8) / 8) * 8;
+                i = i + 1;
+            }
+            a_top = mark;
+        }
+    }
+    if (g_post == 1 && depth >= g_mindepth && g_quit == 0) {
+        e_name = name; e_nlen = nlen; e_dir = isdir; e_size = size; e_start = start;
+        e_prune = 0; e_mtime = 0 - 1;
+        eval(root);
+    }
+    return;
+}
+
+// Fold "." and ".." out of an absolute path, in place: the filesystem knows
+// neither. Returns the new length.
+fn normalize(p as *u8, n as i64) as i64 {
+    let is i64 as o with mut = 0;            // write position
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        while (i < n && p[i] == cast(u8, 47)) { i = i + 1; }
+        let is i64 as s = i;
+        while (i < n && p[i] != cast(u8, 47)) { i = i + 1; }
+        let is i64 as len = i - s;
+        if (len == 0 || (len == 1 && p[s] == cast(u8, 46))) { }
+        else if (len == 2 && p[s] == cast(u8, 46) && p[s + 1] == cast(u8, 46)) {
+            while (o > 0 && p[o - 1] != cast(u8, 47)) { o = o - 1; }
+            if (o > 0) { o = o - 1; }
+        } else {
+            p[o] = cast(u8, 47); o = o + 1;
+            let is i64 as k with mut = 0;
+            while (k < len) { p[o] = p[s + k]; o = o + 1; k = k + 1; }
+        }
+    }
+    if (o == 0) { p[0] = cast(u8, 47); o = 1; }
+    p[o] = cast(u8, 0);
+    return o;
+}
+
+fn start_at(root as i64, path as *u8) as void {
+    let is i64 as pl = prog.slen(path);
+    if (pl == 0 || pl >= 4000) {
+        flush();
+        prog.errs("find: '"); prog.errs(path); prog.errs("': not a path\n");
+        g_status = 1;
+        return;
+    }
+    let is i64 as i with mut = 0;
+    while (i <= pl) { sbuf[i] = path[i]; i = i + 1; }
+    slen = pl;
+    // Absolute: as given, or under / for a relative one.
+    alen = 0;
+    if (path[0] != cast(u8, 47)) { abuf[0] = cast(u8, 47); alen = 1; }
+    i = 0;
+    while (i < pl) { abuf[alen + i] = path[i]; i = i + 1; }
+    alen = normalize(cast(*u8, &abuf[0]), alen + pl);
+    let is i64 as isdir with mut = 1;
+    let is i64 as size with mut = 0;
+    if (alen > 1) {
+        let is [4]i64 as st;
+        let is i32 as rc = sys.stat(cast(*u8, &abuf[0]), cast(*u8, &st[0]));
+        if (cast(i64, rc) != 0) {
+            flush();
+            prog.errs("find: '"); prog.errs(path); prog.errs("': "); prog.errs(sys.err_text(cast(i64, rc))); prog.errs("\n");
+            g_status = 1;
+            return;
+        }
+        size = st[0];
+        isdir = st[3];
+    }
+    // The name a -name test sees: the last component as given ("dir" for
+    // "a/dir/", "/" for "/", "." for ".").
+    let is i64 as e with mut = slen;
+    while (e > 1 && sbuf[e - 1] == cast(u8, 47)) { e = e - 1; }
+    let is i64 as b with mut = e;
+    while (b > 0 && sbuf[b - 1] != cast(u8, 47)) { b = b - 1; }
+    if (b == e) { b = 0; }
+    let is [4096]u8 as nm;
+    let is i64 as k with mut = 0;
+    while (b + k < e) { nm[k] = sbuf[b + k]; k = k + 1; }
+    nm[k] = cast(u8, 0);
+    e_name = cast(i64, &nm[0]); e_nlen = k;
+    e_dir = isdir; e_size = size; e_start = 1;
+    visit(root, 0);
+    return;
+}
+
+fn usage() as void {
+    prog.outs("usage: find [PATH...] [EXPRESSION]\n");
+    prog.outs("  ( EXPR )  ! EXPR  EXPR -a EXPR  EXPR -o EXPR\n");
+    prog.outs("  options: -maxdepth N -mindepth N -depth\n");
+    prog.outs("  tests:   -name P -iname P -path P -ipath P -type f|d -size [+-]N[cwbkMG]\n");
+    prog.outs("           -empty -newer FILE -mtime [+-]N -mmin [+-]N -true -false\n");
+    prog.outs("  actions: -print -print0 -prune -quit -delete -exec CMD ... ; -exec CMD ... {} + -ok CMD ... ;\n");
+    return;
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
-    // paths come first, up to the first argument beginning with '-'.
+    g_argv = cast(i64, argv);
+    g_argc = argc;
+    if (argc >= 2 && (streq(prog.arg(argv, 1), "--help") == 1 || streq(prog.arg(argv, 1), "-help") == 1)) {
+        usage();
+        return 0;
+    }
+    // -H -L -P first: there are no symbolic links here to follow or not.
     let is i64 as i with mut = 1;
-    while (i < argc) { let is *u8 as a = prog.arg(argv, i); if (cast(i64, a[0]) == 45) { break; } i = i + 1; }
-    let is i64 as pathend = i;
+    while (i < argc && (streq(prog.arg(argv, i), "-H") == 1 || streq(prog.arg(argv, i), "-L") == 1
+                        || streq(prog.arg(argv, i), "-P") == 1)) { i = i + 1; }
+    let is i64 as first = i;
     while (i < argc) {
         let is *u8 as a = prog.arg(argv, i);
-        if (streq(a, "-name") == 1) { i = i + 1; if (i < argc) { let is *u8 as v = prog.arg(argv, i); g_namep = cast(i64, v); g_nlen = prog.slen(v); i = i + 1; } }
-        else if (streq(a, "-type") == 1) { i = i + 1; if (i < argc) { let is *u8 as v = prog.arg(argv, i); if (cast(i64, v[0]) == 102) { g_type = 1; } else if (cast(i64, v[0]) == 100) { g_type = 2; } i = i + 1; } }
-        else { i = i + 1; }
+        if (a[0] == cast(u8, 45) || streq(a, "(") == 1 || streq(a, "!") == 1) { break; }
+        i = i + 1;
     }
-    if (pathend <= 1) { find_walk("/", 1); return 0; }
-    let is i64 as k with mut = 1;
-    while (k < pathend) {
-        let is [256]u8 as pb;
-        let is *u8 as path = prog.abspath(prog.arg(argv, k), cast(*u8, &pb[0]));
-        find_walk(path, prog.slen(path));
+    let is i64 as pathend = i;
+
+    let is i64 as root with mut = 0 - 1;
+    if (pathend < argc) {
+        g_pos = pathend;
+        root = parse_or();
+        if (g_pos < argc) { die("unexpected '", word(g_pos), "'"); }
+    }
+    if (g_action == 0) {
+        let is i64 as pr = node(K_PRINT);
+        if (root < 0) { root = pr; } else { root = bin(K_AND, root, pr); }
+    }
+
+    a_base = sys.reserve(0, ARENA, sys.PROT_READ | sys.PROT_WRITE);
+    if (a_base <= 0) { die("no memory to walk with", "", ""); }
+
+    if (pathend == first) { start_at(root, "."); }
+    let is i64 as k with mut = first;
+    while (k < pathend && g_quit == 0) {
+        start_at(root, prog.arg(argv, k));
         k = k + 1;
     }
-    return 0;
+    let is i64 as b with mut = 0;
+    while (b < nbatch) { batch_run(bnode[b]); b = b + 1; }
+    flush();
+    return cast(i32, g_status);
 }
