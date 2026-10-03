@@ -5,6 +5,7 @@ use "wterm_state.cst" as s;
 use "wterm_grid.cst" as g;
 use "wterm_child.cst" as cli;
 use "wterm_repl.cst" as r;
+use "wterm_sel.cst" as sel;
 use "std/causticos/term.cst" as term;
 use "std/os/causticos.cst" as sys;
 use "../lib/wmproto/wmproto.cst" as wmp;
@@ -47,17 +48,19 @@ fn _dec(buf as *u8, off as i64, v as i64) as i64 {
     return o;
 }
 
+// The 1-based cell under content pixel (px, py), for mouse reports. The cells
+// are drawn from the content's corner, 8x16 each. This used to scale by the
+// window's size over the cell count, which the term's margins make larger
+// than the cells: reports landed up to three columns left of the pointer.
 fn px_to_cell_col(t as *term.Term, px as i64) as i64 {
     let is i64 as c with mut = 1;
-    if (t.width > 0 && t.cols > 0) { c = px * t.cols / t.width + 1; }
-    if (c < 1) { c = 1; }
+    if (px > 0) { c = px / term.GLYPH_W + 1; }
     if (c > t.cols) { c = t.cols; }
     return c;
 }
 fn px_to_cell_row(t as *term.Term, py as i64) as i64 {
     let is i64 as r with mut = 1;
-    if (t.height > 0 && t.rows > 0) { r = py * t.rows / t.height + 1; }
-    if (r < 1) { r = 1; }
+    if (py > 0) { r = py / term.GLYPH_H + 1; }
     if (r > t.rows) { r = t.rows; }
     return r;
 }
@@ -204,23 +207,31 @@ fn finish_job(t as *term.Term, slot as i64) as void {
 
 // The n bytes of s.ta_back — typed while the last job ran, never read by it —
 // as if typed now: into the line, and Enter runs it. Once a line starts a job,
-// the rest is that job's input, the way it would have been on a tty. Escape
-// sequences (arrows, mouse reports) were for the program that is gone and are
-// skipped.
+// the rest is that job's input, the way it would have been on a tty.
 fn type_ahead(t as *term.Term, n as i64) as void {
+    let is i64 as i = feed_line(t, cast(*u8, &s.ta_back[0]), n);
+    if (i < n && s.fg_job >= 0) {
+        let is i64 as cin = jobs.get(s.fg_job).in_fd;
+        if (cin >= 0) { g.to_child(cin, cast(*u8, &s.ta_back[i]), n - i); }
+    }
+    return;
+}
+
+// Text as if typed at the prompt: p[0..n] into the line, Enter running it.
+// Stops when a line starts a job — what follows is that job's input, the
+// caller's to hand it — and returns how much it took. Escape sequences
+// (arrows, mouse reports) are skipped: typed ahead, they were for a program
+// that is gone; pasted, they are not the user's keys.
+fn feed_line(t as *term.Term, p as *u8, n as i64) as i64 {
     let is i64 as i with mut = 0;
     while (i < n) {
-        if (s.fg_job >= 0) {
-            let is i64 as cin = jobs.get(s.fg_job).in_fd;
-            if (cin >= 0) { g.to_child(cin, cast(*u8, &s.ta_back[i]), n - i); }
-            return;
-        }
-        let is i64 as c = cast(i64, s.ta_back[i]);
+        if (s.fg_job >= 0) { return i; }
+        let is i64 as c = cast(i64, p[i]);
         if (c == 0x1B) {
             i = i + 1;
-            if (i < n && s.ta_back[i] == cast(u8, 0x5B)) {               // CSI: up to its final byte
+            if (i < n && p[i] == cast(u8, 0x5B)) {                       // CSI: up to its final byte
                 i = i + 1;
-                while (i < n && (s.ta_back[i] < cast(u8, 0x40) || s.ta_back[i] > cast(u8, 0x7E))) { i = i + 1; }
+                while (i < n && (p[i] < cast(u8, 0x40) || p[i] > cast(u8, 0x7E))) { i = i + 1; }
             }
         }
         else if (c == 0x0A) { handle_key(t, ks.KEY_ENTER, 0x100); }
@@ -228,14 +239,133 @@ fn type_ahead(t as *term.Term, n as i64) as void {
         else if (c == 0x09) { handle_key(t, ks.KEY_TAB, 0x100); }
         else if (c >= 32 && c < 127) { handle_key(t, c, 0x100); }
         else if (c >= 0x80) {
-            // A character typed as UTF-8 goes back in whole; a byte that is
-            // not part of one is dropped, as a control byte is.
+            // A character as UTF-8 goes in whole; a byte that is not part of
+            // one is dropped, as a control byte is.
             let is [1]i32 as cp1;
-            let is i64 as used = utf8.decode1(cast(*u8, &s.ta_back[0]), n, i, cast(*i32, &cp1[0]));
+            let is i64 as used = utf8.decode1(p, n, i, cast(*i32, &cp1[0]));
             if (used > 1) { handle_key(t, cast(i64, cp1[0]), 0x100); i = i + used - 1; }
         }
         i = i + 1;
     }
+    return n;
+}
+
+// ---- pasting -----------------------------------------------------------------
+//
+// The clipboard's text arrives in a segment (MSG_CLIP_DATA) and is typed from
+// there: at the prompt as if typed, Enter running each line; to a running
+// program as its input. A program is given only as much as its input channel
+// takes at the moment, and the rest when it has read that — the main loop
+// waits for room — so pasting into a program that does not read never blocks
+// the terminal. A line of the paste that starts a program hands it the rest,
+// as type-ahead does.
+
+// How much of p[0..k] ends on a whole character.
+fn _whole(p as *u8, k as i64) as i64 {
+    let is i64 as j with mut = k - 1;
+    let is i64 as back with mut = 0;
+    while (j > 0 && back < 3 && (cast(i64, p[j]) & 0xC0) == 0x80) { j = j - 1; back = back + 1; }
+    if (j < 0) { return k; }
+    let is i64 as b = cast(i64, p[j]);
+    let is i64 as need with mut = 1;
+    if (b >= 0xC0 && b < 0xE0) { need = 2; }
+    if (b >= 0xE0 && b < 0xF0) { need = 3; }
+    if (b >= 0xF0 && b < 0xF8) { need = 4; }
+    if (j + need > k && j > 0) { return j; }
+    return k;
+}
+
+fn paste_start(t as *term.Term, len as i64) as void {
+    if (len <= 0) { return; }
+    let is i64 as fd = wmp.clip_take();
+    if (fd < 0) { return; }
+    paste_cancel();                                  // a new paste replaces one still going
+    s.paste_fd = fd;
+    s.paste_off = 0;
+    s.paste_len = len;
+    paste_pump(t);
+    return;
+}
+
+fn paste_cancel() as void {
+    if (s.paste_fd >= 0) { sys.close(s.paste_fd); }
+    s.paste_fd = 0 - 1;
+    return;
+}
+
+// Type as much of the paste as can go now.
+fn paste_pump(t as *term.Term) as void {
+    let is [2048]u8 as b;
+    while (s.paste_fd >= 0) {
+        let is i64 as left = s.paste_len - s.paste_off;
+        if (left <= 0) { paste_cancel(); return; }
+        let is i64 as k with mut = left;
+        if (k > 2048) { k = 2048; }
+        if (s.fg_job >= 0) {
+            // A program's input, as far as its channel has room; its input
+            // from a file or a pipe instead keeps the paste for the prompt.
+            let is i64 as cin = jobs.get(s.fg_job).in_fd;
+            if (cin < 0) { return; }
+            let is [4]i64 as ci;
+            if (sys.chan_info(cin, cast(*i64, &ci[0])) != 0 || ci[3] != 0) { return; }
+            if (ci[2] <= 0) { return; }                  // the main loop waits for room
+            if (k > ci[2]) { k = ci[2]; }
+            if (sys.seg_read(s.paste_fd, s.paste_off, cast(*u8, &b[0]), k) < 0) { paste_cancel(); return; }
+            g.to_child(cin, cast(*u8, &b[0]), k);
+            s.paste_off = s.paste_off + k;
+        } else {
+            if (sys.seg_read(s.paste_fd, s.paste_off, cast(*u8, &b[0]), k) < 0) { paste_cancel(); return; }
+            let is i64 as cut with mut = k;
+            if (k < left) { cut = _whole(cast(*u8, &b[0]), k); }
+            s.paste_off = s.paste_off + feed_line(t, cast(*u8, &b[0]), cut);
+        }
+    }
+    return;
+}
+
+// The program in the foreground waits for a paste and its input has room.
+fn paste_wants_room() as i64 {
+    if (s.paste_fd < 0 || s.fg_job < 0) { return 0 - 1; }
+    return jobs.get(s.fg_job).in_fd;
+}
+
+// ---- the mouse ---------------------------------------------------------------
+
+// A button change (MSG_MOUSE_BTN). A program that asked for the mouse gets it,
+// unless Shift is held; else the terminal's own: the left button selects
+// (wterm_sel), the middle one pastes.
+fn mouse_btn(t as *term.Term, a as i64, px as i64, py as i64) as void {
+    let is i64 as buttons = wmp.mouse_buttons(a);
+    let is i64 as mods = wmp.mouse_mods(a);
+    if (s.fg_job >= 0 && t.mouse_mode != 0 && (mods & ks.MOD_SHIFT) == 0 && s.sel_state != 1) {
+        forward_mouse_btn(t, buttons, px, py);
+        return;
+    }
+    let is i64 as diff = buttons ^ s.mouse_prev_btn;
+    s.mouse_prev_btn = buttons;
+    if ((diff & cp.BTN_LEFT) != 0) {
+        if ((buttons & cp.BTN_LEFT) != 0) { sel.press(t, px, py, mods); } else { sel.release(t); }
+    }
+    if ((diff & cp.BTN_MIDDLE) != 0 && (buttons & cp.BTN_MIDDLE) != 0) { wmp.clip_get(); }
+    return;
+}
+
+// The pointer moved with a button down (MSG_MOUSE_MOVE): a selection being
+// dragged, or a program that asked for drags (?1002/?1003), which get them as
+// the button + 32, once per cell.
+fn mouse_move(t as *term.Term, a as i64, px as i64, py as i64) as void {
+    if (s.sel_state == 1) { sel.drag(t, px, py); return; }
+    let is i64 as buttons = wmp.mouse_buttons(a);
+    if (s.fg_job < 0 || t.mouse_mode < 2 || buttons == 0) { return; }
+    let is i64 as col = px_to_cell_col(t, px);
+    let is i64 as row = px_to_cell_row(t, py);
+    if (col == s.mouse_mcol && row == s.mouse_mrow) { return; }
+    s.mouse_mcol = col; s.mouse_mrow = row;
+    let is i64 as xb with mut = 32;
+    if ((buttons & cp.BTN_LEFT) == 0) {
+        if ((buttons & cp.BTN_MIDDLE) != 0) { xb = 33; } else { xb = 34; }
+    }
+    mouse_emit(t, xb, col, row, 1);
     return;
 }
 
@@ -349,6 +479,15 @@ fn handle_key(t as *term.Term, keysym as i64, kb as i64) as void {
     let is i64 as pressed = cp.key_pressed(kb);
     if (pressed != 1) { return; }
     let is i64 as ck = ks.chord_key(keysym);
+    let is i64 as kmods = cp.key_mods(kb);
+    // The clipboard, whoever has the keys: Ctrl+Shift+C copies the selection,
+    // Ctrl+Shift+V and Shift+Insert paste.
+    if ((kmods & ks.MOD_CTRL) != 0 && (kmods & ks.MOD_SHIFT) != 0 && ck == 0x63) { sel.copy(t); return; }
+    if (((kmods & ks.MOD_CTRL) != 0 && (kmods & ks.MOD_SHIFT) != 0 && ck == 0x76)
+        || ((kmods & ks.MOD_SHIFT) != 0 && keysym == ks.KEY_INSERT)) {
+        wmp.clip_get();
+        return;
+    }
     // Shift+PgUp/PgDn page through the history, whoever has the keys — the
     // terminal's own, never passed on.
     if ((cp.key_mods(kb) & ks.MOD_SHIFT) != 0 && (keysym == ks.KEY_PGUP || keysym == ks.KEY_PGDN)) {
@@ -381,6 +520,7 @@ fn handle_key(t as *term.Term, keysym as i64, kb as i64) as void {
                 jobs.kill_job(s.fg_job);
             }
             sx.list_cancel();            // and the rest of its line with it
+            paste_cancel();              // and of a paste: its next line would run
             return;
         }
         // Otherwise a job in the foreground is who the user is talking to.
@@ -486,7 +626,11 @@ fn handle_msg(t as *term.Term, m as *i64) as void {
         // that asked to be told is told, and may keep the window (close_window).
         if (s.close_wait_until == 0) { close_window(t); }
     } else if (m[0] == wmp.MSG_MOUSE_BTN) {
-        forward_mouse_btn(t, m[1], m[2], m[3]);   // a=buttons, b=x, c=y (content-relative)
+        mouse_btn(t, m[1], m[2], m[3]);           // a=buttons|mods<<8, b=x, c=y (content-relative)
+    } else if (m[0] == wmp.MSG_MOUSE_MOVE) {
+        mouse_move(t, m[1], m[2], m[3]);
+    } else if (m[0] == wmp.MSG_CLIP_DATA) {
+        paste_start(t, m[1]);
     } else if (m[0] == wmp.MSG_MOUSE_WHEEL) {
         forward_mouse_wheel(t, m[1], m[2], m[3]); // a=delta, b=x, c=y
     } else if (m[0] == wmp.MSG_KILL_RES && m[3] >= 0 && m[3] < jobs.max_jobs()) {
@@ -546,6 +690,10 @@ fn main(argc as i64, argv as *u8) as i32 {
     if (gva < 0) { return 2; }
     let is term.Term as t = term.init_text(win_w, win_h);
     if (term.attach_grid_lazy(&t, cast(*i64, gva), s.GRID_STRIDE, s.grid_rows) != 0) { return 2; }
+    // Long lines copy back whole only with the rows marked; without (a
+    // screen taller than the array covers) copying still works, a newline
+    // at every wrap.
+    term.attach_wraps(&t, cast(*u8, &s.wraps[0]), 4096);
     g._col(&t, s.C_TITLE);
     g.puts(&t, "Caustic Terminal\n");
     g._col(&t, s.C_DIM);
@@ -585,7 +733,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     }
     // 2 fixed entries (WM channel, exit events), one per running job's output
     // and one per job asking the terminal its size (ttyproto).
-    let is [102]i64 as pe;
+    // One more for a paste waiting on its program's input.
+    let is [105]i64 as pe;
 
     while (1 == 1) {
         let is i64 as n with mut = 0;
@@ -646,6 +795,12 @@ fn main(argc as i64, argv as *u8) as i32 {
             ptmo = s.close_wait_until - sys.time_ns();
             if (ptmo < 0) { ptmo = 0; }
         }
+        // A paste waiting for its program to read: woken when there is room.
+        let is i64 as pw = paste_wants_room();
+        if (pw >= 0) {
+            pe[n*3+0] = pw; pe[n*3+1] = sys.POLL_WRITABLE; pe[n*3+2] = 0;
+            n = n + 1;
+        }
         sys.poll(&pe[0], n, ptmo);
 
         let is i64 as pk with mut = 0;
@@ -672,6 +827,7 @@ fn main(argc as i64, argv as *u8) as i32 {
             jj = jj + 1;
         }
         close_check();
+        paste_pump(&t);
 
         // What the WM sent while a kill waited on its answer, first, in order.
         let is [4]i64 as hm;

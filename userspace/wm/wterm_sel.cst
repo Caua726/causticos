@@ -1,0 +1,225 @@
+// wterm/wterm_sel.cst — selecting text with the mouse, and copying it.
+//
+// Dragging with the left button selects, across lines and into the history
+// (dragging past the top or the bottom scrolls the view). A double click
+// selects a word, a triple click the line — a long line the terminal wrapped,
+// whole — and dragging on after either goes by words or by lines. Shift+click
+// moves the selection's end there. Letting go copies the selection to the
+// clipboard, the WM's (wmproto clip_set), as terminals on Linux do;
+// Ctrl+Shift+C copies it again. Pasting is wterm.cst's (paste_pump).
+//
+// A program that asked for the mouse (xterm tracking) gets the clicks
+// instead; with Shift held they select, as in xterm.
+//
+// The selection's ends are line NUMBERS (term.line_number), which stay with
+// the text while output scrolls it up, so a selection made while a program
+// prints keeps covering what was selected. It is dropped when that text has
+// scrolled out of the history, the screen is cleared, or a program switches to
+// its own screen (wterm_grid.flatten_rows).
+use "wterm_state.cst" as s;
+use "wterm_grid.cst" as g;
+use "std/causticos/term.cst" as term;
+use "std/os/causticos.cst" as sys;
+use "../lib/wmproto/wmproto.cst" as wmp;
+use "../lib/keymap/keysym.cst" as ks;
+
+let is i64 as UNIT_CHAR with imut = 1;
+let is i64 as UNIT_WORD with imut = 2;
+let is i64 as UNIT_LINE with imut = 3;
+
+// The window's cells are drawn from its content's top-left corner, 8x16 each
+// (the compositor's cblit_text; the term's own margin is for pixel surfaces).
+
+// The visible row under content pixel py, scrolling the view one line toward
+// the pointer when it is past the top or the bottom (a drag that leaves the
+// window goes on selecting).
+fn _row(t as *term.Term, py as i64, scroll as i64) as i64 {
+    if (py < 0) {
+        if (scroll == 1) { term.scroll_view(t, 1); }
+        return 0;
+    }
+    let is i64 as r with mut = py / term.GLYPH_H;
+    if (r >= t.rows) {
+        if (scroll == 1) { term.scroll_view(t, 0 - 1); }
+        r = t.rows - 1;
+    }
+    return r;
+}
+
+// The column of content pixel px: the cell it is on (cell = 1, 0..cols-1), or
+// the boundary between cells nearest it (cell = 0, 0..cols).
+fn _col(t as *term.Term, px as i64, cell as i64) as i64 {
+    let is i64 as c with mut = 0;
+    if (px > 0) {
+        if (cell == 1) { c = px / term.GLYPH_W; }
+        else { c = (px + term.GLYPH_W / 2) / term.GLYPH_W; }
+    }
+    let is i64 as max with mut = t.cols;
+    if (cell == 1) { max = t.cols - 1; }
+    if (c > max) { c = max; }
+    return c;
+}
+
+fn _cp(t as *term.Term, num as i64, c as i64) as i64 {
+    return term.cell_cp(term.line_cell(t, term.number_line(t, num), c));
+}
+
+// Part of a word, for a double click: anything but blanks and the characters
+// that separate words on a command line — so a path, a URL or NAME=value
+// comes out whole.
+fn _wordc(cp as i64) as i64 {
+    if (cp == 0 || cp == 0x20 || cp == 0x09) { return 0; }
+    if (cp == term.CELL_WIDE_TAIL) { return 1; }
+    let is *u8 as sep = "'\"`()[]{}<>|;,";
+    let is i64 as i with mut = 0;
+    while (sep[i] != cast(u8, 0)) {
+        if (cp == cast(i64, sep[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// (l0, c0) comes before (l1, c1).
+fn _before(l0 as i64, c0 as i64, l1 as i64, c1 as i64) as i64 {
+    if (l0 < l1 || (l0 == l1 && c0 < c1)) { return 1; }
+    return 0;
+}
+
+// The span the selection covers, from its two ends and its unit.
+fn _span(t as *term.Term) as void {
+    let is i64 as l0 with mut = s.sel_al;
+    let is i64 as c0 with mut = s.sel_ac;
+    let is i64 as l1 with mut = s.sel_bl;
+    let is i64 as c1 with mut = s.sel_bc;
+    if (_before(l1, c1, l0, c0) == 1) {
+        l0 = s.sel_bl; c0 = s.sel_bc;
+        l1 = s.sel_al; c1 = s.sel_ac;
+    }
+    if (s.sel_unit == UNIT_WORD) {
+        // The ends are cells: grow out to the words they are in.
+        if (_wordc(_cp(t, l0, c0)) == 1) {
+            while (c0 > 0 && _wordc(_cp(t, l0, c0 - 1)) == 1) { c0 = c0 - 1; }
+        }
+        if (_wordc(_cp(t, l1, c1)) == 1) {
+            while (c1 + 1 < t.cols && _wordc(_cp(t, l1, c1 + 1)) == 1) { c1 = c1 + 1; }
+        }
+        c1 = c1 + 1;
+    } else if (s.sel_unit == UNIT_LINE) {
+        // Whole lines, and a line the terminal wrapped is one line.
+        while (term.line_wrapped(t, term.number_line(t, l0)) == 1) { l0 = l0 - 1; }
+        while (term.line_wrapped(t, term.number_line(t, l1) + 1) == 1) { l1 = l1 + 1; }
+        c0 = 0;
+        c1 = t.cols;
+    }
+    s.sel_s0l = l0; s.sel_s0c = c0;
+    s.sel_s1l = l1; s.sel_s1c = c1;
+    return;
+}
+
+// Where the pointer is, as the moving end: a boundary for characters, a cell
+// for words and lines.
+fn _here(t as *term.Term, px as i64, py as i64, scroll as i64, l as *i64, c as *i64) as void {
+    let is i64 as r = _row(t, py, scroll);
+    l[0] = term.line_number(t, term.view_line(t, r));
+    if (s.sel_unit == UNIT_CHAR) { c[0] = _col(t, px, 0); } else { c[0] = _col(t, px, 1); }
+    return;
+}
+
+// The left button went down at content pixel (px, py), with mods held.
+fn press(t as *term.Term, px as i64, py as i64, mods as i64) as void {
+    let is i64 as now = sys.time_ns();
+    let is i64 as cl = term.line_number(t, term.view_line(t, _row(t, py, 0)));
+    let is i64 as cc = _col(t, px, 1);
+    if (now - s.click_ns < s.CLICK_NS && cl == s.click_l && cc == s.click_c) {
+        s.click_n = s.click_n + 1;
+        if (s.click_n > 3) { s.click_n = 1; }
+    } else {
+        s.click_n = 1;
+    }
+    s.click_ns = now; s.click_l = cl; s.click_c = cc;
+    let is [1]i64 as hl;
+    let is [1]i64 as hc;
+    if ((mods & ks.MOD_SHIFT) != 0 && s.sel_state == 2) {
+        // Shift+click: the end moves here, the start stays.
+        _here(t, px, py, 0, cast(*i64, &hl[0]), cast(*i64, &hc[0]));
+        s.sel_bl = hl[0]; s.sel_bc = hc[0];
+        s.sel_state = 1;
+        _span(t);
+        g.refresh_all(t);
+        return;
+    }
+    s.sel_unit = s.click_n;
+    _here(t, px, py, 0, cast(*i64, &hl[0]), cast(*i64, &hc[0]));
+    s.sel_al = hl[0]; s.sel_ac = hc[0];
+    s.sel_bl = hl[0]; s.sel_bc = hc[0];
+    s.sel_alt = t.alt;
+    let is i64 as was = s.sel_state;
+    s.sel_state = 1;
+    _span(t);
+    // A plain press only clears what was selected; a double or triple click
+    // selects at once.
+    if (was != 0 || s.sel_unit != UNIT_CHAR) { g.refresh_all(t); }
+    return;
+}
+
+// The pointer moved with the left button still down.
+fn drag(t as *term.Term, px as i64, py as i64) as void {
+    if (s.sel_state != 1) { return; }
+    let is i64 as off0 = t.view_off;
+    let is [1]i64 as hl;
+    let is [1]i64 as hc;
+    _here(t, px, py, 1, cast(*i64, &hl[0]), cast(*i64, &hc[0]));
+    if (hl[0] == s.sel_bl && hc[0] == s.sel_bc && t.view_off == off0) { return; }
+    s.sel_bl = hl[0]; s.sel_bc = hc[0];
+    _span(t);
+    g.refresh_all(t);
+    return;
+}
+
+fn empty() as i64 {
+    if (_before(s.sel_s0l, s.sel_s0c, s.sel_s1l, s.sel_s1c) == 1) { return 0; }
+    return 1;
+}
+
+// The left button came up: a selection that covers something is made, and
+// copied.
+fn release(t as *term.Term) as void {
+    if (s.sel_state != 1) { return; }
+    if (empty() == 1) {
+        s.sel_state = 0;
+        g.refresh_all(t);
+        return;
+    }
+    s.sel_state = 2;
+    copy(t);
+    return;
+}
+
+// Put the selection on the clipboard. The text is laid out in a scratch
+// mapping as big as the lines it covers can need, handed to the WM, and let go.
+fn copy(t as *term.Term) as void {
+    if (s.sel_state != 2 || empty() == 1) { return; }
+    let is i64 as lines = s.sel_s1l - s.sel_s0l + 1;
+    let is i64 as cap = lines * (t.cols * 3 + 1);
+    let is i64 as bytes = ((cap + 4095) / 4096) * 4096;
+    let is i64 as va = sys.mmap(0, bytes, sys.PROT_READ | sys.PROT_WRITE);
+    if (va <= 0) {
+        sys.write_serial(cast(*u8, "wterm: no memory to copy the selection\n"), 39);
+        return;
+    }
+    let is i64 as n = term.copy_text(t, term.number_line(t, s.sel_s0l), s.sel_s0c,
+                                     term.number_line(t, s.sel_s1l), s.sel_s1c,
+                                     cast(*u8, va), cap);
+    let is i64 as rc = wmp.clip_set(cast(*u8, va), n);
+    sys.munmap(va, bytes);
+    if (rc < 0) { wmp.log_kv(cast(*u8, "wterm: the clipboard did not take the selection rc="), 51, rc); }
+    return;
+}
+
+// Drop the selection (its highlight goes with it).
+fn clear(t as *term.Term) as void {
+    if (s.sel_state == 0) { return; }
+    s.sel_state = 0;
+    g.refresh_all(t);
+    return;
+}
