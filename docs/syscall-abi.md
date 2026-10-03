@@ -227,7 +227,11 @@ child's table at `child_fd`.
 **Keyboard event** (2 B per event; `READ` on a `DEV_KEYBOARD` fd returns a
 multiple of 2): byte 0 = scancode (PS/2 set-1, `0..0x7F`); byte 1 = flags —
 **bit0 = pressed** (1) / released (0), **bit1 = extended** (was `0xE0`-prefixed).
-The kernel applies **no keymap** — scancode→char/layout is your job.
+The kernel applies **no keymap** — scancode→char/layout is your job
+(`userspace/lib/keymap` does it, in the layout `/var/keymap` or `/etc/keymap`
+names). `WRITE` of one byte sets the keyboard's LEDs: bit 0 Scroll Lock, bit 1
+Num Lock, bit 2 Caps Lock; `E_AGAIN` when another holder has the keyboard,
+`E_IO` when it does not acknowledge.
 
 ---
 
@@ -246,7 +250,8 @@ PRESENT(fd, x, y, w, h)                            # blit damage to the scanout
 ```
 kfd = DEV_OPEN(DEV_KEYBOARD, 0, 0)
 READ(kfd, &ev, 2)        # ev[0]=scancode, ev[1]=flags; blocks for an event
-# apply your keymap + modifier tracking here (userspace)
+# apply your keymap + modifier tracking here (userspace: lib/keymap key())
+WRITE(kfd, &leds, 1)     # light CapsLock/NumLock when they change (lib/keymap locks())
 ```
 
 **IPC / give a child its console (the founding pattern):**

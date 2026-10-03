@@ -1,5 +1,6 @@
-// compositor/comp_input.cst — keyboard/mouse/tablet pumps, modifier tracking,
-// the keymap → keysym normaliser, and the cursor-acceleration profile.
+// compositor/comp_input.cst — keyboard/mouse/tablet pumps, the keyboard layout
+// (lib/keymap: scancodes to what they type) and its LEDs, and the
+// cursor-acceleration profile.
 use "comp_state.cst" as s;
 use "comp_damage.cst" as dmg;
 use "comp_render.cst" as r;
@@ -7,22 +8,47 @@ use "accel.cst" as accel;
 use "std/os/causticos.cst" as sys;
 use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
+use "../lib/keymap/keymap.cst" as km;
+use "../lib/keymap/keysym.cst" as ks;
 
 fn cmd_send(mtype as i64, a as i64, b as i64, c as i64) as void {
     cp.msg_send(s.cmd_fd, mtype, a, b, c);
     return;
 }
 
+// Show CapsLock and NumLock on the keyboard. The keyboard only lights what it
+// is told; a failure is the kernel's to report (it says why on the serial
+// line), and the keys work the same without their lights.
+fn set_leds() as void {
+    if (s.kbd_fd < 0) { return; }
+    let is [1]u8 as m;
+    m[0] = cast(u8, km.locks(&s.kmap));
+    sys.write(s.kbd_fd, cast(*u8, &m[0]), 1);
+    return;
+}
+
+// The layout chosen, loaded again (MSG_WC_KEYMAP). A layout that does not load
+// leaves the keyboard as it was; keymap.cst says why on the serial line.
+fn reload_keymap() as void {
+    if (km.load_chosen(&s.kmap) == 0) {
+        sys.write_serial(cast(*u8, "comp: keymap "), 13);
+        sys.write_serial(km.file_ptr(&s.kmap), km.file_len(&s.kmap));
+        sys.write_serial(cast(*u8, "\n"), 1);
+    }
+    return;
+}
+
 fn handle_key(sc as i64, devflags as i64) as void {
     let is i64 as pressed = devflags & 1;
     let is i64 as ext = (devflags >> 1) & 1;
-    if (sc == 0x2A || sc == 0x36) { s.mod_shift = pressed; }
-    if (sc == 0x1D) { s.mod_ctrl = pressed; }
-    if (sc == 0x38) { s.mod_alt = pressed; }
-    if (ext == 1 && sc == 0x5B) { s.mod_super = pressed; }
+    let is [2]i64 as sym;
+    let is i64 as locks = km.locks(&s.kmap);
+    let is i64 as n = km.key(&s.kmap, sc, ext, pressed, cast(*i64, &sym[0]));
+    if (km.locks(&s.kmap) != locks) { set_leds(); }
+    let is i64 as held = km.mods(&s.kmap);
     // Super+Ctrl+A toggles the pointer accel profile live. The compositor owns
     // the pointer "feel", so it consumes the chord itself — it is NOT forwarded.
-    if (pressed == 1 && sc == 0x1E && s.mod_super == 1 && s.mod_ctrl == 1) {
+    if (pressed == 1 && ext == 0 && sc == 0x1E && (held & ks.MOD_SUPER) != 0 && (held & ks.MOD_CTRL) != 0) {
         if (s.accel_profile == 0) { s.accel_profile = 1; } else { s.accel_profile = 0; }
         // The chord is a global gesture, so it moves every pointer at once —
         // including one whose config had pinned it to the other profile. The
@@ -38,13 +64,13 @@ fn handle_key(sc as i64, devflags as i64) as void {
         else { sys.write_serial(cast(*u8, "comp: accel=flat\n"), 17); }
         return;
     }
-    let is i64 as mods with mut = 0;
-    if (s.mod_shift == 1) { mods = mods | cp.MOD_SHIFT; }
-    if (s.mod_ctrl == 1)  { mods = mods | cp.MOD_CTRL; }
-    if (s.mod_alt == 1)   { mods = mods | cp.MOD_ALT; }
-    if (s.mod_super == 1) { mods = mods | cp.MOD_SUPER; }
-    let is i64 as keysym = cp.keysym_of(sc, ext, s.mod_shift);
-    cmd_send(cp.MSG_CP_KEY, keysym, cp.key_b(mods, pressed, ext), sc);
+    // Every transition goes to the WM, typing or not: it tracks the modifiers
+    // from them, and binds act on the key. A dead key and a letter it does not
+    // go on type two characters, as two messages.
+    let is i64 as b = cp.key_b(km.ev_mods(&s.kmap), pressed, ext);
+    if (n == 0) { cmd_send(cp.MSG_CP_KEY, 0, b, sc); return; }
+    cmd_send(cp.MSG_CP_KEY, sym[0], b, sc);
+    if (n == 2) { cmd_send(cp.MSG_CP_KEY, sym[1], b, sc); }
     return;
 }
 

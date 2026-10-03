@@ -1,0 +1,668 @@
+// keymap.cst — which character a key makes, in the layout the user chose.
+//
+// The kernel hands userspace raw PS/2 Set-1 scancodes: the keyboard is events,
+// and what a key means is policy (docs/architecture.md). This is that policy,
+// in the one place both programs that read the keyboard share — the compositor,
+// for the desktop, and the fullscreen shell of the `shell` profile. It used to
+// be two copies of a US-only table, and there was no way to type "ç".
+//
+// A layout is a text file, /etc/keymaps/<name>.map, except "us", which is
+// compiled in here: a machine whose map files are missing or broken still has
+// a keyboard. Which layout is in use is the name in /var/keymap (the user's
+// choice; the `keymap` command writes it), else in /etc/keymap (the image's
+// default), else "us".
+//
+// A map file, one key per line ('#' at the start of a line is a comment):
+//
+//     <scancode> <plain> [<shift> [<altgr> [<shift+altgr>]]]
+//
+// The scancode is 0xNN, Set 1, never 0xE0-prefixed: Enter, the arrows, Esc,
+// Tab, Backspace, the modifiers, the F keys and the keypad are the same on
+// every layout and are not in the file — except that a keypad key's line
+// (0x47-0x53) says what it types with NumLock on, which is how ABNT2's keypad
+// decimal key types a comma. A symbol is one character written as itself (UTF-8),
+// U+XXXX, `none`, or `dead:<accent>` — a dead key, whose accent is that
+// character (dead:´ dead:` dead:^ dead:~ dead:¨ dead:' dead:" ...): it types
+// nothing until the next key, which it accents if Unicode composes the pair.
+// Also:
+//
+//     name <words>                        what `keymap` shows for the layout
+//     compose dead:<a> <char> <result>    dead key <a> then <char> makes <result>
+//                                         where that is not what Unicode
+//                                         composition gives (´ then c is ć, but
+//                                         Brazilian keyboards make it ç)
+//
+// A key whose shifted symbol is the capital of its plain one is a letter and
+// also takes CapsLock. On a layout with any AltGr symbol, Right Alt is AltGr,
+// and so is Ctrl+Left Alt (as on Windows) on a key that has one; on a layout
+// without, Right Alt is Alt.
+use "std/os/causticos.cst" as sys;
+use "std/unicode/utf8.cst" as utf8;
+use "std/unicode/compose.cst" as uc;
+use "keysym.cst" as ks;
+
+// A dead key in a table: the flag, the combining mark it adds (bits 21-39) and
+// the accent it types on its own (bits 0-20).
+let is i64 as DEAD_BIT with imut = 0x10000000000;
+let is i64 as CP_MASK  with imut = 0x1FFFFF;
+
+let is i64 as NCMP with imut = 32;
+
+struct Keymap {
+    lv as [512]i64;            // 128 scancodes x 4 levels: plain, shift, altgr, shift+altgr
+    caps as [128]i64;          // 1 = a letter: CapsLock acts as Shift on it
+    cmp as [96]i64;            // compose overrides: NCMP x (mark, char, result)
+    ncmp as i64;
+    has_altgr as i64;
+    name as [48]u8;            // "Português (Brasil, ABNT2)"
+    name_len as i64;
+    file as [32]u8;            // "br-abnt2"
+    file_len as i64;
+    lshift as i64;
+    rshift as i64;
+    lctrl as i64;
+    rctrl as i64;
+    lalt as i64;
+    ralt as i64;
+    lsuper as i64;
+    rsuper as i64;
+    capslock as i64;
+    numlock as i64;
+    dead as i64;               // the dead key waiting for its letter, 0 = none
+    ev_mods as i64;            // the modifiers of the last key(), see ev_mods()
+}
+
+// US, compiled in: what every machine has when no map file loads.
+fn _builtin_us() as *u8 {
+    return "name English (US)\n0x29 ` ~\n0x02 1 !\n0x03 2 @\n0x04 3 #\n0x05 4 $\n0x06 5 %\n0x07 6 ^\n0x08 7 &\n0x09 8 *\n0x0A 9 (\n0x0B 0 )\n0x0C - _\n0x0D = +\n0x10 q Q\n0x11 w W\n0x12 e E\n0x13 r R\n0x14 t T\n0x15 y Y\n0x16 u U\n0x17 i I\n0x18 o O\n0x19 p P\n0x1A [ {\n0x1B ] }\n0x2B \\ |\n0x1E a A\n0x1F s S\n0x20 d D\n0x21 f F\n0x22 g G\n0x23 h H\n0x24 j J\n0x25 k K\n0x26 l L\n0x27 ; :\n0x28 ' \"\n0x2C z Z\n0x2D x X\n0x2E c C\n0x2F v V\n0x30 b B\n0x31 n N\n0x32 m M\n0x33 , <\n0x34 . >\n0x35 / ?\n0x56 \\ |\n";
+}
+
+// ---- parsing ----------------------------------------------------------------
+
+// The combining mark a dead key's accent stands for; 0 when it is not an accent.
+fn _dead_mark(acc as i64) as i64 {
+    if (acc == 0xB4 || acc == 0x27) { return 0x301; }      // ´ '  acute
+    if (acc == 0x60) { return 0x300; }                      // `    grave
+    if (acc == 0x5E) { return 0x302; }                      // ^    circumflex
+    if (acc == 0x7E || acc == 0x2DC) { return 0x303; }      // ~ ˜  tilde
+    if (acc == 0xA8 || acc == 0x22) { return 0x308; }       // ¨ "  diaeresis
+    if (acc == 0xB8) { return 0x327; }                      // ¸    cedilla
+    if (acc == 0xB0 || acc == 0x2DA) { return 0x30A; }      // ° ˚  ring
+    if (acc == 0x2C7) { return 0x30C; }                     // ˇ    caron
+    if (acc == 0x2D8) { return 0x306; }                     // ˘    breve
+    if (acc == 0x2DD) { return 0x30B; }                     // ˝    double acute
+    if (acc == 0xAF) { return 0x304; }                      // ¯    macron
+    if (acc == 0x2DB) { return 0x328; }                     // ˛    ogonek
+    if (acc == 0x2D9) { return 0x307; }                     // ˙    dot above
+    return 0;
+}
+
+fn _hexval(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+// One character, exactly: its code point, or -1.
+fn _one_char(p as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0 - 1; }
+    let is [1]i32 as cp;
+    let is i64 as used = utf8.decode1(p, n, 0, cast(*i32, &cp[0]));
+    if (used != n) { return 0 - 1; }
+    return cast(i64, cp[0]);
+}
+
+// A symbol token: a table value (0 = none), or -1 when it is not one.
+fn _sym(p as *u8, n as i64) as i64 {
+    if (n == 4 && p[0] == cast(u8, 110) && p[1] == cast(u8, 111) && p[2] == cast(u8, 110) && p[3] == cast(u8, 101)) {
+        return 0;                                            // none
+    }
+    if (n >= 3 && p[0] == cast(u8, 85) && p[1] == cast(u8, 43)) {   // U+XXXX
+        let is i64 as v with mut = 0;
+        let is i64 as i with mut = 2;
+        while (i < n) {
+            let is i64 as h = _hexval(cast(i64, p[i]));
+            if (h < 0) { return 0 - 1; }
+            v = v * 16 + h;
+            i = i + 1;
+        }
+        if (v <= 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) { return 0 - 1; }
+        return v;
+    }
+    if (n > 5 && p[0] == cast(u8, 100) && p[1] == cast(u8, 101) && p[2] == cast(u8, 97)
+        && p[3] == cast(u8, 100) && p[4] == cast(u8, 58)) {  // dead:
+        let is i64 as acc = _one_char(cast(*u8, cast(i64, p) + 5), n - 5);
+        if (acc < 0) { return 0 - 1; }
+        let is i64 as mark = _dead_mark(acc);
+        if (mark == 0) { return 0 - 1; }
+        return DEAD_BIT | (mark << 21) | acc;
+    }
+    return _one_char(p, n);
+}
+
+fn _is_space(c as u8) as i64 {
+    if (c == cast(u8, 32) || c == cast(u8, 9) || c == cast(u8, 13)) { return 1; }
+    return 0;
+}
+
+// Split a line into up to 8 tokens: starts and lengths. Returns the count.
+fn _tokens(p as *u8, n as i64, ts as *i64, tl as *i64) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n && k < 8) {
+        while (i < n && _is_space(p[i]) == 1) { i = i + 1; }
+        if (i >= n) { return k; }
+        let is i64 as st = i;
+        while (i < n && _is_space(p[i]) == 0) { i = i + 1; }
+        ts[k] = st; tl[k] = i - st;
+        k = k + 1;
+    }
+    return k;
+}
+
+fn _word(p as *u8, n as i64, w as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (w[i] != cast(u8, 0)) {
+        if (i >= n || p[i] != w[i]) { return 0; }
+        i = i + 1;
+    }
+    if (i != n) { return 0; }
+    return 1;
+}
+
+// Why the last load failed, for the person who wrote the file.
+let is [96]u8 as _why with mut;
+let is i64 as _why_len with mut = 0;
+
+fn _set_why(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != cast(u8, 0) && i < 95) { _why[i] = s[i]; i = i + 1; }
+    _why_len = i;
+}
+
+fn why_ptr() as *u8 { return cast(*u8, &_why[0]); }
+fn why_len() as i64 { return _why_len; }
+
+fn _clear_tables(k as *Keymap) as void {
+    let is i64 as i with mut = 0;
+    while (i < 512) { k.lv[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 128) { k.caps[i] = 0; i = i + 1; }
+    k.ncmp = 0;
+    k.has_altgr = 0;
+    k.name_len = 0;
+}
+
+// Read a map's text. apply = 0 only checks it; apply = 1 also fills k (whose
+// tables the caller has cleared). Returns 0, or the line number of the first
+// error, with _why saying what is wrong with it.
+fn _parse(k as *Keymap, text as *u8, len as i64, apply as i64) as i64 {
+    let is [8]i64 as ts;
+    let is [8]i64 as tl;
+    let is i64 as pos with mut = 0;
+    let is i64 as line with mut = 0;
+    while (pos < len) {
+        line = line + 1;
+        let is i64 as st = pos;
+        while (pos < len && text[pos] != cast(u8, 10)) { pos = pos + 1; }
+        let is *u8 as lp = cast(*u8, cast(i64, text) + st);
+        let is i64 as ln = pos - st;
+        pos = pos + 1;
+        let is i64 as nt = _tokens(lp, ln, cast(*i64, &ts[0]), cast(*i64, &tl[0]));
+        if (nt == 0) { continue; }
+        let is *u8 as t0 = cast(*u8, cast(i64, lp) + ts[0]);
+        if (t0[0] == cast(u8, 35)) { continue; }             // '#' comment
+        if (_word(t0, tl[0], "name") == 1) {
+            if (apply == 1) {
+                // The rest of the line, as written.
+                let is i64 as a = ts[1];
+                let is i64 as e with mut = ln;
+                while (e > a && _is_space(lp[e - 1]) == 1) { e = e - 1; }
+                let is i64 as j with mut = 0;
+                while (a + j < e && j < 47) { k.name[j] = lp[a + j]; j = j + 1; }
+                // Cut short, it ends before a character, not in one.
+                if (a + j < e) {
+                    while (j > 0 && (cast(i64, lp[a + j]) & 0xC0) == 0x80) { j = j - 1; }
+                }
+                k.name_len = j;
+            }
+            continue;
+        }
+        if (_word(t0, tl[0], "compose") == 1) {
+            if (nt != 4) { _set_why("compose takes dead:<accent> <char> <result>"); return line; }
+            let is i64 as d = _sym(cast(*u8, cast(i64, lp) + ts[1]), tl[1]);
+            let is i64 as c = _sym(cast(*u8, cast(i64, lp) + ts[2]), tl[2]);
+            let is i64 as r = _sym(cast(*u8, cast(i64, lp) + ts[3]), tl[3]);
+            if (d <= 0 || (d & DEAD_BIT) == 0) { _set_why("compose: the first symbol must be dead:<accent>"); return line; }
+            if (c <= 0 || (c & DEAD_BIT) != 0 || r <= 0 || (r & DEAD_BIT) != 0) {
+                _set_why("compose: <char> and <result> must be characters");
+                return line;
+            }
+            if (apply == 1) {
+                if (k.ncmp >= NCMP) { _set_why("more than 32 compose lines"); return line; }
+                k.cmp[k.ncmp * 3] = (d >> 21) & 0x7FFFF;
+                k.cmp[k.ncmp * 3 + 1] = c;
+                k.cmp[k.ncmp * 3 + 2] = r;
+                k.ncmp = k.ncmp + 1;
+            }
+            continue;
+        }
+        // <scancode> <symbols...>
+        if (tl[0] < 3 || t0[0] != cast(u8, 48) || (t0[1] != cast(u8, 120) && t0[1] != cast(u8, 88))) {
+            _set_why("a line starts with a scancode (0xNN), name or compose");
+            return line;
+        }
+        let is i64 as sc with mut = 0;
+        let is i64 as i with mut = 2;
+        while (i < tl[0]) {
+            let is i64 as h = _hexval(cast(i64, t0[i]));
+            if (h < 0) { _set_why("the scancode is not hexadecimal"); return line; }
+            sc = sc * 16 + h;
+            i = i + 1;
+        }
+        if (sc <= 0 || sc >= 128) { _set_why("the scancode is past 0x7F"); return line; }
+        if (nt < 2 || nt > 5) { _set_why("a key takes 1 to 4 symbols"); return line; }
+        let is i64 as lvl with mut = 0;
+        while (lvl < nt - 1) {
+            let is i64 as v = _sym(cast(*u8, cast(i64, lp) + ts[lvl + 1]), tl[lvl + 1]);
+            if (v < 0) {
+                _set_why("not a symbol: one character, U+XXXX, none or dead:<accent>");
+                return line;
+            }
+            if (apply == 1) {
+                k.lv[sc * 4 + lvl] = v;
+                if (lvl >= 2 && v != 0) { k.has_altgr = 1; }
+            }
+            lvl = lvl + 1;
+        }
+        if (apply == 1) {
+            // A letter: the shifted symbol is the plain one's capital.
+            let is i64 as a = k.lv[sc * 4];
+            let is i64 as b = k.lv[sc * 4 + 1];
+            k.caps[sc] = 0;
+            if ((a & DEAD_BIT) == 0 && (b & DEAD_BIT) == 0 && a != b) {
+                if (a >= 97 && a <= 122 && b == a - 32) { k.caps[sc] = 1; }
+                if (a >= 0xE0 && a <= 0xFE && a != 0xF7 && b == a - 32) { k.caps[sc] = 1; }
+                if (a >= 0x100 && a <= 0x17F && b == a - 1) { k.caps[sc] = 1; }
+                if (a >= 0x3B1 && a <= 0x3C9 && b == a - 32) { k.caps[sc] = 1; }
+                if (a >= 0x430 && a <= 0x44F && b == a - 32) { k.caps[sc] = 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+// ---- loading ----------------------------------------------------------------
+
+let is [8192]u8 as _fbuf with mut;
+
+fn _read(path as *u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n with mut = 0;
+    while (n < 8191) {
+        let is i64 as r = sys.read(fd, cast(*u8, cast(i64, &_fbuf[0]) + n), 8191 - n);
+        if (r <= 0) { break; }
+        n = n + r;
+    }
+    sys.close(fd);
+    return n;
+}
+
+fn _set_file(k as *Keymap, name as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n && i < 31) { k.file[i] = name[i]; i = i + 1; }
+    k.file_len = i;
+}
+
+fn _use_builtin(k as *Keymap) as void {
+    let is *u8 as us = _builtin_us();
+    let is i64 as n with mut = 0;
+    while (us[n] != cast(u8, 0)) { n = n + 1; }
+    _clear_tables(k);
+    _parse(k, us, n, 1);
+    _set_file(k, "us", 2);
+}
+
+// A fresh keymap: US, nothing held, NumLock on (as a PC keyboard starts).
+fn init(k as *Keymap) as void {
+    _use_builtin(k);
+    k.lshift = 0; k.rshift = 0; k.lctrl = 0; k.rctrl = 0;
+    k.lalt = 0; k.ralt = 0; k.lsuper = 0; k.rsuper = 0;
+    k.capslock = 0; k.numlock = 1; k.dead = 0;
+}
+
+// A layout's file name is a name, never a path.
+fn valid_name(name as *u8, n as i64) as i64 {
+    if (n <= 0 || n > 31) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is u8 as c = name[i];
+        let is i64 as ok with mut = 0;
+        if (c >= cast(u8, 97) && c <= cast(u8, 122)) { ok = 1; }
+        if (c >= cast(u8, 48) && c <= cast(u8, 57)) { ok = 1; }
+        if (c == cast(u8, 45) || c == cast(u8, 95)) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// /etc/keymaps/<name>.map, into buf (room for 64 bytes).
+fn map_path(name as *u8, n as i64, buf as *u8) as *u8 {
+    let is *u8 as pre = "/etc/keymaps/";
+    let is i64 as o with mut = 0;
+    while (pre[o] != cast(u8, 0)) { buf[o] = pre[o]; o = o + 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { buf[o] = name[i]; o = o + 1; i = i + 1; }
+    buf[o] = cast(u8, 46); buf[o + 1] = cast(u8, 109); buf[o + 2] = cast(u8, 97); buf[o + 3] = cast(u8, 112);
+    buf[o + 4] = cast(u8, 0);
+    return buf;
+}
+
+// "us" is the table compiled in, never a file: the one layout that cannot go
+// missing.
+fn is_builtin(name as *u8, n as i64) as i64 {
+    if (n == 2 && name[0] == cast(u8, 117) && name[1] == cast(u8, 115)) { return 1; }
+    return 0;
+}
+
+// Load layout `name`. 0 = loaded. -1 = no such layout (or not a valid name);
+// a positive number is the line of the file that is wrong, and why_ptr() says
+// how. k is untouched unless it loads.
+fn load(k as *Keymap, name as *u8, n as i64) as i64 {
+    if (valid_name(name, n) == 0) { _set_why("a layout name is letters, digits, - and _"); return 0 - 1; }
+    if (is_builtin(name, n) == 1) { _use_builtin(k); k.dead = 0; return 0; }
+    let is [64]u8 as p;
+    let is i64 as len = _read(map_path(name, n, cast(*u8, &p[0])));
+    if (len < 0) { _set_why("no such layout in /etc/keymaps"); return 0 - 1; }
+    if (len >= 8191) { _set_why("the file is over 8 KB, more than any layout"); return 1; }
+    return load_text(k, cast(*u8, &_fbuf[0]), len, name, n);
+}
+
+// A layout from text, named `name` — a map being checked before it is
+// installed. The same answers as load(); k is untouched unless it loads.
+fn load_text(k as *Keymap, text as *u8, len as i64, name as *u8, n as i64) as i64 {
+    let is i64 as bad = _parse(k, text, len, 0);
+    if (bad != 0) { return bad; }
+    _clear_tables(k);
+    _parse(k, text, len, 1);
+    _set_file(k, name, n);
+    if (k.name_len == 0) {
+        let is i64 as i with mut = 0;
+        while (i < n && i < 47) { k.name[i] = name[i]; i = i + 1; }
+        k.name_len = i;
+    }
+    k.dead = 0;
+    return 0;
+}
+
+// The layout chosen: /var/keymap, else /etc/keymap — a name on the first line.
+// Written into buf (room for 32 bytes); returns its length, 2 ("us") when
+// neither file names one. src[0] says which: 1 /var/keymap, 2 /etc/keymap,
+// 0 neither.
+fn chosen_src(buf as *u8, src as *i64) as i64 {
+    let is *u8 as path with mut = "/var/keymap";
+    let is i64 as round with mut = 0;
+    while (round < 2) {
+        if (round == 1) { path = "/etc/keymap"; }
+        let is i64 as len = _read(path);
+        if (len > 0) {
+            let is i64 as i with mut = 0;
+            while (i < len && (_is_space(_fbuf[i]) == 1 || _fbuf[i] == cast(u8, 10))) { i = i + 1; }
+            let is i64 as n with mut = 0;
+            while (i + n < len && n < 31 && _fbuf[i + n] != cast(u8, 10) && _is_space(_fbuf[i + n]) == 0) {
+                buf[n] = _fbuf[i + n];
+                n = n + 1;
+            }
+            if (n > 0) { src[0] = round + 1; return n; }
+        }
+        round = round + 1;
+    }
+    buf[0] = cast(u8, 117); buf[1] = cast(u8, 115);
+    src[0] = 0;
+    return 2;
+}
+
+fn chosen(buf as *u8) as i64 {
+    let is [1]i64 as src;
+    return chosen_src(buf, cast(*i64, &src[0]));
+}
+
+// Load the chosen layout. On a failure the keyboard stays what it was (US when
+// nothing loaded yet) and the serial line says why. Returns load()'s answer.
+fn load_chosen(k as *Keymap) as i64 {
+    let is [32]u8 as nm;
+    let is i64 as n = chosen(cast(*u8, &nm[0]));
+    let is i64 as rc = load(k, cast(*u8, &nm[0]), n);
+    if (rc != 0) {
+        sys.write_serial("keymap: cannot load ", 20);
+        sys.write_serial(cast(*u8, &nm[0]), n);
+        sys.write_serial(": ", 2);
+        sys.write_serial(why_ptr(), why_len());
+        sys.write_serial("\n", 1);
+    }
+    return rc;
+}
+
+// A number that changes when the layout chosen does — its name, or its map
+// file being rewritten: compare it with the last one seen to know when to
+// load_chosen() again. The name is read, not stat'ed: a FAT time stamp moves
+// in steps of two seconds, and `keymap set pt` then `keymap set es` inside
+// one of them would leave /var/keymap with the same size and the same time.
+fn config_stamp() as i64 {
+    let is [32]u8 as nm;
+    let is i64 as n = chosen(cast(*u8, &nm[0]));
+    let is i64 as h with mut = 7;
+    let is i64 as i with mut = 0;
+    while (i < n) { h = h * 1000003 + cast(i64, nm[i]); i = i + 1; }
+    if (is_builtin(cast(*u8, &nm[0]), n) == 1 || valid_name(cast(*u8, &nm[0]), n) == 0) { return h; }
+    let is [64]u8 as p;
+    let is [5]i64 as sx;
+    if (sys.statx(map_path(cast(*u8, &nm[0]), n, cast(*u8, &p[0])), cast(*u8, &sx[0])) != 0) { return h * 31; }
+    h = h * 1000003 + sx[0];                                 // size
+    h = h * 1000003 + sx[1];                                 // first cluster
+    h = h * 1000003 + sx[4];                                 // write time
+    return h;
+}
+
+// ---- keys -------------------------------------------------------------------
+
+fn _shift(k as *Keymap) as i64 { if (k.lshift == 1 || k.rshift == 1) { return 1; } return 0; }
+fn _ctrl(k as *Keymap) as i64 { if (k.lctrl == 1 || k.rctrl == 1) { return 1; } return 0; }
+
+// What is held that could select AltGr symbols: 1 = Right Alt, 2 = Ctrl with
+// Left Alt (as on Windows, for keyboards without a Right Alt), 0 = neither or a
+// layout with no AltGr symbols.
+fn _altgr_by(k as *Keymap) as i64 {
+    if (k.has_altgr == 0) { return 0; }
+    if (k.ralt == 1) { return 1; }
+    if (_ctrl(k) == 1 && k.lalt == 1) { return 2; }
+    return 0;
+}
+
+// The modifiers held, as MOD_* bits. On a layout with AltGr symbols, Right Alt
+// is AltGr, not Alt: it selects characters.
+fn mods(k as *Keymap) as i64 {
+    let is i64 as m with mut = 0;
+    if (_shift(k) == 1) { m = m | ks.MOD_SHIFT; }
+    if (_ctrl(k) == 1) { m = m | ks.MOD_CTRL; }
+    if (k.lalt == 1 || (k.ralt == 1 && k.has_altgr == 0)) { m = m | ks.MOD_ALT; }
+    if (k.lsuper == 1 || k.rsuper == 1) { m = m | ks.MOD_SUPER; }
+    return m;
+}
+
+// The modifiers of the last key(): mods(), less the ones that went into
+// choosing its character — Ctrl+Alt+Q typing "/" on ABNT2 is not a Ctrl+Alt
+// chord, while Ctrl+Alt+T, whose key has no AltGr symbol, still is.
+fn ev_mods(k as *Keymap) as i64 { return k.ev_mods; }
+
+// CapsLock and NumLock: bit 0 Scroll Lock (never set), bit 1 NumLock, bit 2
+// CapsLock — the order of the keyboard's LED byte, so this is what to send it.
+fn locks(k as *Keymap) as i64 {
+    let is i64 as m with mut = 0;
+    if (k.numlock == 1) { m = m | 2; }
+    if (k.capslock == 1) { m = m | 4; }
+    return m;
+}
+
+// The key at sc on the keypad, or the fixed keys every layout shares: a KEY_*
+// code or a character; 0 = the layout decides.
+fn _fixed(k as *Keymap, sc as i64, ext as i64) as i64 {
+    if (ext == 1) {
+        if (sc == 0x1C) { return ks.KEY_ENTER; }
+        if (sc == 0x35) { return 0x2F; }                     // keypad /
+        if (sc == 0x47) { return ks.KEY_HOME; }
+        if (sc == 0x48) { return ks.KEY_UP; }
+        if (sc == 0x49) { return ks.KEY_PGUP; }
+        if (sc == 0x4B) { return ks.KEY_LEFT; }
+        if (sc == 0x4D) { return ks.KEY_RIGHT; }
+        if (sc == 0x4F) { return ks.KEY_END; }
+        if (sc == 0x50) { return ks.KEY_DOWN; }
+        if (sc == 0x51) { return ks.KEY_PGDN; }
+        if (sc == 0x52) { return ks.KEY_INSERT; }
+        if (sc == 0x53) { return ks.KEY_DEL; }
+        return 0 - 1;                                        // nothing else extended types
+    }
+    if (sc == 0x01) { return ks.KEY_ESC; }
+    if (sc == 0x0E) { return ks.KEY_BACKSPACE; }
+    if (sc == 0x0F) { return ks.KEY_TAB; }
+    if (sc == 0x1C) { return ks.KEY_ENTER; }
+    if (sc == 0x39) { return 0x20; }
+    if (sc >= 0x3B && sc <= 0x44) { return ks.KEY_F1 + (sc - 0x3B); }
+    if (sc == 0x57) { return ks.KEY_F1 + 10; }
+    if (sc == 0x58) { return ks.KEY_F1 + 11; }
+    if (sc == 0x37) { return 0x2A; }                         // keypad *
+    if (sc == 0x4A) { return 0x2D; }                         // keypad -
+    if (sc == 0x4E) { return 0x2B; }                         // keypad +
+    if (sc >= 0x47 && sc <= 0x53) {
+        // The keypad: digits with NumLock (Shift reverses it, as on a PC), the
+        // navigation keys printed under them without. The layout may say what
+        // the decimal key types (ABNT2: a comma).
+        if (k.numlock == 1 && _shift(k) == 0) {
+            if (k.lv[sc * 4] != 0) { return k.lv[sc * 4]; }
+            let is *u8 as kp = "789-456+1230.";
+            return cast(i64, kp[sc - 0x47]);
+        }
+        if (sc == 0x47) { return ks.KEY_HOME; }
+        if (sc == 0x48) { return ks.KEY_UP; }
+        if (sc == 0x49) { return ks.KEY_PGUP; }
+        if (sc == 0x4B) { return ks.KEY_LEFT; }
+        if (sc == 0x4D) { return ks.KEY_RIGHT; }
+        if (sc == 0x4F) { return ks.KEY_END; }
+        if (sc == 0x50) { return ks.KEY_DOWN; }
+        if (sc == 0x51) { return ks.KEY_PGDN; }
+        if (sc == 0x52) { return ks.KEY_INSERT; }
+        if (sc == 0x53) { return ks.KEY_DEL; }
+        return 0 - 1;                                        // keypad 5 without NumLock
+    }
+    if (sc >= 128) { return 0 - 1; }
+    return 0;
+}
+
+// What the key at sc makes now — a KEY_* code, a character, a dead key, or 0 —
+// and in k.ev_mods the modifiers left over once it is chosen.
+fn _symbol(k as *Keymap, sc as i64, ext as i64) as i64 {
+    k.ev_mods = mods(k);
+    let is i64 as f = _fixed(k, sc, ext);
+    if (f < 0) { return 0; }
+    if (f != 0) { return f; }
+    let is i64 as up with mut = _shift(k);
+    if (k.capslock == 1 && k.caps[sc] == 1) { up = 1 - up; }
+    let is i64 as by = _altgr_by(k);
+    if (by != 0) {
+        let is i64 as v with mut = k.lv[sc * 4 + 2 + up];
+        if (v == 0 && up == 1) { v = k.lv[sc * 4 + 2]; }
+        if (v != 0) {
+            // The AltGr symbol: what selected it is spent.
+            if (by == 2) { k.ev_mods = k.ev_mods & (0 - 1 - ks.MOD_CTRL - ks.MOD_ALT); }
+            return v;
+        }
+    }
+    let is i64 as v2 with mut = k.lv[sc * 4 + up];
+    if (v2 == 0 && up == 1) { v2 = k.lv[sc * 4]; }           // a key with one symbol
+    return v2;
+}
+
+// A dead key's mark on a character: the layout's own rule first, then Unicode.
+fn _compose(k as *Keymap, mark as i64, c as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < k.ncmp) {
+        if (k.cmp[i * 3] == mark && k.cmp[i * 3 + 1] == c) { return k.cmp[i * 3 + 2]; }
+        i = i + 1;
+    }
+    return uc.compose(c, mark);
+}
+
+// One key event. Writes what it makes to out (room for 2) and returns how many:
+// 0 (a modifier, a release, a dead key waiting for its letter), 1, or 2 (a
+// dead key, then a letter it does not go on: both are typed). A symbol is a
+// character's code point or a KEY_* code. ev_mods() is then the modifiers
+// that go with it.
+fn key(k as *Keymap, sc as i64, ext as i64, pressed as i64, out as *i64) as i64 {
+    let is i64 as held with mut = 0 - 1;
+    if (ext == 0 && sc == 0x2A) { k.lshift = pressed; held = 1; }
+    if (ext == 0 && sc == 0x36) { k.rshift = pressed; held = 1; }
+    if (sc == 0x1D) { if (ext == 1) { k.rctrl = pressed; } else { k.lctrl = pressed; } held = 1; }
+    if (sc == 0x38) { if (ext == 1) { k.ralt = pressed; } else { k.lalt = pressed; } held = 1; }
+    if (ext == 1 && sc == 0x5B) { k.lsuper = pressed; held = 1; }
+    if (ext == 1 && sc == 0x5C) { k.rsuper = pressed; held = 1; }
+    if (ext == 0 && sc == 0x3A) { if (pressed == 1) { k.capslock = 1 - k.capslock; } held = 1; }
+    if (ext == 0 && sc == 0x45) { if (pressed == 1) { k.numlock = 1 - k.numlock; } held = 1; }
+    if (held == 1 || pressed == 0) { k.ev_mods = mods(k); return 0; }
+    let is i64 as sym = _symbol(k, sc, ext);
+    if (sym == 0) { return 0; }
+    if (sym >= ks.KEY_BASE && (sym & DEAD_BIT) == 0) {
+        // Backspace takes back a dead key that is still waiting; any other
+        // special key drops it.
+        if (k.dead != 0) {
+            k.dead = 0;
+            if (sym == ks.KEY_BACKSPACE) { return 0; }
+        }
+        out[0] = sym;
+        return 1;
+    }
+    // A chord (Ctrl, Alt or Super held, and not spent on an AltGr symbol) is
+    // the key itself: a dead key in a chord is its accent, and a waiting one
+    // is dropped.
+    if ((k.ev_mods & (ks.MOD_CTRL | ks.MOD_ALT | ks.MOD_SUPER)) != 0) {
+        k.dead = 0;
+        out[0] = sym & CP_MASK;
+        return 1;
+    }
+    if ((sym & DEAD_BIT) != 0) {
+        if (k.dead != 0) {
+            let is i64 as prev = k.dead;
+            k.dead = 0;
+            out[0] = prev & CP_MASK;
+            if (prev == sym) { return 1; }                   // the same dead key twice: its accent
+            k.dead = sym;                                    // another one: the first's accent, and wait again
+            return 1;
+        }
+        k.dead = sym;
+        return 0;
+    }
+    if (k.dead != 0) {
+        let is i64 as d = k.dead;
+        k.dead = 0;
+        let is i64 as acc = d & CP_MASK;
+        if (sym == 0x20) { out[0] = acc; return 1; }         // dead key, then space: the accent
+        let is i64 as c = _compose(k, (d >> 21) & 0x7FFFF, sym);
+        if (c != 0) { out[0] = c; return 1; }
+        out[0] = acc;
+        out[1] = sym;
+        return 2;
+    }
+    out[0] = sym;
+    return 1;
+}
+
+// The US table this module carries, as map-file text: what `keymap show us`
+// prints, and a place to start a layout of one's own from.
+fn builtin_text() as *u8 { return _builtin_us(); }
+
+fn name_ptr(k as *Keymap) as *u8 { return cast(*u8, &k.name[0]); }
+fn name_len(k as *Keymap) as i64 { return k.name_len; }
+fn file_ptr(k as *Keymap) as *u8 { return cast(*u8, &k.file[0]); }
+fn file_len(k as *Keymap) as i64 { return k.file_len; }

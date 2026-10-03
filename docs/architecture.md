@@ -226,7 +226,15 @@ shell↔terminal, and all future IPC fall out of it.
   dead keys, compose, future IME — all *policy*, all changeable, all in the terminal
   (or the app). Collapsing to ASCII in the kernel would be lossy (no key-up, no
   modifiers, no arrows/F-keys) *and* would put policy in the kernel — the
-  historically-criticised legacy-VT mistake. Rejected.
+  historically-criticised legacy-VT mistake. Rejected. The layouts live in
+  `/etc/keymaps` and `lib/keymap` applies them (in the compositor, and in the
+  fullscreen shell when that is the holder); `keymap set` picks one.
+- **LEDs are the holder's to drive.** Whether CapsLock is on is a fact of the
+  layout, so it is userspace's; the keyboard only shows what it is told.
+  `write(kbd_fd, &mask, 1)` — bit 0 Scroll, bit 1 Num, bit 2 Caps — sends it
+  the LED command. Only the grab-stack top may (else `E_AGAIN`). The keyboard's
+  ACK/RESEND come in on IRQ1 like keys, and 0xFE is also a key release (ABNT2's
+  keypad point), so the kernel takes them as answers only while it awaits one.
 - **Why one owner.** The framebuffer scanout is physically one (physical law). For
   input the physical event stream is one, and *someone* must decide who receives each
   event; multiplexing input (routing by focus, deciding who consumes a click) is

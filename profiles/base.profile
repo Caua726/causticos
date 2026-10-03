@@ -104,6 +104,13 @@ bin  soundd
 bin  aplay
 bin  arecord
 
+# the keyboard. A layout is a text file in /etc/keymaps; /etc/keymap names the
+# image's default, and /var/keymap (written by `keymap set`) the user's choice
+# over it. US is compiled into lib/keymap, so it needs no file.
+bin  keymap
+mirror userspace/lib/keymap/maps /etc/keymaps --only *.map
+text /etc/keymap us\n
+
 # power
 bin  poweroff
 bin  reboot

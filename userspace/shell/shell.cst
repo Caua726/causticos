@@ -12,6 +12,9 @@
 use "std/causticos/gfx.cst" as gfx;
 use "std/causticos/term.cst" as term;
 use "std/causticos/input.cst" as input;
+use "../lib/keymap/keymap.cst" as km;
+use "../lib/keymap/keysym.cst" as ks;
+use "std/unicode/utf8.cst" as utf8;
 use "std/os/causticos.cst" as sys;
 use "../lib/repl/repl.cst" as repl;
 use "../lib/jobs/jobs.cst" as jobs;
@@ -42,6 +45,7 @@ fn _col(t as *term.Term, fg as u32) as void { term.set_color(t, fg, C_BG); }
 // The prompt tells you which of the two states the shell is in: waiting for a
 // command, or waiting for the rest of a block you started.
 fn prompt(t as *term.Term) as void {
+    keymap_check();
     _col(t, C_PROMPT);
     if (ss.pending() == 1) { puts(t, "... "); } else { puts(t, "> "); }
     _col(t, C_TEXT);
@@ -64,11 +68,30 @@ fn _lognum(v as i64) as void {
 }
 
 // Run an external program: argv_ptr[i] = byte pointer, argv_len[i] = length
-// Keyboard fd + modifier state, shared with run_program so a running TUI can
-// be fed keystrokes (the shell is a fullscreen terminal: it owns DEV_KEYBOARD).
+// Keyboard fd, and the layout that turns its scancodes into what they type —
+// the shell is a fullscreen terminal: it owns DEV_KEYBOARD, so applying the
+// layout is its job here, as it is the compositor's on the desktop.
 let is i64 as g_kfd with mut = 0;
-let is i64 as g_shift with mut = 0;
-let is i64 as g_ctrl with mut = 0;
+let is km.Keymap as kmap with mut;
+let is i64 as g_km_stamp with mut = 0;
+
+// Show CapsLock and NumLock on the keyboard (a failure is the kernel's to
+// report; the keys work the same without their lights).
+fn set_leds() as void {
+    let is [1]u8 as m;
+    m[0] = cast(u8, km.locks(&kmap));
+    sys.write(g_kfd, cast(*u8, &m[0]), 1);
+}
+
+// The layout chosen (`keymap set`, /etc/keymap) changed since it was loaded:
+// load it again. Looked at with every prompt, which is when a `keymap set`
+// run from here has just finished.
+fn keymap_check() as void {
+    let is i64 as st = km.config_stamp();
+    if (st == g_km_stamp) { return; }
+    g_km_stamp = st;
+    km.load_chosen(&kmap);
+}
 let is i64 as SCROLLBACK with imut = 2000;
 
 // Reply to a TUI child's CSI 18t query: report the grid as ESC[8;rows;cols t on
@@ -351,13 +374,14 @@ fn finish_job(t as *term.Term, slot as i64) as void {
 
 // A key while a job is in the foreground belongs to that job, not to the line
 // editor: it is the running program the user is talking to.
-fn key_to_fg(ev as *input.KeyEvent) as void {
+fn key_to_fg(sym as i64, mods as i64) as void {
     let is *jobs.Job as jb = jobs.get(fg_job);
+    let is i64 as ck = ks.chord_key(sym);
     // Ctrl+C ends the job and the rest of its line, unless it asked to be told
     // (ttyproto EV_INTR: an editor, a recorder with a file to finish); Ctrl+\
     // ends it whatever it asked.
-    if (g_ctrl == 1 && (ev.scancode == 0x2E || ev.scancode == 0x2B)) {
-        if (ev.scancode == 0x2E && (jb.tty_catch & tty.EV_INTR) != 0 && jb.tty_fd >= 0) {
+    if ((mods & ks.MOD_CTRL) != 0 && (ck == 0x63 || ck == 0x5C)) {
+        if (ck == 0x63 && (jb.tty_catch & tty.EV_INTR) != 0 && jb.tty_fd >= 0) {
             tty.send_event(jb.tty_fd, tty.EV_INTR);
         } else {
             jobs.kill_job(fg_job);
@@ -367,20 +391,12 @@ fn key_to_fg(ev as *input.KeyEvent) as void {
     }
     // Everything else is input for the job — if it reads any from here. One
     // whose stdin is a file or a pipe had Ctrl+C refused along with the rest:
-    // this test came first, and `cat < big` could not be stopped.
+    // this test came first, and `cat < big` could not be stopped. What it
+    // reads is what a terminal sends for the key (keysym.term_bytes).
     if (jb.in_fd < 0) { return; }
-    if (ev.extended == 1 && (ev.scancode == 0x48 || ev.scancode == 0x50
-                             || ev.scancode == 0x4D || ev.scancode == 0x4B)) {
-        let is [3]u8 as ek; ek[0] = cast(u8, 0x1B); ek[1] = cast(u8, 0x5B);
-        if (ev.scancode == 0x48)      { ek[2] = cast(u8, 65); }
-        else if (ev.scancode == 0x50) { ek[2] = cast(u8, 66); }
-        else if (ev.scancode == 0x4D) { ek[2] = cast(u8, 67); }
-        else                          { ek[2] = cast(u8, 68); }
-        to_child(jb.in_fd, cast(*u8, &ek[0]), 3);
-        return;
-    }
-    let is i64 as ic = input.scancode_to_ascii(ev.scancode, g_shift);
-    if (ic != 0) { let is [1]u8 as kb; kb[0] = cast(u8, ic); to_child(jb.in_fd, cast(*u8, &kb[0]), 1); }
+    let is [16]u8 as kb;
+    let is i64 as n = ks.term_bytes(sym, mods, cast(*u8, &kb[0]));
+    if (n > 0) { to_child(jb.in_fd, cast(*u8, &kb[0]), n); }
     return;
 }
 
@@ -419,7 +435,13 @@ fn type_ahead(t as *term.Term, n as i64) as void {
                 while (i < n && (ta_back[i] < cast(u8, 0x40) || ta_back[i] > cast(u8, 0x7E))) { i = i + 1; }
             }
         } else if (c == 0x0A || c == 0x08 || c == 0x09 || (c >= 32 && c < 127)) {
-            line_byte(t, c);
+            line_char(t, c);
+        } else if (c >= 0x80) {
+            // A character typed as UTF-8 goes back in whole; a byte that is
+            // not part of one is dropped, as a control byte is.
+            let is [1]i32 as cp1;
+            let is i64 as used = utf8.decode1(cast(*u8, &ta_back[0]), n, i, cast(*i32, &cp1[0]));
+            if (used > 1) { line_char(t, cast(i64, cp1[0])); i = i + used - 1; }
         }
         i = i + 1;
     }
@@ -445,55 +467,53 @@ fn _edit(t as *term.Term, what as i64) as void {
     return;
 }
 
-fn key_to_line(t as *term.Term, ev as *input.KeyEvent) as void {
+fn key_to_line(t as *term.Term, sym as i64, mods as i64) as void {
+    let is i64 as ctrl = mods & ks.MOD_CTRL;
+    let is i64 as ck = ks.chord_key(sym);
     // A Ctrl+R search takes the keys while it runs (repl.cst explains which
     // do what); any other key ends it, keeping the line found, and then goes
     // on below as usual.
     if (repl.searching(&rl) == 1) {
-        if (g_ctrl == 1 && ev.scancode == 0x13) { repl.search_next(&rl, t); term.flush(t); return; }
-        if ((g_ctrl == 1 && ev.scancode == 0x22) || (ev.extended == 0 && ev.scancode == 0x01)) {
+        if (ctrl != 0 && ck == 0x72) { repl.search_next(&rl, t); term.flush(t); return; }      // Ctrl+R
+        if ((ctrl != 0 && ck == 0x67) || sym == ks.KEY_ESC) {
             repl.search_end(&rl, t, 0); term.flush(t); return;            // Ctrl+G, Esc
         }
-        if (ev.extended == 0 && ev.scancode == 0x0E) { repl.search_back(&rl, t); term.flush(t); return; }
-        if (g_ctrl == 0 && ev.extended == 0) {
-            let is i64 as sc_c = input.scancode_to_ascii(ev.scancode, g_shift);
-            if (sc_c >= 0x20 && sc_c < 0x7F) { repl.search_key(&rl, t, sc_c); term.flush(t); return; }
-        }
+        if (sym == ks.KEY_BACKSPACE) { repl.search_back(&rl, t); term.flush(t); return; }
+        if (ctrl == 0 && sym >= 0x20 && sym < ks.KEY_BASE) { repl.search_key(&rl, t, sym); term.flush(t); return; }
         repl.search_end(&rl, t, 1);
         term.flush(t);
     }
-    if (ev.extended == 1 && ev.scancode == 0x48) {              // Up — older history
+    if (sym == ks.KEY_UP) {                                     // older history
         if (repl.nav_up(&rl, t) == 1) { term.flush(t); }
         return;
     }
-    if (ev.extended == 1 && ev.scancode == 0x50) {              // Down — newer history
+    if (sym == ks.KEY_DOWN) {                                   // newer history
         if (repl.nav_down(&rl, t) == 1) { term.flush(t); }
         return;
     }
-    if (ev.extended == 1 && ev.scancode == 0x4B) { _edit(t, 1); return; }   // Left
-    if (ev.extended == 1 && ev.scancode == 0x4D) { _edit(t, 2); return; }   // Right
-    if (ev.extended == 1 && ev.scancode == 0x47) { _edit(t, 3); return; }   // Home
-    if (ev.extended == 1 && ev.scancode == 0x4F) { _edit(t, 4); return; }   // End
-    if (ev.extended == 1 && ev.scancode == 0x53) { _edit(t, 10); return; }  // Delete
-    // Readline's control chords. They are matched on the SCANCODE, so they do
-    // not depend on what the keymap makes of Ctrl+letter.
-    if (g_ctrl == 1) {
-        if (ev.scancode == 0x25) { _edit(t, 5); return; }       // Ctrl+K  kill to end
-        if (ev.scancode == 0x16) { _edit(t, 6); return; }       // Ctrl+U  kill to start
-        if (ev.scancode == 0x11) { _edit(t, 7); return; }       // Ctrl+W  kill word
-        if (ev.scancode == 0x15) { _edit(t, 8); return; }       // Ctrl+Y  yank
-        if (ev.scancode == 0x14) { _edit(t, 9); return; }       // Ctrl+T  transpose
-        if (ev.scancode == 0x1E) { _edit(t, 3); return; }       // Ctrl+A  start of line
-        if (ev.scancode == 0x12) { _edit(t, 4); return; }       // Ctrl+E  end of line
-        if (ev.scancode == 0x13) { repl.search_next(&rl, t); term.flush(t); return; }   // Ctrl+R  search history
-        if (ev.scancode == 0x26) {                              // Ctrl+L  clear the screen
+    if (sym == ks.KEY_LEFT) { _edit(t, 1); return; }
+    if (sym == ks.KEY_RIGHT) { _edit(t, 2); return; }
+    if (sym == ks.KEY_HOME) { _edit(t, 3); return; }
+    if (sym == ks.KEY_END) { _edit(t, 4); return; }
+    if (sym == ks.KEY_DEL) { _edit(t, 10); return; }
+    // Readline's control chords, by the letter on the key (keysym.chord_key).
+    if (ctrl != 0) {
+        if (ck == 0x6B) { _edit(t, 5); return; }       // Ctrl+K  kill to end
+        if (ck == 0x75) { _edit(t, 6); return; }       // Ctrl+U  kill to start
+        if (ck == 0x77) { _edit(t, 7); return; }       // Ctrl+W  kill word
+        if (ck == 0x79) { _edit(t, 8); return; }       // Ctrl+Y  yank
+        if (ck == 0x74) { _edit(t, 9); return; }       // Ctrl+T  transpose
+        if (ck == 0x61) { _edit(t, 3); return; }       // Ctrl+A  start of line
+        if (ck == 0x65) { _edit(t, 4); return; }       // Ctrl+E  end of line
+        if (ck == 0x72) { repl.search_next(&rl, t); term.flush(t); return; }   // Ctrl+R  search history
+        if (ck == 0x6C) {                              // Ctrl+L  clear the screen
             term.clear(t);
             prompt(t);
             repl.reprint(&rl, t);
             term.flush(t);
             return;
         }
-        if (ev.scancode == 0x2E) {                              // Ctrl+C  drop the line
+        if (ck == 0x63) {                              // Ctrl+C  drop the line
             repl.cancel(&rl, t);
             prompt(t);
             term.flush(t);
@@ -501,18 +521,21 @@ fn key_to_line(t as *term.Term, ev as *input.KeyEvent) as void {
         }
         // Ctrl+D deletes at the cursor. On an empty line it does nothing:
         // this shell is /init, and there is no closing it.
-        if (ev.scancode == 0x20) { _edit(t, 10); return; }
+        if (ck == 0x64) { _edit(t, 10); return; }
         // Any other chord is not text. It used to fall through and go into
         // the line as its letter (Ctrl+L typed "l"), and from there into the
         // command.
         return;
     }
-    line_byte(t, input.scancode_to_ascii(ev.scancode, g_shift));
+    if (sym == ks.KEY_ENTER) { line_char(t, 0x0A); return; }
+    if (sym == ks.KEY_TAB) { line_char(t, 0x09); return; }
+    if (sym == ks.KEY_BACKSPACE) { line_char(t, 0x08); return; }
+    if (sym >= 0x20 && sym < ks.KEY_BASE) { line_char(t, sym); }
 }
 
-// One character for the line editor: Enter runs the line, Tab completes, BS
-// erases, anything else printable goes in. 0 does nothing.
-fn line_byte(t as *term.Term, c as i64) as void {
+// One character (a code point) for the line editor: Enter (\n) runs the line,
+// Tab completes, BS erases, anything else printable goes in. 0 does nothing.
+fn line_char(t as *term.Term, c as i64) as void {
     if (c == 0x0A) {
         repl.finish(&rl, t); term.flush(t);
         repl.hist_push(&rl, repl.line_ptr(&rl), repl.line_len(&rl));
@@ -587,6 +610,9 @@ fn main() as i32 {
 
     g_kfd = input.open_keyboard();
     if (g_kfd < 0) { sys.write_serial("shell: NO KBD\n", 14); sys.exit(cast(i32, 2)); }
+    km.init(&kmap);
+    keymap_check();
+    set_leds();
 
     repl.init(&rl);
     // /var may not exist on a fresh disk; an "already exists" here is exactly
@@ -680,19 +706,25 @@ fn main() as i32 {
 
         if ((pe[2] & sys.POLL_READABLE) != 0) {
             if (input.read_event(g_kfd, &ev) == 1) {
-                if (input.is_shift(ev.scancode) == 1) { g_shift = ev.pressed; }
-                else if (input.is_ctrl(ev.scancode) == 1) { g_ctrl = ev.pressed; }
-                else if (ev.pressed == 1) {
+                let is [2]i64 as syms;
+                let is i64 as locks = km.locks(&kmap);
+                let is i64 as nsym = km.key(&kmap, ev.scancode, ev.extended, ev.pressed, cast(*i64, &syms[0]));
+                if (km.locks(&kmap) != locks) { set_leds(); }
+                let is i64 as mods = km.ev_mods(&kmap);
+                let is i64 as si with mut = 0;
+                while (si < nsym) {
+                    let is i64 as sym = syms[si];
+                    si = si + 1;
                     // Shift+PgUp/PgDn page through the history, whoever has the
                     // keys; any other key brings the live screen back first.
-                    if (g_shift == 1 && ev.extended == 1 && (ev.scancode == 0x49 || ev.scancode == 0x51)) {
+                    if ((mods & ks.MOD_SHIFT) != 0 && (sym == ks.KEY_PGUP || sym == ks.KEY_PGDN)) {
                         let is i64 as page with mut = t.rows - 1;
                         if (page < 1) { page = 1; }
-                        if (ev.scancode == 0x49) { term.scroll_view(&t, page); } else { term.scroll_view(&t, 0 - page); }
+                        if (sym == ks.KEY_PGUP) { term.scroll_view(&t, page); } else { term.scroll_view(&t, 0 - page); }
                         term.flush(&t);
                     } else {
                         if (t.view_off != 0) { term.scroll_view(&t, 0 - t.view_off); term.flush(&t); }
-                        if (fg_job >= 0) { key_to_fg(&ev); } else { key_to_line(&t, &ev); }
+                        if (fg_job >= 0) { key_to_fg(sym, mods); } else { key_to_line(&t, sym, mods); }
                     }
                 }
             }
