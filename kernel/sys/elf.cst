@@ -25,6 +25,7 @@ use "util.cst" as util;
 use "pmm.cst" as pmm;
 use "vmm.cst" as vmm;
 use "vma.cst" as vma;
+use "abi.cst" as abi;
 
 // ============================================================
 // ELF constants (subset relevant to a static x86_64 binary)
@@ -81,8 +82,9 @@ let is i64 as USER_STACK_SIZE = 0x4000;
 // window at the top; the program's prologue probes commit the rest on demand
 // via SYS_COMMIT (explicit growth, not demand paging). INITIAL_STACK_COMMIT
 // must cover the entry argv/auxv page + the first frame + the grow helper's own
-// frame, with margin. The runtime tracks the committed bottom from the SAME two
-// constants (USER_STACK_TOP_VA and INITIAL_STACK_COMMIT).
+// frame, with margin. The runtime learns where the committed part ends, and
+// where the reservation does, from the thread block the loader writes at the
+// top of the stack (abi.THREAD_BLOCK_*) — not from copies of these constants.
 let is i64 as INITIAL_STACK_COMMIT = 0x20000;    // 128 KiB committed up-front
 let is i64 as STACK_DYN_CEILING    = 0x800000;   // 8 MiB default reserve ceiling
 
@@ -272,6 +274,8 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
     }
     let is i64 as stack_top = USER_STACK_TOP_VA;
     let is i64 as sprot = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+    let is i64 as stack_low with mut = 0;      // lowest committed byte
+    let is i64 as stack_floor with mut = 0;    // bottom of the reservation
     if (a.stack_dynamic == 1) {
         // Explicit-growth stack: reserve the ceiling, commit only the initial
         // window at the top. The program's prologue probes commit more on
@@ -293,6 +297,8 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
             serial.println("elf: stack initial-commit fail", 30);
             return cast(i32, 0 - 1);
         }
+        stack_low = stack_top - ic;
+        stack_floor = base;
     } else {
         // Strict: eager-commit the whole declared/default size — the wall.
         let is i64 as stack_size with mut = a.stack_size;
@@ -305,11 +311,13 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
             serial.println("elf: stack mmap fail", 20);
             return cast(i32, 0 - 1);
         }
+        stack_low = stack_top - stack_size;
+        stack_floor = stack_low;
     }
 
     // Layout inside our kernel-mapped view of the top page, working backwards
-    // from stack_top: every argv string, then a 16-byte AT_RANDOM blob, then
-    // the argc/argv/envp/auxv scalar array.
+    // from stack_top: the first thread's block, every argv string, then a
+    // 16-byte AT_RANDOM blob, then the argc/argv/envp/auxv scalar array.
     let is i64 as page_va = stack_top - pmm.PAGE_SIZE;
     let is i64 as page_phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
     if (page_phys == 0) {
@@ -319,8 +327,18 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
     let is *u8 as page_kv = cast(*u8, pmm.phys_to_virt(page_phys));
 
     // Cursor inside the page (offset from page base, growing down).
-    let is i64 as off with mut = pmm.PAGE_SIZE;
+    let is i64 as off with mut = pmm.PAGE_SIZE - abi.THREAD_BLOCK_SIZE;
     let is [32]i64 as argv_va;
+
+    // The thread block, 64-aligned at the very top: the first thread's fs
+    // base (proc_from_loaded hands it over). Zero past the defined words.
+    let is *i64 as tb = cast(*i64, &page_kv[off]);
+    let is i64 as tw with mut = 0;
+    while (tw < abi.THREAD_BLOCK_SIZE / 8) { tb[tw] = 0; tw = tw + 1; }
+    tb[abi.TB_STACK_LOW / 8] = stack_low;
+    tb[abi.TB_SELF / 8] = page_va + off;
+    tb[abi.TB_STACK_FLOOR / 8] = stack_floor;
+    a.main_block = page_va + off;
 
     // Write each argv string (NUL-terminated), recording its child VA.
     let is i64 as k with mut = 0;

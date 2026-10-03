@@ -3,8 +3,9 @@
 // functions: they prove the mechanism, not that a userspace program can reach
 // it through the stdlib binding. This closes that gap from the other side.
 //
-// Covers SYS_THREAD_SPAWN/EXIT, SYS_EVENT_SUBSCRIBE, SYS_QUERY_DEVS and
-// SYS_DEV_INFO. Runs from the shell like any other program.
+// Covers SYS_THREAD_SPAWN/EXIT (and each thread's own block and stack),
+// SYS_EVENT_SUBSCRIBE, SYS_QUERY_DEVS and SYS_DEV_INFO. Runs from the shell
+// like any other program.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 
@@ -47,36 +48,49 @@ fn check(name as *u8, ok as i64, got as i64, want as i64) as void {
     return;
 }
 
-// Thread entry: `arg` arrives in rdi. Ending with thread_exit must NOT take the
-// process down — main is still running and has to observe the mark.
-fn worker(arg as i64) as void {
+// The calling thread's block: the word at fs:[8] is the block's own address.
+fn thread_block() as *i64 with naked {
+    asm("mov rax, QWORD PTR fs:[8]\nret\n");
+}
+
+// Thread entry: `arg` arrives in rdi. It just returns: thread_start runs it
+// from a frame that ends the thread when it does, so returning must end THIS
+// thread and not take the process down — main is still running and has to
+// observe the mark.
+fn worker(arg as i64) as i64 {
     worker_mark = arg + 1;
-    sys.thread_exit(0);
-    return;
+    return 0;
+}
+
+fn wait_mark(flag as *i64, ms as i64) as i64 {
+    let is i64 as spins with mut = 0;
+    while (flag[0] == 0 && spins < ms) { sys.sleep_ns(1000000); spins = spins + 1; }
+    return flag[0];
 }
 
 fn test_thread() as void {
-    let is i64 as STACK = 65536;
-    let is i64 as sp = sys.mmap(cast(i64, 0), STACK, sys.PROT_READ | sys.PROT_WRITE);
-    if (sp < 0) { check(cast(*u8, "thread stack"), 0, sp, 0); return; }
-    // The stack grows down, so the thread starts at the TOP of the mapping.
-    // 16-byte aligned: the ABI expects it and a misaligned frame faults on the
-    // first aligned store.
-    let is i64 as top = (sp + STACK) & (0 - 16);
-    let is i64 as tid = sys.thread_spawn(cast(i64, fn_ptr(worker)), 41, top);
-    check(cast(*u8, "thread_spawn tid>0"), tid > 0, tid, 1);
-    if (tid <= 0) { sys.munmap(sp, STACK); return; }
+    say("threads:\n");
+    // The first thread's block is the loader's: it says how far this stack is
+    // committed, and the frame we are in is inside that.
+    let is *i64 as mb = thread_block();
+    let is i64 as here with mut = 0;
+    let is i64 as here_va = cast(i64, &here);
+    check(cast(*u8, "main block points at itself"), mb[1] == cast(i64, mb), mb[1], cast(i64, mb));
+    check(cast(*u8, "main stack: floor <= low <= this frame"),
+          mb[2] <= mb[0] && mb[0] <= here_va, mb[0], here_va);
 
+    let is sys.ThreadStack as ts;
+    let is i64 as rc = sys.thread_start(&ts, cast(i64, fn_ptr(worker)), 41, 65536, 65536);
+    check(cast(*u8, "thread_start"), rc == 0, rc, 0);
+    if (rc != 0) { return; }
     // Bounded wait: a thread that never runs must fail the test, not hang it.
-    let is i64 as spins with mut = 0;
-    while (worker_mark == 0 && spins < 2000) {
-        sys.sleep_ns(1000000);
-        spins = spins + 1;
-    }
-    check(cast(*u8, "worker ran (arg+1)"), worker_mark == 42, worker_mark, 42);
+    wait_mark(&worker_mark, 2000);
+    check(cast(*u8, "worker ran (arg+1), then returned"), worker_mark == 42, worker_mark, 42);
     // The process is still alive to report that — which is itself the proof
-    // that thread_exit ended one thread and not the whole process.
-    sys.munmap(sp, STACK);
+    // that returning ended one thread and not the whole process. Give the
+    // thread a moment to finish leaving before its stack goes.
+    sys.sleep_ns(10000000);
+    sys.thread_stack_free(&ts);
     return;
 }
 
@@ -93,6 +107,100 @@ fn regs_after_syscall() as i64 with naked {
 fn test_syscall_regs() as void {
     let is i64 as diff = regs_after_syscall();
     check(cast(*u8, "a syscall leaves rdi rsi rdx r10 r8 r9 alone"), diff == 0, diff, 0);
+    return;
+}
+
+// --- every thread has its own block --------------------------------------
+// Each looks at fs:[8] again and again with sleeps between, so the threads
+// and main trade cpus many times over; what each sees must never change and
+// must be the block it was started with. A scheduler that switched threads
+// without switching fs would show one thread another's block.
+let is [2]i64 as seen with mut;       // the block each thread saw first
+let is [2]i64 as drift with mut;      // times it saw a different one later
+let is [2]i64 as looked with mut;     // 1 once it is done looking
+
+fn looker(i as i64) as i64 {
+    let is i64 as first = cast(i64, thread_block());
+    seen[i] = first;
+    let is i64 as k with mut = 0;
+    while (k < 200) {
+        if (cast(i64, thread_block()) != first) { drift[i] = drift[i] + 1; }
+        if ((k & 7) == 0) { sys.sleep_ns(100000); } else { sys.getpid(); }
+        k = k + 1;
+    }
+    looked[i] = 1;
+    return 0;
+}
+
+fn test_thread_blocks() as void {
+    let is *i64 as mine = thread_block();
+    let is sys.ThreadStack as a;
+    let is sys.ThreadStack as b;
+    let is i64 as ra = sys.thread_start(&a, cast(i64, fn_ptr(looker)), 0, 65536, 65536);
+    let is i64 as rb = sys.thread_start(&b, cast(i64, fn_ptr(looker)), 1, 65536, 65536);
+    check(cast(*u8, "two lookers started"), ra == 0 && rb == 0, ra + rb, 0);
+    if (ra != 0 || rb != 0) { return; }
+    let is i64 as k with mut = 0;
+    let is i64 as mine_drift with mut = 0;
+    while (k < 200) {
+        if (cast(i64, thread_block()) != cast(i64, mine)) { mine_drift = mine_drift + 1; }
+        sys.sleep_ns(100000);
+        k = k + 1;
+    }
+    wait_mark(cast(*i64, &looked[0]), 3000);
+    wait_mark(cast(*i64, &looked[1]), 3000);
+    check(cast(*u8, "thread 0 saw its own block"), seen[0] == a.block, seen[0], a.block);
+    check(cast(*u8, "thread 1 saw its own block"), seen[1] == b.block, seen[1], b.block);
+    check(cast(*u8, "and only it, across switches"), drift[0] + drift[1] == 0, drift[0] + drift[1], 0);
+    check(cast(*u8, "main kept its own"), mine_drift == 0, mine_drift, 0);
+    sys.sleep_ns(10000000);
+    sys.thread_stack_free(&a);
+    sys.thread_stack_free(&b);
+    return;
+}
+
+// --- a thread's stack grows ----------------------------------------------
+// This recursion is also what makes kabi a dynamic-stack program — every
+// function probes fs:[0] — so every thread test here runs the way a real
+// program's threads do. 400 frames of over half a KiB is ~240 KiB, far past
+// the 64 KiB committed to start with: the probes must commit the rest, in the
+// thread's own reservation, and move ITS block's low mark.
+let is i64 as deep_sum with mut = 0;
+let is i64 as deep_low with mut = 0;
+let is i64 as deep_done with mut = 0;
+
+fn deep(n as i64) as i64 {
+    let is [512]u8 as pad;
+    pad[0] = cast(u8, n & 255);
+    pad[511] = cast(u8, (n >> 1) & 255);
+    if (n == 0) { return 0; }
+    return deep(n - 1) + cast(i64, pad[0]) + cast(i64, pad[511]) - cast(i64, pad[511]);
+}
+
+fn diver(arg as i64) as i64 {
+    deep_sum = deep(arg);
+    let is *i64 as tb = thread_block();
+    deep_low = tb[0];
+    deep_done = 1;
+    return 0;
+}
+
+fn test_thread_stack_growth() as void {
+    let is sys.ThreadStack as t;
+    let is i64 as rc = sys.thread_start(&t, cast(i64, fn_ptr(diver)), 400, 1048576, 65536);
+    check(cast(*u8, "diver started"), rc == 0, rc, 0);
+    if (rc != 0) { return; }
+    wait_mark(&deep_done, 3000);
+    // sum of (n & 255) for n = 1..400
+    let is i64 as want with mut = 0;
+    let is i64 as n with mut = 1;
+    while (n <= 400) { want = want + (n & 255); n = n + 1; }
+    check(cast(*u8, "deep recursion in a thread came back"), deep_done == 1 && deep_sum == want, deep_sum, want);
+    let is i64 as start_low = t.base + t.size - 65536;
+    check(cast(*u8, "its stack grew below the first commit"), deep_low < start_low, deep_low, start_low);
+    check(cast(*u8, "inside its own reservation"), deep_low >= t.base, deep_low, t.base);
+    sys.sleep_ns(10000000);
+    sys.thread_stack_free(&t);
     return;
 }
 
@@ -250,8 +358,9 @@ fn test_fd_races() as void {
             race_go = 0;
             race_done = 0;
             race_rc = 99;
-            let is i64 as top = (sp + STACK * ((r & 1) + 1)) & (0 - 16);
-            if (sys.thread_spawn(cast(i64, fn_ptr(closer)), 0, top) <= 0) { bad_rounds = bad_rounds + 1; }
+            let is i64 as sb = sp + STACK * (r & 1);
+            let is i64 as blk = sys.thread_block_init(sb, STACK, sb);
+            if (sys.thread_run(cast(i64, fn_ptr(closer)), 0, blk) <= 0) { bad_rounds = bad_rounds + 1; }
             sys.sleep_ns(200000);
             race_go = 1;
             let is i64 as mine = cast(i64, sys.close(ch[0]));
@@ -284,7 +393,8 @@ fn test_fd_races() as void {
     reader_fd = c2[0];
     reader_done = 0;
     reader_n = 0;
-    let is i64 as rt = sys.thread_spawn(cast(i64, fn_ptr(reader)), 0, (sp + STACK * 3) & (0 - 16));
+    let is i64 as rblk = sys.thread_block_init(sp + STACK * 2, STACK, sp + STACK * 2);
+    let is i64 as rt = sys.thread_run(cast(i64, fn_ptr(reader)), 0, rblk);
     check(cast(*u8, "reader thread"), rt > 0, rt, 1);
     sys.sleep_ns(30000000);                       // let it block in read
     let is i64 as cr = cast(i64, sys.close(c2[0]));
@@ -359,6 +469,8 @@ fn main() as i32 {
     say("kabi: phase-A syscalls from ring 3\n");
     test_syscall_regs();
     test_thread();
+    test_thread_blocks();
+    test_thread_stack_growth();
     test_events();
     test_devs();
     test_fd_reservation();

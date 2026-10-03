@@ -93,7 +93,7 @@ whatever struct it fills.
 | 43 | `POWER_PENDING` | | what is asked of the power: 0, `POWER_OFF` (1), `POWER_REBOOT` (2); polling it is the desktop listening |
 | 44 | `STATX` | path, len, out | 0 \| errno — `stat` plus mtime |
 | 45 | `EVENT_SUBSCRIBE` | pid, mask | fd \| errno — the signal replacement |
-| 46 | `THREAD_SPAWN` | entry, arg, stack_top | tid \| errno (same aspace) |
+| 46 | `THREAD_SPAWN` | entry, arg, stack_top, block | tid \| errno (same aspace); `block` is its thread block, its fs base (0 = none) |
 | 47 | `THREAD_EXIT` | code | does not return |
 | 48 | `QUERY_DEVS` | out, max | total device count |
 | 49 | `DEV_INFO` | class, index, out | 0 \| errno |
@@ -225,6 +225,17 @@ ceiling; > 0 caps the child's `committed_bytes`.
 **`FdAction`** (16 B; `SPAWN`'s `fdacts` is an array of these): two i64 —
 `child_fd, src_fd`. Installs the KObject the parent holds at `src_fd` into the
 child's table at `child_fd`.
+
+**Thread block** (64 B, at a thread's fs base — ring 3 reads it as `fs:[off]`):
+three i64, then zeros reserved for later words —
+`stack_low` (lowest committed byte of the thread's stack; a dynamic-stack
+program's prologue probes compare against it and lower it as they commit
+more), `self` (the block's own address), `stack_floor` (the bottom of the
+stack's reservation — growth stops there: stack overflow). The loader writes
+the first thread's in the top 64 bytes of its stack; `THREAD_SPAWN` takes the
+one the spawner wrote for the stack it made (`std/os/causticos.cst`
+`thread_start` does both). Only ring 3 reads it; the kernel loads each
+thread's fs base when the thread is switched in.
 
 **Keyboard event** (2 B per event; `READ` on a `DEV_KEYBOARD` fd returns a
 multiple of 2): byte 0 = scancode (PS/2 set-1, `0..0x7F`); byte 1 = flags —

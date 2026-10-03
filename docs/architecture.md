@@ -138,7 +138,9 @@ yielding raw event streams. The set stays small on purpose: one new concept, the
   threads and each leaves at its next boundary; it kills every thread of a
   multi-thread process. Only an ancestor may kill, and the target's whole subtree
   goes with it, the way a job ends as a whole). `SYS_THREAD_SPAWN`/`SYS_THREAD_EXIT`
-  add threads over a shared aspace; `SYS_EVENT_SUBSCRIBE` delivers child-exit events.
+  add threads over a shared aspace — each with its own stack and its own thread
+  block at its fs base, which is how a thread's stack grows; `SYS_EVENT_SUBSCRIBE`
+  delivers child-exit events.
 
 ---
 
