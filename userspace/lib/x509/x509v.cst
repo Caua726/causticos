@@ -29,6 +29,7 @@ use "caustic-crypto/asn1/der.cst" as der;
 use "caustic-crypto/hash/sha2.cst" as sha2;
 use "caustic-crypto/pk/rsa.cst" as rsa;
 use "caustic-crypto/pk/p256.cst" as p256;
+use "caustic-crypto/pk/p384.cst" as p384;
 use "caustic-crypto/pk/ed25519.cst" as ed25519;
 use "caustic-crypto/bigint/bigint.cst" as bi;
 
@@ -42,12 +43,14 @@ let is i64 as SIG_ECDSA_SHA256 with imut = 4;
 let is i64 as SIG_ECDSA_SHA384 with imut = 5;
 let is i64 as SIG_RSA_PSS_SHA256 with imut = 6;
 let is i64 as SIG_ED25519         with imut = 7;
+let is i64 as SIG_ECDSA_SHA512    with imut = 8;
 
 // Public key types we can verify with.
 let is i64 as PK_UNKNOWN with imut = 0;
 let is i64 as PK_RSA     with imut = 1;
 let is i64 as PK_P256    with imut = 2;
 let is i64 as PK_ED25519 with imut = 3;
+let is i64 as PK_P384    with imut = 4;
 
 // keyUsage bits, numbered from the most significant bit of the first content
 // byte the way a DER BIT STRING is.
@@ -103,9 +106,11 @@ let is *u8 as OID_RSA_SHA512   with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d
 let is *u8 as OID_RSA_PSS      with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
 let is *u8 as OID_ECDSA_SHA256 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x02";
 let is *u8 as OID_ECDSA_SHA384 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x03";
+let is *u8 as OID_ECDSA_SHA512 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x04";
 let is *u8 as OID_RSA_ENC      with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
 let is *u8 as OID_EC_PUBKEY    with imut = "\x2a\x86\x48\xce\x3d\x02\x01";
 let is *u8 as OID_PRIME256V1   with imut = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
+let is *u8 as OID_SECP384R1    with imut = "\x2b\x81\x04\x00\x22";
 let is *u8 as OID_ED25519      with imut = "\x2b\x65\x70";
 let is *u8 as OID_EXT_SAN      with imut = "\x55\x1d\x11";
 let is *u8 as OID_EXT_BC       with imut = "\x55\x1d\x13";
@@ -127,6 +132,7 @@ fn sigalg_of(buf as *u8, off as i64, len as i64) as i64 {
     if (oid_is(buf, off, len, OID_RSA_PSS, 9) == 1) { return SIG_RSA_PSS_SHA256; }
     if (oid_is(buf, off, len, OID_ECDSA_SHA256, 8) == 1) { return SIG_ECDSA_SHA256; }
     if (oid_is(buf, off, len, OID_ECDSA_SHA384, 8) == 1) { return SIG_ECDSA_SHA384; }
+    if (oid_is(buf, off, len, OID_ECDSA_SHA512, 8) == 1) { return SIG_ECDSA_SHA512; }
     if (oid_is(buf, off, len, OID_ED25519, 3) == 1) { return SIG_ED25519; }
     return SIG_UNKNOWN;
 }
@@ -217,6 +223,51 @@ fn parse_validity(buf as *u8, len as i64, off as i64, c as *Cert) as i64 {
     return 1;
 }
 
+// Bytes in a coordinate of the curve an EC key is on: 32 for P-256, 48 for
+// P-384, 0 for a key that is not one of them.
+fn ec_size(pk_alg as i64) as i64 {
+    if (pk_alg == PK_P256) { return 32; }
+    if (pk_alg == PK_P384) { return 48; }
+    return 0;
+}
+
+// ECDSA with the key at buf+ec_off (0x04 || X || Y, on the curve pk_alg
+// names) over a message whose digest is given, the signature being the DER
+// Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER } in sig[0..siglen).
+// ECDSA takes the leftmost bits of the digest, as many as the curve has, so a
+// SHA-384 digest is cut to 32 bytes on P-256 and a SHA-256 one is used whole
+// on P-384. 1 when it holds — the certificate chain and TLS's
+// CertificateVerify both ask the same question here.
+fn ecdsa_verify(pk_alg as i64, buf as *u8, ec_off as i64, digest as *u8, dlen as i64,
+                sig as *u8, siglen as i64) as i64 {
+    let is i64 as fl = ec_size(pk_alg);
+    if (fl == 0) { return 0; }
+    let is i64 as sin; let is i64 as slen;
+    if (der.der_enter(sig, siglen, 0, der.TAG_SEQUENCE, &sin, &slen) < 0) { return 0; }
+    let is i64 as t; let is i64 as co; let is i64 as cl;
+    let is i64 as after_r = der.der_read(sig, siglen, sin, &t, &co, &cl);
+    if (after_r < 0 || t != der.TAG_INTEGER) { return 0; }
+    let is i64 as roff; let is i64 as rlen;
+    der.der_uint(sig, co, cl, &roff, &rlen);
+    if (der.der_read(sig, siglen, after_r, &t, &co, &cl) < 0 || t != der.TAG_INTEGER) { return 0; }
+    let is i64 as soff; let is i64 as slen2;
+    der.der_uint(sig, co, cl, &soff, &slen2);
+    if (rlen > fl || slen2 > fl) { return 0; }
+    let is bi.Big as qx = bi.big_from_bytes_be(cast(*u8, cast(i64, buf) + ec_off + 1), fl);
+    let is bi.Big as qy = bi.big_from_bytes_be(cast(*u8, cast(i64, buf) + ec_off + 1 + fl), fl);
+    let is bi.Big as r = bi.big_from_bytes_be(cast(*u8, cast(i64, sig) + roff), rlen);
+    let is bi.Big as s = bi.big_from_bytes_be(cast(*u8, cast(i64, sig) + soff), slen2);
+    let is i64 as zl with mut = dlen;
+    if (zl > fl) { zl = fl; }
+    let is bi.Big as z = bi.big_from_bytes_be(digest, zl);
+    let is i64 as v with mut = 0;
+    if (pk_alg == PK_P256) { v = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s); }
+    else { v = p384.p384_ecdsa_verify(&qx, &qy, &z, &r, &s); }
+    bi.big_free(&qx); bi.big_free(&qy);
+    bi.big_free(&r); bi.big_free(&s); bi.big_free(&z);
+    return v;
+}
+
 fn parse_spki(buf as *u8, len as i64, off as i64, c as *Cert) as i64 {
     let is i64 as spki_in; let is i64 as spki_len;
     if (der.der_enter(buf, len, off, der.TAG_SEQUENCE, &spki_in, &spki_len) < 0) { return 0; }
@@ -238,6 +289,7 @@ fn parse_spki(buf as *u8, len as i64, off as i64, c as *Cert) as i64 {
         // must not be mistaken for one we can.
         if (der.der_read(buf, len, after_oid, &t, &co, &cl) >= 0 && t == der.TAG_OID) {
             if (oid_is(buf, co, cl, OID_PRIME256V1, 8) == 1) { c.pk_alg = PK_P256; }
+            if (oid_is(buf, co, cl, OID_SECP384R1, 5) == 1) { c.pk_alg = PK_P384; }
         }
     }
 
@@ -267,11 +319,11 @@ fn parse_spki(buf as *u8, len as i64, off as i64, c as *Cert) as i64 {
         c.ec_off = key_off;
         return 1;
     }
-    if (c.pk_alg == PK_P256) {
+    if (c.pk_alg == PK_P256 || c.pk_alg == PK_P384) {
         // Uncompressed point only. Compressed points need a square root and
         // are vanishingly rare in certificates; refusing one is honest, and
         // guessing at it would not be.
-        if (key_len != 65) { return 0; }
+        if (key_len != 1 + 2 * ec_size(c.pk_alg)) { return 0; }
         if (buf[key_off] != cast(u8, 4)) { return 0; }
         c.ec_off = key_off;
         return 1;
@@ -618,41 +670,16 @@ fn signed_by(cbuf as *u8, clen as i64, child as *Cert,
         }
     }
 
-    if (child.sigalg == SIG_ECDSA_SHA256 || child.sigalg == SIG_ECDSA_SHA384) {
-        if (parent.pk_alg != PK_P256) { return E_ALGORITHM; }
-        let is bi.Big as qx = bi.big_from_bytes_be(
-            cast(*u8, cast(i64, pbuf) + parent.ec_off + 1), 32);
-        let is bi.Big as qy = bi.big_from_bytes_be(
-            cast(*u8, cast(i64, pbuf) + parent.ec_off + 33), 32);
-        // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
-        let is i64 as sin; let is i64 as slen;
-        if (der.der_enter(cbuf, clen, child.sig_off, der.TAG_SEQUENCE, &sin, &slen) < 0) {
-            bi.big_free(&qx); bi.big_free(&qy);
-            return E_SIGNATURE;
+    if (child.sigalg == SIG_ECDSA_SHA256 || child.sigalg == SIG_ECDSA_SHA384
+        || child.sigalg == SIG_ECDSA_SHA512) {
+        // The issuer's curve decides the arithmetic, the signature algorithm
+        // only the digest: a P-384 CA signs with SHA-384 and a P-256 one may
+        // too, and both are in the chains real servers send.
+        if (ec_size(parent.pk_alg) == 0) { return E_ALGORITHM; }
+        if (ecdsa_verify(parent.pk_alg, pbuf, parent.ec_off, cast(*u8, &digest[0]), dlen,
+                         cast(*u8, cast(i64, cbuf) + child.sig_off), clen - child.sig_off) == 1) {
+            return OK;
         }
-        let is i64 as t; let is i64 as co; let is i64 as cl;
-        let is i64 as after_r = der.der_read(cbuf, clen, sin, &t, &co, &cl);
-        if (after_r < 0 || t != der.TAG_INTEGER) {
-            bi.big_free(&qx); bi.big_free(&qy);
-            return E_SIGNATURE;
-        }
-        let is i64 as roff; let is i64 as rlen;
-        der.der_uint(cbuf, co, cl, &roff, &rlen);
-        if (der.der_read(cbuf, clen, after_r, &t, &co, &cl) < 0 || t != der.TAG_INTEGER) {
-            bi.big_free(&qx); bi.big_free(&qy);
-            return E_SIGNATURE;
-        }
-        let is i64 as soff; let is i64 as slen2;
-        der.der_uint(cbuf, co, cl, &soff, &slen2);
-        let is bi.Big as r = bi.big_from_bytes_be(cast(*u8, cast(i64, cbuf) + roff), rlen);
-        let is bi.Big as s = bi.big_from_bytes_be(cast(*u8, cast(i64, cbuf) + soff), slen2);
-        // ECDSA takes the leftmost bits of the digest; for P-256 with SHA-256
-        // that is all of it, and with SHA-384 it is the first 32 bytes.
-        let is bi.Big as z = bi.big_from_bytes_be(cast(*u8, &digest[0]), 32);
-        let is i64 as v = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s);
-        bi.big_free(&qx); bi.big_free(&qy);
-        bi.big_free(&r); bi.big_free(&s); bi.big_free(&z);
-        if (v == 1) { return OK; }
         return E_SIGNATURE;
     }
 

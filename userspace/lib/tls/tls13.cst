@@ -27,10 +27,12 @@
 //   suites        AES-128-GCM (mandatory to implement, §9.1), AES-256-GCM,
 //                 and ChaCha20-Poly1305.
 //
-//   signatures    rsa_pss_rsae_sha256, ecdsa_secp256r1_sha256, ed25519 — for
-//                 the server's CertificateVerify. The certificates in the
-//                 chain may additionally be signed RSA PKCS#1 with SHA-256,
-//                 384 or 512, which x509v handles.
+//   signatures    rsa_pss_rsae_sha256, ecdsa_secp256r1_sha256,
+//                 ecdsa_secp384r1_sha384, ed25519 — for the server's
+//                 CertificateVerify. The certificates in the chain may
+//                 additionally be signed RSA PKCS#1 with SHA-256, 384 or 512,
+//                 or ECDSA with SHA-512, on P-256 or P-384 keys, which x509v
+//                 handles.
 //
 // THE HANDSHAKE IS THE SECURITY, NOT THE ENCRYPTION. Getting AES right and the
 // certificate check wrong produces a connection that is encrypted perfectly to
@@ -48,10 +50,7 @@ use "tls_key.cst" as k;
 use "caustic-crypto/hash/sha2.cst" as sha2;
 use "caustic-crypto/pk/x25519.cst" as x25519;
 use "caustic-crypto/pk/ed25519.cst" as ed25519;
-use "caustic-crypto/pk/p256.cst" as p256;
 use "caustic-crypto/pk/rsa.cst" as rsa;
-use "caustic-crypto/bigint/bigint.cst" as bi;
-use "caustic-crypto/asn1/der.cst" as der;
 use "caustic-crypto/util/ct.cst" as ct;
 
 // ---- record layer ----
@@ -84,6 +83,7 @@ let is i64 as GROUP_X25519 with imut = 0x001D;
 
 let is i64 as SIG_RSA_PSS_SHA256 with imut = 0x0804;
 let is i64 as SIG_ECDSA_P256     with imut = 0x0403;
+let is i64 as SIG_ECDSA_P384     with imut = 0x0503;
 let is i64 as SIG_ED25519        with imut = 0x0807;
 
 // ---- errors, distinct because they call for different things ----
@@ -449,10 +449,11 @@ fn client_hello(t as *Tls) as i64 {
     put16(b, p, GROUP_X25519); p = p + 2;
 
     put16(b, p, EXT_SIG_ALGS); p = p + 2;
+    put16(b, p, 10); p = p + 2;
     put16(b, p, 8); p = p + 2;
-    put16(b, p, 6); p = p + 2;
     put16(b, p, SIG_RSA_PSS_SHA256); p = p + 2;
     put16(b, p, SIG_ECDSA_P256); p = p + 2;
+    put16(b, p, SIG_ECDSA_P384); p = p + 2;
     put16(b, p, SIG_ED25519); p = p + 2;
 
     put16(b, p, EXT_PSK_MODES); p = p + 2;
@@ -700,37 +701,23 @@ fn check_cert_verify(t as *Tls, off as i64, len as i64, upto as i64) as i64 {
         }
         return E_CERT_VERIFY;
     }
-    if (scheme == SIG_ECDSA_P256) {
-        if (leaf.pk_alg != x.PK_P256) { return E_CERT_VERIFY; }
-        let is [32]u8 as digest;
-        sha2.sha256(cast(*u8, &content[0]), clen, cast(*u8, &digest[0]));
-        let is bi.Big as qx = bi.big_from_bytes_be(
-            cast(*u8, cast(i64, lb) + leaf.ec_off + 1), 32);
-        let is bi.Big as qy = bi.big_from_bytes_be(
-            cast(*u8, cast(i64, lb) + leaf.ec_off + 33), 32);
-        let is i64 as sin; let is i64 as slen;
-        if (der.der_enter(sig, siglen, 0, der.TAG_SEQUENCE, &sin, &slen) < 0) {
-            bi.big_free(&qx); bi.big_free(&qy);
-            return E_CERT_VERIFY;
+    // ecdsa_secp256r1_sha256 and ecdsa_secp384r1_sha384 each name both the
+    // curve and the hash (RFC 8446 §4.2.3): the leaf's key must be on that
+    // curve, not merely an EC key.
+    if (scheme == SIG_ECDSA_P256 || scheme == SIG_ECDSA_P384) {
+        let is [48]u8 as digest;
+        let is i64 as dlen with mut = 32;
+        if (scheme == SIG_ECDSA_P256) {
+            if (leaf.pk_alg != x.PK_P256) { return E_CERT_VERIFY; }
+            sha2.sha256(cast(*u8, &content[0]), clen, cast(*u8, &digest[0]));
+        } else {
+            if (leaf.pk_alg != x.PK_P384) { return E_CERT_VERIFY; }
+            sha2.sha384(cast(*u8, &content[0]), clen, cast(*u8, &digest[0]));
+            dlen = 48;
         }
-        let is i64 as tg; let is i64 as co; let is i64 as cl;
-        let is i64 as after_r = der.der_read(sig, siglen, sin, &tg, &co, &cl);
-        if (after_r < 0) { bi.big_free(&qx); bi.big_free(&qy); return E_CERT_VERIFY; }
-        let is i64 as roff; let is i64 as rlen;
-        der.der_uint(sig, co, cl, &roff, &rlen);
-        if (der.der_read(sig, siglen, after_r, &tg, &co, &cl) < 0) {
-            bi.big_free(&qx); bi.big_free(&qy);
-            return E_CERT_VERIFY;
+        if (x.ecdsa_verify(leaf.pk_alg, lb, leaf.ec_off, cast(*u8, &digest[0]), dlen, sig, siglen) == 1) {
+            return OK;
         }
-        let is i64 as soff; let is i64 as slen2;
-        der.der_uint(sig, co, cl, &soff, &slen2);
-        let is bi.Big as r = bi.big_from_bytes_be(cast(*u8, cast(i64, sig) + roff), rlen);
-        let is bi.Big as s = bi.big_from_bytes_be(cast(*u8, cast(i64, sig) + soff), slen2);
-        let is bi.Big as z = bi.big_from_bytes_be(cast(*u8, &digest[0]), 32);
-        let is i64 as v = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s);
-        bi.big_free(&qx); bi.big_free(&qy);
-        bi.big_free(&r); bi.big_free(&s); bi.big_free(&z);
-        if (v == 1) { return OK; }
         return E_CERT_VERIFY;
     }
     if (scheme == SIG_RSA_PSS_SHA256) {
