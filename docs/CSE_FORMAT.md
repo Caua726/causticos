@@ -52,7 +52,7 @@ both.
 | 0x00 | 4 | magic | `"CST_"` |
 | 0x04 | 2 | version (u16) | `2` |
 | 0x06 | 1 | arch (u8) | `1` = x86_64 |
-| 0x07 | 1 | flags (u8) | `0` |
+| 0x07 | 1 | flags (u8) | bit0 = dynamic stack growth; bit1 = opens its own window (`caustic --window`) — the desktop runs anything without it in a terminal. The loader reads only bit0. |
 | 0x08 | 8 | entry_point (u64) | absolute vaddr to jump to |
 | 0x10 | 8 | base_addr (u64) | `0x400000` (informative; segments carry abs vaddrs) |
 | 0x18 | 4 | seg_count (u32) | number of segments |

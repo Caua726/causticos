@@ -36,7 +36,7 @@ fn pick_client_image(path as *u8, plen as i64) as i64 {
 }
 
 fn spawn_client_path(cpath as *u8, cname as *u8, cnlen as i64,
-                     swal_from as i64) as void {
+                     swal_from as i64, run as *u8, run_len as i64) as void {
     let is i64 as i = win.win_alloc();
     if (i < 0) {
         sys.write_serial(cast(*u8, "wm: window table full\n"), 22);
@@ -99,10 +99,14 @@ fn spawn_client_path(cpath as *u8, cname as *u8, cnlen as i64,
         acts[2] = np.NET_FD; acts[3] = net_c;
         nact = 2;
     }
-    let is [2]i64 as av;
+    // argv: the name, and for a terminal opened to run a program, the
+    // command it runs first.
+    let is [4]i64 as av;
     av[0] = cast(i64, cname); av[1] = cnlen;
+    let is i64 as ac with mut = 1;
+    if (run_len > 0) { av[2] = cast(i64, run); av[3] = run_len; ac = 2; }
     let is i64 as pid = sys.spawn_path(cpath,
-                                       cast(*u8, &acts[0]), nact, cast(*u8, &av[0]), 1);
+                                       cast(*u8, &acts[0]), nact, cast(*u8, &av[0]), ac);
     sys.close(b);
     if (net_c >= 0) { sys.close(net_c); }
     if (pid < 0) {
@@ -157,13 +161,91 @@ fn spawn_client_path(cpath as *u8, cname as *u8, cnlen as i64,
 
 fn spawn_client() as void {
     if (s.client_path_len == 0) { return; }
-    spawn_client_path(cast(*u8, &s.client_path[0]), cast(*u8, "wterm"), 5, 0 - 1);
+    spawn_client_path(cast(*u8, &s.client_path[0]), cast(*u8, "wterm"), 5, 0 - 1, cast(*u8, 0), 0);
     return;
 }
 
-// spawn_named — run a program by name as a window. `from` is the window that
-// asked (or -1): a program the config marks `swallow` takes that window's
-// place instead of opening beside it.
+// CSE image flags byte (docs/CSE_FORMAT.md): bit1 says the program opens its
+// own window — set by `caustic --window`. Everything else writes to a
+// terminal, and started as a window it would have nothing to show and no way
+// to be stopped.
+let is i64 as CSE_F_WINDOW with imut = 2;
+let is i64 as CSE_ARCH_NATIVE with imut = 1 * __target_is_x86_64 + 2 * __target_is_aarch64;
+
+fn _read_at(fd as i64, off as i64, buf as *u8, n as i64) as i64 {
+    if (sys.lseek(fd, off, cast(i32, sys.SEEK_SET)) != off) { return 0 - 1; }
+    return sys.read(fd, buf, n);
+}
+
+fn _is_cst(h as *u8) as i64 {
+    if (h[0] == cast(u8, 67) && h[1] == cast(u8, 83) && h[2] == cast(u8, 84) && h[3] == cast(u8, 95)) { return 1; }  // "CST_"
+    return 0;
+}
+
+// The flags byte of the image this machine would run from `path`, or -1. The
+// same walk the kernel's loader makes, header bytes only: a polyglot .cse.exe
+// ("MZ") names its CST body's offset, in ASCII, in the "CST*" mini-header at
+// 0x40; a v3.1 container indexes one image per architecture ({arch u8, pad,
+// offset u32} from the u32 at 0x08); an image carries the flags at 0x07.
+fn image_flags(path as *u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is [16]u8 as h;
+    let is i64 as base with mut = 0;
+    let is i64 as rc with mut = 0 - 1;
+    if (_read_at(fd, 0, cast(*u8, &h[0]), 16) == 16) {
+        if (h[0] == cast(u8, 77) && h[1] == cast(u8, 90)) {                    // "MZ"
+            let is [12]u8 as num;
+            base = 0 - 1;
+            if (_read_at(fd, 0x48, cast(*u8, &num[0]), 12) == 12) {
+                base = 0;
+                let is i64 as k with mut = 0;
+                while (k < 12 && num[k] >= cast(u8, 48) && num[k] <= cast(u8, 57)) {
+                    base = base * 10 + cast(i64, num[k]) - 48;
+                    k = k + 1;
+                }
+                if (k == 0) { base = 0 - 1; }
+            }
+            if (base < 0 || _read_at(fd, base, cast(*u8, &h[0]), 16) != 16) { base = 0 - 1; }
+        }
+        if (base >= 0 && _is_cst(cast(*u8, &h[0])) == 1) {
+            if (h[4] == cast(u8, 3) && h[5] == cast(u8, 1)) {                  // v3.1 container
+                let is i64 as count = cast(i64, h[6]);
+                let is i64 as index_off = cast(i64, h[8]) | (cast(i64, h[9]) << 8)
+                                        | (cast(i64, h[10]) << 16) | (cast(i64, h[11]) << 24);
+                let is i64 as picked with mut = 0 - 1;
+                let is i64 as k with mut = 0;
+                while (k < count && k < 8 && picked < 0) {
+                    let is [8]u8 as e;
+                    if (_read_at(fd, base + index_off + k * 8, cast(*u8, &e[0]), 8) == 8
+                        && cast(i64, e[0]) == CSE_ARCH_NATIVE) {
+                        picked = cast(i64, e[4]) | (cast(i64, e[5]) << 8)
+                               | (cast(i64, e[6]) << 16) | (cast(i64, e[7]) << 24);
+                    }
+                    k = k + 1;
+                }
+                if (picked >= 0 && _read_at(fd, base + picked, cast(*u8, &h[0]), 16) == 16
+                    && _is_cst(cast(*u8, &h[0])) == 1) { rc = cast(i64, h[7]); }
+            } else {
+                rc = cast(i64, h[7]);
+            }
+        }
+    }
+    sys.close(fd);
+    return rc;
+}
+
+fn opens_window(path as *u8) as i64 {
+    let is i64 as f = image_flags(path);
+    if (f >= 0 && (f & CSE_F_WINDOW) != 0) { return 1; }
+    return 0;
+}
+
+// spawn_named — run a program by name: as a window if it opens one, else in a
+// new terminal that runs it and stays open at the prompt — a terminal program
+// started as a window had nothing to show, and was killed for never opening
+// one. `from` is the window that asked (or -1): a program the config marks
+// `swallow` takes that window's place instead of opening beside it.
 fn spawn_named_from(from as i64, name as *u8, nlen as i64) as void {
     if (nlen <= 0 || nlen > 30) { return; }
     let is [40]u8 as path;
@@ -179,7 +261,18 @@ fn spawn_named_from(from as i64, name as *u8, nlen as i64) as void {
         wmp.title_pack(name, nl, &nm[0], &nm[1]);
         if (cfg.swallow_rule(nm[0], nm[1], nl) == 1) { swal = from; }
     }
-    spawn_client_path(cast(*u8, &path[0]), name, nlen, swal);
+    let is [4]i64 as tst;
+    let is i64 as have_term with mut = 0;
+    if (sys.stat(cast(*u8, "/wterm.cse"), cast(*u8, &tst[0])) == 0 && tst[3] == 0) { have_term = 1; }
+    if (opens_window(cast(*u8, &path[0])) == 1 || have_term == 0) {
+        spawn_client_path(cast(*u8, &path[0]), name, nlen, swal, cast(*u8, 0), 0);
+        return;
+    }
+    // The command the terminal runs: the name without ".cse".
+    let is i64 as cl with mut = nlen;
+    if (cl > 4 && name[cl - 4] == cast(u8, 46) && name[cl - 3] == cast(u8, 99)
+        && name[cl - 2] == cast(u8, 115) && name[cl - 1] == cast(u8, 101)) { cl = cl - 4; }
+    spawn_client_path(cast(*u8, "/wterm.cse"), cast(*u8, "wterm"), 5, swal, name, cl);
     return;
 }
 
