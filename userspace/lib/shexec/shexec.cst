@@ -23,6 +23,7 @@ use "../netproto/netproto.cst" as np;
 use "../netcli/netsvc.cst" as netsvc;
 use "../sndcli/sndcli.cst" as sndcli;
 use "../sndproto/sndproto.cst" as sp;
+use "../ttyproto/ttyproto.cst" as tty;
 
 let is i64 as MAX_CMDS with imut = 8;       // pipeline stages
 let is i64 as MAX_WORDS with imut = 64;
@@ -769,6 +770,8 @@ fn prog_path(w as i64, out as *u8) as i64 {
 //
 // aux_fd_slot: the child fd to install the caller's extra channel on, or -1.
 // aux_maker: a channel pair the caller minted, or 0 for none.
+// want_tty: 1 = the caller is a terminal and will answer ttyproto requests on
+// jb.tty_fd: the stage whose stdout comes back to it gets TTY_FD.
 //
 // A negative result is one of EXEC_* below, and failure_text says it in words
 // — with the word it was about. A redirect whose file would not open came back
@@ -822,7 +825,7 @@ fn failure_status(code as i64) as i64 {
 }
 
 fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
-        aux_fd_slot as i64, aux_out as *i64) as i64 {
+        aux_fd_slot as i64, aux_out as *i64, want_tty as i64) as i64 {
     if (ncmd <= 0) { return EXEC_EMPTY; }
     let is i64 as slot = jobs.alloc();
     if (slot < 0) { return EXEC_NO_SLOT; }
@@ -857,6 +860,8 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                 let is i64 as child_out with mut = 0 - 1;
                 let is i64 as keep_out with mut = 0 - 1;
                 let is i64 as next_read with mut = 0 - 1;
+                let is i64 as tty_keep with mut = 0 - 1;    // the terminal's end of TTY_FD
+                let is i64 as tty_child with mut = 0 - 1;
                 if (failed == 0) {
                     if (cmds[c].out_w >= 0) {
                         if (cmds[c].append == 1) { child_out = sys.open_append(_cpath(cmds[c].out_w)); }
@@ -868,15 +873,26 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         else {
                             child_out = och[1];
                             if (c + 1 < ncmd) { next_read = och[0]; }   // feeds the next stage
-                            else { keep_out = och[0]; }                 // the shell reads it
+                            else {
+                                keep_out = och[0];                      // the shell reads it
+                                // ...and it is the terminal's: this stage, and
+                                // only this one, is told so (ttyproto).
+                                if (want_tty == 1) {
+                                    let is [2]i64 as tch;
+                                    if (sys.channel_create(&tch[0]) == 0) { tty_keep = tch[0]; tty_child = tch[1]; }
+                                }
+                            }
                         }
                     }
                 }
 
                 if (failed == 0) {
-                    // Six pairs at most: stdin, stdout, stderr (2>&1), the
-                    // caller's aux channel, a netd endpoint and a soundd one.
-                    let is [12]i64 as fdacts;
+                    // Seven pairs at most: stdin, stdout, stderr (2>&1), the
+                    // caller's aux channel, a netd endpoint, a soundd one and
+                    // the terminal's. (This held five while six could be put
+                    // in it: with 2>&1, netd and soundd up, the sixth pair
+                    // was written past the end, over the stack.)
+                    let is [14]i64 as fdacts;
                     let is i64 as nact with mut = 2;
                     fdacts[0] = 0; fdacts[1] = child_in;
                     fdacts[2] = 1; fdacts[3] = child_out;
@@ -906,6 +922,10 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         fdacts[nact*2] = sp.SND_FD; fdacts[nact*2+1] = snd_ep;
                         nact = nact + 1;
                     }
+                    if (tty_child >= 0) {
+                        fdacts[nact*2] = tty.TTY_FD; fdacts[nact*2+1] = tty_child;
+                        nact = nact + 1;
+                    }
                     let is [64]i64 as av;
                     let is i64 as k with mut = 0;
                     while (k < cmds[c].wn && k < 32) {
@@ -926,15 +946,18 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     // the ninth gets no network.
                     if (net_ep >= 0) { sys.close(net_ep); net_ep = 0 - 1; }
                     if (snd_ep >= 0) { sys.close(snd_ep); snd_ep = 0 - 1; }
+                    if (tty_child >= 0) { sys.close(tty_child); tty_child = 0 - 1; }
                     if (pid < 0) {
                         failed = 3;
                         if (keep_in >= 0) { sys.close(keep_in); }
                         if (keep_out >= 0) { sys.close(keep_out); }
                         if (next_read >= 0) { sys.close(next_read); }
+                        if (tty_keep >= 0) { sys.close(tty_keep); }
                     } else {
                         jobs.add_pid(slot, pid);
                         if (keep_in >= 0)  { jb.in_fd = keep_in; }
                         if (keep_out >= 0) { jb.out_fd = keep_out; }
+                        if (tty_keep >= 0) { jb.tty_fd = tty_keep; jb.tty_fill = 0; }
                         prev_read = next_read;
                     }
                 } else {
@@ -943,6 +966,8 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     if (keep_out >= 0) { sys.close(keep_out); }
                     if (child_out >= 0) { sys.close(child_out); }
                     if (next_read >= 0) { sys.close(next_read); }
+                    if (tty_keep >= 0) { sys.close(tty_keep); }
+                    if (tty_child >= 0) { sys.close(tty_child); }
                 }
             }
         }
@@ -995,7 +1020,7 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
     glob_words();
     let is i64 as nc = build_cmds();
     let is i64 as slot with mut = 0 - 1;
-    if (nc > 0) { slot = exec(0, cast(*u8, &sub[0]), j, 0 - 1, cast(*i64, 0)); }
+    if (nc > 0) { slot = exec(0, cast(*u8, &sub[0]), j, 0 - 1, cast(*i64, 0), 0); }
 
     if (slot >= 0) {
         let is *jobs.Job as jb = jobs.get(slot);
@@ -1059,7 +1084,7 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
 fn run_sync(t as *term.Term, line as *u8, len as i64) as i64 {
     let is i64 as nc = prepare(line, len);
     if (nc <= 0) { last_status = 2; return 2; }
-    let is i64 as slot = exec(0, line, len, 0 - 1, cast(*i64, 0));
+    let is i64 as slot = exec(0, line, len, 0 - 1, cast(*i64, 0), 1);
     if (slot < 0) {
         // A command in a script that cannot start says so, like one typed at
         // the prompt; it used to fail without a word.
@@ -1074,19 +1099,32 @@ fn run_sync(t as *term.Term, line as *u8, len as i64) as i64 {
     let is i64 as guard with mut = 0;
     let is i64 as running with mut = 1;
     while (running == 1 && guard < 1000000) {
-        let is [6]i64 as pe;
+        let is [9]i64 as pe;
         let is i64 as n with mut = 0;
-        if (jb.out_fd >= 0) { pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0; n = 1; }
+        let is i64 as out_e with mut = 0 - 1;
+        let is i64 as tty_e with mut = 0 - 1;
+        if (jb.out_fd >= 0) { pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0; out_e = 0; n = 1; }
         if (jobs.event_fd() >= 0) {
             pe[n*3+0] = jobs.event_fd(); pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
             n = n + 1;
         }
+        // The script's command may ask the terminal its size (ttyproto); it
+        // waits for the answer, so it has to be served here too.
+        if (jb.tty_fd >= 0) {
+            pe[n*3+0] = jb.tty_fd; pe[n*3+1] = sys.POLL_READABLE; pe[n*3+2] = 0;
+            tty_e = n; n = n + 1;
+        }
         if (n == 0) { running = 0; }
         else {
             sys.poll(&pe[0], n, 100000000);
-            if (jb.out_fd >= 0 && (pe[2] & sys.POLL_READABLE) != 0) {
+            if (out_e >= 0 && (pe[out_e*3+2] & sys.POLL_READABLE) != 0) {
                 let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
                 if (got > 0) { term.puts(t, cast(*u8, &buf[0]), got); }
+            }
+            if (tty_e >= 0 && (pe[tty_e*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                if (tty.answer(jb.tty_fd, &jb.tty_fill, jobs.tty_acc(slot), t.cols, t.rows) < 0) {
+                    sys.close(jb.tty_fd); jb.tty_fd = 0 - 1;
+                }
             }
             jobs.poll_events();
             if (jobs.get(slot).status == jobs.JOB_DONE) {

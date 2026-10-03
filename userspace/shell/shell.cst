@@ -20,6 +20,7 @@ use "../lib/shbuiltin/shbuiltin.cst" as bi;
 use "../lib/shscript/shscript.cst" as ss;
 use "../lib/netcli/netsvc.cst" as netsvc;
 use "../lib/sndcli/sndcli.cst" as sndcli;
+use "../lib/ttyproto/ttyproto.cst" as tty;
 
 let is i64 as IMG_CAP   with imut = 4194304;   // 4 MiB = SPAWN_IMG_MAX (fits the 1.2 MiB compiler)
 
@@ -260,7 +261,7 @@ fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
     if (sx.truncated() == 1) { err(t, "line too long after expansion\n"); sx.set_status(2); return; }
     if (nc == 0 - 2) { err(t, "syntax: redirect with no target\n"); return; }
     if (nc <= 0) { err(t, "too many pipeline stages\n"); return; }
-    let is i64 as slot = sx.exec(bg, line, len2, 0 - 1, cast(*i64, 0));
+    let is i64 as slot = sx.exec(bg, line, len2, 0 - 1, cast(*i64, 0), 1);
     if (slot < 0) {
         let is [192]u8 as m;
         sx.failure_text(slot, cast(*u8, &m[0]));
@@ -584,8 +585,9 @@ fn main() as i32 {
     prompt(&t);
     term.flush(&t);
 
-    // 2 fixed entries (keyboard, exit events) + one per running job.
-    let is [54]i64 as pe;
+    // 2 fixed entries (keyboard, exit events), one per running job's output
+    // and one per job asking the terminal its size (ttyproto).
+    let is [102]i64 as pe;
     while (1 == 1) {
         let is i64 as n with mut = 0;
         pe[0] = g_kfd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
@@ -598,6 +600,7 @@ fn main() as i32 {
         // Remember which poll entry belongs to which job: the table is sparse.
         let is [16]i64 as slot_of_entry;
         let is i64 as njp with mut = 0;
+        let is i64 as je0 = n;                  // the first job entry
         let is i64 as jj with mut = 0;
         while (jj < jobs.max_jobs()) {
             let is *jobs.Job as jb = jobs.get(jj);
@@ -607,6 +610,22 @@ fn main() as i32 {
                 pe[n*3+2] = 0;
                 slot_of_entry[njp] = jj;
                 njp = njp + 1;
+                n = n + 1;
+            }
+            jj = jj + 1;
+        }
+        let is [16]i64 as tty_slot;
+        let is i64 as ntp with mut = 0;
+        let is i64 as te0 = n;
+        jj = 0;
+        while (jj < jobs.max_jobs()) {
+            let is *jobs.Job as tjb = jobs.get(jj);
+            if (tjb.status != jobs.JOB_FREE && tjb.tty_fd >= 0) {
+                pe[n*3+0] = tjb.tty_fd;
+                pe[n*3+1] = sys.POLL_READABLE;
+                pe[n*3+2] = 0;
+                tty_slot[ntp] = jj;
+                ntp = ntp + 1;
                 n = n + 1;
             }
             jj = jj + 1;
@@ -635,7 +654,18 @@ fn main() as i32 {
 
         let is i64 as k with mut = 0;
         while (k < njp) {
-            if ((pe[(2 + k)*3+2] & sys.POLL_READABLE) != 0) { pump_job(&t, slot_of_entry[k]); }
+            if ((pe[(je0 + k)*3+2] & sys.POLL_READABLE) != 0) { pump_job(&t, slot_of_entry[k]); }
+            k = k + 1;
+        }
+        // A job asking how big the terminal is waits for the answer.
+        k = 0;
+        while (k < ntp) {
+            if ((pe[(te0 + k)*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                let is *jobs.Job as tj = jobs.get(tty_slot[k]);
+                if (tty.answer(tj.tty_fd, &tj.tty_fill, jobs.tty_acc(tty_slot[k]), t.cols, t.rows) < 0) {
+                    sys.close(tj.tty_fd); tj.tty_fd = 0 - 1;
+                }
+            }
             k = k + 1;
         }
 
