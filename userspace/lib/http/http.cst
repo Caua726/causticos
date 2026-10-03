@@ -45,7 +45,12 @@ let is i64 as BODY_NONE with imut = 3;
 // Errors. Distinct values because "the response was malformed" and "the
 // connection died" call for different things from a caller.
 let is i64 as E_PROTO with imut = 0 - 100;   // not an HTTP response
-let is i64 as E_LONG  with imut = 0 - 101;   // a header line beyond LINE_CAP
+let is i64 as E_LONG  with imut = 0 - 101;   // a header this client reads, longer than LINE_CAP
+// The longest header line read at all. Past LINE_CAP only the start of a line
+// is kept — enough for its name — and a header the client does not read may
+// run on (a Content-Security-Policy of 4 KB is ordinary); this bounds what a
+// server can make it swallow.
+let is i64 as LINE_MAX with imut = 65536;
 let is i64 as E_CONN  with imut = 0 - 102;   // the Conn failed or ended early
 
 struct Resp {
@@ -60,6 +65,7 @@ struct Resp {
     done       as i64;      // the body has ended
     got        as i64;      // body bytes handed to the caller
     nhdr       as i64;      // header lines seen, so a caller can sanity check
+    line_long  as i64;      // 1 = the last line ran past LINE_CAP; only its start was kept
     raw        as [5120]u8;
 }
 
@@ -151,7 +157,16 @@ fn init(r as *Resp) as void {
     r.done = 0;
     r.got = 0;
     r.nhdr = 0;
+    r.line_long = 0;
     return;
+}
+
+// error_text — what an E_* from this file means, in words.
+fn error_text(e as i64) as *u8 {
+    if (e == E_PROTO) { return cast(*u8, "the server did not answer in HTTP"); }
+    if (e == E_LONG)  { return cast(*u8, "a header this client needs was too long to read whole"); }
+    if (e == E_CONN)  { return cast(*u8, "the connection ended in the middle of the response"); }
+    return cast(*u8, "the response could not be read");
 }
 
 // Refill the pushback buffer. Returns bytes available, 0 at EOF, <0 on error.
@@ -175,23 +190,36 @@ fn get_byte(r as *Resp, c as *cn.Conn) as i64 {
 }
 
 // One CRLF-terminated line into the scratch region, without its terminator.
-// A bare LF is accepted because servers send it; a line longer than the
-// buffer is an error rather than a truncation, since a truncated header is
-// one that will be misread rather than noticed.
+// A bare LF is accepted because servers send it. A line longer than the
+// buffer keeps its first LINE_CAP bytes and sets r.line_long: whoever reads a
+// header must then refuse it rather than misread it (read_head), and a header
+// nobody reads costs nothing. Past LINE_MAX it is an error.
 fn read_line(r as *Resp, c as *cn.Conn) as i64 {
     let is *u8 as line = raw_at(r, LINE_OFF);
     let is i64 as n with mut = 0;
+    let is i64 as total with mut = 0;
+    r.line_long = 0;
     while (1 == 1) {
         let is i64 as ch = get_byte(r, c);
         if (ch < 0) { return E_CONN; }
         if (ch == 10) {
-            if (n > 0 && line[n-1] == cast(u8, 13)) { n = n - 1; }
+            if (r.line_long == 0 && n > 0 && line[n-1] == cast(u8, 13)) { n = n - 1; }
             return n;
         }
-        if (n >= LINE_CAP) { return E_LONG; }
-        line[n] = cast(u8, ch);
-        n = n + 1;
+        total = total + 1;
+        if (total > LINE_MAX) { return E_LONG; }
+        if (n >= LINE_CAP) { r.line_long = 1; }
+        else {
+            line[n] = cast(u8, ch);
+            n = n + 1;
+        }
     }
+    return 0;
+}
+
+// A header this client reads, cut short: refused, never misread.
+fn needed_long(r as *Resp) as i64 {
+    if (r.line_long == 1) { return 1; }
     return 0;
 }
 
@@ -333,23 +361,28 @@ fn read_head(r as *Resp, c as *cn.Conn, is_head as i64) as i64 {
         if (n == 0) { break; }
         r.nhdr = r.nhdr + 1;
         if (hdr_is(r, n, cast(*u8, "content-length"), 14) == 1) {
+            if (needed_long(r) == 1) { return E_LONG; }
             let is i64 as v = parse_dec(line, value_at(r, n, 14), n);
             if (v >= 0) { r.clen = v; }
         }
         if (hdr_is(r, n, cast(*u8, "transfer-encoding"), 17) == 1) {
+            if (needed_long(r) == 1) { return E_LONG; }
             if (value_has(r, n, value_at(r, n, 17), cast(*u8, "chunked"), 7) == 1) {
                 chunked = 1;
             }
         }
         if (hdr_is(r, n, cast(*u8, "connection"), 10) == 1) {
+            if (needed_long(r) == 1) { return E_LONG; }
             if (value_has(r, n, value_at(r, n, 10), cast(*u8, "keep-alive"), 10) == 1) {
                 r.keepalive = 1;
             }
         }
         if (hdr_is(r, n, cast(*u8, "location"), 8) == 1) {
+            // A redirect cut short would be followed to the wrong place.
+            if (needed_long(r) == 1) { return E_LONG; }
             let is i64 as at = value_at(r, n, 8);
             let is i64 as m with mut = n - at;
-            if (m > LOC_CAP - 1) { m = LOC_CAP - 1; }
+            if (m > LOC_CAP - 1) { return E_LONG; }
             let is *u8 as loc = raw_at(r, LOC_OFF);
             let is i64 as i with mut = 0;
             while (i < m) { loc[i] = line[at + i]; i = i + 1; }
