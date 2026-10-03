@@ -570,6 +570,84 @@ fn test_argv() as void {
     return;
 }
 
+// ---- SYS_PROC_LIST: every process, and what each is doing ----
+// 80 children asleep and one spinning. The list held 64 records at most, and
+// said "run" for a process whose every thread was waiting.
+let is i64 as PL_KIDS with imut = 80;
+fn spawn_mode(mode as *u8, ml as i64) as i64 {
+    let is [4]i64 as av;
+    av[0] = cast(i64, "kabi"); av[1] = 4;
+    av[2] = cast(i64, mode); av[3] = ml;
+    return sys.spawn_path(cast(*u8, "/kabi.cse"), cast(*u8, 0), 0, cast(*u8, &av[0]), 2);
+}
+fn pl_find(buf as *i64, n as i64, pid as i64) as *i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (buf[i * 10] == pid) { return cast(*i64, cast(i64, buf) + i * 80); }
+        i = i + 1;
+    }
+    return cast(*i64, 0);
+}
+fn test_proc_list() as void {
+    let is i64 as pv = sys.mmap(0, PL_KIDS * 8, sys.PROT_READ | sys.PROT_WRITE);
+    let is *i64 as pids = cast(*i64, pv);
+    let is i64 as started with mut = 0;
+    while (started < PL_KIDS) {
+        let is i64 as p = spawn_mode("--sleep", 7);
+        if (p < 0) { check(cast(*u8, "proc_list: spawn a sleeper"), 0, p, 0); started = PL_KIDS + 1; }
+        else { pids[started] = p; started = started + 1; }
+    }
+    let is i64 as spin = spawn_mode("--spin", 6);
+    sys.sleep_ns(300000000);                     // they start, and the sleepers block
+
+    let is i64 as total = sys.proc_list(cast(*i64, 0), 0);
+    check(cast(*u8, "proc_list: max 0 counts every process"), total >= PL_KIDS + 3, total, PL_KIDS + 3);
+    check(cast(*u8, "proc_list: no array and max > 0 is E_FAULT"),
+          sys.proc_list(cast(*i64, 0), 1) == sys.E_FAULT, sys.proc_list(cast(*i64, 0), 1), sys.E_FAULT);
+    let is i64 as cap = total + 16;
+    let is i64 as bv = sys.mmap(0, cap * 80, sys.PROT_READ | sys.PROT_WRITE);
+    let is *i64 as buf = cast(*i64, bv);
+    let is i64 as got = sys.proc_list(buf, cap);
+    check(cast(*u8, "proc_list: the whole list fits"), got <= cap, got, cap);
+    let is i64 as seen with mut = 0;
+    let is i64 as asleep with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < PL_KIDS) {
+        let is *i64 as r = pl_find(buf, got, pids[k]);
+        if (cast(i64, r) != 0) {
+            seen = seen + 1;
+            if (r[2] == 1 && r[9] == 0) { asleep = asleep + 1; }
+        }
+        k = k + 1;
+    }
+    check(cast(*u8, "proc_list: all 80 children are listed"), seen == PL_KIDS, seen, PL_KIDS);
+    check(cast(*u8, "proc_list: a sleeping child runs no thread"), asleep == PL_KIDS, asleep, PL_KIDS);
+    let is *i64 as sr = pl_find(buf, got, spin);
+    let is i64 as sready with mut = 0 - 1;
+    if (cast(i64, sr) != 0) { sready = sr[9]; }
+    check(cast(*u8, "proc_list: a spinning child has a thread running"), sready == 1, sready, 1);
+    check(cast(*u8, "proc_list: row 0 is the kernel"), buf[0] == 0, buf[0], 0);
+    // a short array: the first records, and the total still
+    let is i64 as t5 = sys.proc_list(buf, 5);
+    check(cast(*u8, "proc_list: a short array still gets the total"), t5 >= PL_KIDS + 3, t5, PL_KIDS + 3);
+
+    k = 0;
+    // and all of them end when killed, the spinner still running: a cpu
+    // that never went idle never freed a dead thread, and wait() timed out
+    let is i64 as ended with mut = 0;
+    while (k < PL_KIDS) {
+        sys.kill(pids[k]);
+        let is [1]i64 as c;
+        if (sys.wait(pids[k], cast(*i64, &c[0])) == sys.EXIT_KILLED) { ended = ended + 1; }
+        k = k + 1;
+    }
+    check(cast(*u8, "proc_list: 80 killed children are collected beside a spinner"), ended == PL_KIDS, ended, PL_KIDS);
+    if (spin >= 0) { sys.kill(spin); let is [1]i64 as c2; sys.wait(spin, cast(*i64, &c2[0])); }
+    sys.munmap(bv, cap * 80);
+    sys.munmap(pv, PL_KIDS * 8);
+    return;
+}
+
 // The second kabi: argc and the sum must be what the first one said.
 fn argv_child(argc as i64, argv as *u8) as i32 {
     let is *i64 as av = cast(*i64, sys.mmap(0, (argc * 16 + 4095) / 4096 * 4096, sys.PROT_READ | sys.PROT_WRITE));
@@ -581,12 +659,21 @@ fn argv_child(argc as i64, argv as *u8) as i32 {
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
+    if (argc == 2) {
+        let is *u8 as m = prog.arg(argv, 1);
+        if (prog.slen(m) == 7 && m[2] == cast(u8, 115) && m[3] == cast(u8, 108)) { sys.sleep_ns(60000000000); return cast(i32, 0); }   // --sleep
+        if (prog.slen(m) == 6 && m[2] == cast(u8, 115) && m[3] == cast(u8, 112)) {                                                    // --spin
+            let is i64 as x with mut = 0;
+            while (1 == 1) { x = x + 1; }
+        }
+    }
     if (argc >= 4) {
         let is *u8 as a1 = prog.arg(argv, 1);
         if (a1[0] == cast(u8, 45) && a1[1] == cast(u8, 45) && a1[2] == cast(u8, 97)) { return argv_child(argc, argv); }   // --argv
     }
     say("kabi: phase-A syscalls from ring 3\n");
     test_argv();
+    test_proc_list();
     test_syscall_regs();
     test_thread();
     test_thread_blocks();

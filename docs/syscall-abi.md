@@ -83,7 +83,7 @@ whatever struct it fills.
 | 33 | `FD_RECV` | chan_fd | fd \| `E_AGAIN` (nothing pending) |
 | 34 | `POLL` | entries, n, timeout_ns | n_ready \| errno (§5 `PollEntry`); n up to the caller's fd-table size (64, more once it has grown) |
 | 35 | `PROC_KILL` | pid | 0 \| `E_NOENT` (not your descendant) — ends it and everything it started |
-| 36 | `PROC_LIST` | entries, max | total live count (may exceed `max`) |
+| 36 | `PROC_LIST` | entries, max | total count, the kernel row included (may exceed `max`: ask again with room; max 0 only counts) — no limit of its own (§5 `ProcInfo`) |
 | 37 | `MEM_INFO` | out | 0; `[total_pages, free_pages, page_size, committed]` |
 | 38 | `STATFS` | out | 0; `[total_bytes, free_bytes, block_size, flags]`; `STATFS_VOLATILE` (1) = gone at power off |
 | 39 | `CPU_STAT` | out | ncpu; `[ncpu, busy_ns per cpu…, now_ns]`, cumulative |

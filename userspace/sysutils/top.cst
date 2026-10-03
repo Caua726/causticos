@@ -4,16 +4,12 @@
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
+use "../lib/proclist/proclist.cst" as pl;
 
-let is [576]i64 as g_ents;
-
-fn statename(s as i64) as *u8 {
-    if (s == 1) { return "run"; }
-    if (s == 2) { return "exiting"; }
-    if (s == 3) { return "zombie"; }
-    if (s == 4) { return "dead"; }
-    return "?";
-}
+// The last snapshot (every process, lib/proclist) and the order it is shown in.
+let is pl.Snap as g_snap;
+let is i64 as g_ord with mut = 0;
+let is i64 as g_ordcap with mut = 0;
 fn padstr(s as *u8, w as i64) as void {
     prog.outs(s);
     let is i64 as k with mut = prog.slen(s);
@@ -30,38 +26,39 @@ fn draw() as void {
         let is i64 as freekb = mi[1] * pagesz / 1024;
         prog.outs("top - mem "); prog.out_num(totalkb - freekb); prog.outs("/"); prog.out_num(totalkb); prog.outs(" KB used");
     }
-    let is i64 as total = sys.proc_list(cast(*i64, &g_ents[0]), 64);
-    if (total < 0) { prog.outs("\ntop: SYS_PROC_LIST failed\n"); return; }
-    let is i64 as n with mut = total;
-    if (n > 64) { n = 64; }
-    prog.outs(",  "); prog.out_num(total); prog.outs(" procs\n");
-
-    // insertion-sort by committed bytes (word 5), descending. tmp holds one
-    // whole 9-word record (it was [8]i64 and the ninth word smashed the stack).
-    let is i64 as i with mut = 1;
+    let is i64 as rc = pl.take(&g_snap);
+    if (rc < 0) { prog.outs("\ntop: cannot read the process list: "); prog.outs(sys.err_text(rc)); prog.outs("\n"); return; }
+    let is i64 as n = g_snap.n;
+    prog.outs(",  "); prog.out_num(n); prog.outs(" procs\n");
+    if (n > g_ordcap) {
+        let is i64 as nc = n + n / 4 + 8;
+        let is i64 as va = sys.mmap(0, nc * 8, sys.PROT_READ | sys.PROT_WRITE);
+        if (va < 0) { prog.outs("top: out of memory\n"); return; }
+        if (g_ordcap > 0) { sys.munmap(g_ord, g_ordcap * 8); }
+        g_ord = va; g_ordcap = nc;
+    }
+    let is *i64 as ord = cast(*i64, g_ord);
+    // by resident memory, largest first (insertion sort over an index)
+    let is i64 as i with mut = 0;
     while (i < n) {
-        let is [9]i64 as tmp;
-        let is i64 as w with mut = 0; while (w < 9) { tmp[w] = g_ents[i * 9 + w]; w = w + 1; }
+        let is i64 as m = pl.rec(&g_snap, i)[pl.F_RSS];
         let is i64 as j with mut = i - 1;
-        while (j >= 0 && g_ents[j * 9 + 5] < tmp[5]) {
-            w = 0; while (w < 9) { g_ents[(j + 1) * 9 + w] = g_ents[j * 9 + w]; w = w + 1; }
-            j = j - 1;
-        }
-        w = 0; while (w < 9) { g_ents[(j + 1) * 9 + w] = tmp[w]; w = w + 1; }
+        while (j >= 0 && pl.rec(&g_snap, ord[j])[pl.F_RSS] < m) { ord[j + 1] = ord[j]; j = j - 1; }
+        ord[j + 1] = i;
         i = i + 1;
     }
 
     prog.outs("  PID  STATE    NAME             THR        MEM  %MEM\n");
     i = 0;
     while (i < n) {
-        let is i64 as b = i * 9;
-        prog.pad_num(g_ents[b + 0], 5); prog.outs("  ");
-        padstr(statename(g_ents[b + 2]), 9);
-        padstr(cast(*u8, cast(i64, &g_ents[0]) + (b + 6) * 8), 16); prog.outs(" ");
-        prog.pad_num(g_ents[b + 4], 3); prog.outs("  ");
-        prog.pad_num(g_ents[b + 5], 9); prog.outs("  ");
+        let is *i64 as r = pl.rec(&g_snap, ord[i]);
+        prog.pad_num(r[pl.F_PID], 5); prog.outs("  ");
+        padstr(pl.state_name(r), 9);
+        padstr(pl.name(&g_snap, ord[i]), 16); prog.outs(" ");
+        prog.pad_num(r[pl.F_THREADS], 3); prog.outs("  ");
+        prog.pad_num(r[pl.F_RSS], 9); prog.outs("  ");
         let is i64 as pct with mut = 0;
-        if (totalkb > 0) { pct = g_ents[b + 5] / 1024 * 100 / totalkb; }
+        if (totalkb > 0) { pct = r[pl.F_RSS] / 1024 * 100 / totalkb; }
         prog.pad_num(pct, 3); prog.outs("%");
         prog.out("\n", 1);
         i = i + 1;

@@ -1996,41 +1996,63 @@ fn sleep_locked_and_yield(saved_flags as i64) as void {
 let is i64 as POLL_PARK_CAP_NS = 50000000;      // 50 ms
 let is i64 as THR_POLL_PARKED = 344;            // slot in the thread struct (see layout)
 
-// process_cpu_ns — cumulative cpu time of every thread of one process. The
-// per-thread totals are the honest source; a process is just their sum.
-fn process_cpu_ns(pptr as i64) as i64 {
-    let is i64 as ntid = next_tid;
-    let is i64 as tid with mut = 0;
-    let is i64 as sum with mut = 0;
-    while (tid < ntid) {
-        if (thread_ptr(tid) != 0) {
-            if (thr_get(tid, 248) == pptr) { sum = sum + thr_get(tid, 88); }
-        }
-        tid = tid + 1;
-    }
-    return sum;
-}
-
-// kernel_cpu_ns — the same for threads that belong to no process, minus the
-// idle threads: idle time is not work the kernel did.
-fn kernel_cpu_ns() as i64 {
-    let is i64 as ntid = next_tid;
-    let is i64 as tid with mut = 0;
-    let is i64 as sum with mut = 0;
-    let is i64 as nc = num_cpus();
-    while (tid < ntid) {
-        if (thread_ptr(tid) != 0 && thr_get(tid, 248) == 0) {
-            let is i64 as is_idle with mut = 0;
-            let is i64 as c with mut = 0;
-            while (c < nc) {
-                if (smp.cpu_idle_tid(c) == tid) { is_idle = 1; }
-                c = c + 1;
+// thread_stats — what the threads of some processes are doing, in one pass
+// over the tid table: procs[0..n) are *Process values sorted ascending, and
+// for the threads of procs[i], cpu[i] gets their cumulative cpu nanoseconds
+// (a process's cpu time is the sum of its threads') and ready[i] how many are
+// on a cpu or waiting for one. cpu[n] and ready[n] get the same for the
+// kernel's own threads — those of no process — leaving out the idle threads,
+// whose time is not work. The caller zeroes the arrays.
+//
+// It used to be a loop over every tid ever handed out, once per process:
+// tids are never reused, so the cost of one ps or htop refresh grew with
+// everything the system had ever run. The table holds the live threads only.
+// Lockless, like thread_ptr: preemption is held off while the table pointer is
+// in hand, and a thread leaving meanwhile is counted or not, never a fault.
+fn thread_stats(procs as *i64, n as i64, cpu as *i64, ready as *i64) as void {
+    let is i64 as track = lock.preempt_track;
+    if (track != 0) { lock.preempt_inc(); }
+    let is i64 as t = tid_tab;
+    if (t != 0) {
+        let is *i64 as h = cast(*i64, t);
+        let is i64 as cap = h[0];
+        let is i64 as nc = num_cpus();
+        let is i64 as i with mut = 0;
+        while (i < cap) {
+            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + i * 2) * 8);
+            let is i64 as tid = slot[0];
+            let is i64 as tp = slot[1];
+            if (tid >= 0 && tp != 0) {
+                let is *i64 as th = cast(*i64, tp);
+                let is i64 as pp = th[31];                       // process_ptr @248
+                let is i64 as k with mut = 0 - 1;
+                if (pp == 0) {
+                    k = n;
+                    let is i64 as c with mut = 0;
+                    while (c < nc) {
+                        if (smp.cpu_idle_tid(c) == tid) { k = 0 - 1; }
+                        c = c + 1;
+                    }
+                } else {
+                    let is i64 as lo with mut = 0;
+                    let is i64 as hi with mut = n - 1;
+                    while (lo <= hi) {
+                        let is i64 as mid = (lo + hi) / 2;
+                        if (procs[mid] == pp) { k = mid; lo = hi + 1; }
+                        else if (procs[mid] < pp) { lo = mid + 1; }
+                        else { hi = mid - 1; }
+                    }
+                }
+                if (k >= 0) {
+                    cpu[k] = cpu[k] + th[11];                     // total_runtime_ns @88
+                    let is i64 as st = th[1];                     // state @8
+                    if (st == THREAD_RUNNING || st == THREAD_RUNNABLE) { ready[k] = ready[k] + 1; }
+                }
             }
-            if (is_idle == 0) { sum = sum + thr_get(tid, 88); }
+            i = i + 1;
         }
-        tid = tid + 1;
     }
-    return sum;
+    if (track != 0) { lock.preempt_dec(); }
 }
 
 // Bumped by every poll_wake_key. A poller reads it BEFORE asking whether its

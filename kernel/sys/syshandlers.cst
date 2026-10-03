@@ -437,97 +437,164 @@ fn sys_thread_exit(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) a
 
 // ============================================================
 // SYS_PROC_LIST(entries_uptr, max) — snapshot the process tree into a
-// caller array of ProcInfo (6 i64 each), up to `max`. Returns the TOTAL
-// live count so a truncated snapshot is detectable. DFS from init over an
-// explicit worklist (no kernel-stack recursion), under the process tree lock:
-// a sibling pointer followed without it could land in a Process that a
+// caller array of ProcInfo (PROC_INFO_WORDS i64 each), up to `max`. Returns
+// the TOTAL count so a truncated snapshot is detectable: a caller whose array
+// was too small grows it and asks again. There is no cap of the kernel's own —
+// the snapshot is staged in a buffer sized to the tree, not on the kstack (it
+// was 64 entries there, and every process past the 64th was invisible to ps,
+// top and htop). The tree is walked under the process tree lock, by parent
+// links instead of a worklist (a fixed one dropped subtrees once it filled):
+// a sibling pointer followed without the lock could land in a Process that a
 // concurrent wait() has just freed. The copy-out happens after the lock drops.
 // ============================================================
 
-fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
-    let is i64 as uptr = a;
-    let is i64 as maxn with mut = b;
-    if (uptr == 0) { return abi.E_FAULT; }
-    if (maxn < 0) { return abi.E_INVAL; }
-    if (maxn > abi.PROC_LIST_MAX) { maxn = abi.PROC_LIST_MAX; }
-    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
-    let is [576]i64 as kbuf;            // PROC_LIST_MAX(64) * PROC_INFO_WORDS(9)
-    let is i64 as total with mut = 0;
-    let is i64 as n with mut = 0;
+// The next process after p in a preorder walk of init's tree, 0 at the end.
+// Caller holds the tree lock.
+fn _proc_walk_next(p as i64) as i64 {
+    let is i64 as ch = proc.proc_first_child(p);
+    if (ch != 0) { return ch; }
+    let is i64 as q with mut = p;
+    while (q != 0 && q != proc.init_proc && proc.proc_next_sib(q) == 0) { q = proc.proc_parent(q); }
+    if (q == 0 || q == proc.init_proc) { return 0; }
+    return proc.proc_next_sib(q);
+}
 
-    // Entry 0 is always the kernel itself (pid 0, name "kernel") — the honest
-    // counterpart of per-process RSS, so the RAM the kernel holds (code, page
-    // tables, heap, kstacks, frame_meta, FAT cache) is a visible line instead of
-    // hiding in the gap between "used" and the sum of process RSS. Emitted FIRST
-    // so it survives a snapshot truncated to `max` (the kernel is never the row
-    // dropped). pid/ppid 0, state run(1), "threads" = kernel thread count, MEM =
-    // the kernel total from kmem_total().
-    if (n < maxn) {
-        let is i64 as kb0 = n * abi.PROC_INFO_WORDS;
-        kbuf[kb0 + 0] = 0;                        // pid
-        kbuf[kb0 + 1] = 0;                        // ppid
-        kbuf[kb0 + 2] = 1;                        // state = run
-        kbuf[kb0 + 3] = 0;                        // exit_code
-        kbuf[kb0 + 4] = sched.get_thread_count(); // "threads" = live kernel threads
-        kbuf[kb0 + 5] = kmem_total();             // MEM = honest kernel footprint
-        // name "kernel\0" packed into the two name words (little-endian bytes).
-        kbuf[kb0 + 8] = sched.kernel_cpu_ns();
-        let is *u8 as knm = cast(*u8, &kbuf[kb0 + 6]);
-        knm[0] = cast(u8, 107); knm[1] = cast(u8, 101); knm[2] = cast(u8, 114);   // k e r
-        knm[3] = cast(u8, 110); knm[4] = cast(u8, 101); knm[5] = cast(u8, 108);   // n e l
-        knm[6] = cast(u8, 0);   knm[7] = cast(u8, 0);   knm[8] = cast(u8, 0);
-        knm[9] = cast(u8, 0);   knm[10] = cast(u8, 0);  knm[11] = cast(u8, 0);
-        knm[12] = cast(u8, 0);  knm[13] = cast(u8, 0);  knm[14] = cast(u8, 0);
-        knm[15] = cast(u8, 0);
-        n = n + 1;
-    }
-    total = total + 1;
-
-    let is [256]i64 as stk;             // DFS worklist of *Process
-    let is i64 as sp with mut = 0;
-    if (proc.init_proc != 0) { stk[0] = proc.init_proc; sp = 1; }
-    proc.tree_lock();
-    while (sp > 0) {
-        sp = sp - 1;
-        let is i64 as p = stk[sp];
-        if (p != 0) {
-            total = total + 1;
-            if (n < maxn) {
-                let is i64 as base = n * abi.PROC_INFO_WORDS;
-                kbuf[base + 0] = proc.proc_pid(p);
-                let is i64 as par = proc.proc_parent(p);
-                if (par != 0) { kbuf[base + 1] = proc.proc_pid(par); } else { kbuf[base + 1] = 0; }
-                kbuf[base + 2] = proc.proc_state(p);
-                kbuf[base + 3] = proc.proc_exit_code(p);
-                kbuf[base + 4] = proc.proc_thread_count(p);
-                let is i64 as asp = proc.proc_aspace(p);
-                if (asp != 0) {
-                    // Honest RSS: anon committed + every VMA_FILE region (a
-                    // surface's backbuffer, shared segments) the aspace maps —
-                    // not just committed_bytes. So the compositor's 4 MiB
-                    // backbuffer shows up against the compositor, where it lives.
-                    kbuf[base + 5] = vma.aspace_rss_bytes(cast(*vma.Aspace, asp));
-                } else { kbuf[base + 5] = 0; }
-                let is *i64 as nmsrc = cast(*i64, p + 112);      // Process.name @112, 16 bytes
-                kbuf[base + 6] = nmsrc[0]; kbuf[base + 7] = nmsrc[1];
-                // Cumulative cpu nanoseconds. A reader keeps its previous
-                // sample and divides by the elapsed clock — the same shape as
-                // SYS_CPU_STAT, and the only one that answers "how busy over
-                // WHAT interval".
-                kbuf[base + 8] = sched.process_cpu_ns(p);
-                n = n + 1;
-            }
-            let is i64 as sib = proc.proc_next_sib(p);
-            if (sib != 0 && sp < 256) { stk[sp] = sib; sp = sp + 1; }
-            let is i64 as ch = proc.proc_first_child(p);
-            if (ch != 0 && sp < 256) { stk[sp] = ch; sp = sp + 1; }
+// Sort the n (key, value) pairs at a by key, ascending (heapsort: no
+// recursion, no extra memory).
+fn _sort_pairs(a as *i64, n as i64) as void {
+    let is i64 as start with mut = n / 2;
+    let is i64 as end with mut = n;
+    while (end > 1) {
+        if (start > 0) { start = start - 1; }
+        else {
+            end = end - 1;
+            let is i64 as tk = a[0]; let is i64 as tv = a[1];
+            a[0] = a[end * 2]; a[1] = a[end * 2 + 1];
+            a[end * 2] = tk; a[end * 2 + 1] = tv;
+        }
+        let is i64 as root with mut = start;
+        while (root * 2 + 1 < end) {
+            let is i64 as child with mut = root * 2 + 1;
+            if (child + 1 < end && a[child * 2] < a[(child + 1) * 2]) { child = child + 1; }
+            if (a[root * 2] < a[child * 2]) {
+                let is i64 as k2 = a[root * 2]; let is i64 as v2 = a[root * 2 + 1];
+                a[root * 2] = a[child * 2]; a[root * 2 + 1] = a[child * 2 + 1];
+                a[child * 2] = k2; a[child * 2 + 1] = v2;
+                root = child;
+            } else { root = end; }
         }
     }
+}
+
+fn sys_proc_list(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 {
+    let is i64 as uptr = a;
+    let is i64 as maxn = b;
+    if (maxn < 0) { return abi.E_INVAL; }
+    if (maxn > 0 && uptr == 0) { return abi.E_FAULT; }
+    let is i64 as W = abi.PROC_INFO_WORDS;
+    let is i64 as pml4 = sched.thr_aspace_pml4(sched.current_tid());
+
+    // How many there are — the kernel's row and every process — to size the
+    // staging buffer. More may appear before the second walk; those are
+    // counted in the total and left out of this snapshot.
+    let is i64 as have with mut = 1;
+    proc.tree_lock();
+    let is i64 as w0 with mut = proc.init_proc;
+    while (w0 != 0) { have = have + 1; w0 = _proc_walk_next(w0); }
     proc.tree_unlock();
-    if (n > 0) {
-        if (userspace.copy_to_user(pml4, uptr, cast(*u8, &kbuf[0]), n * abi.PROC_INFO_WORDS * 8) != 0) { return abi.E_FAULT; }
+    let is i64 as want with mut = have;
+    if (want > maxn) { want = maxn; }
+    if (want == 0) { return have; }
+
+    let is i64 as kbuf_va = heap.kmalloc(want * W * 8, pmm.ALLOC_ZERO);
+    let is i64 as pairs_va = heap.kmalloc(want * 2 * 8, pmm.ALLOC_ZERO);
+    let is i64 as stats_va = heap.kmalloc((want + 1) * 3 * 8, pmm.ALLOC_ZERO);
+    if (kbuf_va == 0 || pairs_va == 0 || stats_va == 0) {
+        if (kbuf_va != 0) { heap.kfree(kbuf_va); }
+        if (pairs_va != 0) { heap.kfree(pairs_va); }
+        if (stats_va != 0) { heap.kfree(stats_va); }
+        return abi.E_NOMEM;
     }
-    return total;
+    let is *i64 as kbuf = cast(*i64, kbuf_va);
+    let is *i64 as pairs = cast(*i64, pairs_va);              // (*Process, row)
+    let is *i64 as procs = cast(*i64, stats_va);              // sorted *Process
+    let is *i64 as cpu = cast(*i64, stats_va + (want + 1) * 8);
+    let is *i64 as ready = cast(*i64, stats_va + (want + 1) * 16);
+    let is i64 as total with mut = 1;
+    let is i64 as n with mut = 0;
+
+    // Row 0 is always the kernel itself (pid 0, name "kernel") — the honest
+    // counterpart of per-process RSS, so the RAM the kernel holds (code, page
+    // tables, heap, kstacks, frame_meta, FAT cache) is a visible line instead of
+    // hiding in the gap between "used" and the sum of process RSS. First, so it
+    // survives a snapshot truncated to `max`. pid/ppid 0, state alive,
+    // "threads" = kernel thread count, MEM = the kernel total from kmem_total().
+    kbuf[0] = 0;                                  // pid
+    kbuf[1] = 0;                                  // ppid
+    kbuf[2] = proc.PROC_ALIVE;                    // state
+    kbuf[3] = 0;                                  // exit_code
+    kbuf[4] = sched.get_thread_count();           // "threads" = live kernel threads
+    kbuf[5] = kmem_total();                       // MEM = honest kernel footprint
+    let is *u8 as knm = cast(*u8, &kbuf[6]);
+    knm[0] = cast(u8, 107); knm[1] = cast(u8, 101); knm[2] = cast(u8, 114);   // k e r
+    knm[3] = cast(u8, 110); knm[4] = cast(u8, 101); knm[5] = cast(u8, 108);   // n e l
+    n = 1;
+
+    proc.tree_lock();
+    let is i64 as p with mut = proc.init_proc;
+    while (p != 0) {
+        total = total + 1;
+        if (n < want) {
+            let is i64 as base = n * W;
+            kbuf[base + 0] = proc.proc_pid(p);
+            let is i64 as par = proc.proc_parent(p);
+            if (par != 0) { kbuf[base + 1] = proc.proc_pid(par); } else { kbuf[base + 1] = 0; }
+            kbuf[base + 2] = proc.proc_state(p);
+            kbuf[base + 3] = proc.proc_exit_code(p);
+            kbuf[base + 4] = proc.proc_thread_count(p);
+            let is i64 as asp = proc.proc_aspace(p);
+            if (asp != 0) {
+                // Honest RSS: anon committed + every VMA_FILE region (a
+                // surface's backbuffer, shared segments) the aspace maps —
+                // not just committed_bytes. So the compositor's 4 MiB
+                // backbuffer shows up against the compositor, where it lives.
+                kbuf[base + 5] = vma.aspace_rss_bytes(cast(*vma.Aspace, asp));
+            }
+            let is *i64 as nmsrc = cast(*i64, p + 112);      // Process.name @112, 16 bytes
+            kbuf[base + 6] = nmsrc[0]; kbuf[base + 7] = nmsrc[1];
+            pairs[(n - 1) * 2] = p; pairs[(n - 1) * 2 + 1] = n;
+            n = n + 1;
+        }
+        p = _proc_walk_next(p);
+    }
+    // What the threads are doing, matched to the rows by *Process — while the
+    // tree lock still keeps every one of them from being freed and reused.
+    let is i64 as np = n - 1;
+    _sort_pairs(pairs, np);
+    let is i64 as k with mut = 0;
+    while (k < np) { procs[k] = pairs[k * 2]; k = k + 1; }
+    sched.thread_stats(procs, np, cpu, ready);
+    proc.tree_unlock();
+    // Cumulative cpu nanoseconds: a reader keeps its previous sample and
+    // divides by the elapsed clock — the same shape as SYS_CPU_STAT, the only
+    // one that answers "how busy over WHAT interval". Running threads: on a
+    // cpu or waiting for one; 0 means every thread is waiting on something.
+    k = 0;
+    while (k < np) {
+        let is i64 as row = pairs[k * 2 + 1];
+        kbuf[row * W + 8] = cpu[k];
+        kbuf[row * W + 9] = ready[k];
+        k = k + 1;
+    }
+    kbuf[8] = cpu[np];
+    kbuf[9] = ready[np];
+
+    let is i64 as rc with mut = total;
+    if (userspace.copy_to_user(pml4, uptr, cast(*u8, kbuf_va), n * W * 8) != 0) { rc = abi.E_FAULT; }
+    heap.kfree(kbuf_va);
+    heap.kfree(pairs_va);
+    heap.kfree(stats_va);
+    return rc;
 }
 
 // ============================================================

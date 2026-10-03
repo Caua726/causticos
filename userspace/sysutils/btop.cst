@@ -6,6 +6,7 @@
 //   up/down (or arrows) select a process, k ends it (after y), q quits.
 use "std/os/causticos.cst" as sys;
 use "../lib/ttyproto/ttyproto.cst" as tty;
+use "../lib/proclist/proclist.cst" as pl;
 
 // palette (0xRRGGBB), emitted as ANSI truecolor.
 let is i64 as C_FG = 0x00cdd6f4; let is i64 as C_DIM = 0x006c7086;
@@ -16,7 +17,10 @@ let is i64 as C_SEL = 0x0045475a; let is i64 as C_YELLOW = 0x00f9e2af;
 let is i64 as g_cols with mut = 80; let is i64 as g_rows with mut = 24;   // until CSI 8t arrives
 let is i64 as HSIZE = 24;
 let is [400]i64 as cpu_hist; let is i64 as cpu_hpos with mut = 0; let is i64 as cpu_filled with mut = 0; let is i64 as ncpu with mut = 1;
-let is [576]i64 as g_ents; let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
+// The last snapshot of every process (lib/proclist): g_nproc records of pl.W
+// words at g_ents, sorted by pid.
+let is pl.Snap as g_snap;
+let is *i64 as g_ents with mut = cast(*i64, 0); let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
 let is i64 as g_quit with mut = 0; let is i64 as totalb with mut = 1;
 let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
 
@@ -166,56 +170,79 @@ fn cpu_pct(core as i64) as i64 {
 // is the delta over the elapsed clock, keyed by pid so a table that reorders
 // between samples still compares like with like. This is the column that makes
 // "why is the machine busy" a question with an answer on screen.
-let is [64]i64 as pcpu_pid with mut;
-let is [64]i64 as pcpu_ns with mut;
+// The last sample — pcpu_n (pid, cpu ns) pairs in pid order — and this one's
+// percentage per row, in arrays that grow with the process count.
+let is *i64 as pcpu_pid with mut = cast(*i64, 0);
+let is *i64 as pcpu_ns with mut = cast(*i64, 0);
+let is *i64 as pcpu_pct with mut = cast(*i64, 0);
+let is i64 as pcpu_cap with mut = 0;
 let is i64 as pcpu_n with mut = 0;
 let is i64 as pcpu_last_t with mut = 0;
-let is [64]i64 as pcpu_pct with mut;
 
 fn proc_pct(idx as i64) as i64 { return pcpu_pct[idx]; }
 
+// Room for n rows; what the last sample holds is kept. 0, or -1.
+fn pcpu_room(n as i64) as i64 {
+    if (n <= pcpu_cap) { return 0; }
+    let is i64 as nc = n + n / 4 + 8;
+    let is i64 as va = sys.mmap(0, nc * 24, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { return 0 - 1; }
+    let is *i64 as np = cast(*i64, va);
+    let is *i64 as nn = cast(*i64, va + nc * 8);
+    let is i64 as i with mut = 0;
+    while (i < pcpu_n) { np[i] = pcpu_pid[i]; nn[i] = pcpu_ns[i]; i = i + 1; }
+    if (pcpu_cap > 0) { sys.munmap(cast(i64, pcpu_pid), pcpu_cap * 24); }
+    pcpu_pid = np; pcpu_ns = nn; pcpu_pct = cast(*i64, va + nc * 16); pcpu_cap = nc;
+    return 0;
+}
+
+// Both the snapshot and the last sample are in pid order, so one walk pairs
+// them up.
 fn sample_proc_cpu(now as i64) as void {
     let is i64 as dt = now - pcpu_last_t;
+    let is i64 as k with mut = 0;
     let is i64 as i with mut = 0;
     while (i < g_nproc) {
-        let is i64 as pid = g_ents[i * 9];
-        let is i64 as cur = g_ents[i * 9 + 8];
-        let is i64 as prev with mut = 0 - 1;
-        let is i64 as k with mut = 0;
-        while (k < pcpu_n) {
-            if (pcpu_pid[k] == pid) { prev = pcpu_ns[k]; }
-            k = k + 1;
-        }
+        let is *i64 as r = pl.rec(&g_snap, i);
+        let is i64 as pid = r[pl.F_PID];
+        let is i64 as cur = r[pl.F_CPU];
+        while (k < pcpu_n && pcpu_pid[k] < pid) { k = k + 1; }
         let is i64 as pct with mut = 0;
-        if (prev >= 0 && pcpu_last_t > 0 && dt > 0) {
-            pct = (cur - prev) * 100 / dt;
+        if (k < pcpu_n && pcpu_pid[k] == pid && pcpu_last_t > 0 && dt > 0) {
+            pct = (cur - pcpu_ns[k]) * 100 / dt;
             if (pct < 0) { pct = 0; }
             if (pct > 100) { pct = 100; }
         }
         pcpu_pct[i] = pct;
         i = i + 1;
     }
-    // Re-key the history to this snapshot.
-    pcpu_n = g_nproc;
-    if (pcpu_n > 64) { pcpu_n = 64; }
+    // this sample is the next one's last
     i = 0;
-    while (i < pcpu_n) {
-        pcpu_pid[i] = g_ents[i * 9];
-        pcpu_ns[i] = g_ents[i * 9 + 8];
+    while (i < g_nproc) {
+        pcpu_pid[i] = pl.rec(&g_snap, i)[pl.F_PID];
+        pcpu_ns[i] = pl.rec(&g_snap, i)[pl.F_CPU];
         i = i + 1;
     }
+    pcpu_n = g_nproc;
     pcpu_last_t = now;
 }
 
-fn statename(s as i64) as *u8 { if (s == 1) { return "run"; } if (s == 3) { return "zombie"; } if (s == 2) { return "exit"; } return "?"; }
-fn state_col(s as i64) as i64 { if (s == 1) { return C_GREEN; } if (s == 3) { return C_RED; } return C_DIM; }
+fn state_col(r as *i64) as i64 {
+    let is i64 as l = pl.state_letter(r);
+    if (l == 82) { return C_GREEN; }                         // R
+    if (l == 90) { return C_RED; }                           // Z
+    return C_DIM;
+}
+// The snapshot's records in pid order (insertion sort, moving whole records).
 fn sort_procs() as void {
+    let is i64 as W = pl.W;
+    let is [10]i64 as tmp;
     let is i64 as i with mut = 1;
     while (i < g_nproc) {
-        let is [9]i64 as tmp; let is i64 as w with mut = 0; while (w < 9) { tmp[w] = g_ents[i * 9 + w]; w = w + 1; }
+        let is i64 as w with mut = 0; while (w < W) { tmp[w] = g_ents[i * W + w]; w = w + 1; }
         let is i64 as j with mut = i - 1;
-        while (j >= 0 && g_ents[j * 9] > tmp[0]) { w = 0; while (w < 9) { g_ents[(j + 1) * 9 + w] = g_ents[j * 9 + w]; w = w + 1; } j = j - 1; }
-        w = 0; while (w < 9) { g_ents[(j + 1) * 9 + w] = tmp[w]; w = w + 1; }
+        while (j >= 0 && g_ents[j * W] > tmp[0]) { w = 0; while (w < W) { g_ents[(j + 1) * W + w] = g_ents[j * W + w]; w = w + 1; } j = j - 1; }
+        w = 0; while (w < W) { g_ents[(j + 1) * W + w] = tmp[w]; w = w + 1; }
         i = i + 1;
     }
 }
@@ -239,9 +266,9 @@ fn msg_num(v as i64) as void {
     while (n > 0 && g_msglen < 111) { n = n - 1; g_msg[g_msglen] = d[n]; g_msglen = g_msglen + 1; }
 }
 fn ask_kill(idx as i64) as void {
-    let is i64 as pid = g_ents[idx * 9];
+    let is i64 as pid = g_ents[idx * pl.W];
     if (pid == sys.getpid()) { msg_begin(); msg_add("this is btop itself: q quits"); return; }
-    let is *u8 as nm = cast(*u8, cast(i64, &g_ents[0]) + (idx * 9 + 6) * 8);
+    let is *u8 as nm = pl.name(&g_snap, idx);
     let is i64 as i with mut = 0;
     while (i < 16) { g_kname[i] = nm[i]; i = i + 1; }
     g_kpid = pid;
@@ -354,12 +381,12 @@ fn render() as void {
     if (g_scroll < 0) { g_scroll = 0; }
     let is i64 as i with mut = g_scroll; let is i64 as shown with mut = 0;
     while (i < g_nproc && shown < avail) {
-        let is i64 as b = i * 9;
+        let is i64 as b = i * pl.W;
         cup(row, 1);
         if (i == g_sel) { bgc(C_SEL); }
         fgc(C_FG); pad_num(g_ents[b], 5); ob(32); fgc(C_DIM); pad_num(g_ents[b + 1], 4); ob(32);
-        fgc(state_col(g_ents[b + 2])); pad_str(statename(g_ents[b + 2]), 7); ob(32);
-        fgc(C_FG); pad_name(cast(*u8, cast(i64, &g_ents[0]) + (b + 6) * 8), 14); ob(32);
+        fgc(state_col(pl.rec(&g_snap, i))); pad_str(pl.state_name(pl.rec(&g_snap, i)), 7); ob(32);
+        fgc(C_FG); pad_name(pl.name(&g_snap, i), 14); ob(32);
         fgc(C_DIM); pad_num(g_ents[b + 4], 3); ob(32); ob(32); fgc(C_FG); obbytes(g_ents[b + 5]);
         ob(32); ob(32);
         let is i64 as pc = proc_pct(i);
@@ -382,9 +409,11 @@ fn main(argc as i64, argv as *u8) as i32 {
     drain_input(300000000);                        // 300ms: collect the CSI 8t reply
     while (g_quit == 0) {
         sample_cpu();
-        g_nproc = sys.proc_list(cast(*i64, &g_ents[0]), 64); if (g_nproc > 64) { g_nproc = 64; }
-        sort_procs();
-        sample_proc_cpu(sys.time_ns());
+        if (pl.take(&g_snap) == 0 && pcpu_room(g_snap.n) == 0) {
+            g_ents = cast(*i64, g_snap.va); g_nproc = g_snap.n;
+            sort_procs();
+            sample_proc_cpu(sys.time_ns());
+        }
         if (g_sel >= g_nproc) { g_sel = g_nproc - 1; } if (g_sel < 0) { g_sel = 0; }
         render();
         flush_ob();

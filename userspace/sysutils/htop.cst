@@ -6,6 +6,7 @@
 //   up/down select   t tree   s sort   / filter   k kill   q quit
 use "std/os/causticos.cst" as sys;
 use "../lib/ttyproto/ttyproto.cst" as tty;
+use "../lib/proclist/proclist.cst" as pl;
 
 let is i64 as C_FG = 0x00cdd6f4; let is i64 as C_DIM = 0x006c7086;
 let is i64 as C_BARBG = 0x00313244; let is i64 as C_GREEN = 0x00a6e3a1; let is i64 as C_RED = 0x00f38ba8;
@@ -15,9 +16,13 @@ let is i64 as C_SEL = 0x0045475a; let is i64 as C_KEY = 0x0089b4fa; let is i64 a
 let is i64 as g_cols with mut = 80; let is i64 as g_rows with mut = 24;
 let is i64 as HSIZE = 24;
 let is [400]i64 as cpu_hist; let is i64 as cpu_hpos with mut = 0; let is i64 as cpu_filled with mut = 0; let is i64 as ncpu with mut = 1;
-let is [576]i64 as g_ents; let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
+// The last snapshot of every process (lib/proclist), g_nproc records of pl.W
+// words at g_ents, and the rows shown: indexes into it, with tree depths.
+let is pl.Snap as g_snap;
+let is *i64 as g_ents with mut = cast(*i64, 0); let is i64 as g_nproc with mut = 0; let is i64 as g_sel with mut = 0; let is i64 as g_scroll with mut = 0;
 let is i64 as g_quit with mut = 0; let is i64 as totalb with mut = 1;
-let is [64]i64 as g_order; let is [64]i64 as g_depth; let is i64 as g_ordn with mut = 0;   // visible rows -> g_ents index
+let is *i64 as g_order with mut = cast(*i64, 0); let is *i64 as g_depth with mut = cast(*i64, 0);
+let is i64 as g_ordn with mut = 0; let is i64 as g_ordcap with mut = 0;
 let is i64 as g_tree with mut = 0; let is i64 as g_sortm with mut = 0;     // 0 pid, 1 mem, 2 name
 let is i64 as g_filtering with mut = 0; let is [64]u8 as g_filter; let is i64 as g_flen with mut = 0;
 let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
@@ -119,9 +124,14 @@ fn cpu_pct(core as i64) as i64 {
     while (i < cpu_filled) { sum = sum + cpu_hist[core * HSIZE + i]; i = i + 1; }
     return sum / cpu_filled;
 }
-fn state_ch(s as i64) as i64 { if (s == 1) { return 82; } if (s == 3) { return 90; } if (s == 2) { return 69; } return 63; }   // R Z E ?
-fn state_col(s as i64) as i64 { if (s == 1) { return C_GREEN; } if (s == 3) { return C_RED; } return C_DIM; }
-fn nameptr(idx as i64) as *u8 { return cast(*u8, cast(i64, &g_ents[0]) + (idx * 9 + 6) * 8); }
+fn ent(idx as i64) as *i64 { return cast(*i64, cast(i64, g_ents) + idx * pl.W * 8); }
+fn state_col(r as *i64) as i64 {
+    let is i64 as l = pl.state_letter(r);
+    if (l == 82) { return C_GREEN; }                         // R
+    if (l == 90) { return C_RED; }                           // Z
+    return C_DIM;
+}
+fn nameptr(idx as i64) as *u8 { return cast(*u8, cast(i64, g_ents) + (idx * pl.W + 6) * 8); }
 fn name_has_filter(idx as i64) as i64 {
     if (g_flen == 0) { return 1; }
     let is *u8 as nm = nameptr(idx);
@@ -137,14 +147,13 @@ fn name_has_filter(idx as i64) as i64 {
 
 // build g_order[]/g_depth[] from g_ents, honoring tree / sort / filter.
 fn add_children(ppid as i64, depth as i64) as void {
-    if (depth > 24) { return; }
     let is i64 as i with mut = 0;
     while (i < g_nproc) {
         // The kernel row is its own parent (pid 0, ppid 0): it is a root, not a
         // child of itself, or the walk would list it under itself forever.
-        if (g_ents[i * 9 + 1] == ppid && g_ents[i * 9] != ppid && name_has_filter(i) == 1 && g_ordn < 64) {
+        if (g_ents[i * pl.W + 1] == ppid && g_ents[i * pl.W] != ppid && name_has_filter(i) == 1 && g_ordn < g_nproc) {
             g_order[g_ordn] = i; g_depth[g_ordn] = depth; g_ordn = g_ordn + 1;
-            add_children(g_ents[i * 9], depth + 1);
+            add_children(g_ents[i * pl.W], depth + 1);
         }
         i = i + 1;
     }
@@ -154,26 +163,26 @@ fn build_order() as void {
     if (g_tree == 1) {
         let is i64 as i with mut = 0;
         while (i < g_nproc) {
-            let is i64 as pp = g_ents[i * 9 + 1]; let is i64 as has with mut = 0; let is i64 as j with mut = 0;
+            let is i64 as pp = g_ents[i * pl.W + 1]; let is i64 as has with mut = 0; let is i64 as j with mut = 0;
             // A root has no parent on the list — or is its own parent, as the
             // kernel is. Without that second case nothing was a root and tree
             // mode showed an empty list.
-            while (j < g_nproc) { if (g_ents[j * 9] == pp && j != i) { has = 1; } j = j + 1; }
-            if (has == 0 && name_has_filter(i) == 1 && g_ordn < 64) { g_order[g_ordn] = i; g_depth[g_ordn] = 0; g_ordn = g_ordn + 1; add_children(g_ents[i * 9], 1); }
+            while (j < g_nproc) { if (g_ents[j * pl.W] == pp && j != i) { has = 1; } j = j + 1; }
+            if (has == 0 && name_has_filter(i) == 1 && g_ordn < g_nproc) { g_order[g_ordn] = i; g_depth[g_ordn] = 0; g_ordn = g_ordn + 1; add_children(g_ents[i * pl.W], 1); }
             i = i + 1;
         }
         return;
     }
     // flat: filtered indices, then selection-sort by mode
     let is i64 as i with mut = 0;
-    while (i < g_nproc) { if (name_has_filter(i) == 1 && g_ordn < 64) { g_order[g_ordn] = i; g_depth[g_ordn] = 0; g_ordn = g_ordn + 1; } i = i + 1; }
+    while (i < g_nproc) { if (name_has_filter(i) == 1 && g_ordn < g_nproc) { g_order[g_ordn] = i; g_depth[g_ordn] = 0; g_ordn = g_ordn + 1; } i = i + 1; }
     let is i64 as a with mut = 0;
     while (a < g_ordn) {
         let is i64 as best with mut = a; let is i64 as b with mut = a + 1;
         while (b < g_ordn) {
             let is i64 as ib = g_order[b]; let is i64 as ibest = g_order[best]; let is i64 as win with mut = 0;
-            if (g_sortm == 1) { if (g_ents[ib * 9 + 5] > g_ents[ibest * 9 + 5]) { win = 1; } }       // mem desc
-            else { if (g_ents[ib * 9] < g_ents[ibest * 9]) { win = 1; } }                            // pid asc (default)
+            if (g_sortm == 1) { if (g_ents[ib * pl.W + 5] > g_ents[ibest * pl.W + 5]) { win = 1; } }       // mem desc
+            else { if (g_ents[ib * pl.W] < g_ents[ibest * pl.W]) { win = 1; } }                            // pid asc (default)
             if (win == 1) { best = b; }
             b = b + 1;
         }
@@ -215,11 +224,11 @@ fn render() as void {
     if (g_scroll < 0) { g_scroll = 0; }
     let is i64 as o with mut = g_scroll; let is i64 as shown with mut = 0;
     while (o < g_ordn && shown < avail) {
-        let is i64 as e = g_order[o] * 9;
+        let is i64 as e = g_order[o] * pl.W;
         cup(row, 1);
         if (o == g_sel) { bgc(C_SEL); }
         fgc(C_FG); pad_num(g_ents[e], 5); ob(32); fgc(C_DIM); pad_num(g_ents[e + 1], 4); ob(32);
-        fgc(state_col(g_ents[e + 2])); ob(state_ch(g_ents[e + 2])); ob(32);
+        fgc(state_col(ent(g_order[o]))); ob(pl.state_letter(ent(g_order[o]))); ob(32);
         fgc(C_DIM); pad_num(g_ents[e + 4], 3); ob(32); fgc(C_FG);
         let is i64 as mem = g_ents[e + 5]; let is i64 as mpct with mut = 0; if (totalb > 0) { mpct = mem / 1024 * 100 / (totalb / 1024); }
         ob(32); obbytes(mem); ob(32); fgc(C_DIM); pad_num(mpct, 3); ob(37); ob(32);
@@ -259,9 +268,9 @@ fn msg_num(v as i64) as void {
     while (n > 0 && g_msglen < 111) { n = n - 1; g_msg[g_msglen] = d[n]; g_msglen = g_msglen + 1; }
 }
 fn ask_kill(idx as i64) as void {
-    let is i64 as pid = g_ents[idx * 9];
+    let is i64 as pid = g_ents[idx * pl.W];
     if (pid == sys.getpid()) { msg_begin(); msg_add("this is htop itself: q quits"); return; }
-    let is *u8 as nm = cast(*u8, cast(i64, &g_ents[0]) + (idx * 9 + 6) * 8);
+    let is *u8 as nm = cast(*u8, cast(i64, g_ents) + (idx * pl.W + 6) * 8);
     let is i64 as i with mut = 0;
     while (i < 16) { g_kname[i] = nm[i]; i = i + 1; }
     g_kpid = pid;
@@ -332,13 +341,27 @@ fn drain_input(timeout as i64) as void {
     }
 }
 
+// Room for n rows in g_order and g_depth. 0, or -1 out of memory (the last
+// snapshot is kept then).
+fn ensure_rows(n as i64) as i64 {
+    if (n <= g_ordcap) { return 0; }
+    let is i64 as nc = n + n / 4 + 8;
+    let is i64 as va = sys.mmap(0, nc * 16, sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { return 0 - 1; }
+    if (g_ordcap > 0) { sys.munmap(cast(i64, g_order), g_ordcap * 16); }
+    g_order = cast(*i64, va); g_depth = cast(*i64, va + nc * 8); g_ordcap = nc;
+    return 0;
+}
+
 fn main(argc as i64, argv as *u8) as i32 {
     alt_on(); hidec(); clr(); flush_ob();
     esc(); obn(18); ob(116); flush_ob();
     drain_input(300000000);
     while (g_quit == 0) {
         sample_cpu();
-        g_nproc = sys.proc_list(cast(*i64, &g_ents[0]), 64); if (g_nproc > 64) { g_nproc = 64; }
+        if (pl.take(&g_snap) == 0 && ensure_rows(g_snap.n) == 0) {
+            g_ents = cast(*i64, g_snap.va); g_nproc = g_snap.n;
+        }
         render();
         flush_ob();
         drain_input(1000000000);

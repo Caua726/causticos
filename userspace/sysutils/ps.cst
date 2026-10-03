@@ -1,17 +1,11 @@
-// ps — list processes. ps [-l]. Reads SYS_PROC_LIST (pid, ppid, state,
-// exit_code, threads, committed_bytes, name=argv[0]). Sorted by pid. -l adds
-// the exit code. (No owner/CPU%: the kernel doesn't track them yet.)
+// ps — list processes. ps [-l]. Reads SYS_PROC_LIST (lib/proclist: every
+// process, however many): pid, ppid, state — run while a thread is on a cpu
+// or ready for one, sleep while all of them wait — threads, resident memory,
+// name = argv[0]. Sorted by pid. -l adds the exit code.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
-
-fn statename(s as i64) as *u8 {
-    if (s == 1) { return "run"; }
-    if (s == 2) { return "exiting"; }
-    if (s == 3) { return "zombie"; }
-    if (s == 4) { return "dead"; }
-    return "?";
-}
+use "../lib/proclist/proclist.cst" as pl;
 
 fn padstr(s as *u8, w as i64) as void {
     prog.outs(s);
@@ -28,25 +22,23 @@ fn main(argc as i64, argv as *u8) as i32 {
         if (f < 0) { break; }
         if (f == 108) { lflag = 1; } else { prog.outs("usage: ps [-l]\n"); return cast(i32, 1); }
     }
-    let is [576]i64 as ents;                         // PROC_LIST_MAX(64) * 9
-    let is i64 as total = sys.proc_list(cast(*i64, &ents[0]), 64);
-    if (total < 0) { prog.outs("ps: SYS_PROC_LIST failed\n"); return cast(i32, 1); }
-    let is i64 as n with mut = total;
-    if (n > 64) { n = 64; }
-
-    // insertion-sort the 9-word records by pid. tmp holds one whole record: it
-    // was [8]i64, and copying the ninth word into it overwrote the stack — ps
-    // crashed on every run.
-    let is i64 as i with mut = 1;
+    let is pl.Snap as sn;
+    sn.va = 0; sn.cap = 0; sn.n = 0;
+    let is i64 as rc = pl.take(&sn);
+    if (rc < 0) {
+        prog.outs("ps: cannot read the process list: "); prog.outs(sys.err_text(rc)); prog.outs("\n");
+        return cast(i32, 1);
+    }
+    let is i64 as n = sn.n;
+    // the records in pid order, through an index (insertion sort)
+    let is *i64 as ord = cast(*i64, sys.mmap(0, (n + 1) * 8, sys.PROT_READ | sys.PROT_WRITE));
+    if (cast(i64, ord) < 0) { prog.outs("ps: out of memory\n"); return cast(i32, 1); }
+    let is i64 as i with mut = 0;
     while (i < n) {
-        let is [9]i64 as tmp;
-        let is i64 as w with mut = 0; while (w < 9) { tmp[w] = ents[i * 9 + w]; w = w + 1; }
+        let is i64 as pid = pl.rec(&sn, i)[pl.F_PID];
         let is i64 as j with mut = i - 1;
-        while (j >= 0 && ents[j * 9] > tmp[0]) {
-            w = 0; while (w < 9) { ents[(j + 1) * 9 + w] = ents[j * 9 + w]; w = w + 1; }
-            j = j - 1;
-        }
-        w = 0; while (w < 9) { ents[(j + 1) * 9 + w] = tmp[w]; w = w + 1; }
+        while (j >= 0 && pl.rec(&sn, ord[j])[pl.F_PID] > pid) { ord[j + 1] = ord[j]; j = j - 1; }
+        ord[j + 1] = i;
         i = i + 1;
     }
 
@@ -55,18 +47,17 @@ fn main(argc as i64, argv as *u8) as i32 {
     prog.out("\n", 1);
     i = 0;
     while (i < n) {
-        let is i64 as b = i * 9;
-        prog.pad_num(ents[b + 0], 5); prog.outs("  ");
-        prog.pad_num(ents[b + 1], 4); prog.outs("  ");
-        padstr(statename(ents[b + 2]), 9);
-        padstr(cast(*u8, cast(i64, &ents[0]) + (b + 6) * 8), 16);     // name (16 bytes @ words 6-7)
+        let is *i64 as r = pl.rec(&sn, ord[i]);
+        prog.pad_num(r[pl.F_PID], 5); prog.outs("  ");
+        prog.pad_num(r[pl.F_PPID], 4); prog.outs("  ");
+        padstr(pl.state_name(r), 9);
+        padstr(pl.name(&sn, ord[i]), 16);
         prog.outs(" ");
-        prog.pad_num(ents[b + 4], 3); prog.outs("  ");
-        prog.pad_num(ents[b + 5], 9);
-        if (lflag == 1) { prog.outs("  "); prog.pad_num(ents[b + 3], 6); }
+        prog.pad_num(r[pl.F_THREADS], 3); prog.outs("  ");
+        prog.pad_num(r[pl.F_RSS], 9);
+        if (lflag == 1) { prog.outs("  "); prog.pad_num(r[pl.F_EXIT], 6); }
         prog.out("\n", 1);
         i = i + 1;
     }
-    if (total > 64) { prog.outs("(+ "); prog.out_num(total - 64); prog.outs(" more)\n"); }
     return 0;
 }
