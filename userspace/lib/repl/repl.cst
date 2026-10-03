@@ -88,8 +88,11 @@ fn line_clear(r as *Repl) as void {
 // back" can be rows up, not n columns left. Going back with "cursor left" (it
 // stops at column 0) reprinted the whole line from the start of the row it had
 // wrapped onto: every key typed past the edge added another copy of the line.
-// The terminal wraps the moment a row fills, so a cell is one linear index,
-// row * cols + col, and offset k of the line is the start's index plus k.
+// A cell is one linear index, row * cols + col, and offset k of the line is
+// the start's index plus k. When a row fills, the terminal leaves the wrap
+// pending with the cursor still on the last column (term.cst); the cursor is
+// then one past that cell, the first of the next row, which is what _here
+// says.
 // Moves are always taken from where the cursor IS: printing on the last row
 // scrolls, and every row on screen moves up with it.
 //
@@ -114,7 +117,7 @@ fn _csi(t as *term.Term, n as i64, final as i64) as void {
 // Where the cursor is, as a linear index — negative while it is parked for a
 // cell above the top row.
 fn _here(r as *Repl, t as *term.Term) as i64 {
-    return t.cy * t.cols + t.cx - r.above;
+    return t.cy * t.cols + t.cx + t.wrap_pend - r.above;
 }
 
 // _park — set how far above the top-left the cursor really is. A parked cursor
@@ -137,6 +140,9 @@ fn _park(r as *Repl, t as *term.Term, n as i64) as void {
 // has scrolled off.
 fn _goto(r as *Repl, t as *term.Term, to as i64) as void {
     if (t.cols <= 0) { return; }
+    // Already there. Moving would drop a pending wrap — and the cell past the
+    // bottom-right one cannot be moved to, only printed into.
+    if (to == _here(r, t)) { return; }
     let is i64 as dst with mut = to;
     let is i64 as hidden with mut = 0;
     if (dst < 0) { hidden = 0 - dst; dst = 0; }
@@ -144,7 +150,9 @@ fn _goto(r as *Repl, t as *term.Term, to as i64) as void {
     let is i64 as col = dst % t.cols;
     if (row < t.cy) { _csi(t, t.cy - row, 0x41); }        // 'A' up
     if (row > t.cy) { _csi(t, row - t.cy, 0x42); }        // 'B' down
-    if (col != t.cx) { _csi(t, col + 1, 0x47); }          // 'G' column
+    // A pending wrap leaves the cursor ON the cell `col` may name: the move is
+    // made anyway, since a move is what drops the pending wrap.
+    if (col != t.cx || t.wrap_pend == 1) { _csi(t, col + 1, 0x47); }   // 'G' column
     _park(r, t, hidden);
     return;
 }
@@ -181,10 +189,28 @@ fn redraw(r as *Repl, t as *term.Term) as void {
 // that ends exactly at the right edge has already wrapped, and a newline on top
 // of that would leave an empty row.
 fn finish(r as *Repl, t as *term.Term) as void {
-    _goto(r, t, _here(r, t) + (r.shown_len - r.shown_cur));
-    _park(r, t, 0);
-    if (t.cx != 0 || r.shown_len == 0) { term.putc(t, 0x0A); }
+    _to_end(r, t);
+    term.putc(t, 0x0A);
     r.shown_len = 0; r.shown_cur = 0;
+    return;
+}
+
+// _to_end — the cursor just past what is shown, exactly where printing it left
+// the cursor: when it ended on the right edge that is the edge with the wrap
+// pending, a place no cursor move can reach (at the bottom row the next row
+// does not exist yet). So the cursor goes onto the last character shown and
+// prints it again.
+fn _to_end(r as *Repl, t as *term.Term) as void {
+    let is i64 as end = _here(r, t) + (r.shown_len - r.shown_cur);
+    // Even when the cursor is already at `end`: after an edit it may sit at
+    // the start of the next row instead of pending on the edge, and a newline
+    // from there would leave an empty row under the line.
+    if (r.shown_len == 0) { _goto(r, t, end); _park(r, t, 0); return; }
+    _goto(r, t, end - 1);
+    _park(r, t, 0);
+    let is i64 as last with mut = 32;               // a search line with no match yet ends in "': "
+    if (r.llen > 0) { last = cast(i64, r.line[r.llen - 1]); }
+    term.putc(t, last);
     return;
 }
 
@@ -383,8 +409,7 @@ fn line_delete(r as *Repl) as i64 {
 // cancel — Ctrl+C at the prompt: the line is dropped, not run and not kept in
 // the history, with ^C left where it ended; the caller starts a fresh prompt.
 fn cancel(r as *Repl, t as *term.Term) as void {
-    _goto(r, t, _here(r, t) + (r.shown_len - r.shown_cur));
-    _park(r, t, 0);
+    _to_end(r, t);
     term.putc(t, 0x5E); term.putc(t, 0x43);        // ^C
     term.putc(t, 0x0A);
     line_clear(r);
