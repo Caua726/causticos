@@ -9,7 +9,9 @@ the answers stay fixed, not whatever the host's sed happens to be today.
     python3 scripts/gen-cmdt.py            # regenerate userspace/tests/cmdt.cases
 
 "%D" in arguments, file names, contents and expected text is the case's
-directory (a fresh temporary one here, /cmdt/d on CausticOS). Programs there
+directory (a fresh temporary one here, /cmdt/cN on CausticOS). A name in
+`files` that ends in '/' is a directory to make; the others are made in the
+order given, so a directory comes before what is in it. Programs there
 have no working directory, so cases name every file by %D.
 
 A case can carry `want=` when this system answers differently from GNU on
@@ -23,7 +25,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "userspace", "tests", "cmdt.cases")
-GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr"}
+GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls"}
 
 CASES = []
 
@@ -45,6 +47,10 @@ def grep(name, args, stdin=b"", **kw):
 
 def expr(name, args, **kw):
     case(name, "expr", args, b"", **kw)
+
+
+def ls(name, args, **kw):
+    case(name, "ls", args, b"", **kw)
 
 
 L5 = "one\ntwo\nthree\nfour\nfive\n"
@@ -307,12 +313,51 @@ expr("x-match-keyword", ["match", "hello", "h\\(el\\)"])
 expr("x-arith", ["3", "+", "4"])
 expr("x-bad-regex", ["a", ":", "\\(a"])
 
+# ---- ls (not -l, -s, -i or -t: GNU's show owners, block counts, inodes and
+# nanosecond times FAT32 does not have) ----
+TREE = {"%D/b.txt": "bb\n", "%D/a.c": "a\n", "%D/c": "ccc\n", "%D/.hid": "", "%D/sub/": None,
+        "%D/sub/x": "x\n", "%D/Zed": "", "%D/b.txt~": "", "%D/f10": "", "%D/f2": ""}
+ls("l-dir", ["%D"], files=TREE)
+ls("l-a", ["-a", "%D"], files=TREE)
+ls("l-A", ["-A", "%D"], files=TREE)
+ls("l-files", ["%D/c", "%D/a.c"], files=TREE)
+ls("l-file-and-dir", ["%D/c", "%D/sub"], files=TREE)
+ls("l-two-dirs", ["%D/sub", "%D"], files=TREE)
+ls("l-d", ["-d", "%D", "%D/c"], files=TREE)
+ls("l-R", ["-R", "%D"], files=TREE)
+ls("l-missing", ["%D/nope"], files=TREE)
+ls("l-missing-and-file", ["%D/nope", "%D/c"], files=TREE)
+ls("l-1", ["-1", "%D"], files=TREE)
+ls("l-m", ["-m", "%D"], files=TREE)
+ls("l-x", ["-x", "%D"], files=TREE)
+ls("l-C", ["-C", "%D"], files=TREE)
+ls("l-C-narrow", ["-C", "-w", "20", "%D"], files=TREE)
+ls("l-p", ["-p", "%D"], files=TREE)
+ls("l-r", ["-r", "%D"], files=TREE)
+# (no directory in these two: a directory's size is the filesystem's own)
+FLAT = dict((k, v) for k, v in TREE.items() if "sub" not in k)
+ls("l-S", ["-S", "%D"], files=FLAT)
+ls("l-X", ["-X", "%D"], files=TREE)
+ls("l-v", ["-v", "%D"], files=TREE)
+ls("l-I", ["-I", "*.txt", "%D"], files=TREE)
+ls("l-B", ["-B", "%D"], files=TREE)
+ls("l-Q", ["-Q", "%D"], files=TREE)
+ls("l-gdf", ["--group-directories-first", "%D"], files=TREE)
+ls("l-sort-size", ["--sort=size", "%D"], files=FLAT)
+ls("l-bad-option", ["-j", "%D"], files=TREE)
+ls("l-v-more", ["-v", "%D"], files=dict(("%D/" + n, "") for n in
+   ["a1.tar.gz", "a10.tar.gz", "a2.tar.gz", "a2.tar.gz~", ".h2", ".h10", "x-1.0", "x-1.0~rc1", "x-1.0.1", "README"]))   # (FAT32: "readme" would be README)
+ls("l-many", ["%D"], files=dict(("%D/n" + "%04d" % i, "") for i in range(5000)))
+
 
 def run(c):
     d = tempfile.mkdtemp(prefix="cmdt-")
     try:
         sub = lambda s: s.replace("%D", d)
         for path, content in c["files"].items():
+            if path.endswith("/"):
+                os.makedirs(sub(path), exist_ok=True)
+                continue
             if isinstance(content, str):
                 content = content.encode()
             with open(sub(path), "wb") as f:
@@ -347,6 +392,9 @@ def main():
         parts.append(b"T " + c["name"].encode() + b"\n")
         parts.append(b"P /" + c["prog"].encode() + b".cse\n")
         for path, content in c["files"].items():
+            if path.endswith("/"):
+                parts.append(b"M " + path.rstrip("/").encode() + b"\n")
+                continue
             if isinstance(content, str):
                 content = content.encode()
             parts.append(b"F " + path.encode() + b"\n" + blob(content))

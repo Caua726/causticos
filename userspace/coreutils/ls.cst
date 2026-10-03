@@ -1,16 +1,26 @@
 // ls — list directory contents (GNU-flavoured).
+//
+//   ls [OPTION]... [FILE]...
+//
 //   formats: -C columns (down) · -x across · -m comma · -1 one · -l long
 //            Columns are the default when the output is a terminal, as wide
 //            as the terminal; into a pipe or a file it is one name a line.
-//   sort:    name (default) · -S size · -X extension · -v natural · -U none · -r reverse
-//   show:    -a all · -A almost-all · -d dir itself · -R recurse · -i inode
-//            -F classify (*/) · -p dir-slash · -h human · -s blocks · -Q quote names
+//   sort:    name (default) · -t time, newest first · -S size · -X extension
+//            · -v natural · -U none · -r reverse · --sort=WORD
+//   show:    -a all · -A almost-all · -d directories themselves · -R recurse
+//            -i inode (first cluster) · -F classify (*/) · -p dir-slash
+//            -h human · -s blocks · -Q quote names
 //   filter:  -B (no ~backups) · -I PATTERN (glob ignore) · --group-directories-first
-//   misc:    -w COLS (line width) · --color[=always|never|auto]
-//            (auto = colour when the output is a terminal)
-// FAT32 has no Unix owner/group/mtime, so -l shows mode + size + name (date and
-// -t wait for the kernel to expose the FAT write-time). Colours: dirs blue,
-// .cse executables green.
+//   misc:    -w COLS (line width) · --color[=always|never|auto], auto by
+//            default: directories blue, programs (.cse) green, on a terminal
+//
+// A FILE that is not a directory is listed as itself, with the others like
+// it, before the directories; each directory gets its name as a header when
+// there is more than one thing to list (or with -R). FAT32 has no owner or
+// group: -l shows mode, size, the write time and the name.
+//
+// Exit status 0; 1 for a directory inside the listing that cannot be read; 2
+// when a FILE named on the command line cannot be found or read.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
@@ -21,38 +31,62 @@ let is i64 as FL_L = 1; let is i64 as FL_A = 2; let is i64 as FL_1 = 4; let is i
 let is i64 as FL_r = 32; let is i64 as FL_F = 64; let is i64 as FL_H = 128; let is i64 as FL_D = 256;
 let is i64 as FL_I = 512; let is i64 as FL_AA = 1024; let is i64 as FL_X = 2048; let is i64 as FL_M = 4096;
 let is i64 as FL_S = 8192; let is i64 as FL_P = 16384; let is i64 as FL_Q = 32768; let is i64 as FL_B = 65536;
+let is i64 as SORT_NAME = 0; let is i64 as SORT_SIZE = 1; let is i64 as SORT_EXT = 2;
+let is i64 as SORT_NONE = 3; let is i64 as SORT_VER = 4; let is i64 as SORT_TIME = 5;
 let is i64 as g_fl with mut = 0;
-let is i64 as g_sort with mut = 0;        // 0 name, 1 size, 2 ext, 3 none, 4 natural
-let is i64 as g_color with mut = 0;
-let is i64 as g_gdf with mut = 0;         // --group-directories-first
+let is i64 as g_sort with mut = 0;
+let is i64 as g_color with mut = 2;        // 0 never, 1 always, 2 auto (decided once the output is known)
+let is i64 as g_gdf with mut = 0;          // --group-directories-first
 let is i64 as g_width with mut = 80;
-let is i64 as g_width_set with mut = 0;   // -w given: it wins over the terminal's width
-let is i64 as g_tty with mut = 0;         // 1 = the output is a terminal (ttyproto)
-let is i64 as g_cols with mut = 0;        // -C: columns even when it is not
-let is *u8 as g_ignore with mut;          // -I pattern (0 = none)
-let is [256]u8 as g_base_buf;            // the directory being listed (path-prefix for -l mtime lookup)
-let is *u8 as g_base with mut;
+let is i64 as g_width_set with mut = 0;    // -w given: it wins over the terminal's width
+let is i64 as g_tty with mut = 0;          // 1 = the output is a terminal (ttyproto)
+let is i64 as g_cols with mut = 0;         // -C: columns even when it is not
+let is *u8 as g_ignore with mut;           // -I pattern (0 = none)
+let is i64 as g_status with mut = 0;
 
-let is [65536]u8 as g_names;
-let is [4096]i64 as g_off; let is [4096]i64 as g_dir; let is [4096]i64 as g_size;
-let is [4096]i64 as g_clu; let is [4096]i64 as g_attr;
-let is i64 as g_count with mut = 0; let is i64 as g_nbytes with mut = 0;
-let is [256]i64 as g_colw; let is [257]i64 as g_cstart;
+// The entries being listed: records and their names, in mappings that grow —
+// a directory may hold any number of names.
+struct Ent {
+    off as i64;        // its name in NAMES
+    len as i64;
+    dir as i64;
+    size as i64;
+    clu as i64;
+    attr as i64;
+    mtime as i64;
+}
+let is fu.Line as ENTS;                    // [g_count]Ent
+let is fu.Line as NAMES;
+let is fu.Line as SORTTMP;                 // merge sort's other half
+let is i64 as g_count with mut = 0;
+let is [512]u8 as g_base;                  // the directory being listed, for each entry's mtime
 
-fn ename(i as i64) as *u8 { return cast(*u8, cast(i64, &g_names[0]) + g_off[i]); }
+fn room(l as *fu.Line, need as i64) as void {
+    if (fu.line_reserve(l, need) != 0) { prog.errs("ls: out of memory\n"); sys.exit(cast(i32, 2)); }
+}
+fn ent(i as i64) as *Ent { return cast(*Ent, ENTS.va + i * sizeof(Ent)); }
+fn ename(i as i64) as *u8 { return cast(*u8, NAMES.va + ent(i).off); }
+
 fn digits(v as i64) as i64 { let is i64 as n with mut = 1; let is i64 as x with mut = v; while (x >= 10) { x = x / 10; n = n + 1; } return n; }
 fn streq(a as *u8, b as *u8) as i64 { let is i64 as i with mut = 0; while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; } if (a[i] == b[i]) { return 1; } return 0; }
 fn starts(a as *u8, p as *u8) as i64 { let is i64 as i with mut = 0; while (p[i] != 0) { if (a[i] != p[i]) { return 0; } i = i + 1; } return 1; }
 fn atoi(s as *u8) as i64 { let is i64 as v with mut = 0; let is i64 as i with mut = 0; while (s[i] >= 48 && s[i] <= 57) { v = v * 10 + (cast(i64, s[i]) - 48); i = i + 1; } return v; }
 
-// emit ESC[<code>m
+// Columns a name takes: one per character (a byte 10xxxxxx continues one).
+fn disp_width(s as *u8) as i64 {
+    let is i64 as w with mut = 0; let is i64 as i with mut = 0;
+    while (s[i] != 0) { if ((cast(i64, s[i]) & 0xC0) != 0x80) { w = w + 1; } i = i + 1; }
+    return w;
+}
+
+// colour (ANSI SGR) — dirs bold blue, .cse executables bold green
 fn sgr(code as *u8) as void { let is [1]u8 as e; e[0] = cast(u8, 27); prog.out(cast(*u8, &e[0]), 1); prog.outs("["); prog.outs(code); prog.outs("m"); }
 fn ends_cse(nm as *u8) as i64 { let is i64 as n = prog.slen(nm); if (n < 4) { return 0; } if (nm[n - 4] == 46 && nm[n - 3] == 99 && nm[n - 2] == 115 && nm[n - 1] == 101) { return 1; } return 0; }
-fn is_exec(i as i64) as i64 { if (g_dir[i] != 0) { return 0; } return ends_cse(ename(i)); }
-fn color_on(i as i64) as void { if (g_color == 0) { return; } if (g_dir[i] != 0) { sgr("1;34"); } else if (is_exec(i) == 1) { sgr("1;32"); } }
-fn color_off(i as i64) as void { if (g_color == 0) { return; } if (g_dir[i] != 0 || is_exec(i) == 1) { sgr("0"); } }
-// classify suffix char for -F / -p (0 = none)
-fn classify(i as i64) as i64 { if (g_dir[i] != 0) { return 47; } if ((g_fl & FL_F) != 0 && is_exec(i) == 1) { return 42; } return 0; }
+fn is_exec(i as i64) as i64 { if (ent(i).dir != 0) { return 0; } return ends_cse(ename(i)); }
+fn color_on(i as i64) as void { if (g_color == 0) { return; } if (ent(i).dir != 0) { sgr("1;34"); } else if (is_exec(i) == 1) { sgr("1;32"); } }
+fn color_off(i as i64) as void { if (g_color == 0) { return; } if (ent(i).dir != 0 || is_exec(i) == 1) { sgr("0"); } }
+// -F / -p classification char appended after the name (0 = none)
+fn classify(i as i64) as i64 { if (ent(i).dir != 0) { return 47; } if ((g_fl & FL_F) != 0 && is_exec(i) == 1) { return 42; } return 0; }
 
 // --ignore / -I: a shell pattern, matched the way GNU ls does — a leading
 // '.' only by a '.' in the pattern (lib/glob, FL_PERIOD).
@@ -65,14 +99,24 @@ fn ignored(nm as *u8, nlen as i64) as i64 {
     return 0;
 }
 
-fn add_entry(name as *u8, nlen as i64, isdir as i64, size as i64, clu as i64, attr as i64) as void {
-    if (g_count >= 4096 || g_nbytes + nlen + 1 >= 65536) { return; }
-    g_off[g_count] = g_nbytes;
-    let is i64 as k with mut = 0; while (k < nlen) { g_names[g_nbytes] = name[k]; g_nbytes = g_nbytes + 1; k = k + 1; }
-    g_names[g_nbytes] = cast(u8, 0); g_nbytes = g_nbytes + 1;
-    g_dir[g_count] = isdir; g_size[g_count] = size; g_clu[g_count] = clu; g_attr[g_count] = attr; g_count = g_count + 1;
+fn add_entry(name as *u8, nlen as i64, isdir as i64, size as i64, clu as i64, attr as i64, mtime as i64) as void {
+    let is i64 as off = NAMES.len;
+    room(&NAMES, off + nlen + 1);
+    let is *u8 as d = cast(*u8, NAMES.va);
+    let is i64 as k with mut = 0;
+    while (k < nlen) { d[off + k] = name[k]; k = k + 1; }
+    d[off + nlen] = cast(u8, 0);
+    NAMES.len = off + nlen + 1;
+    room(&ENTS, (g_count + 1) * sizeof(Ent));
+    let is *Ent as e = ent(g_count);
+    e.off = off; e.len = nlen; e.dir = isdir; e.size = size; e.clu = clu; e.attr = attr; e.mtime = mtime;
+    g_count = g_count + 1;
+    ENTS.len = g_count * sizeof(Ent);
 }
 
+fn reset_entries() as void { g_count = 0; ENTS.len = 0; NAMES.len = 0; }
+
+// ---- sorting ----
 fn ncmp(a as *u8, b as *u8) as i64 {
     let is i64 as k with mut = 0;
     while (cast(i64, a[k]) != 0 && cast(i64, b[k]) != 0) { if (a[k] != b[k]) { if (a[k] < b[k]) { return 0 - 1; } return 1; } k = k + 1; }
@@ -80,45 +124,157 @@ fn ncmp(a as *u8, b as *u8) as i64 {
     if (cast(i64, a[k]) != 0 && cast(i64, b[k]) == 0) { return 1; }
     return 0;
 }
-fn nat_cmp(a as *u8, b as *u8) as i64 {
+// -v: version order, as GNU's filevercmp has it (the Debian rules). Runs of
+// digits compare by value ("f2" < "f10"); between them letters come before
+// other characters and '~' before anything, the end of the name included
+// ("b.txt~" < "b.txt"); names starting with '.' come first; and file
+// suffixes (".tar.gz") are set aside unless the rest is the same.
+fn is_digit(c as i64) as i64 { if (c >= 48 && c <= 57) { return 1; } return 0; }
+fn is_alpha(c as i64) as i64 { if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { return 1; } return 0; }
+fn vorder(c as i64) as i64 {
+    if (is_digit(c) == 1) { return 0; }
+    if (is_alpha(c) == 1) { return c; }
+    if (c == 126) { return 0 - 1; }
+    return c + 256;
+}
+fn verrevcmp(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
     let is i64 as i with mut = 0; let is i64 as j with mut = 0;
-    while (a[i] != 0 && b[j] != 0) {
-        let is i64 as ca = cast(i64, a[i]); let is i64 as cb = cast(i64, b[j]);
-        if (ca >= 48 && ca <= 57 && cb >= 48 && cb <= 57) {
-            let is i64 as na with mut = 0; while (a[i] >= 48 && a[i] <= 57) { na = na * 10 + (cast(i64, a[i]) - 48); i = i + 1; }
-            let is i64 as nb with mut = 0; while (b[j] >= 48 && b[j] <= 57) { nb = nb * 10 + (cast(i64, b[j]) - 48); j = j + 1; }
-            if (na != nb) { if (na < nb) { return 0 - 1; } return 1; }
-        } else { if (ca != cb) { if (ca < cb) { return 0 - 1; } return 1; } i = i + 1; j = j + 1; }
+    while (i < an || j < bn) {
+        let is i64 as first_diff with mut = 0;
+        while ((i < an && is_digit(cast(i64, a[i])) == 0) || (j < bn && is_digit(cast(i64, b[j])) == 0)) {
+            let is i64 as ac with mut = 0; let is i64 as bc with mut = 0;
+            if (i < an) { ac = vorder(cast(i64, a[i])); }
+            if (j < bn) { bc = vorder(cast(i64, b[j])); }
+            if (ac != bc) { return ac - bc; }
+            i = i + 1; j = j + 1;
+        }
+        while (i < an && a[i] == cast(u8, 48)) { i = i + 1; }
+        while (j < bn && b[j] == cast(u8, 48)) { j = j + 1; }
+        while (i < an && j < bn && is_digit(cast(i64, a[i])) == 1 && is_digit(cast(i64, b[j])) == 1) {
+            if (first_diff == 0) { first_diff = cast(i64, a[i]) - cast(i64, b[j]); }
+            i = i + 1; j = j + 1;
+        }
+        if (i < an && is_digit(cast(i64, a[i])) == 1) { return 1; }
+        if (j < bn && is_digit(cast(i64, b[j])) == 1) { return 0 - 1; }
+        if (first_diff != 0) { return first_diff; }
     }
-    if (a[i] == 0 && b[j] != 0) { return 0 - 1; } if (a[i] != 0 && b[j] == 0) { return 1; } return 0;
+    return 0;
+}
+// Where a name's file suffix starts — (\.[A-Za-z~][A-Za-z0-9~]*)* at its end —
+// or its length when it has none.
+fn suffix_at(s as *u8, n as i64) as i64 {
+    let is i64 as start with mut = n;
+    let is i64 as i with mut = 0;
+    let is i64 as cand with mut = 0 - 1;      // where the run of suffixes now being read began
+    let is i64 as read_alpha with mut = 0;    // just read the '.', want [A-Za-z~]
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if (read_alpha == 1) {
+            read_alpha = 0;
+            if (is_alpha(c) == 0 && c != 126) { cand = 0 - 1; }
+        } else if (c == 46) {
+            read_alpha = 1;
+            if (cand < 0) { cand = i; }
+        } else if (is_alpha(c) == 0 && is_digit(c) == 0 && c != 126) {
+            cand = 0 - 1;
+        }
+        i = i + 1;
+    }
+    if (read_alpha == 1) { cand = 0 - 1; }    // a name ending in '.' has no suffix
+    if (cand >= 0) { start = cand; }
+    return start;
+}
+fn nat_cmp(a as *u8, b as *u8) as i64 {
+    let is i64 as an = prog.slen(a);
+    let is i64 as bn = prog.slen(b);
+    if (an == bn && ncmp(a, b) == 0) { return 0; }
+    if (an == 0) { return 0 - 1; }
+    if (bn == 0) { return 1; }
+    if (streq(a, ".") == 1) { return 0 - 1; }
+    if (streq(b, ".") == 1) { return 1; }
+    if (streq(a, "..") == 1) { return 0 - 1; }
+    if (streq(b, "..") == 1) { return 1; }
+    let is *u8 as pa with mut = a; let is *u8 as pb with mut = b;
+    let is i64 as la with mut = an; let is i64 as lb with mut = bn;
+    if (a[0] == cast(u8, 46) && b[0] != cast(u8, 46)) { return 0 - 1; }
+    if (a[0] != cast(u8, 46) && b[0] == cast(u8, 46)) { return 1; }
+    if (a[0] == cast(u8, 46) && b[0] == cast(u8, 46)) {
+        pa = cast(*u8, cast(i64, a) + 1); pb = cast(*u8, cast(i64, b) + 1); la = an - 1; lb = bn - 1;
+    }
+    let is i64 as ca with mut = suffix_at(pa, la);
+    let is i64 as cb with mut = suffix_at(pb, lb);
+    if ((ca != la || cb != lb) && ca == cb) {
+        let is i64 as k with mut = 0;
+        let is i64 as same with mut = 1;
+        while (k < ca) { if (pa[k] != pb[k]) { same = 0; } k = k + 1; }
+        if (same == 1) { ca = la; cb = lb; }      // the same but for the suffixes: they decide
+    }
+    let is i64 as r = verrevcmp(pa, ca, pb, cb);
+    if (r != 0) { return r; }
+    return ncmp(a, b);
 }
 fn ext_of(nm as *u8) as *u8 { let is i64 as n = prog.slen(nm); let is i64 as i with mut = n - 1; while (i > 0) { if (nm[i] == 46) { return cast(*u8, cast(i64, nm) + i + 1); } i = i - 1; } return cast(*u8, cast(i64, nm) + n); }
-fn order(i as i64, j as i64) as i64 {
-    if (g_gdf != 0 && g_dir[i] != g_dir[j]) { if (g_dir[i] != 0) { return 0 - 1; } return 1; }
-    if (g_sort == 3) { return 0; }                                              // -U: keep order
-    if (g_sort == 1) { if (g_size[i] != g_size[j]) { if (g_size[i] > g_size[j]) { return 0 - 1; } return 1; } }
-    else if (g_sort == 2) { let is i64 as e = ncmp(ext_of(ename(i)), ext_of(ename(j))); if (e != 0) { return e; } }
-    else if (g_sort == 4) { return nat_cmp(ename(i), ename(j)); }
-    return ncmp(ename(i), ename(j));
-}
-fn swap(i as i64, j as i64) as void {
-    let is i64 as a with mut = g_off[i]; g_off[i] = g_off[j]; g_off[j] = a;
-    a = g_dir[i]; g_dir[i] = g_dir[j]; g_dir[j] = a;
-    a = g_size[i]; g_size[i] = g_size[j]; g_size[j] = a;
-    a = g_clu[i]; g_clu[i] = g_clu[j]; g_clu[j] = a;
-    a = g_attr[i]; g_attr[i] = g_attr[j]; g_attr[j] = a;
-}
-fn sort_entries() as void {
-    if (g_sort != 3) {
-        let is i64 as i with mut = 1;
-        while (i < g_count) { let is i64 as j with mut = i; while (j > 0 && order(j - 1, j) > 0) { swap(j - 1, j); j = j - 1; } i = i + 1; }
-    } else if (g_gdf != 0) {        // -U but still group dirs first: stable partition
-        let is i64 as i with mut = 1;
-        while (i < g_count) { let is i64 as j with mut = i; while (j > 0 && g_dir[j - 1] == 0 && g_dir[j] != 0) { swap(j - 1, j); j = j - 1; } i = i + 1; }
-    }
-    if ((g_fl & FL_r) != 0) { let is i64 as a with mut = 0; let is i64 as b with mut = g_count - 1; while (a < b) { swap(a, b); a = a + 1; b = b - 1; } }
+
+// Whether entry a goes after entry b (> 0), as the options order them.
+fn order(a as *Ent, b as *Ent) as i64 {
+    let is *u8 as na = cast(*u8, NAMES.va + a.off);
+    let is *u8 as nb = cast(*u8, NAMES.va + b.off);
+    let is i64 as r with mut = 0;
+    if (g_gdf != 0 && a.dir != b.dir) { if (a.dir != 0) { r = 0 - 1; } else { r = 1; } return r; }
+    if (g_sort == SORT_NONE) { return 0; }
+    if (g_sort == SORT_SIZE && a.size != b.size) { if (a.size > b.size) { r = 0 - 1; } else { r = 1; } }
+    else if (g_sort == SORT_TIME && a.mtime != b.mtime) { if (a.mtime > b.mtime) { r = 0 - 1; } else { r = 1; } }
+    else if (g_sort == SORT_EXT) { r = ncmp(ext_of(na), ext_of(nb)); }
+    else if (g_sort == SORT_VER) { r = nat_cmp(na, nb); }
+    if (r == 0) { r = ncmp(na, nb); }
+    if ((g_fl & FL_r) != 0) { r = 0 - r; }
+    return r;
 }
 
+// A stable merge sort of the entries (they used to be insertion-sorted: a
+// directory of a few thousand names took seconds).
+fn sort_entries() as void {
+    if (g_count < 2) { return; }
+    if (g_sort == SORT_NONE && g_gdf == 0) {
+        if ((g_fl & FL_r) == 0) { return; }
+    }
+    let is i64 as es = sizeof(Ent);
+    room(&SORTTMP, g_count * es);
+    let is i64 as src with mut = ENTS.va;
+    let is i64 as dst with mut = SORTTMP.va;
+    let is i64 as width with mut = 1;
+    while (width < g_count) {
+        let is i64 as lo with mut = 0;
+        while (lo < g_count) {
+            let is i64 as mid with mut = lo + width; if (mid > g_count) { mid = g_count; }
+            let is i64 as hi with mut = lo + 2 * width; if (hi > g_count) { hi = g_count; }
+            let is i64 as i with mut = lo; let is i64 as j with mut = mid; let is i64 as k with mut = lo;
+            while (k < hi) {
+                let is i64 as take_j with mut = 0;
+                if (i >= mid) { take_j = 1; }
+                else if (j < hi && order(cast(*Ent, src + i * es), cast(*Ent, src + j * es)) > 0) { take_j = 1; }
+                let is i64 as from with mut = i;
+                if (take_j == 1) { from = j; j = j + 1; } else { i = i + 1; }
+                let is *i64 as d = cast(*i64, dst + k * es);
+                let is *i64 as s = cast(*i64, src + from * es);
+                let is i64 as w with mut = 0;
+                while (w < es / 8) { d[w] = s[w]; w = w + 1; }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        let is i64 as t = src; src = dst; dst = t;
+        width = width * 2;
+    }
+    if (src != ENTS.va) {
+        let is *i64 as d2 = cast(*i64, ENTS.va);
+        let is *i64 as s2 = cast(*i64, src);
+        let is i64 as n with mut = 0;
+        while (n < g_count * es / 8) { d2[n] = s2[n]; n = n + 1; }
+    }
+}
+
+// ---- output ----
 fn put_human(n as i64) as void {
     if (n < 1024) { prog.out_num(n); return; }
     let is i64 as suf with mut = 75; let is i64 as scale with mut = 1024;
@@ -134,7 +290,8 @@ fn human_width(n as i64) as i64 {
     let is i64 as whole with mut = n / scale; if (whole < 10) { return 4; }
     let is i64 as rem = n - whole * scale; if (rem > 0) { whole = whole + 1; } return digits(whole) + 1;
 }
-fn blocks(i as i64) as i64 { return (g_size[i] + 1023) / 1024; }
+
+fn blocks(i as i64) as i64 { return (ent(i).size + 1023) / 1024; }
 
 fn mode_str(isdir as i64, attr as i64) as void {
     if (isdir != 0) { prog.outs("d"); } else { prog.outs("-"); }
@@ -145,14 +302,14 @@ fn mode_str(isdir as i64, attr as i64) as void {
 
 // width of entry i's visible name field (no colour escapes count)
 fn name_w(i as i64) as i64 {
-    let is i64 as w with mut = prog.slen(ename(i));
+    let is i64 as w with mut = disp_width(ename(i));
     if ((g_fl & FL_Q) != 0) { w = w + 2; }
-    if (classify(i) != 0 && ((g_fl & FL_F) != 0 || ((g_fl & FL_P) != 0 && g_dir[i] != 0))) { w = w + 1; }
+    if (classify(i) != 0 && ((g_fl & FL_F) != 0 || ((g_fl & FL_P) != 0 && ent(i).dir != 0))) { w = w + 1; }
     return w;
 }
 fn cell_width(i as i64) as i64 {
     let is i64 as w with mut = name_w(i);
-    if ((g_fl & FL_I) != 0) { w = w + digits(g_clu[i]) + 1; }
+    if ((g_fl & FL_I) != 0) { w = w + digits(ent(i).clu) + 1; }
     if ((g_fl & FL_S) != 0) { w = w + digits(blocks(i)) + 1; }
     return w;
 }
@@ -161,47 +318,41 @@ fn put_name(i as i64) as void {
     color_on(i); prog.outs(ename(i)); color_off(i);
     if ((g_fl & FL_Q) != 0) { prog.outs("\""); }
     let is i64 as cl = classify(i);
-    if (cl != 0 && ((g_fl & FL_F) != 0 || ((g_fl & FL_P) != 0 && g_dir[i] != 0))) { let is [1]u8 as c; c[0] = cast(u8, cl); prog.out(cast(*u8, &c[0]), 1); }
+    if (cl != 0 && ((g_fl & FL_F) != 0 || ((g_fl & FL_P) != 0 && ent(i).dir != 0))) { let is [1]u8 as c; c[0] = cast(u8, cl); prog.out(cast(*u8, &c[0]), 1); }
 }
 fn put_cell(i as i64) as void {
     if ((g_fl & FL_S) != 0) { prog.out_num(blocks(i)); prog.outs(" "); }
-    if ((g_fl & FL_I) != 0) { prog.out_num(g_clu[i]); prog.outs(" "); }
+    if ((g_fl & FL_I) != 0) { prog.out_num(ent(i).clu); prog.outs(" "); }
     put_name(i);
 }
 
+// Spaces to the next column (GNU's ls pads with spaces, not tabs).
 fn pad_to(from as i64, to as i64) as void {
     let is i64 as f with mut = from;
-    while ((f / 8 + 1) * 8 <= to) { prog.outs("\t"); f = (f / 8 + 1) * 8; }
     while (f < to) { prog.outs(" "); f = f + 1; }
 }
 
-fn print_long() as void {
-    let is i64 as total with mut = 0; let is i64 as i with mut = 0;
-    while (i < g_count) { total = total + blocks(i); i = i + 1; }
-    prog.outs("total "); prog.out_num(total); prog.out("\n", 1);
+// -l. A directory's listing starts with its "total" of 1 KiB blocks; the
+// FILEs named on the command line have none.
+fn print_long(with_total as i64) as void {
+    let is i64 as i with mut = 0;
+    if (with_total == 1) {
+        let is i64 as total with mut = 0;
+        while (i < g_count) { total = total + blocks(i); i = i + 1; }
+        prog.outs("total "); prog.out_num(total); prog.out("\n", 1);
+    }
     let is i64 as sw with mut = 1; i = 0;
-    while (i < g_count) { let is i64 as d with mut = digits(g_size[i]); if ((g_fl & FL_H) != 0) { d = human_width(g_size[i]); } if (d > sw) { sw = d; } i = i + 1; }
+    while (i < g_count) { let is i64 as d with mut = digits(ent(i).size); if ((g_fl & FL_H) != 0) { d = human_width(ent(i).size); } if (d > sw) { sw = d; } i = i + 1; }
     i = 0;
     while (i < g_count) {
-        mode_str(g_dir[i], g_attr[i]); prog.outs(" ");
-        if ((g_fl & FL_I) != 0) { prog.out_num(g_clu[i]); prog.outs(" "); }
-        if ((g_fl & FL_H) != 0) { let is i64 as pad with mut = sw - human_width(g_size[i]); while (pad > 0) { prog.outs(" "); pad = pad - 1; } put_human(g_size[i]); }
-        else { prog.pad_num(g_size[i], sw); }
+        let is *Ent as e = ent(i);
+        mode_str(e.dir, e.attr); prog.outs(" ");
+        if ((g_fl & FL_I) != 0) { prog.out_num(e.clu); prog.outs(" "); }
+        if ((g_fl & FL_H) != 0) { let is i64 as pad with mut = sw - human_width(e.size); while (pad > 0) { prog.outs(" "); pad = pad - 1; } put_human(e.size); }
+        else { prog.pad_num(e.size, sw); }
         prog.outs(" ");
-        // mtime column — SYS_STATX gives us the FAT32 write-time. 0 == unknown
-        // (the root directory or a pre-RTC fixture); mtime_fmt renders it as
-        // "????-??-?? ??:??" so a fresh entry (always stamped) is visible.
-        let is [320]u8 as fp;
-        let is i64 as ppos with mut = 0;
-        let is *u8 as base = g_base;
-        while (cast(i64, base[ppos]) != 0) { fp[ppos] = base[ppos]; ppos = ppos + 1; }
-        if (ppos > 0 && cast(i64, fp[ppos - 1]) != 47) { fp[ppos] = cast(u8, 47); ppos = ppos + 1; }
-        let is *u8 as nm = ename(i);
-        let is i64 as k with mut = 0;
-        while (cast(i64, nm[k]) != 0) { fp[ppos + k] = nm[k]; k = k + 1; }
-        fp[ppos + k] = cast(u8, 0);
         let is [17]u8 as mbuf;
-        fu.mtime_fmt(fu.statx_mtime(cast(*u8, &fp[0])), cast(*u8, &mbuf[0]), 17);
+        fu.mtime_fmt(e.mtime, cast(*u8, &mbuf[0]), 17);
         prog.out(cast(*u8, &mbuf[0]), 16); prog.outs(" ");
         put_name(i); prog.out("\n", 1); i = i + 1;
     }
@@ -214,40 +365,57 @@ fn print_comma() as void {
 }
 fn print_one() as void { let is i64 as i with mut = 0; while (i < g_count) { put_cell(i); prog.out("\n", 1); i = i + 1; } }
 
-// grid layout: pick the widest column count that fits g_width. across=1 lays
-// out row-major (-x), else column-major (-C, the default).
-fn print_grid(across as i64) as void {
-    let is i64 as cols with mut = g_count; if (cols > 256) { cols = 256; }
-    while (cols > 1) {
-        let is i64 as rows = (g_count + cols - 1) / cols; let is i64 as total with mut = 0; let is i64 as j with mut = 0;
-        while (j < cols) {
-            let is i64 as cw with mut = 0; let is i64 as r with mut = 0;
-            while (r < rows) { let is i64 as idx with mut = 0; if (across != 0) { idx = r * cols + j; } else { idx = j * rows + r; } if (idx < g_count) { let is i64 as w = cell_width(idx); if (w > cw) { cw = w; } } r = r + 1; }
-            g_colw[j] = cw; total = total + cw + 2; j = j + 1;
+// grid layout: the most columns that fit g_width. across=1 lays out row-major
+// (-x), else column-major (-C, the default). Column widths in a mapping sized
+// to the entries.
+let is fu.Line as COLW;
+fn colw(j as i64) as *i64 { return cast(*i64, COLW.va + j * 8); }
+fn grid_widths(cols as i64, rows as i64, across as i64) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as j with mut = 0;
+    while (j < cols) {
+        let is i64 as cw with mut = 0; let is i64 as r with mut = 0;
+        while (r < rows) {
+            let is i64 as idx with mut = j * rows + r;
+            if (across != 0) { idx = r * cols + j; }
+            if (idx < g_count) { let is i64 as w = cell_width(idx); if (w > cw) { cw = w; } }
+            r = r + 1;
         }
-        if (total - 2 <= g_width) { break; }
+        let is *i64 as cwp = colw(j);
+        cwp[0] = cw; total = total + cw + 2; j = j + 1;
+    }
+    return total - 2;
+}
+fn print_grid(across as i64) as void {
+    room(&COLW, (g_count + 1) * 8);
+    let is i64 as cols with mut = g_count;
+    // a column is at least one character and two of gap: no more fit the width
+    if (cols > g_width / 3 + 1) { cols = g_width / 3 + 1; }
+    if (cols < 1) { cols = 1; }
+    while (cols > 1) {
+        let is i64 as rows = (g_count + cols - 1) / cols;
+        if (grid_widths(cols, rows, across) <= g_width) { break; }
         cols = cols - 1;
     }
-    if (cols < 1) { cols = 1; }
     let is i64 as rows = (g_count + cols - 1) / cols;
-    let is i64 as jj with mut = 0;
-    while (jj < cols) {
-        let is i64 as cw with mut = 0; let is i64 as r with mut = 0;
-        while (r < rows) { let is i64 as idx with mut = 0; if (across != 0) { idx = r * cols + jj; } else { idx = jj * rows + r; } if (idx < g_count) { let is i64 as w = cell_width(idx); if (w > cw) { cw = w; } } r = r + 1; }
-        g_colw[jj] = cw; jj = jj + 1;
-    }
-    g_cstart[0] = 0; let is i64 as cc with mut = 0; while (cc < cols) { g_cstart[cc + 1] = g_cstart[cc] + g_colw[cc] + 2; cc = cc + 1; }
+    grid_widths(cols, rows, across);
     let is i64 as r2 with mut = 0;
     while (r2 < rows) {
-        let is i64 as c with mut = 0; let is i64 as pos with mut = 0;
+        let is i64 as c with mut = 0; let is i64 as start with mut = 0;
         while (c < cols) {
-            let is i64 as idx with mut = 0; if (across != 0) { idx = r2 * cols + c; } else { idx = c * rows + r2; }
+            let is i64 as idx with mut = c * rows + r2;
+            if (across != 0) { idx = r2 * cols + c; }
             if (idx < g_count) {
-                put_cell(idx); pos = g_cstart[c] + cell_width(idx);
+                put_cell(idx);
+                let is i64 as pos = start + cell_width(idx);
                 let is i64 as more with mut = 0;
-                if (across != 0) { if (c < cols - 1 && idx + 1 < g_count) { more = 1; } } else { if (c < cols - 1 && (c + 1) * rows + r2 < g_count) { more = 1; } }
-                if (more == 1) { pad_to(pos, g_cstart[c + 1]); pos = g_cstart[c + 1]; }
+                if (across != 0) { if (c < cols - 1 && idx + 1 < g_count) { more = 1; } }
+                else { if (c < cols - 1 && (c + 1) * rows + r2 < g_count) { more = 1; } }
+                let is *i64 as cwm = colw(c);
+                if (more == 1) { pad_to(pos, start + cwm[0] + 2); }
             }
+            let is *i64 as cwn = colw(c);
+            start = start + cwn[0] + 2;
             c = c + 1;
         }
         prog.out("\n", 1); r2 = r2 + 1;
@@ -264,82 +432,152 @@ fn print_short() as void {
     print_grid(0);
 }
 
+fn print_entries(with_total as i64) as void {
+    sort_entries();
+    if ((g_fl & FL_L) != 0) { print_long(with_total); }
+    else {
+        if ((g_fl & FL_S) != 0 && with_total == 1) {
+            let is i64 as total with mut = 0; let is i64 as i with mut = 0;
+            while (i < g_count) { total = total + blocks(i); i = i + 1; }
+            prog.outs("total "); prog.out_num(total); prog.out("\n", 1);
+        }
+        print_short();
+    }
+}
+
+// ---- reading ----
 fn de_cluster(de as *u8) as i64 { let is *i64 as p = cast(*i64, cast(i64, de) + 264); return p[0]; }
 fn de_attr(de as *u8) as i64 { let is *i64 as p = cast(*i64, cast(i64, de) + 280); return p[0]; }
+
+// The mtime of name in the directory g_base, when something will show or sort
+// by it.
+fn mtime_in(name as *u8, nlen as i64) as i64 {
+    if ((g_fl & FL_L) == 0 && g_sort != SORT_TIME) { return 0; }
+    let is [768]u8 as fp;
+    let is i64 as p with mut = 0;
+    while (g_base[p] != 0 && p < 511) { fp[p] = g_base[p]; p = p + 1; }
+    if (p > 0 && fp[p - 1] != cast(u8, 47)) { fp[p] = cast(u8, 47); p = p + 1; }
+    let is i64 as k with mut = 0;
+    while (k < nlen && p + k < 767) { fp[p + k] = name[k]; k = k + 1; }
+    fp[p + k] = cast(u8, 0);
+    return fu.statx_mtime(cast(*u8, &fp[0]));
+}
+
+// The directory at path (absolute) into the entries. 0, or the errno.
 fn collect(path as *u8) as i64 {
     let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { return 0 - 1; }
-    g_count = 0; g_nbytes = 0;
+    if (fd < 0) { return fd; }
+    reset_entries();
+    let is i64 as k with mut = 0;
+    while (path[k] != 0 && k < 511) { g_base[k] = path[k]; k = k + 1; }
+    g_base[k] = cast(u8, 0);
     let is [320]u8 as de;
     while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
         let is i64 as nl = fu.de_name_len(cast(*u8, &de[0]));
         let is i64 as dot = fu.is_dot(cast(*u8, &de[0]), nl);
         // A name starting with '.' is hidden unless -a or -A asks for it; "."
-        // and ".." only with -a. Only "." and ".." used to be left out, so
-        // every hidden file showed in a plain ls.
+        // and ".." only with -a.
         let is i64 as hid with mut = 0;
         if (nl > 0 && de[0] == cast(u8, 46)) { hid = 1; }
         if (dot != 0 && (g_fl & FL_A) == 0) { }
         else if (hid == 1 && (g_fl & (FL_A | FL_AA)) == 0) { }
         else if (ignored(cast(*u8, &de[0]), nl) == 1) { }
-        else { add_entry(cast(*u8, &de[0]), nl, fu.de_is_dir(cast(*u8, &de[0])), fu.de_size(cast(*u8, &de[0])), de_cluster(cast(*u8, &de[0])), de_attr(cast(*u8, &de[0]))); }
+        else {
+            add_entry(cast(*u8, &de[0]), nl, fu.de_is_dir(cast(*u8, &de[0])), fu.de_size(cast(*u8, &de[0])),
+                      de_cluster(cast(*u8, &de[0])), de_attr(cast(*u8, &de[0])), mtime_in(cast(*u8, &de[0]), nl));
+        }
     }
     sys.close(fd);
     return 0;
 }
 
-fn list_dir(path as *u8, plen as i64, header as i64) as i32 {
-    if ((g_fl & FL_D) != 0) {                                  // -d: the directory itself, not its contents
-        // Snapshot path into g_base for mtime lookup (collect() isn't called).
-        let is i64 as k with mut = 0;
-        while (k < plen && k < 255) { g_base_buf[k] = path[k]; k = k + 1; }
-        g_base_buf[k] = cast(u8, 0);
-        g_base = cast(*u8, &g_base_buf[0]);
-        g_count = 0; g_nbytes = 0; add_entry(path, plen, 1, 0, 0, 0);
-        if ((g_fl & FL_L) != 0) { print_long(); } else { print_short(); }
-        return 0;
+fn cannot(what as *u8, name as *u8, e as i64) as void {
+    prog.errs("ls: "); prog.errs(what); prog.errs(" '"); prog.errs(name); prog.errs("': "); prog.errs(sys.err_text(e)); prog.errs("\n");
+}
+
+// One directory: its header (when asked), its entries, and with -R the
+// directories in it, each after the listing. `shown` is the name as given,
+// `path` the absolute one. top = 1 for a FILE from the command line.
+fn list_dir(shown as *u8, path as *u8, header as i64, top as i64) as void {
+    let is i64 as rc = collect(path);
+    if (header == 1) { prog.outs(shown); prog.outs(":\n"); }
+    if (rc != 0) {
+        cannot("cannot open directory", shown, rc);
+        if (top == 1) { g_status = 2; } else if (g_status == 0) { g_status = 1; }
+        return;
     }
-    // Snapshot the prefix for mtime composition: <base>/<name>. cap 255.
-    let is i64 as k with mut = 0;
-    while (k < plen && k < 255) { g_base_buf[k] = path[k]; k = k + 1; }
-    g_base_buf[k] = cast(u8, 0);
-    g_base = cast(*u8, &g_base_buf[0]);
-    if (collect(path) != 0) { prog.outs("ls: "); prog.outs(path); prog.outs(": cannot open\n"); return cast(i32, 1); }
-    if (header == 1) { prog.outs(path); prog.outs(":\n"); }
-    sort_entries();
-    if ((g_fl & FL_L) != 0) { print_long(); } else { print_short(); }
-    if ((g_fl & FL_R) != 0) {
-        let is [8192]u8 as subn; let is [256]i64 as suboff; let is [256]i64 as subnl;
-        let is i64 as subc with mut = 0; let is i64 as subu with mut = 0; let is i64 as i with mut = 0;
-        while (i < g_count) {
-            if (g_dir[i] != 0 && fu.is_dot(ename(i), prog.slen(ename(i))) == 0 && subc < 256) {
-                let is *u8 as nm = ename(i); let is i64 as ln = prog.slen(nm);
-                if (subu + ln + 1 <= 8192) { suboff[subc] = subu; let is i64 as k with mut = 0; while (k < ln) { subn[subu] = nm[k]; subu = subu + 1; k = k + 1; } subn[subu] = cast(u8, 0); subu = subu + 1; subnl[subc] = ln; subc = subc + 1; }
-            }
-            i = i + 1;
+    print_entries(1);
+    if ((g_fl & FL_R) == 0) { return; }
+    // The directories to go into, in the order listed, kept apart: the entries
+    // are reused by each of them.
+    let is fu.Line as subs;
+    subs.va = 0; subs.cap = 0; subs.len = 0; subs.nl = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as nsub with mut = 0;
+    while (i < g_count) {
+        if (ent(i).dir != 0 && fu.is_dot(ename(i), ent(i).len) == 0) {
+            let is i64 as ln = ent(i).len;
+            room(&subs, subs.len + ln + 1);
+            let is *u8 as d = cast(*u8, subs.va);
+            let is i64 as k with mut = 0;
+            let is *u8 as en = ename(i);
+            while (k < ln) { d[subs.len + k] = en[k]; k = k + 1; }
+            d[subs.len + ln] = cast(u8, 0);
+            subs.len = subs.len + ln + 1;
+            nsub = nsub + 1;
         }
-        let is i64 as k with mut = 0;
-        while (k < subc) {
-            let is [512]u8 as child;
-            let is i64 as clen = fu.path_join(cast(*u8, &child[0]), path, plen, cast(*u8, cast(i64, &subn[0]) + suboff[k]), subnl[k]);
-            prog.out("\n", 1); list_dir(cast(*u8, &child[0]), clen, 1); k = k + 1;
-        }
+        i = i + 1;
     }
-    return 0;
+    let is i64 as at with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < nsub) {
+        let is *u8 as nm = cast(*u8, subs.va + at);
+        let is i64 as ln = prog.slen(nm);
+        let is [512]u8 as cshown;
+        let is [512]u8 as cpath;
+        fu.path_join(cast(*u8, &cshown[0]), shown, prog.slen(shown), nm, ln);
+        fu.path_join(cast(*u8, &cpath[0]), path, prog.slen(path), nm, ln);
+        prog.out("\n", 1);
+        list_dir(cast(*u8, &cshown[0]), cast(*u8, &cpath[0]), 1, 0);
+        at = at + ln + 1;
+        s = s + 1;
+    }
+    fu.line_free(&subs);
 }
 
 fn set_color(v as *u8) as void {
-    if (streq(v, "never") == 1) { g_color = 0; }
-    else if (streq(v, "auto") == 1) { g_color = 2; }     // decided once it is known where the output goes
-    else { g_color = 1; }                                 // always (and the bare --color)
+    if (streq(v, "never") == 1 || streq(v, "no") == 1 || streq(v, "none") == 1) { g_color = 0; }
+    else if (streq(v, "auto") == 1 || streq(v, "tty") == 1 || streq(v, "if-tty") == 1) { g_color = 2; }
+    else { g_color = 1; }                                 // always, yes, force (and the bare --color)
+}
+
+fn set_sort(v as *u8) as i64 {
+    if (streq(v, "name") == 1) { g_sort = SORT_NAME; }
+    else if (streq(v, "none") == 1) { g_sort = SORT_NONE; }
+    else if (streq(v, "size") == 1) { g_sort = SORT_SIZE; }
+    else if (streq(v, "time") == 1) { g_sort = SORT_TIME; }
+    else if (streq(v, "version") == 1) { g_sort = SORT_VER; }
+    else if (streq(v, "extension") == 1) { g_sort = SORT_EXT; }
+    else { return 0 - 1; }
+    return 0;
+}
+
+fn bad_opt(pre as *u8, o as *u8) as i32 {
+    prog.errs("ls: "); prog.errs(pre); prog.errs(o); prog.errs("'\n");
+    prog.errs("usage: ls [-1aAbBCdFhilmpQrRsStUvwxX] [-I PATTERN] [--color[=WHEN]] [--sort=WORD] [FILE]...\n");
+    return cast(i32, 2);
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
-    let is [256]i64 as paths; let is i64 as npath with mut = 0;
+    let is fu.Line as opers;                       // [n]*u8: the FILEs, in the order given
+    opers.va = 0; opers.cap = 0; opers.len = 0; opers.nl = 0;
+    let is i64 as nop with mut = 0;
+    let is i64 as done with mut = 0;
     let is i64 as i with mut = 1;
     while (i < argc) {
         let is *u8 as a = prog.arg(argv, i);
-        if (a[0] == 45 && a[1] != 0) {                         // an option
+        if (done == 0 && a[0] == 45 && a[1] == 45 && a[2] == 0) { done = 1; }
+        else if (done == 0 && a[0] == 45 && a[1] != 0) {      // an option
             if (a[1] == 45) {                                  // long option
                 let is *u8 as o = cast(*u8, cast(i64, a) + 2);
                 if (streq(o, "all") == 1) { g_fl = g_fl | FL_A; }
@@ -349,7 +587,16 @@ fn main(argc as i64, argv as *u8) as i32 {
                 else if (streq(o, "group-directories-first") == 1) { g_gdf = 1; }
                 else if (streq(o, "reverse") == 1) { g_fl = g_fl | FL_r; }
                 else if (streq(o, "human-readable") == 1) { g_fl = g_fl | FL_H; }
-                else { prog.outs("ls: unknown option --"); prog.outs(o); prog.out("\n", 1); return cast(i32, 1); }
+                else if (streq(o, "kibibytes") == 1) { }
+                else if (streq(o, "directory") == 1) { g_fl = g_fl | FL_D; }
+                else if (streq(o, "recursive") == 1) { g_fl = g_fl | FL_R; }
+                else if (streq(o, "classify") == 1) { g_fl = g_fl | FL_F; }
+                else if (streq(o, "ignore-backups") == 1) { g_fl = g_fl | FL_B; }
+                else if (starts(o, "ignore=") == 1) { g_ignore = cast(*u8, cast(i64, o) + 7); }
+                else if (starts(o, "sort=") == 1) {
+                    if (set_sort(cast(*u8, cast(i64, o) + 5)) != 0) { return bad_opt("invalid argument to --sort: '", cast(*u8, cast(i64, o) + 5)); }
+                }
+                else { return bad_opt("unrecognized option '--", o); }
             } else {                                           // short flags (grouped)
                 let is i64 as j with mut = 1; let is i64 as stop with mut = 0;
                 while (a[j] != 0 && stop == 0) {
@@ -370,28 +617,42 @@ fn main(argc as i64, argv as *u8) as i32 {
                     else if (c == 112) { g_fl = g_fl | FL_P; }
                     else if (c == 81) { g_fl = g_fl | FL_Q; }
                     else if (c == 66) { g_fl = g_fl | FL_B; }
-                    else if (c == 83) { g_sort = 1; }          // -S size
-                    else if (c == 88) { g_sort = 2; }          // -X extension
-                    else if (c == 85) { g_sort = 3; }          // -U none
-                    else if (c == 118) { g_sort = 4; }         // -v natural
-                    else if (c == 119) {                       // -w COLS
-                        let is *u8 as rest = cast(*u8, cast(i64, a) + j + 1);
-                        if (rest[0] != 0) { g_width = atoi(rest); } else { i = i + 1; if (i < argc) { g_width = atoi(prog.arg(argv, i)); } } stop = 1;
-                        g_width_set = 1;
+                    else if (c == 115) { g_fl = g_fl | FL_S; }
+                    else if (c == 107) { }                     // -k: blocks are 1 KiB already
+                    else if (c == 83) { g_sort = SORT_SIZE; }
+                    else if (c == 116) { g_sort = SORT_TIME; }
+                    else if (c == 88) { g_sort = SORT_EXT; }
+                    else if (c == 85) { g_sort = SORT_NONE; }
+                    else if (c == 118) { g_sort = SORT_VER; }
+                    else if (c == 119 || c == 73) {            // -w COLS, -I PATTERN
+                        let is *u8 as rest with mut = cast(*u8, cast(i64, a) + j + 1);
+                        if (rest[0] == 0) {
+                            i = i + 1;
+                            if (i >= argc) {
+                                let is [2]u8 as ob; ob[0] = cast(u8, c); ob[1] = cast(u8, 0);
+                                prog.errs("ls: option requires an argument -- '"); prog.errs(cast(*u8, &ob[0])); prog.errs("'\n");
+                                return cast(i32, 2);
+                            }
+                            rest = prog.arg(argv, i);
+                        }
+                        if (c == 119) { g_width = atoi(rest); g_width_set = 1; } else { g_ignore = rest; }
+                        stop = 1;
                     }
-                    else if (c == 73) {                        // -I PATTERN
-                        let is *u8 as rest = cast(*u8, cast(i64, a) + j + 1);
-                        if (rest[0] != 0) { g_ignore = rest; } else { i = i + 1; if (i < argc) { g_ignore = prog.arg(argv, i); } } stop = 1;
+                    else {
+                        let is [2]u8 as bb; bb[0] = cast(u8, c); bb[1] = cast(u8, 0);
+                        return bad_opt("invalid option -- '", cast(*u8, &bb[0]));
                     }
-                    else { prog.outs("ls: bad option -"); let is [2]u8 as bb; bb[0] = cast(u8, c); bb[1] = cast(u8, 0); prog.outs(cast(*u8, &bb[0])); prog.out("\n", 1); return cast(i32, 1); }
                     j = j + 1;
                 }
             }
-        } else { if (npath < 256) { paths[npath] = cast(i64, a); npath = npath + 1; } }
+        } else {
+            room(&opers, (nop + 1) * 8);
+            let is *i64 as op = cast(*i64, opers.va);
+            op[nop] = cast(i64, a); nop = nop + 1;
+        }
         i = i + 1;
     }
-    // Where the output goes, and how wide it is there. It assumed 80 columns
-    // whatever the window was, and laid a grid out for a pipe as well.
+    // Where the output goes, and how wide it is there.
     let is i64 as tcols with mut = 0;
     let is i64 as trows with mut = 0;
     if (tty.size(&tcols, &trows) == 0) {
@@ -399,15 +660,104 @@ fn main(argc as i64, argv as *u8) as i32 {
         if (g_width_set == 0) { g_width = tcols; }
     }
     if (g_color == 2) { g_color = g_tty; }
-    let is i32 as rc with mut = 0;
-    if (npath == 0) { return list_dir("/", 1, 0); }
-    let is i64 as multi with mut = 0; if (npath > 1) { multi = 1; }
+    if (g_width < 1) { g_width = 1; }
+
+    if (nop == 0) {
+        if ((g_fl & FL_D) != 0) {
+            reset_entries();
+            add_entry(".", 1, 1, 0, 0, 0, fu.statx_mtime("/"));
+            print_entries(0);
+            return 0;
+        }
+        let is i64 as hdr with mut = 0;
+        if ((g_fl & FL_R) != 0) { hdr = 1; }
+        list_dir("/", "/", hdr, 1);
+        return cast(i32, g_status);
+    }
+
+    // The FILEs: what each is. Those that are not directories (all of them,
+    // with -d) are listed together first; the directories after, sorted.
+    let is fu.Line as dirs;                        // [ndir]*u8, the names as given
+    dirs.va = 0; dirs.cap = 0; dirs.len = 0; dirs.nl = 0;
+    let is i64 as ndir with mut = 0;
+    reset_entries();
     let is i64 as k with mut = 0;
-    while (k < npath) {
-        let is [256]u8 as pb; let is *u8 as path = prog.abspath(cast(*u8, paths[k]), cast(*u8, &pb[0]));
-        let is i32 as r = list_dir(path, prog.slen(path), multi);
-        if (r != 0) { rc = r; }
+    while (k < nop) {
+        let is *i64 as opv = cast(*i64, opers.va);
+        let is *u8 as name = cast(*u8, opv[k]);
+        let is [256]u8 as pb;
+        let is *u8 as path = prog.abspath(name, cast(*u8, &pb[0]));
+        let is [5]i64 as sx;
+        let is i32 as src = sys.statx(path, cast(*u8, &sx[0]));
+        if (src != 0) {
+            cannot("cannot access", name, cast(i64, src));
+            g_status = 2;
+        } else if (sx[3] != 0 && (g_fl & FL_D) == 0) {
+            room(&dirs, (ndir + 1) * 8);
+            let is *i64 as dp = cast(*i64, dirs.va);
+            dp[ndir] = cast(i64, name); ndir = ndir + 1;
+        } else {
+            add_entry(name, prog.slen(name), sx[3], sx[0], sx[1], sx[2], sx[4]);
+        }
         k = k + 1;
     }
-    return rc;
+    let is i64 as nfiles = g_count;
+    if (nfiles > 0) { print_entries(0); }
+    // the directories, in the listing's order: sort them as entries, by name
+    // as given (and by the other keys, which a directory has too)
+    if (ndir > 0) {
+        reset_entries();
+        let is i64 as d with mut = 0;
+        while (d < ndir) {
+            let is *i64 as dv = cast(*i64, dirs.va);
+            let is *u8 as name = cast(*u8, dv[d]);
+            let is [256]u8 as pb2;
+            let is *u8 as path = prog.abspath(name, cast(*u8, &pb2[0]));
+            let is [5]i64 as sx2;
+            sys.statx(path, cast(*u8, &sx2[0]));
+            add_entry(name, prog.slen(name), 1, sx2[0], sx2[1], sx2[2], sx2[4]);
+            d = d + 1;
+        }
+        let is i64 as save_gdf = g_gdf;
+        g_gdf = 0;
+        sort_entries();
+        g_gdf = save_gdf;
+        // their names, out of the entries before the first listing reuses them
+        let is fu.Line as order_buf;
+        order_buf.va = 0; order_buf.cap = 0; order_buf.len = 0; order_buf.nl = 0;
+        room(&order_buf, ndir * 8);
+        let is i64 as q with mut = 0;
+        while (q < ndir) {
+            // the entry's name is a copy of the operand: find the operand itself
+            let is *u8 as en = ename(q);
+            let is i64 as f with mut = 0;
+            let is i64 as found with mut = 0;
+            while (f < ndir && found == 0) {
+                let is *i64 as dv2 = cast(*i64, dirs.va);
+                let is *u8 as cand = cast(*u8, dv2[f]);
+                if (streq(cand, en) == 1) { found = cast(i64, cand); }
+                f = f + 1;
+            }
+            let is *i64 as ob = cast(*i64, order_buf.va);
+            ob[q] = found;
+            q = q + 1;
+        }
+        let is i64 as header with mut = 0;
+        if (nop > 1 || (g_fl & FL_R) != 0) { header = 1; }
+        q = 0;
+        while (q < ndir) {
+            let is *i64 as ob2 = cast(*i64, order_buf.va);
+            let is *u8 as name = cast(*u8, ob2[q]);
+            let is [256]u8 as pb3;
+            let is *u8 as ap = prog.abspath(name, cast(*u8, &pb3[0]));
+            let is [256]u8 as apc;
+            let is i64 as z with mut = 0;
+            while (ap[z] != 0) { apc[z] = ap[z]; z = z + 1; }
+            apc[z] = cast(u8, 0);
+            if (nfiles > 0 || q > 0) { prog.out("\n", 1); }
+            list_dir(name, cast(*u8, &apc[0]), header, 1);
+            q = q + 1;
+        }
+    }
+    return cast(i32, g_status);
 }
