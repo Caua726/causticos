@@ -20,6 +20,8 @@ Profile directives, one per line:
   include <profile>                    splice another profile in here
   bin <target> [as <guestpath>]        ship userspace/build/<target>.cse
                                        (default guest path /<target>.cse)
+  tool <target> <guestpath>            ship the output of a target in the TOP
+                                       Causticfile (the toolchain, cross-built)
   init <target>                        ship it as /init.cse — what the kernel launches
   file <hostpath> <guestpath>          copy a host file
   text <guestpath> <content...>        literal content (\\n and \\t honoured)
@@ -32,12 +34,19 @@ Profile directives, one per line:
 Later writes win, so a profile can override something it included — which is how
 `verify` replaces base's greeting with the exact 27-byte string the kernel's
 self-test checks for.
+
+A `tool` is built by `caustic-mk run build` (scripts/build-tools.sh asks this
+script which ones with --tools) and must be up to date when it is packed: the
+`dev` profile ships the compiler beside the /std it compiles against, and a
+compiler older than that /std is a compiler that fails on it. Packing used to
+take whatever build/caustic.cse a months-old bootstrap had left behind.
 """
 
 import argparse
 import fnmatch
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -124,10 +133,31 @@ class Item:
         self.content = content    # bytes
 
 
+def tool_staleness(root, name):
+    """None when caustic-mk calls `name`'s output up to date, else its reason.
+
+    caustic-mk is asked rather than mtimes compared here: an output is stale
+    when anything in its source's IMPORT CLOSURE is newer, the closure is only
+    known to the compiler, and `caustic-mk why` already runs the same check a
+    build does."""
+    try:
+        r = subprocess.run(["caustic-mk", "why", name], cwd=root,
+                           capture_output=True, text=True)
+    except OSError as e:
+        return "caustic-mk could not be run to check it ({})".format(e)
+    if r.returncode == 0:
+        return None
+    lines = [" ".join(l.split()) for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+    return "; ".join(lines[1:]) or "caustic-mk says it needs a rebuild"
+
+
 class Resolver:
-    def __init__(self, root, targets, env):
+    def __init__(self, root, targets, env, tools=None, mode="build"):
         self.root = root
         self.targets = targets
+        self.tools = tools or {}  # top Causticfile: target -> out path
+        self.mode = mode          # "build" | "list" | "tools"
+        self.tool_names = []      # the top-level targets this profile ships
         self.env = env
         self.items = {}           # guest path -> Item (later writes win)
         self.order = []           # insertion order, for stable listing
@@ -180,6 +210,9 @@ class Resolver:
     def _directive(self, line, chain, optional=False):
         word, _, rest = line.partition(" ")
         rest = rest.strip()
+        # --tools runs BEFORE the tools exist, to say which ones to build: a
+        # missing input is the question it answers, not an error.
+        optional = optional or self.mode == "tools"
 
         if word == "opt":
             if not rest:
@@ -204,6 +237,13 @@ class Resolver:
             if len(parts) == 1:
                 return self._bin(parts[0], "/" + parts[0] + ".cse", optional)
             raise ValueError("bin <target> [as <guestpath>]")
+
+        if word == "tool":
+            name, rest2 = take_token(rest)
+            guest, extra = take_token(rest2)
+            if not name or not guest or extra:
+                raise ValueError("tool <target> <guestpath>")
+            return self._tool(name, guest, optional)
 
         if word == "file":
             hostrel, rest2 = take_token(rest)
@@ -257,6 +297,38 @@ class Resolver:
                 "in userspace/ first".format(name, os.path.relpath(host, self.root)))
         with open(host, "rb") as fh:
             self._put(Item("file", guest, os.path.relpath(host, self.root), fh.read()))
+
+    def _build_cmd(self):
+        top = self.seen_profiles[0] if self.seen_profiles else "desktop"
+        return "caustic-mk run build -- --profile {}".format(top)
+
+    def _tool(self, name, guest, optional):
+        if name not in self.tools:
+            raise ValueError(
+                "'{}' is not a target in the top Causticfile — add it there, "
+                "or fix the name".format(name))
+        if name not in self.tool_names:
+            self.tool_names.append(name)
+        if self.mode == "tools":
+            return
+        host = os.path.join(self.root, self.tools[name])
+        rel = os.path.relpath(host, self.root)
+        if not os.path.isfile(host):
+            if optional or self.mode == "list":
+                self.skipped.append("tool {} (not built)".format(name))
+                return
+            raise ValueError(
+                "{} ships {} and it is not built — `{}` builds every tool the "
+                "profile names".format(name, rel, self._build_cmd()))
+        if self.mode == "build":
+            why = tool_staleness(self.root, name)
+            if why is not None:
+                raise ValueError(
+                    "{} is older than its sources ({}) — `{}` rebuilds it; "
+                    "packing it would ship a toolchain that does not match what "
+                    "it was built from".format(rel, why, self._build_cmd()))
+        with open(host, "rb") as fh:
+            self._put(Item("file", guest, rel, fh.read()))
 
     def _mirror(self, rest, optional):
         parts = rest.split()
@@ -316,16 +388,20 @@ def main():
                     help="add a host file; guest path defaults to /<basename>. Repeatable.")
     ap.add_argument("--list", action="store_true",
                     help="resolve and print what would ship, build nothing")
+    ap.add_argument("--tools", action="store_true",
+                    help="print the top-Causticfile targets the profile ships, one per line")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args()
 
     root = repo_root()
     targets = read_causticfile_targets(os.path.join(root, "userspace", "Causticfile"))
+    tools = read_causticfile_targets(os.path.join(root, "Causticfile"))
     env = dict(os.environ)
     env.setdefault("CAUSTIC_DIR", os.path.join(os.path.dirname(root), "Caustic"))
     os.environ.setdefault("CAUSTIC_DIR", env["CAUSTIC_DIR"])
 
-    r = Resolver(root, targets, env)
+    mode = "tools" if a.tools else ("list" if a.list else "build")
+    r = Resolver(root, targets, env, tools, mode)
     try:
         r.load(a.profile)
         # Command-line overrides, applied after the profile so they win. These
@@ -342,6 +418,11 @@ def main():
             r._directive("init " + a.init, ())
     except ValueError as e:
         sys.exit("mkroot: {}".format(e))
+
+    if a.tools:
+        for name in r.tool_names:
+            print(name)
+        return 0
 
     if a.list:
         print("profile {} (includes: {})".format(a.profile, " <- ".join(r.seen_profiles)))

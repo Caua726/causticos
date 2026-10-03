@@ -1,10 +1,23 @@
-// bootstrap.cst — the CausticOS self-host bootstrap driver (runs as /init).
+// bootstrap.cst — one round of the self-host bootstrap, run as /init.
 //
-// Proves the compiler can compile + SAVE on CausticOS: it reads /caustic.cse
-// from disk, spawns it to compile /tiny.cst into /tiny.cse, waits, and reports
-// the result over serial. The host then lifts /tiny.cse off the disk image
-// (scripts/fat32_get.py) and checks the CST_ magic. This is round 0 of the
-// bootstrap; once it works, the same driver chains rounds (rN compiles rN+1).
+// scripts/bootstrap.sh boots causticos from a disk holding this as /init, the
+// round's compiler as /caustic.cse, and the compiler's own source at /src,
+// /std, /caustic-assembler and /caustic-linker. This has that compiler build
+// /src/main.cst into /out.cse — on CausticOS, as an ordinary process — and the
+// script lifts /out.cse off the disk as the next round's compiler. Every round
+// must come out byte-identical to the compiler the dev profile ships.
+//
+// The compile gets the flags the host build gave the shipped compiler: the
+// script writes them to /etc/bootstrap.args, one per line, because a flag that
+// stamps the binary (--app-version) is part of its bytes. The compiler's
+// stdout and stderr come back here over a channel and go to the serial line —
+// the only thing the script can read while the machine runs — so a failed
+// round shows the compiler's own error instead of just an exit code.
+//
+// The round ends by powering the machine off, pass or fail: that is what makes
+// the kernel write /out.cse and the FAT behind it out to the disk before the
+// script reads the image. Killing the VM at the marker could catch a file still
+// in the write-behind buffer.
 use "std/os/causticos.cst" as sys;
 
 fn slen(s as *u8) as i64 {
@@ -27,95 +40,121 @@ fn lognum(n as i64) as void {
     sys.write_serial(cast(*u8, cast(i64, &b[0]) + p + 1), 23 - p);
 }
 
-// Read a whole file into a fresh anonymous mapping. Returns the buffer (len in
-// *out_len) or 0. The mapping is sized to the file (eager commit).
-fn read_whole(path as *u8, out_len as *i64) as *u8 {
-    *out_len = 0;
-    let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { return cast(*u8, 0); }
-    let is i64 as sz = sys.lseek(fd, 0, cast(i32, sys.SEEK_END));
-    sys.lseek(fd, 0, cast(i32, sys.SEEK_SET));
-    if (sz <= 0) { sys.close(fd); return cast(*u8, 0); }
-    let is i64 as va = sys.mmap(cast(i64, 0), sz, sys.PROT_READ | sys.PROT_WRITE);
-    if (va < 0) { sys.close(fd); return cast(*u8, 0); }
-    let is *u8 as buf = cast(*u8, va);
-    let is i64 as got = sys.read(fd, buf, sz);
-    sys.close(fd);
-    *out_len = got;
-    return buf;
+fn power_off() as void {
+    sys.power_request(sys.POWER_OFF);
 }
 
-fn probe(path as *u8) as void {
-    log("probe "); log(path); log(" -> fd=");
-    let is i64 as fd = sys.open_read(path);
-    lognum(fd);
-    if (fd >= 0) {
-        let is [16]u8 as b;
-        let is i64 as n = sys.read(fd, &b, 16);
-        log(" read="); lognum(n);
-        sys.close(fd);
-    }
-    log("\n");
+fn fail(why as *u8) as i32 {
+    log("bootstrap: FAILED: "); log(why); log("\n");
+    power_off();
+    return 1;
+}
+
+// Free memory right now, in KiB — logged with each heartbeat so a round that
+// runs out says how close it came, and the script can size the machine.
+fn free_kb() as i64 {
+    let is [8]i64 as mi;
+    if (sys.mem_info(cast(*i64, &mi[0])) != 0) { return 0 - 1; }
+    return mi[1] * mi[2] / 1024;
+}
+
+// /etc/bootstrap.args, one argument per line, split in place.
+let is [1024]u8 as argsbuf with mut;
+
+// Copy what the compiler wrote to the serial line. 0 once its end is closed.
+fn drain(fd as i64) as i64 {
+    let is [3]i64 as pe;
+    pe[0] = fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+    sys.poll(cast(*i64, &pe[0]), 1, 1000000000);
+    if (pe[2] == 0) { return 1; }
+    let is [512]u8 as b;
+    let is i64 as n = sys.read(fd, cast(*u8, &b[0]), 512);
+    if (n > 0) { sys.write_serial(cast(*u8, &b[0]), n); return 1; }
+    if (n == sys.E_AGAIN) { return 1; }
+    return 0;
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
-    log("bootstrap: self-host round — compiling /src/main.cst on CausticOS\n");
+    log("bootstrap: compiling /src/main.cst on CausticOS\n");
 
-    // VFS probe: isolate kernel path-resolution from compiler logic.
-    probe("/src/main.cst");
-    probe("/std/mem.cst");
-    probe("/std/io.cst");
-    probe("/src/lexer/tokens.cst");
+    let is [64]i64 as av;
+    let is i64 as ac with mut = 0;
+    av[0] = cast(i64, "caustic");        av[1] = 7;
+    av[2] = cast(i64, "/src/main.cst");  av[3] = 13;
+    av[4] = cast(i64, "-o");             av[5] = 2;
+    av[6] = cast(i64, "/out.cse");       av[7] = 8;
+    // -q: the per-function progress would pour ~90 KB onto the serial line.
+    // --no-asm-cache: no multi-megabyte .s cache written beside the source.
+    av[8] = cast(i64, "-q");             av[9] = 2;
+    av[10] = cast(i64, "--no-asm-cache"); av[11] = 14;
+    ac = 6;
 
-    let is i64 as clen with mut = 0;
-    let is *u8 as cimg = read_whole("/caustic.cse", &clen);
-    if (cast(i64, cimg) == 0) { log("bootstrap: read /caustic.cse FAIL\n"); return 1; }
-    log("bootstrap: /caustic.cse len="); lognum(clen); log("\n");
-
-    // argv for the compiler: compile the whole compiler for the caustic target.
-    // The compiler is recursive (recursive-descent parser, DFS passes) so it
-    // declares its stack with --stack-size; everything else resolves via the
-    // source tree mirrored at /src, /std, /caustic-linker, /caustic-assembler.
-    // No --stack-size: the compiler is recursive, but it now grows its stack on
-    // demand via prologue probes (dynamic-stack), so the author never declares
-    // it. -q (quiet): the per-function "gen:" progress would otherwise pour
-    // ~90 KB onto the slow serial console and throttle the compile.
-    // --no-asm-cache: skip writing the ~MB .s cache to FAT32 — one fewer large
-    // disk write on the way out.
-    let is [14]i64 as av;
-    av[0]  = cast(i64, "caustic");                 av[1]  = 7;
-    av[2]  = cast(i64, "/src/main.cst");           av[3]  = 13;
-    av[4]  = cast(i64, "-o");                       av[5]  = 2;
-    av[6]  = cast(i64, "/out.cse");                 av[7]  = 8;
-    av[8]  = cast(i64, "--target=caustic-x86_64");  av[9]  = 23;
-    av[10] = cast(i64, "-q");                       av[11] = 2;
-    av[12] = cast(i64, "--no-asm-cache");           av[13] = 14;
-
-    log("bootstrap: spawning compiler (quiet, no-asm-cache)...\n");
-    let is i64 as pid = sys.spawn_path(cast(*u8, "/caustic.cse"), cast(*u8, 0), 0, cast(*u8, &av[0]), 7);
-    if (pid < 0) { log("bootstrap: spawn FAIL rc="); lognum(pid); log("\n"); return 1; }
-    log("bootstrap: compiler pid="); lognum(pid); log("\n");
-
-    // SYS_WAIT blocks for a bounded window (~1s) then returns E_AGAIN (-8) if the
-    // child is still running. A full self-compile takes far longer, so loop until
-    // the child is actually a zombie. r then holds its real exit code.
-    let is i64 as status with mut = 0;
-    let is i64 as r with mut = 0 - 8;
-    let is i64 as ticks with mut = 0;
-    while (r == (0 - 8)) {
-        r = sys.wait(pid, &status);
-        ticks = ticks + 1;
-        if ((ticks % 10) == 0) { log("bootstrap: still compiling... t="); lognum(ticks); log("s\n"); }
+    let is i64 as afd = sys.open_read("/etc/bootstrap.args");
+    if (afd < 0) { return fail("no /etc/bootstrap.args (the flags the shipped compiler was built with)"); }
+    let is i64 as an = sys.read(afd, cast(*u8, &argsbuf[0]), 1023);
+    sys.close(afd);
+    if (an < 0) { return fail("cannot read /etc/bootstrap.args"); }
+    argsbuf[an] = cast(u8, 0);
+    let is i64 as i with mut = 0;
+    while (i < an && ac < 32) {
+        let is i64 as st = i;
+        while (i < an && argsbuf[i] != cast(u8, 10)) { i = i + 1; }
+        let is i64 as len = i - st;
+        argsbuf[i] = cast(u8, 0);
+        if (len > 0) {
+            av[ac * 2] = cast(i64, &argsbuf[st]);
+            av[ac * 2 + 1] = len;
+            log("bootstrap: flag "); sys.write_serial(cast(*u8, &argsbuf[st]), len); log("\n");
+            ac = ac + 1;
+        }
+        i = i + 1;
     }
-    log("bootstrap: compiler exited code="); lognum(r); log("\n");
 
-    let is i64 as olen with mut = 0;
-    let is *u8 as oimg = read_whole("/out.cse", &olen);
-    if (cast(i64, oimg) == 0) { log("bootstrap: /out.cse NOT written\n"); return 1; }
-    log("bootstrap: /out.cse written len="); lognum(olen); log(" magic=");
-    sys.write_serial(oimg, 4);
-    log("\n");
+    let is [2]i64 as ch;
+    if (sys.channel_create(cast(*i64, &ch[0])) != 0) { return fail("no channel for the compiler's output"); }
+    let is [4]i64 as fda;
+    fda[0] = 1; fda[1] = ch[1];
+    fda[2] = 2; fda[3] = ch[1];
 
+    let is i64 as t0 = sys.time_ns();
+    log("bootstrap: free before the compile: "); lognum(free_kb()); log(" KB\n");
+    let is i64 as pid = sys.spawn_path("/caustic.cse", cast(*u8, &fda[0]), 2, cast(*u8, &av[0]), ac);
+    sys.close(ch[1]);
+    if (pid < 0) {
+        log("bootstrap: cannot start /caustic.cse: "); log(sys.err_text(pid)); log("\n");
+        return fail("spawn");
+    }
+
+    // Until the compiler's end of the channel closes — it exited — copy its
+    // output and say every 10 s that it is still going.
+    let is i64 as next_beat with mut = t0 + 10000000000;
+    let is i64 as low with mut = free_kb();
+    while (drain(ch[0]) == 1) {
+        let is i64 as f = free_kb();
+        if (f >= 0 && f < low) { low = f; }
+        let is i64 as now = sys.time_ns();
+        if (now >= next_beat) {
+            log("bootstrap: still compiling, "); lognum((now - t0) / 1000000000);
+            log(" s, "); lognum(f); log(" KB free\n");
+            next_beat = next_beat + 10000000000;
+        }
+    }
+    sys.close(ch[0]);
+
+    // SYS_WAIT gives up after a bounded window with E_AGAIN; the child is
+    // already gone or about to be, so this loop is short.
+    let is i64 as status with mut = 0;
+    let is i64 as r with mut = sys.E_AGAIN;
+    while (r == sys.E_AGAIN) { r = sys.wait(pid, &status); }
+    let is i64 as secs = (sys.time_ns() - t0) / 1000000000;
+    log("bootstrap: compiler exited code="); lognum(r);
+    log(" after "); lognum(secs); log(" s; least free memory "); lognum(low); log(" KB\n");
+    if (r != 0) { return fail("the compile"); }
+
+    let is [4]i64 as st2;
+    if (sys.stat("/out.cse", cast(*u8, &st2[0])) != 0) { return fail("/out.cse not written"); }
+    log("bootstrap: /out.cse written, "); lognum(st2[0]); log(" bytes\n");
     log("bootstrap: ROUND DONE\n");
+    power_off();
     return 0;
 }

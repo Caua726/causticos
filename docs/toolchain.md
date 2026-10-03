@@ -30,41 +30,47 @@ so the one-shot path and the staged path agree by construction.
 ## Self-host: the bootstrap, four rounds
 
 "It compiles itself" is easy to claim and easy to get subtly wrong. The
-bootstrap makes it falsifiable. `run-bootstrap.sh` runs the compiler *on
-causticos* and has it rebuild its own source tree:
+bootstrap makes it falsifiable. `caustic-mk run bootstrap` (scripts/bootstrap.sh)
+runs the compiler *on causticos* and has it rebuild its own source tree:
 
-1. **Seed.** The host cross-compiles `src/main.cst` to a `caustic.cse`
-   (round 0). This is the only time the host compiler is trusted.
-2. **Round k.** Boot causticos with the round-(k-1) compiler as `/caustic.cse`
-   and the full compiler source mirrored on the FAT32 disk (`/src`, `/std`,
-   `/caustic-assembler`, `/caustic-linker`). A tiny driver (`init.cse`,
-   `userspace/bootstrap.cst`) runs `caustic /src/main.cst -o /out.cse` *inside
-   the OS*. The host lifts `/out.cse` back off the disk image — that is round
-   k's compiler.
-3. **Converge.** Repeat for four rounds. If every round is byte-identical to the
-   seed (same md5), the compiler running on causticos reproduces itself exactly.
-   That is self-host.
+1. **The shipped compiler.** The `dev` profile ships `build/caustic.cse`, which
+   `caustic-mk run build -- --profile dev` cross-builds on the host from
+   `$CAUSTIC_DIR` (the `caustic-cse` target) — the same checkout the profile
+   mirrors as `/src` and `/std`, so the compiler on the image and the stdlib
+   beside it always come from one tree. Packing refuses a compiler older than
+   its sources.
+2. **Round k.** Boot causticos from a disk holding the round-(k-1) compiler as
+   `/caustic.cse` (the shipped one for round 1) and the compiler's source
+   (`/src`, `/std`, `/caustic-assembler`, `/caustic-linker`). The round driver
+   (`/init`, `userspace/tests/bootstrap.cst`) runs
+   `caustic /src/main.cst -o /out.cse` *inside the OS*, with the flags the host
+   build used (read from `caustic-mk build caustic-cse --dry-run`, since
+   `--app-version` stamps the binary), then powers the machine off — which is
+   what writes `/out.cse` to the disk. The host lifts it off the image: that is
+   round k's compiler.
+3. **Compare.** Every round must be byte-identical to the shipped compiler.
+   Round 1 shows causticos reproduces the binary it ships; rounds 2-4 that it
+   keeps doing so from its own output, boot after boot.
 
-The binary we keep — `build/caustic.cse` — is the one that came *out of the VM*,
-not the host seed. The host only bootstraps trust; the shipped compiler is the
-OS's own work. The same rule holds for the standalone tools: the honest way to
-obtain `caustic-as.cse` / `caustic-ld.cse` is to compile them on causticos with
-the converged compiler, not to trust a host cross-build.
+So the host build is not trusted, it is checked: the day the cross-built
+compiler and the one causticos makes of itself differ, the bootstrap fails and
+names the first differing byte. A round's serial log (`build/bootstrap/`) has
+the compiler's own output, how long the compile took, and the least free memory
+it saw.
 
 ### Why the knobs are what they are
 
-- **TCG, not KVM.** causticos' timer/scheduler is reliable under TCG; under KVM
-  the real-hardware timing can stall the scheduler under a sustained compute
-  load. KVM boots (`BOOT_KVM=1`) but is not the validated path. TCG is ~10×
-  slower — hence the long per-round bound.
-- **`-smp 2`.** The compile is single-threaded, but the driver needs a CPU to
-  reap the child and print heartbeats. On `-smp 1` a flat-out compute thread can
-  starve it for minutes.
-- **`--no-asm-cache`.** One fewer FAT32 write path to exercise per build; the
-  on-disk asm cache buys nothing for a single compile.
-- **Fresh disk + fresh snapshot each run.** A toolchain edit must never be
-  measured against a stale snapshot — that trap silently builds the seed from
-  old source. `REUSE=1` opts out when you know the source is unchanged.
+- **KVM when the host has it.** A round compiles the whole compiler in about
+  half a minute under KVM, about ten times that under TCG (`--tcg` forces it).
+- **256M.** The compile's low point is about 121 MB below the memory free when
+  it started; 256M leaves it room. A 64M desktop compiles small programs but
+  cannot rebuild the compiler.
+- **`-smp 2`.** The compile is single-threaded; the driver needs a cpu of its
+  own to copy the compiler's output to the serial line while it runs.
+- **`--no-asm-cache`.** No multi-megabyte `.s` cache written beside the source;
+  a single compile gains nothing from it.
+- **A fresh disk each round**, built by `mkroot.py --profile dev --init
+  bootstrap`, so no round can read what another left behind.
 
 ## Build and seed
 
@@ -98,8 +104,9 @@ caustic-ld --target=caustic-x86_64 hello.cst.s.o -o /hello.cse
 
 This staged path is proven on-device: `caustic-as` and `caustic-ld` run as
 ring-3 programs, the object and the executable land on the FAT32 disk, and the
-resulting `.cse` runs. Build the standalone tools with `caustic-mk build caustic-as-cse` and `caustic-mk build caustic-ld-cse`
-(the canonical build is on the VM, with the converged compiler — see above).
+resulting `.cse` runs. `caustic-mk run build -- --profile dev` builds the
+standalone tools along with the compiler (the `caustic-as-cse` and
+`caustic-ld-cse` targets), from the same `$CAUSTIC_DIR`.
 
 Paths are absolute — causticos has no cwd. A program's "own path" is just the
 argv[0] its spawner chose; the kernel never resolves it.
@@ -122,11 +129,12 @@ the manifest before you get that far.
 ## Validating
 
 `caustic-mk run verify` boots the shipped kernel on 1, 2 and 4 cpus through
-three gates — the live ISO with no disk, a scratch disk with the FAT32 write
-suite, and the `smoke` command line, where every in-kernel smoke has to report
-PASS and none may say FAIL — and reports which markers were missing when one
-fails. `--runs N` repeats each configuration to hunt an intermittent. It works entirely
+four gates — the live ISO with no disk, a scratch disk with the FAT32 write
+suite, the `smoke` command line, where every in-kernel smoke has to report
+PASS and none may say FAIL, and the live ISO again under UEFI firmware — and
+reports which markers were missing when one fails. `--runs N` repeats each configuration to hunt an intermittent. It works entirely
 under `build/verify/`, so it is safe to run while a VM holds `build/disk.img`.
 
 The strongest check for anything touching the toolchain is still the four-round
-bootstrap above: if it converges byte-identically, the OS still builds itself.
+bootstrap above, `caustic-mk run bootstrap`: if every round is byte-identical to
+the shipped compiler, the OS still builds itself.
