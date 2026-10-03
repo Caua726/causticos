@@ -34,6 +34,7 @@ let is i32 as USAGE_KERNEL      = 1;
 let is i32 as USAGE_PAGE_TABLE  = 2;
 let is i32 as USAGE_KERNEL_HEAP = 3;
 let is i32 as USAGE_BOOT_RESERVED = 5;
+let is i32 as USAGE_LOADED      = 6;   // the kernel image and the modules loaded with it
 
 // frame_meta[pfn] — one u8 per page (1 byte), down from the 12-byte
 // PageInfo (12x less resident: ~384KB -> ~32KB in 128MB). The block's
@@ -43,7 +44,7 @@ let is i32 as USAGE_BOOT_RESERVED = 5;
 // vmm.validate_pt_page must recover from a pfn:
 //   bits [1:0]  state  (ABSENT / FREE / ALLOCATED / RESERVED)
 //   bit  [2]    head   (1 = head of a buddy block; 0 = tail)
-//   bits [5:3]  usage  (NONE / KERNEL / PAGE_TABLE / KERNEL_HEAP / BOOT_RESERVED)
+//   bits [5:3]  usage  (NONE / KERNEL / PAGE_TABLE / KERNEL_HEAP / BOOT_RESERVED / LOADED)
 let is i32 as FM_STATE_SHIFT = 0;
 let is i32 as FM_HEAD_SHIFT  = 2;
 let is i32 as FM_USAGE_SHIFT = 3;
@@ -269,7 +270,15 @@ let is [1024]u8 as mb_boot_raw;
 let is i64 as mb_boot_count with mut = 0;
 let is i64 as mb_boot_dropped with mut = 0;   // bytes past MEMBLOCK_MAX entries
 let is i64 as boot_held_pages with mut = 0;
-let is i64 as boot_reclaimed_pages with mut = 0;
+let is i64 as boot_reclaimed_pages with mut = 0;   // bootloader memory and modules handed back
+
+// What the bootloader loaded: the kernel image and the modules beside it. Never
+// usable RAM as such, but given frame_meta (RESERVED, USAGE_LOADED) so that a
+// module whose contents have been consumed — the live root, once expanded —
+// can be handed to the allocator (give_back_loaded).
+let is [1024]u8 as mb_loaded_raw;
+let is i64 as mb_loaded_count with mut = 0;
+let is i64 as loaded_back_pages with mut = 0;
 let is i64 as mb_frozen with mut = 0;
 
 let is i64 as mb_bump with mut = 0;
@@ -347,7 +356,8 @@ fn kernel_image_bytes() as i64 {
         total = total + mb_res_get(r, 1);
         r = r + 1;
     }
-    return total;
+    // A module handed back (the live root's container) is free memory now.
+    return total - loaded_back_pages * PAGE_SIZE;
 }
 
 fn mb_mem_set(idx as i64, base as i64, len as i64) as void {
@@ -389,6 +399,22 @@ fn mb_add_boot(base as i64, len as i64) as void {
         mb_boot_count = mb_boot_count + 1;
     } else {
         mb_boot_dropped = mb_boot_dropped + len;
+    }
+}
+
+fn mb_loaded_get(idx as i64, field as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &mb_loaded_raw) + idx * 16);
+    return p[field];
+}
+
+// Past the table's end a range simply stays without frame_meta: nothing in it
+// can be handed back, which is a loss, not an error.
+fn mb_add_loaded(base as i64, len as i64) as void {
+    if (mb_loaded_count < MEMBLOCK_MAX) {
+        let is *i64 as p = cast(*i64, cast(i64, &mb_loaded_raw) + mb_loaded_count * 16);
+        p[0] = base;
+        p[1] = len;
+        mb_loaded_count = mb_loaded_count + 1;
     }
 }
 
@@ -599,6 +625,7 @@ fn parse_mmap() as void {
         }
         if (t == limine.MMAP_KERNEL_AND_MODULES) {
             mb_add_res(base, len);
+            mb_add_loaded(base, len);
         }
         i = i + 1;
     }
@@ -750,11 +777,16 @@ fn init_sections() as void {
         section_cover(mb_mem_get(i, 0), mb_mem_get(i, 1));
         i = i + 1;
     }
-    // The bootloader's ranges are RAM too, and get their frame_meta now:
-    // mb_alloc is frozen by the time they are handed back.
+    // The bootloader's ranges and what it loaded are RAM too, and get their
+    // frame_meta now: mb_alloc is frozen by the time any of it is handed back.
     i = 0;
     while (i < mb_boot_count) {
         section_cover(mb_boot_get(i, 0), mb_boot_get(i, 1));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < mb_loaded_count) {
+        section_cover(mb_loaded_get(i, 0), mb_loaded_get(i, 1));
         i = i + 1;
     }
 }
@@ -783,6 +815,18 @@ fn addr_in_boot(phys as i64) as i32 {
     while (m < mb_boot_count) {
         let is i64 as bbase = mb_boot_get(m, 0);
         if (phys >= bbase && phys < bbase + mb_boot_get(m, 1)) {
+            return cast(i32, 1);
+        }
+        m = m + 1;
+    }
+    return cast(i32, 0);
+}
+
+fn addr_in_loaded(phys as i64) as i32 {
+    let is i64 as m with mut = 0;
+    while (m < mb_loaded_count) {
+        let is i64 as lbase = mb_loaded_get(m, 0);
+        if (phys >= lbase && phys < lbase + mb_loaded_get(m, 1)) {
             return cast(i32, 1);
         }
         m = m + 1;
@@ -841,6 +885,9 @@ fn init_pageinfo() as void {
                         ppages = ppages + cast(i32, 1);
                         page_set(pfn, PAGE_RESERVED, USAGE_BOOT_RESERVED, cast(i32, 0), cast(i32, 0));
                         boot_n = boot_n + 1;
+                    } else if (addr_in_loaded(phys) != cast(i32, 0)) {
+                        ppages = ppages + cast(i32, 1);
+                        page_set(pfn, PAGE_RESERVED, USAGE_LOADED, cast(i32, 0), cast(i32, 0));
                     }
                 }
                 p = p + cast(i32, 1);
@@ -1347,13 +1394,13 @@ fn free_pages(pfn as i32, order as i32) as void {
 // Handing the bootloader's memory over
 // ============================================================
 
-// Is every page of [pfn, pfn+n) still the bootloader's, untouched?
-fn boot_held_run(pfn as i32, n as i32) as i32 {
+// Is every page of [pfn, pfn+n) still reserved under `usage`, untouched?
+fn held_run(pfn as i32, n as i32, usage as i32) as i32 {
     let is i32 as i with mut = 0;
     while (i < n) {
         if (page_present(pfn + i) == cast(i32, 0)) { return cast(i32, 0); }
         let is i32 as m = frame_meta_read(pfn + i);
-        if (fm_state(m) != PAGE_RESERVED || fm_usage(m) != USAGE_BOOT_RESERVED) {
+        if (fm_state(m) != PAGE_RESERVED || fm_usage(m) != usage) {
             return cast(i32, 0);
         }
         i = i + cast(i32, 1);
@@ -1365,16 +1412,16 @@ fn boot_held_run(pfn as i32, n as i32) as i32 {
 // with whatever free neighbour it has. The lock is taken per block, not over
 // the whole range: on a large UEFI machine the range is hundreds of megabytes,
 // and nobody should wait that long with interrupts off.
-fn give_back_range(start as i32, end as i32) as i64 {
+fn give_back_range(start as i32, end as i32, usage as i32) as i64 {
     let is i64 as n with mut = 0;
     let is i32 as pfn with mut = start;
     while (pfn < end) {
         let is i32 as ord with mut = min3(floor_log2(end - pfn), ctz(pfn), MAX_BLOCK_ORDER);
-        while (ord > cast(i32, 0) && boot_held_run(pfn, cast(i32, 1) << ord) == cast(i32, 0)) {
+        while (ord > cast(i32, 0) && held_run(pfn, cast(i32, 1) << ord, usage) == cast(i32, 0)) {
             ord = ord - cast(i32, 1);
         }
         let is i32 as bsize = cast(i32, 1) << ord;
-        if (boot_held_run(pfn, bsize) != cast(i32, 0)) {
+        if (held_run(pfn, bsize, usage) != cast(i32, 0)) {
             let is i64 as f = lock.acquire_irq(&pmm_lock);
             mark_free(pfn, ord);
             free_total = free_total + bsize;
@@ -1402,21 +1449,40 @@ fn reclaim_boot() as i64 {
         let is i64 as end = base + mb_boot_get(i, 1);
         let is i32 as sp = phys_to_pfn(align_up(base, PAGE_SIZE));
         let is i32 as ep = phys_to_pfn(end);
-        if (ep > sp) { n = n + give_back_range(sp, ep); }
+        if (ep > sp) { n = n + give_back_range(sp, ep, USAGE_BOOT_RESERVED); }
         i = i + 1;
     }
     mb_boot_count = 0;
 
+    boot_held_pages = 0;
+    grew(n);
+    return n;
+}
+
+// The pool grew by `n` pages handed back after boot: count them as memory, and
+// resize the reserves, which are a fraction of the pool.
+fn grew(n as i64) as void {
     let is i64 as f = lock.acquire_irq(&pmm_lock);
     boot_reclaimed_pages = boot_reclaimed_pages + n;
-    boot_held_pages = 0;
-    // The reserves are a fraction of the pool, and the pool just grew.
     let is i32 as res with mut = free_total >> cast(i32, 7);
     if (res < cast(i32, 16)) { res = cast(i32, 16); }
     if (res > free_total) { res = cast(i32, 0); }
     min_reserve = res;
     atomic_reserve = res >> cast(i32, 2);
     lock.release_irq(&pmm_lock, f);
+}
+
+// A module the bootloader loaded, consumed and no longer read: its whole pages
+// go to the allocator. [phys, phys+len) must be one the bootloader loaded —
+// pages outside that, or already handed back, are left alone. Returns the
+// pages handed back.
+fn give_back_loaded(phys as i64, len as i64) as i64 {
+    let is i32 as sp = phys_to_pfn(align_up(phys, PAGE_SIZE));
+    let is i32 as ep = phys_to_pfn(phys + len);
+    if (ep <= sp) { return 0; }
+    let is i64 as n = give_back_range(sp, ep, USAGE_LOADED);
+    loaded_back_pages = loaded_back_pages + n;
+    grew(n);
     return n;
 }
 
