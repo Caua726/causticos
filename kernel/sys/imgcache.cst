@@ -709,11 +709,14 @@ fn _sym(s as i64, sym as *u8, slen as i64) as i64 {
 // multi-MiB image needs a 2 MiB+ contiguous buddy block that a fragmented heap
 // can lack even with ~1 GiB free (which used to spuriously E_NOMEM a spawn).
 // kvmap only needs free pages, not a contiguous run.
-fn _slurp(f as *vfs.VfsFile, out_size as *i64) as i64 {
+//
+// 0 on failure, with *err the errno that says why.
+fn _slurp(f as *vfs.VfsFile, out_size as *i64, err as *i64) as i64 {
     let is i64 as sz = f.size;
-    if (sz <= 0 || sz > abi.SPAWN_IMG_MAX) { return 0; }
+    if (sz <= 0) { *err = abi.E_NOEXEC; return 0; }          // an empty file runs nothing
+    if (sz > abi.SPAWN_IMG_MAX) { *err = abi.E_RANGE; return 0; }
     let is i64 as buf = vmm.kvmap(sz, vmm.KV_DATA, 0, 0);
-    if (buf == 0) { return 0; }
+    if (buf == 0) { *err = abi.E_NOMEM; return 0; }
     // The file handle belongs to the CALLER, and a spawn borrows it. Read from
     // the start whatever its cursor was, and put the cursor back after — a
     // spawn that silently seeks a caller's fd to EOF is a spawn that breaks the
@@ -722,9 +725,22 @@ fn _slurp(f as *vfs.VfsFile, out_size as *i64) as i64 {
     f.offset = 0;
     let is i64 as got = vfs.read(f, cast(*u8, buf), sz);
     f.offset = saved;
-    if (got != sz) { vmm.kvunmap(buf); return 0; }
+    if (got != sz) { vmm.kvunmap(buf); *err = abi.E_IO; return 0; }
     *out_size = sz;
     return buf;
+}
+
+// Build codes the spawner can act on. Every other nonzero code from a build
+// names a check the image failed (the serial line prints it), and the caller
+// hears E_NOEXEC; these two are about the machine, not the file.
+let is i32 as RC_NOMEM     with imut = 0 - 58;   // no frames for the image
+let is i32 as RC_CACHEFULL with imut = 0 - 63;   // no cache slot for a library it imports
+
+// What a failed build means to the program that asked for it.
+fn _errno_of(rc as i32) as i64 {
+    if (rc == RC_NOMEM) { return abi.E_NOMEM; }
+    if (rc == RC_CACHEFULL) { return abi.E_MFILE; }
+    return abi.E_NOEXEC;
 }
 
 // Build a library entry from its bytes. Caller holds the lock.
@@ -806,15 +822,18 @@ fn _lay_all(s as i64, b as *u8, base_off as i64, img_size as i64,
 // Acquire a library by name: "/lib/<name>". Caller holds the lock.
 // The path is built here rather than taken from the image — the path is the
 // kernel's policy, and a library name out of a file must never name a path.
+//
+// The slot, or a negative errno: E_NOENT no such library, E_NOMEM, E_MFILE no
+// cache slot, E_NOEXEC a name that is not a library name or a broken library.
 fn _acquire_lib_locked(nm as *u8, nl as i64) as i64 {
-    if (nl <= 0 || nl > 48) { return 0 - 1; }
+    if (nl <= 0 || nl > 48) { return abi.E_NOEXEC; }
     let is [64]u8 as path;
     let is *u8 as pfx = "/lib/";
     let is i64 as i with mut = 0;
     while (i < 5) { path[i] = pfx[i]; i = i + 1; }
     let is i64 as j with mut = 0;
     while (j < nl) {
-        if (nm[j] == cast(u8, 47)) { return 0 - 1; }   // a '/' would escape /lib
+        if (nm[j] == cast(u8, 47)) { return abi.E_NOEXEC; }   // a '/' would escape /lib
         path[5 + j] = nm[j];
         j = j + 1;
     }
@@ -825,7 +844,7 @@ fn _acquire_lib_locked(nm as *u8, nl as i64) as i64 {
         serial.print("imgcache: /lib/", 15);
         serial.print(nm, nl);
         serial.println(" not found", 10);
-        return 0 - 1;
+        return abi.E_NOENT;
     }
     let is i64 as cluster = f.first_cluster;
     let is i64 as fsize   = f.size;
@@ -838,16 +857,17 @@ fn _acquire_lib_locked(nm as *u8, nl as i64) as i64 {
     }
 
     let is i64 as sz with mut = 0;
-    let is i64 as buf = _slurp(f, &sz);
+    let is i64 as err with mut = abi.E_NOEXEC;
+    let is i64 as buf = _slurp(f, &sz, &err);
     vfs.close(f);
-    if (buf == 0) { return 0 - 1; }
+    if (buf == 0) { return err; }
 
     let is i64 as s = _slot_alloc();
-    if (s < 0) { vmm.kvunmap(buf); return 0 - 1; }
+    if (s < 0) { vmm.kvunmap(buf); return abi.E_MFILE; }
     _ent_reset(s, cluster, fsize);
     let is i32 as rc = _build_csl(s, cast(*u8, buf), sz);
     vmm.kvunmap(buf);
-    if (rc != 0) { _free_locked(s); return 0 - 1; }
+    if (rc != 0) { _free_locked(s); return _errno_of(rc); }
     return s;
 }
 
@@ -1001,6 +1021,8 @@ fn _resolve_imports(s as i64, img as *u8, cst_size as i64,
         while (cur < cst_size && img[cur] != cast(u8, 0)) { cur = cur + 1; }
         if (cur >= cst_size) { return cast(i32, 0 - 50); }
         let is i64 as slot = _acquire_lib_locked(cast(*u8, &img[start]), cur - start);
+        if (slot == abi.E_NOMEM) { return RC_NOMEM; }
+        if (slot == abi.E_MFILE) { return RC_CACHEFULL; }
         if (slot < 0) { return cast(i32, 0 - 51); }
         _ent[s].libs[li] = slot;
         _ent[s].lib_n = li + 1;
@@ -1071,11 +1093,15 @@ fn _resolve_imports(s as i64, img as *u8, cst_size as i64,
 
 // Acquire the image an already-open file holds. The caller owns the VfsFile and
 // closes it; the cache keeps frames, never the handle.
+//
+// Every acquire returns the slot, or a negative errno saying why not: E_NOEXEC
+// (not an image this system runs), E_NOMEM, E_RANGE (bigger than a spawn
+// takes), E_IO, E_MFILE (every cache slot held by a live image).
 fn acquire_file(f as *vfs.VfsFile) as i64 {
-    if (cast(i64, f) == 0) { return 0 - 1; }
+    if (cast(i64, f) == 0) { return abi.E_INVAL; }
     // A file this handle has just written may still have bytes waiting in the
     // VFS write-behind buffer, and the cache keys on (first cluster, size).
-    if (vfs.flush(f) < 0) { return 0 - 1; }
+    if (vfs.flush(f) < 0) { return abi.E_IO; }
     mutex.acquire(&_lk);
     let is i64 as cluster = f.first_cluster;
     let is i64 as fsize   = f.size;
@@ -1091,11 +1117,12 @@ fn acquire_file(f as *vfs.VfsFile) as i64 {
     _misses = _misses + 1;
 
     let is i64 as sz with mut = 0;
-    let is i64 as buf = _slurp(f, &sz);
-    if (buf == 0) { mutex.release(&_lk); return 0 - 1; }
+    let is i64 as err with mut = abi.E_NOEXEC;
+    let is i64 as buf = _slurp(f, &sz, &err);
+    if (buf == 0) { mutex.release(&_lk); return err; }
 
     let is i64 as s = _slot_alloc();
-    if (s < 0) { vmm.kvunmap(buf); mutex.release(&_lk); return 0 - 1; }
+    if (s < 0) { vmm.kvunmap(buf); mutex.release(&_lk); return abi.E_MFILE; }
     _ent_reset(s, cluster, fsize);
     let is i32 as rc = _build_cse(s, cast(*u8, buf), sz);
     vmm.kvunmap(buf);
@@ -1105,7 +1132,7 @@ fn acquire_file(f as *vfs.VfsFile) as i64 {
         serial.println("", 0);
         _free_locked(s);
         mutex.release(&_lk);
-        return 0 - 1;
+        return _errno_of(rc);
     }
     mutex.release(&_lk);
     return s;
@@ -1119,14 +1146,17 @@ fn acquire_file(f as *vfs.VfsFile) as i64 {
 // Anonymous, like acquire_bytes: a segment's contents can change under us, so
 // there is no identity to key a cache entry on and nothing is ever reused.
 fn acquire_seg(priv as i64, size as i64) as i64 {
-    if (priv == 0 || size <= 0 || size > abi.SPAWN_IMG_MAX) { return 0 - 1; }
+    if (priv == 0) { return abi.E_INVAL; }
+    if (size <= 0) { return abi.E_NOEXEC; }
+    if (size > abi.SPAWN_IMG_MAX) { return abi.E_RANGE; }
     // Staged through a kernel buffer: the segment's frames hold the image at
     // arbitrary page boundaries, and the loader needs it flat to parse.
     let is i64 as buf = vmm.kvmap(size, vmm.KV_DATA, 0, 0);
-    if (buf == 0) { return 0 - 1; }
-    if (segment.seg_copy_range(priv, 0, buf, size, 0) != abi.E_OK) {
+    if (buf == 0) { return abi.E_NOMEM; }
+    let is i64 as crc = segment.seg_copy_range(priv, 0, buf, size, 0);
+    if (crc != abi.E_OK) {
         vmm.kvunmap(buf);
-        return 0 - 1;
+        return crc;
     }
     let is i64 as s = acquire_bytes(cast(*u8, buf), size);
     vmm.kvunmap(buf);
@@ -1139,7 +1169,7 @@ fn acquire_seg(priv as i64, size as i64) as i64 {
 fn acquire_bytes(buf as *u8, size as i64) as i64 {
     mutex.acquire(&_lk);
     let is i64 as s = _slot_alloc();
-    if (s < 0) { mutex.release(&_lk); return 0 - 1; }
+    if (s < 0) { mutex.release(&_lk); return abi.E_MFILE; }
     _ent_reset(s, 0, size);
     let is i32 as rc = _build_cse(s, buf, size);
     if (rc != 0) {
@@ -1148,7 +1178,7 @@ fn acquire_bytes(buf as *u8, size as i64) as i64 {
         serial.println("", 0);
         _free_locked(s);
         mutex.release(&_lk);
-        return 0 - 1;
+        return _errno_of(rc);
     }
     mutex.release(&_lk);
     return s;

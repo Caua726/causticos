@@ -28,7 +28,6 @@ use "../ttyproto/ttyproto.cst" as tty;
 let is i64 as MAX_CMDS with imut = 8;       // pipeline stages
 let is i64 as MAX_WORDS with imut = 64;
 let is i64 as BUF_CAP  with imut = 4096;    // expanded + globbed bytes
-let is i64 as IMG_CAP  with imut = 4194304; // = SPAWN_IMG_MAX
 
 // A pipeline stage: a slice of the word table plus where its ends are wired.
 struct Cmd {
@@ -784,12 +783,13 @@ fn prog_path(w as i64, out as *u8) as i64 {
     return _is_prog(out);
 }
 
-// A regular file of a size spawn accepts.
+// A file that is not a directory. Whether it is a program the kernel can run
+// is the kernel's answer, given by spawn with the reason (E_NOEXEC, E_RANGE,
+// ...); judging it here by size made an empty or oversized file "not found".
 fn _is_prog(path as *u8) as i64 {
     let is [4]i64 as st;
     if (sys.stat(path, cast(*u8, &st[0])) != 0) { return 0; }
     if (st[3] != 0) { return 0; }                  // a directory is not a command
-    if (st[0] <= 0 || st[0] > IMG_CAP) { return 0; }
     return 1;
 }
 
@@ -818,6 +818,11 @@ let is i64 as EXEC_NO_SLOT   with imut = 0 - 5;   // the job table is full
 
 let is [128]u8 as fail_word with mut;
 let is i64 as fail_wlen with mut = 0;
+// With EXEC_SPAWN: the errno the kernel gave, so the message can say WHY. A
+// spawn fails for reasons that need different fixes — a Linux binary, a full
+// memory, a file too big — and "could not start the command" named none.
+let is i64 as fail_errno with mut = 0;
+let is i64 as fail_spawned with mut = 0;          // 1 = spawn itself refused, 0 = a channel did
 
 fn _set_fail_word(p as *u8, n as i64) as void {
     let is i64 as k with mut = 0;
@@ -834,7 +839,16 @@ fn failure_text(code as i64, out as *u8) as i64 {
     let is i64 as named with mut = 1;
     if (code == EXEC_NOT_FOUND) { what = cast(*u8, ": not found"); }
     else if (code == EXEC_NO_FILE) { what = cast(*u8, ": cannot open (redirect)"); }
-    else if (code == EXEC_SPAWN) { what = cast(*u8, "could not start the command"); named = 0; }
+    else if (code == EXEC_SPAWN && fail_spawned == 1) { what = _spawn_words(fail_errno); }
+    else if (code == EXEC_SPAWN) {
+        what = cast(*u8, "could not start the command: no channel for its input or output");
+        if (fail_errno == sys.E_NOMEM) {
+            what = cast(*u8, "could not start the command: out of memory for its input or output");
+        } else if (fail_errno == sys.E_MFILE) {
+            what = cast(*u8, "could not start the command: the shell has too many files open");
+        }
+        named = 0;
+    }
     else if (code == EXEC_EMPTY) { what = cast(*u8, "syntax: | with no command on one side"); named = 0; }
     else if (code == EXEC_NO_SLOT) { what = cast(*u8, "too many jobs running; wait for one to end"); named = 0; }
     else { what = cast(*u8, "bad command"); named = 0; }
@@ -847,6 +861,20 @@ fn failure_text(code as i64, out as *u8) as i64 {
     out[n] = cast(u8, 10); n = n + 1;
     out[n] = cast(u8, 0);
     return n;
+}
+
+// Why the kernel refused to spawn a program, after its name.
+fn _spawn_words(e as i64) as *u8 {
+    if (e == sys.E_NOEXEC) {
+        return cast(*u8, ": not a program CausticOS runs (built for another system?)");
+    }
+    if (e == sys.E_NOMEM) { return cast(*u8, ": not enough free memory to start it"); }
+    if (e == sys.E_RANGE) { return cast(*u8, ": too large to run (a program is at most 4 MiB)"); }
+    if (e == sys.E_IO)    { return cast(*u8, ": could not be read from the disk"); }
+    if (e == sys.E_MFILE) { return cast(*u8, ": too many different programs are loaded"); }
+    if (e == sys.E_NOENT) { return cast(*u8, ": not found"); }
+    if (e == sys.E_ISDIR) { return cast(*u8, ": is a directory"); }
+    return cast(*u8, ": could not be started");
 }
 
 // crash_line — if job `slot` crashed, say so on t, on a line of its own, in
@@ -898,7 +926,9 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
     let is i64 as term_r with mut = 0 - 1;
     let is i64 as term_w with mut = 0 - 1;
     let is [2]i64 as ech;
-    if (sys.channel_create(&ech[0]) == 0) { term_r = ech[0]; term_w = ech[1]; }
+    fail_spawned = 0;
+    fail_errno = sys.channel_create(&ech[0]);
+    if (fail_errno == 0) { term_r = ech[0]; term_w = ech[1]; }
     else { failed = 3; }
 
     while (c < ncmd && failed == 0) {
@@ -920,7 +950,8 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     if (child_in < 0) { failed = 2; _set_fail_word(word_ptr(cmds[c].in_w), word_len(cmds[c].in_w)); }
                 } else {
                     let is [2]i64 as ich;
-                    if (sys.channel_create(&ich[0]) != 0) { failed = 3; }
+                    fail_errno = sys.channel_create(&ich[0]);
+                    if (fail_errno != 0) { failed = 3; }
                     else { keep_in = ich[0]; child_in = ich[1]; }
                 }
 
@@ -944,7 +975,8 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         if (sys.channel_create(&tch[0]) == 0) { tty_keep = tch[0]; tty_child = tch[1]; }
                     } else {
                         let is [2]i64 as och;
-                        if (sys.channel_create(&och[0]) != 0) { failed = 3; }
+                        fail_errno = sys.channel_create(&och[0]);
+                        if (fail_errno != 0) { failed = 3; }
                         else {
                             child_out = och[1];
                             if (c + 1 < ncmd) { next_read = och[0]; }   // feeds the next stage
@@ -1018,6 +1050,9 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     if (tty_child >= 0) { sys.close(tty_child); tty_child = 0 - 1; }
                     if (pid < 0) {
                         failed = 3;
+                        fail_errno = pid;
+                        fail_spawned = 1;
+                        _set_fail_word(word_ptr(cmds[c].w0), word_len(cmds[c].w0));
                         if (keep_in >= 0) { sys.close(keep_in); }
                         if (keep_out >= 0) { sys.close(keep_out); }
                         if (next_read >= 0) { sys.close(next_read); }
