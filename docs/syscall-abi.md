@@ -83,7 +83,7 @@ whatever struct it fills.
 | 35 | `PROC_KILL` | pid | 0 \| `E_NOENT` (not your child) |
 | 36 | `PROC_LIST` | entries, max | total live count (may exceed `max`) |
 | 37 | `MEM_INFO` | out | 0; `[total_pages, free_pages, page_size, committed]` |
-| 38 | `STATFS` | out | 0; `[total_bytes, free_bytes, block_size]` |
+| 38 | `STATFS` | out | 0; `[total_bytes, free_bytes, block_size, flags]`; `STATFS_VOLATILE` (1) = gone at power off |
 | 39 | `CPU_STAT` | out | ncpu; `[ncpu, busy_ns per cpu…, now_ns]`, cumulative |
 | 40 | `TIME_WALL` | out | 0; raw RTC `[year,month,day,hour,min,sec]` |
 | 41 | `POWEROFF` | | does not return — ACPI S5 |
