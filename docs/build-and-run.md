@@ -73,7 +73,8 @@ Builds kernel, userspace and ISO, then boots it.
 | `--cmdline "..."` | bake a kernel command line into the ISO |
 | `--headless` | no window; serial on stdout |
 | `--kvm` / `--no-kvm` | override the automatic choice |
-| `-m SIZE`, `--smp N` | memory (default `64M`) and cpu count (default 2) |
+| `-m SIZE`, `--smp N` | memory (default `64M`, `128M` with `--uefi`) and cpu count (default 2) |
+| `--uefi` | boot through UEFI firmware (OVMF, found by `scripts/ovmf.py`) instead of the BIOS |
 | `--persist[=PATH]` | attach a FAT32 disk and boot from **it** instead of the live root; created from the current profile if absent |
 | `--iso PATH` | boot a different ISO; implies `--no-build` |
 | `--monitor` | headless, with the QEMU monitor on `/tmp/cos-mon` and QMP on `/tmp/cos-qmp` |
@@ -82,6 +83,13 @@ The kernel command line does **not** go on a QEMU argument. `-append` only
 reaches a kernel loaded with `-kernel`, and this one is loaded by Limine off the
 ISO — so it is baked into the ISO at build time, which is what `--cmdline` does.
 Passing `-append` with a bootloader in the picture silently does nothing.
+
+UEFI needs 128 MB where the BIOS needs 64, and the difference is the loader's:
+Limine sets 64 MiB aside for the firmware before it loads anything, and OVMF is
+holding some 45 MB of its own at that point, so below about 120 MB the boot
+stops in Limine with `High memory allocator: Out of memory`. None of it is lost
+once the kernel runs — it takes the firmware's boot-time memory back — so the
+128 MB UEFI machine ends up with more free memory than the 64 MB BIOS one.
 
 ### `libvirt`
 
@@ -154,17 +162,25 @@ possible moment. The one deliberate difference: `qemu-args.sh`'s `hostfwd` for
 
 ### `verify`
 
-Two gates, both against the same kernel binary the ISO ships.
+Four gates, all against the same kernel binary the ISO ships.
 
 | Gate | What it boots | What it proves |
 |---|---|---|
 | `live` | the ISO alone, no disk on the bus | the root travels inside the image |
 | `persist` | a scratch disk, `--no-live` ISO, `selftest` command line | the AHCI driver and the FAT32 write path work |
+| `smoke` | the ISO with the `smoke` command line | the in-kernel gauntlet: memory, devices, the VFS, ring 3 |
+| `uefi` | the live ISO through OVMF, at 128M | the UEFI loader path, and the firmware's memory taken back |
+
+Every gate also requires the kernel to have taken the bootloader's memory back,
+which it does only once every cpu has left the stack it booted on. The `uefi`
+gate needs UEFI firmware on the host; without it the gate is skipped, and the
+sweep says so.
 
 ```sh
-caustic-mk run verify                              # 1,2,4 cpus x 20 boots x 2 gates
-caustic-mk run verify -- --smp 2 --runs 5          # quicker
+caustic-mk run verify                              # 1,2,4 cpus x 1 boot x 4 gates
+caustic-mk run verify -- --smp 2 --runs 5          # hunting an intermittent
 caustic-mk run verify -- --live-only --keep-logs
+caustic-mk run verify -- --uefi-only
 ```
 
 Everything it touches lives under `build/verify/` and is created per run, so it

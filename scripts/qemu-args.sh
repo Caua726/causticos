@@ -21,6 +21,7 @@
 #   QEMU_SMP    CPU count, "" → let qemu default     (default "")
 #   QEMU_PCAP   file to dump net0 traffic to, "" off (default "")
 #   QEMU_WAV    file to record guest audio into, "" off (default "")
+#   QEMU_FIRMWARE  bios|uefi                         (default bios)
 #
 # The disk defaults to NONE because the ISO carries its own root now. Attaching
 # one is something a test asks for when the disk is what it is testing.
@@ -36,6 +37,15 @@
 # the floor below which the kernel refuses the volume, and says so. 33 MiB is
 # one megabyte over it. The volume is 93% empty and that is not slack to trim:
 # a smaller FAT32 does not exist.)
+#
+# UEFI needs 128M, not 64M, and the difference is not ours to remove. Limine sets
+# 64 MiB aside for the firmware below 4 GiB before it loads anything (its UEFI
+# init_memmap, unconditionally), and OVMF itself is holding some 45 MB of boot-
+# services memory at that point; the kernel and its modules have to fit in what
+# is left. At 116M and below the loader halts with "High memory allocator: Out
+# of memory" before the kernel exists. Once booted, the kernel takes back all of
+# the firmware's boot-time memory (pmm.reclaim_boot), so a 128M UEFI machine
+# ends up with more free RAM than a 64M BIOS one, not less.
 #
 # QEMU_PCAP is the highest-leverage debugging knob in the tree: when a packet
 # doesn't arrive, open the pcap in Wireshark and read the wrong byte instead of
@@ -59,6 +69,7 @@ QEMU_ACCEL="${QEMU_ACCEL:-tcg}"
 QEMU_SMP="${QEMU_SMP:-}"
 QEMU_PCAP="${QEMU_PCAP:-}"
 QEMU_WAV="${QEMU_WAV:-}"
+QEMU_FIRMWARE="${QEMU_FIRMWARE:-bios}"
 
 # The audio backend, decided before the device line that references it and
 # spliced into QEMU_ARGS itself rather than into a second array — a second
@@ -142,6 +153,29 @@ fi
 
 if [ -n "$QEMU_SMP" ]; then
     QEMU_ARGS+=(-smp "$QEMU_SMP")
+fi
+
+# UEFI: OVMF on two flash devices, the firmware read-only and its variable
+# store. The store is the distribution's template under snapshot=on: the
+# firmware writes boot entries into it, and those writes land in a throwaway
+# overlay instead — so the template stays untouched (it is usually not ours to
+# write), parallel machines never share a store, and no copy is left behind.
+# scripts/ovmf.py finds the firmware the way libvirt does, from QEMU's own
+# descriptors.
+if [ "$QEMU_FIRMWARE" = uefi ]; then
+    if ! _ovmf="$("$PY" "$(dirname "${BASH_SOURCE[0]}")/ovmf.py")"; then
+        echo "qemu-args: UEFI asked for, and there is no firmware to boot it with" >&2
+        exit 1
+    fi
+    _ovmf_code="$(printf '%s\n' "$_ovmf" | sed -n 1p)"
+    _ovmf_vars="$(printf '%s\n' "$_ovmf" | sed -n 2p)"
+    QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=$(hostpath "$_ovmf_code")")
+    if [ -n "$_ovmf_vars" ]; then
+        QEMU_ARGS+=(-drive "if=pflash,format=raw,snapshot=on,file=$(hostpath "$_ovmf_vars")")
+    fi
+elif [ "$QEMU_FIRMWARE" != bios ]; then
+    echo "qemu-args: QEMU_FIRMWARE is '$QEMU_FIRMWARE'; it takes bios or uefi" >&2
+    exit 1
 fi
 
 if [ -n "$QEMU_PCAP" ]; then

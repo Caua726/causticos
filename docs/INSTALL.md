@@ -23,6 +23,7 @@ with it, believe `doctor`.
 | `qemu-system-x86_64` | runs it |
 | a QEMU display backend (GTK or SDL) | shows the window. **A separate package on Arch** — without it QEMU still boots, `--headless`, and refuses to open a window with an error that does not name the missing package |
 | Python 3.8+ | the image tooling (`scripts/*.py`) |
+| OVMF (optional) | UEFI firmware, for `run --uefi` and the `uefi` gate of `verify`. Found from QEMU's own firmware descriptors, so wherever the package puts it. The Windows and Homebrew builds of QEMU bundle one |
 
 Notably **not** needed: `mkfs.fat`, `qemu-img`, `mtools`, or root. The FAT32
 volume is formatted by `scripts/fat32.py`, and nothing here mounts anything.
@@ -46,6 +47,8 @@ sudo apt install limine xorriso qemu-system-x86 qemu-system-gui python3
 
 # Fedora
 sudo dnf install limine xorriso qemu-system-x86 python3   # GTK is bundled here
+
+# Optional: UEFI firmware (Arch: edk2-ovmf, Debian/Ubuntu: ovmf, Fedora: edk2-ovmf)
 ```
 
 Then the toolchain, from [the Caustic releases](https://github.com/Caua726/Caustic/releases):

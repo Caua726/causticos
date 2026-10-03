@@ -43,7 +43,7 @@ source "$(dirname "$0")/portable.sh"
 SMPS="1,2,4"
 RUNS=1
 TOUT=25
-GATES="live persist smoke"
+GATES="live persist smoke uefi"
 KEEP=0
 USE_ACCEL=0
 
@@ -59,6 +59,7 @@ usage: caustic-mk run verify -- [options]
   --live-only      only the live gate (no disk)
   --persist-only   only the persist gate (AHCI + FAT32 writes)
   --smoke-only     only the smoke gate (the in-kernel test gauntlet)
+  --uefi-only      only the uefi gate (the live ISO through OVMF, at 128M)
   --keep-logs      leave the serial logs in build/verify/ for inspection
   --kvm            use the host accelerator (default: TCG, so the sweep is
                    identical on every machine)
@@ -73,6 +74,7 @@ while [ $# -gt 0 ]; do
         --live-only) GATES="live"; shift ;;
         --persist-only) GATES="persist"; shift ;;
         --smoke-only) GATES="smoke"; shift ;;
+        --uefi-only) GATES="uefi"; shift ;;
         --keep-logs) KEEP=1; shift ;;
         --kvm) USE_ACCEL=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -129,6 +131,11 @@ SMOKE_MARKERS=(
 )
 # On the smoke boot a FAIL from any smoke fails the gate.
 SMOKE_FAIL_PATTERN="$FAIL_PATTERN|FAIL"
+# The live ISO again, through UEFI firmware instead of the BIOS: a different
+# loader path in Limine, a different memory map, and on this one the bootloader
+# hands over the firmware's boot-services memory — some 45 MB the kernel must
+# take back. 128M is the memory UEFI needs (scripts/qemu-args.sh says why).
+UEFI_MARKERS=("${LIVE_MARKERS[@]}")
 
 # Hand-counted string lengths first. One counted long sends the literal's NUL
 # and whatever follows it in rodata to the console — the NUL bytes this log
@@ -140,7 +147,17 @@ echo "verify: building the images under test"
 caustic-mk build kernel >/dev/null 2>&1 || { echo "verify: kernel build failed" >&2; exit 1; }
 (cd userspace && caustic-mk build all >/dev/null 2>&1) || { echo "verify: userspace build failed" >&2; exit 1; }
 
-case " $GATES " in *" live "*)
+# No UEFI firmware on this host is a gate that cannot run, not one that failed —
+# but it is said out loud, so a sweep never looks wider than it was.
+case " $GATES " in *" uefi "*)
+    if ! "$PY" scripts/ovmf.py >/dev/null 2>&1; then
+        echo "verify: gate uefi skipped — no UEFI firmware here (python3 scripts/ovmf.py says where it looked)"
+        GATES="$(echo " $GATES " | sed 's/ uefi / /; s/^ *//; s/ *$//')"
+    fi ;;
+esac
+[ -n "$GATES" ] || { echo "verify: no gate left to run" >&2; exit 1; }
+
+case " $GATES " in *" live "*|*" uefi "*)
     bash scripts/mkiso.sh --profile desktop --out "$WORK/live.iso" >/dev/null ;;
 esac
 case " $GATES " in *" smoke "*)
@@ -179,6 +196,8 @@ run_one() {   # run_one <gate> <smp> <index>
         cp "$WORK/pristine.img" "$disk"
     fi
     local iso="$WORK/$gate.iso"
+    local firmware=bios mem=""
+    if [ "$gate" = uefi ]; then iso="$WORK/live.iso"; firmware=uefi; mem=128M; fi
 
     # A port per run. The machine forwards a host port to the guest's httpd, and
     # twenty boots at once all asked for 18080 — nineteen of them died at startup
@@ -189,7 +208,7 @@ run_one() {   # run_one <gate> <smp> <index>
     local args
     mapfile -t args < <(
         QEMU_ISO="$iso" QEMU_DISK="$disk" QEMU_SMP="$smp" QEMU_ACCEL="$ACCEL_NAME" \
-        QEMU_HTTPD_PORT="$port" \
+        QEMU_HTTPD_PORT="$port" QEMU_FIRMWARE="$firmware" QEMU_MEM="$mem" \
         bash -c 'source scripts/qemu-args.sh; printf "%s\n" "${QEMU_ARGS[@]}"'
     )
     args+=(-serial stdio -display none)

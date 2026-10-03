@@ -18,7 +18,8 @@ caustic-mk run build      # just the build, no boot
 That is the whole loop, and it is the same on Linux, WSL and Windows. **`run`
 builds first**, so an edited source file is on the screen one command later and
 a boot never quietly shows you the previous build. A full build is about two
-seconds; the machine it boots needs 64 MB of RAM and no hardware virtualisation.
+seconds; the machine it boots needs 64 MB of RAM (128 MB under UEFI, where the
+bootloader sets 64 MiB aside for the firmware) and no hardware virtualisation.
 
 - **[docs/INSTALL.md](docs/INSTALL.md)** — what to install, per operating system
 - **[docs/WRITING-APPS.md](docs/WRITING-APPS.md)** — writing a program: terminal, window, network, audio

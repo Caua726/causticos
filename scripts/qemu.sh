@@ -17,8 +17,9 @@ cd "$(dirname "$0")/.."
 
 DISPLAY_MODE=gui
 ACCEL_WANT=tcg
-MEM=64M
+MEM=""
 SMP=2
+FIRMWARE=bios
 PERSIST=""
 ISO="build/causticos.iso"
 ISO_GIVEN=0
@@ -42,8 +43,9 @@ Builds kernel + userspace + ISO, then boots it.
   --gui               force a window
   --kvm               use hardware virtualisation when the host has it
                       (default is TCG emulation, which works everywhere)
-  -m SIZE             guest memory (default 64M)
+  -m SIZE             guest memory (default 64M; 128M with --uefi)
   --smp N             cpu count (default 2)
+  --uefi              boot through UEFI firmware (OVMF) instead of the BIOS
   --persist[=PATH]    attach a FAT32 disk and boot from it instead of the live root
                       (created from the current profile if PATH does not exist)
   --iso PATH          boot a different ISO; implies --no-build
@@ -69,6 +71,7 @@ while [ $# -gt 0 ]; do
         --kvm) ACCEL_WANT=auto; shift ;;
         --no-kvm) ACCEL_WANT=tcg; shift ;;
         -m) MEM="$2"; shift 2 ;;
+        --uefi) FIRMWARE=uefi; shift ;;
         --smp) SMP="$2"; shift 2 ;;
         --persist) PERSIST="build/disk.img"; shift ;;
         --persist=*) PERSIST="${1#*=}"; shift ;;
@@ -101,6 +104,23 @@ fi
 
 [ -f "$ISO" ] || { echo "run: $ISO missing — run 'caustic-mk run iso'" >&2; exit 1; }
 
+# The memory floor is the loader's, and it depends on the firmware: under UEFI
+# Limine sets 64 MiB aside for the firmware before loading anything, so a
+# machine below about 120 MB halts in the loader (qemu-args.sh has the numbers).
+# The default follows the firmware; a size given by hand is booted as given,
+# with a word first when it is one that will not get past the loader.
+if [ -z "$MEM" ]; then
+    if [ "$FIRMWARE" = uefi ]; then MEM=128M; else MEM=64M; fi
+elif [ "$FIRMWARE" = uefi ]; then
+    # Whole megabytes or gigabytes; anything fancier is QEMU's to judge.
+    MEM_MB="${MEM%[GgMm]}"
+    case "$MEM_MB" in ''|*[!0-9]*) MEM_MB="" ;; esac
+    case "$MEM" in *[Gg]) [ -n "$MEM_MB" ] && MEM_MB=$(( MEM_MB * 1024 )) ;; esac
+    if [ -n "$MEM_MB" ] && [ "$MEM_MB" -lt 128 ]; then
+        echo "run: UEFI with $MEM: below 128M Limine runs out of memory before the kernel loads" >&2
+    fi
+fi
+
 # KVM when it is actually usable. Passing -enable-kvm unconditionally simply
 # fails on a machine without it; TCG is ~10x slower but it works, and saying
 # which one is in use beats inferring it from the boot time.
@@ -130,8 +150,8 @@ fi
 # owns the device line — so a driver can never be exercised here and missing from
 # a test, which is how the device set drifted before it existed.
 QEMU_ISO="$ISO" QEMU_MEM="$MEM" QEMU_SMP="$SMP" QEMU_DISK="$PERSIST" \
-QEMU_ACCEL="$ACCEL"
-export QEMU_ISO QEMU_MEM QEMU_SMP QEMU_DISK QEMU_ACCEL
+QEMU_ACCEL="$ACCEL" QEMU_FIRMWARE="$FIRMWARE"
+export QEMU_ISO QEMU_MEM QEMU_SMP QEMU_DISK QEMU_ACCEL QEMU_FIRMWARE
 source "$(dirname "$0")/qemu-args.sh"
 ARGS=("${QEMU_ARGS[@]}" -serial stdio)
 
@@ -154,9 +174,9 @@ else
 fi
 
 if [ -n "$PERSIST" ]; then
-    echo "run: ${MEM} ram, ${SMP} cpu, accel=${ACCEL}, root = $PERSIST (persistent)"
+    echo "run: ${MEM} ram, ${SMP} cpu, accel=${ACCEL}, ${FIRMWARE}, root = $PERSIST (persistent)"
 else
-    echo "run: ${MEM} ram, ${SMP} cpu, accel=${ACCEL}, root = live (no disk attached)"
+    echo "run: ${MEM} ram, ${SMP} cpu, accel=${ACCEL}, ${FIRMWARE}, root = live (no disk attached)"
 fi
 
 exec qemu-system-x86_64 "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}

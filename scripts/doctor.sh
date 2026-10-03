@@ -81,6 +81,15 @@ else
     warn "acceleration" "none — using TCG (measured 3.4s to desktop vs 2.8s)"
 fi
 
+# UEFI firmware is optional — the default machine boots through the BIOS — but
+# `run --uefi` and verify's uefi gate need it, and saying so here beats finding
+# out from a skipped gate.
+if OVMF="$("$PY" scripts/ovmf.py 2>/dev/null)"; then
+    ok "uefi firmware" "$(printf '%s\n' "$OVMF" | sed -n 1p)"
+else
+    warn "uefi firmware" "none — 'run --uefi' and verify's uefi gate need OVMF (Arch: edk2-ovmf, Debian: ovmf)"
+fi
+
 PYV="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
 if [ -n "$PYV" ]; then
     if "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)'; then
