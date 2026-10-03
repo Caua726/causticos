@@ -32,6 +32,10 @@ let is i64 as POLL_FIXED with imut = 4;
 let is i64 as JOB_FREE with imut = 0;
 let is i64 as JOB_RUN  with imut = 1;
 let is i64 as JOB_DONE with imut = 2;
+// Finished and its descriptors closed, but its "[n] Done" not shown yet: it
+// ended while another program had the terminal, whose screen is not the
+// shell's to write on. The shell shows it with its next prompt (report_ended).
+let is i64 as JOB_ENDED with imut = 3;
 
 struct Job {
     status as i64;
@@ -200,7 +204,7 @@ fn cmd_len(j as i64) as i64 { return get(j).cmd_len; }
 fn find(pid as i64) as i64 {
     let is i64 as j with mut = 0;
     while (j < cap) {
-        if (get(j).status != JOB_FREE) {
+        if (get(j).status == JOB_RUN || get(j).status == JOB_DONE) {
             let is i64 as k with mut = 0;
             while (k < get(j).npids) {
                 if (get(j).pids[k] == pid) { return j; }
@@ -266,14 +270,56 @@ fn poll_events() as i64 {
 // was reaped. A spawn names its source now, so there is nothing left to hold.
 fn release(j as i64) as void {
     if (j < 0 || j >= cap) { return; }
-    let is *Job as jb = get(j);
+    _close_fds(get(j));
+    get(j).status = JOB_FREE;
+    return;
+}
+fn _close_fds(jb as *Job) as void {
     if (jb.out_fd >= 0) { sys.close(jb.out_fd); jb.out_fd = 0 - 1; }
     if (jb.in_fd >= 0)  { sys.close(jb.in_fd);  jb.in_fd = 0 - 1; }
     if (jb.aux_fd >= 0) { sys.close(jb.aux_fd); jb.aux_fd = 0 - 1; }
     if (jb.tty_fd >= 0) { sys.close(jb.tty_fd); jb.tty_fd = 0 - 1; }
     if (jb.err_fd >= 0) { sys.close(jb.err_fd); jb.err_fd = 0 - 1; }
-    jb.status = JOB_FREE;
+}
+
+// retire — a finished job whose notice must wait (JOB_ENDED): what it held is
+// closed now, the record — command, pid, exit code, crash — stays until the
+// shell has shown it and calls release.
+fn retire(j as i64) as void {
+    if (j < 0 || j >= cap) { return; }
+    _close_fds(get(j));
+    get(j).status = JOB_ENDED;
     return;
+}
+
+// How a job's line names its state: "Running", "Done", "Exit 3", "Ended" (by
+// kill or Ctrl+C), "Crashed". Into out (32 bytes), padded to 8 columns and a
+// space after; its length.
+fn state_word(j as i64, out as *u8) as i64 {
+    let is *Job as jb = get(j);
+    let is *u8 as w with mut = "Done";
+    let is i64 as n with mut = 0;
+    if (jb.status == JOB_RUN) { w = "Running"; }
+    else if (jb.crashed == 1) { w = "Crashed"; }
+    else if (jb.exit_code == sys.EXIT_KILLED) { w = "Ended"; }
+    else if (jb.exit_code != 0) {
+        let is *u8 as e = "Exit ";
+        while (n < 5) { out[n] = e[n]; n = n + 1; }
+        let is [24]u8 as d; let is i64 as dn with mut = 0;
+        let is i64 as x with mut = jb.exit_code;
+        let is i64 as neg with mut = 0;
+        if (x < 0) { neg = 1; x = 0 - x; }
+        if (x == 0) { d[0] = cast(u8, 48); dn = 1; }
+        while (x > 0) { d[dn] = cast(u8, 48 + x % 10); x = x / 10; dn = dn + 1; }
+        if (neg == 1) { out[n] = cast(u8, 45); n = n + 1; }
+        while (dn > 0) { dn = dn - 1; out[n] = d[dn]; n = n + 1; }
+        w = "";
+    }
+    let is i64 as i with mut = 0;
+    while (w[i] != cast(u8, 0)) { out[n] = w[i]; n = n + 1; i = i + 1; }
+    while (n < 8) { out[n] = cast(u8, 32); n = n + 1; }
+    out[n] = cast(u8, 32);
+    return n + 1;
 }
 
 // kill_job — end every pid still live. The shell spawned them and holds the
