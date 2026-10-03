@@ -571,13 +571,27 @@ fn thr_user_fs(tid as i64) as i64                    { return thr_get(tid, THR_U
 // before aspace_destroy: a DEAD worker is only provably off its aspace CR3 once
 // the reaper has freed it (thread_ptr == 0), so tearing the aspace down before
 // then could pull the page tables out from under a CPU mid context-switch.
+//
+// It looks at the live threads only, in the tid table, under tid_lock (so a
+// table being rebuilt is never half-read). It was a lookup of every tid ever
+// handed out, and a parent waiting on a child ran it every 10 ms.
 fn process_has_live_thread(proc_ptr as i64) as i64 {
-    let is i64 as tid with mut = 0;
-    while (tid < next_tid) {
-        if (thread_ptr(tid) != 0 && thr_process_ptr(tid) == proc_ptr) { return 1; }
-        tid = tid + 1;
+    let is i64 as found with mut = 0;
+    let is i64 as f = lock.acquire_irq(&tid_lock);
+    let is i64 as t = tid_tab;
+    if (t != 0) {
+        let is i64 as cap = cast(*i64, t)[0];
+        let is i64 as i with mut = 0;
+        while (i < cap) {
+            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + i * 2) * 8);
+            if (slot[0] >= 0 && slot[1] != 0 && cast(*i64, slot[1])[31] == proc_ptr) {   // process_ptr @248
+                found = 1; i = cap;
+            }
+            i = i + 1;
+        }
     }
-    return 0;
+    lock.release_irq(&tid_lock, f);
+    return found;
 }
 
 // Is `tid` still a live scheduler object? Returns 0 once the deferred
@@ -3180,6 +3194,23 @@ fn reap_drain(cpu as i64) as void {
     }
 }
 
+// Drain every cpu's reap list. Safe from any cpu, in any process context: a
+// thread is queued on its cpu's list under that cpu's sched_lock, and the lock
+// is dropped only once the switch away from it is complete (schedule() keeps
+// it across the rsp/CR3 swap), so a list entry seen under the lock is off its
+// stack and page tables for good. Only the cpu's own idle thread used to
+// drain it — so on a cpu that never went idle (a program computing), a thread
+// that ended was never freed, and a parent's wait() for the process it had
+// killed timed out, the child's last thread still "live".
+fn reap_drain_all() as void {
+    let is i64 as nc = num_cpus();
+    let is i64 as c with mut = 0;
+    while (c < nc) {
+        if (cpu_reap_head(c) >= 0) { reap_drain(c); }      // unlocked peek: a hint
+        c = c + 1;
+    }
+}
+
 fn idle_fn() as void {
     // APs enter with IF=0 (ap_entry deliberately does not sti before
     // calling ap_start so per_cpu_init publishes current_tid without
@@ -3192,7 +3223,7 @@ fn idle_fn() as void {
         // Nothing of our own to run: take queued work from a busier cpu.
         if (nr_running(this_cpu()) == 0) { steal_work(); }
         if (smp.this_cpu_need_resched() != 0) { schedule(); }
-        reap_drain(this_cpu());     // free threads that died on this cpu
+        reap_drain_all();           // free threads that died here, or on a busy cpu
         // Top up the pre-zeroed frame pool while idle (bounded per pass) so a
         // later commit's ALLOC_ZERO skips the inline page wipe. Stops early when
         // the pool is full or memory is tight.
