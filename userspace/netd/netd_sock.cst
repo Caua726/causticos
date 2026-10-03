@@ -38,9 +38,10 @@ struct Sock {
     // expensive thing, indexed by the ones that need it.
     conn      as i64;
     // A listening socket hands its accepted connections to the client as new
-    // sockets; this is where one waits until the client asks for it.
-    pending   as i64;      // conn index of an accepted connection, -1 if none
-    backlog   as i64;
+    // sockets. They wait in the pool, marked as this listener's (conn_lsn),
+    // until the client asks for them; pending counts them, backlog bounds it.
+    pending   as i64;      // connections queued for accept
+    backlog   as i64;      // how many may queue (listen's argument, 1..MAX_BACKLOG)
     // A peer's FIN is announced once. Told twice, a client that counts its
     // closes stops matching them against its opens.
     told_closed as i64;
@@ -61,16 +62,76 @@ let is [32]Sock as socks with mut;
 let is i64 as MAX_CONN = 8;
 let is [8]tc.Conn as conns with mut;
 let is [8]i64 as conn_used with mut;
+// For a connection a listener accepted and its client has not yet taken: that
+// listener (a socket pointer as i64), else 0. And the order they arrived in,
+// so accept hands them out oldest first.
+let is [8]i64 as conn_lsn with mut;
+let is [8]i64 as conn_seq with mut;
+let is i64 as accept_seq with mut = 0;
+let is i64 as MAX_BACKLOG = 4;
+
+// Is anything still holding connection ci — a socket reading it, or a
+// listener with it in its accept queue? One that nothing holds and that has
+// finished (CLOSED) is only taking a slot.
+fn conn_held(ci as i64) as i64 {
+    if (conn_lsn[ci] != 0) { return 1; }
+    if (cast(i64, find_by_conn(ci)) != 0) { return 1; }
+    return 0;
+}
+
+// Give back every slot whose connection has finished and that nothing holds.
+// A connection ends in CLOSED — after TIME_WAIT, on a RST, when an opening
+// handshake fails — and nothing used to free it there, so each one kept its
+// slot for good: eight finished connections and the machine accepted no more.
+fn conn_reap() as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CONN) {
+        if (conn_used[i] == 1 && tc.conn_state(conn_at(i)) == tc.CLOSED && conn_held(i) == 0) {
+            conn_free(i);
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// Queue connection ci for listener l. 0, or -1 when its backlog is full.
+fn queue_accept(l as *Sock, ci as i64) as i64 {
+    if (l.pending >= l.backlog) { return 0 - 1; }
+    conn_lsn[ci] = cast(i64, l);
+    accept_seq = accept_seq + 1;
+    conn_seq[ci] = accept_seq;
+    l.pending = l.pending + 1;
+    return 0;
+}
+
+// The oldest connection queued for listener l, taken off its queue; -1 if none.
+fn take_accept(l as *Sock) as i64 {
+    let is i64 as best with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_CONN) {
+        if (conn_used[i] == 1 && conn_lsn[i] == cast(i64, l)) {
+            if (best < 0 || conn_seq[i] < conn_seq[best]) { best = i; }
+        }
+        i = i + 1;
+    }
+    if (best >= 0) {
+        conn_lsn[best] = 0;
+        l.pending = l.pending - 1;
+    }
+    return best;
+}
 
 fn conn_at(i as i64) as *tc.Conn {
     return &conns[i];
 }
 
 fn conn_alloc() as i64 {
+    conn_reap();
     let is i64 as i with mut = 0;
     while (i < MAX_CONN) {
         if (conn_used[i] == 0) {
             conn_used[i] = 1;
+            conn_lsn[i] = 0;
             tc.conn_init(conn_at(i));
             return i;
         }
@@ -91,7 +152,7 @@ fn conn_alloc() as i64 {
         if (tc.conn_state(c) == tc.TIME_WAIT) {
             // Only one nobody still points at. A socket whose connection was
             // taken away would read another connection's bytes.
-            if (cast(i64, find_by_conn(i)) == 0) {
+            if (conn_held(i) == 0) {
                 if (best < 0 || c.timewait_at < oldest) {
                     best = i;
                     oldest = c.timewait_at;
@@ -101,6 +162,7 @@ fn conn_alloc() as i64 {
         i = i + 1;
     }
     if (best >= 0) {
+        conn_lsn[best] = 0;
         tc.conn_init(conn_at(best));
         return best;
     }
@@ -110,6 +172,7 @@ fn conn_alloc() as i64 {
 fn conn_free(i as i64) as void {
     if (i < 0 || i >= MAX_CONN) { return; }
     conn_used[i] = 0;
+    conn_lsn[i] = 0;
     return;
 }
 
@@ -131,14 +194,14 @@ fn init() as void {
         s.peer_ip = 0; s.peer_port = 0;
         s.rx_drops = 0;
         s.conn = 0 - 1;
-        s.pending = 0 - 1;
+        s.pending = 0;
         s.backlog = 0;
         s.told_closed = 0;
         s.want_write = 0;
         i = i + 1;
     }
     i = 0;
-    while (i < MAX_CONN) { conn_used[i] = 0; i = i + 1; }
+    while (i < MAX_CONN) { conn_used[i] = 0; conn_lsn[i] = 0; i = i + 1; }
     return;
 }
 
@@ -170,7 +233,7 @@ fn create(client as i64, id as i64, proto as i64) as *Sock {
             s.peer_ip = 0; s.peer_port = 0;
             s.rx_drops = 0;
             s.conn = 0 - 1;
-            s.pending = 0 - 1;
+            s.pending = 0;
             s.backlog = 0;
             s.told_closed = 0;
             s.want_write = 0;
@@ -221,7 +284,10 @@ fn close(s as *Sock) as void {
     // that is closed while its Conn stays allocated leaks the expensive half
     // of the pair, and the pool is four deep.
     if (s.conn >= 0) { conn_free(s.conn); s.conn = 0 - 1; }
-    if (s.pending >= 0) { conn_free(s.pending); s.pending = 0 - 1; }
+    // A listener takes the connections still waiting for accept with it.
+    let is i64 as q with mut = take_accept(s);
+    while (q >= 0) { conn_free(q); q = take_accept(s); }
+    s.pending = 0;
     s.state = ST_FREE;
     s.client = 0;
     s.id = 0;

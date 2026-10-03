@@ -751,18 +751,22 @@ fn handle_tcp(idx as i64, p as *u8, plen as i64, src as i64, dst as i64) as void
     // A SYN for a listening port opens a new connection.
     if ((tw.flags_of(p) & tw.SYN) != 0 && (tw.flags_of(p) & tw.ACK) == 0) {
         let is *nsock.Sock as l = nsock.find_listener(dport);
-        if (cast(i64, l) != 0 && l.pending < 0) {
+        if (cast(i64, l) != 0) {
+            // A full accept queue, or no slot for the connection: the SYN is
+            // dropped, not refused. The peer sends it again a moment later,
+            // by when the server may have taken one; a RST would have told
+            // it the port is closed, which it is not.
+            if (l.pending >= l.backlog) { return; }
             let is i64 as ci = nsock.conn_alloc();
-            if (ci >= 0) {
-                let is *tc.Conn as c = nsock.conn_at(ci);
-                tc.conn_listen(c, dst, dport, sys.random_u64());
-                c.peer_ip = src;
-                tc.conn_input(c, p, plen, sys.time_ns());
-                l.pending = ci;
-                tcp_flush(ci);
-                np.send(client_fd[l.client], np.EV_ACCEPTED, l.id, src, sport);
-                return;
-            }
+            if (ci < 0) { return; }
+            let is *tc.Conn as c = nsock.conn_at(ci);
+            tc.conn_listen(c, dst, dport, sys.random_u64());
+            c.peer_ip = src;
+            tc.conn_input(c, p, plen, sys.time_ns());
+            nsock.queue_accept(l, ci);
+            tcp_flush(ci);
+            np.send(client_fd[l.client], np.EV_ACCEPTED, l.id, src, sport);
+            return;
         }
     }
 
@@ -826,6 +830,8 @@ fn run_timers(now as i64) as i64 {
         i = i + 1;
     }
 
+    // Finished connections nothing holds give their slots back.
+    nsock.conn_reap();
     // Every live connection: run its timers and let it send whatever that
     // produced — a retransmission, a delayed ACK coming due, a window probe.
     let is i64 as ci with mut = 0;
@@ -1062,6 +1068,11 @@ fn serve_client(c as i64) as i64 {
         if (cast(i64, s) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
         if (s.proto != np.SOCK_STREAM) { reply_err(c, sock, sys.E_INVAL); return 1; }
         if (s.local_port == 0) { reply_err(c, sock, sys.E_INVAL); return 1; }
+        // listen(backlog): how many accepted connections may wait for the
+        // server to take them.
+        s.backlog = a;
+        if (s.backlog < 1) { s.backlog = 1; }
+        if (s.backlog > nsock.MAX_BACKLOG) { s.backlog = nsock.MAX_BACKLOG; }
         s.state = nsock.ST_LISTEN;
         np.send(client_fd[c], np.EV_OK, sock, s.local_port, 0);
         return 1;
@@ -1071,18 +1082,19 @@ fn serve_client(c as i64) as i64 {
         let is *nsock.Sock as l = nsock.find(c, sock);
         if (cast(i64, l) == 0) { reply_err(c, sock, sys.E_BADF); return 1; }
         if (l.state != nsock.ST_LISTEN) { reply_err(c, sock, sys.E_INVAL); return 1; }
-        if (l.pending < 0) { reply_err(c, sock, sys.E_AGAIN); return 1; }
+        if (l.pending <= 0) { reply_err(c, sock, sys.E_AGAIN); return 1; }
         // The client names the new socket; `a` is the id it wants for it.
         let is *nsock.Sock as ns = nsock.create(c, a, np.SOCK_STREAM);
         if (cast(i64, ns) == 0) { reply_err(c, sock, sys.E_EXIST); return 1; }
-        ns.conn = l.pending;
+        let is i64 as aci = nsock.take_accept(l);
+        if (aci < 0) { nsock.close(ns); reply_err(c, sock, sys.E_AGAIN); return 1; }
+        ns.conn = aci;
         ns.state = nsock.ST_CONN;
         let is *tc.Conn as cn = nsock.conn_at(ns.conn);
         ns.peer_ip = cn.peer_ip;
         ns.peer_port = cn.peer_port;
         ns.local_port = cn.local_port;
-        l.pending = 0 - 1;
-        np.send(client_fd[c], np.EV_OK, a, cn.peer_port, 0);
+        np.send(client_fd[c], np.EV_OK, a, cn.peer_port, cn.peer_ip);
 
         // WHATEVER ALREADY ARRIVED, NOW. A client is told about a connection
         // when the SYN lands, and it takes a round trip to answer with an
@@ -1191,6 +1203,8 @@ fn serve_client(c as i64) as i64 {
                 s.client = 0;
                 s.id = 0;
                 s.conn = 0 - 1;
+                // Already over (the peer reset it, say): the slot goes now.
+                nsock.conn_reap();
             } else {
                 nsock.close(s);
             }

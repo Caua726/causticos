@@ -57,6 +57,7 @@ struct Sock {
     peer_ip as i64;
     peer_port as i64;
     lost    as i64;         // bytes dropped because the ring was full
+    acc_ready as i64;       // a listener: connections netd says are waiting for accept
 }
 
 let is [4]Sock as socks with mut;
@@ -170,6 +171,14 @@ fn pump(deadline as i64) as i64 {
             let is i64 as i = by_id(last[1]);
             if (i >= 0) { socks[i].credit = last[2]; }
         }
+        // Counted, whenever it arrives. A server serving one connection is
+        // inside a recv or a close when the next ones are queued, and the
+        // notice for each came and went there: dropped, the next accept()
+        // waited for a notice already given, with clients queued behind it.
+        if (t == np.EV_ACCEPTED) {
+            let is i64 as i = by_id(last[1]);
+            if (i >= 0) { socks[i].acc_ready = socks[i].acc_ready + 1; }
+        }
         return t;
     }
     return 0;
@@ -205,7 +214,7 @@ fn attach(fd as i64) as i64 {
         socks[i].st = S_FREE;
         socks[i].id = 0;
         socks[i].head = 0; socks[i].len = 0;
-        socks[i].err = 0; socks[i].credit = 0; socks[i].lost = 0;
+        socks[i].err = 0; socks[i].credit = 0; socks[i].lost = 0; socks[i].acc_ready = 0;
         i = i + 1;
     }
     // Three different failures, three different answers: "that fd is not a
@@ -286,7 +295,7 @@ fn open(proto as i64) as i64 {
             s.id = i + 1;            // 0 is netd's "no socket", so never an id
             s.proto = proto;
             s.head = 0; s.len = 0;
-            s.err = 0; s.credit = 0; s.lost = 0;
+            s.err = 0; s.credit = 0; s.lost = 0; s.acc_ready = 0;
             s.peer_ip = 0; s.peer_port = 0;
             if (np.send(ctl, np.REQ_SOCKET, s.id, proto, 0) < 0) { return sys.E_IO; }
             s.st = S_OPEN;           // so an EV_DATA racing the reply is filed
@@ -403,9 +412,13 @@ fn shutdown_write(i as i64) as i64 {
 // local socket. Returns the new index, or a negative errno.
 fn accept(listener as i64, ns as i64) as i64 {
     if (listener < 0 || listener >= MAX_SOCK) { return sys.E_BADF; }
-    if (await(np.EV_ACCEPTED, sys.time_ns() + ns) != 1) { return sys.E_AGAIN; }
-    let is i64 as peer_ip = last[2];
-    let is i64 as peer_port = last[3];
+    let is i64 as deadline = sys.time_ns() + ns;
+    while (socks[listener].acc_ready == 0) {
+        let is i64 as t = pump(deadline);
+        if (t == 0 - 1) { return sys.E_IO; }
+        if (t == 0) { return sys.E_AGAIN; }
+    }
+    socks[listener].acc_ready = socks[listener].acc_ready - 1;
 
     let is i64 as k with mut = 0;
     while (k < MAX_SOCK) {
@@ -414,8 +427,7 @@ fn accept(listener as i64, ns as i64) as i64 {
             n.id = k + 1;
             n.proto = np.SOCK_STREAM;
             n.head = 0; n.len = 0;
-            n.err = 0; n.credit = 0; n.lost = 0;
-            n.peer_ip = peer_ip; n.peer_port = peer_port;
+            n.err = 0; n.credit = 0; n.lost = 0; n.acc_ready = 0;
             n.st = S_OPEN;
             // netd names the new socket with the id WE choose, so the two
             // sides never disagree about which connection is which.
@@ -423,10 +435,14 @@ fn accept(listener as i64, ns as i64) as i64 {
                 n.st = S_FREE;
                 return sys.E_IO;
             }
-            if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) {
+            let is i64 as aw = await(np.EV_OK, sys.time_ns() + 3000000000);
+            if (aw == 0 - 2) { n.st = S_FREE; return sys.E_AGAIN; }   // it went before it was taken
+            if (aw != 1) {
                 n.st = S_FREE;
                 return sys.E_IO;
             }
+            n.peer_port = last[2];
+            n.peer_ip = last[3];
             return k;
         }
         k = k + 1;
