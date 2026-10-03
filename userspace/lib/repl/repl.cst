@@ -10,8 +10,15 @@
 // library must not decide that a process has exactly one line being edited.
 // Echo goes through term.putc, which both shells have; the caller flushes,
 // because only it knows whether that means term.flush or a grid commit.
+//
+// The line is UTF-8. The cursor is a byte offset that is always on a
+// character's first byte, and every edit moves by whole characters: a key that
+// typed "ç" is one character to Backspace over, not two bytes, the second of
+// which would leave half of it behind.
 use "std/causticos/term.cst" as term;
 use "std/os/causticos.cst" as sys;
+use "std/unicode/utf8.cst" as utf8;
+use "std/unicode/cpwidth.cst" as cpw;
 
 let is i64 as LINE_CAP with imut = 256;
 let is i64 as HIST_N   with imut = 16;
@@ -22,15 +29,15 @@ struct Repl {
     hsize as i64;              // slots filled, <= HIST_N
     hnav as i64;               // 0 = editing fresh, 1..hsize = walking back
     llen as i64;               // bytes in `line`
-    cur as i64;                // cursor, 0..llen — edits happen HERE, not at the end
+    cur as i64;                // cursor, 0..llen, on a character's first byte — edits happen HERE
     npush as i64;              // total pushes, monotonic
     npush_load as i64;         // npush when the file was last read/written
     khead as i64;              // kill ring: next slot to write
     ksize as i64;              // kill ring: entries stored
     knav as i64;               // how far back the last yank reached
     above as i64;              // cells of the line above the top row, past the cursor (see _goto)
-    shown_len as i64;          // what is on screen from the line's start: its length...
-    shown_cur as i64;          // ...and where the cursor is in it
+    shown_len as i64;          // what is on screen from the line's start: the cells it covers...
+    shown_cur as i64;          // ...and the cell the cursor is on
     srch as i64;               // 1 = a Ctrl+R search is running
     sqlen as i64;              // bytes in `sq`
     shit as i64;               // history age (1 = newest) of the line found, 0 = none
@@ -157,20 +164,126 @@ fn _goto(r as *Repl, t as *term.Term, to as i64) as void {
     return;
 }
 
+// ---- where characters land ---------------------------------------------------
+//
+// A byte is not a cell. "é" is two bytes in one cell, a combining mark is a
+// character in no cell of its own, and a wide character (CJK, most emoji) takes
+// two — and when only the last column of a row is left it does not fit, so
+// term.cst leaves that column empty and starts it on the next row. Where the
+// line's characters land is therefore worked out the way the terminal will
+// place them, from the column the line starts on: these two functions are the
+// only place that knows, and they follow term.cst's putc and _put_cp exactly,
+// down to what it draws for bytes that are not UTF-8.
+
+// The character at buf[i]: writes its code point to cp, returns the bytes it
+// takes. Broken UTF-8 reads as term.cst draws it: U+FFFD, for one byte, or for
+// the lead and the continuations that came before the sequence broke.
+fn _decode(buf as *u8, len as i64, i as i64, cp as *i64) as i64 {
+    let is i64 as b = cast(i64, buf[i]);
+    cp[0] = 0xFFFD;
+    if (b < 0x80) { cp[0] = b; return 1; }
+    let is i64 as need with mut = 0;
+    let is i64 as v with mut = 0;
+    let is i64 as min with mut = 0;
+    if (b >= 0xC2 && b <= 0xDF) { need = 1; v = b & 0x1F; min = 0x80; }
+    if (b >= 0xE0 && b <= 0xEF) { need = 2; v = b & 0x0F; min = 0x800; }
+    if (b >= 0xF0 && b <= 0xF4) { need = 3; v = b & 0x07; min = 0x10000; }
+    if (need == 0) { return 1; }
+    let is i64 as k with mut = 1;
+    while (k <= need) {
+        if (i + k >= len) { return k; }
+        let is i64 as c = cast(i64, buf[i + k]);
+        if ((c & 0xC0) != 0x80) { return k; }
+        v = (v << 6) | (c & 0x3F);
+        k = k + 1;
+    }
+    if (v >= min && v <= 0x10FFFF && (v < 0xD800 || v > 0xDFFF)) { cp[0] = v; }
+    return k;
+}
+
+// Place the character at buf[i], the cells before it holding `pos` cells of
+// the line, on a terminal `cols` wide where the line starts at column col0:
+// at[0] = the cell it starts on, w[0] = how many it covers. Returns its bytes.
+fn _place(buf as *u8, len as i64, i as i64, pos as i64, col0 as i64, cols as i64,
+          at as *i64, w as *i64) as i64 {
+    let is [1]i64 as cp;
+    let is i64 as n = _decode(buf, len, i, cast(*i64, &cp[0]));
+    let is i64 as cw with mut = cpw.cp_width(cast(i32, cp[0]));
+    if (cp[0] >= 0x80 && cp[0] <= 0x9F) { cw = 0; }          // C1 controls draw nothing
+    if (cw == 2 && cols < 2) { cw = 1; }
+    let is i64 as p with mut = pos;
+    if (cw == 2 && (col0 + p) % cols == cols - 1) { p = p + 1; }   // wraps whole
+    at[0] = p;
+    w[0] = cw;
+    return n;
+}
+
+// The first byte of the character after the one at i.
+fn _next(buf as *u8, len as i64, i as i64) as i64 {
+    if (i >= len) { return len; }
+    let is [1]i64 as cp;
+    return i + _decode(buf, len, i, cast(*i64, &cp[0]));
+}
+
+// The first byte of the character before offset i.
+fn _prev(buf as *u8, i as i64) as i64 {
+    if (i <= 0) { return 0; }
+    let is i64 as j with mut = i - 1;
+    let is i64 as k with mut = 0;
+    while (j > 0 && k < 3 && (cast(i64, buf[j]) & 0xC0) == 0x80) { j = j - 1; k = k + 1; }
+    // j is a lead only if what follows it really is its sequence; else the
+    // byte before i stands alone (term.cst draws it as U+FFFD by itself).
+    if (_next(buf, i, j) == i) { return j; }
+    return i - 1;
+}
+
+// How much of src[0..n] fits in cap bytes without cutting a character.
+fn _fit(src as *u8, n as i64, cap as i64) as i64 {
+    if (n <= cap) { return n; }
+    let is i64 as k with mut = cap;
+    while (k > 0 && (cast(i64, src[k]) & 0xC0) == 0x80) { k = k - 1; }
+    return k;
+}
+
+fn _mod(a as i64, m as i64) as i64 {
+    let is i64 as x = a % m;
+    if (x < 0) { return x + m; }
+    return x;
+}
+
 // _paint — make the screen show buf[0..len] from the line's start, with the
-// cursor at `cur` in it, over whatever was shown there before.
+// cursor before the character at byte `cur`, over whatever was shown there
+// before.
 fn _paint(r as *Repl, t as *term.Term, buf as *u8, len as i64, cur as i64) as void {
-    let is i64 as start = _here(r, t) - r.shown_cur;       // where offset 0 is
-    let is i64 as first with mut = 0;                       // first offset on screen
-    if (start < 0) { first = 0 - start; }
-    _goto(r, t, start + first);
-    let is i64 as pos with mut = first;
-    while (pos < len) { term.putc(t, cast(i64, buf[pos])); pos = pos + 1; }
+    let is i64 as cols = t.cols;
+    if (cols <= 0) { return; }
+    let is i64 as start = _here(r, t) - r.shown_cur;       // the cell the line starts on
+    let is i64 as col0 = _mod(start, cols);
+    let is [1]i64 as at;
+    let is [1]i64 as w;
+    let is i64 as pos with mut = 0;                         // cells before character i
+    let is i64 as curcell with mut = 0 - 1;
+    let is i64 as first with mut = 0 - 1;                   // first character on screen
+    let is i64 as firstcell with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is i64 as n = _place(buf, len, i, pos, col0, cols, cast(*i64, &at[0]), cast(*i64, &w[0]));
+        if (i == cur) { curcell = at[0]; }
+        if (first < 0 && start + at[0] >= 0) { first = i; firstcell = at[0]; }
+        pos = at[0] + w[0];
+        i = i + n;
+    }
+    if (curcell < 0) { curcell = pos; }
+    if (first < 0) { first = len; firstcell = pos; }
+    _goto(r, t, start + firstcell);
+    i = first;
+    while (i < len) { term.putc(t, cast(i64, buf[i])); i = i + 1; }
     // Blank whatever was shown longer than this.
-    while (pos < r.shown_len) { term.putc(t, 0x20); pos = pos + 1; }
-    _goto(r, t, _here(r, t) - (pos - cur));
-    r.shown_len = len;
-    r.shown_cur = cur;
+    let is i64 as end with mut = pos;
+    while (end < r.shown_len) { term.putc(t, 0x20); end = end + 1; }
+    _goto(r, t, _here(r, t) - (end - curcell));
+    r.shown_len = pos;
+    r.shown_cur = curcell;
     return;
 }
 
@@ -199,18 +312,36 @@ fn finish(r as *Repl, t as *term.Term) as void {
 // the cursor: when it ended on the right edge that is the edge with the wrap
 // pending, a place no cursor move can reach (at the bottom row the next row
 // does not exist yet). So the cursor goes onto the last character shown and
-// prints it again.
+// prints it again — all of it: a wide one from its first cell, with the marks
+// that combined into it after it.
 fn _to_end(r as *Repl, t as *term.Term) as void {
     let is i64 as end = _here(r, t) + (r.shown_len - r.shown_cur);
     // Even when the cursor is already at `end`: after an edit it may sit at
     // the start of the next row instead of pending on the edge, and a newline
     // from there would leave an empty row under the line.
     if (r.shown_len == 0) { _goto(r, t, end); _park(r, t, 0); return; }
-    _goto(r, t, end - 1);
+    // The last character that takes cells, and how many.
+    let is [1]i64 as at;
+    let is [1]i64 as w;
+    let is i64 as last with mut = 0 - 1;
+    let is i64 as lw with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < r.llen) {
+        let is i64 as n = _place(cast(*u8, &r.line[0]), r.llen, i, 0, 0, 1 << 30,
+                                 cast(*i64, &at[0]), cast(*i64, &w[0]));
+        if (w[0] > 0) { last = i; lw = w[0]; }
+        i = i + n;
+    }
+    if (last < 0) {                                 // only a search line shows no character: it ends in "': "
+        _goto(r, t, end - 1);
+        _park(r, t, 0);
+        term.putc(t, 32);
+        return;
+    }
+    _goto(r, t, end - lw);
     _park(r, t, 0);
-    let is i64 as last with mut = 32;               // a search line with no match yet ends in "': "
-    if (r.llen > 0) { last = cast(i64, r.line[r.llen - 1]); }
-    term.putc(t, last);
+    i = last;
+    while (i < r.llen) { term.putc(t, cast(i64, r.line[i])); i = i + 1; }
     return;
 }
 
@@ -275,9 +406,9 @@ fn _take(r as *Repl, k as i64) as void {
     let is i64 as slot = slot_of(r, k);
     if (slot < 0) { return; }
     let is *u8 as h = hist_ptr(r, slot);
-    let is i64 as n = r.hlen[slot];
+    let is i64 as n = _fit(h, r.hlen[slot], LINE_CAP - 1);
     let is i64 as i with mut = 0;
-    while (i < n && i < LINE_CAP - 1) { r.line[i] = h[i]; i = i + 1; }
+    while (i < n) { r.line[i] = h[i]; i = i + 1; }
     r.llen = i;
     r.cur = _index_of(cast(*u8, &r.line[0]), r.llen, cast(*u8, &r.sq[0]), r.sqlen);
     if (r.cur < 0) { r.cur = r.llen; }
@@ -342,21 +473,25 @@ fn search_next(r as *Repl, t as *term.Term) as void {
     return;
 }
 
-// search_key — a typed character narrows the query. The line found so far is
-// looked at first: it may still match.
+// search_key — a typed character (a code point) narrows the query. The line
+// found so far is looked at first: it may still match.
 fn search_key(r as *Repl, t as *term.Term, c as i64) as void {
-    if (r.sqlen >= SQ_CAP) { return; }
-    r.sq[r.sqlen] = cast(u8, c);
-    r.sqlen = r.sqlen + 1;
+    let is [4]u8 as e;
+    let is i64 as n = _encode(c, cast(*u8, &e[0]));
+    if (n <= 0 || r.sqlen + n > SQ_CAP) { return; }
+    let is i64 as k with mut = 0;
+    while (k < n) { r.sq[r.sqlen + k] = e[k]; k = k + 1; }
+    r.sqlen = r.sqlen + n;
     _research(r, r.shit);
     redraw(r, t);
     return;
 }
 
-// search_back — Backspace shortens the query and looks again from the newest.
+// search_back — Backspace takes the query's last character off and looks again
+// from the newest.
 fn search_back(r as *Repl, t as *term.Term) as void {
     if (r.sqlen == 0) { return; }
-    r.sqlen = r.sqlen - 1;
+    r.sqlen = _prev(cast(*u8, &r.sq[0]), r.sqlen);
     _research(r, 1);
     redraw(r, t);
     return;
@@ -373,35 +508,69 @@ fn search_end(r as *Repl, t as *term.Term, keep as i64) as void {
     return;
 }
 
-// Insert one byte at the cursor. Returns 0 when the line is full.
+// A character a line can hold, as UTF-8 into e (room for 4): its length, or 0
+// for what is not text — a control (it would move the terminal's cursor
+// instead of being drawn), a surrogate, past U+10FFFF.
+fn _encode(c as i64, e as *u8) as i64 {
+    if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F) || c > 0x10FFFF) { return 0; }
+    let is i64 as n = utf8.encode1(cast(i32, c), e);
+    if (n < 0) { return 0; }
+    return n;
+}
+
+// Remove line[from..to) and close the gap; the cursor is the caller's.
+fn _drop(r as *Repl, from as i64, to as i64) as void {
+    let is i64 as i with mut = to;
+    while (i < r.llen) { r.line[from + i - to] = r.line[i]; i = i + 1; }
+    r.llen = r.llen - (to - from);
+    return;
+}
+
+// Insert one character (a code point) at the cursor. Returns 0 when it is not
+// text or the line is full.
 fn line_push(r as *Repl, c as i64) as i64 {
-    if (r.llen >= LINE_CAP - 1) { return 0; }
+    let is [4]u8 as e;
+    let is i64 as n = _encode(c, cast(*u8, &e[0]));
+    if (n == 0 || r.llen + n > LINE_CAP - 1) { return 0; }
     let is i64 as i with mut = r.llen;
-    while (i > r.cur) { r.line[i] = r.line[i - 1]; i = i - 1; }
-    r.line[r.cur] = cast(u8, c);
-    r.llen = r.llen + 1;
-    r.cur = r.cur + 1;
+    while (i > r.cur) { r.line[i + n - 1] = r.line[i - 1]; i = i - 1; }
+    let is i64 as k with mut = 0;
+    while (k < n) { r.line[r.cur + k] = e[k]; k = k + 1; }
+    r.llen = r.llen + n;
+    r.cur = r.cur + n;
     r.knav = 0;
     return 1;
 }
 
-// Delete the byte BEFORE the cursor.
+// Insert src[0..n] at the cursor, as much of it as fits, never part of a
+// character.
+fn _insert(r as *Repl, src as *u8, n as i64) as void {
+    let is i64 as m = _fit(src, n, LINE_CAP - 1 - r.llen);
+    if (m <= 0) { return; }
+    let is i64 as i with mut = r.llen;
+    while (i > r.cur) { r.line[i + m - 1] = r.line[i - 1]; i = i - 1; }
+    let is i64 as k with mut = 0;
+    while (k < m) { r.line[r.cur + k] = src[k]; k = k + 1; }
+    r.llen = r.llen + m;
+    r.cur = r.cur + m;
+    r.knav = 0;
+    return;
+}
+
+// Delete the character BEFORE the cursor.
 fn line_backspace(r as *Repl) as i64 {
     if (r.cur <= 0) { return 0; }
-    let is i64 as i with mut = r.cur;
-    while (i < r.llen) { r.line[i - 1] = r.line[i]; i = i + 1; }
-    r.llen = r.llen - 1;
-    r.cur = r.cur - 1;
+    let is i64 as p = _prev(cast(*u8, &r.line[0]), r.cur);
+    _drop(r, p, r.cur);
+    r.cur = p;
     r.knav = 0;
     return 1;
 }
 
-// Delete the byte AT the cursor (Del; Ctrl+D on a line that has text).
+// Delete the character AT the cursor (Del; Ctrl+D on a line that has text).
 fn line_delete(r as *Repl) as i64 {
     if (r.cur >= r.llen) { return 0; }
-    let is i64 as i with mut = r.cur + 1;
-    while (i < r.llen) { r.line[i - 1] = r.line[i]; i = i + 1; }
-    r.llen = r.llen - 1;
+    _drop(r, r.cur, _next(cast(*u8, &r.line[0]), r.llen, r.cur));
     r.knav = 0;
     return 1;
 }
@@ -417,8 +586,16 @@ fn cancel(r as *Repl, t as *term.Term) as void {
 }
 
 fn cursor(r as *Repl) as i64 { return r.cur; }
-fn move_left(r as *Repl) as i64 { if (r.cur <= 0) { return 0; } r.cur = r.cur - 1; return 1; }
-fn move_right(r as *Repl) as i64 { if (r.cur >= r.llen) { return 0; } r.cur = r.cur + 1; return 1; }
+fn move_left(r as *Repl) as i64 {
+    if (r.cur <= 0) { return 0; }
+    r.cur = _prev(cast(*u8, &r.line[0]), r.cur);
+    return 1;
+}
+fn move_right(r as *Repl) as i64 {
+    if (r.cur >= r.llen) { return 0; }
+    r.cur = _next(cast(*u8, &r.line[0]), r.llen, r.cur);
+    return 1;
+}
 fn move_home(r as *Repl) as i64 { if (r.cur == 0) { return 0; } r.cur = 0; return 1; }
 fn move_end(r as *Repl) as i64 { if (r.cur == r.llen) { return 0; } r.cur = r.llen; return 1; }
 
@@ -426,8 +603,7 @@ fn move_end(r as *Repl) as i64 { if (r.cur == r.llen) { return 0; } r.cur = r.ll
 // remembered: Ctrl+K at the end of a line must not push the ring's history out.
 fn kill_push(r as *Repl, from as i64, len as i64) as void {
     if (len <= 0) { return; }
-    let is i64 as n with mut = len;
-    if (n > LINE_CAP - 1) { n = LINE_CAP - 1; }
+    let is i64 as n = _fit(cast(*u8, cast(i64, &r.line[0]) + from), len, LINE_CAP - 1);
     let is i64 as i with mut = 0;
     while (i < n) { r.kbuf[r.khead * LINE_CAP + i] = r.line[from + i]; i = i + 1; }
     r.klen[r.khead] = n;
@@ -440,9 +616,7 @@ fn kill_push(r as *Repl, from as i64, len as i64) as void {
 fn _cut(r as *Repl, from as i64, to as i64) as i64 {
     if (to <= from) { return 0; }
     kill_push(r, from, to - from);
-    let is i64 as i with mut = to;
-    while (i < r.llen) { r.line[from + i - to] = r.line[i]; i = i + 1; }
-    r.llen = r.llen - (to - from);
+    _drop(r, from, to);
     if (r.cur > from) { r.cur = from; }
     return 1;
 }
@@ -502,14 +676,22 @@ fn yank(r as *Repl) as i64 {
 // transpose — swap the two characters around the cursor and step past them, the
 // readline behaviour: at the end of the line it swaps the last two.
 fn transpose(r as *Repl) as i64 {
-    if (r.llen < 2) { return 0; }
+    let is *u8 as ln = cast(*u8, &r.line[0]);
     let is i64 as c with mut = r.cur;
-    if (c >= r.llen) { c = r.llen - 1; }
+    if (c >= r.llen) { c = _prev(ln, r.llen); }
     if (c <= 0) { return 0; }
-    let is u8 as tmp = r.line[c - 1];
-    r.line[c - 1] = r.line[c];
-    r.line[c] = tmp;
-    r.cur = c + 1;
+    let is i64 as a = _prev(ln, c);                 // [a, c) and [c, e) trade places
+    let is i64 as e = _next(ln, r.llen, c);
+    let is [8]u8 as tmp;
+    let is i64 as k with mut = 0;
+    while (a + k < c) { tmp[k] = r.line[a + k]; k = k + 1; }
+    let is i64 as la = k;
+    k = 0;
+    while (c + k < e) { r.line[a + k] = r.line[c + k]; k = k + 1; }
+    let is i64 as lb = k;
+    k = 0;
+    while (k < la) { r.line[a + lb + k] = tmp[k]; k = k + 1; }
+    r.cur = e;
     r.knav = 0;
     return 1;
 }
@@ -537,8 +719,7 @@ fn hist_push(r as *Repl, src as *u8, len as i64) as void {
         while (k < len && r.hbuf[prev * LINE_CAP + k] == src[k]) { k = k + 1; }
         if (k == len) { return; }
     }
-    let is i64 as n with mut = len;
-    if (n > LINE_CAP - 1) { n = LINE_CAP - 1; }
+    let is i64 as n = _fit(src, len, LINE_CAP - 1);
     let is i64 as i with mut = 0;
     while (i < n) { r.hbuf[r.hhead * LINE_CAP + i] = src[i]; i = i + 1; }
     r.hlen[r.hhead] = n;
@@ -551,8 +732,9 @@ fn hist_push(r as *Repl, src as *u8, len as i64) as void {
 // recall — replace what is on screen with src[0..srclen]: rub out the typed
 // characters, then echo the recalled ones. The caller flushes.
 fn recall(r as *Repl, t as *term.Term, src as *u8, srclen as i64) as void {
+    let is i64 as n = _fit(src, srclen, LINE_CAP - 1);
     let is i64 as i with mut = 0;
-    while (i < srclen && i < LINE_CAP - 1) { r.line[i] = src[i]; i = i + 1; }
+    while (i < n) { r.line[i] = src[i]; i = i + 1; }
     r.llen = i;
     r.cur = i;                       // a recalled line is ready to be extended
     redraw(r, t);
@@ -880,10 +1062,11 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
     }
     if (nmatch == 0) { return; }
 
-    let is i64 as i with mut = plen;
-    while (i < acclen) {
-        if (line_push(r, cast(i64, acc[i])) == 0) { i = acclen; }
-        else { i = i + 1; }
+    // Two names can share the first bytes of different characters ("café",
+    // "cafè"): the prefix they share stops before that character.
+    while (acclen > plen && (cast(i64, acc[acclen]) & 0xC0) == 0x80) { acclen = acclen - 1; }
+    if (acclen > plen) {
+        _insert(r, cast(*u8, cast(i64, &acc[0]) + plen), acclen - plen);
     }
     if (nmatch == 1) { line_push(r, 32); }               // sole match -> trailing space
     redraw(r, t);
