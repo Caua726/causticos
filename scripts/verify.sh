@@ -96,13 +96,19 @@ FAIL_PATTERN='EXCEPTION|panic:|#GP|#PF|FATAL|kernel halted'
 
 # Markers each gate requires. A gate passes only when EVERY one appeared, and the
 # report says which was missing — "it timed out" is not a diagnosis.
+#
+# Every gate also wants the bootloader's memory back: the line appears only once
+# every cpu has left the stack it booted on, so a cpu that did not — or a reclaim
+# that never ran — fails the boot instead of quietly costing the machine RAM.
 LIVE_MARKERS=(
+    'KB back from the bootloader'
     'ramvol: live root ready'
     'root: ram0'
     'vfs: mounted /'
     'boot: /init.cse launched pid='
 )
 PERSIST_MARKERS=(
+    'KB back from the bootloader'
     'vfs: mounted /'
     'boot: /init.cse launched pid='
     'ALL PHASE-6 TESTS PASS'
@@ -110,6 +116,7 @@ PERSIST_MARKERS=(
 # The last line each smoke prints when it passes. The ring-3 gauntlet runs its
 # smokes in a fixed order and the kill smoke is the last of them.
 SMOKE_MARKERS=(
+    'KB back from the bootloader'
     'kvmap_smoke: PASS'
     'heap_smoke: PASS'
     'random_smoke: PASS'

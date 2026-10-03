@@ -39,14 +39,14 @@ use "gdt.cst"      as gdt;
 // ============================================================
 
 let is i64 as MAX_CPUS = 16;
-let is i64 as AP_STACK_SIZE = 0x4000;   // 16 KiB
+let is i64 as IST_STACK_SIZE = 0x4000;  // 16 KiB, each cpu's exception stack
 
 struct PerCpu {
     self_ptr as i64;          // offset 0: points back at this PerCpu — enables
                               //           `mov rax, gs:[0]` to get the cpu base
     cpu_id as i64;            // 0..cpu_count-1 (0 = BSP by convention)
     lapic_id as i64;
-    idle_stack_top as i64;    // high address; AP's RSP lands here after entry
+    idle_stack_top as i64;    // top of this cpu's idle stack (sched.per_cpu_init)
     is_online as i64;         // all-i64 fields — caustic miscompiles mixed widths
     boot_done as i64;         // 1 after AP finished its first-time init
 
@@ -118,6 +118,10 @@ struct PerCpu {
     // Generation of the TLB shootdown this cpu still owes an acknowledgement
     // for (0 = none). See sched.tlb_shootdown.
     tlb_pending as i64;
+    // 1 once this cpu runs on a stack the kernel allocated. Until then it is
+    // on the one the bootloader gave it, inside memory the bootloader still
+    // holds — which goes back to the allocator only when every cpu is off it.
+    own_stack as i64;
 }
 
 let is [16]PerCpu as per_cpus with mut;
@@ -209,6 +213,7 @@ fn current_line_owner() as i64 {
 // cpu). A single load cannot be split by a migration. The offsets are checked
 // against the struct at boot (check_offsets).
 let is i64 as OFF_CPU_ID       = 0x08;
+let is i64 as OFF_IDLE_STACK   = 0x18;
 let is i64 as OFF_CURRENT_TID  = 0x30;
 let is i64 as OFF_NEED_RESCHED = 0x50;
 let is i64 as OFF_IN_IRQ       = 0x70;
@@ -218,6 +223,7 @@ fn check_offsets() as void {
     let is *PerCpu as p = &per_cpus[0];
     let is i64 as b = cast(i64, p);
     if (cast(i64, &p.cpu_id) - b != OFF_CPU_ID
+        || cast(i64, &p.idle_stack_top) - b != OFF_IDLE_STACK
         || cast(i64, &p.current_tid) - b != OFF_CURRENT_TID
         || cast(i64, &p.need_resched) - b != OFF_NEED_RESCHED
         || cast(i64, &p.in_irq_context) - b != OFF_IN_IRQ
@@ -250,6 +256,32 @@ fn this_cpu_set_current_start_ns(v as i64) as void {
 fn this_cpu_idle_tid() as i64 {
     let is *PerCpu as p = current_cpu();
     return p.idle_tid;
+}
+
+// This cpu's idle stack: published by sched.per_cpu_init, loaded into RSP by
+// sched.enter_idle with a raw gs:[OFF_IDLE_STACK] load, since that runs
+// between stacks.
+fn this_cpu_set_idle_stack_top(v as i64) as void {
+    let is *PerCpu as p = current_cpu();
+    p.idle_stack_top = v;
+}
+
+fn this_cpu_mark_own_stack() as void {
+    let is *PerCpu as p = current_cpu();
+    p.own_stack = 1;
+}
+
+// The first cpu still standing on the stack the bootloader gave it, or -1 when
+// none is. A cpu that never came online counts as standing there: it may still
+// be spinning in the bootloader's code, waiting to read its jump address out of
+// the very memory a reclaim would hand out.
+fn first_cpu_on_boot_stack() as i64 {
+    let is i64 as i with mut = 0;
+    while (i < cpu_count) {
+        if (per_cpus[i].is_online == 0 || per_cpus[i].own_stack == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
 }
 
 fn this_cpu_set_idle_tid(v as i64) as void {
@@ -398,28 +430,10 @@ fn set_per_cpu_kstack(cpu as i64, v as i64) as void {
 
 
 // ============================================================
-// Stack allocation — one 16 KiB per-AP idle stack, carved from the
-// page allocator at init time. Returns the top (high address) so the
-// caller can write it into PerCpu.idle_stack_top and the AP can load
-// it into RSP.
+// Exception stacks
 // ============================================================
 
-fn alloc_idle_stack() as i64 {
-    // AP_STACK_SIZE = 16384 = 4 pages, order = 2 (2^2 = 4).
-    let is i32 as pfn = pmm.alloc_pages(
-        pmm.ALLOC_ZERO,
-        cast(i32, 2),
-        pmm.USAGE_KERNEL,
-        cast(i32, 0));
-    if (pfn == pmm.PFN_NONE) { return 0; }
-    let is i64 as phys = pmm.pfn_to_phys(pfn);
-    let is i64 as base = phys + pmm.hhdm;
-    // Stack grows down; top = base + size - 16 (leave 16-byte
-    // alignment slack for ABI compliance on entry).
-    return base + AP_STACK_SIZE - 16;
-}
-
-// IST1 stack — same size + alignment policy as the idle stack.
+// IST1 stack — 16 KiB, its top 16 bytes below the end for ABI alignment.
 // Allocated once per cpu at boot, never freed. Used by IDT gates
 // programmed with IST=1 (every exception vector after this lands).
 // On entry, the cpu hardware switches RSP to the value stored in
@@ -436,7 +450,7 @@ fn alloc_ist_stack() as i64 {
         cast(i32, 0));
     if (pfn == pmm.PFN_NONE) { return 0; }
     let is i64 as base = pmm.pfn_to_phys(pfn) + pmm.hhdm;
-    return base + AP_STACK_SIZE - 16;
+    return base + IST_STACK_SIZE - 16;
 }
 
 // Set up this cpu's TSS + IST1 stack and install the matching GDT
@@ -494,6 +508,7 @@ fn init_bsp_early() as void {
     per_cpus[0].in_irq_context   = 0;
     per_cpus[0].preempt_count    = 0;
     per_cpus[0].heap_saved_flags = 0;
+    per_cpus[0].own_stack        = 0;
     install_gs_base(&per_cpus[0]);
     // gs:[0x78] is this cpu's preempt count from here on, so spinlocks may
     // start holding preemption off (lock.cst). Every AP installs its own GS
@@ -512,7 +527,8 @@ fn init() as void {
         return;
     }
 
-    let is i64 as n with mut = limine.smp_resp_cpu_count(resp);
+    let is i64 as found = limine.smp_resp_cpu_count(resp);
+    let is i64 as n with mut = found;
     if (n > MAX_CPUS) { n = MAX_CPUS; }
     cpu_count = n;
     bsp_lapic_id = limine.smp_resp_bsp_lapic(resp);
@@ -548,6 +564,7 @@ fn init() as void {
         per_cpus[i].in_irq_context   = 0;
         per_cpus[i].preempt_count    = 0;
         per_cpus[i].heap_saved_flags = 0;
+        per_cpus[i].own_stack        = 0;
         if (per_cpus[i].lapic_id == bsp_lapic_id) {
             bsp_cpu_id = i;
         }
@@ -577,11 +594,9 @@ fn init() as void {
     // consistent view. lock.acquire on log_lock is unrelated
     // synchronisation — it ensures AP's "online" print doesn't race
     // with BSP's log output during bring-up.
-    // AP stacks are Limine-provided at boot time. Once scheduler
-    // SMP retrofit lands and APs actually run kernel code, they'll
-    // migrate to their own per-CPU stacks (PerCpu.idle_stack_top is
-    // reserved for that). For the HLT idle loop here Limine's is
-    // enough.
+    // An AP starts on a stack Limine gave it and stays there until
+    // sched.ap_start moves it onto its idle thread's own; only then may
+    // the memory under the first one be reclaimed (pmm.reclaim_boot).
     i = 0;
     while (i < n) {
         if (i != bsp_cpu_id) {
@@ -594,6 +609,25 @@ fn init() as void {
             limine.smp_info_set_goto(info, cast(i64, fn_ptr(ap_entry)));
         }
         i = i + 1;
+    }
+
+    // The cpus past MAX_CPUS are not used, but Limine started them too and
+    // they spin in its code, on its stacks and page tables, polling a jump
+    // address in memory the kernel will reclaim — where any stale value is
+    // somewhere to jump. INIT puts each back in wait-for-SIPI, which runs
+    // nothing and reads no memory at all.
+    if (found > n) {
+        let is i64 as x with mut = n;
+        while (x < found) {
+            let is i64 as lid = limine.smp_info_lapic_id(cast(*u8, cpu_ptrs[x]));
+            if (lid != bsp_lapic_id) { lapic.send_init_to(lid); }
+            x = x + 1;
+        }
+        lock.acquire(&log_lock);
+        serial.print("smp: ", 5);   util.print_num(found - n);
+        serial.print(" cpus past the ", 15);   util.print_num(MAX_CPUS);
+        serial.println(" this kernel runs put back to sleep", 35);
+        lock.release(&log_lock);
     }
 
     // Rendezvous: wait up to 2 s for every AP to flip is_online.

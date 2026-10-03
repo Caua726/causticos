@@ -171,6 +171,7 @@ let is i64 as thread_pool with mut = 0;
 let is i64 as fpu_pool with mut = 0;
 
 let is i64 as thread_count with mut = 0;
+let is i64 as idle_stacks with mut = 0;    // one per cpu, never freed
 let is i64 as next_tid with mut = 0;
 
 // Global lock protecting next_tid + the tid hash table. Pre-per-cpu
@@ -571,10 +572,11 @@ fn get_thread_count() as i64 { return thread_count; }
 
 // Total RAM held by live kernel stacks: every thread owns one guarded
 // KSTACK_SIZE (32 KiB) kvmap region. The single biggest per-thread kernel cost,
-// so the memory monitor breaks it out of "kernel data" explicitly. (The two
+// so the memory monitor breaks it out of "kernel data" explicitly; every cpu's
+// idle thread has one too, allocated once and never freed. (The two
 // guard pages around each stack are reserved VA, not backed RAM, so they don't
 // count here — only the 32 KiB of real frames does.)
-fn kstacks_bytes() as i64 { return thread_count * KSTACK_SIZE; }
+fn kstacks_bytes() as i64 { return (thread_count + idle_stacks) * KSTACK_SIZE; }
 
 // ============================================================
 // Per-band data
@@ -3056,6 +3058,16 @@ fn init() as void {
 // idle. Each cpu calls this exactly once.
 fn per_cpu_init() as void {
     let is i64 as cpu = this_cpu();
+
+    // The idle thread's own stack, guarded like every kernel stack. Each cpu
+    // came up on a stack the bootloader handed it, in memory the bootloader
+    // still holds; enter_idle moves onto this one for good, and that is what
+    // lets that memory be reclaimed. Allocated before any lock: kvmap may
+    // take page-table and allocator locks of its own.
+    let is i64 as istack = vmm.kvmap(KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
+    if (istack == 0) { pmm.panic("idle stack alloc fail", 21); }
+    smp.this_cpu_set_idle_stack_top(istack + KSTACK_SIZE);
+
     let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
 
     // tid + hash under tid_lock — multiple APs run per_cpu_init
@@ -3066,6 +3078,7 @@ fn per_cpu_init() as void {
     if (iptr == 0) { pmm.panic("idle alloc fail", 15); }
     tid_set_ptr(itid, iptr);
     next_tid = itid + 1;
+    idle_stacks = idle_stacks + 1;   // global, and the APs get here together
     lock.release_irq(&tid_lock, tid_flags);
 
     let is *u8 as tp = cast(*u8, iptr);
@@ -3077,6 +3090,7 @@ fn per_cpu_init() as void {
     thr_set(itid, 16, SCHED_CLASS_IDLE);
     thr_set(itid, 32, BASE_WEIGHT);
     thr_set(itid, 40, DEFAULT_SLICE_NS);
+    thr_set(itid, 72, istack); // kstack_base: schedule() points RSP0 at its top
     thr_set(itid, 256, cpu);   // home_cpu = this cpu
     thr_set(itid, 280, vmm.kas_pml4_phys);  // idle runs in kernel AS
 
@@ -3090,6 +3104,24 @@ fn per_cpu_init() as void {
 fn start() as void {
     sched_active = 1;
     serial.println("sched: active", 13);
+    enter_idle();
+}
+
+// Leave the stack this cpu booted on and become its idle thread, on the stack
+// per_cpu_init allocated for it. Never returns: the frames below — the whole
+// boot path, on the BSP — are abandoned along with the old stack, and nothing
+// may hold a pointer into them. RBP is cleared so a backtrace ends here
+// instead of walking into memory that is about to be someone else's.
+fn enter_idle() as void {
+    asm(".byte 0x65, 0x48, 0x8B, 0x04, 0x25, 0x18, 0x00, 0x00, 0x00\n");    // mov rax, QWORD PTR gs:[0x18] (smp.PerCpu.idle_stack_top)
+    asm("mov rsp, rax\n");
+    asm("xor ebp, ebp\n");
+    asm("call _kernel_task_sched_cst_idle_entry\n");
+    asm(".byte 0x0F, 0x0B\n");   // ud2
+}
+
+fn idle_entry() as void {
+    smp.this_cpu_mark_own_stack();
     idle_fn();
 }
 
@@ -3134,5 +3166,5 @@ fn drop_lock(saved_flags as i64) as void {
 fn ap_start() as void {
     per_cpu_init();
     sysc.init_per_cpu();
-    idle_fn();
+    enter_idle();
 }

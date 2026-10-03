@@ -258,6 +258,18 @@ let is [1024]u8 as mb_mem_raw;
 let is [1024]u8 as mb_res_raw;
 let is i64 as mb_mem_count with mut = 0;
 let is i64 as mb_res_count with mut = 0;
+
+// RAM the bootloader is still standing on when it hands over: its own data —
+// these very memory-map entries, the response structures, the page tables we
+// cloned from, each cpu's first stack — and on UEFI the firmware's boot-
+// services memory, which Limine passes on under the same type. It is real RAM
+// and becomes ours the moment nothing uses it any more (reclaim_boot), which on
+// a UEFI machine is a third of a small one. Held as RESERVED until then.
+let is [1024]u8 as mb_boot_raw;
+let is i64 as mb_boot_count with mut = 0;
+let is i64 as mb_boot_dropped with mut = 0;   // bytes past MEMBLOCK_MAX entries
+let is i64 as boot_held_pages with mut = 0;
+let is i64 as boot_reclaimed_pages with mut = 0;
 let is i64 as mb_frozen with mut = 0;
 
 let is i64 as mb_bump with mut = 0;
@@ -359,6 +371,24 @@ fn mb_add_mem(base as i64, len as i64) as void {
     if (mb_mem_count < MEMBLOCK_MAX) {
         mb_mem_set(mb_mem_count, base, len);
         mb_mem_count = mb_mem_count + 1;
+    }
+}
+
+fn mb_boot_get(idx as i64, field as i64) as i64 {
+    let is *i64 as p = cast(*i64, cast(i64, &mb_boot_raw) + idx * 16);
+    return p[field];
+}
+
+// An entry that does not fit is RAM we will never get back, not RAM we may
+// treat as free: it stays out of every list (absent), and init says how much.
+fn mb_add_boot(base as i64, len as i64) as void {
+    if (mb_boot_count < MEMBLOCK_MAX) {
+        let is *i64 as p = cast(*i64, cast(i64, &mb_boot_raw) + mb_boot_count * 16);
+        p[0] = base;
+        p[1] = len;
+        mb_boot_count = mb_boot_count + 1;
+    } else {
+        mb_boot_dropped = mb_boot_dropped + len;
     }
 }
 
@@ -561,16 +591,12 @@ fn parse_mmap() as void {
         if (t == limine.MMAP_USABLE) {
             mb_add_mem(base, len);
         }
-        // NB: BOOTLOADER_RECLAIM is NOT added as usable memory. Limine
-        // keeps live data there — at minimum the AP trampoline code and
-        // each AP's stack used by its callback — for as long as the
-        // kernel keeps any AP alive. Reclaiming those pages into the
-        // PMM while APs are still executing causes silent corruption of
-        // whatever we later allocated there (observed: LAPIC page-table
-        // pages clobbered on -smp 4, producing #PF in lapic_write
-        // during sched.init). A later phase that fully migrates APs off
-        // Limine-provided stacks can reclaim this region by its own
-        // explicit pass.
+        // Not usable YET: the bootloader's structures and every cpu's first
+        // stack live there until the scheduler has moved each cpu onto a stack
+        // of its own. reclaim_boot hands it over then.
+        if (t == limine.MMAP_BOOTLOADER_RECLAIM) {
+            mb_add_boot(base, len);
+        }
         if (t == limine.MMAP_KERNEL_AND_MODULES) {
             mb_add_res(base, len);
         }
@@ -581,7 +607,14 @@ fn parse_mmap() as void {
     util.print_num(mb_mem_count);
     serial.print(" mem, ", 6);
     util.print_num(mb_res_count);
-    serial.println(" res", 4);
+    serial.print(" res, ", 6);
+    util.print_num(mb_boot_count);
+    serial.println(" bootloader", 11);
+    if (mb_boot_dropped != 0) {
+        serial.print("memblock: ", 10);
+        util.print_num(mb_boot_dropped / 1024);
+        serial.println(" KB of bootloader memory past the table's end will not be reclaimed", 67);
+    }
 }
 
 // ============================================================
@@ -671,6 +704,38 @@ fn freenode_ok(pfn as i32) as i32 {
 // Phase B+C: Create sections
 // ============================================================
 
+// Give [base, base+len) frame_meta: every 128 MiB section it touches gets its
+// one-byte-per-page array the first time.
+fn section_cover(base as i64, len as i64) as void {
+    let is i64 as end = base + len;
+    if (end > phys_end) { phys_end = end; }
+    let is i32 as start_pfn = phys_to_pfn(base);
+    let is i32 as end_pfn = phys_to_pfn(align_up(end, PAGE_SIZE));
+
+    let is i32 as pfn with mut = start_pfn;
+    while (pfn < end_pfn) {
+        let is i32 as sid = pfn >> SECTION_PAGE_SHIFT;
+        if (sid < MAX_SECTIONS) {
+            let is *MemSection as sec = section_get(sid);
+            if (sec.present == cast(i32, 0)) {
+                let is i64 as pi_size = cast(i64, PAGES_PER_SECTION);   // 1 byte/page
+                let is i64 as pi_addr = mb_alloc(pi_size);
+                sec.present = cast(i32, 1);
+                sec.base_pfn = sid << SECTION_PAGE_SHIFT;
+                sec.present_pages = cast(i32, 0);
+                sec.pages = pi_addr;
+
+                serial.print("section ", 8);
+                util.print_num(cast(i64, sid));
+                serial.print(": pages@", 8);
+                util.print_hex(pi_addr);
+                serial.println("", 0);
+            }
+        }
+        pfn = ((pfn >> SECTION_PAGE_SHIFT) + cast(i32, 1)) << SECTION_PAGE_SHIFT;
+    }
+}
+
 fn init_sections() as void {
     // Zero section table
     let is *u8 as st = cast(*u8, &section_table_raw);
@@ -682,34 +747,14 @@ fn init_sections() as void {
 
     let is i64 as i with mut = 0;
     while (i < mb_mem_count) {
-        let is i64 as base = mb_mem_get(i, 0);
-        let is i64 as end = base + mb_mem_get(i, 1);
-        if (end > phys_end) { phys_end = end; }
-        let is i32 as start_pfn = phys_to_pfn(base);
-        let is i32 as end_pfn = phys_to_pfn(align_up(end, PAGE_SIZE));
-
-        let is i32 as pfn with mut = start_pfn;
-        while (pfn < end_pfn) {
-            let is i32 as sid = pfn >> SECTION_PAGE_SHIFT;
-            if (sid < MAX_SECTIONS) {
-                let is *MemSection as sec = section_get(sid);
-                if (sec.present == cast(i32, 0)) {
-                    let is i64 as pi_size = cast(i64, PAGES_PER_SECTION);   // 1 byte/page
-                    let is i64 as pi_addr = mb_alloc(pi_size);
-                    sec.present = cast(i32, 1);
-                    sec.base_pfn = sid << SECTION_PAGE_SHIFT;
-                    sec.present_pages = cast(i32, 0);
-                    sec.pages = pi_addr;
-
-                    serial.print("section ", 8);
-                    util.print_num(cast(i64, sid));
-                    serial.print(": pages@", 8);
-                    util.print_hex(pi_addr);
-                    serial.println("", 0);
-                }
-            }
-            pfn = ((pfn >> SECTION_PAGE_SHIFT) + cast(i32, 1)) << SECTION_PAGE_SHIFT;
-        }
+        section_cover(mb_mem_get(i, 0), mb_mem_get(i, 1));
+        i = i + 1;
+    }
+    // The bootloader's ranges are RAM too, and get their frame_meta now:
+    // mb_alloc is frozen by the time they are handed back.
+    i = 0;
+    while (i < mb_boot_count) {
+        section_cover(mb_boot_get(i, 0), mb_boot_get(i, 1));
         i = i + 1;
     }
 }
@@ -729,6 +774,18 @@ fn addr_in_reserved(phys as i64) as i32 {
             }
         }
         r = r + 1;
+    }
+    return cast(i32, 0);
+}
+
+fn addr_in_boot(phys as i64) as i32 {
+    let is i64 as m with mut = 0;
+    while (m < mb_boot_count) {
+        let is i64 as bbase = mb_boot_get(m, 0);
+        if (phys >= bbase && phys < bbase + mb_boot_get(m, 1)) {
+            return cast(i32, 1);
+        }
+        m = m + 1;
     }
     return cast(i32, 0);
 }
@@ -754,6 +811,7 @@ let is i64 as stat_reserved with mut = 0;
 fn init_pageinfo() as void {
     let is i64 as free_n with mut = 0;
     let is i64 as res_n with mut = 0;
+    let is i64 as boot_n with mut = 0;
 
     let is i32 as sid with mut = 0;
     while (sid < MAX_SECTIONS) {
@@ -777,6 +835,12 @@ fn init_pageinfo() as void {
                             page_set(pfn, PAGE_FREE, USAGE_NONE, cast(i32, 0), cast(i32, 1));
                             free_n = free_n + 1;
                         }
+                    } else if (addr_in_boot(phys) != cast(i32, 0)) {
+                        // The bootloader's until reclaim_boot. Same tag the
+                        // memblock reservations get, so nothing else may free it.
+                        ppages = ppages + cast(i32, 1);
+                        page_set(pfn, PAGE_RESERVED, USAGE_BOOT_RESERVED, cast(i32, 0), cast(i32, 0));
+                        boot_n = boot_n + 1;
                     }
                 }
                 p = p + cast(i32, 1);
@@ -788,11 +852,14 @@ fn init_pageinfo() as void {
 
     stat_free = free_n;
     stat_reserved = res_n;
+    boot_held_pages = boot_n;
     serial.print("pages: ", 7);
     util.print_num(free_n);
     serial.print(" free, ", 7);
     util.print_num(res_n);
-    serial.println(" reserved", 9);
+    serial.print(" reserved, ", 11);
+    util.print_num(boot_n);
+    serial.println(" held by the bootloader", 23);
 }
 
 // ============================================================
@@ -1274,6 +1341,98 @@ fn free_pages(pfn as i32, order as i32) as void {
     merge_insert(pfn, order);
 
     lock.release_irq(&pmm_lock, pflags);
+}
+
+// ============================================================
+// Handing the bootloader's memory over
+// ============================================================
+
+// Is every page of [pfn, pfn+n) still the bootloader's, untouched?
+fn boot_held_run(pfn as i32, n as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (page_present(pfn + i) == cast(i32, 0)) { return cast(i32, 0); }
+        let is i32 as m = frame_meta_read(pfn + i);
+        if (fm_state(m) != PAGE_RESERVED || fm_usage(m) != USAGE_BOOT_RESERVED) {
+            return cast(i32, 0);
+        }
+        i = i + cast(i32, 1);
+    }
+    return cast(i32, 1);
+}
+
+// Free [start, end) in the largest aligned blocks it splits into, merging each
+// with whatever free neighbour it has. The lock is taken per block, not over
+// the whole range: on a large UEFI machine the range is hundreds of megabytes,
+// and nobody should wait that long with interrupts off.
+fn give_back_range(start as i32, end as i32) as i64 {
+    let is i64 as n with mut = 0;
+    let is i32 as pfn with mut = start;
+    while (pfn < end) {
+        let is i32 as ord with mut = min3(floor_log2(end - pfn), ctz(pfn), MAX_BLOCK_ORDER);
+        while (ord > cast(i32, 0) && boot_held_run(pfn, cast(i32, 1) << ord) == cast(i32, 0)) {
+            ord = ord - cast(i32, 1);
+        }
+        let is i32 as bsize = cast(i32, 1) << ord;
+        if (boot_held_run(pfn, bsize) != cast(i32, 0)) {
+            let is i64 as f = lock.acquire_irq(&pmm_lock);
+            mark_free(pfn, ord);
+            free_total = free_total + bsize;
+            merge_insert(pfn, ord);
+            lock.release_irq(&pmm_lock, f);
+            n = n + cast(i64, bsize);
+        }
+        pfn = pfn + bsize;
+    }
+    return n;
+}
+
+// The bootloader's memory becomes ordinary free memory. The caller vouches that
+// nothing uses it any more: every cpu runs on a stack the kernel allocated,
+// every response the bootloader wrote has been read and copied, and no cpu is
+// still parked in the bootloader's code. Once, after boot. Returns the pages
+// handed over.
+fn reclaim_boot() as i64 {
+    // The list itself lives in the kernel image; the ranges it names are
+    // about to be overwritten, so nothing here reads Limine's map again.
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < mb_boot_count) {
+        let is i64 as base = mb_boot_get(i, 0);
+        let is i64 as end = base + mb_boot_get(i, 1);
+        let is i32 as sp = phys_to_pfn(align_up(base, PAGE_SIZE));
+        let is i32 as ep = phys_to_pfn(end);
+        if (ep > sp) { n = n + give_back_range(sp, ep); }
+        i = i + 1;
+    }
+    mb_boot_count = 0;
+
+    let is i64 as f = lock.acquire_irq(&pmm_lock);
+    boot_reclaimed_pages = boot_reclaimed_pages + n;
+    boot_held_pages = 0;
+    // The reserves are a fraction of the pool, and the pool just grew.
+    let is i32 as res with mut = free_total >> cast(i32, 7);
+    if (res < cast(i32, 16)) { res = cast(i32, 16); }
+    if (res > free_total) { res = cast(i32, 0); }
+    min_reserve = res;
+    atomic_reserve = res >> cast(i32, 2);
+    lock.release_irq(&pmm_lock, f);
+    return n;
+}
+
+// Pages still held for the bootloader: what reclaim_boot would hand over.
+fn boot_held() as i64 { return boot_held_pages; }
+
+// All the RAM this kernel manages: the usable map it was handed plus what the
+// bootloader gave back since. What "total" means to `free` and `btop`.
+fn total_bytes() as i64 {
+    let is i64 as t with mut = boot_reclaimed_pages * PAGE_SIZE;
+    let is i64 as i with mut = 0;
+    while (i < mb_mem_count) {
+        t = t + mb_mem_get(i, 1);
+        i = i + 1;
+    }
+    return t;
 }
 
 // ============================================================
