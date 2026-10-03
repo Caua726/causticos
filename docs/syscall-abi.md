@@ -24,9 +24,11 @@ operation set differ.
 - args, in order: `rdi, rsi, rdx, r10, r8, r9` (System V order, but **`r10`
   not `rcx`** — `syscall` clobbers `rcx` with the return RIP).
 - return in `rax`: **`< 0` is a causticos errno**, `>= 0` is a per-call success value.
-- **clobbered** by the instruction: `rax, rcx, r11` + the arg registers used.
-  **preserved:** `rbx, rbp, r12–r15, rsp` — like a C call. Keep anything that
-  must survive a syscall in a callee-saved register.
+- **changed:** `rax` (the result), and `rcx, r11`, which the `syscall`
+  instruction itself overwrites. **Everything else is preserved** — the
+  argument registers `rdi, rsi, rdx, r10, r8, r9` included, as on Linux.
+  (Until 2026-10 the argument registers came back holding whatever the
+  kernel's dispatch code had left in them.)
 
 ---
 

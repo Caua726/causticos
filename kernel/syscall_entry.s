@@ -40,6 +40,19 @@ syscall_entry_asm:
     push r13
     push r14
     push r15
+    # The argument registers come back as they went in, as on Linux: only rax
+    # (the result) and rcx/r11 (which SYSCALL itself overwrites) change.
+    # dispatch is ordinary compiled code and leaves whatever it likes in the
+    # caller-saved registers — kernel addresses included, which went back to
+    # ring 3 as they were. And a program keeping something in rdi across a
+    # syscall lost it: the dynamic-stack grow helper did, and recorded the
+    # stack's new bottom as whatever dispatch had left there.
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
+    push r9
     .byte 0xFB        # sti — safe now: on the kernel stack with a coherent frame
     push r9           # f -> 7th dispatch arg (on stack)
     mov r9, r8        # r9  <- e
@@ -51,6 +64,12 @@ syscall_entry_asm:
     call _kernel_sys_syscall_cst_dispatch
     add rsp, 8        # drop pushed f
     .byte 0xFA        # cli — IRQs off across the unwind
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
     pop r15
     pop r14
     pop r13
