@@ -63,21 +63,21 @@ let is i64 as K_EXEC    with imut = 18;   // na = first word, nb = how many
 let is i64 as K_EXECALL with imut = 19;   // the same, {} + form; nv = its batch
 let is i64 as K_OK      with imut = 20;
 
-// The kernel copies at most this many arguments into a child, and their bytes
-// into one page with the rest of what starts it; -exec stays inside both.
-let is i64 as ARG_MAX   with imut = 32;
-let is i64 as ARG_BYTES with imut = 2800;
+// What an argument costs a command -exec starts: its bytes, plus its NUL and
+// its pointer on the child's stack. Spawn takes sys.ARGV_MAX of that.
+fn arg_cost(len as i64) as i64 { return len + 9; }
 
-// A node per word is the most an expression can have, and the shell hands a
-// program at most 32 words: these hold any expression it can be given.
-let is i64 as MAXN with imut = 128;
-let is [128]i64 as nk with mut;
-let is [128]i64 as na with mut;
-let is [128]i64 as nb with mut;
-let is [128]i64 as nv with mut;
-let is [128]i64 as nw with mut;
-let is [128]i64 as nu with mut;
-let is [128]i64 as np with mut;           // a pattern: its word
+// The expression's nodes. A word makes at most one node, and so does each
+// implied -a between two of them, plus the -print an expression without an
+// action gets: main sizes these from argc.
+let is i64 as MAXN with mut = 0;
+let is *i64 as nk with mut = cast(*i64, 0);
+let is *i64 as na with mut = cast(*i64, 0);
+let is *i64 as nb with mut = cast(*i64, 0);
+let is *i64 as nv with mut = cast(*i64, 0);
+let is *i64 as nw with mut = cast(*i64, 0);
+let is *i64 as nu with mut = cast(*i64, 0);
+let is *i64 as np with mut = cast(*i64, 0);   // a pattern: its word
 let is i64 as nn with mut = 0;
 
 let is i64 as g_argv with mut = 0;
@@ -507,35 +507,53 @@ fn run(av as *i64, ac as i64) as i64 {
     return 0;
 }
 
-let is [4096]u8 as xbuf with mut;         // -exec ... ; arguments with {} replaced
+// -exec ... ; arguments with {} replaced, and the vector handed to spawn:
+// both grow to what a command needs.
+let is fu.Line as XB;
+let is fu.Line as AVL;
+
+fn room(l as *fu.Line, need as i64) as void {
+    if (fu.line_reserve(l, need) != 0) { die("out of memory", "", ""); }
+}
 
 // -exec / -ok, once for this entry. Every "{}" in a word becomes the path.
 fn run_each(n as i64, ask as i64) as i64 {
-    if (nb[n] > ARG_MAX) { return too_long(); }
-    let is [64]i64 as av;
-    let is i64 as ac with mut = 0;
-    let is i64 as used with mut = 0;
+    XB.len = 0;
+    let is i64 as cost with mut = 0;
+    room(&AVL, nb[n] * 16);
+    let is *i64 as offs = cast(*i64, AVL.va);      // where each word starts in XB, for now
     let is i64 as w with mut = 0;
     while (w < nb[n]) {
         let is *u8 as src = word(na[n] + w);
-        let is i64 as start = used;
+        offs[w * 2] = XB.len;
         let is i64 as i with mut = 0;
         while (src[i] != 0) {
             if (src[i] == cast(u8, 123) && src[i + 1] == cast(u8, 125)) {      // {}
-                if (used + slen >= ARG_BYTES) { return too_long(); }
+                room(&XB, XB.len + slen);
+                let is *u8 as d = cast(*u8, XB.va);
                 let is i64 as k with mut = 0;
-                while (k < slen) { xbuf[used] = sbuf[k]; used = used + 1; k = k + 1; }
+                while (k < slen) { d[XB.len + k] = sbuf[k]; k = k + 1; }
+                XB.len = XB.len + slen;
                 i = i + 2;
             } else {
-                if (used + 1 >= ARG_BYTES) { return too_long(); }
-                xbuf[used] = src[i]; used = used + 1; i = i + 1;
+                room(&XB, XB.len + 1);
+                let is *u8 as d1 = cast(*u8, XB.va);
+                d1[XB.len] = src[i]; XB.len = XB.len + 1; i = i + 1;
             }
         }
-        xbuf[used] = cast(u8, 0); used = used + 1;
-        av[ac * 2] = cast(i64, &xbuf[start]); av[ac * 2 + 1] = used - 1 - start;
-        ac = ac + 1;
+        offs[w * 2 + 1] = XB.len - offs[w * 2];
+        cost = cost + arg_cost(offs[w * 2 + 1]);
+        room(&XB, XB.len + 1);
+        let is *u8 as d2 = cast(*u8, XB.va);
+        d2[XB.len] = cast(u8, 0); XB.len = XB.len + 1;
         w = w + 1;
     }
+    if (cost > sys.ARGV_MAX) { return too_long(); }
+    // offsets into pointers, now that XB is done growing
+    let is i64 as ac = nb[n];
+    let is i64 as j0 with mut = 0;
+    while (j0 < ac) { offs[j0 * 2] = XB.va + offs[j0 * 2]; j0 = j0 + 1; }
+    let is *i64 as av = offs;
     if (ask == 1) {
         flush();
         prog.errs("< ");
@@ -547,7 +565,7 @@ fn run_each(n as i64, ask as i64) as i64 {
         prog.errs("\n");
         if (got <= 0 || (ans[0] != cast(u8, 121) && ans[0] != cast(u8, 89))) { return 0; }
     }
-    return run(cast(*i64, &av[0]), ac);
+    return run(av, ac);
 }
 
 fn too_long() as i64 {
@@ -558,65 +576,79 @@ fn too_long() as i64 {
 }
 
 // -exec ... {} +: paths gathered per such action, and run whenever the next
-// would not fit — in the kernel's argument count or in its page of bytes.
-let is i64 as MAXB with imut = 8;
-let is [32768]u8 as bbuf with mut;        // MAXB * 4096: each batch's paths
-let is [8]i64 as bused with mut;
-let is [8]i64 as bcount with mut;
-let is [256]i64 as boff with mut;         // MAXB * ARG_MAX: where each path is
-let is [8]i64 as bnode with mut;
+// would take the command past what spawn takes (sys.ARGV_MAX).
+struct Batch {
+    node as i64;
+    count as i64;        // paths gathered
+    cost as i64;         // what they cost as arguments
+    bytes as fu.Line;    // the paths, each NUL-terminated
+    offs as fu.Line;     // [count]i64: where each starts
+}
+let is fu.Line as BATCHES;                // [nbatch]Batch
 let is i64 as nbatch with mut = 0;
 
+fn batch(i as i64) as *Batch { return cast(*Batch, BATCHES.va + i * sizeof(Batch)); }
+
 fn batch_new(n as i64) as i64 {
-    if (nbatch >= MAXB) { die("too many -exec ... + actions", "", ""); }
-    bused[nbatch] = 0; bcount[nbatch] = 0; bnode[nbatch] = n;
+    room(&BATCHES, (nbatch + 1) * sizeof(Batch));
+    BATCHES.len = (nbatch + 1) * sizeof(Batch);
+    let is *Batch as b = batch(nbatch);
+    b.node = n; b.count = 0; b.cost = 0;
+    b.bytes.va = 0; b.bytes.cap = 0; b.bytes.len = 0;
+    b.offs.va = 0; b.offs.cap = 0; b.offs.len = 0;
     nbatch = nbatch + 1;
     return nbatch - 1;
 }
 
-// The command's own words and its bytes.
-fn batch_fixed(n as i64, bytes as *i64) as i64 {
+// What the command's own words cost.
+fn batch_fixed(n as i64) as i64 {
     let is i64 as w with mut = 0;
-    let is i64 as b with mut = 0;
-    while (w < nb[n]) { b = b + prog.slen(word(na[n] + w)) + 1; w = w + 1; }
-    bytes[0] = b;
-    return nb[n];
+    let is i64 as c with mut = 0;
+    while (w < nb[n]) { c = c + arg_cost(prog.slen(word(na[n] + w))); w = w + 1; }
+    return c;
 }
 
 fn batch_add(n as i64) as void {
-    let is i64 as bi = nv[n];
-    let is [1]i64 as fb;
-    let is i64 as fixed = batch_fixed(n, cast(*i64, &fb[0]));
-    if (fixed + 1 > ARG_MAX || fb[0] + slen + 1 > ARG_BYTES || slen + 1 > 4096) { too_long(); return; }
-    if (fixed + bcount[bi] + 1 > ARG_MAX || fb[0] + bused[bi] + slen + 1 > ARG_BYTES) { batch_run(n); }
-    let is i64 as base = bi * 4096;
-    boff[bi * ARG_MAX + bcount[bi]] = bused[bi];
+    let is i64 as fixed = batch_fixed(n);
+    if (fixed + arg_cost(slen) > sys.ARGV_MAX) { too_long(); return; }
+    if (fixed + batch(nv[n]).cost + arg_cost(slen) > sys.ARGV_MAX) { batch_run(n); }
+    let is *Batch as b = batch(nv[n]);
+    let is i64 as off = b.bytes.len;
+    room(&b.bytes, off + slen + 1);
+    let is *u8 as d = cast(*u8, b.bytes.va);
     let is i64 as k with mut = 0;
-    while (k < slen) { bbuf[base + bused[bi] + k] = sbuf[k]; k = k + 1; }
-    bbuf[base + bused[bi] + slen] = cast(u8, 0);
-    bused[bi] = bused[bi] + slen + 1;
-    bcount[bi] = bcount[bi] + 1;
+    while (k < slen) { d[off + k] = sbuf[k]; k = k + 1; }
+    d[off + slen] = cast(u8, 0);
+    b.bytes.len = off + slen + 1;
+    room(&b.offs, (b.count + 1) * 8);
+    let is *i64 as o = cast(*i64, b.offs.va);
+    o[b.count] = off;
+    b.count = b.count + 1;
+    b.cost = b.cost + arg_cost(slen);
     return;
 }
 
 fn batch_run(n as i64) as void {
-    let is i64 as bi = nv[n];
-    if (bcount[bi] == 0) { return; }
-    let is [64]i64 as av;
+    let is *Batch as b = batch(nv[n]);
+    if (b.count == 0) { return; }
+    let is i64 as total = nb[n] + b.count;
+    room(&AVL, total * 16);
+    let is *i64 as av = cast(*i64, AVL.va);
     let is i64 as ac with mut = 0;
     while (ac < nb[n]) {
         let is *u8 as w = word(na[n] + ac);
         av[ac * 2] = cast(i64, w); av[ac * 2 + 1] = prog.slen(w);
         ac = ac + 1;
     }
+    let is *i64 as o = cast(*i64, b.offs.va);
     let is i64 as j with mut = 0;
-    while (j < bcount[bi]) {
-        let is *u8 as p = cast(*u8, cast(i64, &bbuf[bi * 4096]) + boff[bi * ARG_MAX + j]);
+    while (j < b.count) {
+        let is *u8 as p = cast(*u8, b.bytes.va + o[j]);
         av[ac * 2] = cast(i64, p); av[ac * 2 + 1] = prog.slen(p);
         ac = ac + 1; j = j + 1;
     }
-    if (run(cast(*i64, &av[0]), ac) == 0) { g_status = 1; }
-    bused[bi] = 0; bcount[bi] = 0;
+    if (run(av, ac) == 0) { g_status = 1; }
+    b.bytes.len = 0; b.count = 0; b.cost = 0;
     return;
 }
 
@@ -825,6 +857,12 @@ fn usage() as void {
 fn main(argc as i64, argv as *u8) as i32 {
     g_argv = cast(i64, argv);
     g_argc = argc;
+    MAXN = argc * 2 + 8;
+    let is i64 as nva = sys.mmap(0, fu.page_round(MAXN * 8 * 7), sys.PROT_READ | sys.PROT_WRITE);
+    if (nva < 0) { die("out of memory", "", ""); }
+    nk = cast(*i64, nva); na = cast(*i64, nva + MAXN * 8); nb = cast(*i64, nva + MAXN * 16);
+    nv = cast(*i64, nva + MAXN * 24); nw = cast(*i64, nva + MAXN * 32); nu = cast(*i64, nva + MAXN * 40);
+    np = cast(*i64, nva + MAXN * 48);
     if (argc >= 2 && (streq(prog.arg(argv, 1), "--help") == 1 || streq(prog.arg(argv, 1), "-help") == 1)) {
         usage();
         return 0;
@@ -862,7 +900,7 @@ fn main(argc as i64, argv as *u8) as i32 {
         k = k + 1;
     }
     let is i64 as b with mut = 0;
-    while (b < nbatch) { batch_run(bnode[b]); b = b + 1; }
+    while (b < nbatch) { batch_run(batch(b).node); b = b + 1; }
     flush();
     return cast(i32, g_status);
 }

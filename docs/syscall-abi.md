@@ -138,7 +138,9 @@ Per-call notes:
   same program. The kernel now reads the source once into frames that every later
   spawn of that file maps instead of copying. While a process is running from a
   file, writing/unlinking/renaming it is `E_TXTBSY`.
-  `argv` (r8) is an array of `argc` (r9, ≤ 32) `{str_ptr, str_len}` i64 pairs —
+  `argv` (r8) is an array of `argc` (r9) `{str_ptr, str_len}` i64 pairs, at
+  most `ARGV_MAX` (256 KiB) of them counting each argument's length + 9 (its NUL
+  and its pointer on the child's stack), else `E_2BIG` (-20) —
   the child's argument vector, copied onto its initial System V stack (at
   `_start`, `rsp` → `argc`, then `argv[0..n]`, NULL, **empty envp**, auxv). argv
   is **data, not authority**: the kernel never resolves it (a path in argv is
@@ -180,6 +182,9 @@ Per-call notes:
 | -6 | `E_RANGE` | | -15 | `E_IO` |
 | -7 | `E_PERM` | | -16 | `E_PIPE` (write to a channel whose far end closed) |
 | -8 | `E_AGAIN` | | -17 | `E_TXTBSY` (change a file a live process was loaded from) |
+| | | | -18 | `E_INTR` (kernel-internal: the caller is being terminated) |
+| | | | -19 | `E_NOEXEC` (spawn: not an image this system runs) |
+| | | | -20 | `E_2BIG` (spawn: more than `ARGV_MAX` of arguments) |
 
 ---
 

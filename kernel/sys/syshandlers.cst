@@ -1221,43 +1221,76 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     // (architecture §2): the kernel copies the strings and later lays them on
     // the child's stack, but resolves NOTHING from them — a path in argv is
     // just bytes. Authority still travels only as fds (fdacts above). argc == 0
-    // → the child gets the default argv = ["child"]. Bounded: ≤32 args, ≤256 B
-    // each, ≤2048 B total.
-    let is i64 as argv_uptr = sp.argv_uptr;
+    // → the child gets the default argv = ["child"]. Bounded only by
+    // abi.ARGV_MAX, in one allocation sized to what was given (it was 32
+    // arguments of 256 bytes, 2048 in all, on this stack: a sed script of a
+    // few hundred bytes could not be passed, and the shell cut `ls *` short).
+    let is [3]i64 as av;
+    let is i64 as arc = _argv_in(pml4, sp.argv_uptr, sp.argc, cast(*i64, &av[0]));
+    if (arc != 0) { return arc; }
     let is i64 as argc with mut = sp.argc;
-    let is [512]u8 as argdesc;                         // 32 × 16
-    let is [2048]u8 as argstr;
-    let is [32]i64 as argv_ptrs;
-    let is [32]i64 as argv_lens;
     if (argc < 0) { argc = 0; }
-    if (argc > 32) { return abi.E_INVAL; }
-    if (argc > 0) {
-        if (argv_uptr == 0) { return abi.E_INVAL; }
-        if (userspace.copy_from_user(pml4, cast(*u8, &argdesc[0]), argv_uptr, argc * 16) != 0) {
-            return abi.E_FAULT;
-        }
-        let is *i64 as descs = cast(*i64, &argdesc[0]);
-        let is i64 as soff with mut = 0;
-        let is i64 as ai with mut = 0;
-        while (ai < argc) {
-            let is i64 as sp = descs[ai * 2 + 0];
-            let is i64 as sl with mut = descs[ai * 2 + 1];
-            if (sl < 0) { sl = 0; }
-            if (sl > 256) { return abi.E_INVAL; }
-            if (soff + sl > 2048) { return abi.E_INVAL; }
-            if (sl > 0) {
-                if (sp == 0) { return abi.E_FAULT; }
-                if (userspace.copy_from_user(pml4, cast(*u8, &argstr[soff]), sp, sl) != 0) {
-                    return abi.E_FAULT;
-                }
-            }
-            argv_ptrs[ai] = cast(i64, &argstr[soff]);
-            argv_lens[ai] = sl;
-            soff = soff + sl;
-            ai = ai + 1;
-        }
-    }
+    let is i64 as res = _spawn_child(tid, parent, &sp, cast(*u8, &pathbuf[0]), cast(*u8, &actbuf[0]), n_acts,
+                                     cast(*i64, av[1]), cast(*i64, av[2]), argc);
+    heap.kfree(av[0]);
+    return res;
+}
 
+// SYS_SPAWN's argument vector into one kernel allocation: argc pointers, argc
+// lengths, then the strings. out[0] = the allocation (0 for none), out[1] the
+// pointers, out[2] the lengths. 0, or an errno: E_2BIG past ARGV_MAX.
+fn _argv_in(pml4 as i64, uptr as i64, argc0 as i64, out as *i64) as i64 {
+    out[0] = 0; out[1] = 0; out[2] = 0;
+    let is i64 as argc with mut = argc0;
+    if (argc < 0) { argc = 0; }
+    if (argc == 0) { return 0; }
+    if (argc > abi.ARGV_MAX / 9) { return abi.E_2BIG; }         // a NUL and a pointer each, at least
+    if (uptr == 0) { return abi.E_INVAL; }
+    let is i64 as descs = heap.kmalloc(argc * 16, cast(i32, 0));
+    if (descs == 0) { return abi.E_NOMEM; }
+    if (userspace.copy_from_user(pml4, cast(*u8, descs), uptr, argc * 16) != 0) {
+        heap.kfree(descs);
+        return abi.E_FAULT;
+    }
+    let is *i64 as d = cast(*i64, descs);
+    let is i64 as total with mut = 0;
+    let is i64 as ai with mut = 0;
+    while (ai < argc) {
+        let is i64 as sl = d[ai * 2 + 1];
+        if (sl < 0) { heap.kfree(descs); return abi.E_INVAL; }
+        total = total + sl;
+        if (total + argc * 9 > abi.ARGV_MAX) { heap.kfree(descs); return abi.E_2BIG; }
+        ai = ai + 1;
+    }
+    let is i64 as mem = heap.kmalloc(argc * 16 + total + 8, cast(i32, 0));
+    if (mem == 0) { heap.kfree(descs); return abi.E_NOMEM; }
+    let is *i64 as ptrs = cast(*i64, mem);
+    let is *i64 as lens = cast(*i64, mem + argc * 8);
+    let is i64 as strs = mem + argc * 16;
+    let is i64 as soff with mut = 0;
+    ai = 0;
+    while (ai < argc) {
+        let is i64 as su = d[ai * 2 + 0];
+        let is i64 as sl = d[ai * 2 + 1];
+        if (sl > 0) {
+            if (su == 0 || userspace.copy_from_user(pml4, cast(*u8, strs + soff), su, sl) != 0) {
+                heap.kfree(mem); heap.kfree(descs);
+                return abi.E_FAULT;
+            }
+        }
+        ptrs[ai] = strs + soff;
+        lens[ai] = sl;
+        soff = soff + sl;
+        ai = ai + 1;
+    }
+    heap.kfree(descs);
+    out[0] = mem; out[1] = cast(i64, ptrs); out[2] = cast(i64, lens);
+    return 0;
+}
+
+// The rest of SYS_SPAWN, once everything the caller handed over is copied in.
+fn _spawn_child(tid as i64, parent as i64, sp as *abi.SpawnParams, pathbuf as *u8, actbuf as *u8, n_acts as i64,
+                argv_ptrs as *i64, argv_lens as *i64, argc as i64) as i64 {
     // Resolve the source into a cached image. No staging buffer: the cache
     // reads the source once into the frames the child will map, and every later
     // spawn of the same file maps those same frames instead of reading or
@@ -1265,7 +1298,7 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     // the image and copy_from_user into it — is gone with the bytes it staged.
     let is i64 as slot with mut = 0 - 1;
     if (sp.src_kind == abi.SPAWN_SRC_PATH) {
-        let is *vfs.VfsFile as srcf = vfs.open(cast(*u8, &pathbuf[0]), sp.path_len,
+        let is *vfs.VfsFile as srcf = vfs.open(pathbuf, sp.path_len,
                                                cast(i32, abi.O_RDONLY));
         if (cast(i64, srcf) == 0) { return abi.E_NOENT; }
         if (srcf.is_dir != 0) { vfs.close(srcf); return abi.E_ISDIR; }
@@ -1300,7 +1333,7 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     let is i64 as child with mut = 0;
     if (argc > 0) {
         child = userspace.proc_spawn_slot(parent, slot,
-                                          cast(*i64, &argv_ptrs[0]), cast(*i64, &argv_lens[0]), argc);
+                                          argv_ptrs, argv_lens, argc);
     } else {
         child = userspace.proc_spawn_slot(parent, slot, cast(*i64, 0), cast(*i64, 0), 0);
     }
@@ -1327,7 +1360,7 @@ fn sys_spawn(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64) as i64 
     if (n_acts > 0) {
         let is i64 as parent_asp = sched.thr_aspace_ptr(tid);
         let is i64 as child_asp = proc.proc_aspace(child);
-        let is *i64 as acts = cast(*i64, &actbuf[0]);
+        let is *i64 as acts = cast(*i64, actbuf);
         let is i64 as ai with mut = 0;
         while (ai < n_acts) {
             let is i64 as child_fd = acts[ai * 2 + 0];

@@ -261,17 +261,67 @@ fn load_segments(a as *vma.Aspace, buf as *u8, size as i64) as i32 {
 //     (policy). A path in argv is just bytes — the child acts on it only
 //     through the keys (fds) it was explicitly handed.
 // auxv carries loader facts only (page size, entry, AT_RANDOM) — process info,
-// not authority. Everything lays out in the top stack page; overflow errors
-// rather than corrupts.
-let is i64 as MAX_ARGV = 32;
+// not authority. The arguments take as many pages at the top as they need
+// (SYS_SPAWN bounds them by abi.ARGV_MAX); past the first page they are added
+// to the stack rather than taken from what the program declared for its frames.
+
+// The kernel address of the child's stack byte at va (its page is committed).
+fn _stack_kv(a as *vma.Aspace, va as i64) as i64 {
+    let is i64 as pg = va & cast(i64, 0 - 4096);
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, pg);
+    if (phys == 0) { return 0; }
+    return pmm.phys_to_virt(phys) + (va & 4095);
+}
+
+// n bytes from src onto the child's stack at va, across pages. 0, or -2.
+fn _stack_put(a as *vma.Aspace, va0 as i64, src0 as *u8, n0 as i64) as i32 {
+    let is i64 as va with mut = va0;
+    let is i64 as src with mut = cast(i64, src0);
+    let is i64 as n with mut = n0;
+    while (n > 0) {
+        let is i64 as kv = _stack_kv(a, va);
+        if (kv == 0) { return cast(i32, 0 - 2); }
+        let is i64 as chunk with mut = 4096 - (va & 4095);
+        if (chunk > n) { chunk = n; }
+        let is *u8 as d = cast(*u8, kv);
+        let is *u8 as s = cast(*u8, src);
+        let is i64 as i with mut = 0;
+        while (i < chunk) { d[i] = s[i]; i = i + 1; }
+        va = va + chunk; src = src + chunk; n = n - chunk;
+    }
+    return 0;
+}
+
+// One word at an 8-aligned va (never across a page).
+fn _stack_put64(a as *vma.Aspace, va as i64, v as i64) as i32 {
+    let is i64 as kv = _stack_kv(a, va);
+    if (kv == 0) { return cast(i32, 0 - 2); }
+    let is *i64 as w = cast(*i64, kv);
+    w[0] = v;
+    return 0;
+}
 
 fn build_initial_stack(a as *vma.Aspace, entry as i64,
                         argv_ptrs as *i64, argv_lens as *i64, argc as i64,
                         out_rsp as *i64) as i32 {
-    if (argc < 1 || argc > MAX_ARGV) {
+    if (argc < 1) {
         serial.println("elf: argc out of range", 22);
         return cast(i32, 0 - 4);
     }
+    // What the top of the stack holds: the thread block, the strings with
+    // their NULs, 16 random bytes, argc + argv + NULL + envp NULL + 8 auxv
+    // words, and up to 16 bytes of alignment. Pages past the first are extra.
+    let is i64 as strings with mut = 0;
+    let is i64 as k0 with mut = 0;
+    while (k0 < argc) {
+        let is i64 as l0 with mut = argv_lens[k0];
+        if (l0 < 0) { l0 = 0; }
+        strings = strings + l0 + 1;
+        k0 = k0 + 1;
+    }
+    let is i64 as need = abi.THREAD_BLOCK_SIZE + strings + 16 + (argc + 11) * 8 + 16;
+    let is i64 as extra with mut = pmm.align_up(need, pmm.PAGE_SIZE) - pmm.PAGE_SIZE;
+    if (extra < 0) { extra = 0; }
     let is i64 as stack_top = USER_STACK_TOP_VA;
     let is i64 as sprot = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
     let is i64 as stack_low with mut = 0;      // lowest committed byte
@@ -282,9 +332,10 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
         // demand (SYS_COMMIT). stack_size is reinterpreted as the ceiling.
         let is i64 as ceiling with mut = a.stack_size;
         if (ceiling <= 0) { ceiling = STACK_DYN_CEILING; }
-        ceiling = pmm.align_up(ceiling, pmm.PAGE_SIZE);
+        ceiling = pmm.align_up(ceiling, pmm.PAGE_SIZE) + extra;
         let is i64 as ic with mut = INITIAL_STACK_COMMIT;
-        if (ic > ceiling) { ic = ceiling; }
+        if (ic > ceiling - extra) { ic = ceiling - extra; }
+        ic = ic + extra;
         let is i64 as base = stack_top - ceiling;
         let is i64 as rv = vma.reserve(a, base, ceiling, sprot,
                                        vma.VMA_FIXED | vma.VMA_GROWSDOWN);
@@ -303,7 +354,7 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
         // Strict: eager-commit the whole declared/default size — the wall.
         let is i64 as stack_size with mut = a.stack_size;
         if (stack_size <= 0) { stack_size = USER_STACK_SIZE; }
-        stack_size = pmm.align_up(stack_size, pmm.PAGE_SIZE);
+        stack_size = pmm.align_up(stack_size, pmm.PAGE_SIZE) + extra;
         let is i64 as got = vma.mmap_anon(a, stack_top - stack_size,
                                            stack_size, sprot,
                                            vma.VMA_FIXED | vma.VMA_GROWSDOWN);
@@ -315,81 +366,75 @@ fn build_initial_stack(a as *vma.Aspace, entry as i64,
         stack_floor = stack_low;
     }
 
-    // Layout inside our kernel-mapped view of the top page, working backwards
-    // from stack_top: the first thread's block, every argv string, then a
-    // 16-byte AT_RANDOM blob, then the argc/argv/envp/auxv scalar array.
-    let is i64 as page_va = stack_top - pmm.PAGE_SIZE;
-    let is i64 as page_phys = vmm.virt_to_phys_walk(a.pml4_phys, page_va);
-    if (page_phys == 0) {
+    // Layout, working down from stack_top: the first thread's block, every
+    // argv string, a 16-byte AT_RANDOM blob, then the argc/argv/envp/auxv
+    // words. Written through the child's page tables, page by page.
+    let is i64 as tb_va = stack_top - abi.THREAD_BLOCK_SIZE;
+    let is [8]i64 as tbw;
+    let is i64 as tw with mut = 0;
+    while (tw < 8) { tbw[tw] = 0; tw = tw + 1; }
+    tbw[abi.TB_STACK_LOW / 8] = stack_low;
+    tbw[abi.TB_SELF / 8] = tb_va;
+    tbw[abi.TB_STACK_FLOOR / 8] = stack_floor;
+    if (_stack_put(a, tb_va, cast(*u8, &tbw[0]), 64) != 0) {
         serial.println("elf: stack page lookup fail", 27);
         return cast(i32, 0 - 2);
     }
-    let is *u8 as page_kv = cast(*u8, pmm.phys_to_virt(page_phys));
+    let is i64 as tz with mut = 64;              // the rest of the block, zero
+    let is [1]u8 as zb; zb[0] = cast(u8, 0);
+    while (tz < abi.THREAD_BLOCK_SIZE) { _stack_put(a, tb_va + tz, cast(*u8, &zb[0]), 1); tz = tz + 1; }
+    a.main_block = tb_va;
 
-    // Cursor inside the page (offset from page base, growing down).
-    let is i64 as off with mut = pmm.PAGE_SIZE - abi.THREAD_BLOCK_SIZE;
-    let is [32]i64 as argv_va;
-
-    // The thread block, 64-aligned at the very top: the first thread's fs
-    // base (proc_from_loaded hands it over). Zero past the defined words.
-    let is *i64 as tb = cast(*i64, &page_kv[off]);
-    let is i64 as tw with mut = 0;
-    while (tw < abi.THREAD_BLOCK_SIZE / 8) { tb[tw] = 0; tw = tw + 1; }
-    tb[abi.TB_STACK_LOW / 8] = stack_low;
-    tb[abi.TB_SELF / 8] = page_va + off;
-    tb[abi.TB_STACK_FLOOR / 8] = stack_floor;
-    a.main_block = page_va + off;
-
-    // Write each argv string (NUL-terminated), recording its child VA.
+    // The strings, each NUL-terminated, argv[0] highest.
+    let is i64 as cur with mut = tb_va;
     let is i64 as k with mut = 0;
     while (k < argc) {
         let is i64 as slen with mut = argv_lens[k];
         if (slen < 0) { slen = 0; }
-        if (off < slen + 1) {
-            serial.println("elf: initial stack overflow", 27);
-            return cast(i32, 0 - 3);
-        }
-        off = off - (slen + 1);
-        let is *u8 as src = cast(*u8, argv_ptrs[k]);
-        let is i64 as j with mut = 0;
-        while (j < slen) { page_kv[off + j] = src[j]; j = j + 1; }
-        page_kv[off + slen] = cast(u8, 0);
-        argv_va[k] = page_va + off;
+        cur = cur - (slen + 1);
+        if (_stack_put(a, cur, cast(*u8, argv_ptrs[k]), slen) != 0) { return cast(i32, 0 - 3); }
+        if (_stack_put(a, cur + slen, cast(*u8, &zb[0]), 1) != 0) { return cast(i32, 0 - 3); }
         k = k + 1;
     }
 
     // 16 bytes for AT_RANDOM (zeros until the RNG syscall exists).
-    if (off < 16) { serial.println("elf: initial stack overflow", 27); return cast(i32, 0 - 3); }
-    off = off - 16;
-    let is i64 as random_va = page_va + off;
-    let is i64 as zr with mut = 0;
-    while (zr < 16) { page_kv[off + zr] = cast(u8, 0); zr = zr + 1; }
+    cur = cur - 16;
+    let is i64 as random_va = cur;
+    let is [16]u8 as zr;
+    let is i64 as zi with mut = 0;
+    while (zi < 16) { zr[zi] = cast(u8, 0); zi = zi + 1; }
+    if (_stack_put(a, random_va, cast(*u8, &zr[0]), 16) != 0) { return cast(i32, 0 - 3); }
 
-    // Scalar block: argc + argv[argc] + argv NULL + envp NULL + auxv(8 words).
-    // = 1 + argc + 1 + 1 + 8 = argc + 11 i64s.
-    let is i64 as nwords = argc + 11;
-    let is i64 as scalars_bytes = nwords * 8;
-    if (off < scalars_bytes) {
+    // argc + argv[argc] + argv NULL + envp NULL + auxv(8 words) = argc + 11,
+    // with the stack pointer 16-aligned at argc for _start.
+    cur = (cur - (argc + 11) * 8) & cast(i64, 0 - 16);
+    if (cur < stack_top - extra - pmm.PAGE_SIZE) {
         serial.println("elf: initial stack overflow", 27);
         return cast(i32, 0 - 3);
     }
-    off = off - scalars_bytes;
-    // Align the SP down to 16 so _start sees a 16-aligned rsp at argc.
-    off = off & cast(i64, 0 - 16);
-
-    let is *i64 as words = cast(*i64, &page_kv[off]);
-    let is i64 as user_rsp = page_va + off;
-
-    words[0] = argc;
+    let is i64 as user_rsp = cur;
+    let is i32 as wrc with mut = _stack_put64(a, cur, argc);
+    let is i64 as sva with mut = tb_va;           // argv[w]'s string, recomputed top-down
     let is i64 as w with mut = 0;
-    while (w < argc) { words[1 + w] = argv_va[w]; w = w + 1; }
-    words[1 + argc] = 0;             // argv terminator
-    words[2 + argc] = 0;             // envp[0] = NULL — empty environment
-    let is i64 as ax = 3 + argc;     // auxv begins after the envp NULL
-    words[ax + 0] = AT_PAGESZ;  words[ax + 1] = pmm.PAGE_SIZE;
-    words[ax + 2] = AT_ENTRY;   words[ax + 3] = entry;
-    words[ax + 4] = AT_RANDOM;  words[ax + 5] = random_va;
-    words[ax + 6] = AT_NULL;    words[ax + 7] = 0;
+    while (w < argc) {
+        let is i64 as wl with mut = argv_lens[w];
+        if (wl < 0) { wl = 0; }
+        sva = sva - (wl + 1);
+        if (wrc == 0) { wrc = _stack_put64(a, cur + 8 + w * 8, sva); }
+        w = w + 1;
+    }
+    let is i64 as ax = cur + 8 + argc * 8;
+    if (wrc == 0) { wrc = _stack_put64(a, ax, 0); }                  // argv terminator
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 8, 0); }              // envp[0] = NULL — empty environment
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 16, AT_PAGESZ); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 24, pmm.PAGE_SIZE); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 32, AT_ENTRY); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 40, entry); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 48, AT_RANDOM); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 56, random_va); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 64, AT_NULL); }
+    if (wrc == 0) { wrc = _stack_put64(a, ax + 72, 0); }
+    if (wrc != 0) { return cast(i32, 0 - 3); }
 
     *out_rsp = user_rsp;
     return 0;

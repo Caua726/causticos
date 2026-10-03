@@ -4,8 +4,8 @@
 // it through the stdlib binding. This closes that gap from the other side.
 //
 // Covers SYS_THREAD_SPAWN/EXIT (and each thread's own block and stack),
-// SYS_EVENT_SUBSCRIBE, SYS_QUERY_DEVS and SYS_DEV_INFO. Runs from the shell
-// like any other program.
+// SYS_EVENT_SUBSCRIBE, SYS_QUERY_DEVS and SYS_DEV_INFO, and what SYS_SPAWN
+// carries in an argument vector. Runs from the shell like any other program.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 
@@ -465,8 +465,128 @@ fn test_mapping_outlives_fd() as void {
     return;
 }
 
-fn main() as i32 {
+// ---- the argument vector ----
+
+// A sum over an argument vector's lengths and bytes, from argument `from` on:
+// the spawner and the spawned compute it the same way, so a vector that
+// arrives cut short, reordered or with a byte wrong shows.
+fn argv_sum(av as *i64, n as i64) as i64 {
+    let is i64 as s with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as a = cast(*u8, av[i * 2]);
+        let is i64 as len = av[i * 2 + 1];
+        s = s * 31 + len;
+        let is i64 as j with mut = 0;
+        while (j < len) { s = s * 7 + cast(i64, a[j]); j = j + 1; }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn put_dec(b as *u8, v0 as i64) as i64 {
+    let is i64 as v with mut = v0;
+    let is i64 as n with mut = 0;
+    if (v < 0) { b[0] = cast(u8, 45); n = 1; v = 0 - v; }
+    let is [24]u8 as d;
+    let is i64 as k with mut = 0;
+    if (v == 0) { d[0] = cast(u8, 48); k = 1; }
+    while (v > 0) { d[k] = cast(u8, 48 + v % 10); v = v / 10; k = k + 1; }
+    while (k > 0) { k = k - 1; b[n] = d[k]; n = n + 1; }
+    return n;
+}
+
+fn get_dec(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as neg with mut = 0;
+    if (s[0] == cast(u8, 45)) { neg = 1; i = 1; }
+    let is i64 as v with mut = 0;
+    while (s[i] >= cast(u8, 48) && s[i] <= cast(u8, 57)) { v = v * 10 + cast(i64, s[i]) - 48; i = i + 1; }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+// Spawn a second kabi with n generated arguments, lens[i] long each (after the
+// four it needs to check them); it exits 0 when argc and the sum agree. The
+// spawn's own result: the child's exit code, or spawn's errno.
+fn spawn_argv(n as i64, lens as *i64) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) { total = total + lens[i]; i = i + 1; }
+    let is i64 as avbytes = (n + 4) * 16;
+    let is i64 as mem = sys.mmap(0, (avbytes + total + 4096 + 4095) / 4096 * 4096, sys.PROT_READ | sys.PROT_WRITE);
+    if (mem < 0) { return mem; }
+    let is *i64 as av = cast(*i64, mem);
+    let is *u8 as bytes = cast(*u8, mem + avbytes);
+    let is i64 as at with mut = 0;
+    i = 0;
+    while (i < n) {
+        let is i64 as j with mut = 0;
+        while (j < lens[i]) { bytes[at + j] = cast(u8, 97 + (i * 3 + j) % 26); j = j + 1; }
+        av[(i + 4) * 2] = cast(i64, &bytes[at]); av[(i + 4) * 2 + 1] = lens[i];
+        at = at + lens[i];
+        i = i + 1;
+    }
+    let is i64 as sum = argv_sum(cast(*i64, mem + 64), n);
+    let is *u8 as hdr = cast(*u8, cast(i64, bytes) + at);
+    av[0] = cast(i64, "kabi"); av[1] = 4;
+    av[2] = cast(i64, "--argv"); av[3] = 6;
+    let is i64 as l1 = put_dec(hdr, n + 4);
+    av[4] = cast(i64, hdr); av[5] = l1;
+    let is i64 as l2 = put_dec(cast(*u8, cast(i64, hdr) + 32), sum);
+    av[6] = cast(i64, hdr) + 32; av[7] = l2;
+    let is i64 as pid = sys.spawn_path(cast(*u8, "/kabi.cse"), cast(*u8, 0), 0, cast(*u8, av), n + 4);
+    let is i64 as rc with mut = pid;
+    if (pid >= 0) {
+        let is [1]i64 as code;
+        sys.wait(pid, cast(*i64, &code[0]));
+        rc = code[0];
+    }
+    sys.munmap(mem, (avbytes + total + 4096 + 4095) / 4096 * 4096);
+    return rc;
+}
+
+fn test_argv() as void {
+    // three thousand arguments: the bound used to be 32
+    let is i64 as ln = sys.mmap(0, 65536, sys.PROT_READ | sys.PROT_WRITE);
+    let is *i64 as lens = cast(*i64, ln);
+    let is i64 as i with mut = 0;
+    while (i < 3000) { lens[i] = i % 13 + 1; i = i + 1; }
+    let is i64 as r1 = spawn_argv(3000, lens);
+    check(cast(*u8, "3000 arguments arrive whole"), r1 == 0, r1, 0);
+    // one argument of 200000 bytes: it was 256 at most, 2048 in all
+    lens[0] = 200000;
+    let is i64 as r2 = spawn_argv(1, lens);
+    check(cast(*u8, "a 200000-byte argument arrives whole"), r2 == 0, r2, 0);
+    // past ARGV_MAX, in bytes and in count: E_2BIG, not a child with less
+    lens[0] = sys.ARGV_MAX;
+    let is i64 as r3 = spawn_argv(1, lens);
+    check(cast(*u8, "an argument past ARGV_MAX is E_2BIG"), r3 == sys.E_2BIG, r3, sys.E_2BIG);
+    i = 0;
+    while (i < 8000) { lens[i] = 30; i = i + 1; }
+    let is i64 as r4 = spawn_argv(8000, lens);
+    check(cast(*u8, "8000 arguments of 30 bytes are E_2BIG"), r4 == sys.E_2BIG, r4, sys.E_2BIG);
+    sys.munmap(ln, 65536);
+    return;
+}
+
+// The second kabi: argc and the sum must be what the first one said.
+fn argv_child(argc as i64, argv as *u8) as i32 {
+    let is *i64 as av = cast(*i64, sys.mmap(0, (argc * 16 + 4095) / 4096 * 4096, sys.PROT_READ | sys.PROT_WRITE));
+    let is i64 as i with mut = 0;
+    while (i < argc) { let is *u8 as a = prog.arg(argv, i); av[i * 2] = cast(i64, a); av[i * 2 + 1] = prog.slen(a); i = i + 1; }
+    if (argc != get_dec(prog.arg(argv, 2))) { return cast(i32, 2); }
+    if (argv_sum(cast(*i64, cast(i64, av) + 64), argc - 4) != get_dec(prog.arg(argv, 3))) { return cast(i32, 3); }
+    return cast(i32, 0);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    if (argc >= 4) {
+        let is *u8 as a1 = prog.arg(argv, 1);
+        if (a1[0] == cast(u8, 45) && a1[1] == cast(u8, 45) && a1[2] == cast(u8, 97)) { return argv_child(argc, argv); }   // --argv
+    }
     say("kabi: phase-A syscalls from ring 3\n");
+    test_argv();
     test_syscall_regs();
     test_thread();
     test_thread_blocks();
