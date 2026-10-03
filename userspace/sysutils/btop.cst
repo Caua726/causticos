@@ -3,8 +3,9 @@
 // (wterm in the WM, or the shell) renders it inside its own window. btop never
 // touches the framebuffer and is not a WM client — exactly like htop in a
 // terminal. Learns its size in-band via CSI 18t -> CSI 8;rows;cols t.
-//   up/down (or arrows) select a process, k kills a child, q quits.
+//   up/down (or arrows) select a process, k ends it (after y), q quits.
 use "std/os/causticos.cst" as sys;
+use "../lib/ttyproto/ttyproto.cst" as tty;
 
 // palette (0xRRGGBB), emitted as ANSI truecolor.
 let is i64 as C_FG = 0x00cdd6f4; let is i64 as C_DIM = 0x006c7086;
@@ -220,12 +221,65 @@ fn sort_procs() as void {
 }
 
 // ---- stdin: keys + the CSI 8t size report, parsed as a byte stream ----
-fn do_kill() as void { if (g_sel >= 0 && g_sel < g_nproc) { sys.kill(g_ents[g_sel * 9]); } }
+// ---- k: ending a process ----
+// k asks, y ends. The pid and its name are taken when k is pressed: the list
+// is resampled under the selection every second. The kill is asked of the
+// terminal (ttyproto), which ends it for the user — a program can only end
+// what it started itself, and btop started nothing.
+let is i64 as g_kpid with mut = 0;
+let is [16]u8 as g_kname;
+let is [112]u8 as g_msg; let is i64 as g_msglen with mut = 0; let is i64 as g_msguntil with mut = 0;
+fn msg_begin() as void { g_msglen = 0; g_msguntil = sys.time_ns() + 4000000000; }
+fn msg_add(s as *u8) as void { let is i64 as i with mut = 0; while (s[i] != 0 && g_msglen < 111) { g_msg[g_msglen] = s[i]; g_msglen = g_msglen + 1; i = i + 1; } }
+fn msg_name() as void { let is i64 as i with mut = 0; while (i < 16 && g_kname[i] != cast(u8, 0) && g_msglen < 111) { g_msg[g_msglen] = g_kname[i]; g_msglen = g_msglen + 1; i = i + 1; } }
+fn msg_num(v as i64) as void {
+    let is [20]u8 as d; let is i64 as n with mut = 0; let is i64 as x with mut = v;
+    if (x <= 0) { x = 0; }
+    while (n < 20) { d[n] = cast(u8, 48 + x % 10); n = n + 1; x = x / 10; if (x == 0) { break; } }
+    while (n > 0 && g_msglen < 111) { n = n - 1; g_msg[g_msglen] = d[n]; g_msglen = g_msglen + 1; }
+}
+fn ask_kill(idx as i64) as void {
+    let is i64 as pid = g_ents[idx * 9];
+    if (pid == sys.getpid()) { msg_begin(); msg_add("this is btop itself: q quits"); return; }
+    let is *u8 as nm = cast(*u8, cast(i64, &g_ents[0]) + (idx * 9 + 6) * 8);
+    let is i64 as i with mut = 0;
+    while (i < 16) { g_kname[i] = nm[i]; i = i + 1; }
+    g_kpid = pid;
+}
+fn do_kill() as void {
+    let is i64 as pid = g_kpid;
+    g_kpid = 0;
+    let is i64 as rc with mut = tty.kill(pid);
+    if (rc == 0 - 4) { rc = sys.kill(pid); }        // not on a terminal: what btop started, only
+    msg_begin();
+    if (rc == 0) { msg_add("ended "); msg_num(pid); msg_add(" ("); msg_name(); msg_add(") and what it started"); }
+    else if (rc == sys.E_AGAIN) { msg_num(pid); msg_add(": the terminal did not answer"); }
+    else { msg_num(pid); msg_add(" ("); msg_name(); msg_add("): gone already, or a system service out of reach"); }
+}
+// The bottom line while a kill waits for y, or a result is fresh: 1 when drawn.
+fn kill_line() as i64 {
+    if (g_kpid != 0) {
+        fgc(C_RED); obs("End "); obn(g_kpid); obs(" (");
+        let is i64 as i with mut = 0; while (i < 16 && g_kname[i] != cast(u8, 0)) { ob(cast(i64, g_kname[i])); i = i + 1; }
+        obs(") and what it started? y/n"); eol(); sgr0();
+        return 1;
+    }
+    if (g_msglen > 0 && sys.time_ns() < g_msguntil) {
+        fgc(C_FG); let is i64 as k with mut = 0; while (k < g_msglen) { ob(cast(i64, g_msg[k])); k = k + 1; } eol(); sgr0();
+        return 1;
+    }
+    return 0;
+}
 fn feed(c as i64) as void {
     if (in_esc == 0) {
+        if (g_kpid != 0) {                       // y ends it; anything else does not
+            if (c == 121 || c == 89) { do_kill(); } else { g_kpid = 0; }
+            if (c == 0x1B) { in_esc = 1; }
+            return;
+        }
         if (c == 0x1B) { in_esc = 1; return; }
         if (c == 113) { g_quit = 1; }            // 'q'
-        else if (c == 107) { do_kill(); }        // 'k'
+        else if (c == 107 && g_sel >= 0 && g_sel < g_nproc) { ask_kill(g_sel); }   // 'k'
         return;
     }
     if (in_esc == 1) {
@@ -315,7 +369,9 @@ fn render() as void {
     }
     while (shown < avail) { cup(row, 1); eol(); row = row + 1; shown = shown + 1; }
     // footer
-    cup(g_rows, 1); fgc(C_MAUVE); ob(113); sgr0(); fgc(C_DIM); obs(" quit  "); sgr0();
+    cup(g_rows, 1);
+    if (kill_line() == 1) { return; }
+    fgc(C_MAUVE); ob(113); sgr0(); fgc(C_DIM); obs(" quit  "); sgr0();
     fgc(C_MAUVE); obs("up/dn"); sgr0(); fgc(C_DIM); obs(" select  "); sgr0();
     fgc(C_MAUVE); ob(107); sgr0(); fgc(C_DIM); obs(" kill"); sgr0(); eol();
 }

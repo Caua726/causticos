@@ -131,8 +131,9 @@ yielding raw event streams. The set stays small on purpose: one new concept, the
   reference; the object's `close` op runs at the last reference. Clearing a slot
   *anywhere* must `ko_unref`.
 - Syscalls: `SYS_SPAWN`, `SYS_WAIT`, `SYS_PROC_KILL` (forced, cross-cpu — marks the
-  thread and parks it at its next preemption, the 1 ms tick bounding a pure-user spin;
-  it kills every thread of a multi-thread process). `SYS_THREAD_SPAWN`/`SYS_THREAD_EXIT`
+  threads and each leaves at its next boundary; it kills every thread of a
+  multi-thread process. Only an ancestor may kill, and the target's whole subtree
+  goes with it, the way a job ends as a whole). `SYS_THREAD_SPAWN`/`SYS_THREAD_EXIT`
   add threads over a shared aspace; `SYS_EVENT_SUBSCRIBE` delivers child-exit events.
 
 ---

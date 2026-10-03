@@ -502,7 +502,25 @@ fn handle_msg(t as *term.Term, m as *i64) as void {
         forward_mouse_btn(t, m[1], m[2], m[3]);   // a=buttons, b=x, c=y (content-relative)
     } else if (m[0] == wmp.MSG_MOUSE_WHEEL) {
         forward_mouse_wheel(t, m[1], m[2], m[3]); // a=delta, b=x, c=y
+    } else if (m[0] == wmp.MSG_KILL_RES && m[3] >= 0 && m[3] < jobs.max_jobs()) {
+        // The WM's answer to a kill a job asked for (tag = its slot); the job
+        // is waiting on its terminal channel for it.
+        let is *jobs.Job as kj = jobs.get(m[3]);
+        if (kj.status != jobs.JOB_FREE && kj.tty_fd >= 0) { tty.kill_reply(kj.tty_fd, m[1], m[2]); }
     }
+    return;
+}
+
+// A job asked its terminal to end a process for the user (ttyproto). One this
+// terminal started it ends itself; anything else is the WM's to end, and the
+// WM answers on its own time (handle_msg, MSG_KILL_RES).
+fn kill_for_job(slot as i64, pid as i64) as void {
+    let is *jobs.Job as kj = jobs.get(slot);
+    if (sys.kill(pid) == 0) {
+        tty.kill_reply(kj.tty_fd, pid, 0);
+        return;
+    }
+    wmp.msg_send(s.WM_FD, wmp.MSG_KILL_REQ, pid, slot, 0);
     return;
 }
 
@@ -637,9 +655,10 @@ fn main() as i32 {
         while (pk < ntp) {
             if ((pe[(te0 + pk)*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
                 let is *jobs.Job as tj = jobs.get(tty_slot[pk]);
-                if (tty.answer(tj.tty_fd, &tj.tty_fill, jobs.tty_acc(tty_slot[pk]), t.cols, t.rows, &tj.tty_catch) < 0) {
-                    sys.close(tj.tty_fd); tj.tty_fd = 0 - 1;
-                }
+                let is i64 as kp with mut = 0;
+                let is i64 as ar = tty.answer(tj.tty_fd, &tj.tty_fill, jobs.tty_acc(tty_slot[pk]), t.cols, t.rows, &tj.tty_catch, &kp);
+                if (ar < 0) { sys.close(tj.tty_fd); tj.tty_fd = 0 - 1; }
+                else if (ar == 1) { kill_for_job(tty_slot[pk], kp); }
             }
             pk = pk + 1;
         }
@@ -651,6 +670,12 @@ fn main() as i32 {
         }
         close_check();
 
+        // What the WM sent while a kill waited on its answer, first, in order.
+        let is [4]i64 as hm;
+        while (cli.unhold(&hm[0]) == 1) {
+            if (hm[0] == wmp.MSG_KEY) { handle_key(&t, hm[1], hm[2], hm[3]); }
+            else { handle_msg(&t, &hm[0]); }
+        }
         if ((pe[0*3+2] & sys.POLL_READABLE) != 0) {
             let is [4]i64 as m;
             let is i64 as r2 = wmp.msg_read(s.WM_FD, &s.cmd_fill, cast(*u8, &s.cmd_acc[0]), &m[0]);

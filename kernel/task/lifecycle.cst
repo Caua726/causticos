@@ -90,20 +90,50 @@ fn terminate_fault(p as i64, vector as i64, err as i64, rip as i64, addr as i64)
     return 1;
 }
 
-// SYS_PROC_KILL: terminate the child `pid` of `parent`. The lookup and the
-// marking happen under one hold of the tree lock, so a sibling thread of the
-// parent collecting the same child at that moment cannot free it in between.
-fn terminate_child(parent as i64, pid as i64, code as i64) as i64 {
+// The next process after `c` in a walk of `root`'s subtree (root itself not
+// included), or 0 when the walk is done: down to the first child, else across
+// to the next sibling, else back up through the parents to the first one that
+// has a next sibling. No stack, so no depth limit. Caller holds tree_lock.
+fn subtree_next_locked(root as i64, c as i64) as i64 {
+    let is i64 as d = proc.proc_first_child(c);
+    if (d != 0) { return d; }
+    let is i64 as u with mut = c;
+    while (u != 0 && u != root) {
+        let is i64 as sib = proc.proc_next_sib(u);
+        if (sib != 0) { return sib; }
+        u = proc.proc_parent(u);
+    }
+    return 0;
+}
+
+// SYS_PROC_KILL: terminate `pid` and everything it started, if it is in
+// `caller`'s subtree. The authority to end a process is having started it, or
+// having started what did — the spawn tree, with no ambient pid namespace —
+// and what a process started goes with it, the way a job goes as a whole:
+// Ctrl+C on `run prog` used to end `run` and leave `prog` running with no one
+// above it able to stop it.
+//
+// The lookup and the marking happen under one hold of the tree lock, so the
+// target's parent collecting it at that moment cannot free it in between.
+fn terminate_descendant(caller as i64, pid as i64, code as i64) as i64 {
     proc.tree_lock();
-    let is i64 as child with mut = proc.proc_first_child(parent);
-    while (child != 0 && proc.proc_pid(child) != pid) { child = proc.proc_next_sib(child); }
-    if (child == 0 || proc.proc_collected(child) != 0) {
+    let is i64 as t with mut = proc.proc_first_child(caller);
+    while (t != 0 && proc.proc_pid(t) != pid) { t = subtree_next_locked(caller, t); }
+    if (t == 0 || proc.proc_collected(t) != 0) {
         proc.tree_unlock();
         return abi.E_NOENT;
     }
-    if (proc.proc_state(child) == proc.PROC_ALIVE) {
-        proc.begin_exit_locked(child, code);
-        kick_threads_locked(child);
+    if (proc.proc_state(t) == proc.PROC_ALIVE) {
+        proc.begin_exit_locked(t, code);
+        kick_threads_locked(t);
+    }
+    let is i64 as d with mut = proc.proc_first_child(t);
+    while (d != 0) {
+        if (proc.proc_state(d) == proc.PROC_ALIVE) {
+            proc.begin_exit_locked(d, code);
+            kick_threads_locked(d);
+        }
+        d = subtree_next_locked(t, d);
     }
     proc.tree_unlock();
     return abi.E_OK;
