@@ -393,6 +393,8 @@ def main():
     ap.add_argument("--profile", default="desktop")
     ap.add_argument("--img", help="write the raw FAT32 volume here")
     ap.add_argument("--csvi", help="write the CSVI container here")
+    ap.add_argument("--compress", action="store_true",
+                    help="raw DEFLATE-compress the CSVI record region")
     ap.add_argument("--size", help="volume size (default 64M, or the profile's `size`)")
     ap.add_argument("--label", default="CAUSTICOS")
     ap.add_argument("--init", metavar="TARGET",
@@ -405,6 +407,8 @@ def main():
                     help="print the top-Causticfile targets the profile ships, one per line")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args()
+    if a.compress and not a.csvi:
+        ap.error("--compress requires --csvi")
 
     root = repo_root()
     targets = read_causticfile_targets(os.path.join(root, "userspace", "Causticfile"))
@@ -477,7 +481,7 @@ def main():
 
     blob = None
     if a.csvi:
-        blob = csvi.pack(bytes(f.getbuffer()))
+        blob = csvi.pack(bytes(f.getbuffer()), compress=a.compress)
         os.makedirs(os.path.dirname(os.path.abspath(a.csvi)), exist_ok=True)
         with open(a.csvi, "wb") as fh:
             fh.write(blob)

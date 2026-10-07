@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """csvi.py — CSVI v1: the sparse container the ISO carries the live root in.
 
-A 64 MiB FAT32 root holding ~2 MiB of programs is 97% zeros. ISO 9660 does not
-compress, and the bootloader would read every one of those zero sectors off the
-media before the kernel got a chance to run. CSVI stores only the sectors that
-actually have content, each tagged with its LBA; the kernel takes a zeroed
-window from kvmap and blits the records into it, so every sector nobody named
-is already zero and the expander never has to clear anything.
+A 33 MiB root holding ~2.2 MiB of programs is 93% zeros. CSVI stores only the
+sectors that carry data, each tagged with its LBA; the record region can also
+be compressed as a raw DEFLATE stream. The kernel bounds decoded output by the
+record count in the header and uses its own heap for decoder allocations.
 
 Format, little-endian throughout:
 
@@ -17,31 +15,35 @@ Format, little-endian throughout:
       8     8  volume_bytes   size of the EXPANDED volume; == sectors * sector_size
      16     8  volume_sectors sectors in the expanded volume
      24     4  sector_size    512 (v1 accepts only 512)
-     28     4  flags          bit 0 = payload is FAT32; bits 1..31 reserved, MUST be 0
-     32     8  record_count
+     28     4  flags          bit 0 = FAT32; bit 1 = raw DEFLATE; bits 2..31 reserved
+     32     8  record_count   number of decoded records
      40     8  records_offset MUST be 64 in v1
-     48     4  checksum       FNV-1a 32 over the RECORD REGION only
+     48     4  checksum       FNV-1a 32 over decoded (uncompressed) records
      52     4  reserved0      0
      56     8  reserved1      0
 
-  Records — record_count of them, contiguous from records_offset, 8 + sector_size
-  bytes each
+  Records — record_count of them, each 8 + sector_size bytes when decoded
     off  size  field
       0     8  lba            0-based sector index in the expanded volume
       8   512  data
 
+  With bit 1 clear, records are stored contiguously after the header. With bit
+  1 set, the entire remaining file is one raw DEFLATE stream of those records.
+
   Invariants, all checked on both sides:
-    - file_size == records_offset + record_count * (8 + sector_size), exactly
+    - uncompressed file_size == records_offset + record_count * (8 + sector_size)
+    - compressed stream consumes the remaining file and expands to exactly
+      record_count * (8 + sector_size) bytes
+    - checksum is FNV-1a 32 over the decoded record region
     - lba strictly ascending across records: no duplicates, no reordering
     - lba < volume_sectors for every record
     - any sector not named by a record is zero in the expanded volume
 
 Why one record per sector rather than run-length extents: extents would save
 about 64 KB on a 2 MB container (the 8-byte LBAs) and buy a variable-length
-bounds check inside the kernel. Per-sector records make the expander a ten-line
-loop with one comparison, and make the total file size derivable from the
-header — which is an integrity check for free. Stated trade-off, not an
-oversight.
+bounds check inside the kernel. Per-sector records keep expansion simple. The
+uncompressed size follows directly from the header; compressed streams instead
+must match that exact decoded size and checksum.
 
 Why FNV-1a 32 rather than a cryptographic hash: it is four lines of Caustic and
 it catches the two failure modes that actually happen to a file the bootloader
@@ -62,17 +64,13 @@ FLAG_FAT32 = 1
 # the CSVI header already carries the length and the checksum, so a second
 # framing would only repeat them).
 #
-# deflate rather than xz or zstd, and the reason is the KERNEL, not the ratio:
-# it is the only decoder in caustic-compact that allocates nothing. lzma keeps
-# its probability array behind mmap and zstd and lz4 allocate too, which inside
-# a kernel means a host syscall executing where there is no host. xz would give
-# 12.7% against deflate's 21.0%; the difference is 170 KB of ISO against a
-# decompressor that cannot run. The header stays plain — the kernel
-# has to read it to know how much to allocate before it can decompress anything.
+# Deflate rather than xz or zstd: the shared decoder supports a caller-provided
+# allocator, so the kernel can use its heap instead of calling an OS mmap API.
+# The header stays plain because the kernel needs the output size before it can
+# allocate. The compressed region is raw DEFLATE (no zlib/gzip wrapper).
 #
-# The checksum still covers the UNCOMPRESSED records, so it verifies what was
-# actually packed rather than what happened to arrive: a corrupt xz stream fails
-# in the decoder, and a stream that decodes to the wrong bytes fails here.
+# The checksum covers the UNCOMPRESSED records, so it verifies what was packed
+# rather than the compressed bytes that happened to arrive.
 FLAG_DEFLATE = 2
 
 FNV_OFFSET = 0x811C9DC5
@@ -85,6 +83,22 @@ def fnv1a32(data):
         h ^= b
         h = (h * FNV_PRIME) & 0xFFFFFFFF
     return h
+
+def _inflate_records(region, expected):
+    """Inflate one exact raw-DEFLATE record stream without unbounded growth."""
+    import zlib
+    decoder = zlib.decompressobj(-15)
+    try:
+        records = decoder.decompress(region, expected + 1)
+    except zlib.error as err:
+        raise ValueError("invalid raw DEFLATE stream: {}".format(err)) from None
+    if len(records) > expected or decoder.unconsumed_tail:
+        raise ValueError("raw DEFLATE stream expands beyond {} bytes".format(expected))
+    if not decoder.eof:
+        raise ValueError("incomplete raw DEFLATE stream")
+    if decoder.unused_data:
+        raise ValueError("trailing bytes after raw DEFLATE stream")
+    return records
 
 
 def pack(image, sector_size=SECTOR, flags=FLAG_FAT32, compress=False):
@@ -152,14 +166,13 @@ def parse_header(blob):
     if flags & ~(FLAG_FAT32 | FLAG_DEFLATE):
         raise ValueError("reserved flag bits set: 0x{:08X}".format(flags))
 
+    if count > vol_sectors:
+        raise ValueError("record_count {} exceeds volume_sectors {}"
+                         .format(count, vol_sectors))
     stride = 8 + sector_size
     want = rec_off + count * stride
     if flags & FLAG_DEFLATE:
-        # A compressed region has no derivable size, so the exact-length
-        # invariant does not apply: it is replaced by the decompressed length
-        # having to match, checked below.
-        import zlib
-        recs = zlib.decompress(blob[rec_off:], -15)
+        recs = _inflate_records(blob[rec_off:], count * stride)
         if len(recs) != count * stride:
             raise ValueError("decompressed to {} bytes, header describes {} "
                              "({} records x {})".format(len(recs), count * stride, count, stride))
@@ -169,9 +182,10 @@ def parse_header(blob):
             raise ValueError("file is {} bytes, header describes {} "
                              "({} records x {} + {} header)"
                              .format(len(blob), want, count, stride, rec_off))
-    if fnv1a32(recs) != checksum:
+    actual = fnv1a32(recs)
+    if actual != checksum:
         raise ValueError("checksum mismatch: stored 0x{:08X}, computed 0x{:08X}"
-                         .format(checksum, fnv1a32(recs)))
+                         .format(checksum, actual))
 
     return dict(volume_bytes=vol_bytes, volume_sectors=vol_sectors,
                 sector_size=sector_size, flags=flags, record_count=count,
@@ -186,8 +200,8 @@ def records_of(blob, hdr):
     bytes."""
     region = blob[hdr["records_offset"]:]
     if hdr["flags"] & FLAG_DEFLATE:
-        import zlib
-        return zlib.decompress(region, -15)
+        stride = 8 + hdr["sector_size"]
+        return _inflate_records(region, hdr["record_count"] * stride)
     return region
 
 
@@ -238,6 +252,8 @@ def _cli():
     p = sub.add_parser("pack", help="raw volume image -> CSVI container")
     p.add_argument("image")
     p.add_argument("out")
+    p.add_argument("--compress", action="store_true",
+                   help="raw DEFLATE-compress the sparse record region")
 
     e = sub.add_parser("expand", help="CSVI container -> raw volume image")
     e.add_argument("csvi")
@@ -262,7 +278,7 @@ def _run(a):
     if a.op == "pack":
         with open(a.image, "rb") as fh:
             image = fh.read()
-        blob = pack(image)
+        blob = pack(image, compress=a.compress)
         with open(a.out, "wb") as fh:
             fh.write(blob)
         hdr = parse_header(blob)

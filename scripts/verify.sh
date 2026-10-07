@@ -157,8 +157,10 @@ case " $GATES " in *" uefi "*)
 esac
 [ -n "$GATES" ] || { echo "verify: no gate left to run" >&2; exit 1; }
 
+# The live ISO exercises kernel DEFLATE expansion; smoke and persist retain
+# their uncompressed/physical-root paths.
 case " $GATES " in *" live "*|*" uefi "*)
-    bash scripts/mkiso.sh --profile desktop --out "$WORK/live.iso" >/dev/null ;;
+    bash scripts/mkiso.sh --profile desktop --compress --out "$WORK/live.iso" >/dev/null ;;
 esac
 case " $GATES " in *" smoke "*)
     bash scripts/mkiso.sh --profile desktop --cmdline smoke --out "$WORK/smoke.iso" >/dev/null ;;

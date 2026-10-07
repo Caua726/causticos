@@ -7,7 +7,7 @@ source "$(dirname "$0")/portable.sh"
 # whole point of the reform this belongs to. Passing --no-live leaves the module
 # out, which is how the disk-boot path stays regression-tested.
 #
-# Invoked from the Causticfile:  caustic-mk run iso -- [--profile P] [--no-live]
+# Invoked from the Causticfile:  caustic-mk run iso -- [--profile P] [--no-live] [--compress]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -30,9 +30,11 @@ while [ $# -gt 0 ]; do
         # files are on it". A test harness wants a whole system with itself as
         # init, which is one ISO rather than a disk to attach — and since the
         # live root outranks a disk, attaching one would not even be read.
+        # The live root may use raw DEFLATE; mkroot owns the CSVI packing path.
         --init) ROOT_ARGS+=(--init "$2"); shift 2 ;;
         --add) ROOT_ARGS+=(--add "$2"); shift 2 ;;
         --size) ROOT_ARGS+=(--size "$2"); shift 2 ;;
+        --compress) ROOT_ARGS+=(--compress); shift ;;
         *) echo "mkiso: unknown option '$1'" >&2; exit 1 ;;
     esac
 done

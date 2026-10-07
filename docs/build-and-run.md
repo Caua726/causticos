@@ -383,8 +383,10 @@ At boot:
 
 1. Limine loads the kernel and the `rootfs.csvi` **module**, and reports where it
    put the module (a higher-half address in the direct map).
-2. `ramvol.init()` finds the module by its `CSVI` magic, validates it, takes a
-   zeroed window from `kvmap`, and blits the sparse records into it.
+2. `ramvol.init()` finds the module by its `CSVI` magic and validates the header.
+   If flag bit 1 is set, it inflates the raw-DEFLATE records into a bounded
+   buffer using the kernel heap, checks their decoded checksum, then blits them
+   into a zeroed `kvmap` window.
 3. It registers the result as a `StorageDevice` named `ram0`, with
    `boot_prio = PRIO_LIVE_ROOT`.
 4. `fat32.mount_thread` asks `storage.root_pick()` which device should back `/`.
@@ -396,9 +398,9 @@ At boot:
 The volume is fully writable and **volatile**. The boot says so:
 
 ```
-ramvol: module /boot/rootfs.csvi 1452424B
-storage: registered ram0 (131072 sectors x 512B, prio 100)
-ramvol: live root ready (ram0, 131072 sectors x 512B, volatile)
+ramvol: module /boot/rootfs.csvi 3742504B
+storage: registered ram0 (67584 sectors x 512B, prio 100)
+ramvol: live root ready (ram0, 67584 sectors x 512B, volatile)
 root: ram0 (live, volatile)
 vfs: mounted /
 boot: /init.cse launched pid=2
@@ -451,8 +453,9 @@ a *different binary* from the one that shipped.
 ## CSVI — the sparse container, v1
 
 A 33 MiB root holding ~2.2 MiB of programs is 93% zeros, and ISO 9660 does not
-compress. CSVI stores only the sectors that carry data, each tagged with its LBA.
-The desktop profile's container is about 2.3 MiB.
+compress. CSVI stores only sectors that carry data, each tagged with its LBA;
+the record stream may also be raw-DEFLATE compressed. The desktop profile's
+uncompressed container is about 2.3 MiB.
 
 All fields little-endian.
 
@@ -465,14 +468,14 @@ All fields little-endian.
 | 8 | 8 | `volume_bytes` | of the **expanded** volume; `== volume_sectors * sector_size` |
 | 16 | 8 | `volume_sectors` | |
 | 24 | 4 | `sector_size` | 512; v1 accepts nothing else |
-| 28 | 4 | `flags` | bit 0 = payload is FAT32. Bits 1–31 reserved, must be 0 |
-| 32 | 8 | `record_count` | |
+| 28 | 4 | `flags` | bit 0 = payload is FAT32; bit 1 = raw-DEFLATE records; bits 2–31 reserved |
+| 32 | 8 | `record_count` | Number of decoded records |
 | 40 | 8 | `records_offset` | must be 64 in v1 |
-| 48 | 4 | `checksum` | FNV-1a 32 over the record region only |
+| 48 | 4 | `checksum` | FNV-1a 32 over decoded (uncompressed) records |
 | 52 | 4 | `reserved0` | 0 |
 | 56 | 8 | `reserved1` | 0 |
 
-**Records — `record_count` of them, contiguous, 8 + 512 = 520 bytes each**
+**Records — the decoded stream is `record_count` contiguous records of 8 + 512 = 520 bytes each**
 
 | Off | Size | Field |
 |---:|---:|---|
@@ -481,7 +484,9 @@ All fields little-endian.
 
 **Invariants**, checked by both the packer and the kernel:
 
-- `file_size == records_offset + record_count * 520`, exactly — no slack
+- Without bit 1, `file_size == records_offset + record_count * 520` exactly
+- With bit 1, raw DEFLATE consumes the rest of the module and expands to exactly
+  `record_count * 520` bytes; trailing data is rejected
 - `lba` strictly ascending: no duplicates, no reordering
 - `lba < volume_sectors` for every record
 - any sector no record names is zero in the expanded volume — guaranteed by
@@ -489,9 +494,9 @@ All fields little-endian.
 
 One record per sector rather than run-length extents: extents would save about
 64 KB on a 1.4 MB container and buy a variable-length bounds check inside the
-kernel. Per-sector records make the expander a ten-line loop with one comparison,
-and make the total file size derivable from the header — an integrity check for
-free.
+kernel. Per-sector records keep expansion to a ten-line loop with one
+comparison. For compressed containers, the output length and checksum replace
+the uncompressed file-size invariant.
 
 FNV-1a 32 rather than a cryptographic hash: four lines of Caustic, and it catches
 the two things that actually happen to a file read off boot media — truncation
@@ -501,6 +506,9 @@ Boot ever matters.
 ```sh
 python3 scripts/csvi.py info build/rootfs.csvi --runs   # verify every invariant
 python3 scripts/csvi.py expand build/rootfs.csvi out.img
+python3 scripts/csvi.py pack build/rootfs.img build/rootfs.csvi --compress
+python3 scripts/mkroot.py --profile desktop --csvi build/rootfs.csvi --compress
+bash scripts/mkiso.sh --compress --out build/causticos-compressed.iso
 python3 scripts/fat32.py out.img ls
 ```
 
