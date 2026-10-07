@@ -261,6 +261,37 @@ wrap to the available panel width; an ellipsis marks text that cannot fit.
 Unregistered applications are identified as such, and a catalogue read error
 is shown in words instead of leaving the panel silently empty.
 
+### Desktop keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Super+Enter` | Open a terminal. |
+| `Super+Space` | Open the application launcher. |
+| `Super+Q` | Close the focused window. |
+| `Alt+Tab` / `Alt+Shift+Tab` | Cycle to the next / previous window. |
+| `Super+T` | Cycle the current tag's layout: Float → Tile → Monocle → Float. |
+| `Super+F` | Toggle the focused window between floating and arranged. |
+| `Super+Z` | Promote the focused window to master. |
+| `Super+grave` | Toggle the scratchpad terminal; start it if absent. |
+| `Super+Shift+grave` | Send the focused window to the scratchpad, replacing its previous window. |
+| `Super+I` / `Super+D` | Increase / decrease the master-window count (1–8). |
+| `Super+H` / `Super+L` | Decrease / increase the master area by 5 percentage points (20–85%). |
+| `Super+J` / `Super+K` | Focus the next / previous window. |
+| `Super+-` / `Super+=` | Minimize / maximize or restore the focused window. |
+| `Super+0` | Show all nine tags. |
+| `Super+1`…`9` | View tag 1–9. |
+| `Super+Shift+1`…`9` | Move the focused window to tag 1–9. |
+| `Super+Ctrl+1`…`9` | Toggle tag 1–9 in the current view. |
+| `Super+Shift+Q` | Power off after pressing the chord twice within four seconds. |
+
+The shipped bindings are in `/etc/wm.cst`. Create or edit `/var/wm/config.cst`
+for personal bindings: it is loaded afterward, and a binding for the same
+modifier/key chord replaces the shipped one. `unbind <mods> <key>` removes a
+binding. For example, `bind alt+shift p spawn_term` adds a terminal shortcut;
+`unbind super space` removes the launcher shortcut. Both files are reloaded
+automatically when their modification time changes. Modifier names are
+`super`, `alt`, `shift`, and `ctrl`; join combinations with `+`. Key names use
+physical key positions, independent of the active keymap.
 Super+Space opens the application launcher. If one already exists, the WM
 moves it to the current view, restores it if minimized, and focuses it instead
 of starting a duplicate.
