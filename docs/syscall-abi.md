@@ -228,6 +228,11 @@ layouts the kernel reads/writes.
 **`VfsDirEntry`** (from `READDIR`): `name[256]` (u8, NUL-padded), then five i64 —
 `name_len, first_cluster, size, attr, is_dir`.
 
+`READDIR` returns `E_NOENT` only when iteration reaches the end. Callers must
+distinguish that normal termination from `E_IO`, `E_INVAL` and other errors.
+The FAT32 adapter translates its internal directory return codes before they
+reach this ABI; an empty directory is not an invalid-argument failure.
+
 **`SpawnParams`** (72 B, `SPAWN`'s only argument): nine i64 —
 `src_kind, src_fd, path_uptr, path_len, fdacts_uptr, n_acts, argv_uptr, argc,
 budget`. `src_kind` is `SPAWN_SRC_PATH (0)` or `SPAWN_SRC_FD (1)`; anything else
