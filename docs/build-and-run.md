@@ -310,6 +310,9 @@ silently treating it as an empty file.
 Program diagnostics go to stderr and use the shell's red only while stderr
 reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
 
+`help` lists shell builtins, installed root-level `.cse` programs without the
+suffix, and shell syntax.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by

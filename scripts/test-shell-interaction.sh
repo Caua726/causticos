@@ -167,6 +167,14 @@ type_line 'ps > /ps.out'
 wait_for_file_match ps.out 'PID  PPID  STATE[[:space:]]+NAME' \
     || fail "ps did not write its process table"
 echo "interaction: ps produced a process table"
+type_line 'help'
+sleep 0.5
+type_line 'echo help-processed > /help-ready.out'
+wait_for_file_match help-ready.out '^help-processed$' \
+    || fail "shell did not finish the help command"
+mon "screendump $WORK/help-programs.ppm"
+[[ -s "$WORK/help-programs.ppm" ]] || fail "QEMU did not capture the help screen"
+echo "interaction: captured help program list screen for visual check"
 mon "screendump $WORK/color-baseline.ppm"
 [[ -s "$WORK/color-baseline.ppm" ]] || fail "QEMU did not capture the baseline screen"
 baseline_red=$(red_pixel_count "$WORK/color-baseline.ppm")
