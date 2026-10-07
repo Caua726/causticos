@@ -121,6 +121,10 @@ as the clipboard. Include `.cse`; do not use title packing or shell quoting.
 The WM passes the selected image path literally, including spaces, apostrophes
 and dollar signs. The 16-byte title field limits presentation, not file selection.
 
+The launcher runs console applications inside `wterm` and passes the selected
+image path literally. This gives `newterm` the terminal control channel it needs
+to request another terminal; window applications are started directly.
+
 Pointer motion is always delivered during a button grab. Unpressed motion is
 opt-in through `MSG_POINTER_TRACK`; subscribers also receive the position when
 the pointer leaves their content. Coordinates can be outside the window.
