@@ -278,6 +278,9 @@ grid; PageUp/PageDown move one page, Home/End choose the first/last app, and
 Enter opens the selection. The same navigation works in filtered results, and
 the description panel follows the selection.
 
+Moving the pointer over a tile lightens its background; this is separate from
+the keyboard-selection outline.
+
 `netd`, `soundd` and `httpd` are services, not one-click applications, and are
 omitted from the launcher. Their executables remain installed for explicit
 startup with the required channels and configuration. In particular, opening
