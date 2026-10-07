@@ -292,6 +292,8 @@ command runs, its name replaces that label.
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by
 the current view.
 
+The focused taskbar button starts with `>` in the configured focus-border color.
+
 The shipped bindings are in `/etc/wm.cst`. Create or edit `/var/wm/config.cst`
 for personal bindings: it is loaded afterward, and a binding for the same
 modifier/key chord replaces the shipped one. `unbind <mods> <key>` removes a
