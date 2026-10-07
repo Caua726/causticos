@@ -296,6 +296,11 @@ the current view.
 
 The focused taskbar button starts with `>` in the configured focus-border color.
 
+When the focused window closes, the WM chooses the most recently used visible
+application; the launcher is not an automatic fallback. If none remains,
+keyboard focus clears until you choose a window. `Apps` and Super+Space can
+still focus or open the launcher.
+
 The shipped bindings are in `/etc/wm.cst`. Create or edit `/var/wm/config.cst`
 for personal bindings: it is loaded afterward, and a binding for the same
 modifier/key chord replaces the shipped one. `unbind <mods> <key>` removes a
