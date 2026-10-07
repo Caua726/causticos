@@ -137,6 +137,12 @@ type_line 'rm /lib > /rm-directory.out'
 wait_for_file_match rm-directory.out '^rm: /lib: is a directory \(use -r to remove it\)$' \
     || fail "rm did not reserve the -r advice for directories"
 echo "interaction: rm reserves -r advice for directories"
+type_line 'cat /lib > /cat-directory.out'
+wait_for_file_match cat-directory.out '^cat: /lib: is a directory$' \
+    || fail "cat did not reject a directory with an error"
+"$PY" -c 'import pathlib, sys; raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes() == b"cat: /lib: is a directory\n" else 1)' "$GOT" \
+    || fail "cat directory output contained extra data or diagnostics"
+echo "interaction: cat rejects directories without reading them"
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"

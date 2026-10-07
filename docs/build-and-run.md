@@ -304,6 +304,9 @@ as `already exists`.
 `rm` reports missing files as `no such file or directory` and reserves `-r`
 advice for directories.
 
+`cat` rejects a directory with an `is a directory` diagnostic instead of
+silently treating it as an empty file.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by
