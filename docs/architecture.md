@@ -203,6 +203,12 @@ shell↔terminal, and all future IPC fall out of it.
   **receives** a derived input channel + a surface from the compositor at spawn. A
   fullscreen app `dev_open`s the hardware directly. Both are first-class; the kernel
   forces neither.
+- **Network reporting:** `ifconfig` reads hardware state through `NET_INFO` and
+  obtains address, mask and gateway from the explicitly handed netd channel.
+  Netproto version 2 identifies `REQ_IFINFO` by device port index; `EV_IFINFO`
+  carries the address and mask/link in its header, followed by the 32-byte
+  driver name and an i64 gateway (40 payload bytes). An unconfigured interface
+  is distinct from a missing service or a failed query.
 
 ---
 
