@@ -266,6 +266,12 @@ moves it to the current view, restores it if minimized, and focuses it instead
 of starting a duplicate.
 The taskbar's `Apps` button also opens it when the launcher is closed.
 
+Right-clicking the desktop or a non-window taskbar area opens `Open Apps` and
+`New terminal`. A window titlebar/frame or its taskbar button offers focus or
+restore, minimize or restore, maximize or restore, and close. Escape dismisses
+the menu; Up/Down and Enter operate it. Right-clicks in application content
+continue to go to that application.
+
 The launcher retains complete directory filenames in growable storage, with no
 application-count or label-width cutoff. Labels that do not fit have an ellipsis;
 the description panel identifies the selected name. Opening a program transfers

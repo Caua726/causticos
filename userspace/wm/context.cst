@@ -1,0 +1,296 @@
+// wm/context.cst — one modal popup shared by desktop, taskbar and window frames.
+// Its cell surface is handed to the compositor; this module owns placement,
+// selection and the actions behind each row.
+
+use "state.cst" as s;
+use "window.cst" as win;
+use "layout.cst" as lay;
+use "client.cst" as cli;
+use "actions.cst" as actions;
+use "tags.cst" as tags;
+use "decoration.cst" as dec;
+use "damage.cst" as dmg;
+use "../lib/wmproto/wmproto.cst" as wmp;
+use "../lib/compo_proto/compo_proto.cst" as cp;
+use "../lib/keymap/keysym.cst" as ks;
+use "std/os/causticos.cst" as sys;
+
+let is i64 as MENU_COLS with imut = 22;
+let is i64 as MENU_ROWS_MAX with imut = 4;
+let is i64 as MENU_W with imut = 176;
+
+fn _unavailable(rc as i64) as void {
+    dec.notice(cast(*u8, "Context menu unavailable"), 24, 5000000000);
+    wmp.log_kv(cast(*u8, "wm: context menu unavailable rc="), 32, rc);
+    return;
+}
+
+fn _ensure_surface() as i64 {
+    if (s.context_dec_fd != 0) { return 0; }
+    let is i64 as pages = cp.dec_seg_pages(MENU_COLS, MENU_ROWS_MAX);
+    let is i64 as fd = sys.seg_create(pages, 0);
+    if (fd < 0) { _unavailable(fd); return fd; }
+    let is i64 as base = sys.mmap_fd(sys.PROT_READ | sys.PROT_WRITE, fd);
+    if (base < 0) { sys.close(fd); _unavailable(base); return base; }
+    s.context_dec_fd = fd;
+    s.context_dec_base = base;
+    s.context_dec_pages = pages;
+    s.context_dec_attached = 0;
+    return 0;
+}
+
+fn _rows() as i64 {
+    if (s.context_kind == 1) { return 4; }
+    return 2;
+}
+
+fn _paint() as void {
+    let is i64 as rows = _rows();
+    dec.dec_set_header(s.context_dec_base, MENU_COLS, rows);
+    let is i64 as r with mut = 0;
+    while (r < rows) {
+        let is i64 as bg with mut = s.COL_TITLE_U;
+        if (r == s.context_hover) { bg = s.COL_TITLE_F; }
+        let is i64 as i with mut = 0;
+        while (i < MENU_COLS) {
+            let is *i64 as cell = dec.dec_cell_ptr(s.context_dec_base, r * MENU_COLS + i);
+            cell[0] = cp.make_cell(0x20, s.COL_TEXT, bg);
+            i = i + 1;
+        }
+        let is *u8 as label with mut = cast(*u8, "Open Apps");
+        let is i64 as len with mut = 9;
+        if (s.context_kind == 0) {
+            if (r == 1) { label = cast(*u8, "New terminal"); len = 12; }
+        } else if (r == 0) {
+            label = cast(*u8, "Focus window"); len = 12;
+            if (s.context_target >= 0 && s.context_target < s.MAX_WIN
+                && s.wins[s.context_target].minimized == 1) {
+                label = cast(*u8, "Restore / focus"); len = 15;
+            }
+        } else if (r == 1) {
+            label = cast(*u8, "Minimize window"); len = 15;
+            if (s.context_target >= 0 && s.context_target < s.MAX_WIN
+                && s.wins[s.context_target].minimized == 1) {
+                label = cast(*u8, "Restore window"); len = 14;
+            }
+        } else if (r == 2) {
+            label = cast(*u8, "Maximize window"); len = 15;
+            if (s.context_target >= 0 && s.context_target < s.MAX_WIN
+                && s.wins[s.context_target].maximized == 1) {
+                label = cast(*u8, "Restore size"); len = 12;
+            }
+        } else {
+            label = cast(*u8, "Close window"); len = 12;
+        }
+        dec.cells_utf8(s.context_dec_base, r * MENU_COLS + 2, MENU_COLS - 4,
+                       label, len, s.COL_TEXT, bg);
+        r = r + 1;
+    }
+    s.context_paint_dirty = 0;
+    dmg.dmg_add(s.context_x, s.context_y, s.context_w, s.context_h);
+    return;
+}
+
+fn _position(x as i64, y as i64) as void {
+    let is i64 as rows = _rows();
+    let is i64 as h = rows * 16;
+    let is i64 as nx with mut = x;
+    let is i64 as ny with mut = y;
+    if (nx + MENU_W > s.scr_w) { nx = s.scr_w - MENU_W; }
+    if (nx < 0) { nx = 0; }
+    let is i64 as bar_top = s.scr_h - s.BAR_H;
+    if (ny + h > bar_top) { ny = bar_top - h; }
+    if (ny < 0) { ny = 0; }
+    if (s.context_x != nx || s.context_y != ny || s.context_w != MENU_W || s.context_h != h) {
+        s.context_x = nx;
+        s.context_y = ny;
+        s.context_w = MENU_W;
+        s.context_h = h;
+        s.context_dirty = 1;
+    }
+    return;
+}
+
+fn open_at(x as i64, y as i64, kind as i64, target as i64) as void {
+    let is i64 as nk with mut = kind;
+    let is i64 as nt with mut = target;
+    if (nk != 1 || nt < 0 || nt >= s.MAX_WIN || win.win_mapped(nt) == 0) {
+        nk = 0; nt = 0 - 1;
+    }
+    if (s.context_open == 0 || s.context_kind != nk || s.context_target != nt) {
+        s.context_kind = nk;
+        s.context_target = nt;
+        s.context_hover = 0;
+        s.context_press = 0 - 1;
+        s.context_capture = 0;
+        s.context_paint_dirty = 1;
+    }
+    if (s.context_open == 0) { s.context_open = 1; s.context_dirty = 1; }
+    _position(x, y);
+    return;
+}
+
+fn _window_at() as i64 {
+    let is i64 as layer with mut = 1;
+    let is i64 as split = lay.layers_apart();
+    while (layer >= 0) {
+        let is i64 as zi with mut = 0;
+        while (zi < s.nz) {
+            let is i64 as i = s.zord[zi];
+            if (win.win_visible(i) == 1 && (split == 0 || s.wins[i].floating == layer)) {
+                let is i64 as fx = s.wins[i].x;
+                let is i64 as fy = s.wins[i].y;
+                let is i64 as fw = s.wins[i].w + 2 * s.BORDER;
+                let is i64 as fh = s.wins[i].h + s.TITLE_H + 2 * s.BORDER;
+                if (s.mx >= fx && s.mx < fx + fw && s.my >= fy && s.my < fy + fh) { return i; }
+            }
+            zi = zi + 1;
+        }
+        layer = layer - 1;
+    }
+    return 0 - 1;
+}
+
+// Returns 1 when the right press belongs to WM chrome and opened a menu.
+fn open_at_pointer() as i64 {
+    if (s.my >= s.scr_h - s.BAR_H) {
+        let is [2]i64 as hit;
+        dec.tb_hit(s.mx / 8, &hit[0], &hit[1]);
+        if (hit[0] == s.HOV_ITEM && hit[1] >= 0 && win.win_mapped(hit[1]) == 1) {
+            open_at(s.mx, s.my, 1, hit[1]);
+        } else {
+            open_at(s.mx, s.my, 0, 0 - 1);
+        }
+        return 1;
+    }
+    let is i64 as i = _window_at();
+    if (i >= 0) {
+        let is i64 as cx = s.wins[i].x + s.BORDER;
+        let is i64 as cy = s.wins[i].y + s.BORDER + s.TITLE_H;
+        if (s.mx >= cx && s.mx < cx + s.wins[i].w
+            && s.my >= cy && s.my < cy + s.wins[i].h) { return 0; }
+        open_at(s.mx, s.my, 1, i);
+        return 1;
+    }
+    open_at(s.mx, s.my, 0, 0 - 1);
+    return 1;
+}
+
+fn close() as void {
+    if (s.context_open == 0) { return; }
+    s.context_open = 0;
+    s.context_hover = 0 - 1;
+    s.context_press = 0 - 1;
+    s.context_capture = 0;
+    s.context_dirty = 1;
+    return;
+}
+
+fn _row_at(x as i64, y as i64) as i64 {
+    if (s.context_open == 0 || x < s.context_x || x >= s.context_x + s.context_w
+        || y < s.context_y || y >= s.context_y + s.context_h) { return 0 - 1; }
+    let is i64 as row = (y - s.context_y) / 16;
+    if (row < 0 || row >= _rows()) { return 0 - 1; }
+    return row;
+}
+
+fn hover_at(x as i64, y as i64) as void {
+    let is i64 as row = _row_at(x, y);
+    if (row != s.context_hover) { s.context_hover = row; s.context_paint_dirty = 1; }
+    return;
+}
+
+fn pointer_press() as void {
+    if (s.context_open == 0) { return; }
+    s.context_capture = 1;
+    s.context_press = _row_at(s.mx, s.my);
+    return;
+}
+
+fn _activate(row as i64) as void {
+    let is i64 as kind = s.context_kind;
+    let is i64 as target = s.context_target;
+    close();
+    if (kind == 0) {
+        if (row == 0) { actions.open_launcher(); }
+        else if (row == 1) { cli.spawn_client(); }
+        return;
+    }
+    if (target < 0 || target >= s.MAX_WIN || win.win_mapped(target) == 0) { return; }
+    if (row == 0) {
+        if ((s.wins[target].tags & s.sel_tags) == 0) {
+            s.wins[target].tags = s.sel_tags;
+            tags._after_change();
+        }
+        if (s.wins[target].minimized == 1) { win.win_unminimize(target); }
+        win.win_focus(target);
+    } else if (row == 1) {
+        if (s.wins[target].minimized == 1) { win.win_unminimize(target); }
+        else { win.win_minimize(target); }
+    } else if (row == 2) { win.win_toggle_max(target); }
+    else if (row == 3) { s.wins[target].pend_close = 1; }
+    return;
+}
+
+fn pointer_release() as void {
+    if (s.context_capture == 0) { return; }
+    let is i64 as pressed = s.context_press;
+    let is i64 as released = _row_at(s.mx, s.my);
+    s.context_capture = 0;
+    s.context_press = 0 - 1;
+    if (pressed >= 0 && pressed == released) { _activate(released); }
+    else if (released < 0) { close(); }
+    return;
+}
+
+fn key_handle(keysym as i64, pressed as i64) as void {
+    if (s.context_open == 0 || pressed != 1) { return; }
+    if (keysym == ks.KEY_ESC) { close(); return; }
+    if (keysym == ks.KEY_UP || keysym == ks.KEY_DOWN) {
+        let is i64 as row with mut = s.context_hover;
+        if (row < 0) { row = 0; }
+        else if (keysym == ks.KEY_UP) { row = row - 1; }
+        else { row = row + 1; }
+        if (row < 0) { row = _rows() - 1; }
+        if (row >= _rows()) { row = 0; }
+        s.context_hover = row;
+        s.context_paint_dirty = 1;
+        return;
+    }
+    if (keysym == ks.KEY_ENTER) {
+        let is i64 as row with mut = s.context_hover;
+        if (row < 0) { row = 0; }
+        _activate(row);
+    }
+    return;
+}
+
+fn render() as void {
+    if (s.context_open == 1) {
+        let is i64 as rc = _ensure_surface();
+        if (rc != 0) {
+            s.context_open = 0;
+            s.context_dirty = 1;
+        } else {
+            if (s.context_paint_dirty == 1) { _paint(); }
+            if (s.context_dec_attached == 0) {
+                let is i64 as hrc = dec.dec_handoff(s.context_dec_fd, cp.DEC_CONTEXT_ID,
+                                                    s.context_dec_pages, MENU_COLS, _rows());
+                if (hrc == 0) { s.context_dec_attached = 1; }
+                else if (hrc != sys.E_AGAIN) {
+                    _unavailable(hrc);
+                    s.context_open = 0;
+                    s.context_dirty = 1;
+                }
+            }
+        }
+    }
+    if (s.context_dirty == 1) {
+        if (s.context_open == 1 && s.context_dec_attached == 0) { return; }
+        cp.msg_send(s.wc_fd, cp.MSG_WC_CONTEXT, s.context_open,
+                    cp.pack_xy(s.context_x, s.context_y),
+                    cp.pack_wh(s.context_w, s.context_h));
+        s.context_dirty = 0;
+    }
+    return;
+}
