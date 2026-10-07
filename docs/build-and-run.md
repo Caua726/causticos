@@ -275,8 +275,10 @@ an empty query, Escape closes the launcher.
 
 The highlighted tile is the keyboard selection. Arrow keys move through the
 grid; PageUp/PageDown move one page, Home/End choose the first/last app, and
-Enter opens the selection. The same navigation works in filtered results, and
-the description panel follows the selection.
+Enter opens the selection. The launcher closes after it successfully sends the
+spawn request; a send error leaves it open. Clicking a tile follows the same
+rule. The same navigation works in filtered results, and the description panel
+follows the selection.
 
 The scrollbar thumb can be dragged; clicking its track moves one page. The
 scrollbar is inset from the window's resize edge.
