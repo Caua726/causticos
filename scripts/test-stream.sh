@@ -138,7 +138,7 @@ type_line() {
     mon "sendkey ret"
 }
 
-type_line "aplay http://10.0.2.2:$PORT/streamed.wav"
+type_line "aplay --direct http://10.0.2.2:$PORT/streamed.wav"
 
 DONE=0
 for _ in $(seq 1 900); do

@@ -164,27 +164,27 @@ guest's `httpd`.
 
 Two ways in, and the difference is whether you want to share.
 
-**Through `soundd`** — the mixer. More than one program can be audible at once.
-`lib/sndcli` handles finding it, loading a file, and attaching:
+**Through `soundd`** — the userspace mixer. More than one program can be audible
+at once. The spawning process supplies a channel; `lib/sndcli`'s `adopt()`
+checks it and `endpoint()` supplies one to a child. `open(id)` opens a voice at
+the mixer's reported sample rate and channel count; `write(id, pcm, bytes)`
+feeds PCM with backpressure, `drain(id)` waits for playback, and `close(id)`
+releases the voice.
 
-```caustic
-use "../lib/sndcli/sndcli.cst" as snd;
+`aplay FILE.wav` and `aplay URL` use this path by default. A missing mixer
+channel is an error, not a reason to take the hardware silently.
 
-if (snd.available() != 0) {
-    let is i64 as len with mut = 0;
-    let is i64 as img = snd.load(cast(*u8, "/tone.wav"), &len);
-    // ... hand it to soundd
-}
-```
 
 **Directly** — `sys.dev_open(sys.DEV_AUDIO_OUT, dev, 0)` gives you the device
 itself: a DMA ring of PCM plus a control page, mapped into your address space.
 There is no mixer in the kernel, so **one holder at a time** — and the grab
-stack makes a second opener a takeover, not a refusal. That is the right shape
-for a media player and the wrong one for a notification sound.
+stack makes a second opener a takeover, not a refusal. Use this only when
+exclusive control is intentional.
 
-`aplay` and `arecord` are the worked examples. `DEV_AUDIO_IN` is capture, same
-shape.
+`aplay --direct [-d INDEX] FILE.wav` opts into this takeover; `-d` without
+`--direct` is rejected. Releasing the device restores the previous holder,
+including a displaced `soundd`. `arecord` uses `DEV_AUDIO_IN` for capture,
+with the same mapped-ring shape.
 
 ---
 

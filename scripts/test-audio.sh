@@ -106,7 +106,7 @@ type_line() {
 
 # Typed at the real prompt, like a person would. That also covers the shell
 # handing a fresh device fd to a child, which no in-guest self-test reaches.
-type_line "aplay /tone.wav"
+type_line "aplay --direct /tone.wav"
 
 DONE=0
 for _ in $(seq 1 400); do

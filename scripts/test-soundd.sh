@@ -124,13 +124,13 @@ type_line() {
 }
 
 # Two voices at once, both in the background so the shell stays usable.
-type_line "aplay -m /mix.wav &"
+type_line "aplay /mix.wav &"
 sleep 0.3
-type_line "aplay -m /mix2.wav &"
+type_line "aplay /mix2.wav &"
 
 # Let the mix establish itself, then take the device away from underneath it.
 sleep 1.5
-type_line "aplay /low.wav"
+type_line "aplay --direct /low.wav"
 
 # And wait for the whole thing to finish.
 for _ in $(seq 1 300); do
