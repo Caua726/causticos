@@ -281,6 +281,9 @@ the description panel follows the selection.
 Moving the pointer over a tile lightens its background; this is separate from
 the keyboard-selection outline.
 
+Pixel-based windows keep the arrow cursor; text-grid terminal windows use the
+I-beam cursor.
+
 `netd`, `soundd` and `httpd` are services, not one-click applications, and are
 omitted from the launcher. Their executables remain installed for explicit
 startup with the required channels and configuration. In particular, opening
