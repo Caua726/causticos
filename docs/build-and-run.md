@@ -316,6 +316,8 @@ Super+Space opens the application launcher. If one already exists, the WM
 moves it to the current view, restores it if minimized, and focuses it instead
 of starting a duplicate.
 The taskbar's `Apps` button also opens it when the launcher is closed.
+If the launcher's screen surface cannot be allocated, the taskbar reports
+that there is not enough memory.
 
 Right-clicking the desktop or a non-window taskbar area opens `Open Apps` and
 `New terminal`. A window titlebar/frame or its taskbar button offers focus or
