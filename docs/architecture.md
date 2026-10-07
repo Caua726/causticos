@@ -215,6 +215,9 @@ shell↔terminal, and all future IPC fall out of it.
   means enabled; `NET_FLAG_PROMISC_UNKNOWN` means the device cannot confirm
   its mode. Filter commands are serialized and only acknowledged completions
   update the reported state.
+  Virtio-net negotiates `VIRTIO_NET_F_STATUS` and reads the live 16-bit link
+  status on every query; PCI presence is not link state. Configuration-change
+  interrupts are acknowledged even when no receive queue completion is pending.
 
 ---
 

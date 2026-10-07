@@ -37,60 +37,77 @@ fn say_num(v as i64) as void {
     sys.write_serial(cast(*u8, &b[i]), 24 - i);
     return;
 }
+struct Port {
+    fd as i64;
+    last as i64;
+    saw_down as i64;
+    saw_up_again as i64;
+    transitions as i64;
+}
+
 
 fn main() as i32 {
-    let is i64 as fd = sys.dev_open(sys.DEV_NET, 0, 0);
-    if (fd < 0) { say("linkt: cannot open port 0\n"); return cast(i32, 1); }
-
+    let is i64 as n = sys.dev_count(sys.DEV_NET);
+    if (n <= 0) { say("linkt: no network ports FAIL\n"); return cast(i32, 1); }
+    let is i64 as va = sys.mmap(0, n * sizeof(Port), sys.PROT_READ | sys.PROT_WRITE);
+    if (va < 0) { say("linkt: cannot allocate port state FAIL\n"); return cast(i32, 1); }
+    let is *Port as ports = cast(*Port, va);
     let is [16]i64 as inf;
-    if (sys.net_info(fd, cast(*i64, &inf[0])) != 0) {
-        say("linkt: net_info failed\n");
-        sys.close(fd);
-        return cast(i32, 1);
-    }
-    if (inf[2] == 0) {
-        say("linkt: link already down at start FAIL\n");
-        sys.close(fd);
-        return cast(i32, 1);
-    }
-    // The host waits for this before touching the link, so the "up" it sees
-    // first is genuinely the initial state and not a race.
-    say("linkt: watching\n");
-
-    let is i64 as saw_down with mut = 0;
-    let is i64 as saw_up_again with mut = 0;
-    let is i64 as last with mut = 1;
-    let is i64 as transitions with mut = 0;
-    let is i64 as deadline = sys.time_ns() + RUN_NS;
-
-    while (sys.time_ns() < deadline) {
-        if (sys.net_info(fd, cast(*i64, &inf[0])) == 0) {
-            let is i64 as up = inf[2];
-            if (up != last) {
-                transitions = transitions + 1;
-                say("linkt: link ");
-                if (up != 0) { say("UP\n"); } else { say("DOWN\n"); }
-                // Speed must follow the link: reporting a rate on a dead
-                // link is a number that cannot be true.
-                if (up == 0) {
-                    saw_down = 1;
-                    if (inf[3] != 0) { say("linkt: speed reported while down FAIL\n"); }
-                } else if (saw_down == 1) {
-                    saw_up_again = 1;
-                }
-                last = up;
-            }
+    let is i64 as i with mut = 0;
+    let is i64 as bad with mut = 0;
+    while (i < n) {
+        ports[i].fd = sys.dev_open(sys.DEV_NET, i, 0);
+        ports[i].last = 1;
+        ports[i].saw_down = 0; ports[i].saw_up_again = 0;
+        ports[i].transitions = 0;
+        if (ports[i].fd < 0 || sys.net_info(ports[i].fd, cast(*i64, &inf[0])) != 0) {
+            say("linkt: cannot query port "); say_num(i); say(" FAIL\n");
+            bad = bad + 1;
+        } else if (inf[2] == 0) {
+            say("linkt: port "); say_num(i); say(" already down at start FAIL\n");
+            bad = bad + 1;
         }
-        sys.sleep_ns(SAMPLE_NS);
+        i = i + 1;
     }
-
-    sys.close(fd);
-    say("linkt: transitions="); say_num(transitions); say("\n");
-    if (saw_down == 1 && saw_up_again == 1) {
-        say("linkt: ALL PASS\n");
-        return cast(i32, 0);
+    if (bad == 0) {
+        // The host waits for this baseline before cutting either link.
+        say("linkt: watching\n");
+        let is i64 as deadline = sys.time_ns() + RUN_NS;
+        while (sys.time_ns() < deadline) {
+            i = 0;
+            while (i < n) {
+                if (sys.net_info(ports[i].fd, cast(*i64, &inf[0])) != 0) {
+                    say("linkt: net_info failed FAIL\n"); bad = bad + 1;
+                } else if (inf[2] != ports[i].last) {
+                    ports[i].transitions = ports[i].transitions + 1;
+                    say("linkt: port "); say_num(i); say(" link ");
+                    if (inf[2] != 0) { say("UP\n"); } else { say("DOWN\n"); }
+                    if (inf[2] == 0) {
+                        ports[i].saw_down = 1;
+                        if (inf[3] != 0) {
+                            say("linkt: speed reported while down FAIL\n"); bad = bad + 1;
+                        }
+                    } else if (ports[i].saw_down != 0) {
+                        ports[i].saw_up_again = 1;
+                    }
+                    ports[i].last = inf[2];
+                }
+                i = i + 1;
+            }
+            sys.sleep_ns(SAMPLE_NS);
+        }
     }
-    if (saw_down == 0) { say("linkt: never saw the link go down FAIL\n"); }
-    else { say("linkt: link never came back FAIL\n"); }
+    i = 0;
+    while (i < n) {
+        if (ports[i].fd >= 0) { sys.close(ports[i].fd); }
+        say("linkt: port "); say_num(i); say(" transitions=");
+        say_num(ports[i].transitions); say("\n");
+        if (ports[i].saw_down == 0 || ports[i].saw_up_again == 0) {
+            say("linkt: missing down/up transition FAIL\n"); bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    sys.munmap(va, n * sizeof(Port));
+    if (bad == 0) { say("linkt: ALL PASS\n"); return cast(i32, 0); }
     return cast(i32, 1);
 }

@@ -71,11 +71,15 @@ if ! tr -d '\000' < "$LOG" | grep -q "linkt: watching"; then
     exit 1
 fi
 
-# net0 is the e1000, the one with a real STATUS register to read.
+# Exercise the two independently: e1000 STATUS, then virtio device config.
 sleep 0.5
 mon "set_link net0 off"
 sleep 1.5
 mon "set_link net0 on"
+sleep 0.5
+mon "set_link net1 off"
+sleep 1.5
+mon "set_link net1 on"
 sleep 2.0
 
 for _ in $(seq 1 100); do

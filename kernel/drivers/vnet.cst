@@ -34,7 +34,9 @@ let is i64 as NQ = 16;                 // ring slots we drive per queue (<= devi
 
 // device config offsets (struct virtio_net_config): mac[6] then status le16
 let is i64 as CFG_MAC = 0;
+let is i64 as CFG_STATUS = 6;
 let is i64 as F_MAC = 32;
+let is i64 as F_STATUS = 65536;
 let is i64 as F_CTRL_VQ = 131072;
 let is i64 as F_CTRL_RX = 262144;
 let is i64 as VQ_CONTROL = 2;          // one RX/TX pair; no multiqueue feature
@@ -245,13 +247,14 @@ fn nd_set_promisc(priv as *u8, on as i64) as i64 {
     return 0;
 }
 
-// virtio-net has no link register: if the device is here it is up. The
-// STATUS field exists only when VIRTIO_NET_F_STATUS is negotiated, and we
-// do not negotiate it — reporting a fact we did not ask for would be a
-// guess dressed as a reading.
+// STATUS is live device configuration, not the presence of the PCI function.
+// Without F_STATUS the virtio specification permits assuming the link is up.
 fn nd_link_up(priv as *u8) as i64 {
     let is *VnetCtx as c = cast(*VnetCtx, priv);
-    return c.present;
+    if (c.present == 0) { return 0; }
+    if ((c.vdev.features_lo & F_STATUS) == 0) { return 1; }
+    if ((virtio.rd16(c.vdev.devcfg + CFG_STATUS) & 1) != 0) { return 1; }
+    return 0;
 }
 
 fn nd_mtu(priv as *u8) as i64 {
@@ -272,8 +275,9 @@ fn vnet_irq(hw as *driver.Hardware, ctx as *u8) as i32 {
     if (cast(i64, c) == 0) { return 0; }
     if (c.present == 0) { return 0; }
     let is i64 as isr = virtio.vio_isr_read(&c.vdev);
-    if ((isr & 1) == 0) { return 0; }          // not ours (shared INTx)
-    if (c.port_index >= 0) { netdev.irq_drain(c.port_index); }
+    // Reading the ISR acknowledges queue and configuration changes. Link
+    // queries read STATUS directly, so a config-only interrupt needs no drain.
+    if ((isr & 1) != 0 && c.port_index >= 0) { netdev.irq_drain(c.port_index); }
     return 0;
 }
 
@@ -294,12 +298,16 @@ fn vnet_bind(b as *spec.Binding) as i32 {
         serial.println("vnet: no modern virtio caps", 27);
         return 1;
     }
-    if (virtio.vio_negotiate_features(&c.vdev, F_MAC | F_CTRL_VQ | F_CTRL_RX, 0) != 0) {
+    if (virtio.vio_negotiate_features(&c.vdev, F_MAC | F_STATUS | F_CTRL_VQ | F_CTRL_RX, 0) != 0) {
         serial.println("vnet: feature negotiation FAIL", 30);
         return 1;
     }
     if ((c.vdev.features_lo & F_MAC) == 0 || c.vdev.devcfg == 0 || c.vdev.devcfg_len < 6) {
         serial.println("vnet: MAC configuration unavailable", 35);
+        return 1;
+    }
+    if ((c.vdev.features_lo & F_STATUS) != 0 && c.vdev.devcfg_len < CFG_STATUS + 2) {
+        serial.println("vnet: link status configuration unavailable", 43);
         return 1;
     }
     // rx = queue 0, tx = queue 1
