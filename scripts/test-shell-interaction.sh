@@ -129,6 +129,14 @@ wait_for_file_match mkdir.out '^mkdir: /lib: already exists$' \
     || fail "mkdir did not report that the existing directory already exists"
 echo "interaction: mkdir reports already exists"
 
+type_line 'rm /definitely-not-a-file > /rm-missing.out'
+wait_for_file_match rm-missing.out '^rm: /definitely-not-a-file: no such file or directory$' \
+    || fail "rm did not report the missing-file reason"
+echo "interaction: rm reports a missing file"
+type_line 'rm /lib > /rm-directory.out'
+wait_for_file_match rm-directory.out '^rm: /lib: is a directory \(use -r to remove it\)$' \
+    || fail "rm did not reserve the -r advice for directories"
+echo "interaction: rm reserves -r advice for directories"
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"

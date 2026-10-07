@@ -301,6 +301,9 @@ missing paths from non-directories.
 `mkdir` reports the requested path and the kernel's reason for failure, such
 as `already exists`.
 
+`rm` reports missing files as `no such file or directory` and reserves `-r`
+advice for directories.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by
