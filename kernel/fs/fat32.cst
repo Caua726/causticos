@@ -543,10 +543,7 @@ fn format_8_3(name as *u8, name_len as i64, out as *u8) as i32 {
     return 0;
 }
 
-// Compare 11 bytes starting at buf+base against target (11-byte array).
-// Returns 1 on match, 0 on mismatch. Kept inline-arithmetic instead of
-// taking two pointers so we avoid any Caustic quirk around & on array
-// indexing with *u8 bases.
+// Compare the canonical 11-byte short name with a directory slot.
 fn name_matches(buf as *u8, base as i64, target as *u8) as i32 {
     let is i64 as i with mut = 0;
     while (i < 11) {
@@ -1526,80 +1523,71 @@ fn dir_add_entry(v as *Fat32Volume, parent_cluster as i64,
                              cast(*u8, &entry_scratch[0]), total_slots);
 }
 
-// Remove the directory entry (and its preceding LFN entries) named
-// `name` from `parent_cluster`. Returns the first_cluster of the
-// removed entry on success, or a negative rc. Does NOT free the file's
-// data clusters; callers combine with chain_free for unlink semantics.
+// Remove the named SFN slot and its preceding LFN run, without freeing data.
+// Empty files and rename aliases share first_cluster values, so only the
+// physical slot returned by dir_find identifies the entry to remove.
 fn dir_remove_entry(v as *Fat32Volume, parent_cluster as i64,
-                    name as *u8, name_len as i64,
+                    name as *u8, name_len as i64, file_only as i64,
                     out_first_cluster as *i64, out_size as *i64,
                     out_attr as *i32) as i32 {
     let is i32 as at with mut = 0;
     let is i32 as rc = dir_find(v, parent_cluster, name, name_len,
                                 out_first_cluster, out_size, &at);
-    if (rc != 0) { return rc; }
+    if (rc != 0) { return _lookup_err(rc); }
+    if (file_only != 0 && (at & ATTR_DIRECTORY) != 0) { return vfs.VFS_EISDIR; }
     *out_attr = at;
-
-    // Re-walk the directory to mark the SFN and any preceding LFN run
-    // with 0xE5. We locate the SFN by first_cluster match — safe even
-    // if duplicate short names existed because a cluster number is
-    // unique per live file (we just allocated fresh one).
+    let is i64 as target_cluster = found_ent_cluster;
+    let is i64 as target_off = found_ent_off;
     let is *u8 as buf = cast(*u8, clus_scratch_virt);
     let is i64 as cluster with mut = parent_cluster;
     let is i64 as guard with mut = 0;
-    let is i64 as max_steps = v.cluster_count + 2;
-    let is i64 as lfn_run_start_slot with mut = 0 - 1;
-    let is i64 as lfn_run_cluster with mut = 0 - 1;
-    let is i64 as target_cluster = *out_first_cluster;
-
+    let is i64 as run_cluster with mut = 0;
+    let is i64 as run_off with mut = 0;
     while (cluster >= 2 && cluster < v.cluster_count + 2) {
-        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        if (guard >= v.cluster_count) { return vfs.VFS_EIO; }
         guard = guard + 1;
-        if (cluster_read(v, cluster, buf) != 0) { return cast(i32, 0 - 4); }
-
-        let is i64 as n_slots = v.cluster_size_bytes / 32;
-        let is i64 as i with mut = 0;
-        while (i < n_slots) {
-            let is i64 as boff = i * 32;
-            let is u8 as m = buf[boff];
-            if (m == cast(u8, 0)) { return cast(i32, 0 - 5); }   // unreachable if dir_find matched
-            if (m == cast(u8, 0xE5)) {
-                lfn_run_start_slot = 0 - 1;
-            } else {
-                let is i32 as a = cast(i32, buf[boff + 11]) & 0xFF;
-                if (a == ATTR_LFN) {
-                    if (lfn_run_start_slot < 0) {
-                        lfn_run_start_slot = i;
-                        lfn_run_cluster = cluster;
-                    }
-                } else {
-                    let is i64 as fc_lo = read_u16(buf, boff + 26);
-                    let is i64 as fc_hi = read_u16(buf, boff + 20);
-                    let is i64 as fc = fc_lo | (fc_hi << 16);
-                    if (fc == target_cluster) {
-                        // Mark this entry + preceding LFN run deleted.
-                        if (lfn_run_start_slot >= 0 && lfn_run_cluster == cluster) {
-                            let is i64 as r with mut = lfn_run_start_slot;
-                            while (r <= i) { buf[r * 32] = cast(u8, 0xE5); r = r + 1; }
-                        } else {
-                            buf[boff] = cast(u8, 0xE5);
-                        }
-                        if (cluster_write(v, cluster, buf) != 0) {
-                            return cast(i32, 0 - 6);
-                        }
-                        return 0;
-                    }
-                    lfn_run_start_slot = 0 - 1;
+        if (cluster_read(v, cluster, buf) != 0) { return vfs.VFS_EIO; }
+        let is i64 as off with mut = 0;
+        while (off < v.cluster_size_bytes) {
+            let is u8 as marker = buf[off];
+            if (marker == cast(u8, 0)) { return vfs.VFS_EIO; }
+            let is i32 as attr = cast(i32, buf[off + 11]) & 0xFF;
+            if (marker == cast(u8, 0xE5)) {
+                run_cluster = 0;
+            } else if (attr == ATTR_LFN) {
+                if (run_cluster == 0 || (cast(i64, marker) & 0x40) != 0) {
+                    run_cluster = cluster;
+                    run_off = off;
                 }
+            } else {
+                if (cluster == target_cluster && off == target_off) {
+                    if (run_cluster == 0) { run_cluster = cluster; run_off = off; }
+                    // A long name can start in the preceding directory cluster.
+                    if (run_cluster != cluster) {
+                        if (cluster_read(v, run_cluster, buf) != 0) { return vfs.VFS_EIO; }
+                    }
+                    while (1 == 1) {
+                        let is i64 as end with mut = v.cluster_size_bytes;
+                        if (run_cluster == target_cluster) { end = target_off + 32; }
+                        while (run_off < end) { buf[run_off] = cast(u8, 0xE5); run_off = run_off + 32; }
+                        if (cluster_write(v, run_cluster, buf) != 0) { return vfs.VFS_EIO; }
+                        if (run_cluster == target_cluster) { return 0; }
+                        let is i64 as next = fat_read(v, run_cluster);
+                        if (next < 2 || next >= v.cluster_count + 2) { return vfs.VFS_EIO; }
+                        run_cluster = next;
+                        run_off = 0;
+                        if (cluster_read(v, run_cluster, buf) != 0) { return vfs.VFS_EIO; }
+                    }
+                }
+                run_cluster = 0;
             }
-            i = i + 1;
+            off = off + 32;
         }
-        let is i64 as nxt = fat_read(v, cluster);
-        if (nxt < 0) { return cast(i32, 0 - 4); }
-        if (cluster_is_eof(nxt) == 1) { return cast(i32, 0 - 5); }
-        cluster = nxt;
+        let is i64 as next = fat_read(v, cluster);
+        if (next < 2 || next >= v.cluster_count + 2) { return vfs.VFS_EIO; }
+        cluster = next;
     }
-    return cast(i32, 0 - 5);
+    return vfs.VFS_EIO;
 }
 
 // ============================================================
@@ -1642,13 +1630,13 @@ fn path_split_parent(path as *u8, path_len as i64,
 // On failure leaves no partial state (rolls back cluster allocations).
 fn file_create(v as *Fat32Volume, path as *u8, path_len as i64,
                data as *u8, data_len as i64) as i32 {
-    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cast(i64, v) == 0) { return vfs.VFS_EIO; }
 
     let is i64 as leaf_off with mut = 0;
     let is i64 as leaf_len with mut = 0;
     let is i64 as parent_end with mut = 0;
     if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
-        return cast(i32, 0 - 2);
+        return vfs.VFS_EINVAL;
     }
 
     // Resolve parent directory cluster.
@@ -1658,8 +1646,8 @@ fn file_create(v as *Fat32Volume, path as *u8, path_len as i64,
     if (parent_end > 0) {
         let is i32 as rc = path_lookup(v, path, parent_end,
                                        &parent_cluster, &psz, &pattr);
-        if (rc != 0) { return cast(i32, 0 - 3); }
-        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+        if (rc != 0) { return _lookup_err(rc); }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return vfs.VFS_ENOTDIR; }
     }
 
     // Refuse creation when the name already exists.
@@ -1667,10 +1655,10 @@ fn file_create(v as *Fat32Volume, path as *u8, path_len as i64,
     let is i64 as dummy_s with mut = 0;
     let is i32 as dummy_a with mut = 0;
     let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
-    if (dir_find(v, parent_cluster, leaf_ptr, leaf_len,
-                 &dummy_c, &dummy_s, &dummy_a) == 0) {
-        return cast(i32, 0 - 5);   // EEXIST
-    }
+    let is i32 as exists = dir_find(v, parent_cluster, leaf_ptr, leaf_len,
+                                    &dummy_c, &dummy_s, &dummy_a);
+    if (exists == 0) { return vfs.VFS_EEXIST; }
+    if (exists != cast(i32, 0 - 1)) { return _lookup_err(exists); }
 
     // Allocate cluster chain for the payload. data_len=0 => empty file
     // with first_cluster=0 per FAT32 convention.
@@ -1741,33 +1729,32 @@ fn file_create(v as *Fat32Volume, path as *u8, path_len as i64,
 // the entry in the parent. '..' reads as 0 when the parent is the
 // root (FAT32 convention).
 fn dir_create(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
-    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cast(i64, v) == 0) { return vfs.VFS_EIO; }
 
     let is i64 as leaf_off with mut = 0;
     let is i64 as leaf_len with mut = 0;
     let is i64 as parent_end with mut = 0;
     if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
-        return cast(i32, 0 - 2);
+        return vfs.VFS_EINVAL;
     }
     let is i64 as parent_cluster with mut = v.root_cluster;
     let is i64 as psz with mut = 0;
     let is i32 as pattr with mut = 0;
     if (parent_end > 0) {
-        if (path_lookup(v, path, parent_end,
-                        &parent_cluster, &psz, &pattr) != 0) {
-            return cast(i32, 0 - 3);
-        }
-        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+        let is i32 as rc = path_lookup(v, path, parent_end,
+                                       &parent_cluster, &psz, &pattr);
+        if (rc != 0) { return _lookup_err(rc); }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return vfs.VFS_ENOTDIR; }
     }
 
     let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
     let is i64 as dc with mut = 0;
     let is i64 as ds with mut = 0;
     let is i32 as da with mut = 0;
-    if (dir_find(v, parent_cluster, leaf_ptr, leaf_len,
-                 &dc, &ds, &da) == 0) {
-        return cast(i32, 0 - 5);   // EEXIST
-    }
+    let is i32 as exists = dir_find(v, parent_cluster, leaf_ptr, leaf_len,
+                                    &dc, &ds, &da);
+    if (exists == 0) { return vfs.VFS_EEXIST; }
+    if (exists != cast(i32, 0 - 1)) { return _lookup_err(exists); }
 
     let is i64 as new_c = cluster_alloc(v);
     if (new_c < 0) { return cast(i32, 0 - 6); }
@@ -1860,23 +1847,22 @@ fn dir_is_empty(v as *Fat32Volume, dir_cluster as i64) as i32 {
 }
 
 fn dir_remove(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
-    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cast(i64, v) == 0) { return vfs.VFS_EIO; }
 
     let is i64 as leaf_off with mut = 0;
     let is i64 as leaf_len with mut = 0;
     let is i64 as parent_end with mut = 0;
     if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
-        return cast(i32, 0 - 2);
+        return vfs.VFS_EINVAL;
     }
     let is i64 as parent_cluster with mut = v.root_cluster;
     let is i64 as psz with mut = 0;
     let is i32 as pattr with mut = 0;
     if (parent_end > 0) {
-        if (path_lookup(v, path, parent_end,
-                        &parent_cluster, &psz, &pattr) != 0) {
-            return cast(i32, 0 - 3);
-        }
-        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+        let is i32 as rc = path_lookup(v, path, parent_end,
+                                       &parent_cluster, &psz, &pattr);
+        if (rc != 0) { return _lookup_err(rc); }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return vfs.VFS_ENOTDIR; }
     }
     let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
 
@@ -1885,19 +1871,19 @@ fn dir_remove(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
     let is i32 as fa with mut = 0;
     let is i32 as rc = dir_find(v, parent_cluster, leaf_ptr, leaf_len,
                                 &fc, &fs, &fa);
-    if (rc != 0) { return rc; }
+    if (rc != 0) { return _lookup_err(rc); }
     if ((fa & ATTR_DIRECTORY) == 0) {
-        return cast(i32, 0 - 5);   // not a directory
+        return vfs.VFS_ENOTDIR;
     }
     if (dir_is_empty(v, fc) == 0) {
-        return cast(i32, 0 - 6);   // ENOTEMPTY
+        return vfs.VFS_ENOTEMPTY;
     }
 
     let is i64 as junk_c with mut = 0;
     let is i64 as junk_s with mut = 0;
     let is i32 as junk_a with mut = 0;
     let is i32 as r2 = dir_remove_entry(v, parent_cluster,
-                                        leaf_ptr, leaf_len,
+                                        leaf_ptr, leaf_len, 0,
                                         &junk_c, &junk_s, &junk_a);
     if (r2 != 0) { return r2; }
     chain_free(v, fc);
@@ -1940,6 +1926,8 @@ fn path_rename(v as *Fat32Volume,
     let is i32 as sr = dir_find(v, sp_cluster, s_leaf, s_leaf_len,
                                 &src_cluster, &src_size, &src_attr);
     if (sr != 0) { return sr; }
+    let is i64 as src_ent_cluster = found_ent_cluster;
+    let is i64 as src_ent_off = found_ent_off;
 
     // Resolve destination.
     let is i64 as d_leaf_off with mut = 0;
@@ -1976,12 +1964,12 @@ fn path_rename(v as *Fat32Volume,
         if ((cast(i32, src_attr) & ATTR_DIRECTORY) != 0) { return cast(i32, 0 - 8); }
         // Same name in the same directory: nothing to do, and removing the
         // entry would destroy the file we were asked to keep.
-        if (dp_cluster == sp_cluster && old_c == src_cluster) { return 0; }
+        if (found_ent_cluster == src_ent_cluster && found_ent_off == src_ent_off) { return 0; }
         had_dst = 1;
         let is i64 as junk_dc with mut = 0;
         let is i64 as junk_ds with mut = 0;
         let is i32 as junk_da with mut = 0;
-        if (dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len,
+        if (dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len, 0,
                              &junk_dc, &junk_ds, &junk_da) != 0) {
             return cast(i32, 0 - 8);
         }
@@ -2000,13 +1988,13 @@ fn path_rename(v as *Fat32Volume,
     let is i64 as junk_c with mut = 0;
     let is i64 as junk_s with mut = 0;
     let is i32 as junk_a with mut = 0;
-    let is i32 as r2 = dir_remove_entry(v, sp_cluster, s_leaf, s_leaf_len,
+    let is i32 as r2 = dir_remove_entry(v, sp_cluster, s_leaf, s_leaf_len, 0,
                                         &junk_c, &junk_s, &junk_a);
     if (r2 != 0) {
         // Roll back: remove the new entry too. If the roll-back
         // itself fails the dir has a dup; explicit error propagation
         // matters more than paper-over.
-        dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len,
+        dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len, 0,
                          &junk_c, &junk_s, &junk_a);
         return cast(i32, 0 - 10);
     }
@@ -2041,23 +2029,22 @@ fn path_rename(v as *Fat32Volume,
 }
 
 fn file_unlink(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
-    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cast(i64, v) == 0) { return vfs.VFS_EIO; }
 
     let is i64 as leaf_off with mut = 0;
     let is i64 as leaf_len with mut = 0;
     let is i64 as parent_end with mut = 0;
     if (path_split_parent(path, path_len, &leaf_off, &leaf_len, &parent_end) != 0) {
-        return cast(i32, 0 - 2);
+        return vfs.VFS_EINVAL;
     }
     let is i64 as parent_cluster with mut = v.root_cluster;
     let is i64 as psz with mut = 0;
     let is i32 as pattr with mut = 0;
     if (parent_end > 0) {
-        if (path_lookup(v, path, parent_end,
-                        &parent_cluster, &psz, &pattr) != 0) {
-            return cast(i32, 0 - 3);
-        }
-        if ((pattr & ATTR_DIRECTORY) == 0) { return cast(i32, 0 - 4); }
+        let is i32 as rc = path_lookup(v, path, parent_end,
+                                       &parent_cluster, &psz, &pattr);
+        if (rc != 0) { return _lookup_err(rc); }
+        if ((pattr & ATTR_DIRECTORY) == 0) { return vfs.VFS_ENOTDIR; }
     }
     let is *u8 as leaf_ptr = cast(*u8, cast(i64, path) + leaf_off);
 
@@ -2065,13 +2052,9 @@ fn file_unlink(v as *Fat32Volume, path as *u8, path_len as i64) as i32 {
     let is i64 as fs with mut = 0;
     let is i32 as fa with mut = 0;
     let is i32 as rc = dir_remove_entry(v, parent_cluster,
-                                        leaf_ptr, leaf_len,
+                                        leaf_ptr, leaf_len, 1,
                                         &fc, &fs, &fa);
     if (rc != 0) { return rc; }
-    if ((fa & ATTR_DIRECTORY) != 0) {
-        // Refuse rmdir through unlink. mkdir/rmdir land in a later phase.
-        return cast(i32, 0 - 6);
-    }
     if (fc != 0) { chain_free(v, fc); }
     storage.flush(v.dev);
     return 0;
@@ -2560,6 +2543,20 @@ fn _lookup_err(rc as i32) as i32 {
     return vfs.VFS_EIO;
 }
 
+// Preserve typed semantic errors; the remaining legacy mutation codes describe
+// allocation or I/O failures, never lookup failures. Translate lookups where
+// they occur so their -1/-4 codes cannot alias unrelated mutation failures.
+fn _mutate_err(rc as i32) as i32 {
+    if (rc == cast(i32, 0)) { return 0; }
+    if (rc == vfs.VFS_ENOENT) { return vfs.VFS_ENOENT; }
+    if (rc == vfs.VFS_ENOTDIR) { return vfs.VFS_ENOTDIR; }
+    if (rc == vfs.VFS_EEXIST) { return vfs.VFS_EEXIST; }
+    if (rc == vfs.VFS_EISDIR) { return vfs.VFS_EISDIR; }
+    if (rc == vfs.VFS_ENOTEMPTY) { return vfs.VFS_ENOTEMPTY; }
+    if (rc == vfs.VFS_EINVAL) { return vfs.VFS_EINVAL; }
+    return vfs.VFS_EIO;
+}
+
 fn vfs_resolve(priv as *u8, path as *u8, path_len as i64,
                out_parent_cluster as *i64,
                out_first_cluster as *i64,
@@ -2768,22 +2765,22 @@ fn vfs_update_entry(priv as *u8, ent_cluster as i64,
 
 fn vfs_create(priv as *u8, path as *u8, path_len as i64) as i32 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
-    return file_create(v, path, path_len, cast(*u8, 0), cast(i64, 0));
+    return _mutate_err(file_create(v, path, path_len, cast(*u8, 0), cast(i64, 0)));
 }
 
 fn vfs_unlink(priv as *u8, path as *u8, path_len as i64) as i32 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
-    return file_unlink(v, path, path_len);
+    return _mutate_err(file_unlink(v, path, path_len));
 }
 
 fn vfs_mkdir(priv as *u8, path as *u8, path_len as i64) as i32 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
-    return dir_create(v, path, path_len);
+    return _mutate_err(dir_create(v, path, path_len));
 }
 
 fn vfs_rmdir(priv as *u8, path as *u8, path_len as i64) as i32 {
     let is *Fat32Volume as v = cast(*Fat32Volume, priv);
-    return dir_remove(v, path, path_len);
+    return _mutate_err(dir_remove(v, path, path_len));
 }
 
 fn vfs_rename(priv as *u8,

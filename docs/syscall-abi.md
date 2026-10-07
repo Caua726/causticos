@@ -121,6 +121,13 @@ Per-call notes:
   endpoint, a keyboard device. They block where the object blocks (a channel
   read waits for bytes; a keyboard read waits for events; `0` from a channel
   = the peer closed = EOF).
+- **`UNLINK`/`MKDIR`/`RMDIR`** (16–18): a missing entry or parent is `E_NOENT`;
+  a file in a directory component is `E_NOTDIR`. `MKDIR` on an existing name
+  returns `E_EXIST`. `UNLINK` refuses a directory with `E_ISDIR` **before**
+  changing its entry; `RMDIR` refuses a nonempty directory with `E_NOTEMPTY`.
+  Empty files remain separate entries even though FAT32 stores cluster 0 for
+  all of them. Removal and rename identify the exact directory slot, not the
+  data-cluster number; long-name entries are removed across cluster boundaries.
 - **`SPAWN`** (14): takes ONE pointer, to a `SpawnParams` (§5). Only a Process
   may spawn (`E_PERM` otherwise). The child's fd table starts **empty**; `fdacts`
   (a `[{child_fd, src_fd}]` array, `n_acts ≤ 16`) is the *only* way it gets
@@ -185,6 +192,7 @@ Per-call notes:
 | | | | -18 | `E_INTR` (kernel-internal: the caller is being terminated) |
 | | | | -19 | `E_NOEXEC` (spawn: not an image this system runs) |
 | | | | -20 | `E_2BIG` (spawn: more than `ARGV_MAX` of arguments) |
+| | | | -21 | `E_NOTEMPTY` (rmdir: the directory still has entries) |
 
 ---
 
