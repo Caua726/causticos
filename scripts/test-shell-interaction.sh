@@ -114,6 +114,16 @@ wait_for_file_match hello.out '^ola do CausticOS!' \
     || fail "/hello.txt did not end in a newline"
 echo "interaction: /hello.txt ends with newline"
 
+type_line 'cd /definitely-not-a-directory'
+sleep 0.2
+type_line 'echo after-cd > /after-cd.out'
+wait_for_file_match after-cd.out '^after-cd([[:space:]]|$)' \
+    || fail "shell did not continue after cd rejected a missing path"
+sleep 0.5
+mon "screendump $WORK/cd-error.ppm"
+[[ -s "$WORK/cd-error.ppm" ]] || fail "QEMU did not capture the cd diagnostic screen"
+echo "interaction: captured cd error screen for visual check"
+
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"
