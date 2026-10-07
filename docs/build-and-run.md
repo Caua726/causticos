@@ -309,6 +309,9 @@ binding. For example, `bind alt+shift p spawn_term` adds a terminal shortcut;
 automatically when their modification time changes. Modifier names are
 `super`, `alt`, `shift`, and `ctrl`; join combinations with `+`. Key names use
 physical key positions, independent of the active keymap.
+Invalid bind lines and invalid colour values also appear as a taskbar notice;
+the serial log keeps the diagnostic.
+
 Super+Space opens the application launcher. If one already exists, the WM
 moves it to the current view, restores it if minimized, and focuses it instead
 of starting a duplicate.
