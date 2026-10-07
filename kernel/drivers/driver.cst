@@ -72,6 +72,12 @@ struct DmaBuffer {
     next as *DmaBuffer;
 }
 
+struct MemoryBuffer {
+    virt as *u8;
+    size as i64;
+    next as *MemoryBuffer;
+}
+
 // ============================================================
 // Core structs
 // ============================================================
@@ -125,6 +131,7 @@ struct Hardware {
     mmio_list as *MmioRegion;
     irq_list as *IrqBinding;
     dma_list as *DmaBuffer;
+    memory_list as *MemoryBuffer;
 }
 
 struct BusNode {
@@ -504,8 +511,7 @@ fn hardware_register(dev as *Hardware, parent as *Hardware) as i32 {
 
 // Unlinks dev from the parent's child chain and frees it. Panics if dev
 // still has children — caller is expected to have torn down the subtree
-// first. Resources tracked on the device (MMIO/IRQ/DMA lists) are
-// released before kfree.
+// first. MMIO, IRQ, DMA and memory resources are released before kfree.
 fn hardware_unregister(dev as *Hardware) as void {
     if (cast(i64, dev) == 0) {
         pmm.panic("hardware_unregister: null dev", 29);
@@ -607,21 +613,18 @@ fn bus_node_register(bi as *BusNode, parent as *Hardware) as i32 {
 }
 
 // ============================================================
-// Resource subsystems: MMIO / IRQ / DMA
+// Resource lists: MMIO / IRQ / DMA / memory.
 //
-// Resources are tracked per-device in three singly-linked lists. The lists
-// start empty (null). Allocations prepend; releases scan-and-unlink.
-// hardware_unregister drains all three in order IRQ -> DMA -> MMIO
-// per spec §Cleanup Ordering.
+// Resources are tracked per device. The lists start empty (null);
+// allocations prepend and releases scan-and-unlink. hardware_unregister drains
+// all four after the device has been detached.
 //
-//   - dma_alloc takes physically contiguous pages from the buddy allocator,
-//     rounded up to a power of two (dma_order_for), zeroed, and below 4 GiB
-//     when the device asks for it.
-//   - irq_register links a handler into its vector's chain. Every vector has
-//     an IDT stub that ends in driver_irq_dispatch, which walks the chain, so
-//     nothing about the IDT changes here; routing a device's line to the
-//     vector (IOAPIC) is the bus's job (spec.cst, platform.cst).
-// ============================================================
+//   - dma_alloc takes physically contiguous, zeroed pages, optionally below
+//     4 GiB.
+//   - memory_alloc hands the driver a zeroed kernel-heap buffer; it makes no
+//     physical-contiguity promise.
+//   - irq_register chains handlers sharing one vector.
+//   - MMIO mappings use kvmap(KV_MMIO).
 
 fn mmio_map(dev as *Hardware, phys as u64, size as u64, flags as u32, out as **u8) as i32 {
     if (cast(i64, dev) == 0) { return INVALID_ARGUMENT; }
@@ -743,6 +746,55 @@ fn dma_free(dev as *Hardware, buffer as *DmaBuffer) as void {
             tree_unlock();
             let is i32 as pfn = cast(i32, cast(i64, cur.phys) / pmm.PAGE_SIZE);
             pmm.free_pages(pfn, cast(i32, cur.order));
+            heap.kfree(cast(i64, cur));
+            return;
+        }
+        prev = cur;
+        cur = cur.next;
+    }
+    tree_unlock();
+}
+
+// Allocate a zeroed, kernel-heap buffer tracked on the hardware node. Unlike
+// DMA, the pages need not be physically contiguous or addressable by a device.
+fn memory_alloc(dev as *Hardware, size as u64, out as **MemoryBuffer) as i32 {
+    if (cast(i64, dev) == 0 || cast(i64, out) == 0 || size == 0
+        || size > cast(u64, 0x7FFFFFFFFFFFF000)) {
+        return INVALID_ARGUMENT;
+    }
+    *out = cast(*MemoryBuffer, 0);
+    let is i64 as virt = heap.kmalloc(cast(i64, size), pmm.ALLOC_ZERO);
+    if (virt == 0) { return OUT_OF_MEMORY; }
+    let is i64 as node_addr = heap.kmalloc(sizeof(MemoryBuffer), 0);
+    if (node_addr == 0) {
+        heap.kfree(virt);
+        return OUT_OF_MEMORY;
+    }
+    let is *MemoryBuffer as b = cast(*MemoryBuffer, node_addr);
+    b.virt = cast(*u8, virt);
+    b.size = cast(i64, size);
+
+    tree_lock();
+    b.next = dev.memory_list;
+    dev.memory_list = b;
+    tree_unlock();
+
+    *out = b;
+    return OK;
+}
+
+fn memory_free(dev as *Hardware, buffer as *MemoryBuffer) as void {
+    if (cast(i64, dev) == 0 || cast(i64, buffer) == 0) { return; }
+
+    tree_lock();
+    let is *MemoryBuffer as cur with mut = dev.memory_list;
+    let is *MemoryBuffer as prev with mut = cast(*MemoryBuffer, 0);
+    while (cast(i64, cur) != 0) {
+        if (cast(i64, cur) == cast(i64, buffer)) {
+            if (cast(i64, prev) == 0) { dev.memory_list = cur.next; }
+            else                       { prev.next = cur.next; }
+            tree_unlock();
+            heap.kfree(cast(i64, cur.virt));
             heap.kfree(cast(i64, cur));
             return;
         }
@@ -897,8 +949,8 @@ fn irq_unregister(dev as *Hardware, vector as u32) as void {
     lock.release_irq(&irq_tbl_lock, flags);
 }
 
-// Drains all tracked resources in spec-mandated order IRQ -> DMA -> MMIO.
-// Idempotent: called from hardware_unregister; safe on empty lists.
+// Drains all tracked resources in dependency order. Idempotent: called from
+// hardware_unregister; safe on empty lists.
 fn release_all_resources(dev as *Hardware) as void {
     while (cast(i64, dev.irq_list) != 0) {
         let is *IrqBinding as head = dev.irq_list;
@@ -907,6 +959,10 @@ fn release_all_resources(dev as *Hardware) as void {
     while (cast(i64, dev.dma_list) != 0) {
         let is *DmaBuffer as head = dev.dma_list;
         dma_free(dev, head);
+    }
+    while (cast(i64, dev.memory_list) != 0) {
+        let is *MemoryBuffer as head = dev.memory_list;
+        memory_free(dev, head);
     }
     while (cast(i64, dev.mmio_list) != 0) {
         let is *MmioRegion as head = dev.mmio_list;

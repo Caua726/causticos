@@ -41,6 +41,9 @@ hardware to wire all this up is discovered from ACPI tables
 framework matches them against what it finds on PCI and binds a driver,
 with shared interrupt lines chained when devices collide (`driver.cst`,
 `spec.cst`, `specparse.cst`, `pci.cst`).
+Their `capabilities` block resolves MMIO BARs, IRQ vectors, DMA buffers, validated
+x86 PORTIO ranges and zeroed kernel-heap memory pools into `Binding.caps`.
+Allocated resources are reclaimed on bind failure and hardware teardown.
 
 **Storage.** An AHCI driver talks to SATA disks (`ahci.cst`), a block
 layer sits above it (`storage.cst`), a full FAT32 implementation reads and

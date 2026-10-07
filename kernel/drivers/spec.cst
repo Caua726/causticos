@@ -30,9 +30,9 @@ use "platform.cst" as platform;
 // answers them (driver.MATCH_*).
 
 // ============================================================
-// Capability kinds (Phase 3 fills Binding.caps; Phase 2 leaves
-// caps zeroed and drivers use driver.mmio_map directly)
-// ============================================================
+// Capability requests are resolved before on_bind. The resulting handles in
+// Binding.caps are tracked on the hardware node and released on failure or
+// hardware teardown.
 
 let is i64 as CAP_MMIO   = 1;
 let is i64 as CAP_IRQ    = 2;
@@ -65,6 +65,7 @@ struct Capabilities {
     dma_phys as i64;
     dma_size as i64;
     portio_base as i64;
+    portio_size as i64;
     mem_pool as *u8;
     mem_size as i64;
 }
@@ -353,15 +354,10 @@ fn match_all() as void {
     serial.println(" bindings", 9);
 }
 
-// Phase 3: resolve every CapabilityRequest on a binding into concrete
-// resources stored in binding.caps. MMIO uses the bus's get_bar_info
-// to translate a BAR index into a physical address, then drives
-// driver.mmio_map to produce a virtual pointer. IRQ allocates a
-// driver-framework vector, programs the IOAPIC redirection entry,
-// and registers the spec's on_irq callback. DMA allocates a
-// page-aligned (optionally below-4G) buffer tracked on hw.dma_list.
-// PORTIO / MEMORY are accepted by the parser but not yet resolved
-// here — added when a real driver needs them.
+// Resolve each CapabilityRequest into concrete resources in binding.caps.
+// MMIO maps a bus BAR; IRQ routes a vector; DMA allocates device-addressable
+// pages; PORTIO records a validated x86 port range; MEMORY allocates a zeroed
+// kernel-heap buffer with no physical-contiguity guarantee.
 fn populate_caps(b as *Binding) as i32 {
     let is *Spec as s = b.spec;
     let is *driver.Hardware as hw = b.hardware;
@@ -433,6 +429,7 @@ fn populate_caps(b as *Binding) as i32 {
                                                         cast(*u8, b));
                 if (irc != driver.OK) {
                     if (fresh_vector == 1) {
+                        ioapic.mask(line);
                         line_vector_clear(line);
                         ioapic.release_vector(vector);
                     }
@@ -455,16 +452,37 @@ fn populate_caps(b as *Binding) as i32 {
             b.caps.dma_pool = buf.virt;
             b.caps.dma_phys = buf.phys;
             b.caps.dma_size = req.p1;
+        } else if (req.kind == CAP_PORTIO) {
+            // portio: <base_port>, <port_count>; the half-open range must fit
+            // in x86's 16-bit I/O-port space. p3 is reserved.
+            if (b.caps.portio_size != 0 || req.p1 < 0 || req.p1 > 0xFFFF
+                || req.p2 <= 0 || req.p2 > (0x10000 - req.p1) || req.p3 != 0) {
+                rollback_caps(b);
+                return driver.INVALID_ARGUMENT;
+            }
+            b.caps.portio_base = req.p1;
+            b.caps.portio_size = req.p2;
+        } else if (req.kind == CAP_MEMORY) {
+            // memory: <size_bytes>; always zeroed; p2/p3 are reserved.
+            if (cast(i64, b.caps.mem_pool) != 0 || req.p1 <= 0
+                || req.p1 > 0x7FFFFFFFFFFFF000 || req.p2 != 0 || req.p3 != 0) {
+                rollback_caps(b);
+                return driver.INVALID_ARGUMENT;
+            }
+            let is *driver.MemoryBuffer as buf with mut = cast(*driver.MemoryBuffer, 0);
+            let is i32 as mrc = driver.memory_alloc(hw, cast(u64, req.p1), &buf);
+            if (mrc != driver.OK) { rollback_caps(b); return mrc; }
+            b.caps.mem_pool = buf.virt;
+            b.caps.mem_size = req.p1;
         }
         i = i + 1;
     }
     return 0;
 }
 
-// Undo any partial cap resolution. Called when populate_caps fails
-// mid-way. MMIO entries live on hw.mmio_list; IRQ handler lives in
-// driver's dispatch table. Keeps caps.* fields cleared so the binding
-// doesn't point at torn-down resources.
+// Undo partial or failed bindings. MMIO, IRQ, DMA and memory allocations are
+// removed from the hardware node, and scalar grants are cleared with the
+// binding so no handle points at a released resource.
 fn rollback_caps(b as *Binding) as void {
     if (cast(i64, b.caps.mmio) != 0) {
         let is *driver.MmioRegion as r with mut = b.hardware.mmio_list;
@@ -480,8 +498,29 @@ fn rollback_caps(b as *Binding) as void {
         b.caps.mmio_size = 0;
     }
     if (b.caps.irq_vector != 0) {
-        driver.irq_unregister(b.hardware, cast(u32, b.caps.irq_vector));
-        ioapic.release_vector(b.caps.irq_vector);
+        let is i64 as vector = b.caps.irq_vector;
+        driver.irq_unregister(b.hardware, cast(u32, vector));
+        let is i32 as in_use with mut = 0;
+        let is *Binding as other with mut = cast(*Binding, bindings);
+        while (cast(i64, other) != 0) {
+            if (cast(i64, other) != cast(i64, b) && other.caps.irq_vector == vector) {
+                in_use = 1;
+                other = cast(*Binding, 0);
+            } else {
+                other = other.next;
+            }
+        }
+        if (in_use == 0) {
+            let is i64 as line with mut = 0;
+            while (line < 256) {
+                if (line_vector_table[line] == vector) {
+                    ioapic.mask(line);
+                    line_vector_clear(line);
+                }
+                line = line + 1;
+            }
+            ioapic.release_vector(vector);
+        }
         b.caps.irq_vector = 0;
     }
     if (cast(i64, b.caps.dma_pool) != 0) {
@@ -498,6 +537,21 @@ fn rollback_caps(b as *Binding) as void {
         b.caps.dma_phys = 0;
         b.caps.dma_size = 0;
     }
+    if (cast(i64, b.caps.mem_pool) != 0) {
+        let is *driver.MemoryBuffer as m with mut = b.hardware.memory_list;
+        while (cast(i64, m) != 0) {
+            if (cast(i64, m.virt) == cast(i64, b.caps.mem_pool)) {
+                driver.memory_free(b.hardware, m);
+                m = cast(*driver.MemoryBuffer, 0);
+            } else {
+                m = m.next;
+            }
+        }
+        b.caps.mem_pool = cast(*u8, 0);
+        b.caps.mem_size = 0;
+    }
+    b.caps.portio_base = 0;
+    b.caps.portio_size = 0;
 }
 
 fn bind_all() as void {
@@ -514,6 +568,7 @@ fn bind_all() as void {
                 brc = call(b.spec.on_bind, b);
                 if (brc != driver.OK) {
                     serial.println("spec: on_bind failed", 20);
+                    rollback_caps(b);
                 }
             }
             // A3: a driver that declares a `device { class; acquire }` block

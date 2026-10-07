@@ -124,6 +124,8 @@ SMOKE_MARKERS=(
     'random_smoke: PASS'
     'surface_smoke: PASS'
     'dummy.dma: PASS'
+    'dummy.portio: PASS'
+    'dummy.memory: PASS'
     'netdev_smoke: PASS'
     'audio_smoke: PASS'
     'vfs.test: ALL PASS'
