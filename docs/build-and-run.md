@@ -426,6 +426,9 @@ machine reports **12992 KB free** and runs everything on the image.
 
 If the kernel cannot open, validate or start `/init.cse`, it replaces the logo
 with a boot-error screen; the serial console retains the detailed cause.
+When the live-root allocation fails, the screen says
+`Not enough memory. Boot with more memory.`; serial retains the requested and
+available byte counts.
 
 If you want a genuinely small RAM footprint, the volume size is not the lever —
 the filesystem is. The live root is FAT32 only because FAT32 is the filesystem
