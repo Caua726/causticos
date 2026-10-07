@@ -261,6 +261,14 @@ wrap to the available panel width; an ellipsis marks text that cannot fit.
 Unregistered applications are identified as such, and a catalogue read error
 is shown in words instead of leaving the panel silently empty.
 
+The launcher retains complete directory filenames in growable storage, with no
+application-count or label-width cutoff. Labels that do not fit have an ellipsis;
+the description panel identifies the selected name. Opening a program transfers
+the filename through a segment, not the 16-byte title field or a shell command.
+Console programs run in a terminal using that literal image path, so spaces,
+apostrophes and dollar signs do not select a different program. Directory and
+allocation errors are shown rather than silently presenting a complete list.
+
 For a standalone export:
 
 ```sh

@@ -23,10 +23,11 @@ fn is_internal(base as *u8, blen as i64) as i64 {
 
 // load_icon — try /icons/<base>.csif → decode, store pixels; else ico_pix=0.
 fn load_icon(idx as i64, base as *u8, blen as i64) as void {
-    s.ico_pix[idx] = 0;
-    s.ico_nc[idx] = 0 - 1; // attempted; a missing icon is not reopened on repaint
-    if (blen > 22) { return; }
-    let is [40]u8 as path;
+    let is *s.App as item = s.app(idx);
+    item.ico_pix = 0;
+    item.ico_nc = 0 - 1; // attempted; a missing icon is not reopened on repaint
+    // The directory ABI carries at most 255 name bytes, not a 22-byte UI name.
+    let is [268]u8 as path;
     let is *u8 as pfx = "/icons/";
     let is i64 as o with mut = 0;
     while (o < 7) { path[o] = pfx[o]; o = o + 1; }
@@ -37,14 +38,14 @@ fn load_icon(idx as i64, base as *u8, blen as i64) as void {
     while (j < 6) { path[7 + blen + j] = sfx[j]; j = j + 1; }
     let is csif.Image as im = csif.load(cast(*u8, &path[0]));
     if (im.ok == 0) { return; }
-    s.ico_pix[idx] = cast(i64, im.pixels);
-    s.ico_w[idx] = im.width; s.ico_h[idx] = im.height; s.ico_nc[idx] = im.nchan;
+    item.ico_pix = cast(i64, im.pixels);
+    item.ico_w = im.width; item.ico_h = im.height; item.ico_nc = im.nchan;
     return;
 }
 
 fn is_terminal(idx as i64) as i64 {
-    if (s.name_len[idx] != 5) { return 0; }
-    let is *u8 as p = cast(*u8, &s.names[idx * s.NAMEW]);
+    if (s.app(idx).name_len != 5) { return 0; }
+    let is *u8 as p = s.name(idx);
     return p[0] == cast(u8, 119) && p[1] == cast(u8, 116)
         && p[2] == cast(u8, 101) && p[3] == cast(u8, 114) && p[4] == cast(u8, 109);
 }
@@ -55,10 +56,12 @@ fn after(a as i64, b as i64) as i64 {
     let is i64 as at = is_terminal(a);
     let is i64 as bt = is_terminal(b);
     if (at != bt) { return at < bt; }
-    let is *u8 as ap = cast(*u8, &s.names[a * s.NAMEW]);
-    let is *u8 as bp = cast(*u8, &s.names[b * s.NAMEW]);
+    let is *s.App as aa = s.app(a);
+    let is *s.App as bb = s.app(b);
+    let is *u8 as ap = s.name(a);
+    let is *u8 as bp = s.name(b);
     let is i64 as i with mut = 0;
-    while (i < s.name_len[a] && i < s.name_len[b]) {
+    while (i < aa.name_len && i < bb.name_len) {
         let is i64 as ac with mut = cast(i64, ap[i]);
         let is i64 as bc with mut = cast(i64, bp[i]);
         if (ac >= 65 && ac <= 90) { ac = ac + 32; }
@@ -66,20 +69,17 @@ fn after(a as i64, b as i64) as i64 {
         if (ac != bc) { return ac > bc; }
         i = i + 1;
     }
-    return s.name_len[a] > s.name_len[b];
+    return aa.name_len > bb.name_len;
 }
 
+// Sorting precedes icon and description loading, so only name slices move.
 fn swap(a as i64, b as i64) as void {
-    let is i64 as i with mut = 0;
-    while (i < s.NAMEW) {
-        let is u8 as c = s.names[a * s.NAMEW + i];
-        s.names[a * s.NAMEW + i] = s.names[b * s.NAMEW + i];
-        s.names[b * s.NAMEW + i] = c;
-        i = i + 1;
-    }
-    let is i64 as n = s.name_len[a];
-    s.name_len[a] = s.name_len[b];
-    s.name_len[b] = n;
+    let is *s.App as aa = s.app(a);
+    let is *s.App as bb = s.app(b);
+    let is i64 as off = aa.name_off;
+    let is i64 as len = aa.name_len;
+    aa.name_off = bb.name_off; aa.name_len = bb.name_len;
+    bb.name_off = off; bb.name_len = len;
     return;
 }
 
@@ -109,29 +109,42 @@ fn sort_names() as void {
     return;
 }
 
-// scan_apps — readdir "/" for *.cse, fill the app list (base names minus
-// the .cse extension).
+fn add_app(name as *u8, len as i64) as i64 {
+    if (fu.line_reserve(&s.apps, s.apps.len + sizeof(s.App)) < 0
+        || fu.line_reserve(&s.names, s.names.len + len + 1) < 0) { return sys.E_NOMEM; }
+    let is *u8 as dst = cast(*u8, s.names.va + s.names.len);
+    let is i64 as k with mut = 0;
+    while (k < len) { dst[k] = name[k]; k = k + 1; }
+    dst[len] = cast(u8, 0);
+    let is *s.App as item = s.app(s.app_count);
+    item.name_off = s.names.len; item.name_len = len - 4;
+    item.ico_pix = 0; item.ico_w = 0; item.ico_h = 0; item.ico_nc = 0;
+    item.desc_off = 0; item.desc_len = 0;
+    s.names.len = s.names.len + len + 1;
+    s.apps.len = s.apps.len + sizeof(s.App);
+    s.app_count = s.app_count + 1;
+    return 0;
+}
+
+// scan_apps — readdir "/" for *.cse, retaining each complete filename.
+// name_len excludes the suffix only for labels and catalogue lookup.
 fn scan_apps() as void {
     s.app_count = 0;
     let is i64 as fd = sys.open_read(cast(*u8, "/"));
-    if (fd < 0) { return; }
+    if (fd < 0) { s.scan_error = fd; return; }
     let is [37]i64 as ent;
-    while (s.app_count < s.MAXAPP) {
+    while (1 == 1) {
         let is i64 as rc = sys.readdir(fd, cast(*u8, &ent[0]));
-        if (rc != 0) { break; }
+        if (rc != 0) { if (rc != sys.E_NOENT) { s.scan_error = rc; } break; }
         let is *u8 as nm = cast(*u8, &ent[0]);
         let is i64 as nlen = ent[32];
         let is i64 as isdir = ent[36];
         if (isdir == 1) { continue; }
         if (ends_cse(nm, nlen) == 0) { continue; }
         let is i64 as blen = nlen - 4;
-        if (blen <= 0 || blen >= s.NAMEW) { continue; }
         if (is_internal(nm, blen) == 1) { continue; }
-        let is i64 as slot = s.app_count * s.NAMEW;
-        let is i64 as k with mut = 0;
-        while (k < blen) { s.names[slot + k] = nm[k]; k = k + 1; }
-        s.name_len[s.app_count] = blen;
-        s.app_count = s.app_count + 1;
+        let is i64 as added = add_app(nm, nlen);
+        if (added < 0) { s.scan_error = added; break; }
     }
     sys.close(fd);
     sort_names();
@@ -139,8 +152,8 @@ fn scan_apps() as void {
 }
 
 fn name_is(idx as i64, name as *u8, len as i64) as i64 {
-    if (s.name_len[idx] != len) { return 0; }
-    let is *u8 as own = cast(*u8, &s.names[idx * s.NAMEW]);
+    if (s.app(idx).name_len != len) { return 0; }
+    let is *u8 as own = s.name(idx);
     let is i64 as k with mut = 0;
     while (k < len) { if (own[k] != name[k]) { return 0; } k = k + 1; }
     return 1;
@@ -174,8 +187,8 @@ fn index_descriptions() as void {
         let is i64 as i with mut = 0;
         while (i < s.app_count) {
             if (name_is(i, cast(*u8, s.catalog.va + start), name_end - start) == 1) {
-                s.desc_off[i] = desc;
-                s.desc_len[i] = end - desc;
+                s.app(i).desc_off = desc;
+                s.app(i).desc_len = end - desc;
                 break;
             }
             i = i + 1;
@@ -205,8 +218,8 @@ fn load_visible_icons() as void {
     if (last > s.app_count) { last = s.app_count; }
     let is i64 as i with mut = first;
     while (i < last) {
-        if (s.ico_nc[i] == 0) {
-            load_icon(i, cast(*u8, &s.names[i * s.NAMEW]), s.name_len[i]);
+        if (s.app(i).ico_nc == 0) {
+            load_icon(i, s.name(i), s.app(i).name_len);
         }
         i = i + 1;
     }

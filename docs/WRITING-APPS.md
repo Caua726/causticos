@@ -101,6 +101,7 @@ After that it is a loop: write 32-bit pixels into the mapping, send
 | `MSG_SET_TITLE` | up to 16 bytes, packed into `b` and `c` |
 | `MSG_CLOSE` | I am exiting |
 | `MSG_SPAWN_REQ` | please open another terminal |
+| `MSG_SPAWN_NAMED` | open a complete root filename; use `wmp.spawn_named(name, len)` |
 | `MSG_POINTER_TRACK` | `a=1` subscribes to pointer motion without a button held; `a=0` stops it |
 
 | You receive | Meaning |
@@ -113,6 +114,12 @@ After that it is a loop: write 32-bit pixels into the mapping, send
 | `MSG_RESIZE` | your new size |
 | `MSG_FOCUS` | 0 or 1 |
 | `MSG_CLOSE_REQ` | please exit |
+
+Protocol version 3 sends `MSG_SPAWN_NAMED` filenames in a segment before the
+message (`a=filename byte length`, `b=c=0`), following the same FD-send ordering
+as the clipboard. Include `.cse`; do not use title packing or shell quoting.
+The WM passes the selected image path literally, including spaces, apostrophes
+and dollar signs. The 16-byte title field limits presentation, not file selection.
 
 Pointer motion is always delivered during a button grab. Unpressed motion is
 opt-in through `MSG_POINTER_TRACK`; subscribers also receive the position when
