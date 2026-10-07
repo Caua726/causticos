@@ -124,4 +124,4 @@ bin  hexedit
 icons assets/apps.tsv
 file assets/apps.tsv /etc/apps.tsv
 
-text /hello.txt  ola do CausticOS! este arquivo veio do root FAT32 via cat.
+text /hello.txt  ola do CausticOS! este arquivo veio do root FAT32 via cat.\n

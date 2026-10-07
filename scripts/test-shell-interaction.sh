@@ -107,6 +107,13 @@ wait_for_file_match ps.out 'PID  PPID  STATE[[:space:]]+NAME' \
     || fail "ps did not write its process table"
 echo "interaction: ps produced a process table"
 
+type_line 'cat /hello.txt > /hello.out'
+wait_for_file_match hello.out '^ola do CausticOS!' \
+    || fail "cat did not copy the shipped hello.txt"
+"$PY" -c 'import pathlib, sys; raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes().endswith(b"\n") else 1)' "$GOT" \
+    || fail "/hello.txt did not end in a newline"
+echo "interaction: /hello.txt ends with newline"
+
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"

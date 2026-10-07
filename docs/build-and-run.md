@@ -247,6 +247,9 @@ Later writes win, so a profile can override something it included. Quote a path
 that contains spaces — `text "/long name.txt" hello` — because FAT32 allows them
 and the kernel's own self-test depends on one.
 
+The base image's `/hello.txt` sample ends with a newline, as a complete text
+line should.
+
 `base` includes `icons assets/apps.tsv`, so shell, desktop, dev and verify
 images all carry the icons. Each TSV row contains the executable basename,
 pictogram family, readable badge and description. `scripts/make_icons.py`
