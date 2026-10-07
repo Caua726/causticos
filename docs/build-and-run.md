@@ -269,6 +269,11 @@ Console programs run in a terminal using that literal image path, so spaces,
 apostrophes and dollar signs do not select a different program. Directory and
 allocation errors are shown rather than silently presenting a complete list.
 
+`netd`, `soundd` and `httpd` are services, not one-click applications, and are
+omitted from the launcher. Their executables remain installed for explicit
+startup with the required channels and configuration. In particular, opening
+the application grid cannot start a second `netd` or repeat DHCP.
+
 For a standalone export:
 
 ```sh
