@@ -261,6 +261,10 @@ wrap to the available panel width; an ellipsis marks text that cannot fit.
 Unregistered applications are identified as such, and a catalogue read error
 is shown in words instead of leaving the panel silently empty.
 
+Super+Space opens the application launcher. If one already exists, the WM
+moves it to the current view, restores it if minimized, and focuses it instead
+of starting a duplicate.
+
 The launcher retains complete directory filenames in growable storage, with no
 application-count or label-width cutoff. Labels that do not fit have an ellipsis;
 the description panel identifies the selected name. Opening a program transfers
