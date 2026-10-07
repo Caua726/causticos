@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# verify.sh — boot the system N times per cpu count and check what it printed.
+# verify.sh — exercise boot paths and the interactive shell.
 #
-# Three gates, all against the SAME kernel binary the ISO ships:
+# Four boot gates use the SAME kernel binary the ISO ships:
 #
-#   live     the ISO alone, no disk on the bus. Proves the claim the whole
-#            reform exists for: the root travels inside the image.
-#   persist  a scratch FAT32 disk as the root, with the `selftest` command line,
-#            so the AHCI driver and the FAT32 write path are actually exercised.
-#   smoke    the live ISO with the `smoke` command line: the in-kernel gauntlet
-#            (memory, IPC objects, the driver framework, both NICs, audio, the
-#            VFS self-test, the ring-3 smokes). Every one of them has to report
-#            PASS and nothing may say FAIL. No gate ran this boot before, and
-#            the VFS self-test in it had quietly stopped at its first check.
+#   live     the ISO alone, no disk on the bus. Proves the root travels
+#            inside the image.
+#   persist  a scratch FAT32 disk as the root, with `selftest`, exercising
+#            AHCI and the FAT32 write path.
+#   smoke    the live ISO with `smoke`: kernel memory, IPC, drivers, VFS,
+#            and ring-3 test gauntlet.
+#   uefi     the live ISO through OVMF, with firmware memory reclaimed.
+#
+# Every run also boots the shell on a scratch FAT32 root, types `ps`, a
+# pipeline, and Ctrl+C through QEMU's keyboard, then checks the command output.
+# `--interaction-only` isolates that real-input gate.
 #
 # What the script this replaces got wrong, and why each is fixed here:
 #
@@ -44,6 +46,7 @@ SMPS="1,2,4"
 RUNS=1
 TOUT=25
 GATES="live persist smoke uefi"
+INTERACTION_ONLY=0
 KEEP=0
 USE_ACCEL=0
 
@@ -60,6 +63,7 @@ usage: caustic-mk run verify -- [options]
   --persist-only   only the persist gate (AHCI + FAT32 writes)
   --smoke-only     only the smoke gate (the in-kernel test gauntlet)
   --uefi-only      only the uefi gate (the live ISO through OVMF, at 128M)
+  --interaction-only only the real shell interaction gate (ps, pipes, Ctrl+C)
   --keep-logs      leave the serial logs in build/verify/ for inspection
   --kvm            use the host accelerator (default: TCG, so the sweep is
                    identical on every machine)
@@ -75,6 +79,7 @@ while [ $# -gt 0 ]; do
         --persist-only) GATES="persist"; shift ;;
         --smoke-only) GATES="smoke"; shift ;;
         --uefi-only) GATES="uefi"; shift ;;
+        --interaction-only) GATES=""; INTERACTION_ONLY=1; shift ;;
         --keep-logs) KEEP=1; shift ;;
         --kvm) USE_ACCEL=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -157,7 +162,7 @@ case " $GATES " in *" uefi "*)
         GATES="$(echo " $GATES " | sed 's/ uefi / /; s/^ *//; s/ *$//')"
     fi ;;
 esac
-[ -n "$GATES" ] || { echo "verify: no gate left to run" >&2; exit 1; }
+[ -n "$GATES" ] || [ "$INTERACTION_ONLY" = 1 ] || { echo "verify: no gate left to run" >&2; exit 1; }
 
 # The live ISO exercises kernel DEFLATE expansion; smoke and persist retain
 # their uncompressed/physical-root paths.
@@ -308,6 +313,13 @@ for gate in $GATES; do
 done
 
 echo
-echo "=== $TOTAL_PASS/$((TOTAL_PASS+TOTAL_FAIL)) boots passed ==="
+echo "=== gate: interaction ($ACCEL_NAME) ==="
+if QEMU_ACCEL="$ACCEL_NAME" bash scripts/test-shell-interaction.sh; then
+    TOTAL_PASS=$((TOTAL_PASS+1))
+else
+    TOTAL_FAIL=$((TOTAL_FAIL+1))
+fi
+echo
+echo "=== $TOTAL_PASS/$((TOTAL_PASS+TOTAL_FAIL)) checks passed ==="
 [ "$KEEP" = 1 ] && echo "logs kept in $WORK/"
 [ "$TOTAL_FAIL" -eq 0 ] || exit 1
