@@ -284,6 +284,9 @@ is shown in words instead of leaving the panel silently empty.
 | `Super+Ctrl+1`…`9` | Toggle tag 1–9 in the current view. |
 | `Super+Shift+Q` | Power off after pressing the chord twice within four seconds. |
 
+The taskbar's layout badge spells out `FLOAT`, `TILE`, or `MONOCLE`; click it
+to cycle.
+
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by
 the current view.
 
