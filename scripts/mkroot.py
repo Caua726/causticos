@@ -27,6 +27,7 @@ Profile directives, one per line:
   text <guestpath> <content...>        literal content (\\n and \\t honoured)
   dir <guestpath>                      an empty directory
   mirror <hostdir> <guestdir> [--only <glob>]   recursive copy
+  icons <catalog>                     generate /icons/<name>.csif from application TSV
   size <bytes|48M|64M>                 volume size for this profile
   opt <directive...>                   skip silently when the source is missing
   # ...                                comment
@@ -52,6 +53,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import csvi
 import fat32
+import make_icons
 
 # 33 MiB: one megabyte over the floor, and the floor is the only thing setting
 # this number. The sparse container on the ISO is the SAME size either way (it
@@ -277,6 +279,17 @@ class Resolver:
 
         if word == "mirror":
             return self._mirror(rest, optional)
+
+        if word == "icons":
+            catalog, extra = take_token(rest)
+            if not catalog or extra:
+                raise ValueError("icons <catalog>")
+            if self.mode == "tools":
+                return
+            self._put(Item("dir", "/icons"))
+            for name, content in make_icons.build_icons(self._host(catalog)):
+                self._put(Item("file", "/icons/" + name + ".csif", catalog, content))
+            return
 
         raise ValueError("unknown directive {!r}".format(word))
 

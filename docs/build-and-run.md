@@ -239,12 +239,25 @@ Directives:
 | `text <guestpath> <content>` | literal content (`\n`, `\t` honoured) |
 | `dir <guestpath>` | an empty directory |
 | `mirror <hostdir> <guestdir> [--only <glob>]` | recursive copy |
+| `icons <catalog>` | generate original RGBA/QOI CSIF icons into `/icons` |
 | `size <bytes\|48M>` | volume size for this profile |
 | `opt <directive>` | skip silently when the source is missing |
 
 Later writes win, so a profile can override something it included. Quote a path
 that contains spaces — `text "/long name.txt" hello` — because FAT32 allows them
 and the kernel's own self-test depends on one.
+
+`base` includes `icons assets/apps.tsv`, so shell, desktop, dev and verify
+images all carry the icons. Each TSV row contains the executable basename,
+pictogram family, readable badge and description. `scripts/make_icons.py`
+renders the original 56×56 pixel artwork using only Python's standard library
+and the existing CSIF encoder; no downloaded icon pack or generated binary
+needs to be checked in. For a standalone export:
+
+```sh
+python3 scripts/make_icons.py /tmp/causticos-icons
+```
+
 
 ## How the ISO boots without a disk
 
