@@ -424,6 +424,9 @@ looked right, and could not spawn anything bigger than that. `cat` worked and
 reads like a loader bug and is a machine out of memory. At 33 MiB the same
 machine reports **12992 KB free** and runs everything on the image.
 
+If the kernel cannot open, validate or start `/init.cse`, it replaces the logo
+with a boot-error screen; the serial console retains the detailed cause.
+
 If you want a genuinely small RAM footprint, the volume size is not the lever —
 the filesystem is. The live root is FAT32 only because FAT32 is the filesystem
 this kernel speaks, and it speaks it for real disks and USB sticks. A RAM root
