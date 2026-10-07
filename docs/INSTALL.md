@@ -198,8 +198,8 @@ mouse; that one does need a grab, and native Wayland refuses QEMU's classic
 grab — so `run` routes GTK through XWayland when it sees `WAYLAND_DISPLAY`.
 Click inside the window to capture, `Ctrl+Alt+G` to release.
 
-Once the desktop is up: `Super+Enter` opens a terminal, `Alt+Tab` cycles
-windows, `Super+Q` closes one.
+Once the desktop is up: `Super+Enter` opens a terminal, and `Alt+Tab` shows the
+window list while cycling; release Alt to commit. `Super+Q` closes one.
 
 ## Real hardware
 

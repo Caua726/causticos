@@ -268,7 +268,7 @@ is shown in words instead of leaving the panel silently empty.
 | `Super+Enter` | Open a terminal. |
 | `Super+Space` | Open the application launcher. |
 | `Super+Q` | Close the focused window. |
-| `Alt+Tab` / `Alt+Shift+Tab` | Cycle to the next / previous window. |
+| `Alt+Tab` / `Alt+Shift+Tab` | Show the window list while cycling to the next / previous window; release Alt to commit. |
 | `Super+T` | Cycle the current tag's layout: Float → Tile → Monocle → Float. |
 | `Super+F` | Toggle the focused window between floating and arranged. |
 | `Super+Z` | Promote the focused window to master. |
