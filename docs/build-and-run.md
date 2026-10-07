@@ -154,6 +154,18 @@ boots on exactly one machine.
 
 Its device set mirrors `scripts/qemu-args.sh` down to the MAC addresses: the same
 e1000 and virtio-net, virtio-tablet, virtio-sound, PS/2 keyboard, stdvga, q35.
+
+The two independent SLIRP backends use non-overlapping IPv4 subnets in both
+launch paths:
+
+| NIC | Driver | Subnet | DHCP lease | Gateway |
+|---|---|---|---|---|
+| 0 | e1000 | 10.0.2.0/24 | 10.0.2.15 | 10.0.2.2 |
+| 1 | virtio-net | 10.0.3.0/24 | 10.0.3.15 | 10.0.3.2 |
+
+The guest learns these addresses and routes through DHCP; they are not driver
+defaults. The boot smoke's ARP probes target the gateway on each fixture's link.
+
 When you add a device to one, add it to the other — a driver that enumerates
 under `run` and is missing under virt-manager is a bug found at the worst
 possible moment. The one deliberate difference: `qemu-args.sh`'s `hostfwd` for

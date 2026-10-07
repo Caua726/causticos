@@ -114,7 +114,9 @@ QEMU_ARGS=(
     # NIC 1 — modern virtio-net. disable-legacy/disable-modern pin the device
     # to the 1.1 transport kernel/drivers/virtio.cst speaks; without them QEMU
     # offers a transitional device and feature negotiation fails.
-    -netdev user,id=net1
+    # A second SLIRP instance must use a distinct subnet: both instances'
+    # default DHCP leases are otherwise 10.0.2.15, with overlapping routes.
+    -netdev user,id=net1,net=10.0.3.0/24
     -device virtio-net-pci,netdev=net1,mac=52:54:00:12:34:57,disable-legacy=on,disable-modern=off
 
     # Absolute pointer — the guest cursor tracks the host cursor with no grab.
