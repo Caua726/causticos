@@ -298,6 +298,9 @@ shell prompt; output that already ends in a newline does not gain a blank line.
 The `cd` builtin includes the requested path in failures and distinguishes
 missing paths from non-directories.
 
+`mkdir` reports the requested path and the kernel's reason for failure, such
+as `already exists`.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by

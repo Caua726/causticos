@@ -124,6 +124,11 @@ mon "screendump $WORK/cd-error.ppm"
 [[ -s "$WORK/cd-error.ppm" ]] || fail "QEMU did not capture the cd diagnostic screen"
 echo "interaction: captured cd error screen for visual check"
 
+type_line 'mkdir /lib > /mkdir.out'
+wait_for_file_match mkdir.out '^mkdir: /lib: already exists$' \
+    || fail "mkdir did not report that the existing directory already exists"
+echo "interaction: mkdir reports already exists"
+
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"
