@@ -101,16 +101,25 @@ After that it is a loop: write 32-bit pixels into the mapping, send
 | `MSG_SET_TITLE` | up to 16 bytes, packed into `b` and `c` |
 | `MSG_CLOSE` | I am exiting |
 | `MSG_SPAWN_REQ` | please open another terminal |
+| `MSG_POINTER_TRACK` | `a=1` subscribes to pointer motion without a button held; `a=0` stops it |
 
 | You receive | Meaning |
 |---|---|
 | `MSG_WELCOME` | screen size + your window size |
 | `MSG_KEY` | a keysym, normalised |
 | `MSG_MOUSE_BTN` | button mask + x,y relative to your content |
+| `MSG_MOUSE_MOVE` | latest content-relative pointer position, buttons and modifiers |
 | `MSG_MOUSE_WHEEL` | delta + position |
 | `MSG_RESIZE` | your new size |
 | `MSG_FOCUS` | 0 or 1 |
 | `MSG_CLOSE_REQ` | please exit |
+
+Pointer motion is always delivered during a button grab. Unpressed motion is
+opt-in through `MSG_POINTER_TRACK`; subscribers also receive the position when
+the pointer leaves their content. Coordinates can be outside the window.
+Motion is coalesced, so clients must use the latest position rather than count
+events. The launcher uses this to update its application description panel;
+terminals do not subscribe.
 
 `userspace/wm/wmpat/wmpat.cst` is the smallest complete example — a window that
 draws a pattern and handles resize. Read it start to finish; it is short.

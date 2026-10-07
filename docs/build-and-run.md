@@ -252,7 +252,16 @@ images all carry the icons. Each TSV row contains the executable basename,
 pictogram family, readable badge and description. `scripts/make_icons.py`
 renders the original 56×56 pixel artwork using only Python's standard library
 and the existing CSIF encoder; no downloaded icon pack or generated binary
-needs to be checked in. For a standalone export:
+needs to be checked in.
+
+The base profile also installs the same catalogue at `/etc/apps.tsv`. The
+launcher looks up the description by executable basename and shows it in the
+panel below the grid when the pointer is over an application. Descriptions
+wrap to the available panel width; an ellipsis marks text that cannot fit.
+Unregistered applications are identified as such, and a catalogue read error
+is shown in words instead of leaving the panel silently empty.
+
+For a standalone export:
 
 ```sh
 python3 scripts/make_icons.py /tmp/causticos-icons

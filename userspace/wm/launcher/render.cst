@@ -4,15 +4,19 @@
 use "state.cst" as s;
 use "std/causticos/font.cst" as font;
 use "std/unicode/utf8.cst" as utf8;
+use "std/os/causticos.cst" as sys;
+use "std/causticos/prog.cst" as prog;
 
 fn gpix(x as i64, y as i64, color as i64) as void {
     if (x < 0 || y < 0 || x >= s.win_w || y >= s.win_h) { return; }
+    if (s.paint_limit >= 0 && y >= s.paint_limit) { return; }
     let is *u32 as p = cast(*u32, s.seg_base + y * s.seg_stride + x * 4);
     p[0] = cast(u32, color);
     return;
 }
 fn gpix_alpha(x as i64, y as i64, color as i64, alpha as i64) as void {
     if (alpha == 0 || x < 0 || y < 0 || x >= s.win_w || y >= s.win_h) { return; }
+    if (s.paint_limit >= 0 && y >= s.paint_limit) { return; }
     if (alpha == 255) { gpix(x, y, color); return; }
     let is *u32 as p = cast(*u32, s.seg_base + y * s.seg_stride + x * 4);
     let is i64 as bg = cast(i64, p[0]);
@@ -24,10 +28,20 @@ fn gpix_alpha(x as i64, y as i64, color as i64, alpha as i64) as void {
     return;
 }
 fn gfill(x as i64, y as i64, w as i64, h as i64, color as i64) as void {
-    let is i64 as yy with mut = y;
-    while (yy < y + h) {
-        let is i64 as xx with mut = x;
-        while (xx < x + w) { gpix(xx, yy, color); xx = xx + 1; }
+    let is i64 as x0 with mut = x;
+    let is i64 as y0 with mut = y;
+    let is i64 as x1 with mut = x + w;
+    let is i64 as y1 with mut = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > s.win_w) { x1 = s.win_w; }
+    if (y1 > s.win_h) { y1 = s.win_h; }
+    if (s.paint_limit >= 0 && y1 > s.paint_limit) { y1 = s.paint_limit; }
+    let is i64 as yy with mut = y0;
+    while (yy < y1) {
+        let is *u32 as pixels = cast(*u32, s.seg_base + yy * s.seg_stride);
+        let is i64 as xx with mut = x0;
+        while (xx < x1) { pixels[xx] = cast(u32, color); xx = xx + 1; }
         yy = yy + 1;
     }
     return;
@@ -92,11 +106,17 @@ fn rows_total() as i64 {
     return (s.app_count + cols - 1) / cols;
 }
 
+
+fn grid_bottom() as i64 {
+    let is i64 as h = s.win_h - s.DETAIL_H;
+    if (h < s.PAD) { return s.PAD; }
+    return h;
+}
 // Whole rows that fit. A partial row at the bottom is still drawn (clipped by
 // gpix), but it does not count as reachable — otherwise the last row could
 // never be scrolled fully into view.
 fn rows_visible() as i64 {
-    let is i64 as h = s.win_h - s.PAD;
+    let is i64 as h = grid_bottom() - s.PAD;
     if (h < s.TILE) { return 1; }
     return h / s.TILE;
 }
@@ -170,7 +190,7 @@ fn draw_scrollbar() as void {
     let is i64 as vis = rows_visible();
     if (total <= vis) { return; }
     let is i64 as x = s.win_w - s.SBW;
-    let is i64 as h = s.win_h;
+    let is i64 as h = grid_bottom();
     gfill(x, 0, s.SBW, h, s.COL_SBTRK);
     let is i64 as th with mut = h * vis / total;
     if (th < 16) { th = 16; }
@@ -179,8 +199,75 @@ fn draw_scrollbar() as void {
     return;
 }
 
+// Word-wrapped UTF-8, with a visible ellipsis if the physical panel is too
+// small. Neither a long word nor a malformed byte can stall the renderer.
+fn paragraph(text as *u8, len as i64, x as i64, y as i64, cols as i64, rows as i64, color as i64) as void {
+    if (cols <= 0 || rows <= 0) { return; }
+    let is i64 as start with mut = 0;
+    let is i64 as row with mut = 0;
+    while (start < len && row < rows) {
+        while (start < len && text[start] == cast(u8, 32)) { start = start + 1; }
+        let is i64 as end with mut = start;
+        let is i64 as last_space with mut = 0 - 1;
+        let is i64 as count with mut = 0;
+        while (end < len && count < cols) {
+            if (text[end] == cast(u8, 32)) { last_space = end; }
+            let is [1]i32 as cp;
+            let is i64 as n with mut = utf8.decode1(text, len, end, cast(*i32, &cp[0]));
+            if (n <= 0) { n = 1; }
+            end = end + n;
+            count = count + 1;
+        }
+        if (end < len && row + 1 == rows) {
+            let is i64 as dots with mut = 3;
+            if (dots > cols) { dots = cols; }
+            end = start; count = 0;
+            while (end < len && count < cols - dots) {
+                let is [1]i32 as cp;
+                let is i64 as n with mut = utf8.decode1(text, len, end, cast(*i32, &cp[0]));
+                if (n <= 0) { n = 1; }
+                end = end + n; count = count + 1;
+            }
+            gtext(text + start, end - start, x, y + row * 16, color);
+            gtext(cast(*u8, "..."), dots, x + count * 8, y + row * 16, color);
+            return;
+        }
+        if (end < len && last_space > start) { end = last_space; }
+        gtext(text + start, end - start, x, y + row * 16, color);
+        start = end;
+        row = row + 1;
+    }
+    return;
+}
+
+fn draw_details() as void {
+    let is i64 as top = grid_bottom();
+    gfill(0, top, s.win_w, s.win_h - top, s.COL_BG);
+    gfill(0, top, s.win_w, 1, s.COL_SBTHM);
+    let is i64 as cols = (s.win_w - 24) / 8;
+    let is i64 as hint_rows = (s.win_h - top - 8) / 16;
+    let is i64 as desc_rows = (s.win_h - top - 24) / 16;
+    let is i64 as idx = s.detail_idx;
+    if (idx < 0 || idx >= s.app_count) {
+        let is *u8 as hint = "Point at an application to see its description.";
+        paragraph(hint, prog.slen(hint), 12, top + 8, cols, hint_rows, s.COL_LABEL);
+        return;
+    }
+    paragraph(cast(*u8, &s.names[idx * s.NAMEW]), s.name_len[idx], 12, top + 8, cols, 1, s.COL_ICOB);
+    let is *u8 as text with mut = cast(*u8, s.catalog.va + s.desc_off[idx]);
+    let is i64 as len with mut = s.desc_len[idx];
+    if (len == 0) {
+        text = cast(*u8, "No description registered for this application.");
+        if (s.catalog_error < 0) { text = sys.err_text(s.catalog_error); }
+        len = prog.slen(text);
+    }
+    paragraph(text, len, 12, top + 24, cols, desc_rows, s.COL_LABEL);
+    return;
+}
+
 fn paint() as void {
-    gfill(0, 0, s.win_w, s.win_h, s.COL_BG);
+    s.paint_limit = grid_bottom();
+    gfill(0, 0, s.win_w, s.paint_limit, s.COL_BG);
     let is i64 as cols = cols_per_row();
     // Only the rows on screen are drawn. Painting all 77 tiles and letting gpix
     // clip the off-screen ones costs a full glyph raster per hidden label.
@@ -207,5 +294,7 @@ fn paint() as void {
         i = i + 1;
     }
     draw_scrollbar();
+    s.paint_limit = 0 - 1;
+    draw_details();
     return;
 }
