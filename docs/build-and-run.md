@@ -286,6 +286,8 @@ is shown in words instead of leaving the panel silently empty.
 
 The taskbar's layout badge spells out `FLOAT`, `TILE`, or `MONOCLE`; click it
 to cycle.
+At the prompt, terminal windows are labelled `term#<pid>`; while a foreground
+command runs, its name replaces that label.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by
 the current view.
