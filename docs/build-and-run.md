@@ -269,6 +269,10 @@ Console programs run in a terminal using that literal image path, so spaces,
 apostrophes and dollar signs do not select a different program. Directory and
 allocation errors are shown rather than silently presenting a complete list.
 
+Typing filters application names and registered descriptions without regard to
+case. Backspace removes the last character. Escape clears a nonempty query; with
+an empty query, Escape closes the launcher.
+
 `netd`, `soundd` and `httpd` are services, not one-click applications, and are
 omitted from the launcher. Their executables remain installed for explicit
 startup with the required channels and configuration. In particular, opening
