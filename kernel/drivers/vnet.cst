@@ -1,18 +1,16 @@
 // vnet.cst — virtio-net driver (virtio spec §5.1), the SECOND consumer of
 // the modern PCI transport in virtio.cst. Where vtablet proved the transport
-// on a one-queue input device, this proves it on a two-queue DMA device:
-// a receiveq the device fills with incoming frames and a transmitq the
-// driver fills with outgoing ones, each frame prefixed by a 12-byte
+// on a one-queue input device, this uses receive, transmit and control queues:
+// the device fills receive buffers, reads outgoing frames, and acknowledges
+// receive-filter changes. Each data frame starts with a 12-byte
 // virtio_net_hdr. Same netdev.NetDevice vtable the e1000 fills, so it is a
 // drop-in alternative NIC — the framework wires whichever devices the machine
 // presents, and up to four of them.
 //
 // Modern-only (VERSION_1 negotiated in virtio.cst). We do NOT negotiate
 // MRG_RXBUF or CSUM/GSO offloads, so the header is the plain 12-byte form
-// and num_buffers is always 1. The MAC comes from device config (the
-// VIRTIO_NET_F_MAC feature QEMU always offers); we read it without
-// negotiating the bit, which is fine — config is readable regardless and we
-// only USE the address.
+// and num_buffers is always 1. MAC and receive-filter control are negotiated
+// explicitly; absent filter control means the receive mode is unknown.
 
 use "pci.cst" as pci;
 use "driver.cst" as driver;
@@ -20,13 +18,13 @@ use "spec.cst" as spec;
 use "ksym.cst" as ksym;
 use "serial.cst" as serial;
 use "lock.cst" as lock;
+use "mutex.cst" as mutex;
 use "sched.cst" as sched;
 use "timer.cst" as timer;
 use "util.cst" as util;
 use "virtio.cst" as virtio;
 use "netdev.cst" as netdev;
 
-let is i64 as NET_HDR_LEN = 10;        // virtio_net_hdr, no MRG_RXBUF (legacy-compat 10 bytes... )
 // NOTE: the modern (VERSION_1) header is 12 bytes — flags(1) gso_type(1)
 // hdr_len(2) gso_size(2) csum_start(2) csum_offset(2) num_buffers(2).
 let is i64 as HDR = 12;
@@ -36,6 +34,10 @@ let is i64 as NQ = 16;                 // ring slots we drive per queue (<= devi
 
 // device config offsets (struct virtio_net_config): mac[6] then status le16
 let is i64 as CFG_MAC = 0;
+let is i64 as F_MAC = 32;
+let is i64 as F_CTRL_VQ = 131072;
+let is i64 as F_CTRL_RX = 262144;
+let is i64 as VQ_CONTROL = 2;          // one RX/TX pair; no multiqueue feature
 
 // Up to four adapters. Same reasoning as e1000: a static array, no free path,
 // and two of the same device stops being a case the driver refuses. It used to
@@ -50,6 +52,11 @@ struct VnetCtx {
     vdev as virtio.VirtioDev;
     rxq  as virtio.VirtQueue;
     txq  as virtio.VirtQueue;
+    ctlq as virtio.VirtQueue;
+    ctl_lock as mutex.Mutex;
+    ctl_enabled as i64;
+    ctl_failed as i64;
+    promisc as i64;          // last acknowledged mode, -1 until known
     lk   as lock.TicketLock;
     mac  as [8]u8;           // 6 used
 }
@@ -179,6 +186,65 @@ fn nd_mac(priv as *u8, out6 as *u8) as i64 {
     return 0;
 }
 
+fn nd_promisc(priv as *u8) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    return c.promisc;
+}
+
+// One transaction owns the request, response and descriptor chain until the
+// device returns it. The mutex may sleep; the IRQ handler never consumes ctlq.
+fn nd_set_promisc(priv as *u8, on as i64) as i64 {
+    let is *VnetCtx as c = cast(*VnetCtx, priv);
+    mutex.acquire(&c.ctl_lock);
+    if (c.ctl_enabled == 0 || c.ctl_failed != 0) {
+        mutex.release(&c.ctl_lock);
+        return 0 - 1;
+    }
+    let is i64 as head = virtio.vio_desc_alloc(&c.ctlq);
+    let is i64 as ack = virtio.vio_desc_alloc(&c.ctlq);
+    if (head < 0 || ack < 0) {
+        if (head >= 0) { virtio.vio_desc_free_chain(&c.ctlq, head); }
+        if (ack >= 0) { virtio.vio_desc_free_chain(&c.ctlq, ack); }
+        mutex.release(&c.ctl_lock);
+        return 0 - 1;
+    }
+    let is i64 as mode with mut = 0;
+    if (on != 0) { mode = 1; }
+    // virtio_net_ctrl_hdr { RX=0, PROMISC=0 }, then the one-byte setting.
+    virtio.wr8(c.ctlq.buf_va, 0);
+    virtio.wr8(c.ctlq.buf_va + 1, 0);
+    virtio.wr8(c.ctlq.buf_va + 2, mode);
+    virtio.wr8(c.ctlq.buf_va + 16, 255);
+    virtio.vio_desc_set(&c.ctlq, head, c.ctlq.buf_phys, 3, virtio.DESC_F_NEXT, ack);
+    virtio.vio_desc_set(&c.ctlq, ack, c.ctlq.buf_phys + 16, 1, virtio.DESC_F_WRITE, 0);
+    virtio.vio_avail_push(&c.ctlq, head);
+    virtio.vio_publish(&c.vdev, &c.ctlq, VQ_CONTROL);
+    let is i64 as deadline = timer.current_time_ns() + 1000000000;
+    let is i64 as got with mut = 0 - 1;
+    while (got < 0 && timer.current_time_ns() < deadline) {
+        got = virtio.vio_next_used(&c.ctlq);
+        if (got < 0) { sched.sleep_for_ns(200000); }
+    }
+    if (got != head) {
+        // No completion means the device may still own the DMA buffers.
+        // Quarantine this queue, never reuse its chain after a timeout.
+        c.ctl_failed = 1; c.promisc = 0 - 1;
+        mutex.release(&c.ctl_lock);
+        return 0 - 1;
+    }
+    let is i64 as written = c.ctlq.last_used_len;
+    let is i64 as status = virtio.rd8(c.ctlq.buf_va + 16);
+    virtio.vio_desc_free_chain(&c.ctlq, head);
+    if (written != 1 || status != 0) {
+        c.promisc = 0 - 1;
+        mutex.release(&c.ctl_lock);
+        return 0 - 1;
+    }
+    c.promisc = mode;
+    mutex.release(&c.ctl_lock);
+    return 0;
+}
+
 // virtio-net has no link register: if the device is here it is up. The
 // STATUS field exists only when VIRTIO_NET_F_STATUS is negotiated, and we
 // do not negotiate it — reporting a fact we did not ask for would be a
@@ -207,7 +273,7 @@ fn vnet_irq(hw as *driver.Hardware, ctx as *u8) as i32 {
     if (c.present == 0) { return 0; }
     let is i64 as isr = virtio.vio_isr_read(&c.vdev);
     if ((isr & 1) == 0) { return 0; }          // not ours (shared INTx)
-    netdev.irq_drain(c.port_index);
+    if (c.port_index >= 0) { netdev.irq_drain(c.port_index); }
     return 0;
 }
 
@@ -221,12 +287,19 @@ fn vnet_bind(b as *spec.Binding) as i32 {
     let is *netdev.NetDevice as nd = nd_at(nctx);
     b.private = cast(*u8, c);
     let is i64 as hw = cast(i64, b.hardware);
+    c.port_index = 0 - 1; c.promisc = 0 - 1;
+    c.ctl_enabled = 0; c.ctl_failed = 0;
+    mutex.name(&c.ctl_lock, cast(*u8, "vnet receive filter"), 19);
     if (virtio.vio_setup(hw, &c.vdev) != 0) {
         serial.println("vnet: no modern virtio caps", 27);
         return 1;
     }
-    if (virtio.vio_negotiate(&c.vdev) != 0) {
+    if (virtio.vio_negotiate_features(&c.vdev, F_MAC | F_CTRL_VQ | F_CTRL_RX, 0) != 0) {
         serial.println("vnet: feature negotiation FAIL", 30);
+        return 1;
+    }
+    if ((c.vdev.features_lo & F_MAC) == 0 || c.vdev.devcfg == 0 || c.vdev.devcfg_len < 6) {
+        serial.println("vnet: MAC configuration unavailable", 35);
         return 1;
     }
     // rx = queue 0, tx = queue 1
@@ -238,6 +311,14 @@ fn vnet_bind(b as *spec.Binding) as i32 {
         serial.println("vnet: txq setup FAIL", 20);
         return 1;
     }
+    if ((c.vdev.features_lo & F_CTRL_VQ) != 0) {
+        if (virtio.vio_queue_setup(&c.vdev, VQ_CONTROL, 4, 16, &c.ctlq) != 0
+            || c.ctlq.qsize < 2) {
+            serial.println("vnet: control queue setup failed", 32);
+            return 1;
+        }
+        if ((c.vdev.features_lo & F_CTRL_RX) != 0) { c.ctl_enabled = 1; }
+    }
     // hand every rx buffer to the device (device-WRITABLE)
     let is i64 as i with mut = 0;
     while (i < c.rxq.qsize) {
@@ -245,16 +326,20 @@ fn vnet_bind(b as *spec.Binding) as i32 {
         i = i + 1;
     }
     // read the MAC from device config
-    if (c.vdev.devcfg != 0) {
-        let is i64 as m with mut = 0;
-        while (m < 6) {
-            c.mac[m] = cast(u8, virtio.rd8(c.vdev.devcfg + CFG_MAC + m) & 0xFF);
-            m = m + 1;
-        }
+    let is i64 as m with mut = 0;
+    while (m < 6) {
+        c.mac[m] = cast(u8, virtio.rd8(c.vdev.devcfg + CFG_MAC + m) & 0xFF);
+        m = m + 1;
     }
     c.tx_inflight = 0;
     c.present = 1;
     virtio.vio_driver_ok(&c.vdev);
+    if (c.ctl_enabled != 0 && nd_set_promisc(cast(*u8, c), 0) != 0) {
+        serial.println("vnet: receive filter command failed", 35);
+        c.present = 0;
+        virtio.wr8(c.vdev.common + virtio.C_STATUS, virtio.ST_FAILED);
+        return 1;
+    }
     virtio.vio_publish(&c.vdev, &c.rxq, 0);
     serial.print("vnet: virtio-net up mac=", 24);
     print_mac(c);
@@ -269,11 +354,9 @@ fn vnet_bind(b as *spec.Binding) as i32 {
     nd.mac         = fn_ptr(nd_mac);
     nd.link_up     = fn_ptr(nd_link_up);
     nd.mtu         = fn_ptr(nd_mtu);
-    // No control queue: VIRTIO_NET_F_CTRL_RX is what carries a promiscuous
-    // toggle, we do not negotiate it, and the device delivers everything the
-    // backend hands over regardless. Null says "cannot change it, and it is
-    // on" — which is the truth, rather than a knob that silently does nothing.
+    nd.promisc     = fn_ptr(nd_promisc);
     nd.set_promisc = cast(fn(*u8, i64) as i64, 0);
+    if (c.ctl_enabled != 0) { nd.set_promisc = fn_ptr(nd_set_promisc); }
     // And no notion of line rate at all: there is no wire. Reporting a number
     // would be inventing one.
     nd.speed       = cast(fn(*u8) as i64, 0);

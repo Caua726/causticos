@@ -209,6 +209,12 @@ shell↔terminal, and all future IPC fall out of it.
   carries the address and mask/link in its header, followed by the 32-byte
   driver name and an i64 gateway (40 payload bytes). An unconfigured interface
   is distinct from a missing service or a failed query.
+  Receive mode is reported by the driver, not inferred from the presence of a
+  setter. E1000 starts with host filtering; virtio-net negotiates its control
+  queue and explicitly disables promiscuous reception. `NET_FLAG_PROMISC`
+  means enabled; `NET_FLAG_PROMISC_UNKNOWN` means the device cannot confirm
+  its mode. Filter commands are serialized and only acknowledged completions
+  update the reported state.
 
 ---
 
