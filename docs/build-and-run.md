@@ -289,6 +289,9 @@ to cycle.
 At the prompt, terminal windows are labelled `term#<pid>`; while a foreground
 command runs, its name replaces that label.
 
+Foreground output that leaves the cursor mid-line is separated from the next
+shell prompt; output that already ends in a newline does not gain a blank line.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by

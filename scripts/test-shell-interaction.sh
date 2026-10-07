@@ -13,7 +13,7 @@ LOG="$WORK/serial.log"
 GOT="$WORK/guest-file"
 MON="$WORK/monitor.sock"
 QPID=""
-KEEP=0
+KEEP="${KEEP:-0}"
 
 cleanup() {
     if [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
@@ -111,6 +111,18 @@ type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"
 echo "interaction: pipeline delivered five bytes to wc -c"
+
+# A one-byte `head` leaves its output unterminated. Capture the real shell
+# screen so the prompt's line placement can be checked in QEMU.
+type_line 'head -c 1 /hello.txt'
+sleep 0.5
+type_line 'echo next > /after-no-newline.out'
+wait_for_file_match after-no-newline.out '^next([[:space:]]|$)' \
+    || fail "shell did not accept a command after no-newline output"
+sleep 0.5
+mon "screendump $WORK/no-newline.ppm"
+[[ -s "$WORK/no-newline.ppm" ]] || fail "QEMU did not capture the no-newline prompt screen"
+echo "interaction: prompt returned after output without newline"
 
 type_line 'sleep 60'
 sleep 1
