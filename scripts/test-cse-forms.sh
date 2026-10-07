@@ -24,8 +24,11 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 source "$(dirname "$0")/portable.sh"
 
-CAUSTIC="${CAUSTIC:-$HOME/.local/bin/caustic}"
-[ -x "$CAUSTIC" ] || { echo "no caustic at $CAUSTIC"; exit 1; }
+# Honor an explicit override; otherwise use the compiler selected by PATH.
+CAUSTIC="${CAUSTIC:-caustic}"
+CAUSTIC_PATH=$(command -v "$CAUSTIC" 2>/dev/null) \
+    || { echo "no caustic executable '$CAUSTIC' on PATH" >&2; exit 1; }
+[ -x "$CAUSTIC_PATH" ] || { echo "caustic is not executable: $CAUSTIC_PATH" >&2; exit 1; }
 [ -f build/causticos.iso ] || { echo "build/causticos.iso missing"; exit 1; }
 
 WORK=build/cse-forms
@@ -50,7 +53,7 @@ EOF
 build_form() {
     local name="$1"; shift
     rm -f "$WORK/$name.cse" "$WORK/$name.cse.exe"
-    if ! "$CAUSTIC" --target=caustic-x86_64 "$@" "$WORK/form.cst" \
+    if ! "$CAUSTIC_PATH" --target=caustic-x86_64 "$@" "$WORK/form.cst" \
             -o "$WORK/$name.cse" >/tmp/cse-form-$name.log 2>&1; then
         echo "FAIL: building $name" >&2
         tail -5 /tmp/cse-form-$name.log >&2
