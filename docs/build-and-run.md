@@ -307,6 +307,9 @@ advice for directories.
 `cat` rejects a directory with an `is a directory` diagnostic instead of
 silently treating it as an empty file.
 
+Program diagnostics go to stderr and use the shell's red only while stderr
+reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by

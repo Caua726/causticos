@@ -75,6 +75,7 @@ key_of() {
         '/') printf 'slash' ;;
         '.') printf 'dot' ;;
         '>') printf 'shift-dot' ;;
+        '&') printf 'shift-7' ;;
         '|') printf 'shift-backslash' ;;
         *) echo "no QEMU key name for '$1'" >&2; return 1 ;;
     esac
@@ -101,11 +102,98 @@ wait_for_file_match() {
     done
     return 1
 }
+guest_file_is_exact() {
+    "$PY" - "$GOT" "$1" <<'PY'
+from pathlib import Path
+import sys
+
+actual = Path(sys.argv[1]).read_bytes()
+expected = sys.argv[2].replace(r"\n", "\n").encode()
+if actual != expected:
+    print(f"expected {expected!r}, got {actual!r}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+red_pixel_count() {
+    "$PY" - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+pos = 0
+
+def token():
+    global pos
+    while True:
+        while pos < len(data) and data[pos] in b" \t\r\n":
+            pos += 1
+        if pos < len(data) and data[pos] == 35:
+            end = data.find(b"\n", pos)
+            if end < 0:
+                raise SystemExit("unterminated PPM comment")
+            pos = end + 1
+            continue
+        break
+    start = pos
+    while pos < len(data) and data[pos] not in b" \t\r\n#":
+        pos += 1
+    if pos == start:
+        raise SystemExit("missing PPM header token")
+    return data[start:pos]
+
+magic = token()
+width = int(token())
+height = int(token())
+maxval = int(token())
+if magic != b"P6" or maxval != 255 or pos >= len(data) or data[pos] not in b" \t\r\n":
+    raise SystemExit("unexpected QEMU PPM format")
+if data[pos:pos + 2] == b"\r\n":
+    pos += 2
+else:
+    pos += 1
+pixels = data[pos:]
+if len(pixels) != width * height * 3:
+    raise SystemExit("truncated or oversized QEMU PPM raster")
+red = sum(
+    pixels[i] > 160 and pixels[i + 1] < 120 and pixels[i + 2] < 120
+    for i in range(0, len(pixels), 3)
+)
+print(red)
+PY
+}
 
 type_line 'ps > /ps.out'
 wait_for_file_match ps.out 'PID  PPID  STATE[[:space:]]+NAME' \
     || fail "ps did not write its process table"
 echo "interaction: ps produced a process table"
+mon "screendump $WORK/color-baseline.ppm"
+[[ -s "$WORK/color-baseline.ppm" ]] || fail "QEMU did not capture the baseline screen"
+baseline_red=$(red_pixel_count "$WORK/color-baseline.ppm")
+
+type_line 'missing-command-for-color-test'
+sleep 0.5
+type_line 'echo shell-error-processed > /shell-error-ready.out'
+wait_for_file_match shell-error-ready.out '^shell-error-processed$' \
+    || fail "shell did not finish the not-found command"
+mon "screendump $WORK/shell-error.ppm"
+[[ -s "$WORK/shell-error.ppm" ]] || fail "QEMU did not capture the shell error screen"
+shell_error_red=$(red_pixel_count "$WORK/shell-error.ppm")
+(( shell_error_red > baseline_red + 4 )) || fail "shell not-found diagnostic was not rendered red"
+echo "interaction: shell not-found diagnostic is red"
+
+type_line 'cat /definitely-not-a-file'
+sleep 0.5
+type_line 'echo program-error-processed > /program-error-ready.out'
+wait_for_file_match program-error-ready.out '^program-error-processed$' \
+    || fail "shell did not finish the program-error command"
+mon "screendump $WORK/program-error.ppm"
+[[ -s "$WORK/program-error.ppm" ]] || fail "QEMU did not capture the program error screen"
+program_error_red=$(red_pixel_count "$WORK/program-error.ppm")
+(( program_error_red > shell_error_red + 4 )) || fail "program stderr diagnostic was not rendered red"
+echo "interaction: terminal-bound program diagnostic is red"
+
+
 
 type_line 'cat /hello.txt > /hello.out'
 wait_for_file_match hello.out '^ola do CausticOS!' \
@@ -113,7 +201,6 @@ wait_for_file_match hello.out '^ola do CausticOS!' \
 "$PY" -c 'import pathlib, sys; raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes().endswith(b"\n") else 1)' "$GOT" \
     || fail "/hello.txt did not end in a newline"
 echo "interaction: /hello.txt ends with newline"
-
 type_line 'cd /definitely-not-a-directory'
 sleep 0.2
 type_line 'echo after-cd > /after-cd.out'
@@ -124,25 +211,38 @@ mon "screendump $WORK/cd-error.ppm"
 [[ -s "$WORK/cd-error.ppm" ]] || fail "QEMU did not capture the cd diagnostic screen"
 echo "interaction: captured cd error screen for visual check"
 
-type_line 'mkdir /lib > /mkdir.out'
+
+type_line 'mkdir /lib 2>&1 > /mkdir.out'
 wait_for_file_match mkdir.out '^mkdir: /lib: already exists$' \
     || fail "mkdir did not report that the existing directory already exists"
+guest_file_is_exact 'mkdir: /lib: already exists\n' \
+    || fail "redirected mkdir error contained ANSI or extra output"
 echo "interaction: mkdir reports already exists"
 
-type_line 'rm /definitely-not-a-file > /rm-missing.out'
+type_line 'rm /definitely-not-a-file 2>&1 > /rm-missing.out'
 wait_for_file_match rm-missing.out '^rm: /definitely-not-a-file: no such file or directory$' \
     || fail "rm did not report the missing-file reason"
+guest_file_is_exact 'rm: /definitely-not-a-file: no such file or directory\n' \
+    || fail "redirected missing-file error contained ANSI or extra output"
 echo "interaction: rm reports a missing file"
-type_line 'rm /lib > /rm-directory.out'
+type_line 'rm /lib 2>&1 > /rm-directory.out'
 wait_for_file_match rm-directory.out '^rm: /lib: is a directory \(use -r to remove it\)$' \
     || fail "rm did not reserve the -r advice for directories"
+guest_file_is_exact 'rm: /lib: is a directory (use -r to remove it)\n' \
+    || fail "redirected directory error contained ANSI or extra output"
 echo "interaction: rm reserves -r advice for directories"
-type_line 'cat /lib > /cat-directory.out'
+type_line 'cat /lib 2>&1 > /cat-directory.out'
 wait_for_file_match cat-directory.out '^cat: /lib: is a directory$' \
     || fail "cat did not reject a directory with an error"
 "$PY" -c 'import pathlib, sys; raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes() == b"cat: /lib: is a directory\n" else 1)' "$GOT" \
     || fail "cat directory output contained extra data or diagnostics"
 echo "interaction: cat rejects directories without reading them"
+type_line 'cat /definitely-not-a-file 2>&1 > /cat-missing.out'
+wait_for_file_match cat-missing.out '^cat: /definitely-not-a-file: no such file or directory$' \
+    || fail "cat did not report the redirected missing-file reason"
+guest_file_is_exact 'cat: /definitely-not-a-file: no such file or directory\n' \
+    || fail "redirected program error contained ANSI or extra output"
+echo "interaction: redirected program errors stay uncolored"
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"

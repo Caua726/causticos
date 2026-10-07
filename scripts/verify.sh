@@ -150,9 +150,11 @@ UEFI_MARKERS=("${LIVE_MARKERS[@]}")
 # as a failed boot, so no gate below would ever see it.
 "$PY" scripts/check-str-lens.py || { echo "verify: a string length is miscounted (scripts/check-str-lens.py --fix)" >&2; exit 1; }
 
+# The build cache tracks target files, not their imported .cst modules.
+# Force these images so changes to shared kernel/runtime code reach the gates.
 echo "verify: building the images under test"
-caustic-mk build kernel >/dev/null 2>&1 || { echo "verify: kernel build failed" >&2; exit 1; }
-(cd userspace && caustic-mk build all >/dev/null 2>&1) || { echo "verify: userspace build failed" >&2; exit 1; }
+caustic-mk build kernel --force >/dev/null 2>&1 || { echo "verify: kernel build failed" >&2; exit 1; }
+(cd userspace && caustic-mk build all --force >/dev/null 2>&1) || { echo "verify: userspace build failed" >&2; exit 1; }
 
 # No UEFI firmware on this host is a gate that cannot run, not one that failed —
 # but it is said out loud, so a sweep never looks wider than it was.
