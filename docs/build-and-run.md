@@ -273,6 +273,11 @@ Typing filters application names and registered descriptions without regard to
 case. Backspace removes the last character. Escape clears a nonempty query; with
 an empty query, Escape closes the launcher.
 
+The highlighted tile is the keyboard selection. Arrow keys move through the
+grid; PageUp/PageDown move one page, Home/End choose the first/last app, and
+Enter opens the selection. The same navigation works in filtered results, and
+the description panel follows the selection.
+
 `netd`, `soundd` and `httpd` are services, not one-click applications, and are
 omitted from the launcher. Their executables remain installed for explicit
 startup with the required channels and configuration. In particular, opening
