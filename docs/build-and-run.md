@@ -278,6 +278,9 @@ grid; PageUp/PageDown move one page, Home/End choose the first/last app, and
 Enter opens the selection. The same navigation works in filtered results, and
 the description panel follows the selection.
 
+The scrollbar thumb can be dragged; clicking its track moves one page. The
+scrollbar is inset from the window's resize edge.
+
 Moving the pointer over a tile lightens its background; this is separate from
 the keyboard-selection outline.
 
