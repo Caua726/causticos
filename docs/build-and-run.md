@@ -274,6 +274,9 @@ omitted from the launcher. Their executables remain installed for explicit
 startup with the required channels and configuration. In particular, opening
 the application grid cannot start a second `netd` or repeat DHCP.
 
+The development-only `wmpat` checkerboard fixture is also omitted from the
+application grid; its image remains available to development profiles.
+
 For a standalone export:
 
 ```sh
