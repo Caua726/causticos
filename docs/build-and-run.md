@@ -284,6 +284,9 @@ is shown in words instead of leaving the panel silently empty.
 | `Super+Ctrl+1`…`9` | Toggle tag 1–9 in the current view. |
 | `Super+Shift+Q` | Power off after pressing the chord twice within four seconds. |
 
+The taskbar marks an occupied tag with `*`, even when its windows are hidden by
+the current view.
+
 The shipped bindings are in `/etc/wm.cst`. Create or edit `/var/wm/config.cst`
 for personal bindings: it is loaded afterward, and a binding for the same
 modifier/key chord replaces the shipped one. `unbind <mods> <key>` removes a
