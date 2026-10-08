@@ -272,9 +272,15 @@ guest_file_is_exact 'cat: /definitely-not-a-file: no such file or directory\n' \
     || fail "redirected program error contained ANSI or extra output"
 echo "interaction: redirected program errors stay uncolored"
 type_line 'echo pipe | wc -c > /pipe.out'
-wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
-    || fail "pipeline did not deliver the five-byte input to wc -c"
-echo "interaction: pipeline delivered five bytes to wc -c"
+wait_for_file_match pipe.out '^5$' \
+    || fail "pipeline did not deliver an unpadded five-byte count to wc -c"
+guest_file_is_exact '5\n' \
+    || fail "wc -c added padding or extra output"
+type_line 'echo pipe | wc -c'
+sleep 0.5
+mon "screendump $WORK/wc-stdin.ppm"
+[[ -s "$WORK/wc-stdin.ppm" ]] || fail "QEMU did not capture the stdin byte count"
+echo "interaction: wc -c counted five pipeline bytes without padding"
 
 type_line 'seq 5 | head -3 > /head-classic.out'
 wait_for_file_match head-classic.out '^3$' \

@@ -321,6 +321,9 @@ silently treating it as an empty file.
 zero; later `-n` or `-c` options take precedence. File and piped input use the
 same streaming path as `head -n N`.
 
+`wc` leaves a single selected stdin count unpadded (`echo pipe | wc -c` prints
+`5`). Multiple selected pipe counts retain aligned columns.
+
 Program diagnostics go to stderr and use the shell's red only while stderr
 reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
 

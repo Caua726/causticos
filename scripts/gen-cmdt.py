@@ -25,7 +25,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "userspace", "tests", "cmdt.cases")
-GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head"}
+GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head", "wc": "/usr/bin/wc"}
 
 CASES = []
 
@@ -357,6 +357,17 @@ case("head-classic-file", "head", ["-3", "%D/input"], files={"%D/input": L5})
 case("head-classic-modern-precedence", "head", ["-3", "-n", "2"], L5)
 case("head-classic-not-first", "head", ["-q", "-3"], L5)
 case("head-classic-invalid-suffix", "head", ["-3x"], L5)
+
+# A single count has no column padding; multiple pipe counts stay aligned.
+case("wc-stdin-bytes", "wc", ["-c"], b"x" * 58)
+case("wc-stdin-words", "wc", ["-w"], "one two\n")
+case("wc-stdin-empty", "wc", ["-c"])
+case("wc-stdin-lines", "wc", ["-l"], L5)
+case("wc-stdin-chars", "wc", ["-m"], "é日\n")
+case("wc-stdin-longest", "wc", ["-L"], "a\tb\n")
+case("wc-stdin-repeated-option", "wc", ["-cc"], "abc")
+case("wc-stdin-two-counts", "wc", ["-lc"], L5)
+case("wc-stdin-default-counts", "wc", [], L5)
 
 
 def run(c):
