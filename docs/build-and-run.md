@@ -328,6 +328,10 @@ same streaming path as `head -n N`.
 user program is PID 1, with its own threads and resident memory; there is no
 empty synthetic `init` process. Children whose parent exits are adopted by the
 kernel root (PPID 0), and the orphan reaper collects them after they exit.
+Process labels are the basename of the supplied `argv[0]`, without `.cse`, so
+launching a program through the launcher or a shell uses the same label.
+The 15-byte display limit never splits a UTF-8 character; arguments themselves
+are unchanged, and labels do not grant authority.
 
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
