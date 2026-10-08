@@ -317,6 +317,10 @@ behavior.
 In the fullscreen `shell` profile, `exit` saves command history and powers off,
 because `/init` cannot terminate. In a desktop `wterm`, it closes that window.
 
+Background job output is rendered on separate lines with the prompt restored;
+while a foreground command owns the terminal, background output is drained
+without drawing over that program.
+
 The text caret appears only in the focused terminal window.
 
 The taskbar marks an occupied tag with `*`, even when its windows are hidden by

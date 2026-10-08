@@ -81,12 +81,16 @@ key_of() {
     esac
 }
 
-type_line() {
+type_text() {
     local text="$1" i key
     for ((i = 0; i < ${#text}; i++)); do
         key=$(key_of "${text:$i:1}")
         mon "sendkey $key"
     done
+}
+
+type_line() {
+    type_text "$1"
     mon "sendkey ret"
 }
 
@@ -287,6 +291,18 @@ if grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:sp
     fail "sleep remained in the process table after Ctrl+C"
 fi
 echo "interaction: Ctrl+C returned the prompt and reaped sleep"
+type_line 'ping -c 3 10.0.2.2 &'
+sleep 0.2
+type_text 'echo background-output-preserved > /bg-preserved.out'
+sleep 1
+mon "screendump $WORK/background-output.ppm"
+[[ -s "$WORK/background-output.ppm" ]] || fail "QEMU did not capture the background output screen"
+echo "interaction: captured background output while editing the prompt"
+sleep 7
+mon 'sendkey ret'
+wait_for_file_match bg-preserved.out '^background-output-preserved$' \
+    || fail "background output damaged the editable prompt line"
+echo "interaction: prompt line survived background output"
 
 type_line 'exit'
 for _ in $(seq 1 100); do
