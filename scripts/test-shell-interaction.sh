@@ -175,6 +175,11 @@ wait_for_file_match help-ready.out '^help-processed$' \
 mon "screendump $WORK/help-programs.ppm"
 [[ -s "$WORK/help-programs.ppm" ]] || fail "QEMU did not capture the help screen"
 echo "interaction: captured help program list screen for visual check"
+type_line 'help exit'
+sleep 0.5
+mon "screendump $WORK/help-exit.ppm"
+[[ -s "$WORK/help-exit.ppm" ]] || fail "QEMU did not capture the exit help screen"
+echo "interaction: captured exit help screen for visual check"
 mon "screendump $WORK/color-baseline.ppm"
 [[ -s "$WORK/color-baseline.ppm" ]] || fail "QEMU did not capture the baseline screen"
 baseline_red=$(red_pixel_count "$WORK/color-baseline.ppm")
@@ -283,14 +288,40 @@ if grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:sp
 fi
 echo "interaction: Ctrl+C returned the prompt and reaped sleep"
 
-mon 'quit'
-for _ in $(seq 1 50); do
+type_line 'exit'
+for _ in $(seq 1 100); do
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.1
 done
 if kill -0 "$QPID" 2>/dev/null; then
-    kill -9 "$QPID" 2>/dev/null || true
+    fail "exit did not power off the fullscreen shell profile"
 fi
 wait "$QPID" 2>/dev/null || true
 QPID=""
+"$PY" scripts/fat32.py "$DISK" get /var/history "$GOT" >/dev/null 2>&1 \
+    || fail "exit powered off before the history file could be read"
+"$PY" - "$GOT" <<'PY' || fail "exit did not save its command to /var/history"
+from pathlib import Path
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+if data[:4] != b"HIST" or len(data) < 8:
+    raise SystemExit(1)
+count = int.from_bytes(data[4:8], "little")
+pos = 8
+for _ in range(count):
+    if pos + 4 > len(data):
+        raise SystemExit(1)
+    size = int.from_bytes(data[pos:pos + 4], "little")
+    pos += 4
+    end = pos + size
+    if end > len(data):
+        raise SystemExit(1)
+    if data[pos:end] == b"exit":
+        raise SystemExit(0)
+    pos = end
+raise SystemExit(1)
+PY
+echo "interaction: exit saved history before powering off"
+echo "interaction: exit powered off the fullscreen shell profile"
 echo "=== shell-interaction: PASS ==="

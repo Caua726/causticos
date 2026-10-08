@@ -310,8 +310,12 @@ silently treating it as an empty file.
 Program diagnostics go to stderr and use the shell's red only while stderr
 reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
 
-`help` lists shell builtins, installed root-level `.cse` programs without the
-suffix, and shell syntax.
+`help` lists shell builtins, `exit`, and installed root-level `.cse` programs
+without the suffix and shell syntax. `help exit` explains the shell-specific
+behavior.
+
+In the fullscreen `shell` profile, `exit` saves command history and powers off,
+because `/init` cannot terminate. In a desktop `wterm`, it closes that window.
 
 The text caret appears only in the focused terminal window.
 
