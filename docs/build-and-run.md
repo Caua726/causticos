@@ -338,6 +338,10 @@ The `htop` shortcut footer separates each key from its label (`t tree`,
 `btop` right-aligns compact resident-memory values in the process table;
 its memory and CPU percentage headers match the data columns.
 
+`free` declares its selected units in the table header: KiB by default or with
+`-k`, bytes with `-b`, and MiB with `-m`. In `-h` output, `K` and `M` mean KiB
+and MiB, not decimal multiples. The declaration also applies to `committed`.
+
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
 old save confirmation.
