@@ -324,6 +324,10 @@ same streaming path as `head -n N`.
 `wc` leaves a single selected stdin count unpadded (`echo pipe | wc -c` prints
 `5`). Multiple selected pipe counts retain aligned columns.
 
+`hexedit` shows `Saved N bytes` only after all bytes were written and the file
+closed successfully. Further edits restore the modified marker and remove the
+old save confirmation.
+
 Program diagnostics go to stderr and use the shell's red only while stderr
 reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
 
