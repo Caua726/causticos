@@ -344,6 +344,14 @@ and MiB, not decimal multiples. The declaration also applies to `committed`.
 `committed` aligns with the `total` column in every unit mode; human-readable
 unit suffixes occupy the same numeric field.
 
+`pager` requests SGR mouse tracking for its alternate screen. In `wterm`, the
+wheel scrolls three file lines per notch, clamped to the first and last line.
+Mouse and size reports are parsed independently of search text; ordinary
+clicks and release reports do not scroll or become commands. Exiting disables
+tracking, and the terminal restores its own modes after `Ctrl+C`.
+The `pagert` self-test covers wheel direction and bounds, fragmented reports,
+search preservation, size reports and keyboard navigation.
+
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
 old save confirmation.
