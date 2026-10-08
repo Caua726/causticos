@@ -849,6 +849,8 @@ fn main(argc as i64, argv as *u8) as i32 {
             pe[n*3+0] = repl.sync_fd(&s.hs); pe[n*3+1] = sys.POLL_WRITABLE; pe[n*3+2] = 0;
             hist_e = n; n = n + 1;
         }
+        // A full input batch can leave held messages but no channel bytes.
+        if (s.held_head < s.held_tail) { ptmo = 0; }
         sys.poll(pe, n, ptmo);
         if (hist_e >= 0 && (pe[hist_e*3+2] & sys.POLL_WRITABLE) != 0) { repl.sync(&s.hs, &s.rl); }
 
@@ -878,23 +880,29 @@ fn main(argc as i64, argv as *u8) as i32 {
         close_check();
         paste_pump(&t);
 
-        // What the WM sent while a kill waited on its answer, first, in order.
-        let is [4]i64 as hm;
-        while (cli.unhold(&hm[0]) == 1) {
-            if (hm[0] == wmp.MSG_KEY) { handle_key(&t, hm[1], hm[2]); }
-            else { handle_msg(&t, &hm[0]); }
-        }
-        if ((pe[0*3+2] & sys.POLL_READABLE) != 0) {
-            let is [4]i64 as m;
-            let is i64 as r2 = wmp.msg_read(s.WM_FD, &s.cmd_fill, cast(*u8, &s.cmd_acc[0]), &m[0]);
-            if (r2 < 0) { return 0; }
-            if (r2 == 1) {
-                if (m[0] == wmp.MSG_KEY) {
-                    handle_key(&t, m[1], m[2]);
-                } else {
-                    handle_msg(&t, &m[0]);
-                }
+        // Drain ready WM input in order, but yield to job output after a
+        // bounded batch. Poll before each read: an empty channel blocks.
+        // A handler may hold messages while waiting for a kill reply; those
+        // stay ahead of anything still in the channel.
+        let is [4]i64 as m;
+        let is [3]i64 as wm_pe;
+        let is i64 as wm_got with mut = pe[2];
+        let is i64 as wm_reads with mut = 0;
+        while (wm_reads < 64) {
+            let is i64 as ready with mut = cli.unhold(&m[0]);
+            if (ready == 0) {
+                if ((wm_got & sys.POLL_READABLE) == 0) { break; }
+                ready = wmp.msg_read(s.WM_FD, &s.cmd_fill, cast(*u8, &s.cmd_acc[0]), &m[0]);
+                if (ready < 0) { return 0; }
             }
+            if (ready == 1) {
+                if (m[0] == wmp.MSG_KEY) { handle_key(&t, m[1], m[2]); }
+                else { handle_msg(&t, &m[0]); }
+            }
+            wm_reads = wm_reads + 1;
+            wm_pe[0] = s.WM_FD; wm_pe[1] = sys.POLL_READABLE; wm_pe[2] = 0;
+            sys.poll(&wm_pe[0], 1, 0);
+            wm_got = wm_pe[2];
         }
 
         if (s.pend_on == 1 && (pe[0*3+2] & sys.POLL_WRITABLE) != 0) {

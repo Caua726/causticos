@@ -292,6 +292,10 @@ to cycle.
 At the prompt, terminal windows are labelled `term#<pid>`; while a foreground
 command runs, its name replaces that label.
 
+Windowed terminals drain queued WM messages in batches of up to 64 reads,
+preserving message order and partial frames. Each batch yields to job output,
+exit events, and pending commits; idle terminals still block in `poll`.
+
 Foreground output that leaves the cursor mid-line is separated from the next
 shell prompt; output that already ends in a newline does not gain a blank line.
 
