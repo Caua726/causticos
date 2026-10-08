@@ -223,6 +223,11 @@ exclusive control is intentional.
 including a displaced `soundd`. `arecord` uses `DEV_AUDIO_IN` for capture,
 with the same mapped-ring shape.
 
+The `aplay` played/streamed frame total counts accepted source PCM frames.
+Widening mono to stereo does not double it, and silence completing the final
+DMA period is excluded. Direct playback still queues that tail and waits for
+the hardware/application cursors before closing the device.
+
 ---
 
 ## Where things live

@@ -157,6 +157,24 @@ tr -d '\000' < "$LOG" | grep -q "^aplay: streamed" \
     || { echo "FAIL: the stream did not play (log: $LOG)"
          tr -d '\000' < "$LOG" | tail -12; exit 1; }
 
+# Widening mono preserves frames; DMA-period tail silence is not source PCM.
+"$PY" - "$SERVED" "$LOG" <<'PY'
+import re
+import sys
+import wave
+with wave.open(sys.argv[1], "rb") as source:
+    wanted = source.getnframes()
+with open(sys.argv[2], "rb") as report:
+    text = report.read().replace(b"\0", b"")
+match = re.search(rb"^aplay: streamed ([0-9]+) frames", text, re.MULTILINE)
+if match is None:
+    sys.exit("FAIL: no completed source-frame counter")
+got = int(match.group(1))
+if got != wanted:
+    sys.exit(f"FAIL: reported {got} source frames, WAV contains {wanted}")
+print(f"  ok   reported source frames match WAV: {got}")
+PY
+
 sleep 0.5
 mon "quit"
 for _ in $(seq 1 50); do kill -0 $QPID 2>/dev/null || break; sleep 0.1; done
