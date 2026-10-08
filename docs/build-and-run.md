@@ -351,6 +351,9 @@ clicks and release reports do not scroll or become commands. Exiting disables
 tracking, and the terminal restores its own modes after `Ctrl+C`.
 The `pagert` self-test covers wheel direction and bounds, fragmented reports,
 search preservation, size reports and keyboard navigation.
+`q` or a standalone `Esc` closes the viewer. While entering a search, `Esc`
+cancels that search first; the next `Esc` closes the viewer. Escape prefixes
+inside terminal reports remain navigation, mouse or size reports, not quit keys.
 
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
