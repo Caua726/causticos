@@ -341,6 +341,8 @@ its memory and CPU percentage headers match the data columns.
 `free` declares its selected units in the table header: KiB by default or with
 `-k`, bytes with `-b`, and MiB with `-m`. In `-h` output, `K` and `M` mean KiB
 and MiB, not decimal multiples. The declaration also applies to `committed`.
+`committed` aligns with the `total` column in every unit mode; human-readable
+unit suffixes occupy the same numeric field.
 
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
