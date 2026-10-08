@@ -335,6 +335,8 @@ are unchanged, and labels do not grant authority.
 
 The `htop` shortcut footer separates each key from its label (`t tree`,
 `q quit`) in both windowed and maximized terminals.
+`btop` right-aligns compact resident-memory values in the process table;
+its memory and CPU percentage headers match the data columns.
 
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
