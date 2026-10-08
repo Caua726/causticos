@@ -270,6 +270,10 @@ wrap to the available panel width; an ellipsis marks text that cannot fit.
 Unregistered applications are identified as such, and a catalogue read error
 is shown in words instead of leaving the panel silently empty.
 
+The taskbar clock explicitly displays `HH:MM:SS UTC`. The default `date` and
+`date -u` output also identifies UTC; an explicit `+FORMAT` keeps its requested
+format rather than receiving an implicit suffix.
+
 ### Desktop keyboard shortcuts
 
 | Shortcut | Action |
