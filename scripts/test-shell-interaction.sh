@@ -276,6 +276,17 @@ wait_for_file_match pipe.out '(^|[^[:digit:]])5([^[:digit:]]|$)' \
     || fail "pipeline did not deliver the five-byte input to wc -c"
 echo "interaction: pipeline delivered five bytes to wc -c"
 
+type_line 'seq 5 | head -3 > /head-classic.out'
+wait_for_file_match head-classic.out '^3$' \
+    || fail "classic head -3 did not receive the pipeline's first three lines"
+guest_file_is_exact '1\n2\n3\n' \
+    || fail "classic head -3 wrote the wrong lines"
+type_line 'seq 5 | head -3'
+sleep 0.5
+mon "screendump $WORK/head-classic.ppm"
+[[ -s "$WORK/head-classic.ppm" ]] || fail "QEMU did not capture classic head output"
+echo "interaction: classic head -3 received and displayed three pipeline lines"
+
 # A one-byte `head` leaves its output unterminated. Capture the real shell
 # screen so the prompt's line placement can be checked in QEMU.
 type_line 'head -c 1 /hello.txt'

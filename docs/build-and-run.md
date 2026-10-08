@@ -317,6 +317,10 @@ advice for directories.
 `cat` rejects a directory with an `is a directory` diagnostic instead of
 silently treating it as an empty file.
 
+`head -N` accepts a classic decimal line count as its first argument, including
+zero; later `-n` or `-c` options take precedence. File and piped input use the
+same streaming path as `head -n N`.
+
 Program diagnostics go to stderr and use the shell's red only while stderr
 reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
 

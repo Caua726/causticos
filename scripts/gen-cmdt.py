@@ -25,7 +25,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "userspace", "tests", "cmdt.cases")
-GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls"}
+GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head"}
 
 CASES = []
 
@@ -348,6 +348,15 @@ ls("l-bad-option", ["-j", "%D"], files=TREE)
 ls("l-v-more", ["-v", "%D"], files=dict(("%D/" + n, "") for n in
    ["a1.tar.gz", "a10.tar.gz", "a2.tar.gz", "a2.tar.gz~", ".h2", ".h10", "x-1.0", "x-1.0~rc1", "x-1.0.1", "README"]))   # (FAT32: "readme" would be README)
 ls("l-many", ["%D"], files=dict(("%D/n" + "%04d" % i, "") for i in range(5000)))
+
+# Classic head counts are recognized only as the first argument, like GNU.
+case("head-classic-count", "head", ["-3"], L5)
+case("head-classic-zero", "head", ["-0"], L5)
+case("head-classic-leading-zero", "head", ["-005"], L5)
+case("head-classic-file", "head", ["-3", "%D/input"], files={"%D/input": L5})
+case("head-classic-modern-precedence", "head", ["-3", "-n", "2"], L5)
+case("head-classic-not-first", "head", ["-q", "-3"], L5)
+case("head-classic-invalid-suffix", "head", ["-3x"], L5)
 
 
 def run(c):
