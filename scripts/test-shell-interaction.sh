@@ -28,8 +28,9 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+printf 'AB\b' > "$WORK/backspace.bin"
 
-"$PY" scripts/mkroot.py --profile shell --img "$DISK" -q
+"$PY" scripts/mkroot.py --profile shell --img "$DISK" --add "$WORK/backspace.bin:/backspace.bin" -q
 bash scripts/mkiso.sh --cmdline "root=ahci-p0" --out "$ISO" >/dev/null
 
 QEMU_ISO="$ISO"
@@ -171,6 +172,16 @@ type_line 'ps > /ps.out'
 wait_for_file_match ps.out 'PID  PPID  STATE[[:space:]]+NAME' \
     || fail "ps did not write its process table"
 echo "interaction: ps produced a process table"
+
+type_line 'cat /backspace.bin'
+sleep 0.5
+type_line 'echo backspace-returned > /backspace-returned.out'
+wait_for_file_match backspace-returned.out '^backspace-returned([[:space:]]|$)' \
+    || fail "shell did not accept a command after raw Backspace output"
+sleep 0.5
+mon "screendump $WORK/backspace.ppm"
+[[ -s "$WORK/backspace.ppm" ]] || fail "QEMU did not capture the Backspace output screen"
+echo "interaction: captured raw Backspace output screen for visual check"
 type_line 'help'
 sleep 0.5
 type_line 'echo help-processed > /help-ready.out'
