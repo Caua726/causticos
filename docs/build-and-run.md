@@ -324,6 +324,11 @@ same streaming path as `head -n N`.
 `wc` leaves a single selected stdin count unpadded (`echo pipe | wc -c` prints
 `5`). Multiple selected pipe counts retain aligned columns.
 
+`ps`, `htop`, and `btop` represent the kernel once, as PID 0. The first actual
+user program is PID 1, with its own threads and resident memory; there is no
+empty synthetic `init` process. Children whose parent exits are adopted by the
+kernel root (PPID 0), and the orphan reaper collects them after they exit.
+
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
 old save confirmation.

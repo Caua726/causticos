@@ -3,8 +3,8 @@
 // A Process is the OS's unit of isolation + ownership: it owns one
 // address space (*vma.Aspace — memory + the fd table = its authority)
 // plus identity (pid), lineage (parent/children), and lifecycle
-// (state, exit_code). It owns >=1 Thread; the Thread is the schedulable
-// execution unit and points back here via its process_ptr slot.
+// (state, exit_code). A user process owns >=1 Thread; the Thread is the
+// schedulable execution unit and points back here via its process_ptr slot.
 //
 // causticos identity: "tudo é uma chave" — a process IS the set of
 // handles (fds) it holds, and that set lives in its Aspace's fd table.
@@ -37,9 +37,9 @@ let is i64 as PROC_ZOMBIE  = 3;   // dead, exit_code valid, awaiting wait()
 let is i64 as PROC_DEAD    = 4;   // collected; struct about to be freed
 
 // Flags
-let is i64 as FLAG_INIT   = 1;    // pid 1: root of the tree, reaps orphans, cannot exit
-let is i64 as FLAG_ORPHAN = 2;    // reparented to init when its parent exited — nobody
-                                  // will wait() for it, so lifecycle's orphan reaper does
+let is i64 as FLAG_ROOT   = 1;    // pid 0: kernel tree root, cannot exit
+let is i64 as FLAG_ORPHAN = 2;    // reparented to the root when its parent exited
+                                  // nobody will wait() for it, so the kernel reaper does
 let is i64 as FLAG_FAULTED = 4;   // ended by a CPU exception in ring 3; the fault_*
                                   // fields say which (an exit(139) is not a crash)
 
@@ -48,13 +48,13 @@ let is i64 as FLAG_FAULTED = 4;   // ended by a CPU exception in ring 3; the fau
 // scheduler uses for Thread) — no struct decl so the layout is explicit.
 // ============================================================
 // 0    pid              i64
-// 8    parent           i64   (*Process; 0 = no parent / init)
+// 8    parent           i64   (*Process; 0 = no parent / kernel root)
 // 16   first_child      i64   (*Process)
 // 24   next_sibling     i64   (*Process)
 // 32   prev_sibling     i64   (*Process)
 // 40   state            i64   (PROC_*)
 // 48   exit_code        i64   (valid once ZOMBIE)
-// 56   aspace           i64   (*vma.Aspace; 0 for init / kernel-side)
+// 56   aspace           i64   (*vma.Aspace; 0 for the kernel root)
 // 64   first_tid        i64   (main thread tid; -1 = none)
 // 72   thread_count     i64
 // 80   create_time      i64   (ns)
@@ -71,11 +71,11 @@ let is i64 as PROC_SIZE = 160;
 // Typed pool (Phase B sub-phase 2). Created lazily on first use under heap_lock.
 let is i64 as proc_pool with mut = 0;
 
-// PID counter — monotonic, never reused (no PID-reuse aliasing bugs).
-let is i64 as next_pid with mut = 1;
+// PID counter — monotonic, never reused. The kernel root takes pid 0;
+// the first user process takes pid 1.
+let is i64 as next_pid with mut = 0;
 
-// Init process (pid 1): root of the tree, reaper of orphans.
-let is i64 as init_proc with mut = 0;
+let is i64 as root_proc with mut = 0;
 
 // Child-exit hook, wired by main.cst to eventfd.event_post. Kept as a raw
 // fn-pointer (0 until wired) so process.cst carries no eventfd import edge —
@@ -139,15 +139,16 @@ fn proc_set_reap_done(proc as i64, v as i64) as void { proc_set(proc, 104, v); }
 // ============================================================
 
 // Overwrite the name with a kernel-chosen placeholder so no process is
-// ever nameless on screen. FLAG_INIT (pid 1) gets "init"; everything else
+// ever nameless on screen. FLAG_ROOT (pid 0) gets "kernel"; everything else
 // gets "proc<pid>" (e.g. "proc7"). The spawn path overrides this with
 // argv[0] when the spawner supplied one.
 fn proc_set_name_default(proc as i64, pid as i64, flags as i64) as void {
     let is *u8 as nm = cast(*u8, proc + 112);
-    if ((flags & FLAG_INIT) != 0) {
-        nm[0] = cast(u8, 105); nm[1] = cast(u8, 110);   // 'i' 'n'
-        nm[2] = cast(u8, 105); nm[3] = cast(u8, 116);   // 'i' 't'
-        nm[4] = cast(u8, 0);
+    if ((flags & FLAG_ROOT) != 0) {
+        nm[0] = cast(u8, 107); nm[1] = cast(u8, 101);   // k e
+        nm[2] = cast(u8, 114); nm[3] = cast(u8, 110);   // r n
+        nm[4] = cast(u8, 101); nm[5] = cast(u8, 108);   // e l
+        nm[6] = cast(u8, 0);
         return;
     }
     // "proc" + decimal pid, truncated to fit the 15-char body.
@@ -214,16 +215,15 @@ fn remove_child(parent as i64, child as i64) as void {
     proc_set(child, 32, 0);
 }
 
-// Orphans go to init (pid 1). Init runs no code, so "init reaps them" means
-// lifecycle's orphan reaper, which collects exactly the FLAG_ORPHAN ones —
-// init's own children (the boot spawn, the kernel smokes) are waited for by
-// whoever spawned them. Caller holds tree_lock.
-fn reparent_children_to_init(proc as i64) as void {
+// Orphans go to the kernel root (pid 0). Its orphan reaper collects exactly
+// the FLAG_ORPHAN children; direct kernel children (boot spawn and smokes)
+// are waited for by whoever spawned them. Caller holds tree_lock.
+fn reparent_children_to_root(proc as i64) as void {
     let is i64 as child with mut = proc_first_child(proc);
     while (child != 0) {
         let is i64 as next = proc_next_sib(child);
         remove_child(proc, child);
-        add_child(init_proc, child);
+        add_child(root_proc, child);
         proc_set(child, 88, proc_flags(child) | FLAG_ORPHAN);
         child = next;
     }
@@ -234,7 +234,7 @@ fn reparent_children_to_init(proc as i64) as void {
 // ============================================================
 
 // Create a Process around an already-built address space (aspace = 0 for
-// the init/kernel-side root). Adds it under `parent` (0 = no parent).
+// the kernel root). Adds it under `parent` (0 = no parent).
 // Returns the Process pointer (as i64), or 0 on alloc failure.
 fn process_create(parent as i64, aspace as i64, flags as i64) as i64 {
     let is i64 as proc = heap.kpool_alloc_ensure(cast(i64, &proc_pool), PROC_SIZE, 1);
@@ -255,9 +255,9 @@ fn process_create(parent as i64, aspace as i64, flags as i64) as i64 {
     proc_set(proc, 88, flags);                  // flags
 
     // Always give the process a visible name. The spawn path overwrites this
-    // with argv[0] when one was supplied; absent that, the placeholder ("init"
-    // for pid 1, "proc<pid>" otherwise) keeps the process from showing as a
-    // blank row in ps — a nameless process appears AS such, never hidden.
+    // with argv[0] when supplied; otherwise the placeholder ("kernel" for the
+    // root, "proc<pid>" for user processes) keeps the process from showing as
+    // a blank row in ps.
     proc_set_name_default(proc, pid, flags);
 
     if (parent != 0) {
@@ -286,7 +286,7 @@ fn attach_main_thread(proc as i64, tid as i64) as void {
 //                a process killed while it was calling exit reports whichever
 //                happened first, never a mix.
 //   finish_exit  EXITING -> ZOMBIE, by the last thread out once the fd table is
-//                drained: children go to init, the parent's subscribers hear.
+//                drained: children go to the kernel root; subscribers hear.
 //
 // begin_exit returns 1 if this call started the exit, 0 if it was already on
 // its way (or gone).
@@ -300,8 +300,8 @@ fn begin_exit(proc as i64, code as i64) as i64 {
 
 // The same, for a caller already holding tree_lock.
 fn begin_exit_locked(proc as i64, code as i64) as i64 {
-    if ((proc_flags(proc) & FLAG_INIT) != 0) {
-        pmm.panic("init process exited", 19);
+    if ((proc_flags(proc) & FLAG_ROOT) != 0) {
+        pmm.panic("kernel root exited", 18);
     }
     if (proc_state(proc) != PROC_ALIVE) { return 0; }
     proc_set(proc, 48, code);                   // exit_code
@@ -316,7 +316,7 @@ fn finish_exit(proc as i64) as void {
         tree_unlock();
         return;
     }
-    reparent_children_to_init(proc);
+    reparent_children_to_root(proc);
     proc_set(proc, 40, PROC_ZOMBIE);
     let is i64 as parent = proc_get(proc, 8);
     let is i64 as parent_pid with mut = 0;
@@ -429,12 +429,12 @@ fn init() as void {
     serial.println("proc: init", 10);
     // proc_pool is created lazily on the first process_create (kpool_alloc_ensure).
 
-    // pid 1 — the root. No address space (it runs no user code in v0);
-    // it exists as the tree root and the destination for orphans.
-    init_proc = process_create(0, 0, FLAG_INIT);
+    // Kernel ownership and orphan collection live under pid 0. It has no
+    // user address space; proc_list represents it with real kernel accounting.
+    root_proc = process_create(0, 0, FLAG_ROOT);
 
-    serial.print("  init pid=", 11);
-    util.print_num(proc_pid(init_proc));
+    serial.print("  root pid=", 11);
+    util.print_num(proc_pid(root_proc));
     serial.println("", 0);
     serial.println("proc: ready", 11);
 }
