@@ -128,6 +128,12 @@ Per-call notes:
   Empty files remain separate entries even though FAT32 stores cluster 0 for
   all of them. Removal and rename identify the exact directory slot, not the
   data-cluster number; long-name entries are removed across cluster boundaries.
+- **`STATX`** (44) exposes modification time in Unix epoch seconds; this ABI
+  does not expose a birth-time field. New FAT32 file and directory entries
+  store both creation date and creation time on disk from the same RTC sample
+  as their initial write timestamp, at DOS's two-second resolution. Time zero
+  is valid midnight when its date is present, not an unset timestamp. Content
+  rewrites preserve the creation fields; existing entries are not backfilled.
 - **`SPAWN`** (14): takes ONE pointer, to a `SpawnParams` (§5). Only a Process
   may spawn (`E_PERM` otherwise). The child's fd table starts **empty**; `fdacts`
   (a `[{child_fd, src_fd}]` array, `n_acts ≤ 16`) is the *only* way it gets
