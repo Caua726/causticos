@@ -333,6 +333,9 @@ launching a program through the launcher or a shell uses the same label.
 The 15-byte display limit never splits a UTF-8 character; arguments themselves
 are unchanged, and labels do not grant authority.
 
+The `htop` shortcut footer separates each key from its label (`t tree`,
+`q quit`) in both windowed and maximized terminals.
+
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
 old save confirmation.
