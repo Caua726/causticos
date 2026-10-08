@@ -179,6 +179,33 @@ class Handler(socketserver.StreamRequestHandler):
             if not is_head:
                 self.wfile.write(body)
 
+        elif path == "/stream-paced.wav":
+            # A real WAV, with a pause after enough bytes to parse its header
+            # and subsequent delivery just above 48 kHz mono's 96 kB/s. The
+            # player must prepare before taking the DAC and must not reapply
+            # its startup reserve while already playing.
+            full = os.path.join(SERVE_DIR, "streamed.wav")
+            if not os.path.isfile(full):
+                self.wfile.write(self.head(404, "Not Found", body_len=0))
+            else:
+                data = open(full, "rb").read()
+                self.wfile.write(self.head(200, "OK", body_len=len(data)))
+                if not is_head:
+                    self.wfile.write(data[:4096])
+                    self.wfile.flush()
+                    time.sleep(0.25)
+                    at = 4096
+                    deadline = time.monotonic()
+                    while at < len(data):
+                        n = min(4096, len(data) - at)
+                        self.wfile.write(data[at:at + n])
+                        self.wfile.flush()
+                        at += n
+                        deadline += n / 102400.0
+                        pause = deadline - time.monotonic()
+                        if pause > 0:
+                            time.sleep(pause)
+
         else:
             # A real file, if there is one by that name. basename only: this is
             # a test server, but a test server that can be talked out of its

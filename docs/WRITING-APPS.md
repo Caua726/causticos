@@ -235,6 +235,14 @@ Widening mono to stereo does not double it, and silence completing the final
 DMA period is excluded. Direct playback still queues that tail and waits for
 the hardware/application cursors before closing the device.
 
+For HTTP WAVs, `aplay` allocates and primes its source buffer before acquiring
+the running audio sink. The half-second reserve is a startup condition only;
+once running, every available complete PCM frame can be submitted as room
+allows. EOF starts a shorter valid clip without waiting for that reserve.
+No gain adjustment hides starvation: sources slower than their PCM rate can
+still underrun. The paced streaming regression checks zero reported underruns,
+waveform gaps and startup/steady RMS level on an adequately fast source.
+
 ---
 
 ## Where things live

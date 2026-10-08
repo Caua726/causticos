@@ -6,21 +6,15 @@
 # emulated NIC and feeds the samples to the converter WHILE the rest of the
 # file is still on the wire. Nothing is downloaded first.
 #
-# The claim that makes it more than a download is what happens to the socket
-# when the audio arrives faster than 48000 frames a second: aplay's write
-# blocks on the hardware clock, so nothing is read, so the receive window
-# closes, so the server stops sending. A DAC in a virtual machine ends up
-# pacing a TCP connection — with no rate limiter anywhere and nothing
-# negotiating it.
+# The server pauses after a parsable header, then sends small blocks just
+# above the source PCM rate. The player must prime before acquiring a running
+# device, and then feed available PCM without reapplying its startup reserve.
+# Short stalls are covered by that reserve, not by changing the gain.
 #
-# WHAT IS CHECKED, and why it is the recording rather than the log. The audio
-# has to come out at the right pitch, at the right amplitude, for the right
-# length, and — the part that matters for streaming — WITHOUT GAPS. A stall
-# anywhere between the server's socket and the converter is a hole in the
-# middle of the tone, and check-wav.py measures exactly that. A guest that
-# downloaded the file and played it afterwards would pass every other check
-# and fail nothing; the tight gap tolerance is what makes this a test of
-# streaming rather than of fetching.
+# The captured waveform checks pitch, amplitude, duration and gaps. The native
+# report must also have the exact source-frame count and zero underruns on
+# this adequately paced source. The first audible quarter-second is compared
+# with steady PCM so startup silence cannot mask a reduced initial level.
 #
 # It did not pass when it was written, and what it found was not in the audio
 # path at all. The network delivered 82 KiB/s against the 94 that 48 kHz mono
@@ -138,7 +132,7 @@ type_line() {
     mon "sendkey ret"
 }
 
-type_line "aplay --direct http://10.0.2.2:$PORT/streamed.wav"
+type_line "aplay --direct http://10.0.2.2:$PORT/stream-paced.wav"
 
 DONE=0
 for _ in $(seq 1 900); do
@@ -172,6 +166,9 @@ if match is None:
 got = int(match.group(1))
 if got != wanted:
     sys.exit(f"FAIL: reported {got} source frames, WAV contains {wanted}")
+xruns = sum(map(int, re.findall(rb"^aplay: ([0-9]+) underruns", text, re.MULTILINE)))
+if xruns:
+    sys.exit(f"FAIL: a sufficiently fast paced source incurred {xruns} underruns")
 print(f"  ok   reported source frames match WAV: {got}")
 PY
 
@@ -189,5 +186,26 @@ kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
 "$PY" scripts/check-wav.py "$WAV" \
     --freq "$FREQ" --seconds "$SECS" --rate 48000 \
     --tolerance-hz 20 --min-amplitude 0.35 --max-gap-ms 30
+
+# The first audible quarter-second must have the same level as steady PCM.
+"$PY" - "$WAV" <<'PY'
+import math
+import runpy
+import sys
+parser = runpy.run_path("scripts/check-wav.py")
+rate, _channels, _bits, signals = parser["read_wav"](sys.argv[1])
+for channel, signal in enumerate(signals):
+    onset = next((i for i, value in enumerate(signal) if value != 0), None)
+    if onset is None:
+        sys.exit(f"FAIL: channel {channel} is silent")
+    first = signal[onset:onset + rate // 4]
+    steady = signal[onset + rate // 2:onset + rate]
+    rms_first = math.sqrt(sum(value * value for value in first) / len(first))
+    rms_steady = math.sqrt(sum(value * value for value in steady) / len(steady))
+    ratio = rms_first / rms_steady if rms_steady else 0
+    if ratio < 0.95:
+        sys.exit(f"FAIL: channel {channel} startup/steady RMS ratio {ratio:.3f}")
+    print(f"  ok   channel {channel} startup/steady RMS ratio {ratio:.3f}")
+PY
 
 echo "=== stream: PASS ==="
