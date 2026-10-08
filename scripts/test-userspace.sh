@@ -143,6 +143,7 @@ DRIVEN=(
     "httpd|scripts/test-httpd.sh|host fetched from the guest"
     "cseforms|scripts/test-cse-forms.sh|pure, compat and bundle"
     "shellnet|scripts/test-shell-net.sh|wget typed at the prompt"
+    "runallwait|scripts/test-runall.sh|delayed nonzero verdict"
 )
 
 # The ones that MEASURE TIME, run one at a time. Each of these records real

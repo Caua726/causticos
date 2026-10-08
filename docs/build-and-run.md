@@ -199,6 +199,12 @@ Everything it touches lives under `build/verify/` and is created per run, so it
 is safe to run while a VM holds `build/disk.img` open. A failure names the
 markers that were missing and keeps the serial log.
 
+`scripts/test-userspace.sh` runs the ring-3 self-tests and host-driven VM checks.
+The guest runner waits through `SYS_WAIT`'s five-second timeout and only reports
+an exit code after successful collection; other wait errors are failures.
+`scripts/test-runall.sh` isolates that contract with a child that exits 23 after
+six seconds: the runner must report 23 and exit 1, never a false success.
+
 ### `profiles`, `root`, `clean`, `distclean`, `usb`
 
 ```sh
