@@ -40,6 +40,8 @@ let is i64 as pathlen with mut = 0;
 let is [2048]u8 as reqbuf;
 let is [4096]u8 as body;
 let is [1024]u8 as outname;
+let is [1056]u8 as tmpname;
+let is i64 as tmpdirlen with mut = 0;
 let is http.Resp as resp;
 let is cn.Conn as conn with mut;   // what HTTP talks to: the socket, or TLS over it
 let is cn.Conn as raw with mut;    // the socket, when TLS is in between
@@ -52,6 +54,61 @@ fn say(s as *u8) as void { if (quiet == 0) { prog.outs(s); } return; }
 fn say_num(v as i64) as void { if (quiet == 0) { prog.out_num(v); } return; }
 
 fn err(s as *u8) as void { prog.outs(s); return; }
+
+// Reserve a directory rather than opening a predictable temporary filename:
+// OPEN has no exclusive-create flag, and truncating somebody else's file
+// would be worse than leaving a failed download behind. mkdir is exclusive.
+// Keep it in the destination's parent so the final rename stays on one volume.
+fn open_temp() as i64 {
+    let is i64 as parent with mut = 0;
+    let is i64 as i with mut = 0;
+    while (outname[i] != cast(u8, 0)) {
+        if (outname[i] == cast(u8, 47)) { parent = i + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < parent) { tmpname[i] = outname[i]; i = i + 1; }
+    let is *u8 as suffix with mut = cast(*u8, ".wget-");
+    let is i64 as j with mut = 0;
+    while (j < 6) { tmpname[i] = suffix[j]; i = i + 1; j = j + 1; }
+    let is [24]u8 as digits;
+    let is i64 as n with mut = 0;
+    let is i64 as pid with mut = sys.getpid();
+    while (pid > 0) { digits[n] = cast(u8, 48 + pid % 10); pid = pid / 10; n = n + 1; }
+    while (n > 0) { n = n - 1; tmpname[i] = digits[n]; i = i + 1; }
+    tmpdirlen = i;
+    tmpname[i] = cast(u8, 0);
+    let is i64 as r = cast(i64, sys.mkdir(cast(*u8, &tmpname[0])));
+    if (r != 0) {
+        err("wget: cannot reserve temporary output: "); err(sys.err_text(r)); err("\n");
+        return r;
+    }
+    suffix = cast(*u8, "/out");
+    j = 0;
+    while (j < 4) { tmpname[i] = suffix[j]; i = i + 1; j = j + 1; }
+    tmpname[i] = cast(u8, 0);
+    let is i64 as fd = sys.open_write(cast(*u8, &tmpname[0]));
+    if (fd < 0) {
+        err("wget: cannot create temporary output: "); err(sys.err_text(fd)); err("\n");
+        remove_temp();
+    }
+    return fd;
+}
+
+// Only paths inside the directory successfully reserved by this invocation.
+fn remove_temp() as i64 {
+    let is i64 as r with mut = cast(i64, sys.unlink(cast(*u8, &tmpname[0])));
+    if (r != 0 && r != sys.E_NOENT) {
+        err("wget: cannot remove temporary output: "); err(sys.err_text(r)); err("\n");
+    } else { r = 0; }
+    tmpname[tmpdirlen] = cast(u8, 0);
+    let is i64 as dr = cast(i64, sys.rmdir(cast(*u8, &tmpname[0])));
+    if (dr != 0) {
+        err("wget: cannot remove temporary directory: "); err(sys.err_text(dr)); err("\n");
+        return dr;
+    }
+    return r;
+}
 
 fn print_ip(v as i64) as void {
     let is i64 as i with mut = 0;
@@ -370,13 +427,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as k with mut = 0;
     while (opath[k] != cast(u8, 0) && k < 1023) { outname[k] = opath[k]; k = k + 1; }
     outname[k] = cast(u8, 0);
-    let is i64 as fd = sys.open_write(cast(*u8, &outname[0]));
-    if (fd < 0) {
-        err("wget: cannot create ");
-        prog.outs(cast(*u8, &outname[0]));
-        err("\n");
-        return cast(i32, 1);
-    }
+    let is i64 as fd = open_temp();
+    if (fd < 0) { return cast(i32, 1); }
 
     let is [1]i64 as got;
     got[0] = 0;
@@ -385,11 +437,12 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as st with mut = 0;
     while (hops <= MAX_REDIRECT) {
         st = fetch(fd, cast(*i64, &got[0]));
-        if (st < 0) { sys.close(fd); return cast(i32, 1); }
+        if (st < 0) { sys.close(fd); remove_temp(); return cast(i32, 1); }
         if (http.is_redirect(&resp) == 0) { break; }
         if (adopt_location(http.location(&resp), resp.loclen) != 0) {
             err("wget: bad redirect target\n");
             sys.close(fd);
+            remove_temp();
             return cast(i32, 1);
         }
         say("redirected to ");
@@ -398,18 +451,34 @@ fn main(argc as i64, argv as *u8) as i32 {
         hops = hops + 1;
         st = 0 - 2;                        // not finished yet
     }
-    sys.close(fd);
+    let is i64 as closed = cast(i64, sys.close(fd));
+    if (closed != 0) {
+        err("wget: cannot close temporary output: "); err(sys.err_text(closed)); err("\n");
+        remove_temp();
+        return cast(i32, 1);
+    }
 
     if (st == 0 - 2) {
         err("wget: too many redirects\n");
+        remove_temp();
         return cast(i32, 1);
     }
     if (st != 200) {
         err("wget: server said ");
         prog.out_num(st);
         err("\n");
+        remove_temp();
         return cast(i32, 1);
     }
+    // A complete 200 response, including a legitimate empty one, is the only
+    // outcome that publishes the requested filename.
+    let is i64 as installed = cast(i64, sys.rename(cast(*u8, &tmpname[0]), cast(*u8, &outname[0])));
+    if (installed != 0) {
+        err("wget: cannot install download: "); err(sys.err_text(installed)); err("\n");
+        remove_temp();
+        return cast(i32, 1);
+    }
+    if (remove_temp() != 0) { return cast(i32, 1); }
 
     let is i64 as dt = sys.time_ns() - t0;
     say("saved ");

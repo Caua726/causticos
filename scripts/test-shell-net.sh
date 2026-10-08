@@ -1,6 +1,6 @@
 #!/bin/bash
-# test-shell-net.sh — type wget at the real shell prompt, twice, and check what
-# lands on the disk.
+# test-shell-net.sh — type wget at the real shell prompt and check what
+# lands on disk, including failed-download output preservation.
 #
 # Every other network test spawns netd itself and hands the child a channel by
 # hand. That proves the mechanism and says nothing about whether the machine you
@@ -123,6 +123,9 @@ key_of() {
         '/') printf 'slash' ;;
         '.') printf 'dot' ;;
         ':') printf 'shift-semicolon' ;;
+        '>') printf 'shift-dot' ;;
+        '|') printf 'shift-backslash' ;;
+        '&') printf 'shift-7' ;;
         *)  echo "no key name for '$1'" >&2; exit 1 ;;
     esac
 }
@@ -160,10 +163,10 @@ wait_for_file() {
 }
 
 check_blob() {
-    "$PY" - "$GOT" "$1" <<'PY'
+    "$PY" - "$GOT" "$1" "${2:-65536}" <<'PY'
 import sys
 got = open(sys.argv[1], 'rb').read()
-want = bytes(((i * 31 + 7) & 0xFF) for i in range(65536))
+want = bytes(((i * 31 + 7) & 0xFF) for i in range(int(sys.argv[3])))
 if got != want:
     for i, (a, b) in enumerate(zip(got, want)):
         if a != b:
@@ -192,5 +195,36 @@ if ! wait_for_file s.bin 65536; then
     exit 1
 fi
 check_blob "https, same binary, 65536 bytes, every one correct"
+
+# Failure must not publish a new empty file or truncate an existing output.
+# The conditional marker waits for wget's actual exit status, not just a file
+# appearing while the foreground command is still running.
+type_line "wget -q -O /rejected.bin http://10.0.2.2:$PORT/missing || touch /status404"
+wait_for_file status404 0 || { echo "FAIL: HTTP 404 did not return failure"; exit 1; }
+if "$PY" scripts/fat32.py "$DISK" get rejected.bin "$GOT" >/dev/null 2>&1; then
+    echo "FAIL: HTTP 404 left /rejected.bin behind"
+    exit 1
+fi
+echo "  ok   HTTP 404 returns failure without creating the output"
+
+type_line "wget -q -O /o.bin http://10.0.2.2:$PORT/missing || touch /statuskeep"
+wait_for_file statuskeep 0 || { echo "FAIL: replacement HTTP 404 did not return failure"; exit 1; }
+"$PY" scripts/fat32.py "$DISK" get o.bin "$GOT" >/dev/null
+check_blob "HTTP 404 preserves every byte of an existing output"
+
+type_line "wget -q -O /o.bin http://10.0.2.2:$PORT/chunked && touch /statusreplace"
+wait_for_file statusreplace 0 || { echo "FAIL: successful replacement did not complete"; exit 1; }
+"$PY" scripts/fat32.py "$DISK" get o.bin "$GOT" >/dev/null
+check_blob "successful chunked response replaces the existing output" 5000
+
+type_line "wget -q -O /o.bin http://10.0.2.2:$PORT/truncated || touch /statustruncated"
+wait_for_file statustruncated 0 || { echo "FAIL: truncated body did not return failure"; exit 1; }
+"$PY" scripts/fat32.py "$DISK" get o.bin "$GOT" >/dev/null
+check_blob "truncated body preserves the complete previous output" 5000
+
+type_line "wget -q -O /zero.bin http://10.0.2.2:$PORT/empty && touch /statuszero"
+wait_for_file statuszero 0 || { echo "FAIL: empty successful body did not return success"; exit 1; }
+wait_for_file zero.bin 0 || { echo "FAIL: empty successful body has no output"; exit 1; }
+echo "  ok   a successful empty body publishes an empty file"
 
 echo "=== shell-net: PASS ==="

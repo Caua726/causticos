@@ -101,6 +101,14 @@ class Handler(socketserver.StreamRequestHandler):
             if not is_head:
                 self.wfile.write(BLOB)
 
+        elif path == "/empty":
+            self.wfile.write(self.head(200, "OK", body_len=0))
+
+        elif path == "/truncated":
+            self.wfile.write(self.head(200, "OK", body_len=64))
+            if not is_head:
+                self.wfile.write(BLOB[:32])
+
         elif path == "/chunked":
             self.wfile.write(self.head(200, "OK", chunked=True))
             if not is_head:

@@ -171,6 +171,16 @@ http.build_request(cast(*u8, &reqbuf[0]), 2048, ...);
 http.read_head(&resp, &conn, 0);
 ```
 
+`wget` downloads into a PID-specific directory reserved with `mkdir` in the
+destination's parent, then renames the completed file to its requested name.
+Only a complete HTTP 200 body and a successful close reach that publication
+step; a successful zero-byte body still creates its output. HTTP errors,
+certificate rejection, and truncated transfers discard this invocation's
+temporary data without creating or truncating the requested destination.
+A pre-existing temporary directory is refused, never reused or removed.
+`test-shell-net.sh` exercises output absence, preservation of existing bytes,
+successful replacement, and a legitimate empty response through the real shell.
+
 `ping` is the opposite end — it opens `DEV_NET` and builds ICMP by hand. Both
 are legitimate; the question is whether you want a byte stream or a packet.
 
