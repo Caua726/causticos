@@ -281,6 +281,9 @@ type_line 'sleep 60'
 sleep 1
 mon 'sendkey ctrl-c'
 sleep 0.2
+mon "screendump $WORK/ctrl-c.ppm"
+[[ -s "$WORK/ctrl-c.ppm" ]] || fail "QEMU did not capture the interrupted foreground screen"
+echo "interaction: captured Ctrl+C after interrupting foreground sleep"
 type_line 'echo resumed > /interrupt.out'
 wait_for_file_match interrupt.out '^resumed([[:space:]]|$)' \
     || fail "Ctrl+C did not return the prompt for the next command"
