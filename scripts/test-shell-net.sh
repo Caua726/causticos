@@ -227,4 +227,25 @@ wait_for_file statuszero 0 || { echo "FAIL: empty successful body did not return
 wait_for_file zero.bin 0 || { echo "FAIL: empty successful body has no output"; exit 1; }
 echo "  ok   a successful empty body publishes an empty file"
 
+# An unrelated disconnected port must not make a working route "offline".
+mon "set_link net1 off"
+type_line "wget -q -O /one-link.bin http://10.0.2.2:$PORT/f.bin"
+wait_for_file one-link.bin 65536 || { echo "FAIL: an unrelated down link blocked HTTP"; exit 1; }
+check_blob "primary route works while the secondary link is down"
+
+mon "set_link net0 off"
+type_line "wget -q -O /offline.bin http://10.0.2.2:$PORT/f.bin || touch /statusoffline"
+wait_for_file statusoffline 0 || { echo "FAIL: disconnected request did not return failure"; exit 1; }
+if "$PY" scripts/fat32.py "$DISK" get offline.bin "$GOT" >/dev/null 2>&1; then
+    echo "FAIL: disconnected request left an output"
+    exit 1
+fi
+echo "  ok   both links down returns failure without publishing an output"
+
+mon "set_link net0 on"
+mon "set_link net1 on"
+type_line "wget -q -O /recovered.bin http://10.0.2.2:$PORT/f.bin"
+wait_for_file recovered.bin 65536 || { echo "FAIL: HTTP did not recover after link restoration"; exit 1; }
+check_blob "HTTP recovers after restoring both links"
+
 echo "=== shell-net: PASS ==="

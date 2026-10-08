@@ -181,6 +181,13 @@ A pre-existing temporary directory is refused, never reused or removed.
 `test-shell-net.sh` exercises output absence, preservation of existing bytes,
 successful replacement, and a legitimate empty response through the real shell.
 
+Before resolving or connecting, `wget` checks live carrier state through `netd`,
+not the presence of a cached DHCP lease. It reports a disconnected cable only
+when every managed interface successfully reports link down; an unrelated
+disconnected port does not block a working route. Carrier is queried again on
+address, resolution, or connection errors, while unknown status keeps the
+original error instead of inventing a cable-loss diagnosis.
+
 `ping` is the opposite end — it opens `DEV_NET` and builds ICMP by hand. Both
 are legitimate; the question is whether you want a byte stream or a packet.
 
