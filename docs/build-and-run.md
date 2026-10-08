@@ -327,6 +327,8 @@ same streaming path as `head -n N`.
 `hexedit` shows `Saved N bytes` only after all bytes were written and the file
 closed successfully. Further edits restore the modified marker and remove the
 old save confirmation.
+A failed save displays the kernel's error in red and retains the buffer and
+modified marker; `s` retries without losing the edits.
 
 Program diagnostics go to stderr and use the shell's red only while stderr
 reaches a terminal. Redirected errors stay plain text, without ANSI escapes.
