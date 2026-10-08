@@ -223,6 +223,13 @@ exclusive control is intentional.
 including a displaced `soundd`. `arecord` uses `DEV_AUDIO_IN` for capture,
 with the same mapped-ring shape.
 
+The direct `write` path owns the application cursor. Acquisition starts the
+clock immediately; `hw_ptr` identifies the period already in flight, not a
+place that can still be filled. Writes start at least one period beyond it,
+including the first write and underrun recovery, so initial PCM is not lost
+behind a device-side queue. The file-playback regression compares the entire
+recorded PCM with its source, including the first samples.
+
 The `aplay` played/streamed frame total counts accepted source PCM frames.
 Widening mono to stereo does not double it, and silence completing the final
 DMA period is excluded. Direct playback still queues that tail and waits for

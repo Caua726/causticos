@@ -763,12 +763,13 @@ fn audio_write(priv as i64, buf as i64, n as i64) as i64 {
             let is i64 as fl = lock.acquire_irq(&stream_lk[si]);
             let is i64 as hp = holders[hi].hw_ptr;
             let is i64 as ap with mut = ctl_get(holders[hi].virt, abi.AUDIO_W_APP_PTR);
-            // The kernel owns app_ptr here, but the hardware moved underneath
-            // it: if hw_ptr has passed it, those frames are gone and writing
-            // them would put samples behind the playback point, where they
-            // are heard a whole buffer late. Catching up is the recovery, and
-            // the xrun was already counted at the interrupt that caused it.
-            if (ap < hp) { ap = hp; }
+            // hw_ptr marks the start of the period already being played.
+            // Its PCM may already be in a device-side queue, even before the
+            // first IRQ. Begin in the next period, never overwrite the one
+            // in flight. The same boundary recovers an underrun without
+            // discarding the first submitted frames behind the DAC.
+            let is i64 as writable = hp + streams[si].period_frames;
+            if (ap < writable) { ap = writable; }
             let is i64 as room = streams[si].buffer_frames - (ap - hp);
             let is i64 as take with mut = want - done;
             if (take > room) { take = room; }
@@ -1027,23 +1028,17 @@ fn smoke_stream(si as i64) as void {
                     audio_write(priv, cast(i64, &smoke_pcm[0]), fb - 1), abi.E_INVAL);
 
         smoke_fill(2 * pf, fb);
-        // The clock does not wait to be written to. Between the acquire and
-        // this write the engine has already eaten some periods, so the cursor
-        // does not start at zero — it starts wherever playback had reached,
-        // which is what the catch-up in audio_write is for. Asserting
-        // app_ptr == 1024 passed under one cpu and failed under four, because
-        // it was really asserting that nothing else got scheduled.
-        //
-        // What is actually promised: the write begins at some point between
-        // where the hardware was before the call and where it is after, and
-        // advances the cursor by exactly what was handed over.
+        // The clock starts on acquire. Its current period is already in
+        // flight, so the write begins one period beyond a hardware cursor
+        // sampled during the call, then advances by the submitted frames.
+        // Bracket that cursor instead of assuming no IRQ can occur here.
         let is i64 as hp_before = ctl_get(base, abi.AUDIO_W_HW_PTR);
         smoke_check(cast(*u8, "two periods accepted whole"), 26,
                     audio_write(priv, cast(i64, &smoke_pcm[0]), 2 * pf * fb), 2 * pf * fb);
         let is i64 as hp_after = ctl_get(base, abi.AUDIO_W_HW_PTR);
         let is i64 as ap_now = ctl_get(base, abi.AUDIO_W_APP_PTR);
         smoke_check(cast(*u8, "the cursor advanced by what was written"), 39,
-                    ap_now >= hp_before + 2 * pf && ap_now <= hp_after + 2 * pf, 1);
+                    ap_now >= hp_before + 3 * pf && ap_now <= hp_after + 3 * pf, 1);
         // And never further ahead than the ring is deep: a cursor past that
         // would mean the copy wrote over frames the hardware had not read.
         smoke_check(cast(*u8, "and stayed inside the ring"), 26,

@@ -150,4 +150,29 @@ echo "recorded: $(stat -c%s "$WAV") bytes"
     --freq "$FREQ" --seconds "$SECONDS_OF_TONE" --rate 48000 \
     --tolerance-hz 20 --min-amplitude 0.2 --max-gap-ms 30
 
+# Direct PCM must reach the DAC in full, including the first in-flight-period
+# boundary. Pitch/length tolerances alone hid a silently discarded period.
+"$PY" - "$TONE" "$WAV" <<'PY'
+import runpy
+import sys
+read_wav = runpy.run_path("scripts/check-wav.py")["read_wav"]
+source_rate, source_channels, source_bits, expected = read_wav(sys.argv[1])
+rate, channels, bits, recorded = read_wav(sys.argv[2])
+if (rate, channels, bits) != (source_rate, source_channels, source_bits):
+    sys.exit("FAIL: direct PCM format changed")
+for channel, source in enumerate(expected):
+    source_first = next(i for i, value in enumerate(source) if value != 0)
+    captured = recorded[channel]
+    heard_first = next((i for i, value in enumerate(captured) if value != 0), None)
+    if heard_first is None or heard_first < source_first:
+        sys.exit(f"FAIL: channel {channel} has no complete source onset")
+    start = heard_first - source_first
+    heard = captured[start:start + len(source)]
+    if heard != source:
+        mismatch = next((i for i, (a, b) in enumerate(zip(heard, source)) if a != b),
+                        min(len(heard), len(source)))
+        sys.exit(f"FAIL: channel {channel} PCM differs at source frame {mismatch}")
+    print(f"  ok   channel {channel} all {len(source)} source frames reached the DAC exactly")
+PY
+
 echo "=== audio: PASS ==="
