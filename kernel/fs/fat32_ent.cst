@@ -800,22 +800,18 @@ fn path_rename(v as *fatvol.Fat32Volume,
     let is i64 as old_c with mut = 0;
     let is i64 as old_s with mut = 0;
     let is i32 as old_a with mut = 0;
-    let is i64 as had_dst with mut = 0;
     if (fatdir.dir_find(v, dp_cluster, d_leaf, d_leaf_len,
                  &old_c, &old_s, &old_a) == 0) {
         if ((cast(i32, old_a) & fatdir.ATTR_DIRECTORY) != 0) { return cast(i32, 0 - 8); }
         if ((cast(i32, src_attr) & fatdir.ATTR_DIRECTORY) != 0) { return cast(i32, 0 - 8); }
+        let is i64 as dst_ent_cluster = fatdir.found_ent_cluster;
+        let is i64 as dst_ent_off = fatdir.found_ent_off;
         // Same name in the same directory: nothing to do, and removing the
         // entry would destroy the file we were asked to keep.
-        if (fatdir.found_ent_cluster == src_ent_cluster && fatdir.found_ent_off == src_ent_off) { return 0; }
-        had_dst = 1;
-        let is i64 as junk_dc with mut = 0;
-        let is i64 as junk_ds with mut = 0;
-        let is i32 as junk_da with mut = 0;
-        if (dir_remove_entry(v, dp_cluster, d_leaf, d_leaf_len, 0,
-                             &junk_dc, &junk_ds, &junk_da) != 0) {
-            return cast(i32, 0 - 8);
-        }
+        if (dst_ent_cluster == src_ent_cluster && dst_ent_off == src_ent_off) { return 0; }
+        return replace_entry(v, sp_cluster, s_leaf, s_leaf_len,
+                             src_ent_cluster, src_ent_off,
+                             dst_ent_cluster, dst_ent_off, old_c);
     }
 
     // Add new entry first (keeps data reachable even if the crash
@@ -842,11 +838,6 @@ fn path_rename(v as *fatvol.Fat32Volume,
         return cast(i32, 0 - 10);
     }
 
-    // The replaced file's clusters are nobody's now: its only directory entry
-    // is gone. Freed AFTER the rename committed, so a failure above leaves the
-    // old data intact rather than reachable-by-nothing.
-    if (had_dst == 1 && old_c >= 2) { fatvol.chain_free(v, old_c); }
-
     // If this was a directory rename across parents, patch its '..'
     // to point at the new parent. Same-parent renames leave '..'
     // untouched (pointer equivalence).
@@ -867,6 +858,62 @@ fn path_rename(v as *fatvol.Fat32Volume,
         }
     }
 
+    storage.flush(v.dev);
+    return 0;
+}
+
+// One 32-byte directory slot at a known place, into or out of `slot`.
+fn slot_read(v as *fatvol.Fat32Volume, ent_cluster as i64, ent_off as i64, slot as *u8) as i32 {
+    let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
+    if (fatvol.cluster_read(v, ent_cluster, buf) != 0) { return vfs.VFS_EIO; }
+    let is i64 as i with mut = 0;
+    while (i < 32) { slot[i] = buf[ent_off + i]; i = i + 1; }
+    return 0;
+}
+fn slot_write(v as *fatvol.Fat32Volume, ent_cluster as i64, ent_off as i64, slot as *u8) as i32 {
+    let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
+    if (fatvol.cluster_read(v, ent_cluster, buf) != 0) { return vfs.VFS_EIO; }
+    let is i64 as i with mut = 0;
+    while (i < 32) { buf[ent_off + i] = slot[i]; i = i + 1; }
+    if (fatvol.cluster_write(v, ent_cluster, buf) != 0) { return vfs.VFS_EIO; }
+    return 0;
+}
+
+// rename over an existing file. The destination's own entry is rewritten in
+// place — one slot write — to describe the source's file: its chain, size,
+// attributes and times, under the destination's name. Then the source's
+// entry goes. At no point is the destination name missing: it names the old
+// file until the slot write and the new one after it.
+//
+// It used to remove the destination's entry first and add a new one: if the
+// add failed, the destination was gone and its clusters belonged to no name.
+// Now a failure to rewrite the slot changes nothing, and a failure to remove
+// the source puts the destination's old slot back. The old file's clusters
+// are freed only once the rename has committed.
+fn replace_entry(v as *fatvol.Fat32Volume, sp_cluster as i64, s_leaf as *u8, s_leaf_len as i64,
+                 src_ent_cluster as i64, src_ent_off as i64,
+                 dst_ent_cluster as i64, dst_ent_off as i64, old_c as i64) as i32 {
+    let is [32]u8 as src_slot;
+    let is [32]u8 as old_slot;
+    let is [32]u8 as new_slot;
+    if (slot_read(v, src_ent_cluster, src_ent_off, cast(*u8, &src_slot[0])) != 0) { return cast(i32, 0 - 9); }
+    if (slot_read(v, dst_ent_cluster, dst_ent_off, cast(*u8, &old_slot[0])) != 0) { return cast(i32, 0 - 9); }
+    let is i64 as i with mut = 0;
+    while (i < 11) { new_slot[i] = old_slot[i]; i = i + 1; }      // the destination's 8.3 name
+    while (i < 32) { new_slot[i] = src_slot[i]; i = i + 1; }      // the source's everything else
+    if (slot_write(v, dst_ent_cluster, dst_ent_off, cast(*u8, &new_slot[0])) != 0) { return cast(i32, 0 - 9); }
+
+    let is i64 as junk_c with mut = 0;
+    let is i64 as junk_s with mut = 0;
+    let is i32 as junk_a with mut = 0;
+    if (dir_remove_entry(v, sp_cluster, s_leaf, s_leaf_len, 0, &junk_c, &junk_s, &junk_a) != 0) {
+        // The destination names the old file again. If even that fails, both
+        // names describe the new file and the old one's clusters stay
+        // allocated: nothing is freed that a name still needs.
+        slot_write(v, dst_ent_cluster, dst_ent_off, cast(*u8, &old_slot[0]));
+        return cast(i32, 0 - 10);
+    }
+    if (old_c >= 2) { fatvol.chain_free(v, old_c); }
     storage.flush(v.dev);
     return 0;
 }
