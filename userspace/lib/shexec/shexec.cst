@@ -25,6 +25,7 @@ use "../sndcli/sndcli.cst" as sndcli;
 use "../sndproto/sndproto.cst" as sp;
 use "../ttyproto/ttyproto.cst" as tty;
 use "../glob/glob.cst" as glob;
+use "std/causticos/prog.cst" as prog;
 
 let is i64 as MAX_CMDS with imut = 8;       // pipeline stages
 let is i64 as MAX_WORDS with imut = 64;
@@ -65,8 +66,8 @@ fn status() as i64 { return last_status; }
 // The kernel has no cwd and must not grow one: "no ambient global namespace" is
 // the second principle, and a per-process directory the kernel resolves against
 // is exactly that. So the shell keeps one itself and hands the VFS absolute
-// paths only. A child inherits nothing — it gets argv, and argv is already
-// resolved by the time it is spawned.
+// paths only. Each child is handed the directory as it is at the spawn, at
+// sys.DIR_FD (prog.dir_handoff), and resolves its own relative paths there.
 let is [256]u8 as cwd with mut;
 let is i64 as cwd_len with mut = 0;
 
@@ -583,10 +584,9 @@ fn glob_words() as void {
                         if (nn < MAX_WORDS && wfill + dlen + nl + 1 < BUF_CAP) {
                             let is i64 as o = wfill;
                             // The directory is ALWAYS prefixed, even when the
-                            // pattern carried none. A child process has no cwd
-                            // to resolve against — the kernel has none to give
-                            // it — so a match found in the shell's directory has
-                            // to reach the child as the absolute path it is.
+                            // pattern carried none: the match reaches the child
+                            // as the absolute path it is, the same file in
+                            // whatever directory the child resolves against.
                             let is i64 as d2 with mut = 0;
                             while (d2 < dlen) { wbuf[wfill] = dir[d2]; wfill = wfill + 1; d2 = d2 + 1; }
                             if (wfill > o && wbuf[wfill - 1] != cast(u8, 47)) {
@@ -950,9 +950,10 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                 }
 
                 if (failed == 0) {
-                    // Eight pairs at most: stdin/stdout/stderr, aux, network,
-                    // audio, TTY control, and the stderr-terminal marker.
-                    let is [16]i64 as fdacts;
+                    // Nine pairs at most: stdin/stdout/stderr, aux, network,
+                    // audio, TTY control, the stderr-terminal marker and the
+                    // directory.
+                    let is [18]i64 as fdacts;
                     let is i64 as nact with mut = 2;
                     fdacts[0] = 0; fdacts[1] = child_in;
                     fdacts[2] = 1; fdacts[3] = child_out;
@@ -996,6 +997,14 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         fdacts[nact*2] = sys.STDERR_TTY_FD; fdacts[nact*2+1] = term_w;
                         nact = nact + 1;
                     }
+                    // The directory the shell is in now: a relative path this
+                    // stage is given means here, and a later cd does not move
+                    // it. Its own copy, so no stage can change another's.
+                    let is i64 as dir_fd = prog.dir_handoff(cast(*u8, &cwd[0]), cwd_len);
+                    if (dir_fd >= 0) {
+                        fdacts[nact*2] = sys.DIR_FD; fdacts[nact*2+1] = dir_fd;
+                        nact = nact + 1;
+                    }
                     let is [128]i64 as av;              // MAX_WORDS pairs
                     let is i64 as k with mut = 0;
                     while (k < cmds[c].wn && k < MAX_WORDS) {
@@ -1012,6 +1021,7 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     else if (child_in >= 0) { sys.close(child_in); }
                     if (child_out >= 0 && child_out != term_w) { sys.close(child_out); }
                     if (tty_child >= 0) { sys.close(tty_child); tty_child = 0 - 1; }
+                    if (dir_fd >= 0) { sys.close(dir_fd); }
                     if (pid < 0) {
                         failed = 3;
                         fail_errno = pid;

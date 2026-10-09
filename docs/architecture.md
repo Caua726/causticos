@@ -61,8 +61,11 @@ Three things this is, and is not:
    is the part that matters, is narrower: **a name is never authority.** A path gets
    you a key by going through the kernel, and everything after that — reading,
    writing, passing it to a child — happens through the key alone. There is no
-   ambient cwd (the shell keeps its own and resolves before it asks), no `/dev` tree,
-   and `argv` is data the kernel never resolves.
+   ambient cwd: the kernel keeps no directory per process. A shell keeps its own,
+   and at each spawn hands the child the directory it is in at that moment as a
+   segment at fd 10 (`sys.DIR_FD`), which `prog.abspath` resolves relative paths
+   against; a later `cd` does not move a program already started. There is no
+   `/dev` tree, and `argv` is data the kernel never resolves.
 
    Granted, per-process namespaces — where even that first `open` resolves through a
    root you were handed — remain the direction. They are not built, and until they

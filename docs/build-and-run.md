@@ -335,6 +335,13 @@ shell prompt; output that already ends in a newline does not gain a blank line.
 The `cd` builtin includes the requested path in failures and distinguishes
 missing paths from non-directories.
 
+After `cd /d`, a program started from the shell resolves the relative names it
+is given in `/d`: `touch x` creates `/d/x`, `vic n.txt` saves `/d/n.txt`, `ls`
+and `du` with no argument and `find` list `/d`, in every stage of a pipeline.
+The shell hands each program the directory as it is at the spawn (fd 10,
+read by `prog.abspath`), so a later `cd` does not move a program already
+running. Programs that start others — `run`, `find -exec` — hand on their own.
+
 `mkdir` reports the requested path and the kernel's reason for failure, such
 as `already exists`.
 
