@@ -4,8 +4,8 @@ An x86_64 operating system written in [Caustic](https://github.com/Caua726/Caust
 a from-scratch systems language with its own compiler, assembler and linker. It
 boots under Limine, runs its own ring-3 programs, and compiles itself.
 
-**The ISO boots the whole system with no disk.** Around 7 MB: a kernel, a
-compositor, a window manager, a terminal, and 99 programs — including a TCP/IP
+**The ISO boots the whole system with no disk.** About 10 MB: a kernel, a
+compositor, a window manager, a terminal, and 81 programs — including a TCP/IP
 stack with TLS, and audio. Write it to a USB stick and a real machine comes up
 into a desktop.
 
@@ -40,7 +40,8 @@ For the friendly version of how that works, see
 [docs/executables.md](docs/executables.md); the exact byte layout and syscall
 contract live in [docs/CSE_FORMAT.md](docs/CSE_FORMAT.md).
 
-Around 74k lines of Caustic across 248 modules. x86_64 only.
+About 98k lines of Caustic in 300 source files — 43k in the kernel, 55k in the
+userspace (`git ls-files '*.cst' | xargs cat | wc -l`). x86_64 only.
 
 ## What works
 
@@ -53,7 +54,7 @@ Around 74k lines of Caustic across 248 modules. x86_64 only.
 - **Storage** — AHCI (SATA) and a RAM-backed live root, behind one block-device registry; a FAT32 implementation (read, write, create, unlink, rename, mkdir) and a POSIX-shaped VFS on top.
 - **Network** — e1000 and virtio-net drivers under a `DEV_NET` class that hands userspace raw ethernet frames, and `netd`: ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, HTTP/1.1 and TLS 1.3 with certificate verification, all in ring 3. `wget https://…` works.
 - **Sound** — a `DEV_AUDIO_OUT` / `DEV_AUDIO_IN` class: a DMA ring of PCM and a control page, mapped into the holder, or fed with `write()`. Mixing is in userspace (`soundd`), not the kernel: `aplay` uses it by default, reports a missing mixer channel, and takes exclusive hardware control only with `--direct`. virtio-sound drives it; Intel HDA (the one real machines have) is still to come.
-- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, process spawn with fd handoff, channels, shared segments, eventfds, surfaces. 99 programs: a shell, ~45 coreutils, monitors (`ps`, `top`, `btop`, `htop`, `df`, `free`), editors (`vic`, `pager`, `hexedit`), and the network and audio tools (`ping`, `wget`, `nslookup`, `nc`, `httpd`, `aplay`, `arecord`).
+- **Userspace** — ring 3 via `iretq`, `SYSCALL`/`SYSRET`, process spawn with fd handoff, channels, shared segments, eventfds, surfaces. The desktop image carries 81 programs (`caustic-mk run profiles` lists them): a shell, 41 coreutils, monitors (`ps`, `top`, `btop`, `htop`, `df`, `free`), editors (`vic`, `pager`, `hexedit`), and the network and audio tools (`ping`, `wget`, `nslookup`, `nc`, `httpd`, `aplay`, `arecord`).
 - **Spawning names the image, never carries it** — a path, or an fd you hold (a file, or a segment for an image that was never on disk). The kernel reads it once into frames that every later spawn of the same program maps instead of copying, so a second terminal costs its data and not its code. Changing a file a process is running from is `E_TXTBSY`.
 - **Desktop** — a compositor that owns the framebuffer and input, a window manager with tags, layouts and a config file, a terminal emulator, and a launcher. The launcher pins the terminal first and lists the other programs alphabetically, with original function pictograms and readable badges. Every profile carries the CSIF icons; only visible icons are decoded. Pointing at an application shows its purpose in a word-wrapped description panel.
 - **Self-hosting** — the Caustic compiler compiles itself *on* causticos, four rounds, byte-identical.
