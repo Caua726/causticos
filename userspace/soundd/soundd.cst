@@ -292,18 +292,10 @@ fn client_drop(cslot as i64) as void {
     return;
 }
 
-// Mint a client and send its far end over `reply_fd`, the channel that asked.
-// Any holder may: the compositor mints the WM's, the WM a window's, a terminal
-// a command's — authority handed down the way netd's is, each level giving
-// its children what it was given. With no slot free, or no channel to be
-// had, it says so at once rather than leave the asker waiting for an fd that
-// is not coming.
-fn mint(reply_fd as i64) as void {
-    let is [2]i64 as ch;
-    if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
-        sp.send(reply_fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
-        return;
-    }
+// A channel end someone parked on the gate becomes a client, greeted with the
+// shape the mixer runs at — or, with every slot taken, told so in an
+// SEV_ERROR it can read after we have let go of it.
+fn admit(fd as i64) as void {
     let is i64 as slot with mut = 0 - 1;
     let is i64 as k with mut = 0;
     while (k < MAX_CLIENTS) {
@@ -311,21 +303,28 @@ fn mint(reply_fd as i64) as void {
         k = k + 1;
     }
     if (slot < 0) {
-        sys.close(ch[0]); sys.close(ch[1]);
+        sp.send(fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
+        sys.close(fd);
         say("soundd: no client slot free\n");
-        sp.send(reply_fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
         return;
     }
-    cl_fd[slot] = ch[0];
-    cl_live[slot] = 1;
-    say("soundd: client "); say(num(slot)); say(" minted\n");
-    // The far end goes back over the asking channel; the spawner installs it
-    // at SND_FD in the child.
-    if (sys.fd_send(reply_fd, ch[1]) != 0) {
-        client_drop(slot);
-        sp.send(reply_fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
+    if (sp.send(fd, sp.SEV_HELLO, sp.SND_MAGIC, rate, (channels << 32) | frame_bytes) < 0) {
+        sys.close(fd);                        // it went away while parked
+        return;
     }
-    sys.close(ch[1]);
+    cl_fd[slot] = fd;
+    cl_live[slot] = 1;
+    say("soundd: client "); say(num(slot)); say(" joined\n");
+    return;
+}
+
+// Whatever is parked on the gate. Called every turn, not only on a wake
+// byte: a program that parked and died before writing its byte must not
+// leave the one slot occupied for everyone after it.
+fn take_parked(gate as i64) as void {
+    if (gate < 0) { return; }
+    let is i64 as fd = sys.fd_recv(gate);
+    if (fd >= 0) { admit(fd); }
     return;
 }
 
@@ -337,14 +336,6 @@ fn handle(cslot as i64) as i64 {
     let is i64 as mtype = m[0];
     let is i64 as id = m[1];
 
-    if (mtype == sp.SREQ_HELLO) {
-        sp.send(fd, sp.SEV_HELLO, sp.SND_MAGIC, rate, (channels << 32) | frame_bytes);
-        return 0;
-    }
-    if (mtype == sp.SREQ_NEW_CLIENT) {
-        mint(fd);
-        return 0;
-    }
     if (mtype == sp.SREQ_OPEN) {
         // The rate is reported, never negotiated — the kernel opened the
         // device at what the hardware could do and soundd does not resample
@@ -426,7 +417,10 @@ fn handle(cslot as i64) as i64 {
 // ============================================================
 
 fn main(argc as i64, argv as *u8) as i32 {
-    let is i64 as ctl_fd = sp.SND_FD;
+    // The gate (sndproto's SND_FD). -1 once every holder has closed it.
+    let is i64 as gate with mut = sp.SND_FD;
+    let is [4]i64 as gi;
+    if (sys.chan_info(gate, cast(*i64, &gi[0])) != 0) { gate = 0 - 1; }
     // Announced before anything can go wrong, the way netd does. A daemon that
     // dies during setup and a daemon that never got scheduled look identical
     // from the outside otherwise.
@@ -482,16 +476,21 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as cursor with mut = app_ptr();
 
     while (1 == 1) {
-        // Poll the device and every client at once. The device's WRITABLE is
-        // the period clock; a client's READABLE is work to stage. One call
-        // waits for whichever comes first, and nothing spins.
+        // Poll the device, the gate and every client at once. The device's
+        // WRITABLE is the period clock; a client's READABLE is work to stage.
+        // One call waits for whichever comes first, and nothing spins.
         let is i64 as n with mut = 0;
         pollbuf[0] = dev_fd; pollbuf[1] = sys.POLL_WRITABLE; pollbuf[2] = 0;
         n = 1;
-        pollbuf[n * 3 + 0] = ctl_fd;
-        pollbuf[n * 3 + 1] = sys.POLL_READABLE;
-        pollbuf[n * 3 + 2] = 0;
-        n = n + 1;
+        let is i64 as gate_slot with mut = 0 - 1;
+        if (gate >= 0) {
+            gate_slot = n;
+            pollbuf[n * 3 + 0] = gate;
+            pollbuf[n * 3 + 1] = sys.POLL_READABLE;
+            pollbuf[n * 3 + 2] = 0;
+            n = n + 1;
+        }
+        let is i64 as first_client = n;
         let is i64 as c with mut = 0;
         while (c < MAX_CLIENTS) {
             if (cl_live[c] != 0) {
@@ -554,21 +553,20 @@ fn main(argc as i64, argv as *u8) as i32 {
             sys.audio_ctl_publish(map, sys.AUDIO_W_APP_PTR, cursor);
         }
 
-        // Answer anyone who spoke. The control channel and every client
-        // channel can mint endpoints; a client channel also carries streams.
-        if ((pollbuf[5] & sys.POLL_READABLE) != 0) {
-            let is [4]i64 as m;
-            if (sp.recv(ctl_fd, cast(*i64, &m[0])) > 0) {
-                if (m[0] == sp.SREQ_NEW_CLIENT) {
-                    mint(ctl_fd);
-                } else if (m[0] == sp.SREQ_HELLO) {
-                    sp.send(ctl_fd, sp.SEV_HELLO, sp.SND_MAGIC, rate,
-                            (channels << 32) | frame_bytes);
-                }
+        // Newcomers. Wake bytes mean only "look"; a parked fd with no byte
+        // behind it is looked for every turn anyway.
+        if (gate_slot >= 0 && (pollbuf[gate_slot * 3 + 2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+            let is [64]u8 as wake;
+            if (sys.read(gate, cast(*u8, &wake[0]), 64) <= 0) {
+                // Every holder has closed it: nobody new can arrive, and the
+                // clients there are keep their channels.
+                sys.close(gate);
+                gate = 0 - 1;
             }
         }
+        take_parked(gate);
 
-        let is i64 as e with mut = 2;
+        let is i64 as e with mut = first_client;
         while (e < n) {
             if ((pollbuf[e * 3 + 2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
                 let is i64 as slot = client_slot(pollbuf[e * 3 + 0]);

@@ -1,12 +1,15 @@
 // sndcli — how a program reaches soundd, and how it hands it on.
 //
-// The same two halves netsvc has, for the same reason: there is no service
-// namespace (architecture.md §2.2), so a soundd channel arrives exactly one
-// way — whoever spawned the program put one there.
+// The same halves netsvc has, for the same reason: there is no service
+// namespace (architecture.md §2.2), so soundd's gate arrives exactly one way —
+// whoever spawned the program put it at SND_FD (sndproto explains the gate).
 //
-//   adopt()      take the channel I was handed and prove soundd is behind it
-//   endpoint()   mint one for a program I am about to spawn
+//   gate()       the gate to hand a child I am about to spawn: my own
+//   adopt()      become a client through the gate, the first time I play
 //   start()      /init only
+//
+// Handing the gate on costs soundd nothing, so only a program that plays
+// becomes a client. Every spawn used to mint one.
 //
 // EXACTLY ONE PROCESS STARTS SOUNDD. DEV_AUDIO_OUT is exclusive but
 // preemptible, so a second soundd does not fail — it takes the stream from the
@@ -14,9 +17,9 @@
 // into a mixer nobody can hear. Two mixers, one converter, one of them
 // silently pointless.
 //
-// A missing mixer channel is explicit: adopt() fails. A caller may open the
-// device directly only when it wants exclusive control. aplay defaults to
-// soundd and requires --direct for that takeover; it never falls back.
+// A missing mixer is explicit: adopt() fails. A caller may open the device
+// directly only when it wants exclusive control. aplay defaults to soundd and
+// requires --direct for that takeover; it never falls back.
 
 use "std/os/causticos.cst" as sys;
 use "../sndproto/sndproto.cst" as sp;
@@ -27,24 +30,38 @@ let is i64 as soundd_pid with mut = 0;
 let is i64 as srate with mut = 0;
 let is i64 as schannels with mut = 0;
 let is i64 as sframe_bytes with mut = 0;
+// The gate: SND_FD when a spawner put a channel there, the other end of
+// soundd's for /init, -1 when there is none. Looked at once.
+let is i64 as gate_fd with mut = 0 - 1;
+let is i64 as gate_known with mut = 0;
 
-fn available() as i64 { return ready; }
 fn pid() as i64 { return soundd_pid; }
 fn rate() as i64 { return srate; }
 fn channels() as i64 { return schannels; }
 fn frame_bytes() as i64 { return sframe_bytes; }
 fn ctl_fd() as i64 { return ctl; }
 
-// One round trip that both proves there is a soundd behind the fd and learns
-// the shape it is mixing in — a client has to know the rate before it can send
-// a single correct sample.
+// Why adopt() failed, for the end of a message a person reads.
+fn why(rc as i64) as *u8 {
+    if (rc == sys.E_NOENT) { return cast(*u8, "no mixer: nothing gave this program soundd's gate"); }
+    if (rc == sys.E_MFILE) { return cast(*u8, "no mixer: soundd is serving as many programs as it can"); }
+    if (rc == sys.E_PIPE)  { return cast(*u8, "no mixer: soundd is not running"); }
+    if (rc == sys.E_AGAIN) { return cast(*u8, "no mixer: soundd did not answer"); }
+    if (rc == sys.E_INVAL) { return cast(*u8, "no mixer: what is at the gate is not soundd"); }
+    return sys.err_text(rc);
+}
+
+// soundd's greeting is its first message on a new client: it proves a mixer
+// is behind the channel and says the shape it mixes in — a client has to know
+// the rate before it can send a single correct sample. An SEV_ERROR instead
+// says why soundd would not take one more.
 fn attach(fd as i64) as i64 {
-    if (sp.send(fd, sp.SREQ_HELLO, 0, sp.SND_VERSION, 0) < 0) { return sys.E_IO; }
     let is [4]i64 as m;
-    if (sp.recv(fd, cast(*i64, &m[0])) < 0) { return sys.E_IO; }
-    // A HELLO from something else (netd answers with the same number) is
-    // not a mixer: the magic says it is soundd, and a rate of nothing is not
-    // one either.
+    if (sp.recv(fd, cast(*i64, &m[0])) < 0) { return sys.E_PIPE; }
+    if (m[0] == sp.SEV_ERROR) { return sys.E_MFILE; }   // every client slot is taken
+    // A HELLO from something else (netd greets with the same number) is not
+    // a mixer: the magic says it is soundd, and a rate of nothing is not one
+    // either.
     if (m[0] != sp.SEV_HELLO || m[1] != sp.SND_MAGIC || m[2] <= 0) { return sys.E_INVAL; }
     ctl = fd;
     srate = m[2];
@@ -54,14 +71,54 @@ fn attach(fd as i64) as i64 {
     return 0;
 }
 
-fn adopt() as i64 {
-    if (ready == 1) { return 0; }
-    return attach(sp.SND_FD);
+// The gate to install at SND_FD in a child, or -1 when there is no mixer to
+// give — which is not an error: a program that never wanted sound should
+// still run. Borrowed: the caller hands it on and does not close it. Only a
+// channel at SND_FD counts; a file this program opened there is never handed
+// to a child as a gate.
+fn gate() as i64 {
+    if (gate_known == 0) {
+        gate_known = 1;
+        let is [4]i64 as ci;
+        if (sys.chan_info(sp.SND_FD, cast(*i64, &ci[0])) == 0) { gate_fd = sp.SND_FD; }
+    }
+    return gate_fd;
 }
 
-// Start soundd and keep its control channel. /init only — see the header.
-fn start() as i64 {
+// Become a client through the gate: a new channel pair, one end parked there
+// for soundd to take, a byte so it looks, the other end kept and attached.
+// The gate holds one parked fd at a time, so a program parking at the same
+// moment as another waits its turn.
+fn adopt() as i64 {
     if (ready == 1) { return 0; }
+    let is i64 as g = gate();
+    if (g < 0) { return sys.E_NOENT; }
+    let is [2]i64 as ch;
+    if (sys.channel_create(cast(*i64, &ch[0])) != 0) { return sys.E_NOMEM; }
+    let is i64 as deadline = sys.time_ns() + 2000000000;
+    while (1 == 1) {
+        let is i64 as r = sys.fd_send(g, ch[1]);
+        if (r == 0) { break; }
+        if (r != sys.E_AGAIN || sys.time_ns() >= deadline) {
+            sys.close(ch[0]); sys.close(ch[1]);
+            if (r == sys.E_AGAIN) { return sys.E_AGAIN; }
+            return sys.E_PIPE;
+        }
+        sys.sleep_ns(1000000);
+    }
+    sys.close(ch[1]);                          // soundd's now, once it takes it
+    let is [1]u8 as wake;
+    wake[0] = cast(u8, 1);
+    if (sp.write_all(g, cast(*u8, &wake[0]), 1) < 0) { sys.close(ch[0]); return sys.E_PIPE; }
+    let is i64 as a = attach(ch[0]);
+    if (a != 0) { sys.close(ch[0]); }
+    return a;
+}
+
+// Start soundd and keep the gate. /init only — see the header. /init becomes
+// a client too, once: that is what proves the mixer answers.
+fn start() as i64 {
+    if (gate() >= 0) { return adopt(); }
     let is [2]i64 as ch;
     if (sys.channel_create(cast(*i64, &ch[0])) != 0) { return sys.E_NOMEM; }
     let is [2]i64 as fda;
@@ -76,41 +133,18 @@ fn start() as i64 {
         soundd_pid = 0;
         return sys.E_IO;
     }
-    if (attach(ch[0]) != 0) {
-        sys.close(ch[0]);
-        return sys.E_IO;
-    }
+    gate_fd = ch[0];
+    gate_known = 1;
+    if (adopt() != 0) { return sys.E_IO; }
     return 0;
 }
 
+// Use what I was given, and start soundd myself only if I was given nothing
+// and am the process that is allowed to.
 fn attach_or_start(may_start as i64) as i64 {
-    if (adopt() == 0) { return 0; }
+    if (gate() >= 0) { return adopt(); }
     if (may_start == 0) { return sys.E_NOENT; }
     return start();
-}
-
-// An endpoint to install at SND_FD in a child, or -1 when there is no mixer to
-// give — which is not an error: a program that never wanted sound should still
-// run. Whoever holds a channel can mint one, so each level hands down what it
-// was handed. soundd answers a refusal with EV_ERROR, read here, so a full
-// mixer costs nothing to ask.
-fn endpoint() as i64 {
-    if (ready == 0) { return 0 - 1; }
-    if (sp.send(ctl, sp.SREQ_NEW_CLIENT, 0, 0, 0) < 0) { return 0 - 1; }
-    let is i64 as deadline = sys.time_ns() + 2000000000;
-    while (sys.time_ns() < deadline) {
-        let is i64 as fd = sys.fd_recv(ctl);
-        if (fd >= 0) { return fd; }
-        let is [3]i64 as pe;
-        pe[0] = ctl; pe[1] = sys.POLL_READABLE; pe[2] = 0;
-        sys.poll(cast(*i64, &pe[0]), 1, 1000000);
-        if ((pe[2] & sys.POLL_READABLE) != 0) {
-            let is [4]i64 as m;
-            if (sp.recv(ctl, cast(*i64, &m[0])) < 0) { return 0 - 1; }
-            if (m[0] == sp.SEV_ERROR) { return 0 - 1; }
-        }
-    }
-    return 0 - 1;
 }
 
 // ---- streams ----

@@ -145,9 +145,12 @@ it is why a terminal costs a few hundred KB instead of a full framebuffer.
 ## 3. A network client
 
 The network stack lives in **ring 3**, in `netd`. A program does not speak to
-the NIC; it asks netd for an endpoint. netd is started by the compositor (it is
-`/init`, so it is the one process allowed to), and it is already running by the
-time your program does.
+the NIC; it becomes a client of netd. netd is started by the compositor (it is
+`/init`, so it is the one process allowed to), and every program below it is
+handed netd's **gate** at fd 6: `lib/netcli/netsvc`'s `adopt()` makes the
+program a client through it the first time it needs the network, and `gate()`
+is what a spawner passes to its children. Handing the gate on costs netd
+nothing, so a program that never opens a socket is never a client.
 
 The layers, pick the one you need:
 
@@ -202,8 +205,9 @@ guest's `httpd`.
 Two ways in, and the difference is whether you want to share.
 
 **Through `soundd`** — the userspace mixer. More than one program can be audible
-at once. The spawning process supplies a channel; `lib/sndcli`'s `adopt()`
-checks it and `endpoint()` supplies one to a child. `open(id)` opens a voice at
+at once. The spawning process passes soundd's gate at fd 7; `lib/sndcli`'s
+`adopt()` makes the program a client through it, and `gate()` is what a
+spawner hands its children. `open(id)` opens a voice at
 the mixer's reported sample rate and channel count; `write(id, pcm, bytes)`
 feeds PCM with backpressure, `drain(id)` waits for playback, and `close(id)`
 releases the voice.

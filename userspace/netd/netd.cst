@@ -39,19 +39,20 @@ use "../lib/netproto/netproto.cst" as np;
 use "netd_if.cst" as nif;
 use "netd_sock.cst" as nsock;
 
-// One per program that holds a channel. In the windowed flavour that is the
-// compositor, the window manager, every terminal and launcher the WM spawns,
-// and every command each terminal runs — the shell mints one per child and
-// the slot comes back when the child exits and its channel closes.
+// One per program that uses the network. The rest of the system holds only
+// the gate (netproto's NET_FD): a program becomes a client by parking its own
+// end of a new channel there, so a command that never opens a socket never
+// takes a slot — every spawn used to, and each one said so on the serial line.
 let is i64 as MAX_CLIENTS = 16;
 let is i64 as POLL_CAP_NS = 250000000;      // 250 ms: the idle heartbeat
 let is i64 as ICMP_ID_BASE = 0x4E44;        // "ND"
 
-// Client channels. Slot 0 is the control channel handed to us at spawn; the
-// rest are minted on REQ_NEW_CLIENT.
+// Client channels, all equal: there is no control slot.
 let is [16]i64 as client_fd with mut;
 let is [16]i64 as client_live with mut;
 let is i64 as n_clients with mut = 0;
+// The gate, handed to us at spawn. -1 once every holder has gone.
+let is i64 as gate_fd with mut = 0 - 1;
 
 let is [2048]u8 as rxbuf;
 let is [2048]u8 as payload;
@@ -965,44 +966,6 @@ fn serve_client(c as i64) as i64 {
         if (np.read_all(client_fd[c], cast(*u8, &payload[0]), plen) < 0) { return 0; }
     }
 
-    if (t == np.REQ_HELLO) {
-        np.send(client_fd[c], np.EV_HELLO, 0, np.VERSION, nif.count());
-        return 1;
-    }
-    if (t == np.REQ_NEW_CLIENT) {
-        // A client asks for a second endpoint, to hand to a program it is
-        // about to spawn. There is no service namespace to look netd up in
-        // (architecture.md §2.2), so this is the only way a channel reaches a
-        // process that netd did not already know about: someone who has one
-        // mints another and passes it on. That is not an escalation — a
-        // client that can ask for one could equally have been handed one by
-        // whoever spawned it.
-        let is i64 as k with mut = 0;
-        while (k < MAX_CLIENTS && client_live[k] == 1) { k = k + 1; }
-        if (k >= MAX_CLIENTS) { reply_err(c, 0, sys.E_AGAIN); return 1; }
-        let is [2]i64 as ch;
-        if (sys.channel_create(cast(*i64, &ch[0])) != 0) {
-            reply_err(c, 0, sys.E_NOMEM);
-            return 1;
-        }
-        // The far end goes out first and the announcement second, the order
-        // the compositor already uses for segment handoff: by the time the
-        // asker sees EV_OK the fd is waiting for it, so it never has to poll
-        // for something that may not have been sent yet.
-        if (sys.fd_send(client_fd[c], ch[1]) != 0) {
-            sys.close(ch[0]);
-            sys.close(ch[1]);
-            reply_err(c, 0, sys.E_IO);
-            return 1;
-        }
-        sys.close(ch[1]);                     // the asker owns it now
-        client_fd[k] = ch[0];
-        client_live[k] = 1;
-        n_clients = n_clients + 1;
-        np.send(client_fd[c], np.EV_OK, 0, k, 0);
-        log("netd: client "); log_num(k); log(" minted\n");
-        return 1;
-    }
     if (t == np.REQ_PING) {
         do_ping(c, a, np.unpack_port(b), np.unpack_len(b));
         return 1;
@@ -1232,6 +1195,54 @@ fn drop_client(c as i64) as void {
     return;
 }
 
+// A channel end someone parked on the gate becomes a client, greeted with
+// EV_HELLO — or, with every slot taken, told why in an EV_ERROR it can read
+// after we have let go of it.
+fn admit(fd as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < MAX_CLIENTS && client_live[k] == 1) { k = k + 1; }
+    if (k >= MAX_CLIENTS) {
+        np.send(fd, np.EV_ERROR, 0, sys.E_MFILE, 0);
+        sys.close(fd);
+        log("netd: every client slot is taken, one refused\n");
+        return;
+    }
+    if (np.send(fd, np.EV_HELLO, 0, np.VERSION, nif.count()) < 0) {
+        sys.close(fd);                        // it went away while parked
+        return;
+    }
+    client_fd[k] = fd;
+    client_live[k] = 1;
+    n_clients = n_clients + 1;
+    log("netd: client "); log_num(k); log(" joined\n");
+    return;
+}
+
+// Whatever is parked on the gate. Called every turn, not only when a wake
+// byte arrives: a program that parked and died before writing its byte must
+// not leave the one slot occupied for everyone after it.
+fn take_parked() as void {
+    if (gate_fd < 0) { return; }
+    let is i64 as fd = sys.fd_recv(gate_fd);
+    if (fd >= 0) { admit(fd); }
+    return;
+}
+
+// Wake bytes carry no meaning beyond "look"; drain them and look.
+fn serve_gate() as void {
+    let is [64]u8 as wake;
+    let is i64 as r = sys.read(gate_fd, cast(*u8, &wake[0]), 64);
+    if (r <= 0) {
+        // Every holder has closed it: nobody new can arrive, and the clients
+        // there are keep their channels.
+        sys.close(gate_fd);
+        gate_fd = 0 - 1;
+        return;
+    }
+    take_parked();
+    return;
+}
+
 // ============================================================
 
 fn main(argc as i64, argv as *u8) as i32 {
@@ -1264,22 +1275,21 @@ fn main(argc as i64, argv as *u8) as i32 {
     }
     if (nif.count() == 0) { log("netd: no port could be opened\n"); return cast(i32, 1); }
 
-    // The control channel arrives on fd 3, the way a compositor client finds
-    // the framebuffer. Without it netd still runs and serves nobody, which is
+    // The gate arrives at NET_FD, the way a compositor client finds the
+    // framebuffer. Without it netd still runs and serves nobody, which is
     // useful for a boot that only wants the stack answering pings.
-    client_fd[0] = np.NET_FD;
-    client_live[0] = 1;
-    n_clients = 1;
+    let is [4]i64 as gi;
+    if (sys.chan_info(np.NET_FD, cast(*i64, &gi[0])) == 0) { gate_fd = np.NET_FD; }
     log("netd: ready\n");
 
     while (1 == 1) {
         let is i64 as now = sys.time_ns();
         let is i64 as next = run_timers(now);
 
-        // Watch every interface and every live client at once. The timeout is
-        // the nearest deadline, so an idle stack costs nothing.
-        // 3 words per entry: 2 interfaces + MAX_CLIENTS clients.
-        let is [54]i64 as pe;
+        // Watch every interface, the gate and every live client at once. The
+        // timeout is the nearest deadline, so an idle stack costs nothing.
+        // 3 words per entry: 2 interfaces + the gate + MAX_CLIENTS clients.
+        let is [57]i64 as pe;
         let is i64 as n with mut = 0;
         let is i64 as k with mut = 0;
         while (k < nif.count()) {
@@ -1289,9 +1299,17 @@ fn main(argc as i64, argv as *u8) as i32 {
             n = n + 1;
             k = k + 1;
         }
+        let is i64 as gate_slot with mut = 0 - 1;
+        if (gate_fd >= 0) {
+            gate_slot = n;
+            pe[n*3+0] = gate_fd;
+            pe[n*3+1] = sys.POLL_READABLE;
+            pe[n*3+2] = 0;
+            n = n + 1;
+        }
         // Which client each poll slot belongs to, recorded rather than
         // recomputed. Recomputing it after the poll walks the live set a
-        // second time — and REQ_NEW_CLIENT makes a slot live during that
+        // second time — and admitting a client makes a slot live during that
         // walk, so the second pass finds one more client than the first and
         // reads a poll entry that was never filled in. Acting on the garbage
         // in it means calling serve_client on a channel with nothing in it,
@@ -1336,9 +1354,16 @@ fn main(argc as i64, argv as *u8) as i32 {
             k = k + 1;
         }
 
+        // Newcomers. The clients served below are the ones this turn's poll
+        // covered, recorded in `polled`; one admitted here waits for the next.
+        if (gate_slot >= 0 && (pe[gate_slot*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+            serve_gate();
+        } else {
+            take_parked();
+        }
+
         // Only the slots that were actually polled, and only clients still
-        // live: serving one can mint another and dropping one can retire it,
-        // and both happen inside this loop.
+        // live: dropping one retires it inside this loop.
         let is i64 as j with mut = 0;
         while (j < npolled) {
             let is i64 as who = polled[j];

@@ -204,9 +204,10 @@ fn await(want as i64, deadline as i64) as i64 {
 
 // ---- attaching ----
 
-// Take a netd channel and prove it is one. A program whose fd 3 is something
-// else finds out here, on one round trip, rather than by sending a socket
-// request into a pipe and waiting out a timeout.
+// Take a client channel and wait for netd's greeting on it. Three different
+// failures, three different answers: "nothing is there" (E_PIPE), "something
+// is there but said nothing" (E_AGAIN), and "netd said no" — the errno it gave,
+// e.g. E_AGAIN with every client slot taken — are three different things.
 fn attach(fd as i64) as i64 {
     ctl = fd;
     let is i64 as i with mut = 0;
@@ -217,26 +218,41 @@ fn attach(fd as i64) as i64 {
         socks[i].err = 0; socks[i].credit = 0; socks[i].lost = 0; socks[i].acc_ready = 0;
         i = i + 1;
     }
-    // Three different failures, three different answers: "that fd is not a
-    // channel", "it is a channel but nothing answered", and "something
-    // answered but speaks another version" are three different things to fix.
-    if (np.send(ctl, np.REQ_HELLO, 0, np.VERSION, 0) < 0) { return sys.E_PIPE; }
-    if (await(np.EV_HELLO, sys.time_ns() + 3000000000) != 1) { return sys.E_AGAIN; }
+    let is i64 as r = await(np.EV_HELLO, sys.time_ns() + 3000000000);
+    if (r == 0 - 2) { return last[2]; }
+    if (r == 0 - 1) { return sys.E_PIPE; }
+    if (r != 1) { return sys.E_AGAIN; }
     version = last[2];
     nifaces = last[3];
     if (version != np.VERSION) { return sys.E_INVAL; }
     return 0;
 }
 
-// Mint a second endpoint, to hand to a program about to be spawned. netd
-// sends the fd first and announces it second, so by the time EV_OK arrives
-// the descriptor is already waiting.
-fn new_endpoint() as i64 {
-    if (np.send(ctl, np.REQ_NEW_CLIENT, 0, 0, 0) < 0) { return sys.E_IO; }
-    if (await(np.EV_OK, sys.time_ns() + 3000000000) != 1) { return sys.E_IO; }
-    let is i64 as fd = sys.fd_recv(ctl);
-    if (fd < 0) { return sys.E_IO; }
-    return fd;
+// Become a client through netd's gate (netproto's NET_FD): a new channel pair,
+// one end parked on the gate for netd to take, a byte so it looks, and the
+// other end kept and attached. The gate holds one parked fd at a time, so a
+// program parking at the same moment as another waits its turn.
+fn attach_gate(gate as i64) as i64 {
+    let is [2]i64 as ch;
+    if (sys.channel_create(cast(*i64, &ch[0])) != 0) { return sys.E_NOMEM; }
+    let is i64 as deadline = sys.time_ns() + 3000000000;
+    while (1 == 1) {
+        let is i64 as r = sys.fd_send(gate, ch[1]);
+        if (r == 0) { break; }
+        if (r != sys.E_AGAIN || sys.time_ns() >= deadline) {
+            sys.close(ch[0]); sys.close(ch[1]);
+            if (r == sys.E_AGAIN) { return sys.E_AGAIN; }
+            return sys.E_PIPE;
+        }
+        sys.sleep_ns(1000000);
+    }
+    sys.close(ch[1]);                          // netd's now, once it takes it
+    let is [1]u8 as wake;
+    wake[0] = cast(u8, 1);
+    if (np.write_all(gate, cast(*u8, &wake[0]), 1) < 0) { sys.close(ch[0]); return sys.E_PIPE; }
+    let is i64 as a = attach(ch[0]);
+    if (a != 0) { sys.close(ch[0]); ctl = 0 - 1; }
+    return a;
 }
 
 // ---- naming and interfaces ----

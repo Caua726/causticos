@@ -1,23 +1,28 @@
 // netsvc — how a program gets the network, and how it hands it on.
 //
 // There is no service namespace to look netd up in (architecture.md §2.2), so
-// a network channel reaches a process exactly one way: whoever spawned it put
-// one there. That makes the chain explicit, and it makes this module the two
-// halves of every link in it —
+// the network reaches a process exactly one way: whoever spawned it put netd's
+// gate at NET_FD (netproto explains the gate). That makes the chain explicit,
+// and it makes this module the halves of every link in it —
 //
-//   adopt()      take the channel I was handed, and prove it is netd's
-//   endpoint()   mint one for a program I am about to spawn
+//   gate()       the gate to hand a child I am about to spawn: my own
+//   adopt()      become a client through the gate, the first time I need to
+//   start()      /init only: start netd and hold the gate's other end
+//
+// Handing the gate on costs netd nothing, so only a program that actually
+// uses the network becomes a client. Every spawn used to mint one, and every
+// command typed in a terminal was a netd client for its whole life.
 //
 // EXACTLY ONE PROCESS STARTS NETD, and it is /init. DEV_NET is exclusive but
 // preemptible (kernel/sys/grab.cst), so a second netd does not fail — it takes
 // the interface away from the first, which then goes quiet with its DHCP lease
 // still nominally live. Two stacks, one link, one of them silently wrong. So
-// start() is called by /init and by nothing else; everyone below adopts what
+// start() is called by /init and by nothing else; everyone below hands on what
 // they were given, and a link that forgets to pass it on leaves its children
 // with no network rather than with a second stack.
 //
-// A program with no netd is not broken, it is offline: adopt() fails, every
-// call here says so, and the program prints something a person can act on.
+// A program with no netd is not broken, it is offline: adopt() fails, and the
+// program prints something a person can act on.
 
 use "std/os/causticos.cst" as sys;
 use "../netproto/netproto.cst" as np;
@@ -25,28 +30,53 @@ use "netcli.cst" as nc;
 
 let is i64 as ready with mut = 0;
 let is i64 as netd_pid with mut = 0;
+// The gate: NET_FD when a spawner put a channel there, the other end of netd's
+// for /init, -1 when there is none. Looked at once.
+let is i64 as gate_fd with mut = 0 - 1;
+let is i64 as gate_known with mut = 0;
 
-fn available() as i64 { return ready; }
 fn pid() as i64 { return netd_pid; }
 
-// Load a .cse image. Deliberately not futil's slurp: this module is linked
-// into the compositor and the window manager, which have no other reason to
-// carry a file-utility library, and the whole thing is fifteen lines.
-// Take the channel we were handed and prove there is a netd behind it. One
-// round trip, and a fast failure when NET_FD is not a channel at all — which
-// is why netproto writes through the raw syscall rather than the std wrapper
-// that would have quietly redirected the handshake to the serial console.
+// Why adopt() failed, for the end of a message a person reads.
+fn why(rc as i64) as *u8 {
+    if (rc == sys.E_NOENT) { return cast(*u8, "no network: nothing gave this program netd's gate"); }
+    if (rc == sys.E_MFILE) { return cast(*u8, "no network: netd is serving as many programs as it can"); }
+    if (rc == sys.E_PIPE)  { return cast(*u8, "no network: netd is not running"); }
+    if (rc == sys.E_AGAIN) { return cast(*u8, "no network: netd did not answer"); }
+    if (rc == sys.E_INVAL) { return cast(*u8, "no network: what is at the gate does not speak netd's protocol"); }
+    return sys.err_text(rc);
+}
+
+// The gate to install at NET_FD in a child, or -1 when there is no network to
+// give — which is not an error, and a spawner that treats it as one refuses to
+// run programs that never wanted the network in the first place. Borrowed: the
+// caller hands it on and does not close it. A channel at NET_FD is taken as
+// the gate; anything else there (a file this program opened, with no gate
+// installed) is not, and is never handed to a child as one.
+fn gate() as i64 {
+    if (gate_known == 0) {
+        gate_known = 1;
+        let is [4]i64 as ci;
+        if (sys.chan_info(np.NET_FD, cast(*i64, &ci[0])) == 0) { gate_fd = np.NET_FD; }
+    }
+    return gate_fd;
+}
+
+// Become a client: once, on first use.
 fn adopt() as i64 {
     if (ready == 1) { return 0; }
-    let is i64 as r = nc.attach(np.NET_FD);
+    let is i64 as g = gate();
+    if (g < 0) { return sys.E_NOENT; }
+    let is i64 as r = nc.attach_gate(g);
     if (r != 0) { return r; }
     ready = 1;
     return 0;
 }
 
-// Start netd and keep its control channel. /init only — see the header.
+// Start netd and keep the gate. /init only — see the header. /init becomes a
+// client too, once: that is what proves netd answers.
 fn start() as i64 {
-    if (ready == 1) { return 0; }
+    if (gate() >= 0) { return adopt(); }
     let is [2]i64 as ch;
     if (sys.channel_create(cast(*i64, &ch[0])) != 0) { return sys.E_NOMEM; }
     let is [2]i64 as fda;
@@ -61,31 +91,18 @@ fn start() as i64 {
         netd_pid = 0;
         return sys.E_IO;
     }
-    if (nc.attach(ch[0]) != 0) {
-        // It spawned but does not answer: leave it running rather than
-        // killing it blind, and report offline. Whatever went wrong is on
-        // netd's own serial log.
-        sys.close(ch[0]);
-        return sys.E_IO;
-    }
-    ready = 1;
+    gate_fd = ch[0];
+    gate_known = 1;
+    // It spawned but does not answer: leave it running rather than killing
+    // it blind, and report it. Whatever went wrong is on netd's serial log.
+    if (adopt() != 0) { return sys.E_IO; }
     return 0;
 }
 
-// The whole rule in one call: take what I was given, and start one myself only
-// if I am the process that is allowed to.
+// The whole rule in one call: use what I was given, and start netd myself only
+// if I was given nothing and am the process that is allowed to.
 fn attach_or_start(may_start as i64) as i64 {
-    if (adopt() == 0) { return 0; }
+    if (gate() >= 0) { return adopt(); }
     if (may_start == 0) { return sys.E_NOENT; }
     return start();
-}
-
-// An endpoint to install at NET_FD in a child, or -1 when there is no network
-// to give — which is not an error, and a spawner that treats it as one refuses
-// to run programs that never wanted the network in the first place.
-fn endpoint() as i64 {
-    if (ready == 0) { return 0 - 1; }
-    let is i64 as fd = nc.new_endpoint();
-    if (fd < 0) { return 0 - 1; }
-    return fd;
 }
