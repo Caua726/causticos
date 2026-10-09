@@ -550,14 +550,40 @@ fn list_scan(line as *u8, len as i64, from as i64, at as *i64, oplen as *i64) as
     return OP_END;
 }
 
+// list_valid — whether line is a well-formed list: no separator without a
+// command before it ("; a", "a && && b"), no && or || without one after. A
+// list that is not is refused before any of it runs.
+fn list_valid(line as *u8, len as i64) as i64 {
+    let is i64 as start with mut = 0;
+    let is i64 as prev with mut = OP_SEMI;
+    while (1 == 1) {
+        let is i64 as at with mut = 0;
+        let is i64 as oplen with mut = 0;
+        let is i64 as op = list_scan(line, len, start, &at, &oplen);
+        let is i64 as a with mut = start;
+        let is i64 as b with mut = at;
+        while (a < b && _blank(line[a]) == 1) { a = a + 1; }
+        while (b > a && _blank(line[b - 1]) == 1) { b = b - 1; }
+        if (a == b) {
+            // Nothing here: fine only at the end, after ';' or '&'.
+            if (op != OP_END || prev == OP_AND || prev == OP_OR) { return 0; }
+            return 1;
+        }
+        if (op == OP_END) { return 1; }
+        prev = op;
+        start = at + oplen;
+    }
+    return 1;
+}
+
 // Split line into the list. Returns the number of parts (0 for a blank line);
-// -1 for a separator with no command before it ("; a", "a && && b") or a
-// trailing && / || with none after; -2 when the line could not be kept
-// (room_error says why).
+// -1 when it is not a well-formed list (list_valid); -2 when the line could
+// not be kept (room_error says why).
 fn list_begin(line as *u8, len as i64) as i64 {
     l_n = 0;
     l_next = 0;
     room_err = 0;
+    if (list_valid(line, len) == 0) { return 0 - 1; }
     let is i64 as rd = _ready();
     if (rd != 0) { room_err = rd; return 0 - 2; }
     if (_room(&list_g, len + 1) == 0) { return 0 - 2; }
@@ -572,12 +598,7 @@ fn list_begin(line as *u8, len as i64) as i64 {
         let is i64 as b with mut = at;
         while (a < b && _blank(l_line[a]) == 1) { a = a + 1; }
         while (b > a && _blank(l_line[b - 1]) == 1) { b = b - 1; }
-        if (a == b) {
-            if (op != OP_END) { l_n = 0; return 0 - 1; }
-            // The line ends after a separator: fine after ';' or '&'.
-            if (l_n > 0 && (l_op[l_n - 1] == OP_AND || l_op[l_n - 1] == OP_OR)) { l_n = 0; return 0 - 1; }
-            return l_n;
-        }
+        if (a == b) { return l_n; }                     // the end, after ';' or '&'
         if (_room(&loff_g, (l_n + 1) * 8) == 0 || _room(&llen_g, (l_n + 1) * 8) == 0
             || _room(&lop_g, (l_n + 1) * 8) == 0) { l_n = 0; return 0 - 2; }
         l_off[l_n] = a; l_len[l_n] = b - a; l_op[l_n] = op;
@@ -1349,6 +1370,12 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
 // and copied the command into 4096 bytes. It does not recurse — what it runs
 // is tokenised, not expanded — so there is no depth to cap.
 //
+// The line is a list, as at the prompt: `a ; b`, `a && b`, `a || b`. Its
+// commands run one after the other and what they all print is the value. A
+// `&` in it separates like `;` — the value is everything printed, so the
+// substitution waits for that command anyway. The whole text ran as one
+// command, and `$(echo a ; echo b)` was "a ; echo b".
+//
 // What the commands of $(...) wrote to stderr, held until the shell that is
 // expanding the line can put it on its terminal (cap_err_show). Past the
 // buffer, the rest is counted and the count shown.
@@ -1368,6 +1395,25 @@ fn _cap_err_take(fd as i64) as i64 {
         k = k + 1;
     }
     return 1;
+}
+
+// Append m[0, len) to cap_err: a complaint about $(...) that is the shell's
+// own, shown with what its commands said on stderr.
+fn _cap_err_add(m as *u8, len as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < len) {
+        if (cap_err_len < 2048) { cap_err[cap_err_len] = m[k]; cap_err_len = cap_err_len + 1; }
+        else { cap_err_lost = cap_err_lost + 1; }
+        k = k + 1;
+    }
+    return;
+}
+
+fn _cap_err_add_z(m as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (m[n] != cast(u8, 0)) { n = n + 1; }
+    _cap_err_add(m, n);
+    return;
 }
 
 // Put what $(...) said on stderr on the terminal, after the expansion that ran
@@ -1395,6 +1441,68 @@ fn cap_err_show(t as *term.Term) as void {
     cap_err_len = 0;
     cap_err_lost = 0;
     term.flush(t);
+}
+
+// _capture_one — one command of a $(...) list (wbase already past the
+// caller's words): run it, append its stdout to out, and return its status,
+// the last stage's exit code. A command that cannot start says why, with
+// what the list said on stderr; it used to come out empty without a word.
+fn _capture_one(src as *u8, len as i64, out as *u8, n as *i64) as i64 {
+    tokenise(src, len);
+    glob_words();
+    let is i64 as nc = build_cmds();
+    if (nc == 0 - 2) { _cap_err_add_z("syntax: redirect with no target, in $(...)\n"); return 2; }
+    if (nc < 0) { _cap_err_add_z("syntax: | with no command on one side, in $(...)\n"); return 2; }
+    if (nc == 0) { return 0; }
+    let is i64 as slot = exec(0, src, len, 0 - 1, cast(*i64, 0), 0);
+    if (slot < 0) {
+        let is [192]u8 as m;
+        let is i64 as ml = failure_text(slot, cast(*u8, &m[0]));
+        _cap_err_add(cast(*u8, &m[0]), ml);
+        return failure_status(slot);
+    }
+    let is *jobs.Job as jb = jobs.get(slot);
+    let is [256]u8 as buf;
+    let is i64 as reading with mut = 1;
+    while (reading == 1) {
+        let is [6]i64 as pe;
+        pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
+        let is i64 as np with mut = 1;
+        if (jb.err_fd >= 0) { pe[3] = jb.err_fd; pe[4] = sys.POLL_READABLE; pe[5] = 0; np = 2; }
+        sys.poll(&pe[0], np, 1000000000);
+        // Its complaints, kept for the shell to show (cap_err_show): a stage
+        // blocked on a full error channel would otherwise never finish the
+        // output this is waiting for.
+        if (np == 2 && (pe[5] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+            if (_cap_err_take(jb.err_fd) == 0) { sys.close(jb.err_fd); jb.err_fd = 0 - 1; }
+        }
+        if ((pe[2] & sys.POLL_READABLE) != 0) {
+            let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
+            if (got <= 0) { reading = 0; }
+            else {
+                let is i64 as k with mut = 0;
+                while (k < got) { _put(out, n, cast(i64, buf[k])); k = k + 1; }
+            }
+        } else if ((pe[2] & sys.POLL_CLOSED) != 0) { reading = 0; }
+        else if (jobs.get(slot).status != jobs.JOB_RUN) { reading = 0; }
+    }
+    // Whatever it said on its way out, up to the end of the channel.
+    let is i64 as eg with mut = 0;
+    while (jb.err_fd >= 0 && eg < 64) {
+        let is [3]i64 as ep;
+        ep[0] = jb.err_fd; ep[1] = sys.POLL_READABLE; ep[2] = 0;
+        sys.poll(&ep[0], 1, 200000000);
+        if ((ep[2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) == 0) { eg = 64; }
+        else if (_cap_err_take(jb.err_fd) == 0) { eg = 64; }
+        eg = eg + 1;
+    }
+    // The status is the last stage's, for the && and || after it. Its output
+    // ended, so it has exited or is about to; the stages before it may still
+    // be writing to a reader that is gone, and end_job stops those.
+    let is i64 as code with mut = 0;
+    sys.wait_exit(jobs.last_pid(slot), &code);
+    jobs.end_job(slot);
+    return code;
 }
 
 fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
@@ -1431,54 +1539,39 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
         i = i + 1;
     }
 
-    wbase = s_wfill;
-    tokenise(src, len);
-    glob_words();
-    let is i64 as nc = build_cmds();
-    let is i64 as slot with mut = 0 - 1;
-    if (nc > 0) { slot = exec(0, src, len, 0 - 1, cast(*i64, 0), 0); }
-
-    if (slot >= 0) {
-        let is *jobs.Job as jb = jobs.get(slot);
-        let is [256]u8 as buf;
-        let is i64 as start = n[0];
-        let is i64 as reading with mut = 1;
-        while (reading == 1) {
-            let is [6]i64 as pe;
-            pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
-            let is i64 as np with mut = 1;
-            if (jb.err_fd >= 0) { pe[3] = jb.err_fd; pe[4] = sys.POLL_READABLE; pe[5] = 0; np = 2; }
-            sys.poll(&pe[0], np, 1000000000);
-            // Its complaints, kept for the shell to show (cap_err_show): a
-            // stage blocked on a full error channel would otherwise never
-            // finish the output this is waiting for.
-            if (np == 2 && (pe[5] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
-                if (_cap_err_take(jb.err_fd) == 0) { sys.close(jb.err_fd); jb.err_fd = 0 - 1; }
-            }
-            if ((pe[2] & sys.POLL_READABLE) != 0) {
-                let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
-                if (got <= 0) { reading = 0; }
-                else {
-                    let is i64 as k with mut = 0;
-                    while (k < got) { _put(out, n, cast(i64, buf[k])); k = k + 1; }
+    let is i64 as start = n[0];
+    if (list_valid(src, len) == 0) {
+        _cap_err_add_z("syntax: ; && || or & with no command on one side, in $(...)\n");
+    } else {
+        let is i64 as p with mut = 0;
+        let is i64 as prev with mut = OP_SEMI;         // the operator before this part
+        let is i64 as status with mut = 0;
+        let is i64 as going with mut = 1;
+        while (going == 1) {
+            let is i64 as at with mut = 0;
+            let is i64 as oplen with mut = 0;
+            let is i64 as op = list_scan(src, len, p, &at, &oplen);
+            let is i64 as a with mut = p;
+            let is i64 as b with mut = at;
+            while (a < b && _blank(src[a]) == 1) { a = a + 1; }
+            while (b > a && _blank(src[b - 1]) == 1) { b = b - 1; }
+            if (a == b) { going = 0; }                  // the end, after ';' or '&'
+            else {
+                let is i64 as run with mut = 1;
+                if (prev == OP_AND && status != 0) { run = 0; }
+                if (prev == OP_OR && status == 0) { run = 0; }
+                if (run == 1) {
+                    wbase = s_wfill;
+                    status = _capture_one(cast(*u8, cast(i64, src) + a), b - a, out, n);
                 }
-            } else if ((pe[2] & sys.POLL_CLOSED) != 0) { reading = 0; }
-            else if (jobs.get(slot).status != jobs.JOB_RUN) { reading = 0; }
+                if (op == OP_END) { going = 0; }
+                prev = op;
+                p = at + oplen;
+            }
         }
-        while (n[0] > start && (out[n[0] - 1] == cast(u8, 10) || out[n[0] - 1] == cast(u8, 13))) {
-            n[0] = n[0] - 1;
-        }
-        // Whatever it said on its way out, up to the end of the channel.
-        let is i64 as eg with mut = 0;
-        while (jb.err_fd >= 0 && eg < 64) {
-            let is [3]i64 as ep;
-            ep[0] = jb.err_fd; ep[1] = sys.POLL_READABLE; ep[2] = 0;
-            sys.poll(&ep[0], 1, 200000000);
-            if ((ep[2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) == 0) { eg = 64; }
-            else if (_cap_err_take(jb.err_fd) == 0) { eg = 64; }
-            eg = eg + 1;
-        }
-        jobs.end_job(slot);
+    }
+    while (n[0] > start && (out[n[0] - 1] == cast(u8, 10) || out[n[0] - 1] == cast(u8, 13))) {
+        n[0] = n[0] - 1;
     }
 
     // Restore the caller's parse state.
