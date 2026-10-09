@@ -105,6 +105,21 @@ let is i64 as g_kfd with mut = 0;
 let is km.Keymap as kmap with mut;
 let is i64 as g_km_stamp with mut = 0;
 
+// Keys are taken from the keyboard in batches — everything queued at once —
+// and the screen is presented once per batch, not once per key. One event per
+// pass round the main loop, each with a full-screen present, was slower than
+// keys arrive when they come fast (a paste, a script typing, a quick typist on
+// a slow machine), and the kernel's ring filled and dropped the rest of the
+// line. While a batch is being handled, show() only notes that the screen
+// changed; the batch's end presents it.
+let is [512]u8 as kev with mut;
+let is i64 as g_batch with mut = 0;
+let is i64 as g_dirty with mut = 0;
+fn show(t as *term.Term) as void {
+    if (g_batch == 1) { g_dirty = 1; return; }
+    term.flush(t);
+}
+
 // Show CapsLock and NumLock on the keyboard (a failure is the kernel's to
 // report; the keys work the same without their lights).
 fn set_leds() as void {
@@ -314,7 +329,7 @@ fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
         // now go to, and the one whose completion prints the next prompt.
         jobs.get(j).bg = 0;
         fg_job = j;
-        ta_end = 0;
+        ta_end = 0; ta_late = 0;
         term.puts(t, jobs.cmd_ptr(j), jobs.cmd_len(j));
         term.putc(t, 0x0A);
         return;
@@ -351,7 +366,7 @@ fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
         sx.set_status(sx.failure_status(slot));
         return;
     }
-    if (bg == 1) { print_job(t, slot, "\n"); sx.set_status(0); } else { fg_job = slot; ta_end = 0; }
+    if (bg == 1) { print_job(t, slot, "\n"); sx.set_status(0); } else { fg_job = slot; ta_end = 0; ta_late = 0; }
     return;
 }
 
@@ -410,9 +425,17 @@ fn finish_job(t as *term.Term, slot as i64) as void {
             if (sys.chan_info(jb.in_fd, &ci[0]) == 0) { unread = ci[0] - ci[2]; }
         }
         if (unread > ta_end) { unread = ta_end; }
-        if (unread > TA_CAP) { unread = TA_CAP; }
+        // Then what it could no longer be sent at all: keys typed after it had
+        // stopped taking input, in the order they came.
+        let is i64 as late = ta_late;
+        if (unread + late > TA_CAP) { unread = TA_CAP - late; }
+        if (unread < 0) { unread = 0; }
         let is i64 as k with mut = 0;
         while (k < unread) { ta_back[k] = ta_ring[(ta_end - unread + k) % TA_CAP]; k = k + 1; }
+        let is i64 as lk with mut = 0;
+        while (lk < late) { ta_back[unread + lk] = ta_ring[(ta_end + lk) % TA_CAP]; lk = lk + 1; }
+        unread = unread + late;
+        ta_late = 0;
         // This is where '$?' comes from. Without it the status a script or an
         // `if` reads is whatever a builtin last returned, not what the command
         // the user actually ran exited with.
@@ -485,16 +508,33 @@ fn key_to_fg(sym as i64, mods as i64) as void {
 // forward, newest last, as much as the channel holds. When the job ends, the
 // part it never read goes back to the prompt (finish_job) — the way a tty
 // keeps type-ahead. It used to die with the job.
+//
+// Keys the job can no longer be sent go on after them, as ta_late: a write
+// that fails or falls short means the job has stopped taking input (it ended,
+// and its end has not been collected yet), and from then on nothing more is
+// written, so the order stays the order they were typed in. Those used to be
+// lost — and with keys taken a batch at a time, a whole line typed just after a
+// short command ended went with them.
 let is i64 as TA_CAP with imut = 8192;
 let is [8192]u8 as ta_ring with mut;
 let is i64 as ta_end with mut = 0;
+let is i64 as ta_late with mut = 0;
 let is [8192]u8 as ta_back with mut;
 
 fn to_child(cin as i64, p as *u8, n as i64) as void {
-    let is i64 as w = syscall(11, cin, cast(i64, p), n);
+    let is i64 as w with mut = 0;
+    if (ta_late == 0) {
+        w = syscall(11, cin, cast(i64, p), n);
+        if (w < 0) { w = 0; }
+    }
     let is i64 as k with mut = 0;
     while (k < w) { ta_ring[(ta_end + k) % TA_CAP] = p[k]; k = k + 1; }
-    if (w > 0) { ta_end = ta_end + w; }
+    ta_end = ta_end + w;
+    while (k < n && ta_late < TA_CAP) {
+        ta_ring[(ta_end + ta_late) % TA_CAP] = p[k];
+        ta_late = ta_late + 1;
+        k = k + 1;
+    }
     return;
 }
 
@@ -544,7 +584,7 @@ fn _edit(t as *term.Term, what as i64) as void {
     else if (what == 8) { ok = repl.yank(&rl); }
     else if (what == 9) { ok = repl.transpose(&rl); }
     else if (what == 10) { ok = repl.line_delete(&rl); }
-    if (ok == 1) { repl.redraw(&rl, t); term.flush(t); }
+    if (ok == 1) { repl.redraw(&rl, t); show(t); }
     return;
 }
 
@@ -555,21 +595,21 @@ fn key_to_line(t as *term.Term, sym as i64, mods as i64) as void {
     // do what); any other key ends it, keeping the line found, and then goes
     // on below as usual.
     if (repl.searching(&rl) == 1) {
-        if (ctrl != 0 && ck == 0x72) { repl.search_next(&rl, t); term.flush(t); return; }      // Ctrl+R
+        if (ctrl != 0 && ck == 0x72) { repl.search_next(&rl, t); show(t); return; }      // Ctrl+R
         if ((ctrl != 0 && ck == 0x67) || sym == ks.KEY_ESC) {
-            repl.search_end(&rl, t, 0); term.flush(t); return;            // Ctrl+G, Esc
+            repl.search_end(&rl, t, 0); show(t); return;            // Ctrl+G, Esc
         }
-        if (sym == ks.KEY_BACKSPACE) { repl.search_back(&rl, t); term.flush(t); return; }
-        if (ctrl == 0 && sym >= 0x20 && sym < ks.KEY_BASE) { repl.search_key(&rl, t, sym); term.flush(t); return; }
+        if (sym == ks.KEY_BACKSPACE) { repl.search_back(&rl, t); show(t); return; }
+        if (ctrl == 0 && sym >= 0x20 && sym < ks.KEY_BASE) { repl.search_key(&rl, t, sym); show(t); return; }
         repl.search_end(&rl, t, 1);
-        term.flush(t);
+        show(t);
     }
     if (sym == ks.KEY_UP) {                                     // older history
-        if (repl.nav_up(&rl, t) == 1) { term.flush(t); }
+        if (repl.nav_up(&rl, t) == 1) { show(t); }
         return;
     }
     if (sym == ks.KEY_DOWN) {                                   // newer history
-        if (repl.nav_down(&rl, t) == 1) { term.flush(t); }
+        if (repl.nav_down(&rl, t) == 1) { show(t); }
         return;
     }
     if (sym == ks.KEY_LEFT) { _edit(t, 1); return; }
@@ -586,18 +626,18 @@ fn key_to_line(t as *term.Term, sym as i64, mods as i64) as void {
         if (ck == 0x74) { _edit(t, 9); return; }       // Ctrl+T  transpose
         if (ck == 0x61) { _edit(t, 3); return; }       // Ctrl+A  start of line
         if (ck == 0x65) { _edit(t, 4); return; }       // Ctrl+E  end of line
-        if (ck == 0x72) { repl.search_next(&rl, t); term.flush(t); return; }   // Ctrl+R  search history
+        if (ck == 0x72) { repl.search_next(&rl, t); show(t); return; }   // Ctrl+R  search history
         if (ck == 0x6C) {                              // Ctrl+L  clear the screen
             term.clear(t);
             prompt(t);
             repl.reprint(&rl, t);
-            term.flush(t);
+            show(t);
             return;
         }
         if (ck == 0x63) {                              // Ctrl+C  drop the line
             repl.cancel(&rl, t);
             prompt(t);
-            term.flush(t);
+            show(t);
             return;
         }
         // Ctrl+D deletes at the cursor. On an empty line it does nothing:
@@ -628,16 +668,16 @@ fn line_char(t as *term.Term, c as i64) as void {
         run_line(t, repl.line_ptr(&rl), repl.line_len(&rl));
         repl.line_clear(&rl);
         if (fg_job < 0) { prompt(t); }      // a foreground job prints it when it ends
-        term.flush(t);
+        show(t);
     } else if (c == 0x09) {                                     // Tab — autocomplete
         let is [64]i64 as bt;
         let is i64 as nb = builtins(cast(*i64, &bt[0]));
         repl.complete(&rl, t, cast(*i64, &bt[0]), nb);
-        term.flush(t);
+        show(t);
     } else if (c == 0x08) {
-        if (repl.line_backspace(&rl) == 1) { repl.redraw(&rl, t); term.flush(t); }
+        if (repl.line_backspace(&rl) == 1) { repl.redraw(&rl, t); show(t); }
     } else if (c != 0) {
-        if (repl.line_push(&rl, c) == 1) { repl.redraw(&rl, t); term.flush(t); }
+        if (repl.line_push(&rl, c) == 1) { repl.redraw(&rl, t); show(t); }
     }
     return;
 }
@@ -794,7 +834,16 @@ fn main() as i32 {
         }
 
         if ((pe[2] & sys.POLL_READABLE) != 0) {
-            if (input.read_event(g_kfd, &ev) == 1) {
+            // Everything queued, in one read (the kernel hands over what it
+            // has, never more than asked); a remainder is the next pass's.
+            let is i64 as got = sys.read(g_kfd, cast(*u8, &kev[0]), 512);
+            g_batch = 1;
+            let is i64 as at with mut = 0;
+            while (at + 2 <= got) {
+                ev.scancode = cast(i64, kev[at]);
+                ev.pressed = cast(i64, kev[at + 1]) & 1;
+                ev.extended = (cast(i64, kev[at + 1]) >> 1) & 1;
+                at = at + 2;
                 let is [2]i64 as syms;
                 let is i64 as locks = km.locks(&kmap);
                 let is i64 as nsym = km.key(&kmap, ev.scancode, ev.extended, ev.pressed, cast(*i64, &syms[0]));
@@ -810,13 +859,15 @@ fn main() as i32 {
                         let is i64 as page with mut = t.rows - 1;
                         if (page < 1) { page = 1; }
                         if (sym == ks.KEY_PGUP) { term.scroll_view(&t, page); } else { term.scroll_view(&t, 0 - page); }
-                        term.flush(&t);
+                        show(&t);
                     } else {
-                        if (t.view_off != 0) { term.scroll_view(&t, 0 - t.view_off); term.flush(&t); }
+                        if (t.view_off != 0) { term.scroll_view(&t, 0 - t.view_off); show(&t); }
                         if (fg_job >= 0) { key_to_fg(sym, mods); } else { key_to_line(&t, sym, mods); }
                     }
                 }
             }
+            g_batch = 0;
+            if (g_dirty == 1) { g_dirty = 0; term.flush(&t); }
         }
 
         let is i64 as k with mut = 0;
