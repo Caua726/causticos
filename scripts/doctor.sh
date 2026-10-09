@@ -13,9 +13,16 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 FAIL=0
-ok()   { printf '  \033[32mok\033[0m    %-22s %s\n' "$1" "${2:-}"; }
-warn() { printf '  \033[33mwarn\033[0m  %-22s %s\n' "$1" "$2"; }
-bad()  { printf '  \033[31mFAIL\033[0m  %-22s %s\n' "$1" "$2"; FAIL=1; }
+# Colour only for a person at a terminal. Piped into a log, a CI step or `less`
+# the escape codes arrive as text (^[[32mok^[[0m) around every verdict; NO_COLOR
+# turns them off on a terminal too (https://no-color.org).
+C_OK=""; C_WARN=""; C_BAD=""; C_END=""
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_BAD=$'\033[31m'; C_END=$'\033[0m'
+fi
+ok()   { printf '  %sok%s    %-22s %s\n' "$C_OK" "$C_END" "$1" "${2:-}"; }
+warn() { printf '  %swarn%s  %-22s %s\n' "$C_WARN" "$C_END" "$1" "$2"; }
+bad()  { printf '  %sFAIL%s  %-22s %s\n' "$C_BAD" "$C_END" "$1" "$2"; FAIL=1; }
 
 need_tool() {   # need_tool <name> <fix>
     local p; p="$(command -v "$1" 2>/dev/null)"
