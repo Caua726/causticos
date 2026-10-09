@@ -357,8 +357,9 @@ refuses them, as GNU does.
 `wc` leaves a single selected stdin count unpadded (`echo pipe | wc -c` prints
 `5`). Multiple selected pipe counts retain aligned columns.
 
-`ps`, `htop`, and `btop` represent the kernel once, as PID 0. The first actual
-user program is PID 1, with its own threads and resident memory; there is no
+`ps`, `htop`, and `btop` represent the kernel once, as PID 0, with the kernel's
+own threads; each user thread is counted on its process's row only. The first
+actual user program is PID 1, with its own threads and resident memory; there is no
 empty synthetic `init` process. Children whose parent exits are adopted by the
 kernel root (PPID 0), and the orphan reaper collects them after they exit.
 The fullscreen shell starts boot services only when it is PID 1. Other shells,
