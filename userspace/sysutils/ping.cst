@@ -1,23 +1,22 @@
 // ping — the first real round trip.
 //
-// Holds a network port itself rather than talking to a daemon, because no
-// daemon exists yet and because that is a legitimate way to use the machine:
-// DEV_NET is a preemptible exclusive device, so a program may take it, use it,
-// and hand it back. When netd lands, ping keeps working exactly like this and
-// gains the option of going through it instead.
+// Holds a network port itself rather than going through netd: DEV_NET is a
+// preemptible exclusive device, so a program may take it, use it, and hand it
+// back. netd goes quiet on that port while ping holds it and resumes after.
 //
 // Everything below the ICMP echo is the library code nett already proves
 // without a network. What this adds is the part that cannot be proved that
 // way: that real frames go out, real frames come back, and the two match.
 //
-// The address is static. DHCP is a later phase, and QEMU's SLIRP hands out
-// 10.0.2.15/24 with a gateway at 10.0.2.2, so those are the defaults — stated
-// here rather than discovered, and overridable, which is honest about what
-// this does and does not yet do.
+// The port's address, netmask and gateway are the ones netd leased for it,
+// asked over the gate this program was given. They used to be fixed at
+// 10.0.2.15/24 via 10.0.2.2 — QEMU's first network — so the second port,
+// on a network of its own, could not reach its own gateway. -s and -g
+// override what the lease says; with no netd, -s is required.
 //
 //   ping 10.0.2.2              — four echoes
 //   ping -c 10 10.0.2.2        — ten
-//   ping -i 1 10.0.2.2         — from port index 1 (the second NIC)
+//   ping -i 1 10.0.3.2         — from port index 1 (the second NIC)
 //   ping -s 10.0.2.42 10.0.2.3 — a different source address
 
 use "std/causticos/prog.cst" as prog;
@@ -26,10 +25,11 @@ use "../lib/netbuf/netbuf.cst" as nb;
 use "../lib/neteth/neteth.cst" as eth;
 use "../lib/netarp/netarp.cst" as arp;
 use "../lib/netip/netip.cst" as ip;
+use "../lib/netcli/netcli.cst" as nc;
+use "../lib/netcli/netsvc.cst" as netsvc;
 
-let is i64 as DEFAULT_SRC = 0x0A00020F;     // 10.0.2.15
-let is i64 as DEFAULT_GW  = 0x0A000202;     // 10.0.2.2
-let is i64 as DEFAULT_MASK_BITS = 24;
+// The netmask assumed for an address given with -s when no lease says one.
+let is i64 as EXPLICIT_MASK_BITS = 24;
 
 let is i64 as ARP_WAIT_NS  = 2000000000;
 let is i64 as ECHO_WAIT_NS = 2000000000;
@@ -329,13 +329,25 @@ fn usage() as void {
     return;
 }
 
+// The address, netmask and gateway netd leased for `port`, into out[0..2].
+// 0, or why not: no netd, or netd has no address on that port yet.
+fn leased(port as i64, out as *i64) as i64 {
+    let is i64 as rc with mut = netsvc.adopt();
+    if (rc != 0) { return rc; }
+    let is [4]i64 as info;
+    rc = nc.iface_info(port, cast(*i64, &info[0]));
+    if (rc != 0) { return rc; }
+    if (info[0] == 0) { return sys.E_AGAIN; }
+    out[0] = info[0]; out[1] = info[1]; out[2] = info[2];
+    return 0;
+}
+
 fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as count with mut = 4;
     let is i64 as port with mut = 0;
     let is i64 as dst with mut = 0;
-    our_ip = DEFAULT_SRC;
-    gw_ip = DEFAULT_GW;
-    our_mask = ip.prefix_mask(DEFAULT_MASK_BITS);
+    let is i64 as src_arg with mut = 0;
+    let is i64 as gw_arg with mut = 0;
 
     let is i64 as ai with mut = 1;
     while (ai < argc) {
@@ -345,8 +357,8 @@ fn main(argc as i64, argv as *u8) as i32 {
             let is *u8 as v = prog.arg(argv, ai + 1);
             if (a[1] == cast(u8, 99)) { count = parse_num(v); }        // -c
             else if (a[1] == cast(u8, 105)) { port = parse_num(v); }   // -i
-            else if (a[1] == cast(u8, 115)) { our_ip = parse_ip(v); }  // -s
-            else if (a[1] == cast(u8, 103)) { gw_ip = parse_ip(v); }   // -g
+            else if (a[1] == cast(u8, 115)) { src_arg = parse_ip(v); } // -s
+            else if (a[1] == cast(u8, 103)) { gw_arg = parse_ip(v); }  // -g
             else { usage(); return cast(i32, 1); }
             ai = ai + 2;
         } else {
@@ -354,8 +366,28 @@ fn main(argc as i64, argv as *u8) as i32 {
             ai = ai + 1;
         }
     }
-    if (dst <= 0 || count <= 0 || port < 0 || our_ip <= 0 || gw_ip <= 0) {
+    if (dst <= 0 || count <= 0 || port < 0 || src_arg < 0 || gw_arg < 0) {
         usage();
+        return cast(i32, 1);
+    }
+
+    // The lease first, then what was given explicitly over it.
+    let is [3]i64 as lease;
+    let is i64 as lrc = leased(port, cast(*i64, &lease[0]));
+    if (lrc == 0) {
+        our_ip = lease[0]; our_mask = lease[1]; gw_ip = lease[2];
+    } else {
+        our_mask = ip.prefix_mask(EXPLICIT_MASK_BITS);
+    }
+    if (src_arg > 0) { our_ip = src_arg; }
+    if (gw_arg > 0) { gw_ip = gw_arg; }
+    if (our_ip <= 0) {
+        prog.errs("ping: port ");
+        prog.err_num(port);
+        prog.errs(" has no address (");
+        if (lrc == sys.E_AGAIN) { prog.errs("netd has no lease on it yet"); }
+        else { prog.errs(netsvc.why(lrc)); }
+        prog.errs("); give one with -s\n");
         return cast(i32, 1);
     }
 
