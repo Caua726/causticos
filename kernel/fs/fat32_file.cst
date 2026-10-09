@@ -1,7 +1,14 @@
 // fat32_file.cst — file data: reading a file's cluster chain, and writing or
 // truncating at any offset, growing or shrinking the chain to fit.
+//
+// Writes and truncations fail with the VFS's own codes — VFS_ENOSPC when the
+// volume is full, VFS_EIO when the disk does not answer — which the syscall
+// layer turns into what a program can name. They were small local numbers
+// (-3 for "no cluster"), and every one of them reached write() as "invalid
+// argument": hexedit said "Save failed: invalid argument" on a full disk.
 
 use "fat32_vol.cst" as fatvol;
+use "vfs.cst" as vfs;
 
 // ============================================================
 // File read — walk the cluster chain of `first_cluster`, copying up
@@ -75,13 +82,13 @@ fn file_write_at(v as *fatvol.Fat32Volume,
                  first_cluster as i64, old_size as i64,
                  offset as i64, data as *u8, data_len as i64,
                  out_first_cluster as *i64, h as *i64) as i64 {
-    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (cast(i64, v) == 0) { return cast(i64, vfs.VFS_EINVAL); }
     fatvol.fat_batch_begin();
     let is i64 as r = file_write_chain(v, first_cluster, old_size, offset,
                                        data, data_len, out_first_cluster, h);
     let is i32 as wb = fatvol.fat_batch_end(v);
     if (r < 0) { return r; }
-    if (wb != 0) { return 0 - 10; }
+    if (wb != 0) { return cast(i64, vfs.VFS_EIO); }
     return r;
 }
 
@@ -89,14 +96,14 @@ fn file_write_chain(v as *fatvol.Fat32Volume,
                     first_cluster as i64, old_size as i64,
                     offset as i64, data as *u8, data_len as i64,
                     out_first_cluster as *i64, h as *i64) as i64 {
-    if (offset < 0 || data_len < 0) { return 0 - 1; }
+    if (offset < 0 || data_len < 0) { return cast(i64, vfs.VFS_EINVAL); }
     let is i64 as first with mut = first_cluster;
     let is i64 as size with mut = old_size;
     if (data_len == 0) {
         *out_first_cluster = first;
         return size;
     }
-    if (fatvol.ensure_scratch() != 0) { return 0 - 2; }
+    if (fatvol.ensure_scratch() != 0) { return cast(i64, vfs.VFS_ENOMEM); }
 
     while (size < offset) {
         let is i64 as z with mut = offset - size;
@@ -110,7 +117,7 @@ fn file_write_chain(v as *fatvol.Fat32Volume,
 
     if (first == 0) {
         first = fatvol.cluster_alloc(v);
-        if (first < 0) { return 0 - 3; }
+        if (first < 0) { return first; }
     }
     *out_first_cluster = first;
 
@@ -118,7 +125,8 @@ fn file_write_chain(v as *fatvol.Fat32Volume,
     let is i64 as end = offset + data_len;
     let is i64 as idx with mut = offset / cbytes;
     let is i64 as cur_cluster with mut = fatvol.walk_to(v, first, idx, h, 1);
-    if (cur_cluster < 2) { return 0 - 4; }
+    if (cur_cluster < 0) { return cur_cluster; }
+    if (cur_cluster < 2) { return cast(i64, vfs.VFS_EIO); }
 
     let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
     let is i64 as written with mut = 0;
@@ -140,10 +148,10 @@ fn file_write_chain(v as *fatvol.Fat32Volume,
         if (in_clus_off == 0 && chunk == cbytes) {
             while (k < cbytes) { buf[k] = data[written + k]; k = k + 1; }
         } else {
-            if (fatvol.cluster_read(v, cur_cluster, buf) != 0) { return 0 - 5; }
+            if (fatvol.cluster_read(v, cur_cluster, buf) != 0) { return cast(i64, vfs.VFS_EIO); }
             while (k < chunk) { buf[in_clus_off + k] = data[written + k]; k = k + 1; }
         }
-        if (fatvol.cluster_write(v, cur_cluster, buf) != 0) { return 0 - 6; }
+        if (fatvol.cluster_write(v, cur_cluster, buf) != 0) { return cast(i64, vfs.VFS_EIO); }
 
         written = written + chunk;
         cur_off = cur_off + chunk;
@@ -151,11 +159,11 @@ fn file_write_chain(v as *fatvol.Fat32Volume,
         else {
             // Next cluster, linking a new one when the chain ends here.
             let is i64 as nxt with mut = fatvol.fat_read(v, cur_cluster);
-            if (nxt < 0) { return 0 - 7; }
+            if (nxt < 0) { return cast(i64, vfs.VFS_EIO); }
             if (fatvol.cluster_is_eof(nxt) == 1) {
                 nxt = fatvol.cluster_alloc(v);
-                if (nxt < 0) { return 0 - 8; }
-                if (fatvol.fat_write(v, cur_cluster, nxt) != 0) { return 0 - 9; }
+                if (nxt < 0) { return nxt; }
+                if (fatvol.fat_write(v, cur_cluster, nxt) != 0) { return cast(i64, vfs.VFS_EIO); }
             }
             cur_cluster = nxt;
             idx = idx + 1;
@@ -175,20 +183,20 @@ fn file_write_chain(v as *fatvol.Fat32Volume,
 fn file_truncate(v as *fatvol.Fat32Volume,
                  first_cluster as i64, old_size as i64,
                  new_size as i64, out_first_cluster as *i64) as i32 {
-    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cast(i64, v) == 0) { return vfs.VFS_EINVAL; }
     fatvol.fat_batch_begin();
     let is i32 as rc = file_truncate_chain(v, first_cluster, old_size, new_size, out_first_cluster);
     let is i32 as wb = fatvol.fat_batch_end(v);
     if (rc != 0) { return rc; }
-    if (wb != 0) { return cast(i32, 0 - 9); }
+    if (wb != 0) { return vfs.VFS_EIO; }
     return 0;
 }
 
 fn file_truncate_chain(v as *fatvol.Fat32Volume,
                        first_cluster as i64, old_size as i64,
                        new_size as i64, out_first_cluster as *i64) as i32 {
-    if (new_size < 0) { return cast(i32, 0 - 1); }
-    if (fatvol.ensure_scratch() != 0) { return cast(i32, 0 - 2); }
+    if (new_size < 0) { return vfs.VFS_EINVAL; }
+    if (fatvol.ensure_scratch() != 0) { return vfs.VFS_ENOMEM; }
 
     let is i64 as cbytes = v.cluster_size_bytes;
 
@@ -207,11 +215,11 @@ fn file_truncate_chain(v as *fatvol.Fat32Volume,
     if (new_size < old_size) {
         // Shrink: keep first `want` clusters, free the rest, cut chain.
         let is i64 as keep_last = fatvol.chain_advance(v, first_cluster, want - 1);
-        if (keep_last < 2) { return cast(i32, 0 - 3); }
+        if (keep_last < 2) { return vfs.VFS_EIO; }
         let is i64 as tail = fatvol.fat_read(v, keep_last);
-        if (tail < 0) { return cast(i32, 0 - 4); }
+        if (tail < 0) { return vfs.VFS_EIO; }
         // Mark keep_last as EOC.
-        if (fatvol.fat_write(v, keep_last, 0x0FFFFFFF) != 0) { return cast(i32, 0 - 5); }
+        if (fatvol.fat_write(v, keep_last, 0x0FFFFFFF) != 0) { return vfs.VFS_EIO; }
         if (fatvol.cluster_is_eof(tail) == 0) {
             fatvol.chain_free(v, tail);
         }
@@ -220,12 +228,12 @@ fn file_truncate_chain(v as *fatvol.Fat32Volume,
         let is i64 as in_last = new_size % cbytes;
         if (in_last > 0) {
             if (fatvol.cluster_read(v, keep_last, cast(*u8, fatvol.clus_scratch_virt)) != 0) {
-                return cast(i32, 0 - 6);
+                return vfs.VFS_EIO;
             }
             let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
             let is i64 as z with mut = in_last;
             while (z < cbytes) { buf[z] = cast(u8, 0); z = z + 1; }
-            if (fatvol.cluster_write(v, keep_last, buf) != 0) { return cast(i32, 0 - 7); }
+            if (fatvol.cluster_write(v, keep_last, buf) != 0) { return vfs.VFS_EIO; }
         }
         *out_first_cluster = first_cluster;
         return 0;
@@ -234,9 +242,8 @@ fn file_truncate_chain(v as *fatvol.Fat32Volume,
     // Grow: ensure chain has `want` clusters. Pad the final partial
     // cluster's tail with zeros so reads past old_size return zero.
     let is i64 as new_first with mut = first_cluster;
-    if (fatvol.chain_ensure_length(v, first_cluster, want, &new_first) != 0) {
-        return cast(i32, 0 - 8);
-    }
+    let is i32 as grc = fatvol.chain_ensure_length(v, first_cluster, want, &new_first);
+    if (grc != 0) { return grc; }
 
     // Zero the region between old_size and new_size in the cluster(s)
     // that straddle that boundary. For the cluster containing old_size
@@ -252,12 +259,12 @@ fn file_truncate_chain(v as *fatvol.Fat32Volume,
             if (tail_off > 0) {
                 let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
                 if (fatvol.cluster_read(v, tail_cluster, buf) != 0) {
-                    return cast(i32, 0 - 9);
+                    return vfs.VFS_EIO;
                 }
                 let is i64 as z with mut = tail_off;
                 while (z < cbytes) { buf[z] = cast(u8, 0); z = z + 1; }
                 if (fatvol.cluster_write(v, tail_cluster, buf) != 0) {
-                    return cast(i32, 0 - 10);
+                    return vfs.VFS_EIO;
                 }
             }
         }
@@ -267,11 +274,11 @@ fn file_truncate_chain(v as *fatvol.Fat32Volume,
     let is i64 as zc with mut = fatvol.chain_advance(v, new_first, zfrom);
     let is i64 as zidx with mut = zfrom;
     while (zidx < want && zc >= 2) {
-        if (fatvol.cluster_zero(v, zc) != 0) { return cast(i32, 0 - 11); }
+        if (fatvol.cluster_zero(v, zc) != 0) { return vfs.VFS_EIO; }
         zidx = zidx + 1;
         if (zidx < want) {
             let is i64 as nxt = fatvol.fat_read(v, zc);
-            if (nxt < 0) { return cast(i32, 0 - 12); }
+            if (nxt < 0) { return vfs.VFS_EIO; }
             if (fatvol.cluster_is_eof(nxt) == 1) { zidx = want; }
             else { zc = nxt; }
         }

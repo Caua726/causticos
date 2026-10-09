@@ -517,7 +517,10 @@ fn fat_write(v as *Fat32Volume, cluster as i64, value as i64) as i32 {
 }
 
 // A free FAT entry, marked end-of-chain so a second alloc cannot pick it
-// before the caller links it. Returns the cluster number, -1 on ENOSPC.
+// before the caller links it. Returns the cluster number, VFS_ENOSPC when
+// the volume is full, or VFS_EIO when the FAT could not be read or written —
+// the caller passes either on as it is, so a full disk reaches write() as
+// "no space left" and not as a made-up "invalid argument".
 //
 // The search resumes where the last one stopped (wrapping once), the way
 // FAT's own FSInfo "next free" hint works. It used to start at cluster 3
@@ -525,7 +528,7 @@ fn fat_write(v as *Fat32Volume, cluster as i64, value as i64) as i32 {
 // growing a cluster at a time scanned past everything before it, again, for
 // each cluster — quadratic in the size of the disk's contents.
 fn cluster_alloc(v as *Fat32Volume) as i64 {
-    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (cast(i64, v) == 0) { return cast(i64, vfs.VFS_EINVAL); }
     let is i64 as max_c = v.cluster_count + 2;
     let is i64 as c with mut = v.alloc_next;
     if (c < 3 || c >= max_c) { c = 3; }
@@ -533,18 +536,18 @@ fn cluster_alloc(v as *Fat32Volume) as i64 {
     while (looked < max_c - 3) {
         let is i64 as entry = fat_read(v, c);
         if (entry == 0) {
-            if (fat_write(v, c, 0x0FFFFFFF) != 0) { return 0 - 2; }
+            if (fat_write(v, c, 0x0FFFFFFF) != 0) { return cast(i64, vfs.VFS_EIO); }
             v.alloc_next = c + 1;
             if (v.free_clusters > 0) { v.free_clusters = v.free_clusters - 1; }
             fsinfo_dirty = 1;
             return c;
         }
-        if (entry < 0) { return 0 - 2; }   // I/O
+        if (entry < 0) { return cast(i64, vfs.VFS_EIO); }
         c = c + 1;
         if (c >= max_c) { c = 3; }
         looked = looked + 1;
     }
-    return 0 - 1;
+    return cast(i64, vfs.VFS_ENOSPC);
 }
 
 // Freeing a cluster can make any open file's chain cursor (FileHint) point
@@ -624,10 +627,11 @@ fn hint_set(h as *i64, first as i64, idx as i64, cluster as i64) as void {
 // The cluster at index `idx` of the chain starting at `first`, from the cursor
 // when it is at or before idx. With extend=1 a chain that ends early is
 // lengthened (new clusters linked, contents left as they are — callers write
-// them or never expose them). Negative on I/O error, or past the end with
-// extend=0.
+// them or never expose them). Otherwise the cluster number: VFS_EIO on an
+// I/O error or a chain shorter than the file (extend=0), cluster_alloc's
+// error when lengthening it fails.
 fn walk_to(v as *Fat32Volume, first as i64, idx as i64, h as *i64, extend as i64) as i64 {
-    if (first < 2) { return 0 - 1; }
+    if (first < 2) { return cast(i64, vfs.VFS_EINVAL); }
     let is i64 as c with mut = first;
     let is i64 as i with mut = 0;
     if (hint_usable(h, first, idx) == 1) {
@@ -636,12 +640,12 @@ fn walk_to(v as *Fat32Volume, first as i64, idx as i64, h as *i64, extend as i64
     }
     while (i < idx) {
         let is i64 as nxt with mut = fat_read(v, c);
-        if (nxt < 0) { return 0 - 2; }
+        if (nxt < 0) { return cast(i64, vfs.VFS_EIO); }
         if (cluster_is_eof(nxt) == 1) {
-            if (extend == 0) { return 0 - 3; }
+            if (extend == 0) { return cast(i64, vfs.VFS_EIO); }
             nxt = cluster_alloc(v);
-            if (nxt < 0) { return 0 - 4; }
-            if (fat_write(v, c, nxt) != 0) { return 0 - 5; }
+            if (nxt < 0) { return nxt; }
+            if (fat_write(v, c, nxt) != 0) { return cast(i64, vfs.VFS_EIO); }
         }
         c = nxt;
         i = i + 1;
@@ -752,7 +756,7 @@ fn chain_advance(v as *Fat32Volume, first_cluster as i64,
 // Ensure the chain starting at `first_cluster` has at least `want`
 // clusters; allocate and link new clusters as needed. If first_cluster
 // is 0 (empty file), allocates fresh chain and returns the new head
-// via *out_first_cluster. Returns 0 on success.
+// via *out_first_cluster. Returns 0, VFS_ENOSPC or VFS_EIO.
 fn chain_ensure_length(v as *Fat32Volume, first_cluster as i64,
                        want as i64, out_first_cluster as *i64) as i32 {
     if (want <= 0) { *out_first_cluster = first_cluster; return 0; }
@@ -760,7 +764,7 @@ fn chain_ensure_length(v as *Fat32Volume, first_cluster as i64,
     let is i64 as head_c with mut = first_cluster;
     if (head_c == 0) {
         let is i64 as c = cluster_alloc(v);
-        if (c < 0) { return cast(i32, 0 - 1); }
+        if (c < 0) { return cast(i32, c); }
         head_c = c;
     }
 
@@ -768,11 +772,11 @@ fn chain_ensure_length(v as *Fat32Volume, first_cluster as i64,
     let is i64 as have with mut = 1;
     while (have < want) {
         let is i64 as nxt = fat_read(v, c);
-        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (nxt < 0) { return vfs.VFS_EIO; }
         if (cluster_is_eof(nxt) == 1) {
             let is i64 as new_c = cluster_alloc(v);
-            if (new_c < 0) { return cast(i32, 0 - 3); }
-            if (fat_write(v, c, new_c) != 0) { return cast(i32, 0 - 4); }
+            if (new_c < 0) { return cast(i32, new_c); }
+            if (fat_write(v, c, new_c) != 0) { return vfs.VFS_EIO; }
             c = new_c;
         } else {
             c = nxt;
