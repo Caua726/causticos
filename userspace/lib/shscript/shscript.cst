@@ -20,11 +20,20 @@ use "std/causticos/term.cst" as term;
 use "../shexec/shexec.cst" as sx;
 use "../shbuiltin/shbuiltin.cst" as bi;
 use "../repl/repl.cst" as repl;
+use "../grow/grow.cst" as grow;
 
-let is i64 as SRC_CAP  with imut = 4096;
-let is i64 as MAX_TOK  with imut = 512;
-let is i64 as MAX_STMT with imut = 128;
-let is i64 as MAX_FN   with imut = 8;
+// Every table here grows (lib/grow) instead of having a size picked for it:
+// reserved once as address space, backed with memory as a script reaches it.
+// They were 4096 bytes of source, 512 tokens, 128 statements, 64 statements a
+// block, 32 switch arms and 8 functions in 4096 bytes, and past most of them
+// the rest was dropped without a word — a `for` over 100 items ran 64 times,
+// and a long block lost its tail. Reaching a reservation, or the end of
+// memory first, is an error that says so (_room_text).
+let is i64 as SRC_LIMIT   with imut = 16777216;   // bytes of a construct's source
+let is i64 as TOK_LIMIT   with imut = 2097152;    // its tokens
+let is i64 as STMT_LIMIT  with imut = 1048576;    // its statements
+let is i64 as FN_LIMIT    with imut = 65536;      // functions defined
+let is i64 as FNBUF_LIMIT with imut = 67108864;   // bytes of their names and bodies
 
 // token kinds
 let is i64 as T_WORD  with imut = 0;
@@ -49,14 +58,20 @@ let is i64 as S_FOR    with imut = 3;
 let is i64 as S_SWITCH with imut = 4;
 let is i64 as S_FUNC   with imut = 5;
 
-let is [4096]u8 as src with mut;
+let is grow.Grow as src_g with mut;
+let is *u8 as src with mut = cast(*u8, 0);
 let is i64 as srclen with mut = 0;
 
-let is [512]i64 as t_kind with mut;
-let is [512]i64 as t_off with mut;
-let is [512]i64 as t_len with mut;
-let is [512]i64 as t_line with mut;
-let is [512]i64 as t_col with mut;
+let is grow.Grow as tkind_g with mut;
+let is grow.Grow as toff_g with mut;
+let is grow.Grow as tlen_g with mut;
+let is grow.Grow as tline_g with mut;
+let is grow.Grow as tcol_g with mut;
+let is *i64 as t_kind with mut = cast(*i64, 0);
+let is *i64 as t_off with mut = cast(*i64, 0);
+let is *i64 as t_len with mut = cast(*i64, 0);
+let is *i64 as t_line with mut = cast(*i64, 0);
+let is *i64 as t_col with mut = cast(*i64, 0);
 let is i64 as ntok with mut = 0;
 
 // A statement. Spans are token ranges; children are statement indices, held as
@@ -73,8 +88,19 @@ struct Stmt {
     d0 as i64;      // for: the variable's token; switch: first case; func: name token
     dn as i64;
 }
-let is [128]Stmt as st with mut;
+let is grow.Grow as st_g with mut;
+let is *Stmt as st with mut = cast(*Stmt, 0);
 let is i64 as nst with mut = 0;
+
+// A block's statements, gathered while its children parse (stk, a stack: a
+// nested block pushes above and pops back to where it started), then laid
+// down as one contiguous run in kids — see parse_block.
+let is grow.Grow as kids_g with mut;
+let is *i64 as kids with mut = cast(*i64, 0);
+let is i64 as nkids with mut = 0;
+let is grow.Grow as stk_g with mut;
+let is *i64 as stk with mut = cast(*i64, 0);
+let is i64 as stk_top with mut = 0;
 
 // Named functions.
 //
@@ -83,13 +109,99 @@ let is i64 as nst with mut = 0;
 // a function stores its own name and body TEXT in an arena that outlives the
 // script that defined it, and is re-parsed when it is called. That costs a
 // parse per call and buys a definition that is still there next time.
-let is [8]i64 as fn_name_off with mut;
-let is [8]i64 as fn_name_len with mut;
-let is [8]i64 as fn_body_off with mut;
-let is [8]i64 as fn_body_len with mut;
+// Four words a function in fnt: name offset, name length, body offset, body
+// length, all into fnbuf.
+let is grow.Grow as fnt_g with mut;
+let is *i64 as fnt with mut = cast(*i64, 0);
 let is i64 as nfn with mut = 0;
-let is [4096]u8 as fnbuf with mut;
+let is grow.Grow as fnbuf_g with mut;
+let is *u8 as fnbuf with mut = cast(*u8, 0);
 let is i64 as fnfill with mut = 0;
+
+// The lines a multi-line construct accumulates into, and span_text's line.
+let is grow.Grow as pend_g with mut;
+let is *u8 as pend with mut = cast(*u8, 0);
+let is i64 as pendlen with mut = 0;
+let is grow.Grow as span_g with mut;
+
+let is i64 as ready with mut = 0;
+
+// Reserve every table, once. 0, or E_NOMEM.
+fn _ready() as i64 {
+    if (ready == 1) { return 0; }
+    if (grow.init(&src_g, SRC_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&tkind_g, TOK_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&toff_g, TOK_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&tlen_g, TOK_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&tline_g, TOK_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&tcol_g, TOK_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&st_g, STMT_LIMIT * sizeof(Stmt)) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&kids_g, STMT_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&stk_g, STMT_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&fnt_g, FN_LIMIT * 32) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&fnbuf_g, FNBUF_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&pend_g, SRC_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&span_g, SRC_LIMIT) != 0) { return sys.E_NOMEM; }
+    src = grow.bytes(&src_g);
+    t_kind = grow.words(&tkind_g);
+    t_off = grow.words(&toff_g);
+    t_len = grow.words(&tlen_g);
+    t_line = grow.words(&tline_g);
+    t_col = grow.words(&tcol_g);
+    st = cast(*Stmt, st_g.base);
+    kids = grow.words(&kids_g);
+    stk = grow.words(&stk_g);
+    fnt = grow.words(&fnt_g);
+    fnbuf = grow.bytes(&fnbuf_g);
+    pend = grow.bytes(&pend_g);
+    ready = 1;
+    return 0;
+}
+
+// Why a table could not grow: E_2BIG past its reservation, E_NOMEM out of
+// memory. Set by whatever ran out first; a feed clears it.
+let is i64 as grow_err with mut = 0;
+
+// Room for n bytes of g. 1, or 0 with grow_err set.
+fn _room(g as *grow.Grow, n as i64) as i64 {
+    let is i64 as rc = grow.need(g, n);
+    if (rc == 0) { return 1; }
+    if (grow_err == 0) { grow_err = rc; }
+    return 0;
+}
+
+fn _room_text() as *u8 {
+    if (grow_err == sys.E_2BIG) { return cast(*u8, "script too large: more than the shell can hold"); }
+    return cast(*u8, "not enough memory for the script");
+}
+
+// Room for one more token in each of its five tables.
+fn _tok_room() as i64 {
+    let is i64 as at = (ntok + 1) * 8;
+    if (_room(&tkind_g, at) == 0 || _room(&toff_g, at) == 0 || _room(&tlen_g, at) == 0
+        || _room(&tline_g, at) == 0 || _room(&tcol_g, at) == 0) { return 0; }
+    return 1;
+}
+
+// Push a statement index on stk. 1, or 0 with grow_err set.
+fn _stk_push(s as i64) as i64 {
+    if (_room(&stk_g, (stk_top + 1) * 8) == 0) { return 0; }
+    stk[stk_top] = s;
+    stk_top = stk_top + 1;
+    return 1;
+}
+
+// Lay stk[from, stk_top) down as a run in kids and pop it. The run's first
+// index into kids, or -1 with grow_err set.
+fn _stk_to_kids(from as i64) as i64 {
+    let is i64 as count = stk_top - from;
+    if (_room(&kids_g, (nkids + count) * 8) == 0) { stk_top = from; return 0 - 1; }
+    let is i64 as base = nkids;
+    let is i64 as i with mut = 0;
+    while (i < count) { kids[nkids] = stk[from + i]; nkids = nkids + 1; i = i + 1; }
+    stk_top = from;
+    return base;
+}
 
 // ---- errors ----------------------------------------------------------------
 //
@@ -164,7 +276,7 @@ fn tokenise() as void {
         let is i64 as c = cast(i64, src[i]);
         if (c == 32 || c == 9) { i = i + 1; }
         else if (c == 10 || c == 59) {                          // newline or ';'
-            if (ntok < MAX_TOK) {
+            if (_tok_room() == 1) {
                 t_kind[ntok] = T_SEMI; t_off[ntok] = i; t_len[ntok] = 1;
                 t_line[ntok] = line; t_col[ntok] = i - bol + 1;
                 ntok = ntok + 1;
@@ -193,7 +305,7 @@ fn tokenise() as void {
                 } else if (ch == 32 || ch == 9 || ch == 10 || ch == 59) { stop = 1; }
                 else { i = i + 1; }
             }
-            if (ntok < MAX_TOK) {
+            if (_tok_room() == 1) {
                 t_off[ntok] = o; t_len[ntok] = i - o;
                 t_kind[ntok] = _kw(o, i - o);
                 t_line[ntok] = line; t_col[ntok] = col;
@@ -235,7 +347,7 @@ fn _skip_semis() as void {
 }
 
 fn _alloc_stmt() as i64 {
-    if (nst >= MAX_STMT) { return 0 - 1; }
+    if (_room(&st_g, (nst + 1) * sizeof(Stmt)) == 0) { return 0 - 1; }
     let is i64 as k = nst;
     nst = nst + 1;
     st[k].kind = S_CMD; st[k].a0 = 0; st[k].a1 = 0;
@@ -244,20 +356,29 @@ fn _alloc_stmt() as i64 {
     return k;
 }
 
-// A block's statements are parsed into the flat table in order, so a body is a
-// contiguous [first, count) range — no child pointers to fix up.
-let is [512]i64 as kids with mut;
-let is i64 as nkids with mut = 0;
+// How deep blocks may nest while they are parsed. Parsing recurses once a
+// level, and the tables no longer stop a script from being arbitrarily deep,
+// so the native stack would; this keeps a deep script an error instead.
+let is i64 as PARSE_DEPTH_LIMIT with imut = 1000;
+let is i64 as parse_depth with mut = 0;
 
 // parse_stmt — one statement. Returns its index, or -1 with the error set.
 fn parse_stmt() as i64 {
+    if (parse_depth >= PARSE_DEPTH_LIMIT) { return _fail(pos, "blocks nested more than 1000 deep"); }
+    parse_depth = parse_depth + 1;
+    let is i64 as r = _parse_stmt();
+    parse_depth = parse_depth - 1;
+    return r;
+}
+
+fn _parse_stmt() as i64 {
     _skip_semis();
     if (pos >= ntok) { return 0 - 1; }
     let is i64 as k = t_kind[pos];
 
     if (k == T_IF || k == T_WHILE) {
         let is i64 as node = _alloc_stmt();
-        if (node < 0) { return _fail(pos, "script too large"); }
+        if (node < 0) { return _fail(pos, _room_text()); }
         if (k == T_IF) { st[node].kind = S_IF; } else { st[node].kind = S_WHILE; }
         pos = pos + 1;
         st[node].a0 = pos;
@@ -287,6 +408,7 @@ fn parse_stmt() as i64 {
             t_kind[pos] = T_IF;                        // rewrite: elsif IS a nested if
             let is i64 as inner = parse_stmt();
             if (inner < 0) { return 0 - 1; }
+            if (_room(&kids_g, (nkids + 1) * 8) == 0) { return _fail(pos, _room_text()); }
             kids[nkids] = inner; st[node].c0 = nkids; st[node].cn = 1; nkids = nkids + 1;
             return node;                               // the inner if consumed the 'end'
         }
@@ -297,7 +419,7 @@ fn parse_stmt() as i64 {
 
     if (k == T_FOR) {
         let is i64 as node = _alloc_stmt();
-        if (node < 0) { return _fail(pos, "script too large"); }
+        if (node < 0) { return _fail(pos, _room_text()); }
         st[node].kind = S_FOR;
         pos = pos + 1;
         if (pos >= ntok || t_kind[pos] != T_WORD) { return _fail(pos, "expected a loop variable"); }
@@ -322,7 +444,7 @@ fn parse_stmt() as i64 {
 
     if (k == T_SWITCH) {
         let is i64 as node = _alloc_stmt();
-        if (node < 0) { return _fail(pos, "script too large"); }
+        if (node < 0) { return _fail(pos, _room_text()); }
         st[node].kind = S_SWITCH;
         pos = pos + 1;
         if (pos >= ntok) { return _fail(pos, "expected a value to switch on"); }
@@ -334,29 +456,29 @@ fn parse_stmt() as i64 {
         // Each case is one statement whose head span is the pattern and whose
         // body is the arm. They are NOT contiguous in the statement table —
         // every arm allocates its own body in between — so, like any block's
-        // children, the arms are recorded as a run in `kids`.
-        let is [32]i64 as arms;
-        let is i64 as count with mut = 0;
+        // children, the arms are gathered on stk and laid down as a run in
+        // `kids`. They were 32, and a 33rd case was dropped without a word.
+        let is i64 as sbase = stk_top;
         _skip_semis();
         while (pos < ntok && t_kind[pos] == T_CASE) {
             let is i64 as arm = _alloc_stmt();
-            if (arm < 0) { return _fail(pos, "script too large"); }
+            if (arm < 0) { stk_top = sbase; return _fail(pos, _room_text()); }
             st[arm].kind = S_CMD;
             pos = pos + 1;
-            if (pos >= ntok) { return _fail(pos, "expected a case pattern"); }
+            if (pos >= ntok) { stk_top = sbase; return _fail(pos, "expected a case pattern"); }
             st[arm].a0 = pos; st[arm].a1 = pos + 1;
             pos = pos + 1;
             _skip_semis();
             let is i64 as f with mut = 0;
             let is i64 as n with mut = 0;
-            if (parse_block(&f, &n) < 0) { return 0 - 1; }
+            if (parse_block(&f, &n) < 0) { stk_top = sbase; return 0 - 1; }
             st[arm].b0 = f; st[arm].bn = n;
-            if (count < 32) { arms[count] = arm; count = count + 1; }
+            if (_stk_push(arm) == 0) { stk_top = sbase; return _fail(pos, _room_text()); }
             _skip_semis();
         }
-        let is i64 as abase = nkids;
-        let is i64 as ai with mut = 0;
-        while (ai < count && nkids < 512) { kids[nkids] = arms[ai]; nkids = nkids + 1; ai = ai + 1; }
+        let is i64 as count = stk_top - sbase;
+        let is i64 as abase = _stk_to_kids(sbase);
+        if (abase < 0) { return _fail(pos, _room_text()); }
         st[node].d0 = abase; st[node].dn = count;
         if (pos >= ntok || t_kind[pos] != T_END) { return _fail(pos, "expected 'end'"); }
         pos = pos + 1;
@@ -365,7 +487,7 @@ fn parse_stmt() as i64 {
 
     if (k == T_FUNC) {
         let is i64 as node = _alloc_stmt();
-        if (node < 0) { return _fail(pos, "script too large"); }
+        if (node < 0) { return _fail(pos, _room_text()); }
         st[node].kind = S_FUNC;
         pos = pos + 1;
         if (pos >= ntok || t_kind[pos] != T_WORD) { return _fail(pos, "expected a function name"); }
@@ -390,7 +512,7 @@ fn parse_stmt() as i64 {
 
     if (k == T_BEGIN) {                                 // a bare block: grouping
         let is i64 as node = _alloc_stmt();
-        if (node < 0) { return _fail(pos, "script too large"); }
+        if (node < 0) { return _fail(pos, _room_text()); }
         st[node].kind = S_IF;
         st[node].a0 = 0 - 1; st[node].a1 = 0 - 1;       // no condition = always run
         pos = pos + 1;
@@ -409,7 +531,7 @@ fn parse_stmt() as i64 {
 
     // A plain command: everything up to the next break or block keyword.
     let is i64 as node = _alloc_stmt();
-    if (node < 0) { return _fail(pos, "script too large"); }
+    if (node < 0) { return _fail(pos, _room_text()); }
     st[node].kind = S_CMD;
     st[node].a0 = pos;
     while (pos < ntok && t_kind[pos] != T_SEMI) { pos = pos + 1; }
@@ -421,24 +543,24 @@ fn parse_stmt() as i64 {
 //
 // A child that is itself a block allocates its own statements while it parses,
 // so the parent's children are NOT contiguous in the statement table. The block
-// therefore records a run in `kids`, a list of statement indices: gathered
-// locally first, appended after every descendant has finished, so the run is
-// contiguous there even though the statements are not.
+// therefore records a run in `kids`, a list of statement indices: gathered on
+// stk first, appended after every descendant has finished, so the run is
+// contiguous there even though the statements are not. It gathered them in 64
+// slots, and the 65th statement of a block was dropped without a word.
 fn parse_block(out_first as *i64, out_n as *i64) as i64 {
-    let is [64]i64 as local;
-    let is i64 as count with mut = 0;
+    let is i64 as base = stk_top;
     _skip_semis();
     while (pos < ntok && t_kind[pos] != T_END && t_kind[pos] != T_ELSE
            && t_kind[pos] != T_ELSIF && t_kind[pos] != T_CASE) {
         let is i64 as s = parse_stmt();
-        if (s < 0) { return 0 - 1; }
-        if (count < 64) { local[count] = s; count = count + 1; }
+        if (s < 0) { stk_top = base; return 0 - 1; }
+        if (_stk_push(s) == 0) { stk_top = base; return _fail(pos, _room_text()); }
         _skip_semis();
     }
-    let is i64 as base = nkids;
-    let is i64 as i with mut = 0;
-    while (i < count && nkids < 512) { kids[nkids] = local[i]; nkids = nkids + 1; i = i + 1; }
-    out_first[0] = base;
+    let is i64 as count = stk_top - base;
+    let is i64 as first = _stk_to_kids(base);
+    if (first < 0) { return _fail(pos, _room_text()); }
+    out_first[0] = first;
     out_n[0] = count;
     return 0;
 }
@@ -447,47 +569,56 @@ fn parse_block(out_first as *i64, out_n as *i64) as i64 {
 
 // The text of a token span, rebuilt as one line with single spaces. Tokens are
 // slices of the source, so this is a copy, not a re-parse: what reaches shexec
-// is a command line exactly like a typed one.
-let is [1024]u8 as spanbuf with mut;
-
+// is a command line exactly like a typed one. Valid until the next call; 0
+// when there is no memory for it (grow_err says why). It kept 1023 bytes and
+// cut the rest of the line off.
 fn span_text(a0 as i64, a1 as i64, out_len as *i64) as *u8 {
-    let is i64 as n with mut = 0;
+    let is i64 as need with mut = 0;
     let is i64 as i with mut = a0;
+    while (i < a1 && i < ntok) { need = need + t_len[i] + 1; i = i + 1; }
+    out_len[0] = 0;
+    if (_room(&span_g, need + 1) == 0) { return cast(*u8, 0); }
+    let is *u8 as sb = grow.bytes(&span_g);
+    let is i64 as n with mut = 0;
+    i = a0;
     while (i < a1 && i < ntok) {
-        if (n > 0 && n < 1023) { spanbuf[n] = cast(u8, 32); n = n + 1; }
+        if (n > 0) { sb[n] = cast(u8, 32); n = n + 1; }
         let is i64 as k with mut = 0;
-        while (k < t_len[i] && n < 1023) { spanbuf[n] = src[t_off[i] + k]; n = n + 1; k = k + 1; }
+        while (k < t_len[i]) { sb[n] = src[t_off[i] + k]; n = n + 1; k = k + 1; }
         i = i + 1;
     }
     out_len[0] = n;
-    return cast(*u8, &spanbuf[0]);
+    return sb;
 }
 
-// One token's raw text, for a loop variable's name or a case pattern.
-let is [256]u8 as tokbuf with mut;
+// One token's raw text, for a loop variable's name or a case pattern: the
+// token itself, in src. It was copied into 256 bytes and cut there.
 fn tok_text(i as i64, out_len as *i64) as *u8 {
-    let is i64 as n with mut = t_len[i];
-    if (n > 255) { n = 255; }
-    let is i64 as k with mut = 0;
-    while (k < n) { tokbuf[k] = src[t_off[i] + k]; k = k + 1; }
-    out_len[0] = n;
-    return cast(*u8, &tokbuf[0]);
+    out_len[0] = t_len[i];
+    return cast(*u8, &src[t_off[i]]);
 }
 
-// Loop and recursion bounds. A runaway `while true` would otherwise wedge the
-// only shell on the machine with no way to interrupt it, so it is capped and
-// says so rather than hanging.
+// Loop and recursion bounds. A runaway `while true` or a function that calls
+// itself would otherwise wedge the only shell on the machine with no way to
+// interrupt it, so both are capped and say so rather than hanging.
 let is i64 as MAX_ITER with imut = 100000;
 let is i64 as MAX_DEPTH with imut = 16;
 let is i64 as run_depth with mut = 0;
 
+fn fn_name(f as i64) as *u8 { return cast(*u8, &fnbuf[fnt[f * 4]]); }
+fn fn_name_len(f as i64) as i64 { return fnt[f * 4 + 1]; }
+fn fn_body(f as i64) as *u8 { return cast(*u8, &fnbuf[fnt[f * 4 + 2]]); }
+fn fn_body_len(f as i64) as i64 { return fnt[f * 4 + 3]; }
+
 // find_fn — index of a function by name, or -1.
 fn find_fn(name as *u8, len as i64) as i64 {
+    if (ready == 0) { return 0 - 1; }
     let is i64 as f with mut = 0;
     while (f < nfn) {
-        if (fn_name_len[f] == len) {
+        if (fn_name_len(f) == len) {
+            let is *u8 as nm = fn_name(f);
             let is i64 as k with mut = 0;
-            while (k < len && fnbuf[fn_name_off[f] + k] == name[k]) { k = k + 1; }
+            while (k < len && nm[k] == name[k]) { k = k + 1; }
             if (k == len) { return f; }
         }
         f = f + 1;
@@ -502,28 +633,29 @@ fn has_fn(name as *u8, len as i64) as i64 {
 
 // define_fn — copy the name and the body's raw text into the arena. A redefine
 // reuses the slot but still appends its text: the arena only grows, which is
-// bounded by how much someone types in one session.
+// bounded by how much someone types in one session. The name was cut to 64
+// bytes, so two long names that shared them were one function.
 fn define_fn(t as *term.Term, s as i64) as i64 {
-    let is i64 as nlen with mut = t_len[st[s].d0];
-    if (nlen > 64) { nlen = 64; }
+    let is i64 as nlen = t_len[st[s].d0];
     let is i64 as b_from = t_off[st[s].a0];
     let is i64 as b_to with mut = srclen;
     if (st[s].a1 < ntok) { b_to = t_off[st[s].a1]; }
     let is i64 as blen with mut = b_to - b_from;
     if (blen < 0) { blen = 0; }
-    if (fnfill + nlen + blen > 4096) { _puts(t, "shell: no room for another function\n"); return 1; }
 
     let is i64 as slot with mut = find_fn(cast(*u8, &src[t_off[st[s].d0]]), nlen);
-    if (slot < 0) {
-        if (nfn >= MAX_FN) { _puts(t, "shell: too many functions\n"); return 1; }
-        slot = nfn; nfn = nfn + 1;
+    if (_room(&fnbuf_g, fnfill + nlen + blen) == 0
+        || (slot < 0 && _room(&fnt_g, (nfn + 1) * 32) == 0)) {
+        _puts(t, "shell: function not defined: "); _puts(t, _room_text()); _puts(t, "\n");
+        return 1;
     }
-    fn_name_off[slot] = fnfill;
-    fn_name_len[slot] = nlen;
+    if (slot < 0) { slot = nfn; nfn = nfn + 1; }
+    fnt[slot * 4] = fnfill;
+    fnt[slot * 4 + 1] = nlen;
     let is i64 as i with mut = 0;
     while (i < nlen) { fnbuf[fnfill] = src[t_off[st[s].d0] + i]; fnfill = fnfill + 1; i = i + 1; }
-    fn_body_off[slot] = fnfill;
-    fn_body_len[slot] = blen;
+    fnt[slot * 4 + 2] = fnfill;
+    fnt[slot * 4 + 3] = blen;
     let is i64 as j with mut = 0;
     while (j < blen) { fnbuf[fnfill] = src[b_from + j]; fnfill = fnfill + 1; j = j + 1; }
     return 0;
@@ -535,6 +667,11 @@ fn run_one(t as *term.Term, a0 as i64, a1 as i64) as i64 {
     if (a1 <= a0) { return 0; }
     let is i64 as len with mut = 0;
     let is *u8 as text = span_text(a0, a1, &len);
+    if (cast(i64, text) == 0) {
+        _puts(t, "shell: "); _puts(t, _room_text()); _puts(t, "\n");
+        sx.set_status(2);
+        return 2;
+    }
 
     // A defined function shadows a program of the same name, the way a builtin
     // does: it is the more specific thing the user just wrote.
@@ -575,62 +712,91 @@ fn exec_block(t as *term.Term, first as i64, n as i64) as i64 {
 
 // call_fn — re-tokenise and re-parse the stored body, run it, and put the
 // caller's parse state back. The token and statement tables are module-wide, so
-// the call has to save and restore them; that also makes recursion work, up to
-// MAX_DEPTH.
+// the call saves what it overwrites — the source and the tokens, into a scratch
+// mapping sized to them — and restores it after; that also makes recursion
+// work, up to MAX_DEPTH. The save was 4096 bytes and 512 tokens on the stack,
+// and a body longer than that was cut.
 fn call_fn(t as *term.Term, f as i64) as i64 {
-    if (run_depth >= MAX_DEPTH) { _puts(t, "shell: functions nested too deep\n"); return 1; }
-    let is [4096]u8 as save_src;
+    if (run_depth >= MAX_DEPTH) {
+        _puts(t, "shell: functions nested more than 16 deep; this call was not run\n");
+        return 1;
+    }
     let is i64 as save_srclen = srclen;
     let is i64 as save_ntok = ntok;
     let is i64 as save_pos = pos;
     let is i64 as save_nst = nst;
     let is i64 as save_nkids = nkids;
-    let is [512]i64 as sk; let is [512]i64 as so; let is [512]i64 as sl;
-    let is [512]i64 as sln; let is [512]i64 as sc;
+    let is i64 as save_stk = stk_top;
+    // Tokens first, five words each, then the source bytes: the words stay
+    // aligned whatever the source's length.
+    let is i64 as sz = ((save_ntok * 40 + save_srclen + 4095) / 4096) * 4096;
+    let is i64 as sva with mut = 0;
+    if (sz > 0) {
+        sva = sys.mmap(0, sz, sys.PROT_READ | sys.PROT_WRITE);
+        if (sva < 0) { _puts(t, "shell: not enough memory to call the function\n"); return 1; }
+    }
+    let is *i64 as stok = cast(*i64, sva);
+    let is *u8 as ssrc = cast(*u8, sva + save_ntok * 40);
     let is i64 as i with mut = 0;
-    while (i < save_srclen) { save_src[i] = src[i]; i = i + 1; }
-    i = 0;
     while (i < save_ntok) {
-        sk[i] = t_kind[i]; so[i] = t_off[i]; sl[i] = t_len[i];
-        sln[i] = t_line[i]; sc[i] = t_col[i];
+        stok[i * 5] = t_kind[i]; stok[i * 5 + 1] = t_off[i]; stok[i * 5 + 2] = t_len[i];
+        stok[i * 5 + 3] = t_line[i]; stok[i * 5 + 4] = t_col[i];
         i = i + 1;
     }
+    i = 0;
+    while (i < save_srclen) { ssrc[i] = src[i]; i = i + 1; }
 
-    srclen = 0;
-    let is i64 as b with mut = 0;
-    while (b < fn_body_len[f] && srclen < SRC_CAP) {
-        src[srclen] = fnbuf[fn_body_off[f] + b];
-        srclen = srclen + 1; b = b + 1;
-    }
-    tokenise();
-    pos = 0;
-    let is i64 as bf with mut = 0;
-    let is i64 as bn with mut = 0;
     let is i64 as status with mut = 0;
-    run_depth = run_depth + 1;
-    if (parse_block(&bf, &bn) < 0) { report_error(t); status = 2; }
-    else { status = exec_block(t, bf, bn); }
-    run_depth = run_depth - 1;
+    let is i64 as blen = fn_body_len(f);
+    grow_err = 0;
+    if (_room(&src_g, blen) == 0) {
+        _puts(t, "shell: "); _puts(t, _room_text()); _puts(t, "\n");
+        status = 2;
+    } else {
+        let is *u8 as body = fn_body(f);
+        let is i64 as b with mut = 0;
+        while (b < blen) { src[b] = body[b]; b = b + 1; }
+        srclen = blen;
+        tokenise();
+        if (grow_err != 0) {
+            _puts(t, "shell: "); _puts(t, _room_text()); _puts(t, "\n");
+            status = 2;
+        } else {
+            pos = 0;
+            let is i64 as bf with mut = 0;
+            let is i64 as bn with mut = 0;
+            run_depth = run_depth + 1;
+            if (parse_block(&bf, &bn) < 0) { report_error(t); status = 2; }
+            else { status = exec_block(t, bf, bn); }
+            run_depth = run_depth - 1;
+        }
+    }
 
     // Restore: the statements this call allocated are dropped wholesale, which
-    // is safe because nothing outside the call refers to them.
+    // is safe because nothing outside the call refers to them. The tables had
+    // room for what is put back: it was in them before the call.
     srclen = save_srclen;
     i = 0;
-    while (i < save_srclen) { src[i] = save_src[i]; i = i + 1; }
+    while (i < save_srclen) { src[i] = ssrc[i]; i = i + 1; }
     ntok = save_ntok;
     i = 0;
     while (i < save_ntok) {
-        t_kind[i] = sk[i]; t_off[i] = so[i]; t_len[i] = sl[i];
-        t_line[i] = sln[i]; t_col[i] = sc[i];
+        t_kind[i] = stok[i * 5]; t_off[i] = stok[i * 5 + 1]; t_len[i] = stok[i * 5 + 2];
+        t_line[i] = stok[i * 5 + 3]; t_col[i] = stok[i * 5 + 4];
         i = i + 1;
     }
-    pos = save_pos; nst = save_nst; nkids = save_nkids;
+    pos = save_pos; nst = save_nst; nkids = save_nkids; stk_top = save_stk;
+    if (sz > 0) { sys.munmap(sva, sz); }
     return status;
 }
 
 fn exec_stmt(t as *term.Term, s as i64) as i64 {
     if (s < 0 || s >= nst) { return 0; }
-    if (run_depth >= MAX_DEPTH) { return 0; }
+    // It returned here without a word, and the statement simply did not run.
+    if (run_depth >= MAX_DEPTH) {
+        _puts(t, "shell: blocks nested more than 16 deep; this one was not run\n");
+        return 2;
+    }
     run_depth = run_depth + 1;
     let is i64 as status with mut = 0;
     let is i64 as k = st[s].kind;
@@ -663,67 +829,89 @@ fn exec_stmt(t as *term.Term, s as i64) as i64 {
         // so the body reaches it through the ordinary $name path.
         let is i64 as vlen with mut = 0;
         let is *u8 as vname = tok_text(st[s].d0, &vlen);
-        let is [256]u8 as vsave;
-        let is i64 as vn with mut = 0;
-        while (vn < vlen && vn < 255) { vsave[vn] = vname[vn]; vn = vn + 1; }
-
         let is i64 as ilen with mut = 0;
         let is *u8 as items = span_text(st[s].a0, st[s].a1, &ilen);
-        let is i64 as nc = sx.prepare(items, ilen);
-        sx.cap_err_show(t);
-        // The expanded words live in shexec's word buffer, and the FIRST command
-        // in the body reparses a line into that same buffer. So the whole list
-        // is copied out before the loop runs, not one item at a time: reading
-        // item 2 after iteration 1 was reading whatever the body had left there.
-        let is [512]u8 as ibuf;
-        let is [64]i64 as ioff;
-        let is [64]i64 as ilen_of;
-        let is i64 as ifill with mut = 0;
-        let is i64 as count with mut = 0;
-        if (nc > 0) {
-            let is *sx.Cmd as c0 = sx.cmd_at(0);
-            let is i64 as w with mut = 0;
-            while (w < c0.wn && w < 64) {
-                let is *u8 as wp = sx.word_ptr(c0.w0 + w);
-                let is i64 as wl with mut = sx.word_len(c0.w0 + w);
-                if (ifill + wl > 512) { wl = 512 - ifill; }
-                if (wl < 0) { wl = 0; }
-                ioff[count] = ifill;
-                ilen_of[count] = wl;
-                let is i64 as q with mut = 0;
-                while (q < wl) { ibuf[ifill] = wp[q]; ifill = ifill + 1; q = q + 1; }
-                count = count + 1;
-                w = w + 1;
-            }
+        let is i64 as nc with mut = 0 - 1;
+        if (cast(i64, items) != 0) {
+            nc = sx.prepare(items, ilen);
+            sx.cap_err_show(t);
         }
-        let is i64 as it with mut = 0;
-        while (it < count) {
-            sx.env_set(cast(*u8, &vsave[0]), vn,
-                       cast(*u8, &ibuf[ioff[it]]), ilen_of[it]);
-            status = exec_block(t, st[s].b0, st[s].bn);
-            it = it + 1;
+        if (cast(i64, items) == 0) {
+            _puts(t, "shell: "); _puts(t, _room_text()); _puts(t, "\n");
+            status = 2;
+        } else if (sx.room_error() != 0) {
+            _puts(t, "shell: "); _puts(t, sx.room_text(sx.room_error())); _puts(t, "\n");
+            status = 2;
+        } else if (nc > 0) {
+            // The expanded words live in shexec's word buffer, and the FIRST
+            // command in the body reparses a line into that same buffer. So the
+            // whole list — and the variable's name, which is in src — is copied
+            // out before the loop runs, into a mapping sized to it. It was 64
+            // items in 512 bytes, and the rest of the list was dropped.
+            let is *sx.Cmd as c0 = sx.cmd_at(0);
+            let is i64 as count = c0.wn;
+            let is i64 as bytes with mut = vlen;
+            let is i64 as w with mut = 0;
+            while (w < count) { bytes = bytes + sx.word_len(c0.w0 + w); w = w + 1; }
+            let is i64 as sz = ((count * 16 + bytes + 4095) / 4096) * 4096;
+            let is i64 as va = sys.mmap(0, sz, sys.PROT_READ | sys.PROT_WRITE);
+            if (va < 0) {
+                _puts(t, "shell: not enough memory for the loop's items\n");
+                status = 2;
+            } else {
+                let is *i64 as idx = cast(*i64, va);                // offset, length an item
+                let is *u8 as ib = cast(*u8, va + count * 16);
+                let is i64 as fill with mut = 0;
+                while (fill < vlen) { ib[fill] = vname[fill]; fill = fill + 1; }
+                w = 0;
+                while (w < count) {
+                    let is *u8 as wp = sx.word_ptr(c0.w0 + w);
+                    let is i64 as wl = sx.word_len(c0.w0 + w);
+                    idx[w * 2] = fill;
+                    idx[w * 2 + 1] = wl;
+                    let is i64 as q with mut = 0;
+                    while (q < wl) { ib[fill] = wp[q]; fill = fill + 1; q = q + 1; }
+                    w = w + 1;
+                }
+                let is i64 as it with mut = 0;
+                while (it < count) {
+                    let is i64 as rc = sx.env_set(ib, vlen, cast(*u8, cast(i64, ib) + idx[it * 2]), idx[it * 2 + 1]);
+                    if (rc < 0) {
+                        _puts(t, "shell: for: "); _puts(t, sx.env_err_text(rc)); _puts(t, "\n");
+                        status = 1;
+                        it = count;
+                    } else {
+                        status = exec_block(t, st[s].b0, st[s].bn);
+                        it = it + 1;
+                    }
+                }
+                sys.munmap(va, sz);
+            }
         }
     }
     else if (k == S_SWITCH) {
         let is i64 as slen with mut = 0;
         let is *u8 as subj = span_text(st[s].a0, st[s].a1, &slen);
-        let is [256]u8 as sv;
-        let is i64 as sn with mut = slen;
-        if (sn > 255) { sn = 255; }
-        let is i64 as q with mut = 0;
-        while (q < sn) { sv[q] = subj[q]; q = q + 1; }
-        // Patterns are glob patterns, so `case *.cst` reads the way it looks.
-        let is i64 as a with mut = 0;
-        let is i64 as done with mut = 0;
-        while (a < st[s].dn && done == 0) {
-            let is i64 as arm = kids[st[s].d0 + a];
-            let is i64 as plen with mut = 0;
-            let is *u8 as pat = tok_text(st[arm].a0, &plen);
-            if (sx.fnmatch(pat, plen, cast(*u8, &sv[0]), sn) == 1) {
-                status = exec_block(t, st[arm].b0, st[arm].bn);
-                done = 1;
+        if (cast(i64, subj) == 0) {
+            _puts(t, "shell: "); _puts(t, _room_text()); _puts(t, "\n");
+            status = 2;
+        } else {
+            // Patterns are glob patterns, so `case *.cst` reads the way it
+            // looks. The subject is matched where span_text left it: nothing
+            // runs between two matches, and once an arm runs no other is tried.
+            // It was copied into 256 bytes and cut there.
+            let is i64 as a with mut = 0;
+            let is i64 as done with mut = 0;
+            while (a < st[s].dn && done == 0) {
+                let is i64 as arm = kids[st[s].d0 + a];
+                let is i64 as plen with mut = 0;
+                let is *u8 as pat = tok_text(st[arm].a0, &plen);
+                if (sx.fnmatch(pat, plen, subj, slen) == 1) {
+                    status = exec_block(t, st[arm].b0, st[arm].bn);
+                    done = 1;
+                }
+                a = a + 1;
             }
-            a = a + 1;
         }
     }
     else if (k == S_FUNC) { status = define_fn(t, s); }
@@ -738,6 +926,7 @@ fn exec_stmt(t as *term.Term, s as i64) as i64 {
 // caller that wants a clean session.
 fn reset() as void {
     nst = 0; nkids = 0; nfn = 0; fnfill = 0; ntok = 0; srclen = 0; pendlen = 0;
+    stk_top = 0; parse_depth = 0;
     return;
 }
 
@@ -768,27 +957,42 @@ fn is_block_start(line as *u8, len as i64) as i64 {
     return 0;
 }
 
-// The line buffer a multi-line construct accumulates into.
-let is [4096]u8 as pend with mut;
-let is i64 as pendlen with mut = 0;
+// The lines a multi-line construct accumulates into (pend, at the top).
 fn pending() as i64 { if (pendlen > 0) { return 1; } return 0; }
 fn pending_clear() as void { pendlen = 0; return; }
+
+// A construct that cannot be held, said in words and dropped whole.
+fn _drop_construct(t as *term.Term) as i64 {
+    _puts(t, "shell: "); _puts(t, _room_text()); _puts(t, "; the construct was dropped\n");
+    pendlen = 0;
+    return 0 - 1;
+}
 
 // feed — hand the REPL's line to the script engine.
 //
 // Returns 1 when the construct is still open (the shell shows a continuation
 // prompt and calls again), 0 when it ran, and -1 on a parse error already
 // reported. Recovery is "drop the whole construct": a half-parsed block has no
-// safe resumption point, and the person can press Up and fix it.
+// safe resumption point, and the person can press Up and fix it. The
+// construct was kept in 4096 bytes, and what came after was cut off.
 fn feed(t as *term.Term, line as *u8, len as i64) as i64 {
+    if (_ready() != 0) {
+        _puts(t, "shell: not enough memory for the script engine\n");
+        pendlen = 0;
+        return 0 - 1;
+    }
+    grow_err = 0;
+    if (_room(&pend_g, pendlen + len + 1) == 0) { return _drop_construct(t); }
     let is i64 as i with mut = 0;
-    while (i < len && pendlen < SRC_CAP - 2) { pend[pendlen] = line[i]; pendlen = pendlen + 1; i = i + 1; }
-    if (pendlen < SRC_CAP - 2) { pend[pendlen] = cast(u8, 10); pendlen = pendlen + 1; }
+    while (i < len) { pend[pendlen] = line[i]; pendlen = pendlen + 1; i = i + 1; }
+    pend[pendlen] = cast(u8, 10); pendlen = pendlen + 1;
 
-    srclen = 0;
+    if (_room(&src_g, pendlen) == 0) { return _drop_construct(t); }
     let is i64 as k with mut = 0;
-    while (k < pendlen && srclen < SRC_CAP) { src[srclen] = pend[k]; srclen = srclen + 1; k = k + 1; }
+    while (k < pendlen) { src[k] = pend[k]; k = k + 1; }
+    srclen = pendlen;
     tokenise();
+    if (grow_err != 0) { return _drop_construct(t); }
     let is i64 as d = depth();
     if (d > 0) { return 1; }                       // still inside a block
     if (d < 0) {
@@ -805,6 +1009,8 @@ fn feed(t as *term.Term, line as *u8, len as i64) as i64 {
     // after enough typing the shell answered "script too large" forever.
     nst = 0;
     nkids = 0;
+    stk_top = 0;
+    parse_depth = 0;
     pos = 0;
     let is i64 as f with mut = 0;
     let is i64 as n with mut = 0;
