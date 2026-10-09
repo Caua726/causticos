@@ -22,7 +22,8 @@ Profile directives, one per line:
                                        (default guest path /<target>.cse)
   tool <target> <guestpath>            ship the output of a target in the TOP
                                        Causticfile (the toolchain, cross-built)
-  init <target>                        ship it as /init.cse — what the kernel launches
+  init <target>                        ship it as /init.cse — what the kernel launches —
+                                       and name it in /etc/init (ps's label for it)
   file <hostpath> <guestpath>          copy a host file
   text <guestpath> <content...>        literal content (\\n and \\t honoured)
   dir <guestpath>                      an empty directory
@@ -230,7 +231,14 @@ class Resolver:
 
         if word == "init":
             self.init_name = rest
-            return self._bin(rest, "/init.cse", optional)
+            before = len(self.skipped)
+            self._bin(rest, "/init.cse", optional)
+            # /etc/init names the program /init.cse is: the kernel labels the
+            # first process with it, so ps shows "shell" or "compositor"
+            # rather than one fixed name whatever the profile booted.
+            if len(self.skipped) == before:
+                self._put(Item("file", "/etc/init", "<init>", (rest + "\n").encode("utf-8")))
+            return
 
         if word == "bin":
             parts = rest.split()

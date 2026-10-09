@@ -240,7 +240,7 @@ Directives:
 |---|---|
 | `include <profile>` | splice another profile in here |
 | `bin <target> [as <guestpath>]` | ship `userspace/build/<target>.cse` |
-| `init <target>` | ship it as `/init.cse` — what the kernel launches |
+| `init <target>` | ship it as `/init.cse` — what the kernel launches — and write its name to `/etc/init`, the label `ps` gives the first process |
 | `file <hostpath> <guestpath>` | copy a host file |
 | `text <guestpath> <content>` | literal content (`\n`, `\t` honoured) |
 | `dir <guestpath>` | an empty directory |
@@ -360,7 +360,9 @@ refuses them, as GNU does.
 `ps`, `htop`, and `btop` represent the kernel once, as PID 0, with the kernel's
 own threads; each user thread is counted on its process's row only. The first
 actual user program is PID 1, with its own threads and resident memory; there is no
-empty synthetic `init` process. Children whose parent exits are adopted by the
+empty synthetic `init` process. The first process is labelled with the program
+`/etc/init` names (`compositor` on the desktop, `shell` in the shell profile),
+or `init` on a root that does not say. Children whose parent exits are adopted by the
 kernel root (PPID 0), and the orphan reaper collects them after they exit.
 The fullscreen shell starts boot services only when it is PID 1. Other shells,
 including orphans with PPID 0, use inherited service channels when available
