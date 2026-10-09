@@ -35,10 +35,25 @@ use "../lib/sndproto/sndproto.cst" as sp;
 
 // Every window on the desktop holds one (the WM hands each an endpoint) and
 // every command a terminal runs gets one more, so eight ran out with a few
-// windows open. A client costs two words here and an entry in the poll set,
-// whose size is the pollbuf below.
-let is i64 as MAX_CLIENTS = 32;
-let is i64 as MAX_STREAMS = 16;
+// windows open. A client costs two words here and an entry in the poll set.
+//
+// The table is reserved once for CLIENT_LIMIT clients and committed
+// CLIENT_CHUNK at a time as they join, the poll set with it. It was 32 fixed
+// slots, and the 33rd program playing or recording at once was refused.
+// CLIENT_LIMIT is address space, not memory: descriptors and memory run out
+// long before it.
+let is i64 as CLIENT_LIMIT with imut = 4096;
+let is i64 as CLIENT_CHUNK with imut = 16;
+let is i64 as POLL_FIXED with imut = 2;        // the device and the gate
+
+// Streams — voices in the mix — grow the same way, each new slot getting its
+// staging as it is made. It was 16 fixed, so the 17th program playing at once
+// was told "soundd could not open the playback stream" whatever the client
+// table allowed. Each voice costs a pass of the mix per period; the ceiling on
+// that is the cpu, and it is not this file's to guess.
+let is i64 as STREAM_LIMIT with imut = 4096;
+let is i64 as STREAM_CHUNK with imut = 16;
+let is i64 as ST_FIELDS with imut = 10;        // the st_ tables below
 
 // Per-stream staging, in FRAMES. Two device buffers deep: enough that a client
 // scheduled a little late is still ahead of the mixer, small enough that a
@@ -81,23 +96,118 @@ let is i64 as period_frames with mut = 0;
 let is i64 as buffer_frames with mut = 0;
 
 // ---- clients ----
-// All flat arrays rather than an array of structs: the tables are small, every
-// field is an i64, and this sidesteps the mixed-width struct trap entirely.
-let is [32]i64 as cl_fd with mut;           // == MAX_CLIENTS, 0 = free
-let is [32]i64 as cl_live with mut;
-let is [16]i64 as st_client with mut;       // == MAX_STREAMS; owning client slot + 1, 0 = free
-let is [16]i64 as st_id with mut;           // the client's own stream number
-let is [16]i64 as st_gain with mut;
-let is [16]i64 as st_head with mut;         // frames consumed by the mixer
-let is [16]i64 as st_tail with mut;         // frames written by the client
-let is [16]i64 as st_drain with mut;        // 1 = tell the client when it runs dry
-let is [16]i64 as st_buf with mut;          // STAGE_BYTES of staging
-let is [16]i64 as st_mixed with mut;        // frames this stream contributed
-let is [16]i64 as st_short with mut;        // periods it could not fill
-let is [16]i64 as st_lost with mut;         // frames dropped for want of room — must stay 0
+// All flat arrays rather than an array of structs: every field is an i64, and
+// this sidesteps the mixed-width struct trap entirely. The client arrays are
+// reserved for CLIENT_LIMIT and never move; client_cap slots are committed.
+let is *i64 as cl_fd with mut = cast(*i64, 0);       // 0 = free
+let is *i64 as cl_live with mut = cast(*i64, 0);
+let is *i64 as pollbuf with mut = cast(*i64, 0);     // (POLL_FIXED + cap) * 3 words
+let is i64 as client_cap with mut = 0;
 
-let is [3072]i64 as pollbuf;                // (MAX_CLIENTS + 2) * 3, generously
+// ---- streams ----
+// One reservation, ST_FIELDS tables of STREAM_LIMIT words in it; stream_cap
+// slots of each are committed.
+let is i64 as st_mem with mut = 0;
+let is i64 as stream_cap with mut = 0;
+let is *i64 as st_client with mut = cast(*i64, 0);   // owning client slot + 1, 0 = free
+let is *i64 as st_id with mut = cast(*i64, 0);       // the client's own stream number
+let is *i64 as st_gain with mut = cast(*i64, 0);
+let is *i64 as st_head with mut = cast(*i64, 0);     // frames consumed by the mixer
+let is *i64 as st_tail with mut = cast(*i64, 0);     // frames written by the client
+let is *i64 as st_drain with mut = cast(*i64, 0);    // 1 = tell the client when it runs dry
+let is *i64 as st_buf with mut = cast(*i64, 0);      // STAGE_BYTES of staging
+let is *i64 as st_mixed with mut = cast(*i64, 0);    // frames this stream contributed
+let is *i64 as st_short with mut = cast(*i64, 0);    // periods it could not fill
+let is *i64 as st_lost with mut = cast(*i64, 0);     // frames dropped for want of room — must stay 0
+
 let is [4096]u8 as rxbuf;                   // == sp.SND_MAX_PAYLOAD
+
+fn _pages(n as i64) as i64 { return ((n + 4095) / 4096) * 4096; }
+
+// Commit a reserved table of words from `had` entries to `need`. Committing
+// is idempotent, so a grow that failed half way is simply tried again.
+fn _table_grow(t as i64, had as i64, need as i64) as i64 {
+    let is i64 as h = _pages(had * 8);
+    let is i64 as n = _pages(need * 8);
+    if (n <= h) { return 0; }
+    if (sys.commit(t + h, n - h, sys.PROT_READ | sys.PROT_WRITE) != 0) { return 0 - 1; }
+    return 0;
+}
+
+// Commit CLIENT_CHUNK more client slots, all free, and the poll room they
+// need. 0, or -1 when the reservation is full or memory has run out.
+fn clients_grow() as i64 {
+    if (client_cap + CLIENT_CHUNK > CLIENT_LIMIT) { return 0 - 1; }
+    let is i64 as ncap = client_cap + CLIENT_CHUNK;
+    if (_table_grow(cast(i64, cl_fd), client_cap, ncap) != 0) { return 0 - 1; }
+    if (_table_grow(cast(i64, cl_live), client_cap, ncap) != 0) { return 0 - 1; }
+    let is i64 as rw = sys.PROT_READ | sys.PROT_WRITE;
+    let is i64 as phad with mut = _pages((POLL_FIXED + client_cap) * 24);
+    if (client_cap == 0) { phad = 0; }
+    let is i64 as pneed = _pages((POLL_FIXED + ncap) * 24);
+    if (pneed > phad && sys.commit(cast(i64, pollbuf) + phad, pneed - phad, rw) != 0) { return 0 - 1; }
+    let is i64 as i with mut = client_cap;
+    while (i < ncap) { cl_fd[i] = 0; cl_live[i] = 0; i = i + 1; }
+    client_cap = ncap;
+    return 0;
+}
+
+// Reserve the tables and commit the first slots. 0, or -1 without memory.
+fn clients_init() as i64 {
+    let is i64 as rw = sys.PROT_READ | sys.PROT_WRITE;
+    cl_fd = cast(*i64, sys.reserve(0, _pages(CLIENT_LIMIT * 8), rw));
+    cl_live = cast(*i64, sys.reserve(0, _pages(CLIENT_LIMIT * 8), rw));
+    pollbuf = cast(*i64, sys.reserve(0, _pages((POLL_FIXED + CLIENT_LIMIT) * 24), rw));
+    if (cast(i64, cl_fd) <= 0 || cast(i64, cl_live) <= 0 || cast(i64, pollbuf) <= 0) { return 0 - 1; }
+    return clients_grow();
+}
+
+// Commit STREAM_CHUNK more stream slots, all free, each with its staging.
+// Staging is mapped when the slot is made and kept: a client comes and goes,
+// and allocating 64 KiB on its arrival would put a page fault on the path of
+// the first sound it makes. 0, or -1 when the reservation is full or memory
+// has run out (nothing of this round is kept then but committed table pages).
+fn streams_grow() as i64 {
+    if (stream_cap + STREAM_CHUNK > STREAM_LIMIT) { return 0 - 1; }
+    let is i64 as ncap = stream_cap + STREAM_CHUNK;
+    let is i64 as span = _pages(STREAM_LIMIT * 8);
+    let is i64 as f with mut = 0;
+    while (f < ST_FIELDS) {
+        if (_table_grow(st_mem + f * span, stream_cap, ncap) != 0) { return 0 - 1; }
+        f = f + 1;
+    }
+    let is i64 as i with mut = stream_cap;
+    while (i < ncap) {
+        let is i64 as va = sys.mmap(cast(i64, 0), STAGE_BYTES, sys.PROT_READ | sys.PROT_WRITE);
+        if (va < 0) {
+            let is i64 as j with mut = stream_cap;
+            while (j < i) { sys.munmap(st_buf[j], STAGE_BYTES); j = j + 1; }
+            return 0 - 1;
+        }
+        st_buf[i] = va;
+        st_client[i] = 0;
+        i = i + 1;
+    }
+    stream_cap = ncap;
+    return 0;
+}
+
+fn streams_init() as i64 {
+    let is i64 as span = _pages(STREAM_LIMIT * 8);
+    st_mem = sys.reserve(0, ST_FIELDS * span, sys.PROT_READ | sys.PROT_WRITE);
+    if (st_mem <= 0) { return 0 - 1; }
+    st_client = cast(*i64, st_mem);
+    st_id     = cast(*i64, st_mem + span);
+    st_gain   = cast(*i64, st_mem + 2 * span);
+    st_head   = cast(*i64, st_mem + 3 * span);
+    st_tail   = cast(*i64, st_mem + 4 * span);
+    st_drain  = cast(*i64, st_mem + 5 * span);
+    st_buf    = cast(*i64, st_mem + 6 * span);
+    st_mixed  = cast(*i64, st_mem + 7 * span);
+    st_short  = cast(*i64, st_mem + 8 * span);
+    st_lost   = cast(*i64, st_mem + 9 * span);
+    return streams_grow();
+}
 
 let is [24]u8 as numbuf;
 
@@ -117,7 +227,7 @@ fn num(v as i64) as *u8 {
 fn voices() as i64 {
     let is i64 as n with mut = 0;
     let is i64 as i with mut = 0;
-    while (i < MAX_STREAMS) {
+    while (i < stream_cap) {
         if (st_client[i] != 0) { n = n + 1; }
         i = i + 1;
     }
@@ -206,7 +316,7 @@ fn mix_period(frames as i64, at as i64) as void {
     }
 
     let is i64 as s with mut = 0;
-    while (s < MAX_STREAMS) {
+    while (s < stream_cap) {
         if (st_client[s] != 0) {
             let is i64 as have with mut = stage_avail(s);
             if (have > frames) { have = frames; }
@@ -243,7 +353,7 @@ fn mix_period(frames as i64, at as i64) as void {
 
 fn client_slot(fd as i64) as i64 {
     let is i64 as i with mut = 0;
-    while (i < MAX_CLIENTS) {
+    while (i < client_cap) {
         if (cl_fd[i] == fd && cl_live[i] != 0) { return i; }
         i = i + 1;
     }
@@ -252,37 +362,44 @@ fn client_slot(fd as i64) as i64 {
 
 fn stream_find(cslot as i64, id as i64) as i64 {
     let is i64 as i with mut = 0;
-    while (i < MAX_STREAMS) {
+    while (i < stream_cap) {
         if (st_client[i] == cslot + 1 && st_id[i] == id) { return i; }
         i = i + 1;
     }
     return 0 - 1;
 }
 
+// A free stream slot for the client's stream `id`, the table grown when every
+// slot is taken. The slot, -1 for an id the client already has open, -2 when
+// no slot can be had.
 fn stream_alloc(cslot as i64, id as i64) as i64 {
     if (stream_find(cslot, id) >= 0) { return 0 - 1; }   // ids are the client's; a duplicate is a bug
+    let is i64 as slot with mut = 0 - 1;
     let is i64 as i with mut = 0;
-    while (i < MAX_STREAMS) {
-        if (st_client[i] == 0) {
-            st_client[i] = cslot + 1;
-            st_id[i] = id;
-            st_gain[i] = sp.SND_UNITY;
-            st_head[i] = 0;
-            st_tail[i] = 0;
-            st_drain[i] = 0;
-            st_mixed[i] = 0;
-            st_short[i] = 0;
-            st_lost[i] = 0;
-            return i;
-        }
+    while (i < stream_cap && slot < 0) {
+        if (st_client[i] == 0) { slot = i; }
         i = i + 1;
     }
-    return 0 - 2;
+    if (slot < 0) {
+        let is i64 as at = stream_cap;
+        if (streams_grow() != 0) { return 0 - 2; }
+        slot = at;
+    }
+    st_client[slot] = cslot + 1;
+    st_id[slot] = id;
+    st_gain[slot] = sp.SND_UNITY;
+    st_head[slot] = 0;
+    st_tail[slot] = 0;
+    st_drain[slot] = 0;
+    st_mixed[slot] = 0;
+    st_short[slot] = 0;
+    st_lost[slot] = 0;
+    return slot;
 }
 
 fn client_drop(cslot as i64) as void {
     let is i64 as i with mut = 0;
-    while (i < MAX_STREAMS) {
+    while (i < stream_cap) {
         if (st_client[i] == cslot + 1) { st_client[i] = 0; }
         i = i + 1;
     }
@@ -293,19 +410,24 @@ fn client_drop(cslot as i64) as void {
 }
 
 // A channel end someone parked on the gate becomes a client, greeted with the
-// shape the mixer runs at — or, with every slot taken, told so in an
-// SEV_ERROR it can read after we have let go of it.
+// shape the mixer runs at — or, when no slot can be had (the table cannot
+// grow: memory or its reservation has run out), told so in an SEV_ERROR it
+// can read after we have let go of it.
 fn admit(fd as i64) as void {
     let is i64 as slot with mut = 0 - 1;
     let is i64 as k with mut = 0;
-    while (k < MAX_CLIENTS) {
+    while (k < client_cap) {
         if (cl_live[k] == 0 && slot < 0) { slot = k; }
         k = k + 1;
     }
     if (slot < 0) {
+        let is i64 as at = client_cap;
+        if (clients_grow() == 0) { slot = at; }
+    }
+    if (slot < 0) {
         sp.send(fd, sp.SEV_ERROR, 0, SND_ERR_FULL, 0);
         sys.close(fd);
-        say("soundd: no client slot free\n");
+        say("soundd: no room for another client\n");
         return;
     }
     if (sp.send(fd, sp.SEV_HELLO, sp.SND_MAGIC, rate, (channels << 32) | frame_bytes) < 0) {
@@ -452,20 +574,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     }
     ring = map + ctl(sys.AUDIO_W_DATA_OFFSET);
 
-    let is i64 as i with mut = 0;
-    while (i < MAX_CLIENTS) { cl_fd[i] = 0; cl_live[i] = 0; i = i + 1; }
-    let is i64 as j with mut = 0;
-    while (j < MAX_STREAMS) {
-        st_client[j] = 0;
-        // Staging is mapped once and kept: a client comes and goes, and
-        // allocating 64 KiB on its arrival would put a page fault on the path
-        // of the first sound it makes.
-        let is i64 as va = sys.mmap(cast(i64, 0), STAGE_BYTES,
-                                    sys.PROT_READ | sys.PROT_WRITE);
-        if (va < 0) { say("soundd: cannot allocate staging\n"); return cast(i32, 1); }
-        st_buf[j] = va;
-        j = j + 1;
-    }
+    if (clients_init() != 0) { say("soundd: no memory for the client table\n"); return cast(i32, 1); }
+    if (streams_init() != 0) { say("soundd: no memory for the stream table\n"); return cast(i32, 1); }
 
     say("soundd: ready\n");
 
@@ -492,7 +602,7 @@ fn main(argc as i64, argv as *u8) as i32 {
         }
         let is i64 as first_client = n;
         let is i64 as c with mut = 0;
-        while (c < MAX_CLIENTS) {
+        while (c < client_cap) {
             if (cl_live[c] != 0) {
                 // A client whose every stream is full is not polled: its
                 // channel fills, and its write blocks. That IS the flow
@@ -508,7 +618,7 @@ fn main(argc as i64, argv as *u8) as i32 {
                 // audio before anyone counted the frames.
                 let is i64 as room with mut = 0;
                 let is i64 as s2 with mut = 0;
-                while (s2 < MAX_STREAMS) {
+                while (s2 < stream_cap) {
                     if (st_client[s2] == c + 1
                         && stage_room(s2) >= sp.SND_MAX_PAYLOAD / 4) { room = 1; }
                     s2 = s2 + 1;
@@ -517,7 +627,7 @@ fn main(argc as i64, argv as *u8) as i32 {
                 // is where its OPEN is going to come from.
                 let is i64 as has with mut = 0;
                 let is i64 as s3 with mut = 0;
-                while (s3 < MAX_STREAMS) {
+                while (s3 < stream_cap) {
                     if (st_client[s3] == c + 1) { has = 1; }
                     s3 = s3 + 1;
                 }
@@ -581,7 +691,7 @@ fn main(argc as i64, argv as *u8) as i32 {
 
         // A stream that asked to be told when it ran dry, and has.
         let is i64 as d with mut = 0;
-        while (d < MAX_STREAMS) {
+        while (d < stream_cap) {
             if (st_client[d] != 0 && st_drain[d] == 1 && stage_avail(d) == 0) {
                 let is i64 as owner = st_client[d] - 1;
                 if (cl_live[owner] != 0) {

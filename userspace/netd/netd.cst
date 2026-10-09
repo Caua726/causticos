@@ -43,14 +43,64 @@ use "netd_sock.cst" as nsock;
 // the gate (netproto's NET_FD): a program becomes a client by parking its own
 // end of a new channel there, so a command that never opens a socket never
 // takes a slot — every spawn used to, and each one said so on the serial line.
-let is i64 as MAX_CLIENTS = 16;
+//
+// The table is reserved once for CLIENT_LIMIT clients and committed
+// CLIENT_CHUNK at a time as programs join, together with the poll set that
+// watches them. It was sixteen fixed slots, and the seventeenth program using
+// the network at once was refused with E_MFILE. CLIENT_LIMIT is address
+// space, not memory: descriptors and memory run out long before it.
+let is i64 as CLIENT_LIMIT with imut = 4096;
+let is i64 as CLIENT_CHUNK with imut = 16;
+let is i64 as POLL_FIXED with imut = 3;        // two interfaces and the gate
 let is i64 as POLL_CAP_NS = 250000000;      // 250 ms: the idle heartbeat
 let is i64 as ICMP_ID_BASE = 0x4E44;        // "ND"
 
-// Client channels, all equal: there is no control slot.
-let is [16]i64 as client_fd with mut;
-let is [16]i64 as client_live with mut;
+// Client channels, all equal: there is no control slot. client_cap slots are
+// committed; each array is reserved for CLIENT_LIMIT and never moves.
+let is *i64 as client_fd with mut = cast(*i64, 0);
+let is *i64 as client_live with mut = cast(*i64, 0);
+let is *i64 as poll_ents with mut = cast(*i64, 0);   // (POLL_FIXED + cap) * 3 words
+let is *i64 as polled with mut = cast(*i64, 0);      // which client each poll entry is
+let is i64 as client_cap with mut = 0;
 let is i64 as n_clients with mut = 0;
+
+fn _pages(n as i64) as i64 { return ((n + 4095) / 4096) * 4096; }
+
+// Commit CLIENT_CHUNK more client slots, all free, and the poll room they
+// need. 0, or -1 when the reservation is full or memory has run out.
+fn clients_grow() as i64 {
+    if (client_cap + CLIENT_CHUNK > CLIENT_LIMIT) { return 0 - 1; }
+    let is i64 as ncap = client_cap + CLIENT_CHUNK;
+    let is i64 as rw = sys.PROT_READ | sys.PROT_WRITE;
+    let is i64 as had = _pages(client_cap * 8);
+    let is i64 as need = _pages(ncap * 8);
+    if (need > had) {
+        if (sys.commit(cast(i64, client_fd) + had, need - had, rw) != 0) { return 0 - 1; }
+        if (sys.commit(cast(i64, client_live) + had, need - had, rw) != 0) { return 0 - 1; }
+        if (sys.commit(cast(i64, polled) + had, need - had, rw) != 0) { return 0 - 1; }
+    }
+    let is i64 as phad with mut = _pages((POLL_FIXED + client_cap) * 24);
+    let is i64 as pneed = _pages((POLL_FIXED + ncap) * 24);
+    if (client_cap == 0) { phad = 0; }
+    if (pneed > phad && sys.commit(cast(i64, poll_ents) + phad, pneed - phad, rw) != 0) { return 0 - 1; }
+    let is i64 as i with mut = client_cap;
+    while (i < ncap) { client_fd[i] = 0 - 1; client_live[i] = 0; i = i + 1; }
+    client_cap = ncap;
+    return 0;
+}
+
+// Reserve the tables and commit the first slots. 0, or -1 without memory.
+fn clients_init() as i64 {
+    let is i64 as rw = sys.PROT_READ | sys.PROT_WRITE;
+    client_fd = cast(*i64, sys.reserve(0, _pages(CLIENT_LIMIT * 8), rw));
+    client_live = cast(*i64, sys.reserve(0, _pages(CLIENT_LIMIT * 8), rw));
+    polled = cast(*i64, sys.reserve(0, _pages(CLIENT_LIMIT * 8), rw));
+    poll_ents = cast(*i64, sys.reserve(0, _pages((POLL_FIXED + CLIENT_LIMIT) * 24), rw));
+    if (cast(i64, client_fd) <= 0 || cast(i64, client_live) <= 0
+        || cast(i64, polled) <= 0 || cast(i64, poll_ents) <= 0) { return 0 - 1; }
+    return clients_grow();
+}
+
 // The gate, handed to us at spawn. -1 once every holder has gone.
 let is i64 as gate_fd with mut = 0 - 1;
 
@@ -248,7 +298,7 @@ fn handle_icmp(idx as i64, m as *u8, mlen as i64, src as i64) as void {
             if (next_mtu >= ip.MIN_MTU && next_mtu < f.mtu) { f.mtu = next_mtu; }
         }
         let is i64 as c with mut = 0;
-        while (c < MAX_CLIENTS) {
+        while (c < client_cap) {
             if (client_live[c] == 1) { np.send(client_fd[c], np.EV_UNREACH, 0, src, code); }
             c = c + 1;
         }
@@ -1196,15 +1246,16 @@ fn drop_client(c as i64) as void {
 }
 
 // A channel end someone parked on the gate becomes a client, greeted with
-// EV_HELLO — or, with every slot taken, told why in an EV_ERROR it can read
-// after we have let go of it.
+// EV_HELLO — or, when no slot can be had (the table cannot grow: memory or its
+// reservation has run out), told why in an EV_ERROR it can read after we
+// have let go of it.
 fn admit(fd as i64) as void {
     let is i64 as k with mut = 0;
-    while (k < MAX_CLIENTS && client_live[k] == 1) { k = k + 1; }
-    if (k >= MAX_CLIENTS) {
+    while (k < client_cap && client_live[k] == 1) { k = k + 1; }
+    if (k >= client_cap && clients_grow() != 0) {
         np.send(fd, np.EV_ERROR, 0, sys.E_MFILE, 0);
         sys.close(fd);
-        log("netd: every client slot is taken, one refused\n");
+        log("netd: no room for another client, one refused\n");
         return;
     }
     if (np.send(fd, np.EV_HELLO, 0, np.VERSION, nif.count()) < 0) {
@@ -1251,9 +1302,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     dns.cache_init(&dns_cache);
     let is i64 as di with mut = 0;
     while (di < 2) { dhcp_on[di] = 0; di = di + 1; }
+    if (clients_init() != 0) { log("netd: no memory for the client table\n"); return cast(i32, 1); }
     let is i64 as i with mut = 0;
-    while (i < MAX_CLIENTS) { client_fd[i] = 0 - 1; client_live[i] = 0; i = i + 1; }
-    i = 0;
     while (i < MAX_PINGS) { ping_live[i] = 0; i = i + 1; }
 
     // Take every port the machine has.
@@ -1288,8 +1338,8 @@ fn main(argc as i64, argv as *u8) as i32 {
 
         // Watch every interface, the gate and every live client at once. The
         // timeout is the nearest deadline, so an idle stack costs nothing.
-        // 3 words per entry: 2 interfaces + the gate + MAX_CLIENTS clients.
-        let is [57]i64 as pe;
+        // 3 words per entry: the interfaces, the gate and every client.
+        let is *i64 as pe = poll_ents;
         let is i64 as n with mut = 0;
         let is i64 as k with mut = 0;
         while (k < nif.count()) {
@@ -1315,10 +1365,9 @@ fn main(argc as i64, argv as *u8) as i32 {
         // in it means calling serve_client on a channel with nothing in it,
         // and the blocking read that follows takes the whole daemon down.
         let is i64 as first_client = n;
-        let is [16]i64 as polled;
         let is i64 as npolled with mut = 0;
         k = 0;
-        while (k < MAX_CLIENTS) {
+        while (k < client_cap) {
             if (client_live[k] == 1) {
                 pe[n*3+0] = client_fd[k];
                 // WRITABLE as well, but only for a client that is still owed
