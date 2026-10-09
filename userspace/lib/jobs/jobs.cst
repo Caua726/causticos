@@ -26,6 +26,10 @@ let is i64 as JOB_CHUNK with imut = 16;
 // the first time the slot runs one. It was eight, and the ninth stage's pid
 // was dropped: never reaped, never ended with the job.
 let is i64 as PIDS_LIMIT with imut = 65536;   // address space, not memory
+// What a background job wrote after its last newline waits in a Grow of its
+// own until the rest of the line comes (out_lines). Address space, not
+// memory: a job that writes no newline is shown a screenful at a time.
+let is i64 as HELD_LIMIT with imut = 16777216;
 let is i64 as CMD_CAP  with imut = 64;     // command text kept for `jobs`
 // Poll entries a shell needs besides its jobs' (the keyboard or the WM, exit
 // events, a paste waiting to be read, the history thread's channel wanting
@@ -66,6 +70,8 @@ struct Job {
     err_fd as i64;         // a job with no terminal ($(...)): its stages' stderr,
                            // kept apart from the stdout being captured; or -1
     pg as grow.Grow;       // the pids, npids of them (pid_at)
+    held as grow.Grow;     // a background job's output past its last newline,
+    nheld as i64;          // nheld bytes of it, not shown yet (out_lines)
     cmd as [64]u8;         // CMD_CAP
     tty_acc as [32]u8;     // a ttyproto request being read
     crash as [8]i64;       // WAIT_INFO_WORDS: how it crashed
@@ -158,6 +164,7 @@ fn alloc() as i64 {
             jb.tty_fd = 0 - 1; jb.tty_fill = 0; jb.tty_catch = 0;
             jb.err_fd = 0 - 1;
             jb.reported = 0;
+            jb.nheld = 0;
             jb.crashed = 0;
             jb.status = JOB_RUN;
             return i;
@@ -190,6 +197,43 @@ fn last_pid(j as i64) as i64 {
     let is *Job as jb = get(j);
     if (jb.npids <= 0) { return 0; }
     return pid_at(j, jb.npids - 1);
+}
+
+// out_lines — n more bytes of background job j's output, added to what it
+// holds. Returns how many of the held bytes, from the start, are whole lines
+// (up to the last newline): those are the caller's to show now, above the
+// prompt, and then to drop (held_drop). The rest waits for its newline, so a
+// line written in pieces is shown once, whole; it was shown a piece a line,
+// each under its own prompt. Past `screen` bytes with no newline in them —
+// a screenful, which the user could not see the start of anyway — all of it
+// is returned. A negative errno when the bytes could not be kept: nothing was
+// added, and the caller shows what is held and then them.
+fn out_lines(j as i64, p as *u8, n as i64, screen as i64) as i64 {
+    let is *Job as jb = get(j);
+    if (jb.held.base == 0 && grow.init(&jb.held, HELD_LIMIT) != 0) { return sys.E_NOMEM; }
+    let is i64 as rc = grow.need(&jb.held, jb.nheld + n);
+    if (rc != 0) { return rc; }
+    let is *u8 as h = grow.bytes(&jb.held);
+    let is i64 as i with mut = 0;
+    while (i < n) { h[jb.nheld + i] = p[i]; i = i + 1; }
+    jb.nheld = jb.nheld + n;
+    let is i64 as k with mut = jb.nheld;
+    while (k > 0 && h[k - 1] != cast(u8, 10)) { k = k - 1; }
+    if (k == 0 && jb.nheld >= screen) { return jb.nheld; }
+    return k;
+}
+
+fn held(j as i64) as *u8 { return grow.bytes(&get(j).held); }
+fn held_len(j as i64) as i64 { return get(j).nheld; }
+
+// Drop the first k held bytes, which the caller has shown.
+fn held_drop(j as i64, k as i64) as void {
+    let is *Job as jb = get(j);
+    let is *u8 as h = grow.bytes(&jb.held);
+    let is i64 as i with mut = k;
+    while (i < jb.nheld) { h[i - k] = h[i]; i = i + 1; }
+    jb.nheld = jb.nheld - k;
+    return;
 }
 
 fn set_cmd(j as i64, src as *u8, len as i64) as void {
