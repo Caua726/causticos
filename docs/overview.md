@@ -26,10 +26,13 @@ each address space tracks its mapped regions and open files
 (`vma.cst`).
 
 **Scheduling and SMP.** The scheduler is EEVDF across a set of QoS bands,
-plus a deadline class for real-time-ish work, all on red-black trees
-(`sched.cst`, `rbtree.cst`). It's preemptive and runs on multiple cores —
-AP bring-up, per-CPU state, and ticket locks live in `smp.cst` and
-`lock.cst`.
+plus a deadline class for real-time-ish work, all on red-black trees. The
+thread record and TID table are `thread.cst`, the per-CPU run queues
+`runq.cst`, the EEVDF/deadline/anti-abuse policy `qos.cst`, lazy FPU state
+`fpu.cst`, and `sched.cst` is the scheduler proper (sleep, wakeup,
+`schedule()`, the tick, idle); `tlb.cst` does TLB shootdown, `rbtree.cst` the
+trees. It's preemptive and runs on multiple cores — AP bring-up, per-CPU
+state, and ticket locks live in `smp.cst` and `lock.cst`.
 
 **Time.** Three clocks: the PIT for early boot, the LAPIC timer for
 scheduling ticks (calibrated against the HPET), and the HPET for a
@@ -47,8 +50,10 @@ Allocated resources are reclaimed on bind failure and hardware teardown.
 
 **Storage.** An AHCI driver talks to SATA disks (`ahci.cst`), a block
 layer sits above it (`storage.cst`), a full FAT32 implementation reads and
-writes (`fat32.cst`), and a POSIX-shaped VFS gives the rest of the kernel
-`open`/`read`/`write`/`readdir` (`vfs.cst`).
+writes (`fat32_vol.cst` the volume and its FAT, `fat32_dir.cst` lookup and
+readdir, `fat32_file.cst` file data, `fat32_ent.cst` creating and renaming
+entries, `fat32.cst` the VFS adapter and mount), and a POSIX-shaped VFS gives
+the rest of the kernel `open`/`read`/`write`/`readdir` (`vfs.cst`).
 
 **Network.** An e1000 NIC driver with real TX/RX rings and interrupts
 (`pcitest.cst`). There's no protocol stack yet — it can move frames, not

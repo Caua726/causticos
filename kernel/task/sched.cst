@@ -1,5 +1,8 @@
-// sched.cst — Full scheduler: EEVDF, deadline (EDF+CBS), anti-abuse, preemption
-// Based on causticos_sched_spec_v1
+// sched.cst — the scheduler: thread creation, sleep and wakeup, poll parking,
+// load balancing, schedule() and the timer tick, idle, and kill delivery.
+// Built on thread.cst (the thread record), runq.cst (the per-cpu run
+// queues), qos.cst (EEVDF, deadline and anti-abuse policy) and fpu.cst (lazy
+// FPU state); tlb.cst sits above it. Based on causticos_sched_spec_v1.
 //
 // Locking. Every cpu has its own run queue — QoS bands, deadline tree, counters
 // — under its own irq-safe spinlock (per_cpu_sched_locks). schedule() on a cpu
@@ -8,11 +11,6 @@
 // cpu moved meanwhile. Two run-queue locks are only ever held together by
 // steal_work, lower cpu first. Order: run-queue lock > tid_lock > heap_lock;
 // tlb_lock is taken with no run-queue lock held.
-//
-// Thread allocation: a typed pool (heap.kpool) for the structs + an
-// open-addressing hash table for TID→Thread* lookup. Hash table grows
-// dynamically (doubles at 75% load).
-// Thread count limited only by available memory.
 
 use "serial.cst" as serial;
 use "pmm.cst" as pmm;
@@ -26,502 +24,20 @@ use "lock.cst" as lock;
 use "vmm.cst" as vmm;
 use "gdt.cst" as gdt;
 use "syscall.cst" as sysc;
+use "thread.cst" as thread;
+use "runq.cst" as runq;
+use "qos.cst" as qos;
+use "fpu.cst" as fpu;
 
 // ============================================================
-// Constants
+// Termination — the scheduler's half of the request thread.cst describes at
+// thr_kill_pending: whether the running thread was asked, and making a thread
+// that was asked get to a boundary where it can act on it.
 // ============================================================
-
-// Thread states (§15)
-let is i64 as THREAD_RUNNING   = 1;
-let is i64 as THREAD_RUNNABLE  = 2;
-let is i64 as THREAD_SLEEPING  = 3;
-let is i64 as THREAD_SUSPENDED = 4;
-let is i64 as THREAD_DEAD      = 5;
-
-// Scheduling classes (§4)
-let is i64 as SCHED_CLASS_DEADLINE = 0;
-let is i64 as SCHED_CLASS_QOS     = 1;
-let is i64 as SCHED_CLASS_IDLE    = 2;
-
-// QoS bands (§4.2.1)
-let is i64 as QOS_INPUT        = 0;
-let is i64 as QOS_RENDER       = 1;
-let is i64 as QOS_ACTIVE       = 2;
-let is i64 as QOS_NORMAL       = 3;
-let is i64 as QOS_BATCH        = 4;
-let is i64 as QOS_LAZY         = 5;
-let is i64 as NUM_QOS_BANDS    = 6;
-
-// QoS budget enforcement window (§7.2): 1 second in ns
-let is i64 as QOS_WINDOW_NS    = 1000000000;
-
-// EEVDF (§5)
-let is i64 as BASE_WEIGHT      = 1024;
-let is i64 as DEFAULT_SLICE_NS = 5000000;
-let is i64 as SLEEPER_BONUS_NS with mut = 2500000;  // configurable (§5.4)
-
-// Quantum (§13) — mutable, configurable
-let is i64 as MIN_QUANTUM_NS   = 1000000;
-let is i64 as MAX_QUANTUM_NS   = 100000000;
-let is i64 as quantum_ns with mut = 5000000;
-
-// Deadline (§6) — configurable
-let is i64 as MAX_DL_UTIL_PCT with mut = 70;
-
-// Capabilities (§8)
-let is i64 as CAP_SCHED_REALTIME = 1;
-let is i64 as CAP_SCHED_INPUT    = 2;
-let is i64 as CAP_SCHED_RENDER   = 4;
-let is i64 as CAP_SCHED_AFFINITY = 8;
-
-// Kernel stack. 8 KiB (order 1) overflowed: a syscall handler stages user I/O
-// through a [4096]u8 on this stack, and the heaviest paths nest deep —
-// dispatch -> sys_read/write (4 KiB buf) -> vfs -> fat32 -> cluster_read ->
-// io -> ahci -> ... -> plus a device IRQ taken on the SAME stack (IF is set
-// during dispatch). Past 8 KiB the overflow silently corrupts whatever sits
-// below the stack — including a thread's saved context — so a thread later
-// resumed with a garbage RIP/RSP (a leaked kstack return address). It only bit
-// the self-host compiler: thousands of deep read/write syscalls, where simple
-// register-only smokes never went deep enough. 32 KiB (order 3) gives the 4 KiB
-// staging buffer + the deepest chain + a nested IRQ ample headroom.
-let is i64 as KSTACK_SIZE      = 32768;
-let is i64 as MAX_THREADS      = 64;
-
-// FPU state size (fxsave = 512 bytes)
-let is i64 as FPU_STATE_SIZE   = 512;
-
-// ============================================================
-// Thread struct — 400 bytes
-// ============================================================
-// 0    tid              i64
-// 8    state            i64
-// 16   sched_class      i64
-// 24   qos_band         i64
-// 32   weight           i64
-// 40   slice_ns         i64
-// 48   vruntime         i64
-// 56   virtual_deadline i64
-// 64   kstack_top       i64   (saved RSP)
-// 72   kstack_base      i64
-// 80   entry_fn         i64
-// 88   total_runtime_ns i64
-// 96   next_tid         i64   (run list / deadline list)
-// 104  prev_tid         i64
-// 112  lag              i64
-// 120  voluntary_sw     i64
-// 128  forced_sw        i64
-// --- Deadline class (§6) ---
-// 136  dl_runtime_ns    i64
-// 144  dl_period_ns     i64
-// 152  dl_deadline_ns   i64
-// 160  dl_budget_left   i64
-// 168  dl_period_start  i64
-// 176  dl_abs_deadline  i64
-// --- Anti-abuse (§7) ---
-// 184  cpu_used_window  i64
-// 192  window_start_ns  i64
-// 200  band_violations  i64
-// 208  band_below_count i64
-// 216  original_qos_band i64
-// 224  capabilities     i64
-// --- FPU (§14.2) ---
-// 232  fpu_dirty        i64
-// 240  fpu_state_addr   i64   (pointer to 512-byte fxsave area, 16-aligned)
-// --- Process link ---
-// 248  process_ptr      i64   (ptr to owning Process)
-// 256  home_cpu         i64   (cpu owning this thread's runqueue)
-// 264  last_run_ns      i64   (monotonic when this thread last started running)
-// 272  sleep_until_ns   i64   (timer-driven wakeup deadline; 0 = no auto-wake)
-// --- User-thread link ---
-// 280  aspace_pml4      i64   (user PML4 phys; kernel AS for kernel threads)
-// 288  user_entry       i64   (ring-3 RIP)
-// 296  user_rsp         i64   (ring-3 RSP)
-// 304  aspace_ptr       i64   (*vma.Aspace; 0 for kernel threads)
-// 312  kstack_va        i64   (guarded kvmap VA — kvunmap'd by the reaper)
-// 320  io_buf           i64   (lazy 4 KiB syscall-I/O staging — kfree'd by the reaper)
-// 328  kill_pending     i64   (the process is terminating: leave at the next
-//                              user boundary — see kill_kick)
-// 336  initial_rdi      i64   (ring-3 rdi of a SYS_THREAD_SPAWN worker)
-// 344  poll_parked      i64   (1 while on a cpu's parked list — poll_park_keys)
-// 352  wait_next        i64   (mutex wait queue link: next waiter tid + 1)
-// 360  wait_granted     i64   (1 once a mutex release handed this thread the lock)
-// 368  intr_sleep       i64   (1 while in a sleep a kill may cut short)
-// 376  held_ko0         i64   (a KObject this syscall holds a reference to —
-// 384  held_ko1         i64    vma.fd_hold; dropped on the way back to ring 3)
-// 392  queued_band      i64   (band + 1 while in a run-queue tree, 0 when not)
-// 400  park_keys        i64   (*i64: what a parked poller waits on — see poll_park_keys)
-// 408  park_nkeys       i64
-// 416  park_next        i64   (parked-list link: next tid + 1, 0 = end)
-// 424  park_prev        i64   (previous tid + 1, 0 = head)
-// 432  park_cpu         i64   (the cpu whose parked list holds it)
-// 440  tsleep_next      i64   (timed-sleeper list link: next tid + 1, 0 = end)
-// 448  tsleep_prev      i64   (previous tid + 1, 0 = head)
-// 456  dlt_next         i64   (budget-throttled deadline list: next tid + 1)
-// 464  dlt_prev         i64   (previous tid + 1, 0 = head)
-// 472  dlt_on           i64   (1 while on that list)
-// 480  user_fs          i64   (ring-3 fs base: the thread's own block — the
-//                              loader's for a process's first thread, the
-//                              spawner's for SYS_THREAD_SPAWN; 0 = none)
-// Total: 488
-
-let is i64 as THREAD_SIZE = 488;
-
-// Named slots used outside this file. initial_rdi and poll_parked used to
-// share 336; they never collided only because a worker reads its rdi before
-// it can ever park, which is luck, not a layout.
-let is i64 as THR_INITIAL_RDI  = 336;
-let is i64 as THR_WAIT_NEXT    = 352;
-let is i64 as THR_WAIT_GRANTED = 360;
-let is i64 as THR_KILL         = 328;
-let is i64 as THR_INTR_SLEEP   = 368;
-let is i64 as THR_HELD0        = 376;
-let is i64 as THR_HELD1        = 384;
-let is i64 as THR_QUEUED       = 392;
-let is i64 as THR_PARK_KEYS    = 400;
-let is i64 as THR_PARK_NKEYS   = 408;
-let is i64 as THR_PARK_NEXT    = 416;
-let is i64 as THR_PARK_PREV    = 424;
-let is i64 as THR_PARK_CPU     = 432;
-let is i64 as THR_TSLEEP_NEXT  = 440;
-let is i64 as THR_TSLEEP_PREV  = 448;
-let is i64 as THR_DLT_NEXT     = 456;
-let is i64 as THR_DLT_PREV     = 464;
-let is i64 as THR_DLT_ON       = 472;
-let is i64 as THR_USER_FS      = 480;
-// Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
-// Created lazily on first use under heap_lock (SMP-safe), so there is no
-// init-order dependency between sched.init and per_cpu_init / AP bring-up.
-let is i64 as thread_pool with mut = 0;
-let is i64 as fpu_pool with mut = 0;
-
-let is i64 as thread_count with mut = 0;
-let is i64 as idle_stacks with mut = 0;    // one per cpu, never freed
-let is i64 as next_tid with mut = 0;
-
-// Global lock protecting next_tid + the tid hash table. Pre-per-cpu
-// runqueue, the global sched_lock served this duty implicitly. Now
-// every cpu has its own runqueue lock and APs run per_cpu_init
-// concurrently, so the tid allocator needs its own serialiser.
-// Held briefly (a kmalloc + handful of writes), nests INSIDE any
-// per-cpu sched_lock. Order: sched_lock(cpu) > tid_lock > heap_lock.
-let is lock.TicketLock as tid_lock with mut;
-
-// TID -> Thread* table. Every scheduler path reads it, on every cpu, with no
-// lock (thread_ptr, under thr_get/thr_set); it is written under tid_lock. The
-// first version was an ordinary open-addressing table, and three things in it
-// were unsafe for a reader running alongside a writer:
-//   - growing published the new, still-EMPTY buffer before copying into it,
-//     and cap and buffer as two separate stores, so a lookup during a grow
-//     found nothing or probed with the wrong mask;
-//   - the old buffer was freed while lookups could still be inside it;
-//   - deleting shifted later entries back into the hole (backward-shift
-//     deletion), so a lookup could meet the transient EMPTY and conclude a
-//     live thread did not exist.
-// A lookup that comes back empty reads every field as 0 (thr_get's guard), and
-// "band 0" is QOS_INPUT: make_runnable queued a new thread in the highest band
-// under the wrong number, leaving a ghost node that pick_next chose forever
-// over every real thread below it. That was the hang.
-//
-// So now:
-//   - one allocation {cap, used, live, -, slots[cap]{tid, ptr}} behind one
-//     pointer, tid_tab: a reader loads it once and sees a matching cap;
-//   - a deleted entry becomes TID_TOMB and never moves; lookups probe past it;
-//     an insert reuses the first tombstone on its path;
-//   - an entry is written pointer first, tid second, so a reader that sees the
-//     tid sees its pointer;
-//   - a full table (live + tombstones past 3/4) is rebuilt complete, then
-//     published with one store; the old one is retired, and freed only once
-//     every cpu has since passed a quiescent point — schedule() past its
-//     preemption gate, or the top of its idle loop — which a lookup cannot
-//     span, because thread_ptr holds preemption off while it reads.
-let is i64 as TID_EMPTY = 0 - 1;
-let is i64 as TID_TOMB  = 0 - 2;
-let is i64 as TID_HDR_WORDS = 4;          // cap, used, live, reserved
-let is i64 as tid_tab with mut = 0;
-
-// Retired tables waiting for their grace period: the table, and each cpu's
-// quiescent count when it was retired.
-let is i64 as TID_RETIRE_MAX = 8;
-let is [8]i64 as tid_retired with mut;
-let is [128]i64 as tid_retired_seen with mut;     // TID_RETIRE_MAX * 16 cpus
-let is [16]i64 as cpu_quiesce with mut;           // per-cpu quiescent count
-
-fn tid_tab_alloc(cap as i64) as i64 {
-    let is i64 as t = heap.kmalloc((TID_HDR_WORDS + cap * 2) * 8, pmm.ALLOC_ZERO);
-    if (t == 0) { pmm.panic("tid table alloc failed", 22); }
-    let is *i64 as h = cast(*i64, t);
-    h[0] = cap;
-    h[1] = 0;
-    h[2] = 0;
-    let is i64 as i with mut = 0;
-    while (i < cap) {
-        h[TID_HDR_WORDS + i * 2] = TID_EMPTY;
-        i = i + 1;
-    }
-    return t;
-}
-
-fn tid_ht_init(cap as i64) as void {
-    tid_tab = tid_tab_alloc(cap);
-}
-
-// Store order matters to a reader on another cpu: the pointer has to be in the
-// slot before the tid that makes the slot match. x86 keeps stores in order; the
-// empty asm keeps the compiler from reordering them.
-fn tid_slot_publish(slot as *i64, tid as i64, ptr as i64) as void {
-    slot[1] = ptr;
-    asm("\n");
-    slot[0] = tid;
-}
-
-// Put (tid, ptr) into table t, which has room. Caller holds tid_lock.
-fn tid_tab_put(t as i64, tid as i64, ptr as i64) as void {
-    let is *i64 as h = cast(*i64, t);
-    let is i64 as cap = h[0];
-    let is i64 as mask = cap - 1;
-    let is i64 as idx with mut = tid & mask;
-    let is i64 as tomb with mut = 0 - 1;
-    let is i64 as steps with mut = 0;
-    while (steps < cap) {
-        let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
-        if (slot[0] == tid) { slot[1] = ptr; return; }
-        if (slot[0] == TID_TOMB && tomb < 0) { tomb = idx; }
-        if (slot[0] == TID_EMPTY) {
-            if (tomb >= 0) {
-                tid_slot_publish(cast(*i64, t + (TID_HDR_WORDS + tomb * 2) * 8), tid, ptr);
-            } else {
-                tid_slot_publish(slot, tid, ptr);
-                h[1] = h[1] + 1;                      // an EMPTY became used
-            }
-            h[2] = h[2] + 1;
-            return;
-        }
-        idx = (idx + 1) & mask;
-        steps = steps + 1;
-    }
-    if (tomb >= 0) {
-        tid_slot_publish(cast(*i64, t + (TID_HDR_WORDS + tomb * 2) * 8), tid, ptr);
-        h[2] = h[2] + 1;
-        return;
-    }
-    pmm.panic("tid table full", 14);
-}
-
-// This cpu is at a point where it holds no table pointer. Called from
-// schedule() past the preemption gate and from the top of the idle loop.
-fn tid_quiesce(cpu as i64) as void {
-    cpu_quiesce[cpu] = cpu_quiesce[cpu] + 1;
-}
-
-// Free the retired tables whose grace period is over: every cpu that is up has
-// been quiescent since they were retired. Caller holds tid_lock.
-fn tid_reclaim_locked() as void {
-    let is i64 as ncpu = smp.get_cpu_count();
-    let is i64 as r with mut = 0;
-    while (r < TID_RETIRE_MAX) {
-        if (tid_retired[r] != 0) {
-            let is i64 as all with mut = 1;
-            let is i64 as c with mut = 0;
-            while (c < ncpu) {
-                if (cpu_quiesce[c] == tid_retired_seen[r * 16 + c]) { all = 0; }
-                c = c + 1;
-            }
-            if (all == 1) {
-                heap.kfree(tid_retired[r]);
-                tid_retired[r] = 0;
-            }
-        }
-        r = r + 1;
-    }
-}
-
-fn tid_retire_locked(t as i64) as void {
-    tid_reclaim_locked();
-    let is i64 as ncpu = smp.get_cpu_count();
-    let is i64 as r with mut = 0;
-    while (r < TID_RETIRE_MAX) {
-        if (tid_retired[r] == 0) {
-            let is i64 as c with mut = 0;
-            while (c < ncpu) {
-                tid_retired_seen[r * 16 + c] = cpu_quiesce[c];
-                c = c + 1;
-            }
-            tid_retired[r] = t;
-            return;
-        }
-        r = r + 1;
-    }
-    // Eight rebuilds inside one grace period: something keeps every cpu from
-    // ever reaching schedule() or its idle loop, and the table cannot be
-    // replaced safely. Say so rather than free memory that may be in use.
-    pmm.panic("tid table: no retire slot (a cpu never quiesces)", 48);
-}
-
-// Caller holds tid_lock.
-fn tid_set_ptr(tid as i64, ptr as i64) as void {
-    let is *i64 as h = cast(*i64, tid_tab);
-    let is i64 as cap = h[0];
-    if ((h[1] + 1) * 4 > cap * 3) {
-        // Rebuild: double when live threads fill half of it, otherwise the
-        // same size, which clears the tombstones.
-        let is i64 as new_cap with mut = cap;
-        if ((h[2] + 1) * 2 > cap) { new_cap = cap * 2; }
-        let is i64 as nt = tid_tab_alloc(new_cap);
-        let is i64 as i with mut = 0;
-        while (i < cap) {
-            let is *i64 as slot = cast(*i64, tid_tab + (TID_HDR_WORDS + i * 2) * 8);
-            if (slot[0] >= 0) { tid_tab_put(nt, slot[0], slot[1]); }
-            i = i + 1;
-        }
-        let is i64 as old = tid_tab;
-        asm("\n");
-        tid_tab = nt;                                 // one store publishes it
-        tid_retire_locked(old);
-    }
-    tid_tab_put(tid_tab, tid, ptr);
-}
-
-fn thread_ptr(tid as i64) as i64 {
-    // Preemption off while the table pointer is in hand: the grace period that
-    // frees a retired table counts on no lookup spanning a switch.
-    let is i64 as track = lock.preempt_track;
-    if (track != 0) { lock.preempt_inc(); }
-    let is i64 as t = tid_tab;
-    let is i64 as found with mut = 0;
-    if (t != 0 && tid >= 0) {
-        let is *i64 as h = cast(*i64, t);
-        let is i64 as cap = h[0];
-        let is i64 as mask = cap - 1;
-        let is i64 as idx with mut = tid & mask;
-        let is i64 as checked with mut = 0;
-        while (checked < cap) {
-            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
-            let is i64 as st = slot[0];
-            if (st == tid) { found = slot[1]; checked = cap; }
-            else if (st == TID_EMPTY) { checked = cap; }
-            else {
-                idx = (idx + 1) & mask;
-                checked = checked + 1;
-            }
-        }
-    }
-    if (track != 0) { lock.preempt_dec(); }
-    return found;
-}
-
-// Remove tid: its slot becomes a tombstone, nothing moves. Caller holds
-// tid_lock. No-op if tid is not present.
-fn tid_ht_remove(tid as i64) as void {
-    let is i64 as t = tid_tab;
-    if (t == 0) { return; }
-    let is *i64 as h = cast(*i64, t);
-    let is i64 as cap = h[0];
-    let is i64 as mask = cap - 1;
-    let is i64 as idx with mut = tid & mask;
-    let is i64 as steps with mut = 0;
-    while (steps < cap) {
-        let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
-        if (slot[0] == TID_EMPTY) { return; }
-        if (slot[0] == tid) {
-            slot[0] = TID_TOMB;
-            h[2] = h[2] - 1;
-            return;
-        }
-        idx = (idx + 1) & mask;
-        steps = steps + 1;
-    }
-}
-
-// thr_get/thr_set go through thread_ptr which returns 0 when the
-// tid isn't (yet) in the hash table. Without the null-guard the
-// dereference turns `0 + off` into a low-address read/write and page-
-// faults. The usual trigger was a LAPIC timer IRQ landing inside
-// create_thread / sched.init between `next_tid = next_tid + 1` and
-// the matching `tid_set_ptr`: a scanner iterating `tid < next_tid`
-// (the per-tick ones did, before they kept lists of their own) hit the
-// half-published slot. Returning 0 / no-op is the correct fallback — the
-// slot is transiently invalid, not corrupt.
-fn thr_get(tid as i64, off as i64) as i64 {
-    let is i64 as base = thread_ptr(tid);
-    if (base == 0) { return 0; }
-    let is *i64 as p = cast(*i64, base + off);
-    return p[0];
-}
-
-fn thr_set(tid as i64, off as i64, v as i64) as void {
-    let is i64 as base = thread_ptr(tid);
-    if (base == 0) { return; }
-    let is *i64 as p = cast(*i64, base + off);
-    p[0] = v;
-}
-
-fn thr_state(tid as i64) as i64         { return thr_get(tid, 8); }
-fn thr_class(tid as i64) as i64         { return thr_get(tid, 16); }
-fn thr_band(tid as i64) as i64          { return thr_get(tid, 24); }
-fn thr_weight(tid as i64) as i64        { return thr_get(tid, 32); }
-fn thr_slice(tid as i64) as i64         { return thr_get(tid, 40); }
-fn thr_vruntime(tid as i64) as i64      { return thr_get(tid, 48); }
-fn thr_vdeadline(tid as i64) as i64     { return thr_get(tid, 56); }
-fn thr_kstack_top(tid as i64) as i64    { return thr_get(tid, 64); }
-fn thr_kstack_base(tid as i64) as i64   { return thr_get(tid, 72); }
-
-// Per-thread 4 KiB staging buffer for syscall I/O (read/write/write_serial),
-// allocated off the heap the first time the thread needs it. This 4 KiB used to
-// ride the kernel stack — the single biggest kstack consumer, and why 8 KiB
-// overflowed under deep I/O. Per-thread, so concurrent syscalls on different
-// threads never share it (a thread runs on at most one cpu); freed in reap_one.
-fn thr_io_buf(tid as i64) as i64 {
-    let is i64 as buf with mut = thr_get(tid, 320);
-    if (buf != 0) { return buf; }
-    buf = heap.kmalloc(4096, cast(i32, 0));
-    if (buf == 0) { return 0; }
-    thr_set(tid, 320, buf);
-    return buf;
-}
-
-fn thr_entry(tid as i64) as i64         { return thr_get(tid, 80); }
-fn thr_runtime(tid as i64) as i64       { return thr_get(tid, 88); }
-fn thr_next(tid as i64) as i64          { return thr_get(tid, 96); }
-fn thr_prev(tid as i64) as i64          { return thr_get(tid, 104); }
-fn thr_lag(tid as i64) as i64           { return thr_get(tid, 112); }
-fn thr_dl_budget(tid as i64) as i64     { return thr_get(tid, 160); }
-fn thr_dl_abs_dl(tid as i64) as i64     { return thr_get(tid, 176); }
-fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
-fn thr_home_cpu(tid as i64) as i64      { return thr_get(tid, 256); }
-fn thr_last_run_ns(tid as i64) as i64   { return thr_get(tid, 264); }
-fn thr_sleep_until_ns(tid as i64) as i64 { return thr_get(tid, 272); }
-// Address space the thread runs against. Kernel threads share
-// vmm.kas_pml4_phys (set by create_thread); user threads carry the
-// pml4_phys handed back by vmm.as_create. Read on every context
-// switch — if it differs from the cpu's current CR3, we reload.
-fn thr_aspace_pml4(tid as i64) as i64   { return thr_get(tid, 280); }
-// User entry / stack — meaningful only for user threads. The kernel
-// trampoline reads these on first dispatch and IRETQs to ring 3.
-fn thr_user_entry(tid as i64) as i64    { return thr_get(tid, 288); }
-fn thr_user_rsp(tid as i64) as i64      { return thr_get(tid, 296); }
-// *vma.Aspace for this user thread (as i64). Syscall handlers need the
-// Aspace pointer — not just pml4 — to call mmap/fd_* against it. Stored
-// at create time, before the thread becomes runnable. 0 for kernel threads.
-fn thr_aspace_ptr(tid as i64) as i64    { return thr_get(tid, 304); }
-
-// ---- Termination (the sched-side half) ----
-// A thread is never stopped where it stands. Stopping one mid-syscall leaves
-// whatever it holds held forever — the Ctrl+C freeze was exactly that: a writer
-// parked inside fat32 with the file system lock, and every later file operation
-// on the machine spinning behind it. Termination is a REQUEST instead: the
-// flag below, honoured by the thread itself at the next point where it holds
-// nothing — on its way back to ring 3 (syscall return, interrupt return), or
-// out of an interruptible sleep, which hands the syscall an E_INTR to unwind
-// with. lifecycle.cst owns what happens at that point.
-fn thr_kill_pending(tid as i64) as i64  { return thr_get(tid, THR_KILL); }
 fn kill_requested() as i64 {
-    let is i64 as tid = current_tid();
+    let is i64 as tid = runq.current_tid();
     if (tid < 0) { return 0; }
-    return thr_get(tid, THR_KILL);
-}
-fn thr_is_running(tid as i64) as i64 {
-    if (thr_state(tid) == THREAD_RUNNING) { return 1; }
-    return 0;
+    return thread.thr_get(tid, thread.THR_KILL);
 }
 
 // Mark `tid` for termination and make sure it gets to a boundary promptly:
@@ -535,243 +51,21 @@ fn thr_is_running(tid as i64) as i64 {
 // takes to check the flag — so a sleeper either saw the flag and did not sleep,
 // or is SLEEPING with intr_sleep set by the time we look.
 fn kill_kick(tid as i64) as void {
-    if (thread_ptr(tid) == 0) { return; }
-    thr_set(tid, THR_KILL, 1);
+    if (thread.thread_ptr(tid) == 0) { return; }
+    thread.thr_set(tid, thread.THR_KILL, 1);
     let is i64 as cpu with mut = 0;
-    let is i64 as f = lock_home(tid, &cpu);
-    let is i64 as st = thr_state(tid);
-    let is i64 as intr = thr_get(tid, THR_INTR_SLEEP);
+    let is i64 as f = runq.lock_home(tid, &cpu);
+    let is i64 as st = thread.thr_state(tid);
+    let is i64 as intr = thread.thr_get(tid, thread.THR_INTR_SLEEP);
     let is i64 as lapic_id with mut = 0 - 1;
-    if (st == THREAD_RUNNING && cpu != this_cpu()) {
+    if (st == thread.THREAD_RUNNING && cpu != runq.this_cpu()) {
         let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
         if (cast(i64, pc) != 0) { lapic_id = pc.lapic_id; }
     }
-    lock.release_irq(sched_lock_ptr(cpu), f);
-    if (st == THREAD_SUSPENDED) { make_runnable(tid); return; }
-    if (st == THREAD_SLEEPING && intr != 0) { wakeup_thread(tid); return; }
+    lock.release_irq(runq.sched_lock_ptr(cpu), f);
+    if (st == thread.THREAD_SUSPENDED) { make_runnable(tid); return; }
+    if (st == thread.THREAD_SLEEPING && intr != 0) { wakeup_thread(tid); return; }
     if (lapic_id >= 0) { lapic.send_resched_ipi_to(lapic_id); }
-}
-
-// *process.Process owning this thread (as i64; 0 for kernel threads).
-// The thread is execution; the Process is isolation/identity/lineage.
-fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
-
-// Initial ring-3 rdi for a thread (Thread+336, the arg SYS_THREAD_SPAWN passes
-// to the worker's entry fn). 0 for a normal process main thread — its args
-// arrive on the stack, and enter_user's register clear keeps rdi = 0 there.
-fn thr_set_initial_rdi(tid as i64, v as i64) as void { thr_set(tid, THR_INITIAL_RDI, v); }
-fn thr_initial_rdi(tid as i64) as i64                { return thr_get(tid, THR_INITIAL_RDI); }
-// The thread's fs base. Set before a thread first runs (it is created
-// suspended, or not yet a user thread anyone can see); schedule() loads it.
-fn thr_set_user_fs(tid as i64, v as i64) as void     { thr_set(tid, THR_USER_FS, v); }
-fn thr_user_fs(tid as i64) as i64                    { return thr_get(tid, THR_USER_FS); }
-
-// 1 while any thread of `proc_ptr` is still a live scheduler object (thread_ptr
-// != 0 — RUNNING, parked, or DEAD-but-not-yet-reaped). proc_wait spins on this
-// before aspace_destroy: a DEAD worker is only provably off its aspace CR3 once
-// the reaper has freed it (thread_ptr == 0), so tearing the aspace down before
-// then could pull the page tables out from under a CPU mid context-switch.
-//
-// It looks at the live threads only, in the tid table, under tid_lock (so a
-// table being rebuilt is never half-read). It was a lookup of every tid ever
-// handed out, and a parent waiting on a child ran it every 10 ms.
-fn process_has_live_thread(proc_ptr as i64) as i64 {
-    let is i64 as found with mut = 0;
-    let is i64 as f = lock.acquire_irq(&tid_lock);
-    let is i64 as t = tid_tab;
-    if (t != 0) {
-        let is i64 as cap = cast(*i64, t)[0];
-        let is i64 as i with mut = 0;
-        while (i < cap) {
-            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + i * 2) * 8);
-            if (slot[0] >= 0 && slot[1] != 0 && cast(*i64, slot[1])[31] == proc_ptr) {   // process_ptr @248
-                found = 1; i = cap;
-            }
-            i = i + 1;
-        }
-    }
-    lock.release_irq(&tid_lock, f);
-    return found;
-}
-
-// Is `tid` still a live scheduler object? Returns 0 once the deferred
-// reaper has freed it (removed from the tid table). The reaper can free a
-// DEAD thread before an observer polls its state, so "exited" detection
-// must treat reaped-and-gone the same as DEAD.
-fn thr_exists(tid as i64) as i32 {
-    if (thread_ptr(tid) == 0) { return cast(i32, 0); }
-    return cast(i32, 1);
-}
-fn thr_gone(tid as i64) as i32 {
-    if (thread_ptr(tid) == 0) { return cast(i32, 1); }   // reaped
-    if (thr_state(tid) == THREAD_DEAD) { return cast(i32, 1); }
-    return cast(i32, 0);
-}
-
-// Live thread count (idle + kernel + user). Bumped on create, dropped by
-// the reaper — a churn test reads it before/after to prove no leak.
-fn get_thread_count() as i64 { return thread_count; }
-
-// Total RAM held by live kernel stacks: every thread owns one guarded
-// KSTACK_SIZE (32 KiB) kvmap region. The single biggest per-thread kernel cost,
-// so the memory monitor breaks it out of "kernel data" explicitly; every cpu's
-// idle thread has one too, allocated once and never freed. (The two
-// guard pages around each stack are reserved VA, not backed RAM, so they don't
-// count here — only the 32 KiB of real frames does.)
-fn kstacks_bytes() as i64 { return (thread_count + idle_stacks) * KSTACK_SIZE; }
-
-// ============================================================
-// Per-band data
-// ============================================================
-
-// ============================================================
-// CpuRunqueue (§9) — PER-CPU scheduling state
-// One 512-byte runqueue per cpu, indexed by cpu_id. Each cpu owns
-// its own dl_root / band_roots / band_counts etc, so schedule()
-// only contends on its OWN cpu's sched_lock — no global lock,
-// no cross-cpu cache-line ping-pong on the hot path.
-// ============================================================
-// Layout (512 bytes), per cpu:
-// 0    cpu_id           i64
-// 8    dl_root          i64   (RB tree root)
-// 16   dl_count         i64
-// 24   reserved         i64   (was current_tid; now in PerCpu)
-// 32   reserved         i64   (was current_start_ns; now in PerCpu)
-// 40   reserved         i64   (was idle_tid; now in PerCpu)
-// 48   nr_running       i64   (count for THIS cpu only)
-// 56   nr_switches      i64   (count for THIS cpu only)
-// 64   reserved         i64   (was fpu_owner_tid; now in PerCpu)
-// 72   band_roots[6]    48 bytes
-// 120  band_counts[6]   48 bytes
-// 168  band_min_vrt[6]  48 bytes
-// 216  band_budgets[6]  192 bytes (6 * 4 * i64)
-// 408  reserved         104 bytes
-// Total: 512
-
-let is i64 as RQ_SIZE = 512;
-let is i64 as MAX_CPUS_RQ = 16;
-let is [8192]u8 as per_cpu_rqs;            // 16 cpus * 512 bytes
-
-// Per-cpu sched lock array — schedule on cpu X holds X's lock,
-// wakeup_thread targeting cpu X also holds X's lock. Lock is
-// IRQ-safe: acquire_irq disables IRQs locally then takes the
-// ticket. Two cpus rescheduling in parallel never serialise on
-// each other.
-let is [16]lock.TicketLock as per_cpu_sched_locks with mut;
-
-fn rq_ptr(cpu as i64) as i64 {
-    return cast(i64, &per_cpu_rqs) + cpu * RQ_SIZE;
-}
-
-// Pointer to a specific cpu's sched_lock for lock.acquire_irq.
-fn sched_lock_ptr(cpu as i64) as *lock.TicketLock {
-    return &per_cpu_sched_locks[cpu];
-}
-
-// Lock the run queue `tid` lives on, and say which (cpu_out[0]). A RUNNABLE
-// thread can be pulled to another cpu by an idle one (steal_work), and the move
-// happens under the SOURCE cpu's lock — so after taking the lock we look again,
-// and follow the thread if it left. A RUNNING or sleeping thread never moves,
-// so for those the first try always holds.
-fn lock_home(tid as i64, cpu_out as *i64) as i64 {
-    while (1 == 1) {
-        let is i64 as cpu = thr_home_cpu(tid);
-        let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
-        if (thr_home_cpu(tid) == cpu) {
-            cpu_out[0] = cpu;
-            return f;
-        }
-        lock.release_irq(sched_lock_ptr(cpu), f);
-    }
-    return 0;
-}
-
-// Per-cpu reap list — head tid of a singly-linked list of DEAD threads
-// awaiting resource reclamation, chained via the thread's offset-96 slot
-// (the runlist link, unused once a thread is DEAD and off every runqueue).
-// schedule() enqueues a dying thread here BEFORE switching off it;
-// idle_fn drains and frees AFTER the switch, when the thread's kstack +
-// CR3 are provably no longer in use on this cpu — closing the
-// use-after-free race a parent-side immediate reap would open on SMP.
-// Initialised to -1 (empty) in init().
-let is [16]i64 as cpu_reap_heads with mut;
-fn cpu_reap_head(cpu as i64) as i64            { return cpu_reap_heads[cpu]; }
-fn set_cpu_reap_head(cpu as i64, v as i64) as void { cpu_reap_heads[cpu] = v; }
-
-// This-cpu shorthand: most schedule() / pick_next() / runlist_*
-// callers operate on the cpu currently executing them.
-fn this_cpu() as i64 {
-    let is *smp.PerCpu as p = smp.current_cpu();
-    return p.cpu_id;
-}
-fn this_rq_ptr() as i64 { return rq_ptr(this_cpu()); }
-
-fn rq_get(cpu as i64, off as i64) as i64 {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + off);
-    return p[0];
-}
-
-fn rq_set(cpu as i64, off as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + off);
-    p[0] = v;
-}
-
-// Named accessors — all take the target cpu_id.
-fn dl_root(cpu as i64) as i64       { return rq_get(cpu, 8); }
-fn dl_root_ptr(cpu as i64) as i64   { return rq_ptr(cpu) + 8; }
-fn dl_count(cpu as i64) as i64      { return rq_get(cpu, 16); }
-fn dl_set_count(cpu as i64, v as i64) as void { rq_set(cpu, 16, v); }
-
-// current_tid / current_start_ns / idle_tid / fpu_owner_tid live
-// in smp.PerCpu (always per-cpu, no need to mirror in the rq).
-fn current_tid() as i64               { return smp.this_cpu_current_tid(); }
-fn set_current_tid(v as i64) as void  { smp.this_cpu_set_current_tid(v); }
-fn current_start_ns() as i64          { return smp.this_cpu_current_start_ns(); }
-fn set_current_start_ns(v as i64) as void { smp.this_cpu_set_current_start_ns(v); }
-fn idle_tid() as i64                  { return smp.this_cpu_idle_tid(); }
-fn set_idle_tid(v as i64) as void     { smp.this_cpu_set_idle_tid(v); }
-fn num_cpus() as i64                  { return smp.num_cpus(); }
-fn cpu_busy(i as i64) as i64          { return smp.cpu_busy(i); }
-fn cpu_busy_ns(i as i64) as i64       { return smp.cpu_busy_ns(i); }
-fn cpu_idle_ns(i as i64) as i64       { return smp.cpu_idle_ns(i); }
-fn fpu_owner_tid() as i64             { return smp.this_cpu_fpu_owner_tid(); }
-fn set_fpu_owner_tid(v as i64) as void { smp.this_cpu_set_fpu_owner_tid(v); }
-
-fn nr_running(cpu as i64) as i64           { return rq_get(cpu, 48); }
-fn set_nr_running(cpu as i64, v as i64) as void { rq_set(cpu, 48, v); }
-fn nr_switches(cpu as i64) as i64          { return rq_get(cpu, 56); }
-fn set_nr_switches(cpu as i64, v as i64) as void { rq_set(cpu, 56, v); }
-
-fn band_root_ptr(cpu as i64, b as i64) as i64 { return rq_ptr(cpu) + 72 + b * 8; }
-fn band_root(cpu as i64, b as i64) as i64 {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 72);
-    return p[b];
-}
-fn band_count(cpu as i64, b as i64) as i64 {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 120);
-    return p[b];
-}
-fn band_set_count(cpu as i64, b as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 120);
-    p[b] = v;
-}
-fn band_min_vruntime(cpu as i64, b as i64) as i64 {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 168);
-    return p[b];
-}
-fn band_set_min_vruntime(cpu as i64, b as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 168);
-    p[b] = v;
-}
-
-// Band budgets (per cpu).
-fn bb_get(cpu as i64, band as i64, field as i64) as i64 {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 216 + band * 32);
-    return p[field];
-}
-fn bb_set(cpu as i64, band as i64, field as i64, v as i64) as void {
-    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 216 + band * 32);
-    p[field] = v;
 }
 
 // ============================================================
@@ -803,12 +97,6 @@ let is i64 as switch_rsp with mut = 0;
 // X's lock, the cpu it resumes on, which for a thread an idle cpu
 // pulled over (steal_work) is not the cpu it was switched out on.
 
-fn band_weight(b as i64) as i64 {
-    if (b == QOS_BATCH) { return 512; }
-    if (b == QOS_LAZY)  { return 256; }
-    return BASE_WEIGHT;
-}
-
 // ============================================================
 // Preempt disable/enable (§11.5)
 // ============================================================
@@ -829,698 +117,6 @@ fn preempt_enable() as void {
 // reschedule pending (installed by init; lock.cst cannot import this file).
 fn preempt_resched() as void {
     schedule();
-}
-
-// ============================================================
-// TLB shootdown — invalidate stale TLB entries on the OTHER cpus after a
-// present page was unmapped, before its frame is reused. The initiator has
-// already cleared the PTE and invalidated its own entry.
-//
-// The request names what changed (an address space, a range); only cpus that
-// can hold an entry for it are interrupted, and a short range is invalidated
-// page by page instead of throwing away every cpu's whole TLB:
-//
-//   pml4 == 0   a kernel mapping: every other cpu
-//   pml4 != 0   a user address space: the cpus whose CR3 it is now. Without
-//               PCIDs a CR3 load drops every non-global entry, so a cpu that
-//               switched away holds nothing for it.
-//
-// The frames are freed only after every target acknowledged. This used to give
-// up after 100 ms and free them anyway — the one outcome a shootdown exists to
-// prevent: a cpu still translating through a stale entry into a frame that now
-// belongs to someone else. A target that does not answer is a wedged cpu, and
-// the kernel says so and stops.
-//
-// Interrupts may be off on a target (it is spinning on a lock with them
-// disabled) — so a pending request is also served by anyone spinning for
-// tlb_lock (acquire_polling) and by the initiator itself while it waits, and
-// the request is recorded per cpu before the IPI goes out.
-// ============================================================
-
-let is lock.TicketLock as tlb_lock with mut;
-let is i64 as tlb_ack with mut = 0;
-let is i64 as tlb_gen with mut = 0;
-let is i64 as tlb_req_va with mut = 0;
-let is i64 as tlb_req_pages with mut = 0;     // 0 = flush everything
-// A range longer than this is cheaper to drop wholesale than page by page.
-let is i64 as TLB_INVLPG_MAX = 32;
-
-fn tlb_flush_local() as void { asm("call smp_flush_tlb_local\n"); }
-fn tlb_invlpg(va as i64) as void { asm("call smp_invlpg\n"); }
-
-// Serve this cpu's pending request, if any. From the IPI handler, and from any
-// spin that might otherwise keep this cpu from answering.
-fn tlb_serve_pending() as void {
-    let is *smp.PerCpu as me = smp.current_cpu();
-    if (me.tlb_pending == 0) { return; }
-    let is i64 as pages = tlb_req_pages;
-    if (pages > 0 && pages <= TLB_INVLPG_MAX) {
-        let is i64 as i with mut = 0;
-        while (i < pages) {
-            tlb_invlpg(tlb_req_va + i * pmm.PAGE_SIZE);
-            i = i + 1;
-        }
-    } else {
-        tlb_flush_local();
-    }
-    me.tlb_pending = 0;
-    lock.atomic_add(&tlb_ack, 1);
-}
-
-fn tlb_serve_pending_ptr() as i64 { return cast(i64, fn_ptr(tlb_serve_pending)); }
-
-// Called by the TLB-shootdown IPI handler (idt).
-fn tlb_shootdown_ack() as void {
-    tlb_serve_pending();
-}
-
-fn tlb_shootdown(pml4 as i64, va as i64, pages as i64) as void {
-    let is i64 as cpus = smp.cpu_count;
-    if (cpus <= 1) { return; }
-    if (sched_active == 0) { return; }       // APs are not running anything yet
-    preempt_disable();
-    lock.acquire_polling(&tlb_lock, tlb_serve_pending_ptr());
-    let is i64 as self = this_cpu();
-    tlb_gen = tlb_gen + 1;
-    tlb_req_va = va;
-    tlb_req_pages = pages;
-    tlb_ack = 0;
-    // The caller's PTE store must be visible before we read any cpu's CR3: a
-    // cpu that loads this address space after we looked walks the cleared PTE.
-    lock.mfence();
-    let is i64 as targets with mut = 0;
-    let is i64 as c with mut = 0;
-    while (c < cpus) {
-        if (c != self) {
-            let is *smp.PerCpu as pc = smp.get_per_cpu(c);
-            if (cast(i64, pc) != 0 && pc.is_online != 0) {
-                if (pml4 == 0 || (pc.cur_pml4 & 0xFFFFFFFFFFFFF000) == (pml4 & 0xFFFFFFFFFFFFF000)) {
-                    pc.tlb_pending = tlb_gen;
-                    targets = targets + 1;
-                }
-            }
-        }
-        c = c + 1;
-    }
-    if (targets > 0) {
-        lock.mfence();
-        c = 0;
-        while (c < cpus) {
-            let is *smp.PerCpu as pt = smp.get_per_cpu(c);
-            if (c != self && cast(i64, pt) != 0 && pt.tlb_pending == tlb_gen) {
-                lapic.send_tlb_shootdown_ipi_to(pt.lapic_id);
-            }
-            c = c + 1;
-        }
-        let is i64 as t0 = timer.current_time_ns();
-        let is i64 as warned with mut = 0;
-        while (lock.atomic_add(&tlb_ack, 0) < targets) {
-            let is i64 as waited = timer.current_time_ns() - t0;
-            if (warned == 0 && waited > 100000000) {
-                serial.println("tlb: a cpu is slow to acknowledge a shootdown (100 ms)", 54);
-                warned = 1;
-            }
-            if (waited > 5000000000) { tlb_wedged(targets); }
-            asm(".byte 0xF3, 0x90\n");   // pause
-        }
-    }
-    lock.release(&tlb_lock);
-    preempt_enable();
-}
-
-fn tlb_wedged(targets as i64) as void {
-    serial.print("tlb: shootdown gen=", 19);
-    util.print_num(tlb_gen);
-    serial.print(" got ", 5);
-    util.print_num(lock.atomic_add(&tlb_ack, 0));
-    serial.print(" of ", 4);
-    util.print_num(targets);
-    serial.println(" acknowledgements after 5 s; still pending on:", 46);
-    let is i64 as c with mut = 0;
-    while (c < smp.cpu_count) {
-        let is *smp.PerCpu as pc = smp.get_per_cpu(c);
-        if (cast(i64, pc) != 0 && pc.tlb_pending != 0) {
-            serial.print("  cpu", 5);
-            util.print_num(c);
-            serial.print(" current_tid=", 13);
-            util.print_num(pc.current_tid);
-            serial.println("", 0);
-        }
-        c = c + 1;
-    }
-    pmm.panic("TLB shootdown not acknowledged", 30);
-}
-
-// A kernel mapping went away (vmm.kvunmap). Installed into vmm by main.
-fn tlb_shootdown_kernel(va as i64, pages as i64) as void {
-    tlb_shootdown(0, va, pages);
-}
-
-fn tlb_shootdown_kernel_ptr() as i64 { return cast(i64, fn_ptr(tlb_shootdown_kernel)); }
-
-fn cond_resched() as void {
-    if (smp.this_cpu_preempt_count() > 0) { return; }
-    if (smp.this_cpu_in_irq_context() != 0) { return; }
-    if (smp.this_cpu_need_resched() != 0) {
-        schedule();
-    }
-}
-
-// ============================================================
-// Run list operations (QoS bands, sorted by virtual_deadline)
-// ============================================================
-
-// RB tree insert/remove for QoS bands (keyed by virtual_deadline).
-// Per-cpu: caller passes cpu_id of the runqueue that owns tid.
-// A thread is in at most one run-queue tree, and only while queued. Each
-// thread records which (THR_QUEUED: band + 1), and both operations check it:
-// a thread queued twice, or removed from a band it is not in, leaves a node
-// behind that pick_next keeps choosing — a "ghost" of a thread that is running
-// elsewhere or is dead, ahead of every real one in lower bands. That is a
-// corrupted run queue, and it stops the kernel saying so, rather than leaving
-// a cpu picking the ghost forever.
-fn runlist_insert(cpu as i64, band as i64, tid as i64) as void {
-    if (thr_get(tid, THR_QUEUED) != 0) {
-        runq_corrupt("inserting a thread that is already queued", 41, cpu, band, tid);
-    }
-    if (band != thr_band(tid)) {
-        runq_corrupt("inserting a thread into a band that is not its own", 50, cpu, band, tid);
-    }
-    rb.rb_insert(band_root_ptr(cpu, band), thr_vdeadline(tid), tid);
-    band_set_count(cpu, band, band_count(cpu, band) + 1);
-    thr_set(tid, THR_QUEUED, band + 1);
-}
-
-fn runlist_remove(cpu as i64, band as i64, tid as i64) as void {
-    let is i64 as node = rb.rb_find_by_val(band_root(cpu, band), tid);
-    if (node == 0) {
-        runq_corrupt("removing a thread from a band it is not in", 42, cpu, band, tid);
-    }
-    rb.rb_delete(band_root_ptr(cpu, band), node);
-    band_set_count(cpu, band, band_count(cpu, band) - 1);
-    thr_set(tid, THR_QUEUED, 0);
-}
-
-fn runq_corrupt(what as *u8, len as i64, cpu as i64, band as i64, tid as i64) as void {
-    serial.print("sched: run queue: ", 18);
-    serial.print(what, len);
-    serial.print(" - cpu=", 7);
-    util.print_num(cpu);
-    serial.print(" band=", 6);
-    util.print_num(band);
-    serial.print(" tid=", 5);
-    util.print_num(tid);
-    serial.print(" queued_band+1=", 15);
-    util.print_num(thr_get(tid, THR_QUEUED));
-    serial.print(" state=", 7);
-    util.print_num(thr_state(tid));
-    serial.print(" home=", 6);
-    util.print_num(thr_home_cpu(tid));
-    serial.print(" this_cpu=", 10);
-    util.print_num(this_cpu());
-    serial.println("", 0);
-    pmm.panic("scheduler run queue corrupted", 29);
-}
-
-// ============================================================
-// Deadline list (sorted by dl_abs_deadline, ascending) — §6.5
-// Reuses next_tid/prev_tid fields (a thread is in ONE list at a time)
-// ============================================================
-
-// RB tree insert/remove for deadline class (keyed by dl_abs_deadline).
-// Per-cpu: caller passes cpu_id of the runqueue.
-fn dl_insert(cpu as i64, tid as i64) as void {
-    rb.rb_insert(dl_root_ptr(cpu), thr_dl_abs_dl(tid), tid);
-    dl_set_count(cpu, dl_count(cpu) + 1);
-}
-
-fn dl_remove(cpu as i64, tid as i64) as void {
-    let is i64 as node = rb.rb_find_by_val(dl_root(cpu), tid);
-    if (node != 0) {
-        rb.rb_delete(dl_root_ptr(cpu), node);
-        dl_set_count(cpu, dl_count(cpu) - 1);
-    }
-}
-
-// ============================================================
-// EEVDF helpers
-// ============================================================
-
-// band_min_vruntime is a monotonic floor under every vruntime in the band —
-// the base the average below is taken against, so its sums stay small. It
-// follows the smallest vruntime actually queued, never moves backwards, and
-// is advanced past an emptied band by the thread that ran last.
-fn update_band_min_vruntime(cpu as i64, band as i64) as void {
-    let is i64 as n with mut = rb.rb_leftmost(band_root(cpu, band));
-    if (n == 0) { return; }
-    let is i64 as lo with mut = thr_vruntime(rb.nd_val(n));
-    n = rb.rb_next(n);
-    while (n != 0) {
-        let is i64 as v = thr_vruntime(rb.nd_val(n));
-        if (v < lo) { lo = v; }
-        n = rb.rb_next(n);
-    }
-    if (lo > band_min_vruntime(cpu, band)) {
-        band_set_min_vruntime(cpu, band, lo);
-    }
-}
-
-// V: the weighted average vruntime of the band — the virtual time a thread
-// would have if every runnable thread had received exactly its share. EEVDF's
-// eligibility rule is measured against it: a thread is owed cpu (eligible)
-// while its own vruntime is at or behind V.
-//
-// It used to be a per-thread `lag` stored when the thread was last charged
-// and never refreshed while it waited. A thread charged while ahead kept a
-// negative lag frozen in place — ineligible no matter how far behind the
-// others it later fell — and a stream of waking threads (placed with lag 0)
-// could keep it off the cpu indefinitely: the user thread of the in-kernel
-// smoke sat a full second unscheduled on one cpu. Computed here from the
-// live vruntimes at the moment of the decision, nothing can go stale.
-//
-// `extra_tid` (or -1) is a RUNNING thread of this band that is not in the
-// tree — a waker placing a thread must count the one on the cpu. O(n) over the
-// band, which is a handful of threads; schedule() already walks every thread
-// twice per switch.
-fn band_avg_vruntime(cpu as i64, band as i64, extra_tid as i64) as i64 {
-    let is i64 as base = band_min_vruntime(cpu, band);
-    let is i64 as sum_w with mut = 0;
-    let is i64 as sum_wv with mut = 0;
-    let is i64 as n with mut = rb.rb_leftmost(band_root(cpu, band));
-    while (n != 0) {
-        let is i64 as tid = rb.nd_val(n);
-        let is i64 as w = thr_weight(tid);
-        sum_w = sum_w + w;
-        sum_wv = sum_wv + w * (thr_vruntime(tid) - base);
-        n = rb.rb_next(n);
-    }
-    if (extra_tid >= 0) {
-        let is i64 as we = thr_weight(extra_tid);
-        sum_w = sum_w + we;
-        sum_wv = sum_wv + we * (thr_vruntime(extra_tid) - base);
-    }
-    if (sum_w <= 0) { return base; }
-    // Floor division of a possibly negative sum: a thread exactly at the
-    // average must come out eligible, never one ns short of it.
-    let is i64 as q with mut = sum_wv / sum_w;
-    if (sum_wv < 0 && q * sum_w != sum_wv) { q = q - 1; }
-    return base + q;
-}
-
-// The thread RUNNING on `cpu` if it competes in `band` (so it counts toward V
-// while it is out of the tree), else -1. Caller holds that cpu's sched_lock.
-fn running_in_band(cpu as i64, band as i64) as i64 {
-    let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
-    if (cast(i64, pc) == 0) { return 0 - 1; }
-    let is i64 as cur = pc.current_tid;
-    if (cur < 0) { return 0 - 1; }
-    if (thread_ptr(cur) == 0) { return 0 - 1; }
-    if (thr_state(cur) != THREAD_RUNNING) { return 0 - 1; }
-    if (thr_class(cur) != SCHED_CLASS_QOS) { return 0 - 1; }
-    if (thr_band(cur) != band) { return 0 - 1; }
-    return cur;
-}
-
-// Re-place a thread about to be queued again after time off the run queue,
-// and refresh its deadline to match. Caller holds `cpu`'s sched_lock.
-fn place_requeue(cpu as i64, band as i64, tid as i64) as void {
-    let is i64 as v = place_vruntime(cpu, band, tid, 0);
-    let is i64 as w with mut = thr_weight(tid);
-    let is i64 as sl with mut = thr_slice(tid);
-    if (w <= 0) { w = BASE_WEIGHT; }
-    if (sl <= 0) { sl = DEFAULT_SLICE_NS; }
-    thr_set(tid, 48, v);
-    thr_set(tid, 56, v + sl * BASE_WEIGHT / w);
-}
-
-// Where a thread entering the band (created, or waking) starts. Never ahead of
-// what it already earned — a thread that slept a moment after using more than
-// its share keeps that debt — and never more than SLEEPER_BONUS_NS of credit
-// behind V, so sleeping cannot be banked into a monopoly afterwards.
-fn place_vruntime(cpu as i64, band as i64, tid as i64, fresh as i64) as i64 {
-    let is i64 as v = band_avg_vruntime(cpu, band, running_in_band(cpu, band));
-    if (fresh != 0) { return v; }
-    let is i64 as floor = v - SLEEPER_BONUS_NS;
-    let is i64 as old = thr_vruntime(tid);
-    if (old > floor) { return old; }
-    return floor;
-}
-
-fn update_vruntime(cpu as i64, tid as i64, elapsed_ns as i64) as void {
-    let is i64 as w = thr_weight(tid);
-    let is i64 as delta = elapsed_ns * BASE_WEIGHT / w;
-    let is i64 as new_vrt = thr_vruntime(tid) + delta;
-    thr_set(tid, 48, new_vrt);
-    thr_set(tid, 56, new_vrt + (thr_slice(tid) * BASE_WEIGHT / w));
-    thr_set(tid, 88, thr_runtime(tid) + elapsed_ns);
-    // lag (offset 112) is kept for the monitors only — V - v at the moment of
-    // this charge. The scheduler never decides on it (band_avg_vruntime).
-    thr_set(tid, 112, band_avg_vruntime(cpu, thr_band(tid), tid) - new_vrt);
-}
-
-// ============================================================
-// Deadline class: admission test (§6.1)
-// ============================================================
-
-fn dl_total_utilization(cpu as i64) as i64 {
-    // Returns utilization as percentage (walk this cpu's deadline tree).
-    let is i64 as total with mut = 0;
-    let is i64 as n with mut = rb.rb_leftmost(dl_root(cpu));
-    while (n != 0) {
-        let is i64 as tid = rb.nd_val(n);
-        let is i64 as rt = thr_get(tid, 136);
-        let is i64 as pd = thr_get(tid, 144);
-        if (pd > 0) {
-            total = total + (rt * 100 / pd);
-        }
-        n = rb.rb_next(n);
-    }
-    return total;
-}
-
-fn sched_set_deadline(tid as i64, runtime_ns as i64, period_ns as i64, deadline_ns as i64) as i64 {
-    let is i64 as cpu with mut = 0;
-    let is i64 as saved_flags = lock_home(tid, &cpu);
-    // Check capability
-    if ((thr_caps(tid) & CAP_SCHED_REALTIME) == 0) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return 0 - 1;  // EPERM
-    }
-    if (runtime_ns > deadline_ns) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return 0 - 2;  // EINVAL
-    }
-    if (deadline_ns > period_ns) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return 0 - 2;
-    }
-
-    // Admission test against THIS cpu's existing deadline load.
-    let is i64 as new_util = runtime_ns * 100 / period_ns;
-    let is i64 as total = dl_total_utilization(cpu) + new_util;
-    if (total > MAX_DL_UTIL_PCT) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return 0 - 3;  // EBUSY
-    }
-
-    // Remove from QoS band if currently there
-    if (thr_class(tid) == SCHED_CLASS_QOS) {
-        if (thr_state(tid) == THREAD_RUNNABLE) {
-            runlist_remove(cpu, thr_band(tid), tid);
-        }
-    }
-
-    thr_set(tid, 16, SCHED_CLASS_DEADLINE);
-    thr_set(tid, 136, runtime_ns);
-    thr_set(tid, 144, period_ns);
-    thr_set(tid, 152, deadline_ns);
-    thr_set(tid, 160, runtime_ns);                     // budget_left = full
-    let is i64 as now = timer.current_time_ns();
-    thr_set(tid, 168, now);                            // period_start
-    thr_set(tid, 176, now + deadline_ns);              // abs_deadline
-
-    if (thr_state(tid) == THREAD_RUNNABLE) {
-        dl_insert(cpu, tid);
-    }
-
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-    return 0;
-}
-
-// CBS budget enforcement (§6.3) — called from schedule() with the
-// running cpu's lock held; uses that same cpu for dl_remove.
-fn dl_account(cpu as i64, tid as i64, elapsed_ns as i64) as void {
-    let is i64 as budget = thr_dl_budget(tid) - elapsed_ns;
-    thr_set(tid, 160, budget);
-    thr_set(tid, 88, thr_runtime(tid) + elapsed_ns);
-
-    if (budget <= 0) {
-        // Budget exhausted — suspend until next period.
-        // Drop nr_running so the counter stays in step with replenish
-        // (which adds +1 again).
-        thr_set(tid, 8, THREAD_SUSPENDED);
-        dl_remove(cpu, tid);
-        set_nr_running(cpu, nr_running(cpu) - 1);
-        dlt_link(cpu, tid);
-    }
-}
-
-// The deadline threads that ran out of budget, per cpu, under that cpu's
-// sched_lock: what dl_check_replenish and program_next_tick look at. Both run
-// on every schedule(), and both used to walk every tid ever handed out for
-// these — three table lookups per tid, per context switch, for a list that is
-// almost always empty. Deadline threads are never stolen, so the cpu they were
-// throttled on stays theirs.
-let is [16]i64 as dlt_heads with mut;
-
-fn dlt_link(cpu as i64, tid as i64) as void {
-    if (thr_get(tid, THR_DLT_ON) != 0) { return; }
-    let is i64 as head = dlt_heads[cpu];
-    thr_set(tid, THR_DLT_NEXT, head);
-    thr_set(tid, THR_DLT_PREV, 0);
-    if (head != 0) { thr_set(head - 1, THR_DLT_PREV, tid + 1); }
-    dlt_heads[cpu] = tid + 1;
-    thr_set(tid, THR_DLT_ON, 1);
-}
-
-fn dlt_unlink(cpu as i64, tid as i64) as void {
-    if (thr_get(tid, THR_DLT_ON) == 0) { return; }
-    let is i64 as nx = thr_get(tid, THR_DLT_NEXT);
-    let is i64 as pv = thr_get(tid, THR_DLT_PREV);
-    if (pv != 0) { thr_set(pv - 1, THR_DLT_NEXT, nx); }
-    else { dlt_heads[cpu] = nx; }
-    if (nx != 0) { thr_set(nx - 1, THR_DLT_PREV, pv); }
-    thr_set(tid, THR_DLT_NEXT, 0);
-    thr_set(tid, THR_DLT_PREV, 0);
-    thr_set(tid, THR_DLT_ON, 0);
-}
-
-// Period replenishment (§6.4) — runs under THIS cpu's sched_lock,
-// only replenishes deadline threads whose home is this cpu.
-fn dl_check_replenish(cpu as i64) as void {
-    if (dlt_heads[cpu] == 0) { return; }
-    let is i64 as now = timer.current_time_ns();
-    let is i64 as t with mut = dlt_heads[cpu];
-    while (t != 0) {
-        let is i64 as tid = t - 1;
-        t = thr_get(tid, THR_DLT_NEXT);
-        let is i64 as period_start = thr_get(tid, 168);
-        let is i64 as period_ns = thr_get(tid, 144);
-        if (now >= period_start + period_ns) {
-            // New period: replenish budget
-            dlt_unlink(cpu, tid);
-            thr_set(tid, 168, now);                          // new period_start
-            thr_set(tid, 160, thr_get(tid, 136));            // budget = runtime
-            thr_set(tid, 176, now + thr_get(tid, 152));      // new abs_deadline
-            thr_set(tid, 8, THREAD_RUNNABLE);
-            dl_insert(cpu, tid);
-            set_nr_running(cpu, nr_running(cpu) + 1);
-            smp.this_cpu_set_need_resched(1);
-        }
-    }
-}
-
-// ============================================================
-// Anti-abuse: budget enforcement (§7.3)
-// ============================================================
-
-fn qos_budget_check(cpu as i64, tid as i64, elapsed_ns as i64) as void {
-    let is i64 as band = thr_band(tid);
-    let is i64 as max_pct = bb_get(cpu, band, 0);
-    if (max_pct >= 100) { return; }  // no enforcement for this band
-
-    // Accumulate CPU time
-    thr_set(tid, 184, thr_get(tid, 184) + elapsed_ns);
-
-    let is i64 as now = timer.current_time_ns();
-    let is i64 as window_start = thr_get(tid, 192);
-    let is i64 as window_ns = bb_get(cpu, band, 1);
-    let is i64 as window_age = now - window_start;
-
-    if (window_age >= window_ns) {
-        let is i64 as cpu_used = thr_get(tid, 184);
-        let is i64 as cpu_pct = cpu_used * 100 / window_age;
-
-        if (cpu_pct > max_pct) {
-            let is i64 as violations = thr_get(tid, 200) + 1;
-            thr_set(tid, 200, violations);
-            thr_set(tid, 208, 0);  // reset below_count
-            let is i64 as demo_thresh = bb_get(cpu, band, 3);
-            if (demo_thresh > 0) {
-                if (violations >= demo_thresh) {
-                    demote_thread(cpu, tid);
-                }
-            }
-        } else {
-            let is i64 as below = thr_get(tid, 208) + 1;
-            thr_set(tid, 208, below);
-            thr_set(tid, 200, 0);  // reset violations
-            let is i64 as promo_thresh = bb_get(cpu, band, 2);
-            if (promo_thresh > 0) {
-                if (below >= promo_thresh) {
-                    let is i64 as orig = thr_get(tid, 216);
-                    if (band > orig) {
-                        promote_thread(cpu, tid);
-                    }
-                }
-            }
-        }
-        // Reset window
-        thr_set(tid, 184, 0);
-        thr_set(tid, 192, now);
-    }
-}
-
-fn demote_thread(cpu as i64, tid as i64) as void {
-    let is i64 as band = thr_band(tid);
-    if (band >= QOS_LAZY) { return; }
-    let is i64 as new_band = band + 1;
-    if (thr_state(tid) == THREAD_RUNNABLE) {
-        runlist_remove(cpu, band, tid);
-    }
-    thr_set(tid, 24, new_band);
-    thr_set(tid, 32, band_weight(new_band));
-    thr_set(tid, 200, 0);
-    thr_set(tid, 208, 0);
-    if (thr_state(tid) == THREAD_RUNNABLE) {
-        runlist_insert(cpu, new_band, tid);
-    }
-}
-
-fn promote_thread(cpu as i64, tid as i64) as void {
-    let is i64 as band = thr_band(tid);
-    let is i64 as orig = thr_get(tid, 216);
-    if (band <= orig) { return; }
-    let is i64 as new_band = band - 1;
-    if (thr_state(tid) == THREAD_RUNNABLE) {
-        runlist_remove(cpu, band, tid);
-    }
-    thr_set(tid, 24, new_band);
-    thr_set(tid, 32, band_weight(new_band));
-    thr_set(tid, 200, 0);
-    thr_set(tid, 208, 0);
-    if (thr_state(tid) == THREAD_RUNNABLE) {
-        runlist_insert(cpu, new_band, tid);
-    }
-}
-
-// ============================================================
-// Capability check for band declaration (§7.1, §8)
-// ============================================================
-
-fn sched_set_qos(tid as i64, requested_band as i64) as i64 {
-    let is i64 as cpu with mut = 0;
-    let is i64 as saved_flags = lock_home(tid, &cpu);
-    if (requested_band == QOS_INPUT) {
-        if ((thr_caps(tid) & CAP_SCHED_INPUT) == 0) {
-            lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-            return 0 - 1;
-        }
-    }
-    if (requested_band == QOS_RENDER) {
-        if ((thr_caps(tid) & CAP_SCHED_RENDER) == 0) {
-            lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-            return 0 - 1;
-        }
-    }
-    thr_set(tid, 24, requested_band);
-    thr_set(tid, 216, requested_band);  // original_qos_band
-    thr_set(tid, 32, band_weight(requested_band));
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-    return 0;
-}
-
-// ============================================================
-// FPU lazy save (§14.2)
-// ============================================================
-
-// Set TS bit in CR0 (causes #NM on FPU use)
-fn cr0_set_ts() as void {
-    // mov rax, cr0 = 0x0F 0x20 0xC0
-    asm(".byte 0x0F, 0x20, 0xC0\n");
-    asm("or rax, 8\n");           // bit 3 = TS
-    // mov cr0, rax = 0x0F 0x22 0xC0
-    asm(".byte 0x0F, 0x22, 0xC0\n");
-}
-
-// Clear TS bit in CR0
-fn cr0_clear_ts() as void {
-    // clts = 0x0F 0x06
-    asm(".byte 0x0F, 0x06\n");
-}
-
-// Save FPU state (fxsave [rdi])
-fn fpu_save(addr as i64) as void {
-    // fxsave [rdi] = 0x0F 0xAE 0x07
-    asm(".byte 0x0F, 0xAE, 0x07\n");
-}
-
-// Restore FPU state (fxrstor [rdi])
-fn fpu_restore(addr as i64) as void {
-    // fxrstor [rdi] = 0x0F 0xAE, 0x0F
-    asm(".byte 0x0F, 0xAE, 0x0F\n");
-}
-
-// SSE on, for the calling cpu. Run once per cpu (per_cpu_init) before it can
-// schedule a user thread.
-//
-// The FPU and SSE state was already switched lazily (CR0.TS + #NM + fxsave), but
-// the cpu only EXECUTES SSE instructions with CR4.OSFXSR set, and nothing set
-// it: every SSE instruction in a program was #UD, and the compiler died on the
-// first int-to-double conversion it reached (cvtsi2sd) while building itself.
-// OSXMMEXCPT makes an unmasked SIMD floating-point exception #XM (vector 19)
-// instead of #UD. CR0: EM off (no x87 emulation trap), MP on (WAIT honours TS),
-// NE on (x87 errors as #MF, not the legacy FERR# line).
-fn fpu_cpu_init() as void {
-    asm(".byte 0x0F, 0x20, 0xC0\n");    // mov rax, cr0
-    asm("or rax, 4\n");
-    asm("xor rax, 4\n");                // EM (bit 2) off
-    asm("or rax, 34\n");                // MP (bit 1) | NE (bit 5)
-    asm(".byte 0x0F, 0x22, 0xC0\n");    // mov cr0, rax
-    asm(".byte 0x0F, 0x20, 0xE0\n");    // mov rax, cr4
-    asm("or rax, 1536\n");              // OSFXSR (bit 9) | OSXMMEXCPT (bit 10)
-    asm(".byte 0x0F, 0x22, 0xE0\n");    // mov cr4, rax
-    asm(".byte 0x0F, 0x06\n");          // clts — fninit below must not #NM
-    asm(".byte 0xDB, 0xE3\n");          // fninit
-}
-
-// A thread's FPU image before it has run: what the cpu holds after FNINIT,
-// with MXCSR at its power-on value. An all-zero area is NOT that — FCW 0 and
-// MXCSR 0 unmask every floating-point exception, so the first inexact result
-// (1.0/3.0) would fault the program.
-fn fpu_area_init(addr as i64) as void {
-    let is *u8 as fz = cast(*u8, addr);
-    let is i64 as fzi with mut = 0;
-    while (fzi < FPU_STATE_SIZE) { fz[fzi] = 0; fzi = fzi + 1; }   // kpool reuses slots unzeroed
-    fz[0] = cast(u8, 0x7F); fz[1] = cast(u8, 0x03);    // FCW = 0x037F: x87 exceptions masked
-    fz[24] = cast(u8, 0x80); fz[25] = cast(u8, 0x1F);  // MXCSR = 0x1F80: SIMD exceptions masked
-}
-
-// Called by #NM exception handler when a thread uses FPU for first time
-fn handle_nm_fault() as void {
-    cr0_clear_ts();
-
-    let is i64 as cur = current_tid();
-    if (cur < 0) { return; }
-
-    // Save previous owner's FPU state
-    if (fpu_owner_tid() >= 0) {
-        if (fpu_owner_tid() != cur) {
-            let is i64 as prev_fpu_addr = thr_get(fpu_owner_tid(), 240);
-            if (prev_fpu_addr != 0) {
-                fpu_save(prev_fpu_addr);
-            }
-        }
-    }
-
-    // Restore current thread's FPU state
-    let is i64 as cur_fpu_addr = thr_get(cur, 240);
-    if (cur_fpu_addr != 0) {
-        fpu_restore(cur_fpu_addr);
-    }
-
-    set_fpu_owner_tid(cur);
-    thr_set(cur, 232, 1);  // fpu_dirty = 1
 }
 
 // ============================================================
@@ -1574,23 +170,23 @@ fn create_thread(entry as i64, band as i64) as i64 {
     // a turn so workload spreads evenly across the topology.
     let is i64 as home_cpu = pick_home_cpu();
 
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(home_cpu));
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(home_cpu));
 
     // Allocate tid + hash slot under tid_lock so concurrent
     // per_cpu_init / create_thread on different cpus don't reuse
     // the same tid or stomp the same hash bucket.
-    let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
-    let is i64 as tid = next_tid;
+    let is i64 as tid_flags = lock.acquire_irq(&thread.tid_lock);
+    let is i64 as tid = thread.next_tid;
 
-    let is i64 as tptr = heap.kpool_alloc_ensure(cast(i64, &thread_pool), THREAD_SIZE, 1);
+    let is i64 as tptr = heap.kpool_alloc_ensure(cast(i64, &thread.thread_pool), thread.THREAD_SIZE, 1);
     if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
-    tid_set_ptr(tid, tptr);
-    next_tid = tid + 1;
-    lock.release_irq(&tid_lock, tid_flags);
+    thread.tid_set_ptr(tid, tptr);
+    thread.next_tid = tid + 1;
+    lock.release_irq(&thread.tid_lock, tid_flags);
 
     let is *u8 as tp = cast(*u8, tptr);
     let is i64 as z with mut = 0;
-    while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
+    while (z < thread.THREAD_SIZE) { tp[z] = 0; z = z + 1; }
 
     // Kernel stack
     // Guarded kernel stack: kvmap(KV_DATA | KV_GUARD) is a contiguous kernel VA
@@ -1598,9 +194,9 @@ fn create_thread(entry as i64, band as i64) as i64 {
     // overflow past the stack faults at once (#PF on the lower guard) instead of
     // silently corrupting the neighbour below it. It lives in the shared kernel
     // half (as_create copies PML4[256..511]), so it is mapped in every aspace.
-    let is i64 as stack_base = vmm.kvmap(KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
+    let is i64 as stack_base = vmm.kvmap(thread.KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
     if (stack_base == 0) { pmm.panic("stack alloc fail", 16); }
-    let is i64 as stack_top = stack_base + KSTACK_SIZE;
+    let is i64 as stack_top = stack_base + thread.KSTACK_SIZE;
 
     let is *i64 as sf = cast(*i64, stack_top - 56);
     asm("lea rax, [rip+_kernel_task_sched_cst_thread_entry_trampoline]\n");
@@ -1609,43 +205,43 @@ fn create_thread(entry as i64, band as i64) as i64 {
     sf[0] = switch_rsp;
     sf[1] = 0; sf[2] = 0; sf[3] = 0; sf[4] = 0; sf[5] = 0; sf[6] = 0;
 
-    let is i64 as fpu_addr = heap.kpool_alloc_ensure(cast(i64, &fpu_pool), FPU_STATE_SIZE, 1);
-    if (fpu_addr != 0) { fpu_area_init(fpu_addr); }
+    let is i64 as fpu_addr = heap.kpool_alloc_ensure(cast(i64, &thread.fpu_pool), thread.FPU_STATE_SIZE, 1);
+    if (fpu_addr != 0) { fpu.fpu_area_init(fpu_addr); }
 
     // EEVDF: a new thread starts at the band's average — owed exactly its
     // share from here on, no credit and no debt.
-    let is i64 as w = band_weight(band);
-    let is i64 as mvrt = place_vruntime(home_cpu, band, tid, 1);
-    let is i64 as vd = mvrt + (DEFAULT_SLICE_NS * BASE_WEIGHT / w);
+    let is i64 as w = qos.band_weight(band);
+    let is i64 as mvrt = qos.place_vruntime(home_cpu, band, tid, 1);
+    let is i64 as vd = mvrt + (thread.DEFAULT_SLICE_NS * thread.BASE_WEIGHT / w);
     let is i64 as now = timer.current_time_ns();
 
-    thr_set(tid, 0, tid);
-    thr_set(tid, 8, THREAD_RUNNABLE);
-    thr_set(tid, 16, SCHED_CLASS_QOS);
-    thr_set(tid, 24, band);
-    thr_set(tid, 32, w);
-    thr_set(tid, 40, DEFAULT_SLICE_NS);
-    thr_set(tid, 48, mvrt);
-    thr_set(tid, 56, vd);
-    thr_set(tid, 64, stack_top - 56);
-    thr_set(tid, 72, stack_base);
-    thr_set(tid, 80, entry);
-    thr_set(tid, 312, stack_base);   // kstack VA — kvunmap'd by the reaper
-    thr_set(tid, 96, 0 - 1);
-    thr_set(tid, 104, 0 - 1);
-    thr_set(tid, 112, 0);             // lag
-    thr_set(tid, 192, now);           // window_start_ns
-    thr_set(tid, 216, band);          // original_qos_band
-    thr_set(tid, 240, fpu_addr);      // fpu_state_addr
-    thr_set(tid, 256, home_cpu);      // home_cpu — every wakeup_thread / sched
+    thread.thr_set(tid, 0, tid);
+    thread.thr_set(tid, 8, thread.THREAD_RUNNABLE);
+    thread.thr_set(tid, 16, thread.SCHED_CLASS_QOS);
+    thread.thr_set(tid, 24, band);
+    thread.thr_set(tid, 32, w);
+    thread.thr_set(tid, 40, thread.DEFAULT_SLICE_NS);
+    thread.thr_set(tid, 48, mvrt);
+    thread.thr_set(tid, 56, vd);
+    thread.thr_set(tid, 64, stack_top - 56);
+    thread.thr_set(tid, 72, stack_base);
+    thread.thr_set(tid, 80, entry);
+    thread.thr_set(tid, 312, stack_base);   // kstack VA — kvunmap'd by the reaper
+    thread.thr_set(tid, 96, 0 - 1);
+    thread.thr_set(tid, 104, 0 - 1);
+    thread.thr_set(tid, 112, 0);             // lag
+    thread.thr_set(tid, 192, now);           // window_start_ns
+    thread.thr_set(tid, 216, band);          // original_qos_band
+    thread.thr_set(tid, 240, fpu_addr);      // fpu_state_addr
+    thread.thr_set(tid, 256, home_cpu);      // home_cpu — every wakeup_thread / sched
                                       //  cross-cpu touch reads this slot to
                                       //  pick the correct lock + runqueue
-    thr_set(tid, 280, vmm.kas_pml4_phys);  // aspace_pml4 — kernel AS until a
+    thread.thr_set(tid, 280, vmm.kas_pml4_phys);  // aspace_pml4 — kernel AS until a
                                       //  process loader replaces it
 
-    runlist_insert(home_cpu, band, tid);
-    set_nr_running(home_cpu, nr_running(home_cpu) + 1);
-    thread_count = thread_count + 1;
+    runq.runlist_insert(home_cpu, band, tid);
+    runq.set_nr_running(home_cpu, runq.nr_running(home_cpu) + 1);
+    thread.thread_count = thread.thread_count + 1;
 
     // Tell the home cpu it has new work so it preempts on next
     // tick — no IPI needed, the per-cpu need_resched flag is
@@ -1653,7 +249,7 @@ fn create_thread(entry as i64, band as i64) as i64 {
     let is *smp.PerCpu as hpc = smp.get_per_cpu(home_cpu);
     if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
 
-    lock.release_irq(sched_lock_ptr(home_cpu), saved_flags);
+    lock.release_irq(runq.sched_lock_ptr(home_cpu), saved_flags);
     return tid;
 }
 
@@ -1670,25 +266,25 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
                       process_ptr as i64, suspended as i64) as i64 {
     let is i64 as home_cpu = pick_home_cpu();
 
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(home_cpu));
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(home_cpu));
 
-    let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
-    let is i64 as tid = next_tid;
+    let is i64 as tid_flags = lock.acquire_irq(&thread.tid_lock);
+    let is i64 as tid = thread.next_tid;
 
-    let is i64 as tptr = heap.kpool_alloc_ensure(cast(i64, &thread_pool), THREAD_SIZE, 1);
+    let is i64 as tptr = heap.kpool_alloc_ensure(cast(i64, &thread.thread_pool), thread.THREAD_SIZE, 1);
     if (tptr == 0) { pmm.panic("thread alloc fail", 17); }
-    tid_set_ptr(tid, tptr);
-    next_tid = tid + 1;
-    lock.release_irq(&tid_lock, tid_flags);
+    thread.tid_set_ptr(tid, tptr);
+    thread.next_tid = tid + 1;
+    lock.release_irq(&thread.tid_lock, tid_flags);
 
     let is *u8 as tp = cast(*u8, tptr);
     let is i64 as z with mut = 0;
-    while (z < THREAD_SIZE) { tp[z] = 0; z = z + 1; }
+    while (z < thread.THREAD_SIZE) { tp[z] = 0; z = z + 1; }
 
     // Guarded kernel stack (see the matching comment in the other thread ctor).
-    let is i64 as stack_base = vmm.kvmap(KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
+    let is i64 as stack_base = vmm.kvmap(thread.KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
     if (stack_base == 0) { pmm.panic("ustack alloc fail", 17); }
-    let is i64 as stack_top = stack_base + KSTACK_SIZE;
+    let is i64 as stack_top = stack_base + thread.KSTACK_SIZE;
 
     let is *i64 as sf = cast(*i64, stack_top - 56);
     asm("lea rax, [rip+_kernel_task_sched_cst_thread_entry_trampoline]\n");
@@ -1697,53 +293,53 @@ fn create_user_thread_ex(kentry as i64, band as i64, aspace_pml4 as i64,
     sf[0] = switch_rsp;
     sf[1] = 0; sf[2] = 0; sf[3] = 0; sf[4] = 0; sf[5] = 0; sf[6] = 0;
 
-    let is i64 as fpu_addr = heap.kpool_alloc_ensure(cast(i64, &fpu_pool), FPU_STATE_SIZE, 1);
-    if (fpu_addr != 0) { fpu_area_init(fpu_addr); }
+    let is i64 as fpu_addr = heap.kpool_alloc_ensure(cast(i64, &thread.fpu_pool), thread.FPU_STATE_SIZE, 1);
+    if (fpu_addr != 0) { fpu.fpu_area_init(fpu_addr); }
 
-    let is i64 as w = band_weight(band);
-    let is i64 as mvrt = place_vruntime(home_cpu, band, tid, 1);
-    let is i64 as vd = mvrt + (DEFAULT_SLICE_NS * BASE_WEIGHT / w);
+    let is i64 as w = qos.band_weight(band);
+    let is i64 as mvrt = qos.place_vruntime(home_cpu, band, tid, 1);
+    let is i64 as vd = mvrt + (thread.DEFAULT_SLICE_NS * thread.BASE_WEIGHT / w);
     let is i64 as now = timer.current_time_ns();
 
-    thr_set(tid, 0, tid);
-    thr_set(tid, 8, THREAD_RUNNABLE);
-    thr_set(tid, 16, SCHED_CLASS_QOS);
-    thr_set(tid, 24, band);
-    thr_set(tid, 32, w);
-    thr_set(tid, 40, DEFAULT_SLICE_NS);
-    thr_set(tid, 48, mvrt);
-    thr_set(tid, 56, vd);
-    thr_set(tid, 64, stack_top - 56);
-    thr_set(tid, 72, stack_base);
-    thr_set(tid, 80, kentry);
-    thr_set(tid, 96, 0 - 1);
-    thr_set(tid, 104, 0 - 1);
-    thr_set(tid, 112, 0);
-    thr_set(tid, 192, now);
-    thr_set(tid, 216, band);
-    thr_set(tid, 240, fpu_addr);
-    thr_set(tid, 256, home_cpu);
-    thr_set(tid, 280, aspace_pml4);   // user aspace
-    thr_set(tid, 288, user_entry);    // ring-3 RIP
-    thr_set(tid, 296, user_rsp);      // ring-3 RSP
-    thr_set(tid, 304, aspace_ptr);    // *vma.Aspace (for syscall handlers)
-    thr_set(tid, 248, process_ptr);   // owning Process (0 for none)
-    thr_set(tid, 312, stack_base);  // kstack VA — kvunmap'd by the reaper
+    thread.thr_set(tid, 0, tid);
+    thread.thr_set(tid, 8, thread.THREAD_RUNNABLE);
+    thread.thr_set(tid, 16, thread.SCHED_CLASS_QOS);
+    thread.thr_set(tid, 24, band);
+    thread.thr_set(tid, 32, w);
+    thread.thr_set(tid, 40, thread.DEFAULT_SLICE_NS);
+    thread.thr_set(tid, 48, mvrt);
+    thread.thr_set(tid, 56, vd);
+    thread.thr_set(tid, 64, stack_top - 56);
+    thread.thr_set(tid, 72, stack_base);
+    thread.thr_set(tid, 80, kentry);
+    thread.thr_set(tid, 96, 0 - 1);
+    thread.thr_set(tid, 104, 0 - 1);
+    thread.thr_set(tid, 112, 0);
+    thread.thr_set(tid, 192, now);
+    thread.thr_set(tid, 216, band);
+    thread.thr_set(tid, 240, fpu_addr);
+    thread.thr_set(tid, 256, home_cpu);
+    thread.thr_set(tid, 280, aspace_pml4);   // user aspace
+    thread.thr_set(tid, 288, user_entry);    // ring-3 RIP
+    thread.thr_set(tid, 296, user_rsp);      // ring-3 RSP
+    thread.thr_set(tid, 304, aspace_ptr);    // *vma.Aspace (for syscall handlers)
+    thread.thr_set(tid, 248, process_ptr);   // owning Process (0 for none)
+    thread.thr_set(tid, 312, stack_base);  // kstack VA — kvunmap'd by the reaper
     // Suspended: created but parked. The state line above set RUNNABLE;
     // override to SUSPENDED and skip the runqueue insert. proc_start /
     // make_runnable enqueues it once the child's fd table is set up.
-    if (suspended != 0) { thr_set(tid, 8, THREAD_SUSPENDED); }
+    if (suspended != 0) { thread.thr_set(tid, 8, thread.THREAD_SUSPENDED); }
 
-    thread_count = thread_count + 1;
+    thread.thread_count = thread.thread_count + 1;
 
     if (suspended == 0) {
-        runlist_insert(home_cpu, band, tid);
-        set_nr_running(home_cpu, nr_running(home_cpu) + 1);
+        runq.runlist_insert(home_cpu, band, tid);
+        runq.set_nr_running(home_cpu, runq.nr_running(home_cpu) + 1);
         let is *smp.PerCpu as hpc = smp.get_per_cpu(home_cpu);
         if (cast(i64, hpc) != 0) { hpc.need_resched = 1; }
     }
 
-    lock.release_irq(sched_lock_ptr(home_cpu), saved_flags);
+    lock.release_irq(runq.sched_lock_ptr(home_cpu), saved_flags);
     return tid;
 }
 
@@ -1761,26 +357,26 @@ fn create_user_thread(kentry as i64, band as i64, aspace_pml4 as i64,
 // child's fd table is set up. No-op if the thread isn't suspended.
 fn make_runnable(tid as i64) as void {
     let is i64 as cpu with mut = 0;
-    let is i64 as f = lock_home(tid, &cpu);
-    let is i64 as band = thr_band(tid);
-    if (thr_state(tid) == THREAD_SUSPENDED) {
-        thr_set(tid, 8, THREAD_RUNNABLE);
-        if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
+    let is i64 as f = runq.lock_home(tid, &cpu);
+    let is i64 as band = thread.thr_band(tid);
+    if (thread.thr_state(tid) == thread.THREAD_SUSPENDED) {
+        thread.thr_set(tid, 8, thread.THREAD_RUNNABLE);
+        if (thread.thr_class(tid) == thread.SCHED_CLASS_DEADLINE) {
             // Out of budget and being killed: it runs to its exit now, off the
             // throttled list and back in the deadline tree it came from.
-            dlt_unlink(cpu, tid);
-            dl_insert(cpu, tid);
+            qos.dlt_unlink(cpu, tid);
+            runq.dl_insert(cpu, tid);
         } else {
             // Re-placed against the band as it is NOW: the average has moved
             // on since the thread was created suspended.
-            place_requeue(cpu, band, tid);
-            runlist_insert(cpu, band, tid);
+            qos.place_requeue(cpu, band, tid);
+            runq.runlist_insert(cpu, band, tid);
         }
-        set_nr_running(cpu, nr_running(cpu) + 1);
+        runq.set_nr_running(cpu, runq.nr_running(cpu) + 1);
         let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
         if (cast(i64, pc) != 0) { pc.need_resched = 1; }
     }
-    lock.release_irq(sched_lock_ptr(cpu), f);
+    lock.release_irq(runq.sched_lock_ptr(cpu), f);
 }
 
 // ============================================================
@@ -1818,11 +414,11 @@ let is [16]i64 as tsleep_heads with mut;
 let is [16]i64 as tsleep_min with mut;      // earliest wake_at listed, 0 = none
 
 fn tsleep_add(cpu as i64, tid as i64, wake_at as i64) as void {
-    thr_set(tid, 272, wake_at);                 // sleep_until_ns
+    thread.thr_set(tid, 272, wake_at);                 // sleep_until_ns
     let is i64 as head = tsleep_heads[cpu];
-    thr_set(tid, THR_TSLEEP_NEXT, head);
-    thr_set(tid, THR_TSLEEP_PREV, 0);
-    if (head != 0) { thr_set(head - 1, THR_TSLEEP_PREV, tid + 1); }
+    thread.thr_set(tid, thread.THR_TSLEEP_NEXT, head);
+    thread.thr_set(tid, thread.THR_TSLEEP_PREV, 0);
+    if (head != 0) { thread.thr_set(head - 1, thread.THR_TSLEEP_PREV, tid + 1); }
     tsleep_heads[cpu] = tid + 1;
     timed_sleepers_set(cpu, timed_sleepers_get(cpu) + 1);
     if (tsleep_min[cpu] == 0 || wake_at < tsleep_min[cpu]) { tsleep_min[cpu] = wake_at; }
@@ -1831,15 +427,15 @@ fn tsleep_add(cpu as i64, tid as i64, wake_at as i64) as void {
 // Off the list, if on it. The earliest-deadline mark may now be early; the next
 // tick that reaches it finds nothing due and recomputes it.
 fn tsleep_remove(cpu as i64, tid as i64) as void {
-    if (thr_sleep_until_ns(tid) <= 0) { return; }
-    let is i64 as nx = thr_get(tid, THR_TSLEEP_NEXT);
-    let is i64 as pv = thr_get(tid, THR_TSLEEP_PREV);
-    if (pv != 0) { thr_set(pv - 1, THR_TSLEEP_NEXT, nx); }
+    if (thread.thr_sleep_until_ns(tid) <= 0) { return; }
+    let is i64 as nx = thread.thr_get(tid, thread.THR_TSLEEP_NEXT);
+    let is i64 as pv = thread.thr_get(tid, thread.THR_TSLEEP_PREV);
+    if (pv != 0) { thread.thr_set(pv - 1, thread.THR_TSLEEP_NEXT, nx); }
     else { tsleep_heads[cpu] = nx; }
-    if (nx != 0) { thr_set(nx - 1, THR_TSLEEP_PREV, pv); }
-    thr_set(tid, THR_TSLEEP_NEXT, 0);
-    thr_set(tid, THR_TSLEEP_PREV, 0);
-    thr_set(tid, 272, 0);
+    if (nx != 0) { thread.thr_set(nx - 1, thread.THR_TSLEEP_PREV, pv); }
+    thread.thr_set(tid, thread.THR_TSLEEP_NEXT, 0);
+    thread.thr_set(tid, thread.THR_TSLEEP_PREV, 0);
+    thread.thr_set(tid, 272, 0);
     timed_sleepers_set(cpu, timed_sleepers_get(cpu) - 1);
 }
 
@@ -1867,23 +463,23 @@ fn sleep_for_ns(ns as i64) as void {
 // that the device finished in 20 us took the full poll interval.
 fn sleep_unless(word as *i64, value as i64, ns as i64) as void {
     if (ns <= 0) { return; }
-    let is i64 as tid = current_tid();
+    let is i64 as tid = runq.current_tid();
     if (tid < 0) { return; }
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu = thread.thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(cpu));
     let is i64 as met with mut = 0;
     if (cast(i64, word) != 0) {
         if (word[0] == value) { met = 1; }
     }
-    if (met == 1 || thr_state(tid) != THREAD_RUNNING) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    if (met == 1 || thread.thr_state(tid) != thread.THREAD_RUNNING) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
     let is i64 as wake_at = timer.current_time_ns() + ns;
     tsleep_add(cpu, tid, wake_at);
-    thr_set(tid, 8, THREAD_SLEEPING);
-    set_nr_running(cpu, nr_running(cpu) - 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    thread.thr_set(tid, 8, thread.THREAD_SLEEPING);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
 
@@ -1893,28 +489,28 @@ fn sleep_unless(word as *i64, value as i64, ns as i64) as void {
 // Plain sleep_for_ns stays uninterruptible on purpose: a driver polling its
 // hardware must finish the poll, killed or not.
 fn sleep_interruptible(ns as i64) as i64 {
-    let is i64 as tid = current_tid();
+    let is i64 as tid = runq.current_tid();
     if (tid < 0) { return 0; }
-    if (thr_get(tid, THR_KILL) != 0) { return 1; }
-    if (ns <= 0) { yield_cpu(); return thr_get(tid, THR_KILL); }
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    if (thread.thr_get(tid, thread.THR_KILL) != 0) { return 1; }
+    if (ns <= 0) { yield_cpu(); return thread.thr_get(tid, thread.THR_KILL); }
+    let is i64 as cpu = thread.thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(cpu));
     // Checked again under the lock kill_kick reads our state with: either it
     // already set the flag and we do not sleep, or it will see us SLEEPING with
     // intr_sleep set and wake us.
-    if (thr_get(tid, THR_KILL) != 0 || thr_state(tid) != THREAD_RUNNING) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
-        return thr_get(tid, THR_KILL);
+    if (thread.thr_get(tid, thread.THR_KILL) != 0 || thread.thr_state(tid) != thread.THREAD_RUNNING) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+        return thread.thr_get(tid, thread.THR_KILL);
     }
     let is i64 as wake_at = timer.current_time_ns() + ns;
     tsleep_add(cpu, tid, wake_at);
-    thr_set(tid, THR_INTR_SLEEP, 1);
-    thr_set(tid, 8, THREAD_SLEEPING);
-    set_nr_running(cpu, nr_running(cpu) - 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    thread.thr_set(tid, thread.THR_INTR_SLEEP, 1);
+    thread.thr_set(tid, 8, thread.THREAD_SLEEPING);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     schedule();
-    thr_set(tid, THR_INTR_SLEEP, 0);
-    return thr_get(tid, THR_KILL);
+    thread.thr_set(tid, thread.THR_INTR_SLEEP, 0);
+    return thread.thr_get(tid, thread.THR_KILL);
 }
 
 // Called from on_timer_tick on each cpu: wake this cpu's sleepers whose
@@ -1924,19 +520,19 @@ fn tick_wake(cpu as i64, now as i64) as void {
     if (timed_sleepers_get(cpu) <= 0) { return; }
     let is i64 as m = tsleep_min[cpu];
     if (m == 0 || now < m) { return; }
-    let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as f = lock.acquire_irq(runq.sched_lock_ptr(cpu));
     let is i64 as next_min with mut = 0;
     let is i64 as woke with mut = 0;
     let is i64 as lid with mut = 0 - 1;
     let is i64 as t with mut = tsleep_heads[cpu];
     while (t != 0) {
         let is i64 as tid = t - 1;
-        t = thr_get(tid, THR_TSLEEP_NEXT);
-        let is i64 as wake_at = thr_sleep_until_ns(tid);
+        t = thread.thr_get(tid, thread.THR_TSLEEP_NEXT);
+        let is i64 as wake_at = thread.thr_sleep_until_ns(tid);
         if (now >= wake_at) {
             // wake_locked takes it off the list; a sleeper that is somehow not
             // SLEEPING any more still has to leave it.
-            if (thr_state(tid) == THREAD_SLEEPING) {
+            if (thread.thr_state(tid) == thread.THREAD_SLEEPING) {
                 let is i64 as l = wake_locked(tid, cpu);
                 if (l >= 0) { lid = l; }
                 woke = 1;
@@ -1948,20 +544,20 @@ fn tick_wake(cpu as i64, now as i64) as void {
         }
     }
     tsleep_min[cpu] = next_min;
-    lock.release_irq(sched_lock_ptr(cpu), f);
+    lock.release_irq(runq.sched_lock_ptr(cpu), f);
     if (woke == 1) { wake_finish(cpu, lid); }
 }
 
 fn sleep_thread(tid as i64) as void {
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
-    if (thr_state(tid) != THREAD_RUNNING) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    let is i64 as cpu = thread.thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(cpu));
+    if (thread.thr_state(tid) != thread.THREAD_RUNNING) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    thr_set(tid, 8, THREAD_SLEEPING);
-    set_nr_running(cpu, nr_running(cpu) - 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    thread.thr_set(tid, 8, thread.THREAD_SLEEPING);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
 
@@ -1971,11 +567,11 @@ fn sleep_thread(tid as i64) as void {
 // — but reading it from the thread struct keeps the locking pattern
 // uniform with sleep_thread/wakeup_thread.
 fn sleep_locked_and_yield(saved_flags as i64) as void {
-    let is i64 as tid = current_tid();
-    let is i64 as cpu = thr_home_cpu(tid);
-    thr_set(tid, 8, THREAD_SLEEPING);
-    set_nr_running(cpu, nr_running(cpu) - 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    let is i64 as tid = runq.current_tid();
+    let is i64 as cpu = thread.thr_home_cpu(tid);
+    thread.thr_set(tid, 8, thread.THREAD_SLEEPING);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
 
@@ -2012,14 +608,14 @@ let is i64 as THR_POLL_PARKED = 344;            // slot in the thread struct (se
 fn thread_stats(procs as *i64, n as i64, cpu as *i64, ready as *i64) as void {
     let is i64 as track = lock.preempt_track;
     if (track != 0) { lock.preempt_inc(); }
-    let is i64 as t = tid_tab;
+    let is i64 as t = thread.tid_tab;
     if (t != 0) {
         let is *i64 as h = cast(*i64, t);
         let is i64 as cap = h[0];
-        let is i64 as nc = num_cpus();
+        let is i64 as nc = runq.num_cpus();
         let is i64 as i with mut = 0;
         while (i < cap) {
-            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + i * 2) * 8);
+            let is *i64 as slot = cast(*i64, t + (thread.TID_HDR_WORDS + i * 2) * 8);
             let is i64 as tid = slot[0];
             let is i64 as tp = slot[1];
             if (tid >= 0 && tp != 0) {
@@ -2046,7 +642,7 @@ fn thread_stats(procs as *i64, n as i64, cpu as *i64, ready as *i64) as void {
                 if (k >= 0) {
                     cpu[k] = cpu[k] + th[11];                     // total_runtime_ns @88
                     let is i64 as st = th[1];                     // state @8
-                    if (st == THREAD_RUNNING || st == THREAD_RUNNABLE) { ready[k] = ready[k] + 1; }
+                    if (st == thread.THREAD_RUNNING || st == thread.THREAD_RUNNABLE) { ready[k] = ready[k] + 1; }
                 }
             }
             i = i + 1;
@@ -2082,25 +678,25 @@ let is [16]i64 as park_heads with mut;
 
 fn park_link(cpu as i64, tid as i64) as void {
     let is i64 as head = park_heads[cpu];
-    thr_set(tid, THR_PARK_NEXT, head);
-    thr_set(tid, THR_PARK_PREV, 0);
-    if (head != 0) { thr_set(head - 1, THR_PARK_PREV, tid + 1); }
+    thread.thr_set(tid, thread.THR_PARK_NEXT, head);
+    thread.thr_set(tid, thread.THR_PARK_PREV, 0);
+    if (head != 0) { thread.thr_set(head - 1, thread.THR_PARK_PREV, tid + 1); }
     park_heads[cpu] = tid + 1;
-    thr_set(tid, THR_PARK_CPU, cpu);
-    thr_set(tid, THR_POLL_PARKED, 1);
+    thread.thr_set(tid, thread.THR_PARK_CPU, cpu);
+    thread.thr_set(tid, THR_POLL_PARKED, 1);
 }
 
 fn park_unlink(cpu as i64, tid as i64) as void {
-    let is i64 as nx = thr_get(tid, THR_PARK_NEXT);
-    let is i64 as pv = thr_get(tid, THR_PARK_PREV);
-    if (pv != 0) { thr_set(pv - 1, THR_PARK_NEXT, nx); }
+    let is i64 as nx = thread.thr_get(tid, thread.THR_PARK_NEXT);
+    let is i64 as pv = thread.thr_get(tid, thread.THR_PARK_PREV);
+    if (pv != 0) { thread.thr_set(pv - 1, thread.THR_PARK_NEXT, nx); }
     else { park_heads[cpu] = nx; }
-    if (nx != 0) { thr_set(nx - 1, THR_PARK_PREV, pv); }
-    thr_set(tid, THR_PARK_NEXT, 0);
-    thr_set(tid, THR_PARK_PREV, 0);
-    thr_set(tid, THR_PARK_KEYS, 0);
-    thr_set(tid, THR_PARK_NKEYS, 0);
-    thr_set(tid, THR_POLL_PARKED, 0);
+    if (nx != 0) { thread.thr_set(nx - 1, thread.THR_PARK_PREV, pv); }
+    thread.thr_set(tid, thread.THR_PARK_NEXT, 0);
+    thread.thr_set(tid, thread.THR_PARK_PREV, 0);
+    thread.thr_set(tid, thread.THR_PARK_KEYS, 0);
+    thread.thr_set(tid, thread.THR_PARK_NKEYS, 0);
+    thread.thr_set(tid, THR_POLL_PARKED, 0);
 }
 
 // Park until something this thread waits on changes, the deadline passes, or
@@ -2118,42 +714,42 @@ fn park_unlink(cpu as i64, tid as i64) as void {
 // the other order, a waker could look at an empty list just before this thread
 // joined it, and the thread would then sleep through the wake that was its own.
 fn poll_park_keys(deadline as i64, seq as i64, keys as *i64, nkeys as i64) as void {
-    let is i64 as tid = current_tid();
+    let is i64 as tid = runq.current_tid();
     if (tid < 0) { return; }
     let is i64 as now = timer.current_time_ns();
     let is i64 as wake_at with mut = now + POLL_PARK_CAP_NS;
     if (deadline > 0 && deadline < wake_at) { wake_at = deadline; }
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as cpu = thread.thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(cpu));
     // A park is interruptible: a thread being terminated does not go to sleep,
     // and its caller sees kill_requested() on the way round its loop.
-    if (thr_state(tid) != THREAD_RUNNING || thr_get(tid, THR_KILL) != 0) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    if (thread.thr_state(tid) != thread.THREAD_RUNNING || thread.thr_get(tid, thread.THR_KILL) != 0) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    thr_set(tid, THR_PARK_KEYS, cast(i64, keys));
-    thr_set(tid, THR_PARK_NKEYS, nkeys);
+    thread.thr_set(tid, thread.THR_PARK_KEYS, cast(i64, keys));
+    thread.thr_set(tid, thread.THR_PARK_NKEYS, nkeys);
     park_link(cpu, tid);
     asm(".byte 0x0F, 0xAE, 0xF0\n");     // mfence: the link is visible before the read
     if (lock.load_word(&poll_seq) != seq) {
         park_unlink(cpu, tid);
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
     tsleep_add(cpu, tid, wake_at);
-    thr_set(tid, THR_INTR_SLEEP, 1);
-    thr_set(tid, 8, THREAD_SLEEPING);
-    set_nr_running(cpu, nr_running(cpu) - 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    thread.thr_set(tid, thread.THR_INTR_SLEEP, 1);
+    thread.thr_set(tid, 8, thread.THREAD_SLEEPING);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     schedule();
     // Back. A key's waker took this thread off the list; the deadline and a
     // kill did not, and the list is the cpu's it parked on, whatever cpu runs
     // it now.
-    let is i64 as pcpu = thr_get(tid, THR_PARK_CPU);
-    let is i64 as f2 = lock.acquire_irq(sched_lock_ptr(pcpu));
-    if (thr_get(tid, THR_POLL_PARKED) == 1) { park_unlink(pcpu, tid); }
-    lock.release_irq(sched_lock_ptr(pcpu), f2);
-    thr_set(tid, THR_INTR_SLEEP, 0);
+    let is i64 as pcpu = thread.thr_get(tid, thread.THR_PARK_CPU);
+    let is i64 as f2 = lock.acquire_irq(runq.sched_lock_ptr(pcpu));
+    if (thread.thr_get(tid, THR_POLL_PARKED) == 1) { park_unlink(pcpu, tid); }
+    lock.release_irq(runq.sched_lock_ptr(pcpu), f2);
+    thread.thr_set(tid, thread.THR_INTR_SLEEP, 0);
 }
 
 // poll_wake_key — something `key` names changed: bytes into a channel, an
@@ -2175,32 +771,32 @@ fn poll_park_keys(deadline as i64, seq as i64, keys as *i64, nkeys as i64) as vo
 // have preempted a holder on this cpu.
 fn poll_wake_key(key as i64) as void {
     lock.atomic_add(&poll_seq, 1);
-    let is i64 as nc = num_cpus();
+    let is i64 as nc = runq.num_cpus();
     let is i64 as cpu with mut = 0;
     while (cpu < nc) {
         if (park_heads[cpu] != 0) {
-            let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+            let is i64 as f = lock.acquire_irq(runq.sched_lock_ptr(cpu));
             let is i64 as woke with mut = 0;
             let is i64 as lid with mut = 0 - 1;
             let is i64 as t with mut = park_heads[cpu];
             while (t != 0) {
                 let is i64 as tid = t - 1;
-                t = thr_get(tid, THR_PARK_NEXT);
-                let is *i64 as keys = cast(*i64, thr_get(tid, THR_PARK_KEYS));
-                let is i64 as nk = thr_get(tid, THR_PARK_NKEYS);
+                t = thread.thr_get(tid, thread.THR_PARK_NEXT);
+                let is *i64 as keys = cast(*i64, thread.thr_get(tid, thread.THR_PARK_KEYS));
+                let is i64 as nk = thread.thr_get(tid, thread.THR_PARK_NKEYS);
                 let is i64 as hit with mut = 0;
                 let is i64 as k with mut = 0;
                 while (k < nk) {
                     if (keys[k] == key) { hit = 1; k = nk; } else { k = k + 1; }
                 }
-                if (hit == 1 && thr_state(tid) == THREAD_SLEEPING) {
+                if (hit == 1 && thread.thr_state(tid) == thread.THREAD_SLEEPING) {
                     park_unlink(cpu, tid);
                     let is i64 as l = wake_locked(tid, cpu);
                     if (l >= 0) { lid = l; }
                     woke = 1;
                 }
             }
-            lock.release_irq(sched_lock_ptr(cpu), f);
+            lock.release_irq(runq.sched_lock_ptr(cpu), f);
             if (woke == 1) { wake_finish(cpu, lid); }
         }
         cpu = cpu + 1;
@@ -2212,34 +808,34 @@ fn poll_wake_key(key as i64) as void {
 // Returns the lapic id to send a reschedule IPI to once that lock is dropped,
 // or -1 when none is due (the home is this cpu, or the thread was not asleep).
 fn wake_locked(tid as i64, cpu as i64) as i64 {
-    if (thr_state(tid) != THREAD_SLEEPING) { return 0 - 1; }
+    if (thread.thr_state(tid) != thread.THREAD_SLEEPING) { return 0 - 1; }
 
     // A timed sleep pending: off the cpu's timed-sleeper list.
     tsleep_remove(cpu, tid);
 
-    let is i64 as band = thr_band(tid);
-    let is i64 as w with mut = thr_weight(tid);
+    let is i64 as band = thread.thr_band(tid);
+    let is i64 as w with mut = thread.thr_weight(tid);
     // Placement keeps what the thread earned before it slept, bounded by the
     // sleeper bonus (place_vruntime). It used to reset every waker to the
     // band's minimum, which handed a thread that slept for a microsecond the
     // same head start as one that slept for a minute.
-    let is i64 as new_vrt = place_vruntime(cpu, band, tid, 0);
-    let is i64 as slice with mut = thr_slice(tid);
-    if (w <= 0) { w = BASE_WEIGHT; }
-    if (slice <= 0) { slice = DEFAULT_SLICE_NS; }
-    let is i64 as new_vd = new_vrt + (slice * BASE_WEIGHT / w);
+    let is i64 as new_vrt = qos.place_vruntime(cpu, band, tid, 0);
+    let is i64 as slice with mut = thread.thr_slice(tid);
+    if (w <= 0) { w = thread.BASE_WEIGHT; }
+    if (slice <= 0) { slice = thread.DEFAULT_SLICE_NS; }
+    let is i64 as new_vd = new_vrt + (slice * thread.BASE_WEIGHT / w);
 
-    thr_set(tid, 48, new_vrt);
-    thr_set(tid, 112, 0);
-    thr_set(tid, 56, new_vd);
-    thr_set(tid, 8, THREAD_RUNNABLE);
+    thread.thr_set(tid, 48, new_vrt);
+    thread.thr_set(tid, 112, 0);
+    thread.thr_set(tid, 56, new_vd);
+    thread.thr_set(tid, 8, thread.THREAD_RUNNABLE);
 
-    if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
-        dl_insert(cpu, tid);
+    if (thread.thr_class(tid) == thread.SCHED_CLASS_DEADLINE) {
+        runq.dl_insert(cpu, tid);
     } else {
-        runlist_insert(cpu, band, tid);
+        runq.runlist_insert(cpu, band, tid);
     }
-    set_nr_running(cpu, nr_running(cpu) + 1);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) + 1);
 
     // Flag the home cpu (not all cpus) — the thread can only run
     // on its home, so resched on remote cpus is wasted work.
@@ -2249,7 +845,7 @@ fn wake_locked(tid as i64, cpu as i64) as i64 {
     if (cast(i64, hpc) != 0) {
         hpc.need_resched = 1;
         target_lapic_id = hpc.lapic_id;
-        if (cpu != this_cpu()) { is_remote = 1; }
+        if (cpu != runq.this_cpu()) { is_remote = 1; }
     }
 
     if (is_remote == 0) { return 0 - 1; }
@@ -2272,13 +868,13 @@ fn wake_finish(cpu as i64, lapic_id as i64) as void {
 
 fn wakeup_thread(tid as i64) as void {
     let is i64 as cpu with mut = 0;
-    let is i64 as saved_flags = lock_home(tid, &cpu);
-    if (thr_state(tid) != THREAD_SLEEPING) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    let is i64 as saved_flags = runq.lock_home(tid, &cpu);
+    if (thread.thr_state(tid) != thread.THREAD_SLEEPING) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
     let is i64 as lid = wake_locked(tid, cpu);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     wake_finish(cpu, lid);
 }
 
@@ -2294,18 +890,18 @@ fn kick_idle_for(cpu as i64) as void {
     let is *smp.PerCpu as hp = smp.get_per_cpu(cpu);
     if (cast(i64, hp) == 0) { return; }
     if (hp.current_tid == hp.idle_tid) { return; }        // it will run it itself
-    if (nr_running(cpu) < 2) { return; }
+    if (runq.nr_running(cpu) < 2) { return; }
     // Not this cpu: it is running this code, so it is not halted, and if it is
     // idle the idle loop steals at the top of its next pass. An IPI to itself
     // bought nothing — from an interrupt on an idle cpu (a disk completion's
     // wakeup) it was a self-IPI racing the idle thread's own IPIs.
-    let is i64 as me = this_cpu();
+    let is i64 as me = runq.this_cpu();
     let is i64 as c with mut = 0;
     while (c < n) {
         if (c != cpu && c != me) {
             let is *smp.PerCpu as pc = smp.get_per_cpu(c);
             if (cast(i64, pc) != 0 && pc.is_online != 0
-                && pc.current_tid == pc.idle_tid && nr_running(c) == 0) {
+                && pc.current_tid == pc.idle_tid && runq.nr_running(c) == 0) {
                 lapic.send_resched_ipi_to(pc.lapic_id);
                 return;
             }
@@ -2335,15 +931,15 @@ fn kick_idle_for(cpu as i64) as void {
 // Its vruntime keeps its distance from the band average, measured on the old
 // queue and re-applied on the new one, so the move is neither credit nor debt.
 fn steal_work() as i64 {
-    let is i64 as self = this_cpu();
+    let is i64 as self = runq.this_cpu();
     let is i64 as n = smp.get_cpu_count();
     if (n <= 1) { return 0; }
-    let is i64 as mine = nr_running(self);
+    let is i64 as mine = runq.nr_running(self);
     let is i64 as src with mut = 0 - 1;
     let is i64 as most with mut = mine + 1;
     let is i64 as c with mut = 0;
     while (c < n) {
-        if (c != self && nr_running(c) > most) { most = nr_running(c); src = c; }
+        if (c != self && runq.nr_running(c) > most) { most = runq.nr_running(c); src = c; }
         c = c + 1;
     }
     if (src < 0) { return 0; }
@@ -2353,37 +949,37 @@ fn steal_work() as i64 {
     let is i64 as lo with mut = self;
     let is i64 as hi with mut = src;
     if (src < self) { lo = src; hi = self; }
-    let is i64 as f = lock.acquire_irq(sched_lock_ptr(lo));
-    lock.acquire_raw(sched_lock_ptr(hi));
+    let is i64 as f = lock.acquire_irq(runq.sched_lock_ptr(lo));
+    lock.acquire_raw(runq.sched_lock_ptr(hi));
 
     let is i64 as moved with mut = 0;
-    if (nr_running(src) >= nr_running(self) + 2) {
+    if (runq.nr_running(src) >= runq.nr_running(self) + 2) {
         let is *smp.PerCpu as sp = smp.get_per_cpu(src);
         let is i64 as busy_tid = sp.current_tid;
         let is i64 as fpu_tid = sp.fpu_owner_tid;
         let is i64 as b with mut = 0;
-        while (b < NUM_QOS_BANDS && moved == 0) {
-            let is i64 as nd with mut = rb.rb_leftmost(band_root(src, b));
+        while (b < thread.NUM_QOS_BANDS && moved == 0) {
+            let is i64 as nd with mut = rb.rb_leftmost(runq.band_root(src, b));
             while (nd != 0 && moved == 0) {
                 let is i64 as tid = rb.nd_val(nd);
                 nd = rb.rb_next(nd);
                 if (tid != busy_tid && tid != fpu_tid
-                    && thr_state(tid) == THREAD_RUNNABLE
-                    && thr_class(tid) == SCHED_CLASS_QOS) {
-                    let is i64 as rel = thr_vruntime(tid)
-                        - band_avg_vruntime(src, b, running_in_band(src, b));
-                    runlist_remove(src, b, tid);
-                    set_nr_running(src, nr_running(src) - 1);
-                    thr_set(tid, 256, self);
-                    let is i64 as v = band_avg_vruntime(self, b, running_in_band(self, b)) + rel;
-                    let is i64 as w with mut = thr_weight(tid);
-                    let is i64 as sl with mut = thr_slice(tid);
-                    if (w <= 0) { w = BASE_WEIGHT; }
-                    if (sl <= 0) { sl = DEFAULT_SLICE_NS; }
-                    thr_set(tid, 48, v);
-                    thr_set(tid, 56, v + sl * BASE_WEIGHT / w);
-                    runlist_insert(self, b, tid);
-                    set_nr_running(self, nr_running(self) + 1);
+                    && thread.thr_state(tid) == thread.THREAD_RUNNABLE
+                    && thread.thr_class(tid) == thread.SCHED_CLASS_QOS) {
+                    let is i64 as rel = thread.thr_vruntime(tid)
+                        - qos.band_avg_vruntime(src, b, qos.running_in_band(src, b));
+                    runq.runlist_remove(src, b, tid);
+                    runq.set_nr_running(src, runq.nr_running(src) - 1);
+                    thread.thr_set(tid, 256, self);
+                    let is i64 as v = qos.band_avg_vruntime(self, b, qos.running_in_band(self, b)) + rel;
+                    let is i64 as w with mut = thread.thr_weight(tid);
+                    let is i64 as sl with mut = thread.thr_slice(tid);
+                    if (w <= 0) { w = thread.BASE_WEIGHT; }
+                    if (sl <= 0) { sl = thread.DEFAULT_SLICE_NS; }
+                    thread.thr_set(tid, 48, v);
+                    thread.thr_set(tid, 56, v + sl * thread.BASE_WEIGHT / w);
+                    runq.runlist_insert(self, b, tid);
+                    runq.set_nr_running(self, runq.nr_running(self) + 1);
                     smp.this_cpu_set_need_resched(1);
                     moved = 1;
                 }
@@ -2391,8 +987,8 @@ fn steal_work() as i64 {
             b = b + 1;
         }
     }
-    lock.release_raw(sched_lock_ptr(hi));
-    lock.release_irq(sched_lock_ptr(lo), f);
+    lock.release_raw(runq.sched_lock_ptr(hi));
+    lock.release_irq(runq.sched_lock_ptr(lo), f);
     return moved;
 }
 
@@ -2409,45 +1005,44 @@ fn pick_home_cpu() as i64 {
     let is i64 as k with mut = 1;
     while (k < n) {
         let is i64 as c = (start + k) % n;
-        if (nr_running(c) < nr_running(best)) { best = c; }
+        if (runq.nr_running(c) < runq.nr_running(best)) { best = c; }
         k = k + 1;
     }
     return best;
 }
 
 fn suspend_thread(tid as i64) as void {
-    let is i64 as cpu = thr_home_cpu(tid);
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
-    if (thr_state(tid) != THREAD_RUNNING) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    let is i64 as cpu = thread.thr_home_cpu(tid);
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(cpu));
+    if (thread.thr_state(tid) != thread.THREAD_RUNNING) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    thr_set(tid, 8, THREAD_SUSPENDED);
-    set_nr_running(cpu, nr_running(cpu) - 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    thread.thr_set(tid, 8, thread.THREAD_SUSPENDED);
+    runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
     schedule();
 }
 
 fn resume_thread(tid as i64) as void {
     let is i64 as cpu with mut = 0;
-    let is i64 as saved_flags = lock_home(tid, &cpu);
-    if (thr_state(tid) != THREAD_SUSPENDED) {
-        lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    let is i64 as saved_flags = runq.lock_home(tid, &cpu);
+    if (thread.thr_state(tid) != thread.THREAD_SUSPENDED) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
         return;
     }
-    let is i64 as band = thr_band(tid);
-    if (thr_class(tid) == SCHED_CLASS_QOS) { place_requeue(cpu, band, tid); }
-    thr_set(tid, 8, THREAD_RUNNABLE);
-    if (thr_class(tid) == SCHED_CLASS_DEADLINE) { dlt_unlink(cpu, tid); dl_insert(cpu, tid); }
-    else { runlist_insert(cpu, band, tid); }
-    set_nr_running(cpu, nr_running(cpu) + 1);
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    let is i64 as band = thread.thr_band(tid);
+    if (thread.thr_class(tid) == thread.SCHED_CLASS_QOS) { qos.place_requeue(cpu, band, tid); }
+    thread.thr_set(tid, 8, thread.THREAD_RUNNABLE);
+    if (thread.thr_class(tid) == thread.SCHED_CLASS_DEADLINE) { qos.dlt_unlink(cpu, tid); runq.dl_insert(cpu, tid); }
+    else { runq.runlist_insert(cpu, band, tid); }
+    runq.set_nr_running(cpu, runq.nr_running(cpu) + 1);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
 }
 
 // ============================================================
 // Thread entry trampoline
 // ============================================================
-
 
 fn thread_entry_trampoline() as void {
     // First code to run on a brand-new thread. schedule() handed
@@ -2455,19 +1050,19 @@ fn thread_entry_trampoline() as void {
     // built — THIS cpu's sched_lock is still held from that context
     // switch, drop it before enabling IRQs.
     smp.this_cpu_set_in_irq_context(0);
-    let is i64 as cpu = this_cpu();
-    lock.release(sched_lock_ptr(cpu));
+    let is i64 as cpu = runq.this_cpu();
+    lock.release(runq.sched_lock_ptr(cpu));
     asm(".byte 0xFB\n");  // sti
-    smp.call_ptr(thr_entry(current_tid()));
+    smp.call_ptr(thread.thr_entry(runq.current_tid()));
 
     // Thread exited. Mark DEAD + drop from this cpu's nr_running
     // under this cpu's lock, then schedule(); we never come back.
     asm(".byte 0xFA\n");  // cli
-    let is i64 as exit_cpu = this_cpu();
-    lock.acquire(sched_lock_ptr(exit_cpu));
-    thr_set(current_tid(), 8, THREAD_DEAD);
-    set_nr_running(exit_cpu, nr_running(exit_cpu) - 1);
-    lock.release(sched_lock_ptr(exit_cpu));
+    let is i64 as exit_cpu = runq.this_cpu();
+    lock.acquire(runq.sched_lock_ptr(exit_cpu));
+    thread.thr_set(runq.current_tid(), 8, thread.THREAD_DEAD);
+    runq.set_nr_running(exit_cpu, runq.nr_running(exit_cpu) - 1);
+    lock.release(runq.sched_lock_ptr(exit_cpu));
     asm(".byte 0xFB\n");  // sti
     schedule();
     while (1 == 1) { asm(".byte 0xF4\n"); }
@@ -2478,10 +1073,10 @@ fn thread_entry_trampoline() as void {
 // ============================================================
 
 fn pick_next_deadline(cpu as i64) as i64 {
-    let is i64 as n with mut = rb.rb_leftmost(dl_root(cpu));
+    let is i64 as n with mut = rb.rb_leftmost(runq.dl_root(cpu));
     while (n != 0) {
         let is i64 as tid = rb.nd_val(n);
-        if (thr_dl_budget(tid) > 0) { return tid; }
+        if (thread.thr_dl_budget(tid) > 0) { return tid; }
         n = rb.rb_next(n);
     }
     return 0 - 1;
@@ -2493,32 +1088,32 @@ fn pick_next_deadline(cpu as i64) as i64 {
 // average. (schedule() re-inserts the outgoing thread before it gets here, so
 // every competitor is in the tree.)
 fn pick_next_in_band(cpu as i64, band as i64) as i64 {
-    let is i64 as v = band_avg_vruntime(cpu, band, 0 - 1);
-    let is i64 as n with mut = rb.rb_leftmost(band_root(cpu, band));
+    let is i64 as v = qos.band_avg_vruntime(cpu, band, 0 - 1);
+    let is i64 as n with mut = rb.rb_leftmost(runq.band_root(cpu, band));
     let is i64 as lowest with mut = 0 - 1;
     while (n != 0) {
         let is i64 as tid = rb.nd_val(n);
-        if (thr_vruntime(tid) <= v) { return tid; }
-        if (lowest < 0 || thr_vruntime(tid) < thr_vruntime(lowest)) { lowest = tid; }
+        if (thread.thr_vruntime(tid) <= v) { return tid; }
+        if (lowest < 0 || thread.thr_vruntime(tid) < thread.thr_vruntime(lowest)) { lowest = tid; }
         n = rb.rb_next(n);
     }
     return lowest;
 }
 
 fn pick_next(cpu as i64) as i64 {
-    if (dl_count(cpu) > 0) {
+    if (runq.dl_count(cpu) > 0) {
         let is i64 as dl = pick_next_deadline(cpu);
         if (dl >= 0) { return dl; }
     }
     let is i64 as b with mut = 0;
-    while (b < NUM_QOS_BANDS) {
-        if (band_count(cpu, b) > 0) {
+    while (b < thread.NUM_QOS_BANDS) {
+        if (runq.band_count(cpu, b) > 0) {
             let is i64 as tid = pick_next_in_band(cpu, b);
             if (tid >= 0) { return tid; }
         }
         b = b + 1;
     }
-    return idle_tid();
+    return runq.idle_tid();
 }
 
 // ============================================================
@@ -2526,13 +1121,13 @@ fn pick_next(cpu as i64) as i64 {
 // ============================================================
 
 fn account_runtime(cpu as i64, tid as i64, elapsed_ns as i64) as void {
-    if (thr_class(tid) == SCHED_CLASS_DEADLINE) {
-        dl_account(cpu, tid, elapsed_ns);
+    if (thread.thr_class(tid) == thread.SCHED_CLASS_DEADLINE) {
+        qos.dl_account(cpu, tid, elapsed_ns);
     }
-    if (thr_class(tid) == SCHED_CLASS_QOS) {
-        update_vruntime(cpu, tid, elapsed_ns);
-        qos_budget_check(cpu, tid, elapsed_ns);
-        update_band_min_vruntime(cpu, thr_band(tid));
+    if (thread.thr_class(tid) == thread.SCHED_CLASS_QOS) {
+        qos.update_vruntime(cpu, tid, elapsed_ns);
+        qos.qos_budget_check(cpu, tid, elapsed_ns);
+        qos.update_band_min_vruntime(cpu, thread.thr_band(tid));
     }
 }
 
@@ -2556,29 +1151,29 @@ fn schedule() as void {
         serial.print("sched: schedule() with preemption held off, count=", 50);
         util.print_num(smp.this_cpu_preempt_count());
         serial.print(" tid=", 5);
-        util.print_num(current_tid());
+        util.print_num(runq.current_tid());
         serial.println("", 0);
         pmm.panic("sleeping while atomic", 21);
     }
 
     asm(".byte 0xFA\n");  // cli
-    let is i64 as cpu = this_cpu();
-    lock.acquire(sched_lock_ptr(cpu));
+    let is i64 as cpu = runq.this_cpu();
+    lock.acquire(runq.sched_lock_ptr(cpu));
 
     let is i64 as now = timer.current_time_ns();
     heartbeat_set(cpu, now);
     switch_set(cpu, now);
-    tid_quiesce(cpu);
-    let is i64 as prev = current_tid();
+    thread.tid_quiesce(cpu);
+    let is i64 as prev = runq.current_tid();
 
     // Charge the slice that just ended to this cpu's busy or idle total. Done
     // BEFORE the state checks below, because a thread that blocked has already
     // left THREAD_RUNNING and its time would otherwise vanish — which is most
     // of the time on a machine that waits on input.
     if (prev >= 0) {
-        let is i64 as ran = now - current_start_ns();
+        let is i64 as ran = now - runq.current_start_ns();
         let is i64 as was_idle with mut = 0;
-        if (prev == idle_tid()) { was_idle = 1; }
+        if (prev == runq.idle_tid()) { was_idle = 1; }
         smp.this_cpu_add_time(ran, was_idle);
         // Charge the thread its slice. A thread still RUNNING is charged below
         // by account_runtime (both scheduling classes accumulate offset 88), so
@@ -2587,26 +1182,26 @@ fn schedule() as void {
         // on a machine that waits on input, blocking is how nearly every slice
         // ends. Charging in both places would count that time twice, which is
         // exactly what made a 1 Hz monitor report 20% of a core.
-        if (ran > 0 && thr_state(prev) != THREAD_RUNNING) {
-            thr_set(prev, 88, thr_get(prev, 88) + ran);
+        if (ran > 0 && thread.thr_state(prev) != thread.THREAD_RUNNING) {
+            thread.thr_set(prev, 88, thread.thr_get(prev, 88) + ran);
         }
     }
 
     // Account and re-insert prev on its home cpu (= cpu, since the
     // running thread always belongs to this cpu's runqueue).
     if (prev >= 0) {
-        if (thr_state(prev) == THREAD_RUNNING) {
-            let is i64 as elapsed = now - current_start_ns();
+        if (thread.thr_state(prev) == thread.THREAD_RUNNING) {
+            let is i64 as elapsed = now - runq.current_start_ns();
             if (elapsed > 0) {
                 account_runtime(cpu, prev, elapsed);
             }
-            if (thr_state(prev) == THREAD_RUNNING) {
-                thr_set(prev, 8, THREAD_RUNNABLE);
-                if (thr_class(prev) == SCHED_CLASS_DEADLINE) {
-                    dl_insert(cpu, prev);
+            if (thread.thr_state(prev) == thread.THREAD_RUNNING) {
+                thread.thr_set(prev, 8, thread.THREAD_RUNNABLE);
+                if (thread.thr_class(prev) == thread.SCHED_CLASS_DEADLINE) {
+                    runq.dl_insert(cpu, prev);
                 }
-                if (thr_class(prev) == SCHED_CLASS_QOS) {
-                    runlist_insert(cpu, thr_band(prev), prev);
+                if (thread.thr_class(prev) == thread.SCHED_CLASS_QOS) {
+                    runq.runlist_insert(cpu, thread.thr_band(prev), prev);
                 }
             }
         }
@@ -2618,26 +1213,26 @@ fn schedule() as void {
     // never touch it again. Freeing now would race the rsp/CR3 swap below;
     // idle_fn frees it after the switch. Link via the now-free offset 96.
     if (prev >= 0) {
-        if (thr_state(prev) == THREAD_DEAD) {
-            thr_set(prev, 96, cpu_reap_head(cpu));
-            set_cpu_reap_head(cpu, prev);
+        if (thread.thr_state(prev) == thread.THREAD_DEAD) {
+            thread.thr_set(prev, 96, runq.cpu_reap_head(cpu));
+            runq.set_cpu_reap_head(cpu, prev);
         }
     }
 
-    dl_check_replenish(cpu);
+    qos.dl_check_replenish(cpu);
 
     let is i64 as next with mut = pick_next(cpu);
-    if (next < 0) { next = idle_tid(); }
+    if (next < 0) { next = runq.idle_tid(); }
 
-    if (thr_class(next) == SCHED_CLASS_DEADLINE) { dl_remove(cpu, next); }
-    if (thr_class(next) == SCHED_CLASS_QOS) { runlist_remove(cpu, thr_band(next), next); }
+    if (thread.thr_class(next) == thread.SCHED_CLASS_DEADLINE) { runq.dl_remove(cpu, next); }
+    if (thread.thr_class(next) == thread.SCHED_CLASS_QOS) { runq.runlist_remove(cpu, thread.thr_band(next), next); }
 
-    thr_set(next, 8, THREAD_RUNNING);
-    set_current_tid(next);
+    thread.thr_set(next, 8, thread.THREAD_RUNNING);
+    runq.set_current_tid(next);
     let is i64 as t_now = timer.current_time_ns();
-    set_current_start_ns(t_now);
-    thr_set(next, 264, t_now);   // last_run_ns
-    set_nr_switches(cpu, nr_switches(cpu) + 1);
+    runq.set_current_start_ns(t_now);
+    thread.thr_set(next, 264, t_now);   // last_run_ns
+    runq.set_nr_switches(cpu, runq.nr_switches(cpu) + 1);
     smp.this_cpu_set_need_resched(0);
 
     // Context switch. The asm keeps sched_lock held across the
@@ -2648,14 +1243,14 @@ fn schedule() as void {
     // a brand-new one) is responsible for dropping the lock.
     if (prev != next) {
         if (prev >= 0) {
-            if (thr_state(prev) == THREAD_RUNNABLE) {
-                thr_set(prev, 128, thr_get(prev, 128) + 1);
+            if (thread.thr_state(prev) == thread.THREAD_RUNNABLE) {
+                thread.thr_set(prev, 128, thread.thr_get(prev, 128) + 1);
             } else {
-                thr_set(prev, 120, thr_get(prev, 120) + 1);
+                thread.thr_set(prev, 120, thread.thr_get(prev, 120) + 1);
             }
 
             // FPU: set TS so next thread triggers #NM on first FPU use
-            cr0_set_ts();
+            fpu.cr0_set_ts();
 
             // Update TSS.RSP0 + per-cpu syscall_kstack = kstack of
             // the incoming thread. TSS.RSP0 covers IDT-style ring-3
@@ -2670,7 +1265,7 @@ fn schedule() as void {
             // stack-heavy syscall handler (read/write carry a 4 KiB buffer)
             // overflowed the kstack into the adjacent page — a flaky
             // #GP/#PF/register-corruption that got worse with thread churn.
-            let is i64 as next_ktop = thr_kstack_base(next) + KSTACK_SIZE;
+            let is i64 as next_ktop = thread.thr_kstack_base(next) + thread.KSTACK_SIZE;
             gdt.tss_set_rsp0(cpu, next_ktop);
             smp.set_per_cpu_kstack(cpu, next_ktop);
 
@@ -2682,7 +1277,7 @@ fn schedule() as void {
             // half resolves to. Do it inside the lock-held section,
             // before the asm rsp swap, so the new stack is already
             // on a CR3 that maps it.
-            let is i64 as next_pml4 = thr_aspace_pml4(next);
+            let is i64 as next_pml4 = thread.thr_aspace_pml4(next);
             if (next_pml4 != 0) {
                 // Published BEFORE the load (the CR3 write is serialising, so
                 // the store is visible first). A shootdown that misses the new
@@ -2700,8 +1295,8 @@ fn schedule() as void {
             // process (fs:[0] is how far its stack is committed). Only ring 3
             // reads fs, so a kernel thread coming in changes nothing, and the
             // cpu remembers what is loaded to skip a wrmsr that would not.
-            if (thr_aspace_ptr(next) != 0) {
-                let is i64 as next_fs = thr_get(next, THR_USER_FS);
+            if (thread.thr_aspace_ptr(next) != 0) {
+                let is i64 as next_fs = thread.thr_get(next, thread.THR_USER_FS);
                 if (smp.this_cpu_user_fs() != next_fs) {
                     smp.wrmsr(smp.IA32_FS_BASE, next_fs);
                     smp.this_cpu_set_user_fs(next_fs);
@@ -2717,8 +1312,8 @@ fn schedule() as void {
             // cpu is still about to read them in the asm, ctx_*
             // globals stomp. Per-cpu slots close that window
             // without depending on lock coverage of the asm.
-            smp.this_cpu_set_ctx_old_rsp_ptr(thread_ptr(prev) + 64);
-            smp.this_cpu_set_ctx_new_rsp(thr_kstack_top(next));
+            smp.this_cpu_set_ctx_old_rsp_ptr(thread.thread_ptr(prev) + 64);
+            smp.this_cpu_set_ctx_new_rsp(thread.thr_kstack_top(next));
 
             asm("push r15\n");
             asm("push r14\n");
@@ -2758,14 +1353,14 @@ fn schedule() as void {
     // out of this same call frame on the other cpu, holding THAT cpu's lock.
     // Releasing the stale one would free a lock we do not hold and leak the
     // one we do.
-    let is i64 as here = this_cpu();
+    let is i64 as here = runq.this_cpu();
 
     // Program LAPIC for next event under the cpu's lock — both
     // the deadline tree and the suspended-deadline scan are
     // per-cpu state.
     program_next_tick(here);
 
-    lock.release(sched_lock_ptr(here));
+    lock.release(runq.sched_lock_ptr(here));
 
     // sti only on the thread-call path. If schedule() was called
     // from an IRQ stub, the stub's iretq will restore IF from the
@@ -2801,8 +1396,8 @@ fn on_timer_tick() as void {
     // enough.
 
     let is i64 as now = timer.current_time_ns();
-    let is i64 as elapsed = now - current_start_ns();
-    let is i64 as cpu = this_cpu();
+    let is i64 as elapsed = now - runq.current_start_ns();
+    let is i64 as cpu = runq.this_cpu();
 
     // Heartbeat for the watchdog — every cpu's timer tick stamps
     // its own slot. BSP additionally polls for stalled cpus below.
@@ -2825,14 +1420,14 @@ fn on_timer_tick() as void {
         if (steal_work() != 0) { smp.this_cpu_set_need_resched(1); }
     }
 
-    if (current_tid() >= 0) {
-        if (thr_class(current_tid()) == SCHED_CLASS_IDLE) {
-            if (nr_running(cpu) > 0) { smp.this_cpu_set_need_resched(1); }
+    if (runq.current_tid() >= 0) {
+        if (thread.thr_class(runq.current_tid()) == thread.SCHED_CLASS_IDLE) {
+            if (runq.nr_running(cpu) > 0) { smp.this_cpu_set_need_resched(1); }
             return;
         }
     }
 
-    if (elapsed >= quantum_ns) {
+    if (elapsed >= thread.quantum_ns) {
         smp.this_cpu_set_need_resched(1);
     }
 }
@@ -2845,10 +1440,10 @@ fn program_next_tick(cpu as i64) as void {
     if (lapic.calibrated == 0) { return; }
 
     let is i64 as now = timer.current_time_ns();
-    let is i64 as next_event with mut = now + quantum_ns;
+    let is i64 as next_event with mut = now + thread.quantum_ns;
 
-    if (dl_count(cpu) > 0) {
-        let is i64 as lm = rb.rb_leftmost(dl_root(cpu));
+    if (runq.dl_count(cpu) > 0) {
+        let is i64 as lm = rb.rb_leftmost(runq.dl_root(cpu));
         if (lm != 0) {
             let is i64 as dl = rb.nd_key(lm);
             if (dl < next_event) { next_event = dl; }
@@ -2856,16 +1451,16 @@ fn program_next_tick(cpu as i64) as void {
     }
 
     // This cpu's budget-throttled deadline threads: the next replenishment.
-    let is i64 as t with mut = dlt_heads[cpu];
+    let is i64 as t with mut = qos.dlt_heads[cpu];
     while (t != 0) {
         let is i64 as tid = t - 1;
-        t = thr_get(tid, THR_DLT_NEXT);
-        let is i64 as replenish_at = thr_get(tid, 168) + thr_get(tid, 144);
+        t = thread.thr_get(tid, thread.THR_DLT_NEXT);
+        let is i64 as replenish_at = thread.thr_get(tid, 168) + thread.thr_get(tid, 144);
         if (replenish_at < next_event) { next_event = replenish_at; }
     }
 
     let is i64 as delta with mut = next_event - now;
-    if (delta < MIN_QUANTUM_NS) { delta = MIN_QUANTUM_NS; }
+    if (delta < thread.MIN_QUANTUM_NS) { delta = thread.MIN_QUANTUM_NS; }
     lapic.program_tick_ns(delta);
 }
 
@@ -2883,14 +1478,14 @@ fn yield_cpu() as void { schedule(); }
 // will ever resume it, so the bogus saved rsp is harmless.
 fn exit_current_thread() as void {
     asm(".byte 0xFA\n");                        // cli
-    let is i64 as cpu = this_cpu();
-    lock.acquire(sched_lock_ptr(cpu));
-    let is i64 as tid = current_tid();
+    let is i64 as cpu = runq.this_cpu();
+    lock.acquire(runq.sched_lock_ptr(cpu));
+    let is i64 as tid = runq.current_tid();
     if (tid >= 0) {
-        thr_set(tid, 8, THREAD_DEAD);
-        set_nr_running(cpu, nr_running(cpu) - 1);
+        thread.thr_set(tid, 8, thread.THREAD_DEAD);
+        runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
     }
-    lock.release(sched_lock_ptr(cpu));
+    lock.release(runq.sched_lock_ptr(cpu));
     asm(".byte 0xFB\n");                        // sti
     schedule();
     while (1 == 1) { asm(".byte 0xF4\n"); }
@@ -2921,7 +1516,7 @@ fn watchdog_check() as void {
     }
     if (now < watchdog_armed_at_ns) { return; }
 
-    let is i64 as self = this_cpu();
+    let is i64 as self = runq.this_cpu();
     let is i64 as cpus = smp.get_cpu_count();
     let is i64 as ci with mut = 0;
     while (ci < cpus) {
@@ -2968,25 +1563,25 @@ fn watchdog_check() as void {
 // a thread fail to make progress, so the log says who had the cpu instead.
 fn dump_threads() as void {
     let is i64 as now = timer.current_time_ns();
-    let is i64 as ntid = next_tid;
+    let is i64 as ntid = thread.next_tid;
     let is i64 as tid with mut = 0;
     while (tid < ntid) {
-        if (thread_ptr(tid) != 0) {
+        if (thread.thread_ptr(tid) != 0) {
             serial.print("  tid=", 6);
             util.print_num(tid);
             serial.print(" state=", 7);
-            util.print_num(thr_state(tid));
+            util.print_num(thread.thr_state(tid));
             serial.print(" class=", 7);
-            util.print_num(thr_class(tid));
+            util.print_num(thread.thr_class(tid));
             serial.print(" band=", 6);
-            util.print_num(thr_band(tid));
+            util.print_num(thread.thr_band(tid));
             serial.print(" home=", 6);
-            util.print_num(thr_home_cpu(tid));
+            util.print_num(thread.thr_home_cpu(tid));
             serial.print(" vrt_ms=", 8);
-            util.print_num(thr_vruntime(tid) / 1000000);
+            util.print_num(thread.thr_vruntime(tid) / 1000000);
             serial.print(" run_ms=", 8);
-            util.print_num(thr_runtime(tid) / 1000000);
-            let is i64 as lr = thr_last_run_ns(tid);
+            util.print_num(thread.thr_runtime(tid) / 1000000);
+            let is i64 as lr = thread.thr_last_run_ns(tid);
             if (lr > 0) {
                 serial.print(" idle_ms=", 9);
                 util.print_num((now - lr) / 1000000);
@@ -3008,11 +1603,11 @@ fn starvation_dump_and_halt(starved_tid as i64, age_ns as i64) as void {
     serial.print(" age_ms=", 8);
     util.print_num(age_ns / 1000000);
     serial.print(" home_cpu=", 10);
-    util.print_num(thr_home_cpu(starved_tid));
+    util.print_num(thread.thr_home_cpu(starved_tid));
     serial.print(" band=", 6);
-    util.print_num(thr_band(starved_tid));
+    util.print_num(thread.thr_band(starved_tid));
     serial.print(" class=", 7);
-    util.print_num(thr_class(starved_tid));
+    util.print_num(thread.thr_class(starved_tid));
     serial.println("", 0);
 
     let is i64 as cpus = smp.get_cpu_count();
@@ -3027,12 +1622,12 @@ fn starvation_dump_and_halt(starved_tid as i64, age_ns as i64) as void {
             serial.print(" need_resched=", 14);
             util.print_num(pc.need_resched);
             serial.print(" nr_running=", 12);
-            util.print_num(nr_running(ci));
+            util.print_num(runq.nr_running(ci));
             serial.println("", 0);
 
             let is i64 as bi with mut = 0;
-            while (bi < NUM_QOS_BANDS) {
-                let is i64 as bc = band_count(ci, bi);
+            while (bi < thread.NUM_QOS_BANDS) {
+                let is i64 as bc = runq.band_count(ci, bi);
                 if (bc > 0) {
                     serial.print("  band[", 7);
                     util.print_num(bi);
@@ -3047,24 +1642,24 @@ fn starvation_dump_and_halt(starved_tid as i64, age_ns as i64) as void {
     }
 
     let is i64 as now = timer.current_time_ns();
-    let is i64 as ntid with mut = next_tid;
+    let is i64 as ntid with mut = thread.next_tid;
     serial.print("threads (next_tid=", 18);
     util.print_num(ntid);
     serial.println("):", 2);
     let is i64 as tid with mut = 0;
     while (tid < ntid) {
-        if (thread_ptr(tid) != 0) {
+        if (thread.thread_ptr(tid) != 0) {
             serial.print("  tid=", 6);
             util.print_num(tid);
             serial.print(" state=", 7);
-            util.print_num(thr_state(tid));
+            util.print_num(thread.thr_state(tid));
             serial.print(" class=", 7);
-            util.print_num(thr_class(tid));
+            util.print_num(thread.thr_class(tid));
             serial.print(" band=", 6);
-            util.print_num(thr_band(tid));
+            util.print_num(thread.thr_band(tid));
             serial.print(" home=", 6);
-            util.print_num(thr_home_cpu(tid));
-            let is i64 as lr = thr_last_run_ns(tid);
+            util.print_num(thread.thr_home_cpu(tid));
+            let is i64 as lr = thread.thr_last_run_ns(tid);
             if (lr > 0) {
                 serial.print(" age_ms=", 8);
                 util.print_num((now - lr) / 1000000);
@@ -3103,7 +1698,7 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
             serial.print(" in_irq=", 8);
             util.print_num(pc.in_irq_context);
             serial.print(" nr_running=", 12);
-            util.print_num(nr_running(ci));
+            util.print_num(runq.nr_running(ci));
             serial.print(" heartbeat_age_ms=", 18);
             let is i64 as hb = heartbeat_get(ci);
             if (hb > 0) {
@@ -3115,8 +1710,8 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
 
             // Per-cpu band populations
             let is i64 as bi with mut = 0;
-            while (bi < NUM_QOS_BANDS) {
-                let is i64 as bc = band_count(ci, bi);
+            while (bi < thread.NUM_QOS_BANDS) {
+                let is i64 as bc = runq.band_count(ci, bi);
                 if (bc > 0) {
                     serial.print("  band[", 7);
                     util.print_num(bi);
@@ -3132,25 +1727,25 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
 
     // Walk threads and print state of each. Use a snapshot of next_tid
     // taken under tid_lock so the table read is consistent.
-    let is i64 as tflags = lock.acquire_irq(&tid_lock);
-    let is i64 as ntid = next_tid;
-    lock.release_irq(&tid_lock, tflags);
+    let is i64 as tflags = lock.acquire_irq(&thread.tid_lock);
+    let is i64 as ntid = thread.next_tid;
+    lock.release_irq(&thread.tid_lock, tflags);
     serial.print("threads (next_tid=", 18);
     util.print_num(ntid);
     serial.println("):", 2);
     let is i64 as tid with mut = 0;
     while (tid < ntid) {
-        if (thread_ptr(tid) != 0) {
+        if (thread.thread_ptr(tid) != 0) {
             serial.print("  tid=", 6);
             util.print_num(tid);
             serial.print(" state=", 7);
-            util.print_num(thr_state(tid));
+            util.print_num(thread.thr_state(tid));
             serial.print(" class=", 7);
-            util.print_num(thr_class(tid));
+            util.print_num(thread.thr_class(tid));
             serial.print(" band=", 6);
-            util.print_num(thr_band(tid));
+            util.print_num(thread.thr_band(tid));
             serial.print(" home=", 6);
-            util.print_num(thr_home_cpu(tid));
+            util.print_num(thread.thr_home_cpu(tid));
             serial.println("", 0);
         }
         tid = tid + 1;
@@ -3166,20 +1761,20 @@ fn watchdog_dump_and_halt(stalled_cpu as i64, age_ns as i64) as void {
 // remove from the table FIRST (so any tid<next_tid scanner now skips it),
 // then free the backing memory.
 fn reap_one(tid as i64) as void {
-    let is i64 as tptr = thread_ptr(tid);
+    let is i64 as tptr = thread.thread_ptr(tid);
     if (tptr == 0) { return; }
-    let is i64 as kstack_va = thr_get(tid, 312);    // guarded kstack VA (0 if none)
-    let is i64 as io_buf = thr_get(tid, 320);       // per-thread I/O staging (0 if never used)
-    let is i64 as fpu = thr_get(tid, 240);    // fpu_state_addr
+    let is i64 as kstack_va = thread.thr_get(tid, 312);    // guarded kstack VA (0 if none)
+    let is i64 as io_buf = thread.thr_get(tid, 320);       // per-thread I/O staging (0 if never used)
+    let is i64 as fpu = thread.thr_get(tid, 240);    // fpu_state_addr
     // Under tid_lock: a thread being created on another cpu writes the same
     // table, and this ran without it.
-    let is i64 as tf = lock.acquire_irq(&tid_lock);
-    tid_ht_remove(tid);
-    lock.release_irq(&tid_lock, tf);
-    thread_count = thread_count - 1;
-    if (fpu != 0) { heap.kpool_free(fpu_pool, fpu); }
+    let is i64 as tf = lock.acquire_irq(&thread.tid_lock);
+    thread.tid_ht_remove(tid);
+    lock.release_irq(&thread.tid_lock, tf);
+    thread.thread_count = thread.thread_count - 1;
+    if (fpu != 0) { heap.kpool_free(thread.fpu_pool, fpu); }
     if (io_buf != 0) { heap.kfree(io_buf); }
-    heap.kpool_free(thread_pool, tptr);
+    heap.kpool_free(thread.thread_pool, tptr);
     if (kstack_va != 0) { vmm.kvunmap(kstack_va); }   // guarded kstack via kvmap
 }
 
@@ -3191,10 +1786,10 @@ fn reap_one(tid as i64) as void {
 fn reap_drain(cpu as i64) as void {
     let is i64 as more with mut = 1;
     while (more == 1) {
-        let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
-        let is i64 as tid = cpu_reap_head(cpu);
+        let is i64 as f = lock.acquire_irq(runq.sched_lock_ptr(cpu));
+        let is i64 as tid = runq.cpu_reap_head(cpu);
         if (tid < 0) {
-            lock.release_irq(sched_lock_ptr(cpu), f);
+            lock.release_irq(runq.sched_lock_ptr(cpu), f);
             more = 0;
         } else {
             // A tid on this list that is no longer a live object means the list
@@ -3202,15 +1797,15 @@ fn reap_drain(cpu as i64) as void {
             // back. Following it would "pop" thr_get's 0-for-missing and free
             // tid 0, the boot cpu's idle thread, which is precisely the panic
             // the audit caught (a write to 0x40 inside schedule()). Stop here.
-            if (thread_ptr(tid) == 0 || thr_state(tid) != THREAD_DEAD) {
+            if (thread.thread_ptr(tid) == 0 || thread.thr_state(tid) != thread.THREAD_DEAD) {
                 serial.print("sched: reap list holds tid=", 27);
                 util.print_num(tid);
                 serial.print(" which is not a dead thread", 27);
                 serial.println("", 0);
                 pmm.panic("reap list corrupt", 17);
             }
-            set_cpu_reap_head(cpu, thr_get(tid, 96));   // pop
-            lock.release_irq(sched_lock_ptr(cpu), f);
+            runq.set_cpu_reap_head(cpu, thread.thr_get(tid, 96));   // pop
+            lock.release_irq(runq.sched_lock_ptr(cpu), f);
             reap_one(tid);
         }
     }
@@ -3225,10 +1820,10 @@ fn reap_drain(cpu as i64) as void {
 // that ended was never freed, and a parent's wait() for the process it had
 // killed timed out, the child's last thread still "live".
 fn reap_drain_all() as void {
-    let is i64 as nc = num_cpus();
+    let is i64 as nc = runq.num_cpus();
     let is i64 as c with mut = 0;
     while (c < nc) {
-        if (cpu_reap_head(c) >= 0) { reap_drain(c); }      // unlocked peek: a hint
+        if (runq.cpu_reap_head(c) >= 0) { reap_drain(c); }      // unlocked peek: a hint
         c = c + 1;
     }
 }
@@ -3241,9 +1836,9 @@ fn idle_fn() as void {
     // already; the sti here is a harmless no-op for it.
     asm(".byte 0xFB\n");   // sti
     while (1 == 1) {
-        tid_quiesce(this_cpu());    // holding no tid-table pointer here
+        thread.tid_quiesce(runq.this_cpu());    // holding no tid-table pointer here
         // Nothing of our own to run: take queued work from a busier cpu.
-        if (nr_running(this_cpu()) == 0) { steal_work(); }
+        if (runq.nr_running(runq.this_cpu()) == 0) { steal_work(); }
         if (smp.this_cpu_need_resched() != 0) { schedule(); }
         reap_drain_all();           // free threads that died here, or on a busy cpu
         // Top up the pre-zeroed frame pool while idle (bounded per pass) so a
@@ -3266,34 +1861,34 @@ fn init() as void {
     serial.println("sched: init", 11);
 
     // Zero ALL per-cpu runqueues at once (16 cpus * 512 = 8192).
-    let is *u8 as rqz = cast(*u8, &per_cpu_rqs);
+    let is *u8 as rqz = cast(*u8, &runq.per_cpu_rqs);
     let is i64 as zi with mut = 0;
     while (zi < 8192) { rqz[zi] = 0; zi = zi + 1; }
 
-    tid_ht_init(64);
+    thread.tid_ht_init(64);
 
     // Reap lists start empty (-1). MUST be explicit — 0 is a valid tid,
     // so a zero-initialised head would make the reaper try to free tid 0.
     let is i64 as rc with mut = 0;
-    while (rc < 16) { cpu_reap_heads[rc] = 0 - 1; rc = rc + 1; }
+    while (rc < 16) { runq.cpu_reap_heads[rc] = 0 - 1; rc = rc + 1; }
 
     // thread_pool / fpu_pool are created lazily on first alloc (kpool_alloc_ensure).
 
     // Init per-cpu band data + budgets for every possible cpu.
     let is i64 as ci with mut = 0;
-    while (ci < MAX_CPUS_RQ) {
+    while (ci < runq.MAX_CPUS_RQ) {
         let is i64 as b with mut = 0;
-        while (b < NUM_QOS_BANDS) {
-            band_set_count(ci, b, 0);
-            band_set_min_vruntime(ci, b, 0);
+        while (b < thread.NUM_QOS_BANDS) {
+            runq.band_set_count(ci, b, 0);
+            runq.band_set_min_vruntime(ci, b, 0);
             b = b + 1;
         }
-        bb_set(ci, 0, 0, 20);  bb_set(ci, 0, 1, QOS_WINDOW_NS); bb_set(ci, 0, 2, 5); bb_set(ci, 0, 3, 3);
-        bb_set(ci, 1, 0, 70);  bb_set(ci, 1, 1, QOS_WINDOW_NS); bb_set(ci, 1, 2, 5); bb_set(ci, 1, 3, 3);
-        bb_set(ci, 2, 0, 100); bb_set(ci, 2, 1, QOS_WINDOW_NS); bb_set(ci, 2, 2, 0); bb_set(ci, 2, 3, 0);
-        bb_set(ci, 3, 0, 100); bb_set(ci, 3, 1, QOS_WINDOW_NS); bb_set(ci, 3, 2, 0); bb_set(ci, 3, 3, 0);
-        bb_set(ci, 4, 0, 100); bb_set(ci, 4, 1, QOS_WINDOW_NS); bb_set(ci, 4, 2, 0); bb_set(ci, 4, 3, 0);
-        bb_set(ci, 5, 0, 100); bb_set(ci, 5, 1, QOS_WINDOW_NS); bb_set(ci, 5, 2, 0); bb_set(ci, 5, 3, 0);
+        runq.bb_set(ci, 0, 0, 20);  runq.bb_set(ci, 0, 1, thread.QOS_WINDOW_NS); runq.bb_set(ci, 0, 2, 5); runq.bb_set(ci, 0, 3, 3);
+        runq.bb_set(ci, 1, 0, 70);  runq.bb_set(ci, 1, 1, thread.QOS_WINDOW_NS); runq.bb_set(ci, 1, 2, 5); runq.bb_set(ci, 1, 3, 3);
+        runq.bb_set(ci, 2, 0, 100); runq.bb_set(ci, 2, 1, thread.QOS_WINDOW_NS); runq.bb_set(ci, 2, 2, 0); runq.bb_set(ci, 2, 3, 0);
+        runq.bb_set(ci, 3, 0, 100); runq.bb_set(ci, 3, 1, thread.QOS_WINDOW_NS); runq.bb_set(ci, 3, 2, 0); runq.bb_set(ci, 3, 3, 0);
+        runq.bb_set(ci, 4, 0, 100); runq.bb_set(ci, 4, 1, thread.QOS_WINDOW_NS); runq.bb_set(ci, 4, 2, 0); runq.bb_set(ci, 4, 3, 0);
+        runq.bb_set(ci, 5, 0, 100); runq.bb_set(ci, 5, 1, thread.QOS_WINDOW_NS); runq.bb_set(ci, 5, 2, 0); runq.bb_set(ci, 5, 3, 0);
         ci = ci + 1;
     }
 
@@ -3311,8 +1906,8 @@ fn init() as void {
 // pins it to this_cpu()'s runqueue, and publishes it as current +
 // idle. Each cpu calls this exactly once.
 fn per_cpu_init() as void {
-    let is i64 as cpu = this_cpu();
-    fpu_cpu_init();
+    let is i64 as cpu = runq.this_cpu();
+    fpu.fpu_cpu_init();
     // fs as this cpu came up with is whatever firmware left; make it the 0 the
     // per-cpu record says, so the first user thread with a block gets it loaded.
     smp.wrmsr(smp.IA32_FS_BASE, 0);
@@ -3323,41 +1918,41 @@ fn per_cpu_init() as void {
     // still holds; enter_idle moves onto this one for good, and that is what
     // lets that memory be reclaimed. Allocated before any lock: kvmap may
     // take page-table and allocator locks of its own.
-    let is i64 as istack = vmm.kvmap(KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
+    let is i64 as istack = vmm.kvmap(thread.KSTACK_SIZE, vmm.KV_DATA, vmm.KV_GUARD, 0);
     if (istack == 0) { pmm.panic("idle stack alloc fail", 21); }
-    smp.this_cpu_set_idle_stack_top(istack + KSTACK_SIZE);
+    smp.this_cpu_set_idle_stack_top(istack + thread.KSTACK_SIZE);
 
-    let is i64 as saved_flags = lock.acquire_irq(sched_lock_ptr(cpu));
+    let is i64 as saved_flags = lock.acquire_irq(runq.sched_lock_ptr(cpu));
 
     // tid + hash under tid_lock — multiple APs run per_cpu_init
     // concurrently and would otherwise race on next_tid / tid_ht.
-    let is i64 as tid_flags = lock.acquire_irq(&tid_lock);
-    let is i64 as itid = next_tid;
-    let is i64 as iptr = heap.kpool_alloc_ensure(cast(i64, &thread_pool), THREAD_SIZE, 1);
+    let is i64 as tid_flags = lock.acquire_irq(&thread.tid_lock);
+    let is i64 as itid = thread.next_tid;
+    let is i64 as iptr = heap.kpool_alloc_ensure(cast(i64, &thread.thread_pool), thread.THREAD_SIZE, 1);
     if (iptr == 0) { pmm.panic("idle alloc fail", 15); }
-    tid_set_ptr(itid, iptr);
-    next_tid = itid + 1;
-    idle_stacks = idle_stacks + 1;   // global, and the APs get here together
-    lock.release_irq(&tid_lock, tid_flags);
+    thread.tid_set_ptr(itid, iptr);
+    thread.next_tid = itid + 1;
+    thread.idle_stacks = thread.idle_stacks + 1;   // global, and the APs get here together
+    lock.release_irq(&thread.tid_lock, tid_flags);
 
     let is *u8 as tp = cast(*u8, iptr);
     let is i64 as izi with mut = 0;
-    while (izi < THREAD_SIZE) { tp[izi] = 0; izi = izi + 1; }
+    while (izi < thread.THREAD_SIZE) { tp[izi] = 0; izi = izi + 1; }
 
-    thr_set(itid, 0, itid);
-    thr_set(itid, 8, THREAD_RUNNING);
-    thr_set(itid, 16, SCHED_CLASS_IDLE);
-    thr_set(itid, 32, BASE_WEIGHT);
-    thr_set(itid, 40, DEFAULT_SLICE_NS);
-    thr_set(itid, 72, istack); // kstack_base: schedule() points RSP0 at its top
-    thr_set(itid, 256, cpu);   // home_cpu = this cpu
-    thr_set(itid, 280, vmm.kas_pml4_phys);  // idle runs in kernel AS
+    thread.thr_set(itid, 0, itid);
+    thread.thr_set(itid, 8, thread.THREAD_RUNNING);
+    thread.thr_set(itid, 16, thread.SCHED_CLASS_IDLE);
+    thread.thr_set(itid, 32, thread.BASE_WEIGHT);
+    thread.thr_set(itid, 40, thread.DEFAULT_SLICE_NS);
+    thread.thr_set(itid, 72, istack); // kstack_base: schedule() points RSP0 at its top
+    thread.thr_set(itid, 256, cpu);   // home_cpu = this cpu
+    thread.thr_set(itid, 280, vmm.kas_pml4_phys);  // idle runs in kernel AS
 
-    set_idle_tid(itid);
-    set_current_tid(itid);
-    set_current_start_ns(timer.current_time_ns());
+    runq.set_idle_tid(itid);
+    runq.set_current_tid(itid);
+    runq.set_current_start_ns(timer.current_time_ns());
 
-    lock.release_irq(sched_lock_ptr(cpu), saved_flags);
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
 }
 
 fn start() as void {
@@ -3412,11 +2007,11 @@ fn is_active() as i64 {
 // sleep_locked_and_yield reads the thread's home_cpu (= this cpu)
 // to drop the matching lock.
 fn take_lock() as i64 {
-    return lock.acquire_irq(sched_lock_ptr(this_cpu()));
+    return lock.acquire_irq(runq.sched_lock_ptr(runq.this_cpu()));
 }
 
 fn drop_lock(saved_flags as i64) as void {
-    lock.release_irq(sched_lock_ptr(this_cpu()), saved_flags);
+    lock.release_irq(runq.sched_lock_ptr(runq.this_cpu()), saved_flags);
 }
 
 // AP entry point into the scheduler. APs call this after they've

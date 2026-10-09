@@ -1,0 +1,622 @@
+// input_smoke.cst — devices a ring-3 program opens: the framebuffer surface,
+// keyboard, mouse and tablet records, and the exclusive grabs over them. Run
+// by user_smoke.cst on a smoke boot.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "pmm.cst" as pmm;
+use "vma.cst" as vma;
+use "sched.cst" as sched;
+use "thread.cst" as thread;
+use "timer.cst" as timer;
+use "cse.cst" as cse;
+use "abi.cst" as abi;
+use "process.cst" as proc;
+use "fb.cst" as fb;
+use "kobject.cst" as kobject;
+use "kbd.cst" as kbd;
+use "mouse.cst" as mouse;
+use "vtablet.cst" as vtablet;
+use "surface.cst" as surface;
+use "driver.cst" as driver;
+use "userspace.cst" as userspace;
+use "ucode.cst" as uc;
+
+// ============================================================
+// Embedded fb test CSE — proves the surface path end to end from ring 3:
+// dev_open(DEV_FB) → mmap(fd) → draw cyan → present, all via syscalls. The
+// kernel verifies by reading the scanout (no BSS read-back). r15 = BSS base
+// holds fd / mmap VA / present rc.
+//   bss+0x000 dev_open fd   bss+0x008 mmap VA   bss+0x010 present rc
+// ============================================================
+
+let is i64 as CSE_FB_ENTRY  = 0x401000;
+let is i64 as CSE_FB_BSS_VA = 0x402000;
+let is i64 as CSE_FB_FOFF   = 0x50;
+let is i64 as fb_cse_len with mut = 0;
+let is [512]u8 as fb_cse;
+
+fn build_fb_cse() as void {
+    let is *u8 as e = cast(*u8, &fb_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < 512) { e[z] = cast(u8, 0); z = z + 1; }
+
+    // ---- header (32 bytes) ----
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0);                  // version u16 = 2
+    e[6]=cast(u8,1);                                   // arch = 1 (x86_64)
+    e[7]=cast(u8,0);                                   // flags
+    uc.write_le_u64(e, 0x08, CSE_FB_ENTRY);               // entry
+    uc.write_le_u64(e, 0x10, 0x400000);                   // base (informative)
+    uc.write_le_u32(e, 0x18, 2);                          // seg_count
+    uc.write_le_u32(e, 0x1C, 0);
+
+    // ---- seg0 @0x20: .text R-X (perms=5) ----
+    uc.write_le_u64(e, 0x20, CSE_FB_ENTRY);               // vaddr
+    uc.write_le_u32(e, 0x28, CSE_FB_FOFF);                // file_off
+    uc.write_le_u32(e, 0x34, 5);                          // perms R|X
+    // ---- seg1 @0x38: R-W bss page (perms=3) ----
+    uc.write_le_u64(e, 0x38, CSE_FB_BSS_VA);
+    uc.write_le_u32(e, 0x40, 0);
+    uc.write_le_u32(e, 0x44, 0);
+    uc.write_le_u32(e, 0x48, 0x1000);
+    uc.write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_FB_FOFF;
+
+    // movabs r15, CSE_FB_BSS_VA  (callee-saved scratch for the results)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF);
+    uc.write_le_u64(e, c + 2, CSE_FB_BSS_VA);
+    c = c + 10;
+
+    // --- dev_open(DEV_FB=0, 0, 0) → fd ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,22
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;              // xor edi,edi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;              // xor esi,esi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;              // xor edx,edx
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); // mov [r15+0],rax
+    c = c + 4;
+
+    // --- surface_info(fd, r15+0x18) → gate the draw on success ---
+    // Proves SYS_SURFACE_INFO end-to-end from ring 3: if it returns nonzero
+    // (bad fd / not a surface / copy fault) we jump straight to exit, draw
+    // nothing, and the kernel's scanout check reports FAIL. The geometry it
+    // copies is the same the surface presents with, so a PASS means the
+    // holder really read back {width,height,pitch,bpp,fmt}.
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,25
+    e[c+3]=cast(u8,25); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); // mov rdi,[r15+0] (fd)
+    c = c + 4;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x18); // lea rsi,[r15+0x18]
+    c = c + 4;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x85); e[c+2]=cast(u8,0xC0); c = c + 3; // test rax,rax
+    e[c+0]=cast(u8,0x75); c = c + 1;                                   // jnz rel8 → exit (backpatched)
+    let is i64 as fb_gate_rel = c;
+    e[c+0]=cast(u8,0); c = c + 1;                                      // placeholder
+
+    // --- mmap(0, 0x1000, WRITE|MMAP_FD, fd) → VA ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,7
+    e[c+3]=cast(u8,7); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;              // xor edi,edi (hint=0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC6);   // mov rsi,0x1000
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x10); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);   // mov rdx,0x12 (WRITE|MMAP_FD)
+    e[c+3]=cast(u8,0x12); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x4D); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x57); e[c+3]=cast(u8,0x00); // mov r10,[r15+0] (fd)
+    c = c + 4;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x08); // mov [r15+8],rax (VA)
+    c = c + 4;
+
+    // --- fill 256 px with cyan 0x0000FFFF (rax still = VA) ---
+    e[c+0]=cast(u8,0xB9); e[c+1]=cast(u8,0x00); e[c+2]=cast(u8,0x01);   // mov ecx,256
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x00); c = c + 5;
+    e[c+0]=cast(u8,0xBA); e[c+1]=cast(u8,0xFF); e[c+2]=cast(u8,0xFF);   // mov edx,0x0000FFFF
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x00); c = c + 5;
+    // loop: mov [rax],edx ; add rax,4 ; dec ecx ; jnz loop
+    e[c+0]=cast(u8,0x89); e[c+1]=cast(u8,0x10); c = c + 2;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x83); e[c+2]=cast(u8,0xC0); e[c+3]=cast(u8,0x04); c = c + 4;
+    e[c+0]=cast(u8,0xFF); e[c+1]=cast(u8,0xC9); c = c + 2;
+    e[c+0]=cast(u8,0x75); e[c+1]=cast(u8,0xF6); c = c + 2;              // jnz -10
+
+    // --- present(fd, 0, 0, 256, 1) ---
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,23
+    e[c+3]=cast(u8,23); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); // mov rdi,[r15+0] (fd)
+    c = c + 4;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;              // xor esi,esi (x=0)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;              // xor edx,edx (y=0)
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);   // mov r10,256 (w)
+    e[c+3]=cast(u8,0x00); e[c+4]=cast(u8,0x01); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov r8,1 (h)
+    e[c+3]=cast(u8,0x01); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x10); // mov [r15+16],rax
+    c = c + 4;
+
+    // --- exit(0) ---  (also the surface_info-gate target)
+    e[fb_gate_rel] = cast(u8, c - (fb_gate_rel + 1));                   // patch jnz → here
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);   // mov rax,3
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0);
+    c = c + 7;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;              // xor edi,edi
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;              // syscall
+
+    let is i64 as text_size = c - CSE_FB_FOFF;
+    uc.write_le_u32(e, 0x2C, text_size);     // seg0 file_size
+    uc.write_le_u32(e, 0x30, text_size);     // seg0 mem_size
+    fb_cse_len = c;
+}
+
+// Spawn the fb test program and confirm its cyan reached the scanout —
+// the full ring-3 → surface → screen path.
+fn spawn_user_fb_smoke() as void {
+    serial.println("userspace.fb_smoke: start", 25);
+    build_fb_cse();
+
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.fb_smoke: aspace FAIL", 31);
+        return;
+    }
+    let is i64 as entry with mut = 0;
+    let is i64 as user_rsp with mut = 0;
+    let is i32 as rc = cse.load_cse(a, cast(*u8, &fb_cse[0]), fb_cse_len,
+                                     cast(*u8, "fb"), 2, &entry, &user_rsp);
+    if (rc != 0) {
+        serial.print("userspace.fb_smoke: load_cse rc=", 32);
+        util.print_num(cast(i64, rc));
+        serial.println(" FAIL", 5);
+        return;
+    }
+
+    // Clear row 0 (cols 0..255) on the scanout so we detect the app's write,
+    // not the boot surface_smoke's leftover magenta.
+    let is i64 as sv = fb.scanout_virt();
+    let is i64 as bpb = fb.bpp_bytes();
+    let is i64 as i with mut = 0;
+    while (i < 256) {
+        let is *i32 as p = cast(*i32, sv + i * bpb);
+        p[0] = cast(i32, 0);
+        i = i + 1;
+    }
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)),
+        thread.QOS_NORMAL,
+        a.pml4_phys, entry, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.fb_smoke: spawned tid=", 32);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Poll the scanout until the app's cyan lands (or time out).
+    let is i64 as deadline = timer.current_time_ns() + 1500000000;
+    let is i32 as ok with mut = 0;
+    let is i32 as timedout with mut = 0;
+    while (ok == 0 && timedout == 0) {
+        let is *i32 as q0 = cast(*i32, sv);
+        let is *i32 as q1 = cast(*i32, sv + 128 * bpb);
+        if ((cast(i64, q0[0]) & 0xFFFFFF) == 0x0000FFFF) {
+            if ((cast(i64, q1[0]) & 0xFFFFFF) == 0x0000FFFF) { ok = 1; }
+        }
+        if (ok == 0) {
+            if (timer.current_time_ns() >= deadline) { timedout = 1; }
+            else { sched.sleep_for_ns(20000000); }
+        }
+    }
+    if (ok == 1) {
+        serial.println("userspace.fb_smoke: PASS", 24);
+    } else {
+        serial.println("userspace.fb_smoke: no cyan on scanout FAIL", 43);
+    }
+}
+
+// ============================================================
+// Embedded "keyboard child" CSE — proves the raw-input path from ring 3:
+// dev_open(DEV_KEYBOARD) → read(fd, &ev, 2) → exit(ev[0]). The kernel
+// injects a synthetic raw event (QEMU has no physical keyboard) and checks
+// the child exits with that scancode — read off the device by syscall.
+// ============================================================
+
+let is i64 as CSE_KB_ENTRY  = 0x401000;
+let is i64 as CSE_KB_BSS_VA = 0x402000;
+let is i64 as CSE_KB_FOFF   = 0x50;
+let is i64 as child_kb_len with mut = 0;
+let is [256]u8 as child_kb;
+
+fn build_kbd_child_cse() as void {
+    let is *u8 as e = cast(*u8, &child_kb[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    uc.write_le_u64(e, 0x08, CSE_KB_ENTRY);
+    uc.write_le_u64(e, 0x10, 0x400000);
+    uc.write_le_u32(e, 0x18, 2);
+    uc.write_le_u32(e, 0x1C, 0);
+    uc.write_le_u64(e, 0x20, CSE_KB_ENTRY);
+    uc.write_le_u32(e, 0x28, CSE_KB_FOFF);
+    uc.write_le_u32(e, 0x34, 5);
+    uc.write_le_u64(e, 0x38, CSE_KB_BSS_VA);
+    uc.write_le_u32(e, 0x40, 0);
+    uc.write_le_u32(e, 0x44, 0);
+    uc.write_le_u32(e, 0x48, 0x1000);
+    uc.write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_KB_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); uc.write_le_u64(e, c+2, CSE_KB_BSS_VA); c = c + 10;
+    // dev_open(DEV_KEYBOARD=1, 0, 0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,22
+    e[c+0]=cast(u8,0xBF); e[c+1]=cast(u8,1); e[c+2]=cast(u8,0); e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); c = c + 5;  // mov edi,1
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;                        // xor esi,esi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;                        // xor edx,edx
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;  // mov [r15+0],rax (fd)
+    // read(fd, r15+8, 2)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,10
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x08); c = c + 4;  // lea rsi,[r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,2); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rdx,2
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    // exit(byte [r15+8])
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x7F); e[c+4]=cast(u8,0x08); c = c + 5;  // movzx edi, byte [r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+
+    let is i64 as text_size = c - CSE_KB_FOFF;
+    uc.write_le_u32(e, 0x2C, text_size);
+    uc.write_le_u32(e, 0x30, text_size);
+    child_kb_len = c;
+}
+
+// Spawn the keyboard child, inject a synthetic raw event, confirm it exits
+// with the scancode it read off DEV_KEYBOARD (ring-3 dev_open + read).
+fn spawn_kbd_smoke() as void {
+    serial.println("userspace.kbd_smoke: start", 26);
+    // The keyboard driver binds asynchronously (in the bind worker, behind
+    // the disk drivers), so its on_bind hasn't registered DEV_KEYBOARD yet
+    // when the boot self-tests finish. Wait for the class to appear in the
+    // registry (bounded) — a real launcher/terminal would do the same, or
+    // retry dev_open on E_INVAL.
+    let is i64 as kdeadline = timer.current_time_ns() + 4000000000;
+    let is i64 as kwaiting with mut = 1;
+    while (kwaiting == 1) {
+        if (driver.device_count(abi.DEV_KEYBOARD) > 0) { kwaiting = 0; }
+        else if (timer.current_time_ns() >= kdeadline) { kwaiting = 0; }
+        else { sched.sleep_for_ns(20000000); }
+    }
+
+    // Registry honesty (A1/A2): the count is true and the index does not lie.
+    // One framebuffer, one keyboard; instance 0 of each exists, instance 1 of
+    // the keyboard does not — and resolves to nothing (E_NOENT path), never an
+    // alias of 0. Mint-and-free instance 0 to prove dev_open round-trips.
+    let is i64 as nkb = driver.device_count(abi.DEV_KEYBOARD);
+    let is i64 as nfb = driver.device_count(abi.DEV_FB);
+    let is i64 as ko0 = driver.device_open(abi.DEV_KEYBOARD, 0);
+    let is i64 as ko1 = driver.device_open(abi.DEV_KEYBOARD, 1);
+    if (ko0 != 0) { kobject.ko_unref(ko0); }
+    if (ko1 != 0) { kobject.ko_unref(ko1); }
+    if (nkb == 1 && nfb == 1 && ko0 != 0 && ko1 == 0) {
+        serial.println("userspace.devreg_smoke: PASS", 28);
+    } else {
+        serial.print("userspace.devreg_smoke: FAIL nkb=", 33);
+        util.print_num(nkb);
+        serial.print(" nfb=", 5);
+        util.print_num(nfb);
+        serial.print(" ko1=", 5);
+        util.print_num(ko1);
+        serial.println("", 0);
+    }
+
+    build_kbd_child_cse();
+
+    let is i64 as child = userspace.proc_spawn(proc.root_proc, cast(*u8, &child_kb[0]), child_kb_len);
+    if (child == 0) {
+        serial.println("userspace.kbd_smoke: spawn FAIL", 31);
+        return;
+    }
+    userspace.proc_start(child);
+    // Let the child reach dev_open first: acquiring the grab clears the
+    // ring, so an event injected before the open would be wiped.
+    sched.sleep_for_ns(150000000);
+    // Inject scancode 7, pressed (the child's blocking device-read wakes).
+    kbd.inject_event(7, 1);
+
+    let is i64 as code = userspace.proc_wait(proc.root_proc, proc.proc_pid(child));
+    if (code == 7) {
+        serial.println("userspace.kbd_smoke: PASS", 25);
+    } else {
+        serial.print("userspace.kbd_smoke: exit=", 26);
+        util.print_num(code);
+        serial.println(" FAIL", 5);
+    }
+}
+
+// ============================================================
+// Embedded "mouse child" CSE — proves the raw-input path from ring 3:
+// dev_open(DEV_MOUSE) → read(fd, &rec, 4) → exit(rec[0] = dx). The kernel
+// injects a synthetic record (QEMU sends no motion with -display none) and
+// checks the child exits with that dx — read off the device by syscall.
+// ============================================================
+
+let is i64 as CSE_MS_ENTRY  = 0x401000;
+let is i64 as CSE_MS_BSS_VA = 0x402000;
+let is i64 as CSE_MS_FOFF   = 0x50;
+let is i64 as child_ms_len with mut = 0;
+let is [256]u8 as child_ms;
+
+fn build_mouse_child_cse() as void {
+    let is *u8 as e = cast(*u8, &child_ms[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    uc.write_le_u64(e, 0x08, CSE_MS_ENTRY);
+    uc.write_le_u64(e, 0x10, 0x400000);
+    uc.write_le_u32(e, 0x18, 2);
+    uc.write_le_u32(e, 0x1C, 0);
+    uc.write_le_u64(e, 0x20, CSE_MS_ENTRY);
+    uc.write_le_u32(e, 0x28, CSE_MS_FOFF);
+    uc.write_le_u32(e, 0x34, 5);
+    uc.write_le_u64(e, 0x38, CSE_MS_BSS_VA);
+    uc.write_le_u32(e, 0x40, 0);
+    uc.write_le_u32(e, 0x44, 0);
+    uc.write_le_u32(e, 0x48, 0x1000);
+    uc.write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_MS_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); uc.write_le_u64(e, c+2, CSE_MS_BSS_VA); c = c + 10;
+    // dev_open(DEV_MOUSE=2, 0, 0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,22
+    e[c+0]=cast(u8,0xBF); e[c+1]=cast(u8,2); e[c+2]=cast(u8,0); e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); c = c + 5;  // mov edi,2
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;                        // xor esi,esi
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;                        // xor edx,edx
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;  // mov [r15+0],rax (fd)
+    // read(fd, r15+8, 4) — one whole 4-byte record
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;  // mov rax,10
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;  // mov rdi,[r15+0]
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x08); c = c + 4;  // lea rsi,[r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,4); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rdx,4
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+    // exit(byte [r15+8]) — dx of the first record
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x7F); e[c+4]=cast(u8,0x08); c = c + 5;  // movzx edi, byte [r15+8]
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;   // mov rax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;                        // syscall
+
+    let is i64 as text_size = c - CSE_MS_FOFF;
+    uc.write_le_u32(e, 0x2C, text_size);
+    uc.write_le_u32(e, 0x30, text_size);
+    child_ms_len = c;
+}
+
+// Mouse smoke: wait for the driver to bind, check registry honesty, run the
+// byte-decoder self-test, then spawn the child, inject a record (dx=9) and
+// confirm it exits with 9 — ring-3 dev_open + record read. Failures panic:
+// verify.sh greps panics, not FAIL lines.
+fn spawn_mouse_smoke() as void {
+    serial.println("userspace.mouse_smoke: start", 28);
+    let is i64 as mdeadline = timer.current_time_ns() + 4000000000;
+    let is i64 as mwaiting with mut = 1;
+    while (mwaiting == 1) {
+        if (driver.device_count(abi.DEV_MOUSE) > 0) { mwaiting = 0; }
+        else if (timer.current_time_ns() >= mdeadline) { mwaiting = 0; }
+        else { sched.sleep_for_ns(20000000); }
+    }
+
+    let is i64 as nms = driver.device_count(abi.DEV_MOUSE);
+    let is i64 as mo0 = driver.device_open(abi.DEV_MOUSE, 0);
+    let is i64 as mo1 = driver.device_open(abi.DEV_MOUSE, 1);
+    if (mo0 != 0) { kobject.ko_unref(mo0); }
+    if (mo1 != 0) { kobject.ko_unref(mo1); }
+    if (nms != 1) { pmm.panic("mouse_smoke: registry count FAIL", 32); }
+    if (mo0 == 0) { pmm.panic("mouse_smoke: instance 0 FAIL", 28); }
+    if (mo1 != 0) { pmm.panic("mouse_smoke: phantom instance FAIL", 34); }
+
+    if (mouse.decode_self_test() != 1) {
+        pmm.panic("mouse_smoke: decoder FAIL", 25);
+    }
+
+    build_mouse_child_cse();
+    let is i64 as child = userspace.proc_spawn(proc.root_proc, cast(*u8, &child_ms[0]), child_ms_len);
+    if (child == 0) {
+        pmm.panic("mouse_smoke: spawn FAIL", 23);
+    }
+    userspace.proc_start(child);
+    // Let the child's dev_open (which clears the ring on grab) land first.
+    sched.sleep_for_ns(150000000);
+    // Inject dx=9 (the child's blocking record-read wakes).
+    mouse.inject_event(9, 0, 0, 0);
+
+    let is i64 as code = userspace.proc_wait(proc.root_proc, proc.proc_pid(child));
+    if (code == 9) {
+        serial.println("userspace.mouse_smoke: PASS", 27);
+    } else {
+        serial.print("userspace.mouse_smoke: exit=", 28);
+        util.print_num(code);
+        serial.println("", 0);
+        pmm.panic("mouse_smoke FAIL", 16);
+    }
+}
+
+// ============================================================
+// Embedded "tablet child" CSE — ring-3 absolute-pointer path:
+// dev_open(DEV_TABLET) → read(fd, &rec, 8) → exit(rec[0] = x low byte).
+// ============================================================
+
+let is i64 as CSE_TB_ENTRY  = 0x401000;
+let is i64 as CSE_TB_BSS_VA = 0x402000;
+let is i64 as CSE_TB_FOFF   = 0x50;
+let is i64 as child_tb_len with mut = 0;
+let is [256]u8 as child_tb;
+
+fn build_tablet_child_cse() as void {
+    let is *u8 as e = cast(*u8, &child_tb[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F); // "CST_"
+    e[4]=cast(u8,2); e[5]=cast(u8,0); e[6]=cast(u8,1); e[7]=cast(u8,0);
+    uc.write_le_u64(e, 0x08, CSE_TB_ENTRY);
+    uc.write_le_u64(e, 0x10, 0x400000);
+    uc.write_le_u32(e, 0x18, 2);
+    uc.write_le_u32(e, 0x1C, 0);
+    uc.write_le_u64(e, 0x20, CSE_TB_ENTRY);
+    uc.write_le_u32(e, 0x28, CSE_TB_FOFF);
+    uc.write_le_u32(e, 0x34, 5);
+    uc.write_le_u64(e, 0x38, CSE_TB_BSS_VA);
+    uc.write_le_u32(e, 0x40, 0);
+    uc.write_le_u32(e, 0x44, 0);
+    uc.write_le_u32(e, 0x48, 0x1000);
+    uc.write_le_u32(e, 0x4C, 3);
+
+    let is i64 as c with mut = CSE_TB_FOFF;
+    // movabs r15, BSS
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0xBF); uc.write_le_u64(e, c+2, CSE_TB_BSS_VA); c = c + 10;
+    // dev_open(DEV_TABLET=3, 0, 0)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,22); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0xBF); e[c+1]=cast(u8,3); e[c+2]=cast(u8,0); e[c+3]=cast(u8,0); e[c+4]=cast(u8,0); c = c + 5;  // mov edi,3
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xD2); c = c + 2;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x89); e[c+2]=cast(u8,0x47); e[c+3]=cast(u8,0x00); c = c + 4;
+    // read(fd, r15+8, 8) — one whole 8-byte record
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,10); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x7F); e[c+3]=cast(u8,0x00); c = c + 4;
+    e[c+0]=cast(u8,0x49); e[c+1]=cast(u8,0x8D); e[c+2]=cast(u8,0x77); e[c+3]=cast(u8,0x08); c = c + 4;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC2);
+    e[c+3]=cast(u8,8); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+    // exit(byte [r15+8]) — x low byte
+    e[c+0]=cast(u8,0x41); e[c+1]=cast(u8,0x0F); e[c+2]=cast(u8,0xB6); e[c+3]=cast(u8,0x7F); e[c+4]=cast(u8,0x08); c = c + 5;
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0xC7); e[c+2]=cast(u8,0xC0);
+    e[c+3]=cast(u8,3); e[c+4]=cast(u8,0); e[c+5]=cast(u8,0); e[c+6]=cast(u8,0); c = c + 7;
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;
+
+    let is i64 as text_size = c - CSE_TB_FOFF;
+    uc.write_le_u32(e, 0x2C, text_size);
+    uc.write_le_u32(e, 0x30, text_size);
+    child_tb_len = c;
+}
+
+// Tablet smoke: the evdev fold path always (decode self-test, no hardware
+// needed), then — only when the virtio device exists on this machine — the
+// registry honesty checks and the ring-3 read woken by injection.
+fn spawn_tablet_smoke() as void {
+    serial.println("userspace.tablet_smoke: start", 29);
+    if (vtablet.decode_self_test() != 1) {
+        pmm.panic("tablet_smoke: decoder FAIL", 26);
+    }
+    let is i64 as tdeadline = timer.current_time_ns() + 4000000000;
+    let is i64 as twaiting with mut = 1;
+    while (twaiting == 1) {
+        if (driver.device_count(abi.DEV_TABLET) > 0) { twaiting = 0; }
+        else if (timer.current_time_ns() >= tdeadline) { twaiting = 0; }
+        else { sched.sleep_for_ns(20000000); }
+    }
+    if (driver.device_count(abi.DEV_TABLET) == 0) {
+        serial.println("userspace.tablet_smoke: no device (decode-only PASS)", 52);
+        return;
+    }
+    let is i64 as to1 = driver.device_open(abi.DEV_TABLET, 1);
+    if (to1 != 0) { kobject.ko_unref(to1); pmm.panic("tablet_smoke: phantom FAIL", 26); }
+
+    build_tablet_child_cse();
+    let is i64 as child = userspace.proc_spawn(proc.root_proc, cast(*u8, &child_tb[0]), child_tb_len);
+    if (child == 0) { pmm.panic("tablet_smoke: spawn FAIL", 24); }
+    userspace.proc_start(child);
+    // Let the child's dev_open (which clears the ring on grab) land first.
+    sched.sleep_for_ns(150000000);
+    vtablet.inject_event(9, 5, 1, 0);
+    let is i64 as code = userspace.proc_wait(proc.root_proc, proc.proc_pid(child));
+    if (code == 9) {
+        serial.println("userspace.tablet_smoke: PASS", 28);
+    } else {
+        serial.print("userspace.tablet_smoke: exit=", 29);
+        util.print_num(code);
+        serial.println("", 0);
+        pmm.panic("tablet_smoke FAIL", 17);
+    }
+}
+
+// ============================================================
+// grab_smoke — the preemptible exclusivity contract, both flavors:
+// input (second open mutes the first; close hands back a CLEAN ring) and
+// surface (non-top presents paint nothing; close snaps the restored
+// holder's frame back onto the scanout). Panics on failure.
+// ============================================================
+
+fn grab_smoke() as void {
+    serial.println("grab_smoke: start", 17);
+
+    // -- input: keyboard --
+    let is i64 as ko1 = driver.device_open(abi.DEV_KEYBOARD, 0);
+    if (ko1 == 0) { pmm.panic("grab_smoke: open1 FAIL", 22); }
+    kbd.inject_event(5, 1);
+    if (kobject.ko_poll(ko1) != abi.POLL_READABLE) { pmm.panic("grab_smoke: top1 FAIL", 21); }
+    let is i64 as ko2 = driver.device_open(abi.DEV_KEYBOARD, 0);
+    if (ko2 == 0) { pmm.panic("grab_smoke: open2 FAIL", 22); }
+    if (kobject.ko_poll(ko1) != 0) { pmm.panic("grab_smoke: quiet FAIL", 22); }
+    kbd.inject_event(6, 1);
+    if (kobject.ko_poll(ko2) != abi.POLL_READABLE) { pmm.panic("grab_smoke: top2 FAIL", 21); }
+    if (kobject.ko_poll(ko1) != 0) { pmm.panic("grab_smoke: quiet2 FAIL", 23); }
+    kobject.ko_unref(ko2);
+    // ownership returned — and returned CLEAN (ko2's leftover event wiped)
+    if (kobject.ko_poll(ko1) != 0) { pmm.panic("grab_smoke: cleanret FAIL", 25); }
+    kbd.inject_event(7, 1);
+    if (kobject.ko_poll(ko1) != abi.POLL_READABLE) { pmm.panic("grab_smoke: restore FAIL", 24); }
+    kobject.ko_unref(ko1);
+
+    // -- surface: quiet present + snap-back --
+    let is i64 as s1 = driver.device_open(abi.DEV_FB, 0);
+    if (s1 == 0) { pmm.panic("grab_smoke: fb1 FAIL", 20); }
+    let is i64 as s2 = driver.device_open(abi.DEV_FB, 0);
+    if (s2 == 0) { pmm.panic("grab_smoke: fb2 FAIL", 20); }
+    let is *surface.Surface as sp1 = cast(*surface.Surface, kobject.ko_priv(s1));
+    let is *surface.Surface as sp2 = cast(*surface.Surface, kobject.ko_priv(s2));
+    let is *u32 as b1 = cast(*u32, sp1.backbuffer);
+    let is *u32 as b2 = cast(*u32, sp2.backbuffer);
+    b1[0] = cast(u32, 0x00AA1111);
+    b2[0] = cast(u32, 0x00BB2222);
+    let is *u32 as sc = cast(*u32, sp1.scanout);
+    kobject.ko_present(s1, 0, 0, 4, 1);            // s1 is NOT top: must be quiet
+    if ((cast(i64, sc[0]) & 0xFFFFFF) == 0xAA1111) {
+        pmm.panic("grab_smoke: quiet-present FAIL", 30);
+    }
+    kobject.ko_present(s2, 0, 0, 4, 1);            // s2 IS top: must land
+    if ((cast(i64, sc[0]) & 0xFFFFFF) != 0xBB2222) {
+        pmm.panic("grab_smoke: top-present FAIL", 28);
+    }
+    kobject.ko_unref(s2);                          // close → s1's frame snaps back
+    if ((cast(i64, sc[0]) & 0xFFFFFF) != 0xAA1111) {
+        pmm.panic("grab_smoke: snapback FAIL", 25);
+    }
+    kobject.ko_unref(s1);
+    serial.println("grab_smoke: PASS", 16);
+}

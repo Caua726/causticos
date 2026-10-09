@@ -1,0 +1,282 @@
+// fat32_file.cst — file data: reading a file's cluster chain, and writing or
+// truncating at any offset, growing or shrinking the chain to fit.
+
+use "fat32_vol.cst" as fatvol;
+
+// ============================================================
+// File read — walk the cluster chain of `first_cluster`, copying up
+// to min(size, max_bytes) bytes into `dst`. Returns bytes copied or
+// a negative errno on failure.
+// ============================================================
+
+fn file_read(v as *fatvol.Fat32Volume,
+             first_cluster as i64,
+             size as i64,
+             dst as *u8,
+             max_bytes as i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (max_bytes <= 0) { return 0; }
+    if (size <= 0)      { return 0; }
+
+    let is i64 as to_copy with mut = size;
+    if (to_copy > max_bytes) { to_copy = max_bytes; }
+    let is i64 as copied with mut = 0;
+    let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
+    let is i64 as cluster with mut = first_cluster;
+    let is i64 as cbytes = v.cluster_size_bytes;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+
+    while (copied < to_copy) {
+        if (cluster < 2 || cluster >= v.cluster_count + 2) { return 0 - 2; }
+        if (guard > max_steps) { return 0 - 3; }
+        guard = guard + 1;
+
+        let is i32 as rc = fatvol.cluster_read(v, cluster, buf);
+        if (rc != 0) { return 0 - 4; }
+
+        let is i64 as chunk with mut = cbytes;
+        if (chunk > to_copy - copied) { chunk = to_copy - copied; }
+        let is i64 as j with mut = 0;
+        while (j < chunk) {
+            dst[copied + j] = buf[j];
+            j = j + 1;
+        }
+        copied = copied + chunk;
+        if (copied >= to_copy) { return copied; }
+
+        let is i64 as nxt = fatvol.fat_read(v, cluster);
+        if (nxt < 0) { return 0 - 5; }
+        if (fatvol.cluster_is_eof(nxt) == 1) {
+            // File size claimed more bytes than the chain provides —
+            // treat as truncated rather than surfacing EOF as an error.
+            return copied;
+        }
+        cluster = nxt;
+    }
+    return copied;
+}
+
+// ============================================================
+// file_write_at — read-modify-write over the cluster chain. Writes
+// `data[0..data_len]` starting at byte `offset` in the file; extends
+// the chain when offset+data_len exceeds current size. Returns the
+// new file size (>= offset+data_len, never shrinks) or a negative
+// errno on failure. Callers must persist the new (first_cluster, size)
+// via dir_update_entry. `h` is the open file's chain cursor (or null).
+//
+// Writing past the end leaves a hole between the old size and `offset`, and
+// a hole reads as zeros: it is written as zeros first. It used to be left as
+// whatever the newly allocated clusters held — someone else's deleted data.
+// ============================================================
+let is [512]u8 as zero_block;      // .bss: zero
+
+fn file_write_at(v as *fatvol.Fat32Volume,
+                 first_cluster as i64, old_size as i64,
+                 offset as i64, data as *u8, data_len as i64,
+                 out_first_cluster as *i64, h as *i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    fatvol.fat_batch_begin();
+    let is i64 as r = file_write_chain(v, first_cluster, old_size, offset,
+                                       data, data_len, out_first_cluster, h);
+    let is i32 as wb = fatvol.fat_batch_end(v);
+    if (r < 0) { return r; }
+    if (wb != 0) { return 0 - 10; }
+    return r;
+}
+
+fn file_write_chain(v as *fatvol.Fat32Volume,
+                    first_cluster as i64, old_size as i64,
+                    offset as i64, data as *u8, data_len as i64,
+                    out_first_cluster as *i64, h as *i64) as i64 {
+    if (offset < 0 || data_len < 0) { return 0 - 1; }
+    let is i64 as first with mut = first_cluster;
+    let is i64 as size with mut = old_size;
+    if (data_len == 0) {
+        *out_first_cluster = first;
+        return size;
+    }
+    if (fatvol.ensure_scratch() != 0) { return 0 - 2; }
+
+    while (size < offset) {
+        let is i64 as z with mut = offset - size;
+        if (z > 512) { z = 512; }
+        let is i64 as zr = file_write_chain(v, first, size, size,
+                                            cast(*u8, &zero_block[0]), z, out_first_cluster, h);
+        if (zr < 0) { return zr; }
+        first = *out_first_cluster;
+        size = zr;
+    }
+
+    if (first == 0) {
+        first = fatvol.cluster_alloc(v);
+        if (first < 0) { return 0 - 3; }
+    }
+    *out_first_cluster = first;
+
+    let is i64 as cbytes = v.cluster_size_bytes;
+    let is i64 as end = offset + data_len;
+    let is i64 as idx with mut = offset / cbytes;
+    let is i64 as cur_cluster with mut = fatvol.walk_to(v, first, idx, h, 1);
+    if (cur_cluster < 2) { return 0 - 4; }
+
+    let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
+    let is i64 as written with mut = 0;
+    let is i64 as cur_off with mut = offset;
+    let is i64 as going with mut = 1;
+    while (going == 1) {
+        let is i64 as in_clus_off = cur_off % cbytes;
+        let is i64 as chunk with mut = cbytes - in_clus_off;
+        if (chunk > data_len - written) { chunk = data_len - written; }
+
+        // A full, cluster-aligned write overwrites the whole cluster, so the
+        // read-modify-write read is pure waste — skip it. We still stage through
+        // the DMA-safe scratch page (the HBA only DMAs HHDM buffers; `data` may
+        // be neither HHDM nor contiguous), but dropping the read halves the AHCI
+        // commands on a sequential append — the growing .s/.o/.cse that dominates
+        // self-hosting I/O. A partial cluster (leading/trailing fragment) keeps
+        // the read to preserve the bytes it doesn't touch.
+        let is i64 as k with mut = 0;
+        if (in_clus_off == 0 && chunk == cbytes) {
+            while (k < cbytes) { buf[k] = data[written + k]; k = k + 1; }
+        } else {
+            if (fatvol.cluster_read(v, cur_cluster, buf) != 0) { return 0 - 5; }
+            while (k < chunk) { buf[in_clus_off + k] = data[written + k]; k = k + 1; }
+        }
+        if (fatvol.cluster_write(v, cur_cluster, buf) != 0) { return 0 - 6; }
+
+        written = written + chunk;
+        cur_off = cur_off + chunk;
+        if (written >= data_len) { going = 0; }
+        else {
+            // Next cluster, linking a new one when the chain ends here.
+            let is i64 as nxt with mut = fatvol.fat_read(v, cur_cluster);
+            if (nxt < 0) { return 0 - 7; }
+            if (fatvol.cluster_is_eof(nxt) == 1) {
+                nxt = fatvol.cluster_alloc(v);
+                if (nxt < 0) { return 0 - 8; }
+                if (fatvol.fat_write(v, cur_cluster, nxt) != 0) { return 0 - 9; }
+            }
+            cur_cluster = nxt;
+            idx = idx + 1;
+        }
+    }
+    fatvol.hint_set(h, first, idx, cur_cluster);
+
+    if (end > size) { return end; }
+    return size;
+}
+
+// file_truncate — adjust a file to exactly `new_size` bytes. Shrinks
+// by freeing trailing clusters + cutting the chain; grows by
+// allocating zeroed clusters and padding the last partial cluster
+// with zero bytes. Returns new_first_cluster via out (may be 0 when
+// truncating to 0 bytes). Callers update the dir entry.
+fn file_truncate(v as *fatvol.Fat32Volume,
+                 first_cluster as i64, old_size as i64,
+                 new_size as i64, out_first_cluster as *i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    fatvol.fat_batch_begin();
+    let is i32 as rc = file_truncate_chain(v, first_cluster, old_size, new_size, out_first_cluster);
+    let is i32 as wb = fatvol.fat_batch_end(v);
+    if (rc != 0) { return rc; }
+    if (wb != 0) { return cast(i32, 0 - 9); }
+    return 0;
+}
+
+fn file_truncate_chain(v as *fatvol.Fat32Volume,
+                       first_cluster as i64, old_size as i64,
+                       new_size as i64, out_first_cluster as *i64) as i32 {
+    if (new_size < 0) { return cast(i32, 0 - 1); }
+    if (fatvol.ensure_scratch() != 0) { return cast(i32, 0 - 2); }
+
+    let is i64 as cbytes = v.cluster_size_bytes;
+
+    if (new_size == 0) {
+        if (first_cluster != 0) { fatvol.chain_free(v, first_cluster); }
+        *out_first_cluster = 0;
+        return 0;
+    }
+    if (new_size == old_size) {
+        *out_first_cluster = first_cluster;
+        return 0;
+    }
+
+    let is i64 as want = (new_size + cbytes - 1) / cbytes;
+
+    if (new_size < old_size) {
+        // Shrink: keep first `want` clusters, free the rest, cut chain.
+        let is i64 as keep_last = fatvol.chain_advance(v, first_cluster, want - 1);
+        if (keep_last < 2) { return cast(i32, 0 - 3); }
+        let is i64 as tail = fatvol.fat_read(v, keep_last);
+        if (tail < 0) { return cast(i32, 0 - 4); }
+        // Mark keep_last as EOC.
+        if (fatvol.fat_write(v, keep_last, 0x0FFFFFFF) != 0) { return cast(i32, 0 - 5); }
+        if (fatvol.cluster_is_eof(tail) == 0) {
+            fatvol.chain_free(v, tail);
+        }
+        // Zero the trailing bytes inside keep_last so a later read
+        // doesn't surface stale content.
+        let is i64 as in_last = new_size % cbytes;
+        if (in_last > 0) {
+            if (fatvol.cluster_read(v, keep_last, cast(*u8, fatvol.clus_scratch_virt)) != 0) {
+                return cast(i32, 0 - 6);
+            }
+            let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
+            let is i64 as z with mut = in_last;
+            while (z < cbytes) { buf[z] = cast(u8, 0); z = z + 1; }
+            if (fatvol.cluster_write(v, keep_last, buf) != 0) { return cast(i32, 0 - 7); }
+        }
+        *out_first_cluster = first_cluster;
+        return 0;
+    }
+
+    // Grow: ensure chain has `want` clusters. Pad the final partial
+    // cluster's tail with zeros so reads past old_size return zero.
+    let is i64 as new_first with mut = first_cluster;
+    if (fatvol.chain_ensure_length(v, first_cluster, want, &new_first) != 0) {
+        return cast(i32, 0 - 8);
+    }
+
+    // Zero the region between old_size and new_size in the cluster(s)
+    // that straddle that boundary. For the cluster containing old_size
+    // we do a read-modify-write; later clusters are entirely within the
+    // grown region and cluster_alloc already returned zeroed memory
+    // (heap zone) — but alloc_pages doesn't zero the storage block,
+    // so we explicitly cluster_zero them.
+    if (old_size > 0) {
+        let is i64 as last_old_idx = (old_size - 1) / cbytes;
+        let is i64 as tail_cluster = fatvol.chain_advance(v, new_first, last_old_idx);
+        if (tail_cluster >= 2) {
+            let is i64 as tail_off = old_size % cbytes;
+            if (tail_off > 0) {
+                let is *u8 as buf = cast(*u8, fatvol.clus_scratch_virt);
+                if (fatvol.cluster_read(v, tail_cluster, buf) != 0) {
+                    return cast(i32, 0 - 9);
+                }
+                let is i64 as z with mut = tail_off;
+                while (z < cbytes) { buf[z] = cast(u8, 0); z = z + 1; }
+                if (fatvol.cluster_write(v, tail_cluster, buf) != 0) {
+                    return cast(i32, 0 - 10);
+                }
+            }
+        }
+    }
+    let is i64 as zfrom with mut = (old_size + cbytes - 1) / cbytes;
+    if (old_size == 0) { zfrom = 0; }
+    let is i64 as zc with mut = fatvol.chain_advance(v, new_first, zfrom);
+    let is i64 as zidx with mut = zfrom;
+    while (zidx < want && zc >= 2) {
+        if (fatvol.cluster_zero(v, zc) != 0) { return cast(i32, 0 - 11); }
+        zidx = zidx + 1;
+        if (zidx < want) {
+            let is i64 as nxt = fatvol.fat_read(v, zc);
+            if (nxt < 0) { return cast(i32, 0 - 12); }
+            if (fatvol.cluster_is_eof(nxt) == 1) { zidx = want; }
+            else { zc = nxt; }
+        }
+    }
+
+    *out_first_cluster = new_first;
+    return 0;
+}

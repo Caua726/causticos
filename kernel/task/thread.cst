@@ -1,0 +1,575 @@
+// thread.cst — what a thread is to the scheduler: its states, scheduling
+// classes and QoS bands, the THREAD_SIZE record with its field offsets and
+// accessors, and the TID → Thread table.
+//
+// Thread allocation: a typed pool (heap.kpool) for the records + an
+// open-addressing hash table for TID→Thread* lookup, which doubles at 75% load;
+// the thread count is limited only by available memory.
+//
+// Built on by runq.cst (the per-cpu run queues), qos.cst (the scheduling
+// policy) and sched.cst (sleep, wakeup, schedule(), the tick).
+
+use "pmm.cst" as pmm;
+use "heap.cst" as heap;
+use "smp.cst" as smp;
+use "lock.cst" as lock;
+
+// ============================================================
+// Constants
+// ============================================================
+
+// Thread states (§15)
+let is i64 as THREAD_RUNNING   = 1;
+let is i64 as THREAD_RUNNABLE  = 2;
+let is i64 as THREAD_SLEEPING  = 3;
+let is i64 as THREAD_SUSPENDED = 4;
+let is i64 as THREAD_DEAD      = 5;
+
+// Scheduling classes (§4)
+let is i64 as SCHED_CLASS_DEADLINE = 0;
+let is i64 as SCHED_CLASS_QOS     = 1;
+let is i64 as SCHED_CLASS_IDLE    = 2;
+
+// QoS bands (§4.2.1)
+let is i64 as QOS_INPUT        = 0;
+let is i64 as QOS_RENDER       = 1;
+let is i64 as QOS_ACTIVE       = 2;
+let is i64 as QOS_NORMAL       = 3;
+let is i64 as QOS_BATCH        = 4;
+let is i64 as QOS_LAZY         = 5;
+let is i64 as NUM_QOS_BANDS    = 6;
+
+// QoS budget enforcement window (§7.2): 1 second in ns
+let is i64 as QOS_WINDOW_NS    = 1000000000;
+
+// EEVDF (§5)
+let is i64 as BASE_WEIGHT      = 1024;
+let is i64 as DEFAULT_SLICE_NS = 5000000;
+let is i64 as SLEEPER_BONUS_NS with mut = 2500000;  // configurable (§5.4)
+
+// Quantum (§13) — mutable, configurable
+let is i64 as MIN_QUANTUM_NS   = 1000000;
+let is i64 as MAX_QUANTUM_NS   = 100000000;
+let is i64 as quantum_ns with mut = 5000000;
+
+// Deadline (§6) — configurable
+let is i64 as MAX_DL_UTIL_PCT with mut = 70;
+
+// Capabilities (§8)
+let is i64 as CAP_SCHED_REALTIME = 1;
+let is i64 as CAP_SCHED_INPUT    = 2;
+let is i64 as CAP_SCHED_RENDER   = 4;
+let is i64 as CAP_SCHED_AFFINITY = 8;
+
+// Kernel stack. 8 KiB (order 1) overflowed: a syscall handler stages user I/O
+// through a [4096]u8 on this stack, and the heaviest paths nest deep —
+// dispatch -> sys_read/write (4 KiB buf) -> vfs -> fat32 -> cluster_read ->
+// io -> ahci -> ... -> plus a device IRQ taken on the SAME stack (IF is set
+// during dispatch). Past 8 KiB the overflow silently corrupts whatever sits
+// below the stack — including a thread's saved context — so a thread later
+// resumed with a garbage RIP/RSP (a leaked kstack return address). It only bit
+// the self-host compiler: thousands of deep read/write syscalls, where simple
+// register-only smokes never went deep enough. 32 KiB (order 3) gives the 4 KiB
+// staging buffer + the deepest chain + a nested IRQ ample headroom.
+let is i64 as KSTACK_SIZE      = 32768;
+let is i64 as MAX_THREADS      = 64;
+
+// FPU state size (fxsave = 512 bytes)
+let is i64 as FPU_STATE_SIZE   = 512;
+
+// ============================================================
+// Thread struct — 400 bytes
+// ============================================================
+// 0    tid              i64
+// 8    state            i64
+// 16   sched_class      i64
+// 24   qos_band         i64
+// 32   weight           i64
+// 40   slice_ns         i64
+// 48   vruntime         i64
+// 56   virtual_deadline i64
+// 64   kstack_top       i64   (saved RSP)
+// 72   kstack_base      i64
+// 80   entry_fn         i64
+// 88   total_runtime_ns i64
+// 96   next_tid         i64   (run list / deadline list)
+// 104  prev_tid         i64
+// 112  lag              i64
+// 120  voluntary_sw     i64
+// 128  forced_sw        i64
+// --- Deadline class (§6) ---
+// 136  dl_runtime_ns    i64
+// 144  dl_period_ns     i64
+// 152  dl_deadline_ns   i64
+// 160  dl_budget_left   i64
+// 168  dl_period_start  i64
+// 176  dl_abs_deadline  i64
+// --- Anti-abuse (§7) ---
+// 184  cpu_used_window  i64
+// 192  window_start_ns  i64
+// 200  band_violations  i64
+// 208  band_below_count i64
+// 216  original_qos_band i64
+// 224  capabilities     i64
+// --- FPU (§14.2) ---
+// 232  fpu_dirty        i64
+// 240  fpu_state_addr   i64   (pointer to 512-byte fxsave area, 16-aligned)
+// --- Process link ---
+// 248  process_ptr      i64   (ptr to owning Process)
+// 256  home_cpu         i64   (cpu owning this thread's runqueue)
+// 264  last_run_ns      i64   (monotonic when this thread last started running)
+// 272  sleep_until_ns   i64   (timer-driven wakeup deadline; 0 = no auto-wake)
+// --- User-thread link ---
+// 280  aspace_pml4      i64   (user PML4 phys; kernel AS for kernel threads)
+// 288  user_entry       i64   (ring-3 RIP)
+// 296  user_rsp         i64   (ring-3 RSP)
+// 304  aspace_ptr       i64   (*vma.Aspace; 0 for kernel threads)
+// 312  kstack_va        i64   (guarded kvmap VA — kvunmap'd by the reaper)
+// 320  io_buf           i64   (lazy 4 KiB syscall-I/O staging — kfree'd by the reaper)
+// 328  kill_pending     i64   (the process is terminating: leave at the next
+//                              user boundary — see kill_kick)
+// 336  initial_rdi      i64   (ring-3 rdi of a SYS_THREAD_SPAWN worker)
+// 344  poll_parked      i64   (1 while on a cpu's parked list — poll_park_keys)
+// 352  wait_next        i64   (mutex wait queue link: next waiter tid + 1)
+// 360  wait_granted     i64   (1 once a mutex release handed this thread the lock)
+// 368  intr_sleep       i64   (1 while in a sleep a kill may cut short)
+// 376  held_ko0         i64   (a KObject this syscall holds a reference to —
+// 384  held_ko1         i64    vma.fd_hold; dropped on the way back to ring 3)
+// 392  queued_band      i64   (band + 1 while in a run-queue tree, 0 when not)
+// 400  park_keys        i64   (*i64: what a parked poller waits on — see poll_park_keys)
+// 408  park_nkeys       i64
+// 416  park_next        i64   (parked-list link: next tid + 1, 0 = end)
+// 424  park_prev        i64   (previous tid + 1, 0 = head)
+// 432  park_cpu         i64   (the cpu whose parked list holds it)
+// 440  tsleep_next      i64   (timed-sleeper list link: next tid + 1, 0 = end)
+// 448  tsleep_prev      i64   (previous tid + 1, 0 = head)
+// 456  dlt_next         i64   (budget-throttled deadline list: next tid + 1)
+// 464  dlt_prev         i64   (previous tid + 1, 0 = head)
+// 472  dlt_on           i64   (1 while on that list)
+// 480  user_fs          i64   (ring-3 fs base: the thread's own block — the
+//                              loader's for a process's first thread, the
+//                              spawner's for SYS_THREAD_SPAWN; 0 = none)
+// Total: 488
+
+let is i64 as THREAD_SIZE = 488;
+
+// Named slots used outside this file. initial_rdi and poll_parked used to
+// share 336; they never collided only because a worker reads its rdi before
+// it can ever park, which is luck, not a layout.
+let is i64 as THR_INITIAL_RDI  = 336;
+let is i64 as THR_WAIT_NEXT    = 352;
+let is i64 as THR_WAIT_GRANTED = 360;
+let is i64 as THR_KILL         = 328;
+let is i64 as THR_INTR_SLEEP   = 368;
+let is i64 as THR_HELD0        = 376;
+let is i64 as THR_HELD1        = 384;
+let is i64 as THR_QUEUED       = 392;
+let is i64 as THR_PARK_KEYS    = 400;
+let is i64 as THR_PARK_NKEYS   = 408;
+let is i64 as THR_PARK_NEXT    = 416;
+let is i64 as THR_PARK_PREV    = 424;
+let is i64 as THR_PARK_CPU     = 432;
+let is i64 as THR_TSLEEP_NEXT  = 440;
+let is i64 as THR_TSLEEP_PREV  = 448;
+let is i64 as THR_DLT_NEXT     = 456;
+let is i64 as THR_DLT_PREV     = 464;
+let is i64 as THR_DLT_ON       = 472;
+let is i64 as THR_USER_FS      = 480;
+// Typed pools (Phase B sub-phase 2): Thread structs + FPU save areas.
+// Created lazily on first use under heap_lock (SMP-safe), so there is no
+// init-order dependency between sched.init and per_cpu_init / AP bring-up.
+let is i64 as thread_pool with mut = 0;
+let is i64 as fpu_pool with mut = 0;
+
+let is i64 as thread_count with mut = 0;
+let is i64 as idle_stacks with mut = 0;    // one per cpu, never freed
+let is i64 as next_tid with mut = 0;
+
+// Global lock protecting next_tid + the tid hash table. Pre-per-cpu
+// runqueue, the global sched_lock served this duty implicitly. Now
+// every cpu has its own runqueue lock and APs run per_cpu_init
+// concurrently, so the tid allocator needs its own serialiser.
+// Held briefly (a kmalloc + handful of writes), nests INSIDE any
+// per-cpu sched_lock. Order: sched_lock(cpu) > tid_lock > heap_lock.
+let is lock.TicketLock as tid_lock with mut;
+
+// TID -> Thread* table. Every scheduler path reads it, on every cpu, with no
+// lock (thread_ptr, under thr_get/thr_set); it is written under tid_lock. The
+// first version was an ordinary open-addressing table, and three things in it
+// were unsafe for a reader running alongside a writer:
+//   - growing published the new, still-EMPTY buffer before copying into it,
+//     and cap and buffer as two separate stores, so a lookup during a grow
+//     found nothing or probed with the wrong mask;
+//   - the old buffer was freed while lookups could still be inside it;
+//   - deleting shifted later entries back into the hole (backward-shift
+//     deletion), so a lookup could meet the transient EMPTY and conclude a
+//     live thread did not exist.
+// A lookup that comes back empty reads every field as 0 (thr_get's guard), and
+// "band 0" is QOS_INPUT: make_runnable queued a new thread in the highest band
+// under the wrong number, leaving a ghost node that pick_next chose forever
+// over every real thread below it. That was the hang.
+//
+// So now:
+//   - one allocation {cap, used, live, -, slots[cap]{tid, ptr}} behind one
+//     pointer, tid_tab: a reader loads it once and sees a matching cap;
+//   - a deleted entry becomes TID_TOMB and never moves; lookups probe past it;
+//     an insert reuses the first tombstone on its path;
+//   - an entry is written pointer first, tid second, so a reader that sees the
+//     tid sees its pointer;
+//   - a full table (live + tombstones past 3/4) is rebuilt complete, then
+//     published with one store; the old one is retired, and freed only once
+//     every cpu has since passed a quiescent point — schedule() past its
+//     preemption gate, or the top of its idle loop — which a lookup cannot
+//     span, because thread_ptr holds preemption off while it reads.
+let is i64 as TID_EMPTY = 0 - 1;
+let is i64 as TID_TOMB  = 0 - 2;
+let is i64 as TID_HDR_WORDS = 4;          // cap, used, live, reserved
+let is i64 as tid_tab with mut = 0;
+
+// Retired tables waiting for their grace period: the table, and each cpu's
+// quiescent count when it was retired.
+let is i64 as TID_RETIRE_MAX = 8;
+let is [8]i64 as tid_retired with mut;
+let is [128]i64 as tid_retired_seen with mut;     // TID_RETIRE_MAX * 16 cpus
+let is [16]i64 as cpu_quiesce with mut;           // per-cpu quiescent count
+
+fn tid_tab_alloc(cap as i64) as i64 {
+    let is i64 as t = heap.kmalloc((TID_HDR_WORDS + cap * 2) * 8, pmm.ALLOC_ZERO);
+    if (t == 0) { pmm.panic("tid table alloc failed", 22); }
+    let is *i64 as h = cast(*i64, t);
+    h[0] = cap;
+    h[1] = 0;
+    h[2] = 0;
+    let is i64 as i with mut = 0;
+    while (i < cap) {
+        h[TID_HDR_WORDS + i * 2] = TID_EMPTY;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn tid_ht_init(cap as i64) as void {
+    tid_tab = tid_tab_alloc(cap);
+}
+
+// Store order matters to a reader on another cpu: the pointer has to be in the
+// slot before the tid that makes the slot match. x86 keeps stores in order; the
+// empty asm keeps the compiler from reordering them.
+fn tid_slot_publish(slot as *i64, tid as i64, ptr as i64) as void {
+    slot[1] = ptr;
+    asm("\n");
+    slot[0] = tid;
+}
+
+// Put (tid, ptr) into table t, which has room. Caller holds tid_lock.
+fn tid_tab_put(t as i64, tid as i64, ptr as i64) as void {
+    let is *i64 as h = cast(*i64, t);
+    let is i64 as cap = h[0];
+    let is i64 as mask = cap - 1;
+    let is i64 as idx with mut = tid & mask;
+    let is i64 as tomb with mut = 0 - 1;
+    let is i64 as steps with mut = 0;
+    while (steps < cap) {
+        let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
+        if (slot[0] == tid) { slot[1] = ptr; return; }
+        if (slot[0] == TID_TOMB && tomb < 0) { tomb = idx; }
+        if (slot[0] == TID_EMPTY) {
+            if (tomb >= 0) {
+                tid_slot_publish(cast(*i64, t + (TID_HDR_WORDS + tomb * 2) * 8), tid, ptr);
+            } else {
+                tid_slot_publish(slot, tid, ptr);
+                h[1] = h[1] + 1;                      // an EMPTY became used
+            }
+            h[2] = h[2] + 1;
+            return;
+        }
+        idx = (idx + 1) & mask;
+        steps = steps + 1;
+    }
+    if (tomb >= 0) {
+        tid_slot_publish(cast(*i64, t + (TID_HDR_WORDS + tomb * 2) * 8), tid, ptr);
+        h[2] = h[2] + 1;
+        return;
+    }
+    pmm.panic("tid table full", 14);
+}
+
+// This cpu is at a point where it holds no table pointer. Called from
+// schedule() past the preemption gate and from the top of the idle loop.
+fn tid_quiesce(cpu as i64) as void {
+    cpu_quiesce[cpu] = cpu_quiesce[cpu] + 1;
+}
+
+// Free the retired tables whose grace period is over: every cpu that is up has
+// been quiescent since they were retired. Caller holds tid_lock.
+fn tid_reclaim_locked() as void {
+    let is i64 as ncpu = smp.get_cpu_count();
+    let is i64 as r with mut = 0;
+    while (r < TID_RETIRE_MAX) {
+        if (tid_retired[r] != 0) {
+            let is i64 as all with mut = 1;
+            let is i64 as c with mut = 0;
+            while (c < ncpu) {
+                if (cpu_quiesce[c] == tid_retired_seen[r * 16 + c]) { all = 0; }
+                c = c + 1;
+            }
+            if (all == 1) {
+                heap.kfree(tid_retired[r]);
+                tid_retired[r] = 0;
+            }
+        }
+        r = r + 1;
+    }
+}
+
+fn tid_retire_locked(t as i64) as void {
+    tid_reclaim_locked();
+    let is i64 as ncpu = smp.get_cpu_count();
+    let is i64 as r with mut = 0;
+    while (r < TID_RETIRE_MAX) {
+        if (tid_retired[r] == 0) {
+            let is i64 as c with mut = 0;
+            while (c < ncpu) {
+                tid_retired_seen[r * 16 + c] = cpu_quiesce[c];
+                c = c + 1;
+            }
+            tid_retired[r] = t;
+            return;
+        }
+        r = r + 1;
+    }
+    // Eight rebuilds inside one grace period: something keeps every cpu from
+    // ever reaching schedule() or its idle loop, and the table cannot be
+    // replaced safely. Say so rather than free memory that may be in use.
+    pmm.panic("tid table: no retire slot (a cpu never quiesces)", 48);
+}
+
+// Caller holds tid_lock.
+fn tid_set_ptr(tid as i64, ptr as i64) as void {
+    let is *i64 as h = cast(*i64, tid_tab);
+    let is i64 as cap = h[0];
+    if ((h[1] + 1) * 4 > cap * 3) {
+        // Rebuild: double when live threads fill half of it, otherwise the
+        // same size, which clears the tombstones.
+        let is i64 as new_cap with mut = cap;
+        if ((h[2] + 1) * 2 > cap) { new_cap = cap * 2; }
+        let is i64 as nt = tid_tab_alloc(new_cap);
+        let is i64 as i with mut = 0;
+        while (i < cap) {
+            let is *i64 as slot = cast(*i64, tid_tab + (TID_HDR_WORDS + i * 2) * 8);
+            if (slot[0] >= 0) { tid_tab_put(nt, slot[0], slot[1]); }
+            i = i + 1;
+        }
+        let is i64 as old = tid_tab;
+        asm("\n");
+        tid_tab = nt;                                 // one store publishes it
+        tid_retire_locked(old);
+    }
+    tid_tab_put(tid_tab, tid, ptr);
+}
+
+fn thread_ptr(tid as i64) as i64 {
+    // Preemption off while the table pointer is in hand: the grace period that
+    // frees a retired table counts on no lookup spanning a switch.
+    let is i64 as track = lock.preempt_track;
+    if (track != 0) { lock.preempt_inc(); }
+    let is i64 as t = tid_tab;
+    let is i64 as found with mut = 0;
+    if (t != 0 && tid >= 0) {
+        let is *i64 as h = cast(*i64, t);
+        let is i64 as cap = h[0];
+        let is i64 as mask = cap - 1;
+        let is i64 as idx with mut = tid & mask;
+        let is i64 as checked with mut = 0;
+        while (checked < cap) {
+            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
+            let is i64 as st = slot[0];
+            if (st == tid) { found = slot[1]; checked = cap; }
+            else if (st == TID_EMPTY) { checked = cap; }
+            else {
+                idx = (idx + 1) & mask;
+                checked = checked + 1;
+            }
+        }
+    }
+    if (track != 0) { lock.preempt_dec(); }
+    return found;
+}
+
+// Remove tid: its slot becomes a tombstone, nothing moves. Caller holds
+// tid_lock. No-op if tid is not present.
+fn tid_ht_remove(tid as i64) as void {
+    let is i64 as t = tid_tab;
+    if (t == 0) { return; }
+    let is *i64 as h = cast(*i64, t);
+    let is i64 as cap = h[0];
+    let is i64 as mask = cap - 1;
+    let is i64 as idx with mut = tid & mask;
+    let is i64 as steps with mut = 0;
+    while (steps < cap) {
+        let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + idx * 2) * 8);
+        if (slot[0] == TID_EMPTY) { return; }
+        if (slot[0] == tid) {
+            slot[0] = TID_TOMB;
+            h[2] = h[2] - 1;
+            return;
+        }
+        idx = (idx + 1) & mask;
+        steps = steps + 1;
+    }
+}
+
+// thr_get/thr_set go through thread_ptr which returns 0 when the
+// tid isn't (yet) in the hash table. Without the null-guard the
+// dereference turns `0 + off` into a low-address read/write and page-
+// faults. The usual trigger was a LAPIC timer IRQ landing inside
+// create_thread / sched.init between `next_tid = next_tid + 1` and
+// the matching `tid_set_ptr`: a scanner iterating `tid < next_tid`
+// (the per-tick ones did, before they kept lists of their own) hit the
+// half-published slot. Returning 0 / no-op is the correct fallback — the
+// slot is transiently invalid, not corrupt.
+fn thr_get(tid as i64, off as i64) as i64 {
+    let is i64 as base = thread_ptr(tid);
+    if (base == 0) { return 0; }
+    let is *i64 as p = cast(*i64, base + off);
+    return p[0];
+}
+
+fn thr_set(tid as i64, off as i64, v as i64) as void {
+    let is i64 as base = thread_ptr(tid);
+    if (base == 0) { return; }
+    let is *i64 as p = cast(*i64, base + off);
+    p[0] = v;
+}
+
+fn thr_state(tid as i64) as i64         { return thr_get(tid, 8); }
+fn thr_class(tid as i64) as i64         { return thr_get(tid, 16); }
+fn thr_band(tid as i64) as i64          { return thr_get(tid, 24); }
+fn thr_weight(tid as i64) as i64        { return thr_get(tid, 32); }
+fn thr_slice(tid as i64) as i64         { return thr_get(tid, 40); }
+fn thr_vruntime(tid as i64) as i64      { return thr_get(tid, 48); }
+fn thr_vdeadline(tid as i64) as i64     { return thr_get(tid, 56); }
+fn thr_kstack_top(tid as i64) as i64    { return thr_get(tid, 64); }
+fn thr_kstack_base(tid as i64) as i64   { return thr_get(tid, 72); }
+
+// Per-thread 4 KiB staging buffer for syscall I/O (read/write/write_serial),
+// allocated off the heap the first time the thread needs it. This 4 KiB used to
+// ride the kernel stack — the single biggest kstack consumer, and why 8 KiB
+// overflowed under deep I/O. Per-thread, so concurrent syscalls on different
+// threads never share it (a thread runs on at most one cpu); freed in reap_one.
+fn thr_io_buf(tid as i64) as i64 {
+    let is i64 as buf with mut = thr_get(tid, 320);
+    if (buf != 0) { return buf; }
+    buf = heap.kmalloc(4096, cast(i32, 0));
+    if (buf == 0) { return 0; }
+    thr_set(tid, 320, buf);
+    return buf;
+}
+
+fn thr_entry(tid as i64) as i64         { return thr_get(tid, 80); }
+fn thr_runtime(tid as i64) as i64       { return thr_get(tid, 88); }
+fn thr_next(tid as i64) as i64          { return thr_get(tid, 96); }
+fn thr_prev(tid as i64) as i64          { return thr_get(tid, 104); }
+fn thr_lag(tid as i64) as i64           { return thr_get(tid, 112); }
+fn thr_dl_budget(tid as i64) as i64     { return thr_get(tid, 160); }
+fn thr_dl_abs_dl(tid as i64) as i64     { return thr_get(tid, 176); }
+fn thr_caps(tid as i64) as i64          { return thr_get(tid, 224); }
+fn thr_home_cpu(tid as i64) as i64      { return thr_get(tid, 256); }
+fn thr_last_run_ns(tid as i64) as i64   { return thr_get(tid, 264); }
+fn thr_sleep_until_ns(tid as i64) as i64 { return thr_get(tid, 272); }
+// Address space the thread runs against. Kernel threads share
+// vmm.kas_pml4_phys (set by create_thread); user threads carry the
+// pml4_phys handed back by vmm.as_create. Read on every context
+// switch — if it differs from the cpu's current CR3, we reload.
+fn thr_aspace_pml4(tid as i64) as i64   { return thr_get(tid, 280); }
+// User entry / stack — meaningful only for user threads. The kernel
+// trampoline reads these on first dispatch and IRETQs to ring 3.
+fn thr_user_entry(tid as i64) as i64    { return thr_get(tid, 288); }
+fn thr_user_rsp(tid as i64) as i64      { return thr_get(tid, 296); }
+// *vma.Aspace for this user thread (as i64). Syscall handlers need the
+// Aspace pointer — not just pml4 — to call mmap/fd_* against it. Stored
+// at create time, before the thread becomes runnable. 0 for kernel threads.
+fn thr_aspace_ptr(tid as i64) as i64    { return thr_get(tid, 304); }
+
+// ---- Termination (the sched-side half) ----
+// A thread is never stopped where it stands. Stopping one mid-syscall leaves
+// whatever it holds held forever — the Ctrl+C freeze was exactly that: a writer
+// parked inside fat32 with the file system lock, and every later file operation
+// on the machine spinning behind it. Termination is a REQUEST instead: the
+// flag below, honoured by the thread itself at the next point where it holds
+// nothing — on its way back to ring 3 (syscall return, interrupt return), or
+// out of an interruptible sleep, which hands the syscall an E_INTR to unwind
+// with. lifecycle.cst owns what happens at that point.
+fn thr_kill_pending(tid as i64) as i64  { return thr_get(tid, THR_KILL); }
+fn thr_is_running(tid as i64) as i64 {
+    if (thr_state(tid) == THREAD_RUNNING) { return 1; }
+    return 0;
+}
+
+// *process.Process owning this thread (as i64; 0 for kernel threads).
+// The thread is execution; the Process is isolation/identity/lineage.
+fn thr_process_ptr(tid as i64) as i64   { return thr_get(tid, 248); }
+
+// Initial ring-3 rdi for a thread (Thread+336, the arg SYS_THREAD_SPAWN passes
+// to the worker's entry fn). 0 for a normal process main thread — its args
+// arrive on the stack, and enter_user's register clear keeps rdi = 0 there.
+fn thr_set_initial_rdi(tid as i64, v as i64) as void { thr_set(tid, THR_INITIAL_RDI, v); }
+fn thr_initial_rdi(tid as i64) as i64                { return thr_get(tid, THR_INITIAL_RDI); }
+// The thread's fs base. Set before a thread first runs (it is created
+// suspended, or not yet a user thread anyone can see); schedule() loads it.
+fn thr_set_user_fs(tid as i64, v as i64) as void     { thr_set(tid, THR_USER_FS, v); }
+fn thr_user_fs(tid as i64) as i64                    { return thr_get(tid, THR_USER_FS); }
+
+// 1 while any thread of `proc_ptr` is still a live scheduler object (thread_ptr
+// != 0 — RUNNING, parked, or DEAD-but-not-yet-reaped). proc_wait spins on this
+// before aspace_destroy: a DEAD worker is only provably off its aspace CR3 once
+// the reaper has freed it (thread_ptr == 0), so tearing the aspace down before
+// then could pull the page tables out from under a CPU mid context-switch.
+//
+// It looks at the live threads only, in the tid table, under tid_lock (so a
+// table being rebuilt is never half-read). It was a lookup of every tid ever
+// handed out, and a parent waiting on a child ran it every 10 ms.
+fn process_has_live_thread(proc_ptr as i64) as i64 {
+    let is i64 as found with mut = 0;
+    let is i64 as f = lock.acquire_irq(&tid_lock);
+    let is i64 as t = tid_tab;
+    if (t != 0) {
+        let is i64 as cap = cast(*i64, t)[0];
+        let is i64 as i with mut = 0;
+        while (i < cap) {
+            let is *i64 as slot = cast(*i64, t + (TID_HDR_WORDS + i * 2) * 8);
+            if (slot[0] >= 0 && slot[1] != 0 && cast(*i64, slot[1])[31] == proc_ptr) {   // process_ptr @248
+                found = 1; i = cap;
+            }
+            i = i + 1;
+        }
+    }
+    lock.release_irq(&tid_lock, f);
+    return found;
+}
+
+// Is `tid` still a live scheduler object? Returns 0 once the deferred
+// reaper has freed it (removed from the tid table). The reaper can free a
+// DEAD thread before an observer polls its state, so "exited" detection
+// must treat reaped-and-gone the same as DEAD.
+fn thr_exists(tid as i64) as i32 {
+    if (thread_ptr(tid) == 0) { return cast(i32, 0); }
+    return cast(i32, 1);
+}
+fn thr_gone(tid as i64) as i32 {
+    if (thread_ptr(tid) == 0) { return cast(i32, 1); }   // reaped
+    if (thr_state(tid) == THREAD_DEAD) { return cast(i32, 1); }
+    return cast(i32, 0);
+}
+
+// Live thread count (idle + kernel + user). Bumped on create, dropped by
+// the reaper — a churn test reads it before/after to prove no leak.
+fn get_thread_count() as i64 { return thread_count; }
+
+// Total RAM held by live kernel stacks: every thread owns one guarded
+// KSTACK_SIZE (32 KiB) kvmap region. The single biggest per-thread kernel cost,
+// so the memory monitor breaks it out of "kernel data" explicitly; every cpu's
+// idle thread has one too, allocated once and never freed. (The two
+// guard pages around each stack are reserved VA, not backed RAM, so they don't
+// count here — only the 32 KiB of real frames does.)
+fn kstacks_bytes() as i64 { return (thread_count + idle_stacks) * KSTACK_SIZE; }

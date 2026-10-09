@@ -1,0 +1,828 @@
+// mem_smoke.cst — ring-3 smokes of address spaces and threads: a first user
+// thread making progress, a fault that kills only its process, a second
+// thread in the same aspace, the strict reserve/commit model and program-
+// driven commit, partial munmap, the VMA index, and a segment shared between
+// two processes. Run by user_smoke.cst on a smoke boot.
+
+use "serial.cst" as serial;
+use "util.cst" as util;
+use "pmm.cst" as pmm;
+use "vmm.cst" as vmm;
+use "vma.cst" as vma;
+use "sched.cst" as sched;
+use "thread.cst" as thread;
+use "timer.cst" as timer;
+use "abi.cst" as abi;
+use "process.cst" as proc;
+use "segment.cst" as segment;
+use "kobject.cst" as kobject;
+use "userspace.cst" as userspace;
+use "ucode.cst" as uc;
+
+// User VAs the smoke uses. Anywhere in the lower half is fine; we
+// pick spaced-out 4 KiB pages so a copy/paste typo doesn't silently
+// land on the same page as something else.
+let is i64 as USER_TEXT_VA    = 0x0000000000400000;
+let is i64 as USER_DATA_VA    = 0x0000000000401000;
+let is i64 as USER_STACK_VA   = 0x0000000000600000;
+let is i64 as USER_STACK2_VA  = 0x0000000000610000;   // 2nd thread's stack (thread_spawn smoke)
+
+// ----------------------------------------------------------------
+// Smoke shellcode.
+//
+//   movabs rax, USER_DATA_VA   ; 48 B8 <imm64>
+//   inc qword ptr [rax]        ; 48 FF 00
+//   jmp -5                     ; EB FB
+//
+// Bounded loop (5M increments) then SYS_PROC_EXIT(0): the thread runs
+// in ring 3, is preempted by the timer across the loop (the smoke sees
+// the counter advancing), then exits cleanly — no immortal/leaked
+// thread. This is also the workload that first exposed the kstack-top
+// scheduler bug (TSS.RSP0 / syscall-kstack must be the fixed stack top,
+// not the saved rsp); see schedule() in sched.cst.
+// ----------------------------------------------------------------
+fn write_smoke_shellcode(dst as *u8) as i64 {
+    let is i64 as c with mut = 0;
+    // movabs rax, USER_DATA_VA
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xB8); c = c + 2;
+    let is i64 as v with mut = USER_DATA_VA;
+    let is i64 as i with mut = 0;
+    while (i < 8) { dst[c + i] = cast(u8, v & 0xFF); v = v >> 8; i = i + 1; }
+    c = c + 8;
+    // mov rcx, 5000000
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xC7); dst[c + 2] = cast(u8, 0xC1);
+    dst[c + 3] = cast(u8, 0x40); dst[c + 4] = cast(u8, 0x4B);
+    dst[c + 5] = cast(u8, 0x4C); dst[c + 6] = cast(u8, 0x00);
+    c = c + 7;
+    // .loop: inc qword [rax]
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xFF); dst[c + 2] = cast(u8, 0x00);
+    c = c + 3;
+    // dec rcx
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xFF); dst[c + 2] = cast(u8, 0xC9);
+    c = c + 3;
+    // jnz .loop  (rel8 = -8)
+    dst[c + 0] = cast(u8, 0x75); dst[c + 1] = cast(u8, 0xF8); c = c + 2;
+    // mov rax, 3  (SYS_PROC_EXIT)
+    dst[c + 0] = cast(u8, 0x48); dst[c + 1] = cast(u8, 0xC7); dst[c + 2] = cast(u8, 0xC0);
+    dst[c + 3] = cast(u8, 3); dst[c + 4] = cast(u8, 0);
+    dst[c + 5] = cast(u8, 0); dst[c + 6] = cast(u8, 0);
+    c = c + 7;
+    // xor edi, edi  (exit code 0)
+    dst[c + 0] = cast(u8, 0x31); dst[c + 1] = cast(u8, 0xFF); c = c + 2;
+    // syscall
+    dst[c + 0] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    return c;
+}
+
+// (Old syscall_smoke shellcode lived here, hard-coding rax=0 for
+// the now-retired sys_test. Removed since spawn_user_elf_smoke
+// exercises the real causticos ABI end-to-end.)
+
+// mmap a fixed-VA, anonymous, eager-backed region in the aspace and
+// hand back the kernel-virtual address of the first backing page so
+// the caller can populate the region from kernel space. Returns 0
+// on any failure (invalid prot, OOM, range overlap).
+fn mmap_user_fixed(a as *vma.Aspace, va as i64, n as i64,
+                   prot as i64, label as *u8, label_len as i32) as i64 {
+    let is i64 as got = vma.mmap_anon(a, va, n * pmm.PAGE_SIZE,
+                                       prot, vma.VMA_FIXED);
+    if (got != va) {
+        serial.print("userspace: mmap_anon fail ", 26);
+        serial.println(label, label_len);
+        return 0;
+    }
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, va);
+    if (phys == 0) {
+        serial.print("userspace: phys lookup fail ", 28);
+        serial.println(label, label_len);
+        return 0;
+    }
+    return pmm.phys_to_virt(phys);
+}
+
+// Walk the user pml4 by hand to read the current counter value. We
+// can't dereference USER_DATA_VA directly because the kernel runs
+// against kas_pml4 here, not the smoke aspace. Instead, ask vmm for
+// the physical address backing USER_DATA_VA and read it via HHDM.
+fn read_user_counter(a as *vma.Aspace) as i64 {
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, USER_DATA_VA);
+    if (phys == 0) { return cast(i64, 0 - 1); }
+    let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+    return p[0];
+}
+
+// ----------------------------------------------------------------
+// SYS_THREAD_SPAWN smoke shellcode. Two entry points in one text page:
+//   main  (offset 0)     : SYS_THREAD_SPAWN(worker_va, 0, stack2_top); spin
+//                          until counter[1] != 0 (the worker started in our
+//                          aspace), then SYS_PROC_EXIT(0).
+//   worker(offset 0x80)  : inc counter[1] forever (never exits).
+// The worker running proves the spawned thread executes in the SAME aspace
+// (shared data page). main's SYS_PROC_EXIT must then FORCE-KILL the still-
+// spinning worker and tear the process down — the exact multi-thread path.
+// Deterministic: main does not exit until the worker has provably run.
+// ----------------------------------------------------------------
+fn write_thread_spawn_shellcode(dst as *u8, worker_va as i64, stack2_top as i64) as void {
+    let is i64 as c with mut = 0;
+    // mov rax, 46 (SYS_THREAD_SPAWN)
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xC7); dst[c+2] = cast(u8, 0xC0);
+    dst[c+3] = cast(u8, 46); dst[c+4] = cast(u8, 0); dst[c+5] = cast(u8, 0); dst[c+6] = cast(u8, 0);
+    c = c + 7;
+    // movabs rdi, worker_va
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xBF); c = c + 2;
+    let is i64 as v1 with mut = worker_va;
+    let is i64 as i1 with mut = 0;
+    while (i1 < 8) { dst[c+i1] = cast(u8, v1 & 0xFF); v1 = v1 >> 8; i1 = i1 + 1; }
+    c = c + 8;
+    // xor esi, esi (arg = 0)
+    dst[c] = cast(u8, 0x31); dst[c+1] = cast(u8, 0xF6); c = c + 2;
+    // movabs rdx, stack2_top
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xBA); c = c + 2;
+    let is i64 as v2 with mut = stack2_top;
+    let is i64 as i2 with mut = 0;
+    while (i2 < 8) { dst[c+i2] = cast(u8, v2 & 0xFF); v2 = v2 >> 8; i2 = i2 + 1; }
+    c = c + 8;
+    // syscall
+    dst[c] = cast(u8, 0x0F); dst[c+1] = cast(u8, 0x05); c = c + 2;
+    // movabs rax, USER_DATA_VA
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xB8); c = c + 2;
+    let is i64 as v3 with mut = USER_DATA_VA;
+    let is i64 as i3 with mut = 0;
+    while (i3 < 8) { dst[c+i3] = cast(u8, v3 & 0xFF); v3 = v3 >> 8; i3 = i3 + 1; }
+    c = c + 8;
+    // .wait: mov rcx, [rax+8] ; test rcx, rcx ; jz .wait  (spin until worker ran)
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0x8B); dst[c+2] = cast(u8, 0x48); dst[c+3] = cast(u8, 0x08);
+    c = c + 4;
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0x85); dst[c+2] = cast(u8, 0xC9); c = c + 3;
+    dst[c] = cast(u8, 0x74); dst[c+1] = cast(u8, 0xF7); c = c + 2;      // jz -9 -> .wait
+    // mov rax, 3 (SYS_PROC_EXIT) ; xor edi,edi ; syscall
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xC7); dst[c+2] = cast(u8, 0xC0);
+    dst[c+3] = cast(u8, 3); dst[c+4] = cast(u8, 0); dst[c+5] = cast(u8, 0); dst[c+6] = cast(u8, 0);
+    c = c + 7;
+    dst[c] = cast(u8, 0x31); dst[c+1] = cast(u8, 0xFF); c = c + 2;
+    dst[c] = cast(u8, 0x0F); dst[c+1] = cast(u8, 0x05); c = c + 2;
+
+    // ---- worker at offset 0x80: inc counter[1] forever ----
+    c = 0x80;
+    // movabs rax, USER_DATA_VA
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xB8); c = c + 2;
+    let is i64 as v4 with mut = USER_DATA_VA;
+    let is i64 as i4 with mut = 0;
+    while (i4 < 8) { dst[c+i4] = cast(u8, v4 & 0xFF); v4 = v4 >> 8; i4 = i4 + 1; }
+    c = c + 8;
+    // .loop: inc qword [rax+8] ; jmp .loop
+    dst[c] = cast(u8, 0x48); dst[c+1] = cast(u8, 0xFF); dst[c+2] = cast(u8, 0x40); dst[c+3] = cast(u8, 0x08);
+    c = c + 4;
+    dst[c] = cast(u8, 0xEB); dst[c+1] = cast(u8, 0xFA); c = c + 2;      // jmp -6 -> .loop
+}
+
+// Read counter[idx] (idx*8 bytes into USER_DATA_VA) from a foreign aspace via
+// the page-table walk + HHDM, the same trick read_user_counter uses.
+fn read_user_counter_at(a as *vma.Aspace, idx as i64) as i64 {
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, USER_DATA_VA);
+    if (phys == 0) { return cast(i64, 0 - 1); }
+    let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+    return p[idx];
+}
+
+// SYS_THREAD_SPAWN end-to-end: a real process whose main thread spawns a worker
+// into its own aspace. Verifies both threads ran (both counters), then reaps
+// the process (proc_wait) to exercise the multi-thread teardown — the aspace is
+// destroyed only once every thread is off-cpu and reaped.
+fn thread_spawn_smoke() as void {
+    serial.println("thread_spawn_smoke: start", 25);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { serial.println("thread_spawn_smoke: aspace FAIL", 31); return; }
+
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE, cast(*u8, "text"), 4);
+    if (text_kv == 0) { serial.println("thread_spawn_smoke: text FAIL", 29); return; }
+    write_thread_spawn_shellcode(cast(*u8, text_kv), USER_TEXT_VA + 0x80,
+                                 USER_STACK2_VA + pmm.PAGE_SIZE - 16);
+
+    let is i64 as data_kv = mmap_user_fixed(a, USER_DATA_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, cast(*u8, "data"), 4);
+    if (data_kv == 0) { serial.println("thread_spawn_smoke: data FAIL", 29); return; }
+    let is *i64 as cnt = cast(*i64, data_kv);
+    cnt[0] = 0; cnt[1] = 0;
+
+    let is i64 as s1 = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                       vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, cast(*u8, "stk1"), 4);
+    let is i64 as s2 = mmap_user_fixed(a, USER_STACK2_VA, 1,
+                                       vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, cast(*u8, "stk2"), 4);
+    if (s1 == 0 || s2 == 0) { serial.println("thread_spawn_smoke: stack FAIL", 30); return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as p = proc.process_create(proc.root_proc, cast(i64, a), 0);
+    if (p == 0) { serial.println("thread_spawn_smoke: proc FAIL", 29); return; }
+    let is i64 as tid = sched.create_user_thread_ex(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)), thread.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a), p, 1);   // suspended
+    proc.attach_main_thread(p, tid);
+    userspace.proc_start(p);
+
+    let is i64 as pid = proc.proc_pid(p);
+    let is i64 as deadline = timer.current_time_ns() + 3000000000;
+    let is i64 as ok with mut = 0;
+    while (timer.current_time_ns() < deadline && ok == 0) {
+        if (read_user_counter_at(a, 1) > 0) { ok = 1; }       // worker ran in our aspace
+        else { sched.sleep_for_ns(50000000); }
+    }
+    if (ok == 0) {
+        serial.print("thread_spawn_smoke: FAIL worker never ran, counter=", 51);
+        util.print_num(read_user_counter_at(a, 1));
+        serial.println("", 0);
+        return;
+    }
+    // Reap the process: proves the multi-thread teardown is clean (both the
+    // worker and main are off-cpu + reaped before aspace_destroy runs).
+    let is i64 as code = userspace.proc_wait(proc.root_proc, pid);
+    if (code == abi.E_AGAIN) { serial.println("thread_spawn_smoke: reap TIMEOUT", 32); return; }
+    serial.println("thread_spawn_smoke: PASS", 24);
+}
+
+// ----------------------------------------------------------------
+// Smoke entry. Builds an aspace, maps text/data/stack, drops a
+// ring-3 thread on top of it, polls the counter, declares pass/fail.
+// ----------------------------------------------------------------
+fn spawn_user_smoke() as void {
+    serial.println("userspace.smoke: start", 22);
+
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.smoke: aspace_create FAIL", 35);
+        return;
+    }
+
+    // Text page: present, ring 3, executable (NX cleared).
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE,
+                                             cast(*u8, "text"), 4);
+    if (text_kv == 0) { return; }
+    write_smoke_shellcode(cast(*u8, text_kv));
+
+    // Data page: writable, NX.
+    let is i64 as data_kv = mmap_user_fixed(a, USER_DATA_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "data"), 4);
+    if (data_kv == 0) { return; }
+    let is *i64 as cnt = cast(*i64, data_kv);
+    cnt[0] = 0;
+
+    // Stack page: writable, NX.
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                              vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                              cast(*u8, "stack"), 5);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)),
+        thread.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
+    );
+
+    serial.print("userspace.smoke: spawned tid=", 29);
+    util.print_num(tid);
+    serial.print(" pml4=", 6);
+    util.print_hex(a.pml4_phys);
+    serial.println("", 0);
+
+    let is i64 as deadline = timer.current_time_ns() + 1000000000;
+    let is i64 as last with mut = 0;
+    while (timer.current_time_ns() < deadline) {
+        let is i64 as cur = read_user_counter(a);
+        if (cur > 0) {
+            serial.print("userspace.smoke: counter=", 25);
+            util.print_num(cur);
+            serial.println(" PASS", 5);
+            return;
+        }
+        last = cur;
+        sched.sleep_for_ns(50000000);
+    }
+    serial.print("userspace.smoke: counter stalled at ", 36);
+    util.print_num(last);
+    serial.println(" FAIL", 5);
+    sched.dump_threads();
+}
+
+// Second smoke: a user thread whose first instruction is ud2 (the
+// canonical "undefined opcode" trap). The kernel must observe a
+// user-mode #UD, kill the thread, and keep running. If the kernel
+// were still treating user faults as panics this whole test would
+// halt the system instead.
+fn spawn_user_fault_smoke() as void {
+    serial.println("userspace.fault_smoke: start", 28);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.fault_smoke: aspace_create FAIL", 41);
+        return;
+    }
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE,
+                                             cast(*u8, "btext"), 5);
+    if (text_kv == 0) { return; }
+    let is *u8 as code = cast(*u8, text_kv);
+    code[0] = cast(u8, 0x0F);                  // ud2 — invalid opcode
+    code[1] = cast(u8, 0x0B);
+
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                              vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                              cast(*u8, "bstack"), 6);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)),
+        thread.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.fault_smoke: spawned tid=", 35);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Give the scheduler a couple of quanta to dispatch + reap.
+    sched.sleep_for_ns(200000000);
+
+    serial.println("userspace.fault_smoke: kernel still alive PASS", 46);
+}
+
+// Strict reserve/commit mechanics, kernel-side (no ring-3 thread). A page is
+// committed IFF its PTE is present — no per-page field. Proves: reserve leaves
+// the page absent; commit makes it present + zeroed; decommit drops it; a
+// recommit re-zeroes a fresh frame (not the stale value); committing outside a
+// reservation is E_INVAL (not a panic); release clears it. Reads/writes the
+// frame through the HHDM (this test aspace isn't the active CR3). Fail-loud.
+fn vma_strict_smoke() as void {
+    serial.println("userspace.strict_smoke: start", 29);
+    let is i32 as ok with mut = cast(i32, 1);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.strict_smoke: aspace FAIL", 35);
+        return;
+    }
+    let is i64 as RV = 0x0000000000440000;
+    let is i64 as pr = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+
+    // 1. reserve → the VMA exists, the PTE is absent (nothing backed).
+    if (vma.reserve(a, RV, 4096, pr, vma.VMA_FIXED) != RV) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RV) != 0) { ok = cast(i32, 0); }
+
+    // 2. commit → present + zeroed; write/read the frame via the HHDM.
+    if (vma.commit(a, RV, 4096, pr) != cast(i32, 0)) { ok = cast(i32, 0); }
+    let is i64 as pte = vmm.pte_lookup(a.pml4_phys, RV);
+    if (pte == 0) { ok = cast(i32, 0); }
+    if ((pte & vmm.PTE_USER) == 0) { ok = cast(i32, 0); }
+    let is i64 as phys = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+    if (phys == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as p = cast(*i64, pmm.phys_to_virt(phys));
+        if (p[0] != 0) { ok = cast(i32, 0); }                    // commit zeroes
+        p[0] = cast(i64, 0xC0FFEE);
+        if (p[0] != cast(i64, 0xC0FFEE)) { ok = cast(i32, 0); }
+    }
+    if (a.committed_bytes != 4096) { ok = cast(i32, 0); }        // accounting: 1 page committed
+
+    // 3. decommit → the PTE is absent again, committed_bytes back to 0.
+    if (vma.decommit(a, RV, 4096) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RV) != 0) { ok = cast(i32, 0); }
+    if (a.committed_bytes != 0) { ok = cast(i32, 0); }
+
+    // 4. recommit → present with a FRESH zero frame (not the stale 0xC0FFEE).
+    if (vma.commit(a, RV, 4096, pr) != cast(i32, 0)) { ok = cast(i32, 0); }
+    let is i64 as phys2 = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+    if (phys2 == 0) { ok = cast(i32, 0); }
+    else {
+        let is *i64 as p2 = cast(*i64, pmm.phys_to_virt(phys2));
+        if (p2[0] != 0) { ok = cast(i32, 0); }                   // fresh zero
+    }
+
+    // 5. commit outside any reservation → E_INVAL, not a panic.
+    if (vma.commit(a, 0x0000000000900000, 4096, pr) != cast(i32, abi.E_INVAL)) { ok = cast(i32, 0); }
+
+    // 6. release → the VMA is gone, the PTE is absent, accounting back to 0.
+    if (vma.munmap(a, RV, 4096) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RV) != 0) { ok = cast(i32, 0); }
+    if (a.committed_bytes != 0) { ok = cast(i32, 0); }
+    if (a.bookkeeping_bytes != 0) { ok = cast(i32, 0); }
+
+    // 7. budget pre-check → tratable E_NOMEM (not a panic). Set a tiny budget,
+    //    reserve a 4-page region, then a commit that overflows the budget must
+    //    return E_NOMEM and back NOTHING (the range stays absent).
+    let is i64 as RB = 0x0000000000480000;
+    a.budget = 3 * 4096;                                         // tiny ceiling
+    if (vma.reserve(a, RB, 4 * 4096, pr, vma.VMA_FIXED) != RB) { ok = cast(i32, 0); }
+    if (vma.commit(a, RB, 4 * 4096, pr) != cast(i32, abi.E_NOMEM)) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, RB) != 0) { ok = cast(i32, 0); }   // nothing backed
+    if (a.committed_bytes != 0) { ok = cast(i32, 0); }
+    a.budget = 0;                                               // lift the ceiling
+    vma.munmap(a, RB, 4 * 4096);
+
+    vma.aspace_destroy(a);
+    if (ok == cast(i32, 1)) { serial.println("userspace.strict_smoke: PASS", 28); }
+    else { pmm.panic("strict_smoke FAIL", 17); }
+}
+
+// Partial-overlap munmap: split in the middle, trim a tail, remove the rest.
+// Proves the real POSIX munmap — only the covered pages decommit, surviving VMA
+// halves keep theirs, and the VMA count / committed accounting track the splits.
+fn vma_split_smoke() as void {
+    serial.println("userspace.split_smoke: start", 28);
+    let is i32 as ok with mut = cast(i32, 1);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { pmm.panic("split_smoke: aspace FAIL", 24); }
+    let is i64 as V = 0x0000000000700000;
+    let is i64 as P = 4096;
+    let is i64 as pr = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+
+    // One 4-page committed region.
+    if (vma.mmap_anon(a, V, 4 * P, pr, vma.VMA_FIXED) != V) { ok = cast(i32, 0); }
+    if (a.vma_count != 1) { ok = cast(i32, 0); }
+    if (a.committed_bytes != 4 * P) { ok = cast(i32, 0); }
+
+    // munmap the MIDDLE page [V+P, V+2P) -> split into [V,V+P) and [V+2P,V+4P).
+    if (vma.munmap(a, V + P, P) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (a.vma_count != 2) { ok = cast(i32, 0); }                          // split made a 2nd VMA
+    if (a.committed_bytes != 3 * P) { ok = cast(i32, 0); }               // one page decommitted
+    if (vmm.pte_lookup(a.pml4_phys, V) == 0) { ok = cast(i32, 0); }       // head still mapped
+    if (vmm.pte_lookup(a.pml4_phys, V + P) != 0) { ok = cast(i32, 0); }   // hole unmapped
+    if (vmm.pte_lookup(a.pml4_phys, V + 2 * P) == 0) { ok = cast(i32, 0); } // tail still mapped
+
+    // munmap the LAST page [V+3P, V+4P) -> trim the tail VMA to [V+2P, V+3P).
+    if (vma.munmap(a, V + 3 * P, P) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (a.vma_count != 2) { ok = cast(i32, 0); }                          // trim, not split
+    if (vmm.pte_lookup(a.pml4_phys, V + 2 * P) == 0) { ok = cast(i32, 0); }
+    if (vmm.pte_lookup(a.pml4_phys, V + 3 * P) != 0) { ok = cast(i32, 0); }
+    if (a.committed_bytes != 2 * P) { ok = cast(i32, 0); }
+
+    // munmap a range covering both survivors -> all gone.
+    if (vma.munmap(a, V, 4 * P) != cast(i32, 0)) { ok = cast(i32, 0); }
+    if (a.vma_count != 0) { ok = cast(i32, 0); }
+    if (a.committed_bytes != 0) { ok = cast(i32, 0); }
+    if (a.bookkeeping_bytes != 0) { ok = cast(i32, 0); }
+
+    vma.aspace_destroy(a);
+    if (ok == cast(i32, 1)) { serial.println("userspace.split_smoke: PASS", 27); }
+    else { pmm.panic("split_smoke FAIL", 16); }
+}
+
+// The VMA index against the plain list it replaced. Reserves (no frames) 1500
+// one-page areas scattered over 24576 pages and some four-page ones, splits,
+// trims and removes a share of them, and after each phase checks the tree's
+// own rules (vma.tree_ok) and that find / overlap / first-fit answer exactly
+// what a walk of the sorted list answers, for addresses on and around every
+// boundary.
+fn _lin_find(a as *vma.Aspace, va as i64) as i64 {
+    let is *vma.Vma as c with mut = a.vma_head;
+    while (cast(i64, c) != 0) {
+        if (va >= c.start && va < c.end) { return cast(i64, c); }
+        c = c.next;
+    }
+    return 0;
+}
+
+fn _lin_overlaps(a as *vma.Aspace, s as i64, e as i64) as i64 {
+    let is *vma.Vma as c with mut = a.vma_head;
+    while (cast(i64, c) != 0) {
+        if (s < c.end && c.start < e) { return 1; }
+        c = c.next;
+    }
+    return 0;
+}
+
+fn _lin_free(a as *vma.Aspace, hint as i64, len as i64) as i64 {
+    let is i64 as start with mut = hint;
+    if (start < 4096) { start = 4096; }
+    let is *vma.Vma as c with mut = a.vma_head;
+    while (cast(i64, c) != 0) {
+        if (start + len <= c.start) { return start; }
+        if (c.end > start) { start = c.end; }
+        c = c.next;
+    }
+    if (start + len <= vma.USER_VA_MAX) { return start; }
+    return 0 - 1;
+}
+
+fn _vma_agree(a as *vma.Aspace) as i32 {
+    if (vma.tree_ok(a) != 1) { serial.println("userspace.vmatree_smoke: tree rules broken", 42); return cast(i32, 0); }
+    let is i64 as P = 4096;
+    let is i64 as va with mut = 0;
+    while (va < 25000 * P) {
+        if (cast(i64, vma.vma_find(a, va)) != _lin_find(a, va)) { return cast(i32, 0); }
+        if (cast(i64, vma.vma_find(a, va + P - 1)) != _lin_find(a, va + P - 1)) { return cast(i32, 0); }
+        let is i64 as span with mut = 1;
+        while (span <= 5) {
+            if (cast(i64, vma.vma_range_overlaps(a, va, va + span * P)) != _lin_overlaps(a, va, va + span * P)) {
+                return cast(i32, 0);
+            }
+            if (vma.vma_find_free_va(a, va, span * P) != _lin_free(a, va, span * P)) { return cast(i32, 0); }
+            span = span + 2;
+        }
+        va = va + 7 * P;
+    }
+    return cast(i32, 1);
+}
+
+fn _vt_fail(what as *u8, n as i64) as i32 {
+    serial.print("userspace.vmatree_smoke: FAIL ", 30);
+    serial.println(what, n);
+    return cast(i32, 0);
+}
+
+fn vma_tree_smoke() as void {
+    serial.println("userspace.vmatree_smoke: start", 30);
+    let is i32 as ok with mut = cast(i32, 1);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { pmm.panic("vmatree_smoke: aspace FAIL", 26); }
+    let is i64 as P = 4096;
+    let is i64 as pr = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+    let is i64 as i with mut = 0;
+    while (i < 1500) {
+        // 7919 is odd, so i -> i*7919 mod 8192 never repeats: 1500 distinct
+        // slots three pages apart, inserted in no particular order.
+        let is i64 as at = P * (1 + ((i * 7919) % 8192) * 3);
+        if (vma.reserve(a, at, P, pr, vma.VMA_FIXED) != at) { ok = _vt_fail("fixed reserve", 13); }
+        i = i + 1;
+    }
+    // Four-page areas above, to split and trim.
+    i = 0;
+    while (i < 40) {
+        let is i64 as at = P * (24700 + i * 6);
+        if (vma.reserve(a, at, 4 * P, pr, vma.VMA_FIXED) != at) { ok = _vt_fail("fixed 4-page reserve", 20); }
+        i = i + 1;
+    }
+    if (a.vma_count != 1540) { ok = _vt_fail("count after reserves", 20); }
+    if (_vma_agree(a) != cast(i32, 1)) { ok = _vt_fail("answers after reserves", 22); }
+    // A fixed area over an existing one (i = 0's, at one page) is refused.
+    if (vma.reserve(a, P, P, pr, vma.VMA_FIXED) != 0 - 1) { ok = _vt_fail("overlap accepted", 16); }
+
+    // Remove every third one-page area, split, trim heads and tails.
+    i = 0;
+    while (i < 1500) {
+        if (i % 3 == 0) { vma.munmap(a, P * (1 + ((i * 7919) % 8192) * 3), P); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 40) {
+        let is i64 as at = P * (24700 + i * 6);
+        if (i % 4 == 0) { vma.munmap(a, at + P, P); }            // split in two
+        else if (i % 4 == 1) { vma.munmap(a, at, P); }           // trim the head
+        else if (i % 4 == 2) { vma.munmap(a, at + 3 * P, P); }   // trim the tail
+        else { vma.munmap(a, at, 4 * P); }                      // remove
+        i = i + 1;
+    }
+    if (_vma_agree(a) != cast(i32, 1)) { ok = _vt_fail("answers after unmaps", 20); }
+
+    // First fit fills the holes it finds, lowest first, and the tree keeps up.
+    i = 0;
+    while (i < 300) {
+        let is i64 as want = _lin_free(a, P, P);
+        if (vma.reserve(a, P, P, pr, 0) != want) { ok = _vt_fail("first fit", 9); }
+        i = i + 1;
+    }
+    if (_vma_agree(a) != cast(i32, 1)) { ok = _vt_fail("answers after first fits", 24); }
+
+    vma.aspace_destroy(a);
+    if (ok == cast(i32, 1)) { serial.println("userspace.vmatree_smoke: PASS", 29); }
+    else { pmm.panic("vmatree_smoke FAIL", 18); }
+}
+
+// A ring-3 child that attaches an INHERITED segment fd (fd 0, handed over via
+// the fdacts handoff at spawn) and exits with the byte it reads from the shared
+// memory. mmap_fd(fd=0) -> ko_mmap -> seg_attach; the kernel wrote a sentinel
+// into the same frames first, so reading it back proves real cross-process
+// shared memory over a segment.
+let is i64 as SEGCH_ENTRY = 0x401000;
+let is i64 as SEGCH_FOFF  = 0x38;
+let is [256]u8 as segch_cse;
+let is i64 as segch_cse_len with mut = 0;
+
+fn build_seg_child_cse() as void {
+    let is *u8 as e = cast(*u8, &segch_cse[0]);
+    let is i64 as z with mut = 0;
+    while (z < 256) { e[z] = cast(u8, 0); z = z + 1; }
+    e[0]=cast(u8,0x43); e[1]=cast(u8,0x53); e[2]=cast(u8,0x54); e[3]=cast(u8,0x5F);   // "CST_"
+    e[4]=cast(u8,2); e[6]=cast(u8,1);
+    uc.write_le_u64(e, 0x08, SEGCH_ENTRY);
+    uc.write_le_u64(e, 0x10, 0x400000);
+    uc.write_le_u32(e, 0x18, 1);
+    uc.write_le_u64(e, 0x20, SEGCH_ENTRY);
+    uc.write_le_u32(e, 0x28, SEGCH_FOFF);
+    uc.write_le_u32(e, 0x30, 0x1000);
+    uc.write_le_u32(e, 0x34, 5);                          // R-X
+
+    let is i64 as c with mut = SEGCH_FOFF;
+    // mmap_fd(fd=0): mov eax,7; xor edi,edi; xor esi,esi; mov edx,0x12; xor r10d,r10d; syscall
+    e[c+0]=cast(u8,0xB8); uc.write_le_u32(e, c+1, 7); c = c + 5;        // mov eax,7 (SYS_MMAP)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xFF); c = c + 2;           // xor edi,edi (hint 0)
+    e[c+0]=cast(u8,0x31); e[c+1]=cast(u8,0xF6); c = c + 2;           // xor esi,esi (len 0)
+    e[c+0]=cast(u8,0xBA); uc.write_le_u32(e, c+1, 0x12); c = c + 5;     // mov edx, WRITE|MMAP_FD
+    e[c+0]=cast(u8,0x45); e[c+1]=cast(u8,0x31); e[c+2]=cast(u8,0xD2); c = c + 3;   // xor r10d,r10d (fd 0)
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;           // syscall -> rax = va
+    // mov rdi, [rax]   (read the shared sentinel)
+    e[c+0]=cast(u8,0x48); e[c+1]=cast(u8,0x8B); e[c+2]=cast(u8,0x38); c = c + 3;
+    // SYS_PROC_EXIT(rdi)
+    e[c+0]=cast(u8,0xB8); uc.write_le_u32(e, c+1, 3); c = c + 5;        // mov eax,3
+    e[c+0]=cast(u8,0x0F); e[c+1]=cast(u8,0x05); c = c + 2;           // syscall
+    uc.write_le_u32(e, 0x2C, c - SEGCH_FOFF);
+    segch_cse_len = c;
+}
+
+// Cross-process segment sharing, end to end: the kernel creates a segment,
+// writes a sentinel into it, hands the fd to a ring-3 child via the fdacts
+// handoff (ko_ref + fd_install — exactly what sys_spawn does), and the child
+// attaches it (mmap_fd) and exits with the byte it read. proc_wait recovers the
+// exit code == the sentinel ⇒ the child saw the kernel's write through shared
+// memory. (One ring-3 program; the fdacts orchestration is the real syscall
+// path, already exercised by fdacts_smoke.)
+fn spawn_seg_share_smoke() as void {
+    serial.println("userspace.seg_share_smoke: start", 32);
+    build_seg_child_cse();
+    let is i32 as ok with mut = cast(i32, 1);
+    let is i64 as SENTINEL = 90;
+
+    let is i64 as seg_ko = segment.seg_create(1, 0);
+    if (seg_ko == 0) { serial.println("userspace.seg_share_smoke: seg FAIL", 35); return; }
+    let is *kobject.KObject as sk = cast(*kobject.KObject, seg_ko);
+    let is *segment.SegPriv as ss = cast(*segment.SegPriv, sk.priv);
+    let is *i64 as fp = cast(*i64, pmm.phys_to_virt(ss.frames));
+    fp[0] = SENTINEL;                                   // kernel writes the shared value
+
+    let is i64 as child = userspace.proc_spawn(proc.root_proc, cast(*u8, &segch_cse[0]), segch_cse_len);
+    if (child == 0) { serial.println("userspace.seg_share_smoke: spawn FAIL", 37); kobject.ko_unref(seg_ko); return; }
+    let is i64 as casp = proc.proc_aspace(child);
+    kobject.ko_ref(seg_ko);                             // fdacts: bump for the child's fd
+    if (vma.fd_install(cast(*vma.Aspace, casp), 0, seg_ko) != 0) { ok = cast(i32, 0); kobject.ko_unref(seg_ko); }
+    userspace.proc_start(child);
+    let is i64 as code = userspace.proc_wait(proc.root_proc, proc.proc_pid(child));
+    if (code != SENTINEL) { ok = cast(i32, 0); }        // child read the kernel's write
+
+    kobject.ko_unref(seg_ko);                           // drop the kernel's ref
+    if (ok == cast(i32, 1)) { serial.println("userspace.seg_share_smoke: PASS", 31); }
+    else { serial.println("userspace.seg_share_smoke: FAIL", 31); }
+}
+
+// A ring-3 thread that stores to a RESERVED-but-uncommitted page must take a
+// fatal #PF (strict policy #0): the kernel logs cr2 = the faulting VA and kills
+// the thread, surviving. Proves "touched uncommitted = bug" end to end.
+fn spawn_user_reserve_fault_smoke() as void {
+    serial.println("userspace.reserve_fault_smoke: start", 36);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.reserve_fault_smoke: aspace FAIL", 42);
+        return;
+    }
+
+    // Text (eager, executable): movabs rax, USER_DATA_VA ; mov qword [rax], 1.
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE,
+                                            cast(*u8, "rtext"), 5);
+    if (text_kv == 0) { return; }
+    let is *u8 as code = cast(*u8, text_kv);
+    let is i64 as c with mut = 0;
+    code[c + 0] = cast(u8, 0x48); code[c + 1] = cast(u8, 0xB8); c = c + 2;   // movabs rax, imm64
+    let is i64 as v with mut = USER_DATA_VA;
+    let is i64 as i with mut = 0;
+    while (i < 8) { code[c + i] = cast(u8, v & 0xFF); v = v >> 8; i = i + 1; }
+    c = c + 8;
+    code[c + 0] = cast(u8, 0x48); code[c + 1] = cast(u8, 0xC7); code[c + 2] = cast(u8, 0x00);   // mov qword [rax], imm32
+    code[c + 3] = cast(u8, 0x01); code[c + 4] = cast(u8, 0x00);
+    code[c + 5] = cast(u8, 0x00); code[c + 6] = cast(u8, 0x00);
+    c = c + 7;
+
+    // Stack (eager).
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "rstk"), 4);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    // Reserve USER_DATA_VA WITHOUT committing — the store below must fault.
+    if (vma.reserve(a, USER_DATA_VA, 4096,
+                    vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX, vma.VMA_FIXED) != USER_DATA_VA) {
+        serial.println("userspace.reserve_fault_smoke: reserve FAIL", 43);
+        return;
+    }
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)),
+        thread.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.reserve_fault_smoke: spawned tid=", 43);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    sched.sleep_for_ns(200000000);
+    serial.println("userspace.reserve_fault_smoke: kernel still alive PASS", 54);
+}
+
+// Emit a little-endian u32 at dst[at..at+4).
+fn emit_u32(dst as *u8, at as i64, v as i64) as void {
+    dst[at + 0] = cast(u8, v & 0xFF);
+    dst[at + 1] = cast(u8, (v >> 8) & 0xFF);
+    dst[at + 2] = cast(u8, (v >> 16) & 0xFF);
+    dst[at + 3] = cast(u8, (v >> 24) & 0xFF);
+}
+
+// Shellcode: SYS_MMAP(rv, 16 pages, WRITE|MMAP_RESERVE) then commit it in two
+// 8-page chunks (SYS_COMMIT), writing a sentinel into each chunk after it is
+// committed, then SYS_PROC_EXIT(0). Mirrors how a userspace allocator reserves
+// a large window and commits chunks on demand — the std/mem reserve+commit path.
+fn write_commit_chunk_shellcode(dst as *u8, rv as i64) as i64 {
+    let is i64 as c with mut = 0;
+    // mov eax, 7 (SYS_MMAP) ; mov edi, rv ; mov esi, 0x10000 ; mov edx, 0x22 ; syscall
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 7); c = c + 4;
+    dst[c] = cast(u8, 0xBF); c = c + 1; emit_u32(dst, c, rv); c = c + 4;
+    dst[c] = cast(u8, 0xBE); c = c + 1; emit_u32(dst, c, 0x10000); c = c + 4;
+    dst[c] = cast(u8, 0xBA); c = c + 1; emit_u32(dst, c, 0x22); c = c + 4;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    // SYS_COMMIT(rv, 0x8000, WRITE)
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 27); c = c + 4;
+    dst[c] = cast(u8, 0xBF); c = c + 1; emit_u32(dst, c, rv); c = c + 4;
+    dst[c] = cast(u8, 0xBE); c = c + 1; emit_u32(dst, c, 0x8000); c = c + 4;
+    dst[c] = cast(u8, 0xBA); c = c + 1; emit_u32(dst, c, 2); c = c + 4;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    // mov dword [rv], 0xAA   (C7 04 25 <rv32> <imm32>)
+    dst[c] = cast(u8, 0xC7); dst[c + 1] = cast(u8, 0x04); dst[c + 2] = cast(u8, 0x25); c = c + 3;
+    emit_u32(dst, c, rv); c = c + 4; emit_u32(dst, c, 0xAA); c = c + 4;
+    // SYS_COMMIT(rv+0x8000, 0x8000, WRITE)
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 27); c = c + 4;
+    dst[c] = cast(u8, 0xBF); c = c + 1; emit_u32(dst, c, rv + 0x8000); c = c + 4;
+    dst[c] = cast(u8, 0xBE); c = c + 1; emit_u32(dst, c, 0x8000); c = c + 4;
+    dst[c] = cast(u8, 0xBA); c = c + 1; emit_u32(dst, c, 2); c = c + 4;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    // mov dword [rv+0x8000], 0xBB
+    dst[c] = cast(u8, 0xC7); dst[c + 1] = cast(u8, 0x04); dst[c + 2] = cast(u8, 0x25); c = c + 3;
+    emit_u32(dst, c, rv + 0x8000); c = c + 4; emit_u32(dst, c, 0xBB); c = c + 4;
+    // mov eax, 3 (SYS_PROC_EXIT) ; xor edi, edi ; syscall
+    dst[c] = cast(u8, 0xB8); c = c + 1; emit_u32(dst, c, 3); c = c + 4;
+    dst[c] = cast(u8, 0x31); dst[c + 1] = cast(u8, 0xFF); c = c + 2;
+    dst[c] = cast(u8, 0x0F); dst[c + 1] = cast(u8, 0x05); c = c + 2;
+    return c;
+}
+
+// A ring-3 program that reserves a 16-page window then commits it in two 8-page
+// chunks, writing a sentinel into each only after committing it. Proves strict
+// reserve+commit-by-chunk end to end from userspace (criterion 3): if a chunk
+// weren't committed, the store would #PF and the sentinel wouldn't land. The
+// cross-repo std/mem (os.reserve/os.commit) rides the same SYS_MMAP+MMAP_RESERVE
+// / SYS_COMMIT path this exercises.
+fn spawn_user_commit_chunk_smoke() as void {
+    serial.println("userspace.commit_smoke: start", 29);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) {
+        serial.println("userspace.commit_smoke: aspace FAIL", 35);
+        return;
+    }
+    let is i64 as RV = 0x0000000000500000;
+
+    let is i64 as text_kv = mmap_user_fixed(a, USER_TEXT_VA, 1,
+                                            vma.PROT_USER | vma.PROT_WRITE,
+                                            cast(*u8, "ctext"), 5);
+    if (text_kv == 0) { return; }
+    write_commit_chunk_shellcode(cast(*u8, text_kv), RV);
+
+    let is i64 as stack_kv = mmap_user_fixed(a, USER_STACK_VA, 1,
+                                             vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX,
+                                             cast(*u8, "cstk"), 4);
+    if (stack_kv == 0) { return; }
+    let is i64 as user_rsp = USER_STACK_VA + pmm.PAGE_SIZE - 16;
+
+    let is i64 as tid = sched.create_user_thread(
+        cast(i64, fn_ptr(userspace.user_thread_trampoline)),
+        thread.QOS_NORMAL,
+        a.pml4_phys, USER_TEXT_VA, user_rsp, cast(i64, a)
+    );
+    serial.print("userspace.commit_smoke: spawned tid=", 36);
+    util.print_num(tid);
+    serial.println("", 0);
+
+    // Read both chunk sentinels via the aspace's phys (the program ran in its
+    // own aspace, not our CR3). 0xAA + 0xBB present => both chunks committed +
+    // written from ring 3.
+    //
+    // POLLED to a deadline, not slept for a fixed 200 ms. The fixed sleep was a
+    // guess about how fast the child gets scheduled, and it was wrong on a q35
+    // machine — more devices to enumerate, a slower boot, and the child had not
+    // reached its second chunk yet. The test then failed for a machine being
+    // slow, which is the kind of failure that teaches people to ignore a suite.
+    // A deadline is honest either way: it passes as soon as the work is done,
+    // and still fails if it never is.
+    let is i64 as ok with mut = 0;
+    let is i64 as deadline = timer.current_time_ns() + 5000000000;    // 5 s, generous
+    while (ok == 0 && timer.current_time_ns() < deadline) {
+        let is i64 as ph0 = vmm.virt_to_phys_walk(a.pml4_phys, RV);
+        let is i64 as ph1 = vmm.virt_to_phys_walk(a.pml4_phys, RV + 0x8000);
+        if (ph0 != 0 && ph1 != 0) {
+            let is *i64 as p0 = cast(*i64, pmm.phys_to_virt(ph0));
+            let is *i64 as p1 = cast(*i64, pmm.phys_to_virt(ph1));
+            if ((p0[0] & 0xFF) == 0xAA && (p1[0] & 0xFF) == 0xBB) { ok = 1; }
+        }
+        if (ok == 0) { sched.sleep_for_ns(20000000); }
+    }
+    vma.aspace_destroy(a);
+    if (ok == 1) { serial.println("userspace.commit_smoke: chunks committed PASS", 45); }
+    else { pmm.panic("commit_smoke FAIL", 17); }
+}

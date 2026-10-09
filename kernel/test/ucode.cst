@@ -1,0 +1,113 @@
+// ucode.cst — the byte writers the ring-3 smokes build their machine code and
+// CSE images with: little-endian stores, and the instruction sequences more
+// than one test emits (stores to the stack, mov reg/imm, syscall, and the
+// parameter block SYS_SPAWN reads).
+
+fn write_le_u64(p as *u8, off as i64, v as i64) as void {
+    let is i64 as x with mut = v;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        p[off + i] = cast(u8, x & 0xFF);
+        x = x >> 8;
+        i = i + 1;
+    }
+}
+
+// Emit `movabs rax, val ; mov [rsp+off], rax` (off in 0..120, disp8).
+fn emit_store_rsp(dst as *u8, c0 as i64, off as i64, val as i64) as i64 {
+    let is i64 as c with mut = c0;
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0xB8); write_le_u64(dst, c+2, val); c = c + 10;
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0x44);
+    dst[c+3]=cast(u8,0x24); dst[c+4]=cast(u8, off); c = c + 5;
+    return c;
+}
+
+// mov <reg>, imm64. reg is the low 3 bits of the destination (rax=0, rcx=1,
+// rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7); REX.W is always set.
+fn emit_mov_reg_imm(dst as *u8, c0 as i64, reg as i64, val as i64) as i64 {
+    let is i64 as c with mut = c0;
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8, 0xB8 + reg); write_le_u64(dst, c+2, val);
+    return c + 10;
+}
+
+fn emit_syscall(dst as *u8, c0 as i64) as i64 {
+    let is i64 as c with mut = c0;
+    dst[c+0]=cast(u8,0x0F); dst[c+1]=cast(u8,0x05);
+    return c + 2;
+}
+
+// Emit the whole "spawn this image that is sitting in my own memory" sequence:
+//
+//   rbx = SYS_SEG_CREATE(pages, 0)          mint shareable RAM behind an fd
+//         SYS_SEG_COPY(rbx, 0, img, len, 1) write the image into it
+//         SYS_SPAWN(&params{SRC_FD, rbx})   spawn from the fd
+//
+// A spawn NAMES its source now — it does not carry bytes — and an image a
+// program built or carries inside itself has no path to name. A segment is the
+// answer: it is a key, so it fits the model, and it is exactly the memfd that
+// Linux makes you create before execveat will run bytes out of memory.
+//
+// The segment fd is deliberately left open in rbx. These are smokes that exit
+// right after; a real program would close it, and the child is unaffected
+// either way (the cache read the image at spawn).
+//
+// rbx is callee-saved across a syscall, which is why the fd lives there.
+// Leaves the pid in rax and restores rsp. All field values are compile-time
+// constants (image/fdacts/argv VAs are fixed in the CSE layout).
+fn emit_spawn_params(dst as *u8, c0 as i64, img_va as i64, img_len as i64,
+                     fdacts_va as i64, n_acts as i64, argv_va as i64,
+                     argc as i64, budget as i64) as i64 {
+    let is i64 as c with mut = c0;
+    let is i64 as pages = (img_len + 4095) / 4096;
+
+    // rbx = seg_create(pages, 0)
+    c = emit_mov_reg_imm(dst, c, 7, pages);                 // rdi = pages
+    c = emit_mov_reg_imm(dst, c, 6, 0);                     // rsi = flags
+    c = emit_mov_reg_imm(dst, c, 0, 29);                    // rax = SYS_SEG_CREATE
+    c = emit_syscall(dst, c);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xC3); c = c + 3;   // mov rbx,rax
+
+    // seg_write(rbx, 0, img_va, img_len)  == SYS_SEG_COPY(..., to_seg=1)
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xDF); c = c + 3;   // mov rdi,rbx
+    c = emit_mov_reg_imm(dst, c, 6, 0);                     // rsi = offset
+    c = emit_mov_reg_imm(dst, c, 2, img_va);                // rdx = buf
+    dst[c+0]=cast(u8,0x49); dst[c+1]=cast(u8,0xBA); write_le_u64(dst, c+2, img_len); c = c + 10;  // mov r10,len
+    dst[c+0]=cast(u8,0x49); dst[c+1]=cast(u8,0xB8); write_le_u64(dst, c+2, 1); c = c + 10;        // mov r8,1 (to_seg)
+    c = emit_mov_reg_imm(dst, c, 0, 31);                    // rax = SYS_SEG_COPY
+    c = emit_syscall(dst, c);
+
+    // spawn(&params) — 9 x i64 on the stack, source = the segment fd in rbx.
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xEC); dst[c+3]=cast(u8,0x50); c = c + 4;  // sub rsp,80
+    c = emit_store_rsp(dst, c, 0,  1);                      // src_kind = SPAWN_SRC_FD
+    // src_fd comes from rbx, not an immediate: mov [rsp+8], rbx
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0x5C);
+    dst[c+3]=cast(u8,0x24); dst[c+4]=cast(u8,8); c = c + 5;
+    c = emit_store_rsp(dst, c, 16, 0);                      // path_uptr
+    c = emit_store_rsp(dst, c, 24, 0);                      // path_len
+    c = emit_store_rsp(dst, c, 32, fdacts_va);
+    c = emit_store_rsp(dst, c, 40, n_acts);
+    c = emit_store_rsp(dst, c, 48, argv_va);
+    c = emit_store_rsp(dst, c, 56, argc);
+    c = emit_store_rsp(dst, c, 64, budget);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x8D); dst[c+2]=cast(u8,0x3C); dst[c+3]=cast(u8,0x24); c = c + 4;  // lea rdi,[rsp]
+    c = emit_mov_reg_imm(dst, c, 0, 14);                    // rax = SYS_SPAWN
+    c = emit_syscall(dst, c);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x83); dst[c+2]=cast(u8,0xC4); dst[c+3]=cast(u8,0x50); c = c + 4;  // add rsp,80
+
+    // Close the segment fd, keeping the pid. The image was read at spawn, so
+    // the child does not need it — and a smoke that leaks a key is a smoke
+    // teaching the wrong pattern to whoever copies it next.
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xC5); c = c + 3;   // mov rbp,rax (save pid)
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xDF); c = c + 3;   // mov rdi,rbx (seg fd)
+    c = emit_mov_reg_imm(dst, c, 0, 12);                    // rax = SYS_CLOSE
+    c = emit_syscall(dst, c);
+    dst[c+0]=cast(u8,0x48); dst[c+1]=cast(u8,0x89); dst[c+2]=cast(u8,0xE8); c = c + 3;   // mov rax,rbp (restore pid)
+    return c;
+}
+
+fn write_le_u32(p as *u8, off as i64, v as i64) as void {
+    p[off + 0] = cast(u8, v & 0xFF);
+    p[off + 1] = cast(u8, (v >> 8)  & 0xFF);
+    p[off + 2] = cast(u8, (v >> 16) & 0xFF);
+    p[off + 3] = cast(u8, (v >> 24) & 0xFF);
+}

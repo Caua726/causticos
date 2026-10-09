@@ -1,0 +1,386 @@
+// qos.cst — the scheduling policy: band weights and EEVDF virtual time
+// (placement, lag, deadlines within a band), the deadline class (EDF with
+// admission control and CBS replenishment), the anti-abuse budget that demotes
+// and promotes a thread between bands, and the capability check on declaring
+// a band. Called by sched.cst with the run-queue lock held where noted.
+
+use "timer.cst" as timer;
+use "rbtree.cst" as rb;
+use "smp.cst" as smp;
+use "lock.cst" as lock;
+use "thread.cst" as thread;
+use "runq.cst" as runq;
+
+fn band_weight(b as i64) as i64 {
+    if (b == thread.QOS_BATCH) { return 512; }
+    if (b == thread.QOS_LAZY)  { return 256; }
+    return thread.BASE_WEIGHT;
+}
+
+// ============================================================
+// EEVDF helpers
+// ============================================================
+
+// band_min_vruntime is a monotonic floor under every vruntime in the band —
+// the base the average below is taken against, so its sums stay small. It
+// follows the smallest vruntime actually queued, never moves backwards, and
+// is advanced past an emptied band by the thread that ran last.
+fn update_band_min_vruntime(cpu as i64, band as i64) as void {
+    let is i64 as n with mut = rb.rb_leftmost(runq.band_root(cpu, band));
+    if (n == 0) { return; }
+    let is i64 as lo with mut = thread.thr_vruntime(rb.nd_val(n));
+    n = rb.rb_next(n);
+    while (n != 0) {
+        let is i64 as v = thread.thr_vruntime(rb.nd_val(n));
+        if (v < lo) { lo = v; }
+        n = rb.rb_next(n);
+    }
+    if (lo > runq.band_min_vruntime(cpu, band)) {
+        runq.band_set_min_vruntime(cpu, band, lo);
+    }
+}
+
+// V: the weighted average vruntime of the band — the virtual time a thread
+// would have if every runnable thread had received exactly its share. EEVDF's
+// eligibility rule is measured against it: a thread is owed cpu (eligible)
+// while its own vruntime is at or behind V.
+//
+// It used to be a per-thread `lag` stored when the thread was last charged
+// and never refreshed while it waited. A thread charged while ahead kept a
+// negative lag frozen in place — ineligible no matter how far behind the
+// others it later fell — and a stream of waking threads (placed with lag 0)
+// could keep it off the cpu indefinitely: the user thread of the in-kernel
+// smoke sat a full second unscheduled on one cpu. Computed here from the
+// live vruntimes at the moment of the decision, nothing can go stale.
+//
+// `extra_tid` (or -1) is a RUNNING thread of this band that is not in the
+// tree — a waker placing a thread must count the one on the cpu. O(n) over the
+// band, which is a handful of threads; schedule() already walks every thread
+// twice per switch.
+fn band_avg_vruntime(cpu as i64, band as i64, extra_tid as i64) as i64 {
+    let is i64 as base = runq.band_min_vruntime(cpu, band);
+    let is i64 as sum_w with mut = 0;
+    let is i64 as sum_wv with mut = 0;
+    let is i64 as n with mut = rb.rb_leftmost(runq.band_root(cpu, band));
+    while (n != 0) {
+        let is i64 as tid = rb.nd_val(n);
+        let is i64 as w = thread.thr_weight(tid);
+        sum_w = sum_w + w;
+        sum_wv = sum_wv + w * (thread.thr_vruntime(tid) - base);
+        n = rb.rb_next(n);
+    }
+    if (extra_tid >= 0) {
+        let is i64 as we = thread.thr_weight(extra_tid);
+        sum_w = sum_w + we;
+        sum_wv = sum_wv + we * (thread.thr_vruntime(extra_tid) - base);
+    }
+    if (sum_w <= 0) { return base; }
+    // Floor division of a possibly negative sum: a thread exactly at the
+    // average must come out eligible, never one ns short of it.
+    let is i64 as q with mut = sum_wv / sum_w;
+    if (sum_wv < 0 && q * sum_w != sum_wv) { q = q - 1; }
+    return base + q;
+}
+
+// The thread RUNNING on `cpu` if it competes in `band` (so it counts toward V
+// while it is out of the tree), else -1. Caller holds that cpu's sched_lock.
+fn running_in_band(cpu as i64, band as i64) as i64 {
+    let is *smp.PerCpu as pc = smp.get_per_cpu(cpu);
+    if (cast(i64, pc) == 0) { return 0 - 1; }
+    let is i64 as cur = pc.current_tid;
+    if (cur < 0) { return 0 - 1; }
+    if (thread.thread_ptr(cur) == 0) { return 0 - 1; }
+    if (thread.thr_state(cur) != thread.THREAD_RUNNING) { return 0 - 1; }
+    if (thread.thr_class(cur) != thread.SCHED_CLASS_QOS) { return 0 - 1; }
+    if (thread.thr_band(cur) != band) { return 0 - 1; }
+    return cur;
+}
+
+// Re-place a thread about to be queued again after time off the run queue,
+// and refresh its deadline to match. Caller holds `cpu`'s sched_lock.
+fn place_requeue(cpu as i64, band as i64, tid as i64) as void {
+    let is i64 as v = place_vruntime(cpu, band, tid, 0);
+    let is i64 as w with mut = thread.thr_weight(tid);
+    let is i64 as sl with mut = thread.thr_slice(tid);
+    if (w <= 0) { w = thread.BASE_WEIGHT; }
+    if (sl <= 0) { sl = thread.DEFAULT_SLICE_NS; }
+    thread.thr_set(tid, 48, v);
+    thread.thr_set(tid, 56, v + sl * thread.BASE_WEIGHT / w);
+}
+
+// Where a thread entering the band (created, or waking) starts. Never ahead of
+// what it already earned — a thread that slept a moment after using more than
+// its share keeps that debt — and never more than SLEEPER_BONUS_NS of credit
+// behind V, so sleeping cannot be banked into a monopoly afterwards.
+fn place_vruntime(cpu as i64, band as i64, tid as i64, fresh as i64) as i64 {
+    let is i64 as v = band_avg_vruntime(cpu, band, running_in_band(cpu, band));
+    if (fresh != 0) { return v; }
+    let is i64 as floor = v - thread.SLEEPER_BONUS_NS;
+    let is i64 as old = thread.thr_vruntime(tid);
+    if (old > floor) { return old; }
+    return floor;
+}
+
+fn update_vruntime(cpu as i64, tid as i64, elapsed_ns as i64) as void {
+    let is i64 as w = thread.thr_weight(tid);
+    let is i64 as delta = elapsed_ns * thread.BASE_WEIGHT / w;
+    let is i64 as new_vrt = thread.thr_vruntime(tid) + delta;
+    thread.thr_set(tid, 48, new_vrt);
+    thread.thr_set(tid, 56, new_vrt + (thread.thr_slice(tid) * thread.BASE_WEIGHT / w));
+    thread.thr_set(tid, 88, thread.thr_runtime(tid) + elapsed_ns);
+    // lag (offset 112) is kept for the monitors only — V - v at the moment of
+    // this charge. The scheduler never decides on it (band_avg_vruntime).
+    thread.thr_set(tid, 112, band_avg_vruntime(cpu, thread.thr_band(tid), tid) - new_vrt);
+}
+
+// ============================================================
+// Deadline class: admission test (§6.1)
+// ============================================================
+
+fn dl_total_utilization(cpu as i64) as i64 {
+    // Returns utilization as percentage (walk this cpu's deadline tree).
+    let is i64 as total with mut = 0;
+    let is i64 as n with mut = rb.rb_leftmost(runq.dl_root(cpu));
+    while (n != 0) {
+        let is i64 as tid = rb.nd_val(n);
+        let is i64 as rt = thread.thr_get(tid, 136);
+        let is i64 as pd = thread.thr_get(tid, 144);
+        if (pd > 0) {
+            total = total + (rt * 100 / pd);
+        }
+        n = rb.rb_next(n);
+    }
+    return total;
+}
+
+fn sched_set_deadline(tid as i64, runtime_ns as i64, period_ns as i64, deadline_ns as i64) as i64 {
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = runq.lock_home(tid, &cpu);
+    // Check capability
+    if ((thread.thr_caps(tid) & thread.CAP_SCHED_REALTIME) == 0) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+        return 0 - 1;  // EPERM
+    }
+    if (runtime_ns > deadline_ns) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+        return 0 - 2;  // EINVAL
+    }
+    if (deadline_ns > period_ns) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+        return 0 - 2;
+    }
+
+    // Admission test against THIS cpu's existing deadline load.
+    let is i64 as new_util = runtime_ns * 100 / period_ns;
+    let is i64 as total = dl_total_utilization(cpu) + new_util;
+    if (total > thread.MAX_DL_UTIL_PCT) {
+        lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+        return 0 - 3;  // EBUSY
+    }
+
+    // Remove from QoS band if currently there
+    if (thread.thr_class(tid) == thread.SCHED_CLASS_QOS) {
+        if (thread.thr_state(tid) == thread.THREAD_RUNNABLE) {
+            runq.runlist_remove(cpu, thread.thr_band(tid), tid);
+        }
+    }
+
+    thread.thr_set(tid, 16, thread.SCHED_CLASS_DEADLINE);
+    thread.thr_set(tid, 136, runtime_ns);
+    thread.thr_set(tid, 144, period_ns);
+    thread.thr_set(tid, 152, deadline_ns);
+    thread.thr_set(tid, 160, runtime_ns);                     // budget_left = full
+    let is i64 as now = timer.current_time_ns();
+    thread.thr_set(tid, 168, now);                            // period_start
+    thread.thr_set(tid, 176, now + deadline_ns);              // abs_deadline
+
+    if (thread.thr_state(tid) == thread.THREAD_RUNNABLE) {
+        runq.dl_insert(cpu, tid);
+    }
+
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+    return 0;
+}
+
+// CBS budget enforcement (§6.3) — called from schedule() with the
+// running cpu's lock held; uses that same cpu for dl_remove.
+fn dl_account(cpu as i64, tid as i64, elapsed_ns as i64) as void {
+    let is i64 as budget = thread.thr_dl_budget(tid) - elapsed_ns;
+    thread.thr_set(tid, 160, budget);
+    thread.thr_set(tid, 88, thread.thr_runtime(tid) + elapsed_ns);
+
+    if (budget <= 0) {
+        // Budget exhausted — suspend until next period.
+        // Drop nr_running so the counter stays in step with replenish
+        // (which adds +1 again).
+        thread.thr_set(tid, 8, thread.THREAD_SUSPENDED);
+        runq.dl_remove(cpu, tid);
+        runq.set_nr_running(cpu, runq.nr_running(cpu) - 1);
+        dlt_link(cpu, tid);
+    }
+}
+
+// The deadline threads that ran out of budget, per cpu, under that cpu's
+// sched_lock: what dl_check_replenish and program_next_tick look at. Both run
+// on every schedule(), and both used to walk every tid ever handed out for
+// these — three table lookups per tid, per context switch, for a list that is
+// almost always empty. Deadline threads are never stolen, so the cpu they were
+// throttled on stays theirs.
+let is [16]i64 as dlt_heads with mut;
+
+fn dlt_link(cpu as i64, tid as i64) as void {
+    if (thread.thr_get(tid, thread.THR_DLT_ON) != 0) { return; }
+    let is i64 as head = dlt_heads[cpu];
+    thread.thr_set(tid, thread.THR_DLT_NEXT, head);
+    thread.thr_set(tid, thread.THR_DLT_PREV, 0);
+    if (head != 0) { thread.thr_set(head - 1, thread.THR_DLT_PREV, tid + 1); }
+    dlt_heads[cpu] = tid + 1;
+    thread.thr_set(tid, thread.THR_DLT_ON, 1);
+}
+
+fn dlt_unlink(cpu as i64, tid as i64) as void {
+    if (thread.thr_get(tid, thread.THR_DLT_ON) == 0) { return; }
+    let is i64 as nx = thread.thr_get(tid, thread.THR_DLT_NEXT);
+    let is i64 as pv = thread.thr_get(tid, thread.THR_DLT_PREV);
+    if (pv != 0) { thread.thr_set(pv - 1, thread.THR_DLT_NEXT, nx); }
+    else { dlt_heads[cpu] = nx; }
+    if (nx != 0) { thread.thr_set(nx - 1, thread.THR_DLT_PREV, pv); }
+    thread.thr_set(tid, thread.THR_DLT_NEXT, 0);
+    thread.thr_set(tid, thread.THR_DLT_PREV, 0);
+    thread.thr_set(tid, thread.THR_DLT_ON, 0);
+}
+
+// Period replenishment (§6.4) — runs under THIS cpu's sched_lock,
+// only replenishes deadline threads whose home is this cpu.
+fn dl_check_replenish(cpu as i64) as void {
+    if (dlt_heads[cpu] == 0) { return; }
+    let is i64 as now = timer.current_time_ns();
+    let is i64 as t with mut = dlt_heads[cpu];
+    while (t != 0) {
+        let is i64 as tid = t - 1;
+        t = thread.thr_get(tid, thread.THR_DLT_NEXT);
+        let is i64 as period_start = thread.thr_get(tid, 168);
+        let is i64 as period_ns = thread.thr_get(tid, 144);
+        if (now >= period_start + period_ns) {
+            // New period: replenish budget
+            dlt_unlink(cpu, tid);
+            thread.thr_set(tid, 168, now);                          // new period_start
+            thread.thr_set(tid, 160, thread.thr_get(tid, 136));            // budget = runtime
+            thread.thr_set(tid, 176, now + thread.thr_get(tid, 152));      // new abs_deadline
+            thread.thr_set(tid, 8, thread.THREAD_RUNNABLE);
+            runq.dl_insert(cpu, tid);
+            runq.set_nr_running(cpu, runq.nr_running(cpu) + 1);
+            smp.this_cpu_set_need_resched(1);
+        }
+    }
+}
+
+// ============================================================
+// Anti-abuse: budget enforcement (§7.3)
+// ============================================================
+
+fn qos_budget_check(cpu as i64, tid as i64, elapsed_ns as i64) as void {
+    let is i64 as band = thread.thr_band(tid);
+    let is i64 as max_pct = runq.bb_get(cpu, band, 0);
+    if (max_pct >= 100) { return; }  // no enforcement for this band
+
+    // Accumulate CPU time
+    thread.thr_set(tid, 184, thread.thr_get(tid, 184) + elapsed_ns);
+
+    let is i64 as now = timer.current_time_ns();
+    let is i64 as window_start = thread.thr_get(tid, 192);
+    let is i64 as window_ns = runq.bb_get(cpu, band, 1);
+    let is i64 as window_age = now - window_start;
+
+    if (window_age >= window_ns) {
+        let is i64 as cpu_used = thread.thr_get(tid, 184);
+        let is i64 as cpu_pct = cpu_used * 100 / window_age;
+
+        if (cpu_pct > max_pct) {
+            let is i64 as violations = thread.thr_get(tid, 200) + 1;
+            thread.thr_set(tid, 200, violations);
+            thread.thr_set(tid, 208, 0);  // reset below_count
+            let is i64 as demo_thresh = runq.bb_get(cpu, band, 3);
+            if (demo_thresh > 0) {
+                if (violations >= demo_thresh) {
+                    demote_thread(cpu, tid);
+                }
+            }
+        } else {
+            let is i64 as below = thread.thr_get(tid, 208) + 1;
+            thread.thr_set(tid, 208, below);
+            thread.thr_set(tid, 200, 0);  // reset violations
+            let is i64 as promo_thresh = runq.bb_get(cpu, band, 2);
+            if (promo_thresh > 0) {
+                if (below >= promo_thresh) {
+                    let is i64 as orig = thread.thr_get(tid, 216);
+                    if (band > orig) {
+                        promote_thread(cpu, tid);
+                    }
+                }
+            }
+        }
+        // Reset window
+        thread.thr_set(tid, 184, 0);
+        thread.thr_set(tid, 192, now);
+    }
+}
+
+fn demote_thread(cpu as i64, tid as i64) as void {
+    let is i64 as band = thread.thr_band(tid);
+    if (band >= thread.QOS_LAZY) { return; }
+    let is i64 as new_band = band + 1;
+    if (thread.thr_state(tid) == thread.THREAD_RUNNABLE) {
+        runq.runlist_remove(cpu, band, tid);
+    }
+    thread.thr_set(tid, 24, new_band);
+    thread.thr_set(tid, 32, band_weight(new_band));
+    thread.thr_set(tid, 200, 0);
+    thread.thr_set(tid, 208, 0);
+    if (thread.thr_state(tid) == thread.THREAD_RUNNABLE) {
+        runq.runlist_insert(cpu, new_band, tid);
+    }
+}
+
+fn promote_thread(cpu as i64, tid as i64) as void {
+    let is i64 as band = thread.thr_band(tid);
+    let is i64 as orig = thread.thr_get(tid, 216);
+    if (band <= orig) { return; }
+    let is i64 as new_band = band - 1;
+    if (thread.thr_state(tid) == thread.THREAD_RUNNABLE) {
+        runq.runlist_remove(cpu, band, tid);
+    }
+    thread.thr_set(tid, 24, new_band);
+    thread.thr_set(tid, 32, band_weight(new_band));
+    thread.thr_set(tid, 200, 0);
+    thread.thr_set(tid, 208, 0);
+    if (thread.thr_state(tid) == thread.THREAD_RUNNABLE) {
+        runq.runlist_insert(cpu, new_band, tid);
+    }
+}
+
+// ============================================================
+// Capability check for band declaration (§7.1, §8)
+// ============================================================
+
+fn sched_set_qos(tid as i64, requested_band as i64) as i64 {
+    let is i64 as cpu with mut = 0;
+    let is i64 as saved_flags = runq.lock_home(tid, &cpu);
+    if (requested_band == thread.QOS_INPUT) {
+        if ((thread.thr_caps(tid) & thread.CAP_SCHED_INPUT) == 0) {
+            lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+            return 0 - 1;
+        }
+    }
+    if (requested_band == thread.QOS_RENDER) {
+        if ((thread.thr_caps(tid) & thread.CAP_SCHED_RENDER) == 0) {
+            lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+            return 0 - 1;
+        }
+    }
+    thread.thr_set(tid, 24, requested_band);
+    thread.thr_set(tid, 216, requested_band);  // original_qos_band
+    thread.thr_set(tid, 32, band_weight(requested_band));
+    lock.release_irq(runq.sched_lock_ptr(cpu), saved_flags);
+    return 0;
+}

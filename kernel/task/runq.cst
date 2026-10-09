@@ -1,0 +1,245 @@
+// runq.cst — the per-cpu run queues: one RQ_SIZE record per cpu (the
+// running and idle thread, counters, the QoS band trees and the deadline
+// tree), its irq-safe lock, and the insert/remove operations on the trees.
+//
+// Every cpu's queue is under its own lock (per_cpu_sched_locks); a wakeup,
+// kill or QoS change on a thread takes its home cpu's lock through
+// lock_home(), which follows a thread that a balancing cpu moved meanwhile.
+
+use "serial.cst" as serial;
+use "pmm.cst" as pmm;
+use "util.cst" as util;
+use "rbtree.cst" as rb;
+use "smp.cst" as smp;
+use "lock.cst" as lock;
+use "thread.cst" as thread;
+
+// ============================================================
+// Per-band data
+// ============================================================
+
+// ============================================================
+// CpuRunqueue (§9) — PER-CPU scheduling state
+// One 512-byte runqueue per cpu, indexed by cpu_id. Each cpu owns
+// its own dl_root / band_roots / band_counts etc, so schedule()
+// only contends on its OWN cpu's sched_lock — no global lock,
+// no cross-cpu cache-line ping-pong on the hot path.
+// ============================================================
+// Layout (512 bytes), per cpu:
+// 0    cpu_id           i64
+// 8    dl_root          i64   (RB tree root)
+// 16   dl_count         i64
+// 24   reserved         i64   (was current_tid; now in PerCpu)
+// 32   reserved         i64   (was current_start_ns; now in PerCpu)
+// 40   reserved         i64   (was idle_tid; now in PerCpu)
+// 48   nr_running       i64   (count for THIS cpu only)
+// 56   nr_switches      i64   (count for THIS cpu only)
+// 64   reserved         i64   (was fpu_owner_tid; now in PerCpu)
+// 72   band_roots[6]    48 bytes
+// 120  band_counts[6]   48 bytes
+// 168  band_min_vrt[6]  48 bytes
+// 216  band_budgets[6]  192 bytes (6 * 4 * i64)
+// 408  reserved         104 bytes
+// Total: 512
+
+let is i64 as RQ_SIZE = 512;
+let is i64 as MAX_CPUS_RQ = 16;
+let is [8192]u8 as per_cpu_rqs;            // 16 cpus * 512 bytes
+
+// Per-cpu sched lock array — schedule on cpu X holds X's lock,
+// wakeup_thread targeting cpu X also holds X's lock. Lock is
+// IRQ-safe: acquire_irq disables IRQs locally then takes the
+// ticket. Two cpus rescheduling in parallel never serialise on
+// each other.
+let is [16]lock.TicketLock as per_cpu_sched_locks with mut;
+
+fn rq_ptr(cpu as i64) as i64 {
+    return cast(i64, &per_cpu_rqs) + cpu * RQ_SIZE;
+}
+
+// Pointer to a specific cpu's sched_lock for lock.acquire_irq.
+fn sched_lock_ptr(cpu as i64) as *lock.TicketLock {
+    return &per_cpu_sched_locks[cpu];
+}
+
+// Lock the run queue `tid` lives on, and say which (cpu_out[0]). A RUNNABLE
+// thread can be pulled to another cpu by an idle one (steal_work), and the move
+// happens under the SOURCE cpu's lock — so after taking the lock we look again,
+// and follow the thread if it left. A RUNNING or sleeping thread never moves,
+// so for those the first try always holds.
+fn lock_home(tid as i64, cpu_out as *i64) as i64 {
+    while (1 == 1) {
+        let is i64 as cpu = thread.thr_home_cpu(tid);
+        let is i64 as f = lock.acquire_irq(sched_lock_ptr(cpu));
+        if (thread.thr_home_cpu(tid) == cpu) {
+            cpu_out[0] = cpu;
+            return f;
+        }
+        lock.release_irq(sched_lock_ptr(cpu), f);
+    }
+    return 0;
+}
+
+// Per-cpu reap list — head tid of a singly-linked list of DEAD threads
+// awaiting resource reclamation, chained via the thread's offset-96 slot
+// (the runlist link, unused once a thread is DEAD and off every runqueue).
+// schedule() enqueues a dying thread here BEFORE switching off it;
+// idle_fn drains and frees AFTER the switch, when the thread's kstack +
+// CR3 are provably no longer in use on this cpu — closing the
+// use-after-free race a parent-side immediate reap would open on SMP.
+// Initialised to -1 (empty) in init().
+let is [16]i64 as cpu_reap_heads with mut;
+fn cpu_reap_head(cpu as i64) as i64            { return cpu_reap_heads[cpu]; }
+fn set_cpu_reap_head(cpu as i64, v as i64) as void { cpu_reap_heads[cpu] = v; }
+
+// This-cpu shorthand: most schedule() / pick_next() / runlist_*
+// callers operate on the cpu currently executing them.
+fn this_cpu() as i64 {
+    let is *smp.PerCpu as p = smp.current_cpu();
+    return p.cpu_id;
+}
+fn this_rq_ptr() as i64 { return rq_ptr(this_cpu()); }
+
+fn rq_get(cpu as i64, off as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + off);
+    return p[0];
+}
+
+fn rq_set(cpu as i64, off as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + off);
+    p[0] = v;
+}
+
+// Named accessors — all take the target cpu_id.
+fn dl_root(cpu as i64) as i64       { return rq_get(cpu, 8); }
+fn dl_root_ptr(cpu as i64) as i64   { return rq_ptr(cpu) + 8; }
+fn dl_count(cpu as i64) as i64      { return rq_get(cpu, 16); }
+fn dl_set_count(cpu as i64, v as i64) as void { rq_set(cpu, 16, v); }
+
+// current_tid / current_start_ns / idle_tid / fpu_owner_tid live
+// in smp.PerCpu (always per-cpu, no need to mirror in the rq).
+fn current_tid() as i64               { return smp.this_cpu_current_tid(); }
+fn set_current_tid(v as i64) as void  { smp.this_cpu_set_current_tid(v); }
+fn current_start_ns() as i64          { return smp.this_cpu_current_start_ns(); }
+fn set_current_start_ns(v as i64) as void { smp.this_cpu_set_current_start_ns(v); }
+fn idle_tid() as i64                  { return smp.this_cpu_idle_tid(); }
+fn set_idle_tid(v as i64) as void     { smp.this_cpu_set_idle_tid(v); }
+fn num_cpus() as i64                  { return smp.num_cpus(); }
+fn cpu_busy(i as i64) as i64          { return smp.cpu_busy(i); }
+fn cpu_busy_ns(i as i64) as i64       { return smp.cpu_busy_ns(i); }
+fn cpu_idle_ns(i as i64) as i64       { return smp.cpu_idle_ns(i); }
+fn fpu_owner_tid() as i64             { return smp.this_cpu_fpu_owner_tid(); }
+fn set_fpu_owner_tid(v as i64) as void { smp.this_cpu_set_fpu_owner_tid(v); }
+
+fn nr_running(cpu as i64) as i64           { return rq_get(cpu, 48); }
+fn set_nr_running(cpu as i64, v as i64) as void { rq_set(cpu, 48, v); }
+fn nr_switches(cpu as i64) as i64          { return rq_get(cpu, 56); }
+fn set_nr_switches(cpu as i64, v as i64) as void { rq_set(cpu, 56, v); }
+
+fn band_root_ptr(cpu as i64, b as i64) as i64 { return rq_ptr(cpu) + 72 + b * 8; }
+fn band_root(cpu as i64, b as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 72);
+    return p[b];
+}
+fn band_count(cpu as i64, b as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 120);
+    return p[b];
+}
+fn band_set_count(cpu as i64, b as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 120);
+    p[b] = v;
+}
+fn band_min_vruntime(cpu as i64, b as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 168);
+    return p[b];
+}
+fn band_set_min_vruntime(cpu as i64, b as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 168);
+    p[b] = v;
+}
+
+// Band budgets (per cpu).
+fn bb_get(cpu as i64, band as i64, field as i64) as i64 {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 216 + band * 32);
+    return p[field];
+}
+fn bb_set(cpu as i64, band as i64, field as i64, v as i64) as void {
+    let is *i64 as p = cast(*i64, rq_ptr(cpu) + 216 + band * 32);
+    p[field] = v;
+}
+
+// ============================================================
+// Run list operations (QoS bands, sorted by virtual_deadline)
+// ============================================================
+
+// RB tree insert/remove for QoS bands (keyed by virtual_deadline).
+// Per-cpu: caller passes cpu_id of the runqueue that owns tid.
+// A thread is in at most one run-queue tree, and only while queued. Each
+// thread records which (THR_QUEUED: band + 1), and both operations check it:
+// a thread queued twice, or removed from a band it is not in, leaves a node
+// behind that pick_next keeps choosing — a "ghost" of a thread that is running
+// elsewhere or is dead, ahead of every real one in lower bands. That is a
+// corrupted run queue, and it stops the kernel saying so, rather than leaving
+// a cpu picking the ghost forever.
+fn runlist_insert(cpu as i64, band as i64, tid as i64) as void {
+    if (thread.thr_get(tid, thread.THR_QUEUED) != 0) {
+        runq_corrupt("inserting a thread that is already queued", 41, cpu, band, tid);
+    }
+    if (band != thread.thr_band(tid)) {
+        runq_corrupt("inserting a thread into a band that is not its own", 50, cpu, band, tid);
+    }
+    rb.rb_insert(band_root_ptr(cpu, band), thread.thr_vdeadline(tid), tid);
+    band_set_count(cpu, band, band_count(cpu, band) + 1);
+    thread.thr_set(tid, thread.THR_QUEUED, band + 1);
+}
+
+fn runlist_remove(cpu as i64, band as i64, tid as i64) as void {
+    let is i64 as node = rb.rb_find_by_val(band_root(cpu, band), tid);
+    if (node == 0) {
+        runq_corrupt("removing a thread from a band it is not in", 42, cpu, band, tid);
+    }
+    rb.rb_delete(band_root_ptr(cpu, band), node);
+    band_set_count(cpu, band, band_count(cpu, band) - 1);
+    thread.thr_set(tid, thread.THR_QUEUED, 0);
+}
+
+fn runq_corrupt(what as *u8, len as i64, cpu as i64, band as i64, tid as i64) as void {
+    serial.print("sched: run queue: ", 18);
+    serial.print(what, len);
+    serial.print(" - cpu=", 7);
+    util.print_num(cpu);
+    serial.print(" band=", 6);
+    util.print_num(band);
+    serial.print(" tid=", 5);
+    util.print_num(tid);
+    serial.print(" queued_band+1=", 15);
+    util.print_num(thread.thr_get(tid, thread.THR_QUEUED));
+    serial.print(" state=", 7);
+    util.print_num(thread.thr_state(tid));
+    serial.print(" home=", 6);
+    util.print_num(thread.thr_home_cpu(tid));
+    serial.print(" this_cpu=", 10);
+    util.print_num(this_cpu());
+    serial.println("", 0);
+    pmm.panic("scheduler run queue corrupted", 29);
+}
+
+// ============================================================
+// Deadline list (sorted by dl_abs_deadline, ascending) — §6.5
+// Reuses next_tid/prev_tid fields (a thread is in ONE list at a time)
+// ============================================================
+
+// RB tree insert/remove for deadline class (keyed by dl_abs_deadline).
+// Per-cpu: caller passes cpu_id of the runqueue.
+fn dl_insert(cpu as i64, tid as i64) as void {
+    rb.rb_insert(dl_root_ptr(cpu), thread.thr_dl_abs_dl(tid), tid);
+    dl_set_count(cpu, dl_count(cpu) + 1);
+}
+
+fn dl_remove(cpu as i64, tid as i64) as void {
+    let is i64 as node = rb.rb_find_by_val(dl_root(cpu), tid);
+    if (node != 0) {
+        rb.rb_delete(dl_root_ptr(cpu), node);
+        dl_set_count(cpu, dl_count(cpu) - 1);
+    }
+}

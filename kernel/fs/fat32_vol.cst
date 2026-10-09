@@ -1,0 +1,821 @@
+// fat32_vol.cst — a FAT32 volume: the BPB read and validated at mount and
+// the layout derived from it, the FAT itself (next-cluster reads, entry
+// writes through a one-sector cache, allocation and freeing), cluster chains
+// and the cursors over them, whole-cluster I/O, and FSInfo's record of the
+// free-cluster count.
+//
+// Reference: Microsoft FAT Specification (FATGEN103), section BPB/BS.
+// We support bytes_per_sector in {512, 1024, 2048, 4096}, sectors_per_
+// cluster that is a power of two in [1, 128], num_fats in {1, 2}, and
+// require the "FAT32   " fs_type string + 0x55AA signature.
+//
+// No heap dependency: a single static Fat32Volume slot is the V1 mount
+// table. Adding more mounts means promoting to a linked list.
+
+use "storage.cst" as storage;
+use "serial.cst"  as serial;
+use "util.cst"    as util;
+use "pmm.cst"     as pmm;
+use "vfs.cst"     as vfs;
+use "abi.cst"     as abi;
+
+// ============================================================
+// BPB offsets (see FAT spec). Bytes unless suffixed _w (u16) or _d (u32).
+// ============================================================
+let is i64 as BPB_JMP           = 0x00;   // 3 bytes: short jump + nop
+let is i64 as BPB_OEM           = 0x03;   // 8 bytes
+let is i64 as BPB_BYTES_PER_SEC = 0x0B;   // u16
+let is i64 as BPB_SEC_PER_CLUS  = 0x0D;   // u8
+let is i64 as BPB_RSVD_SEC_CNT  = 0x0E;   // u16
+let is i64 as BPB_NUM_FATS      = 0x10;   // u8
+let is i64 as BPB_ROOT_ENT_CNT  = 0x11;   // u16 (must be 0 for FAT32)
+let is i64 as BPB_TOT_SEC_16    = 0x13;   // u16 (must be 0 for FAT32)
+let is i64 as BPB_MEDIA         = 0x15;   // u8
+let is i64 as BPB_FAT_SZ_16     = 0x16;   // u16 (must be 0 for FAT32)
+let is i64 as BPB_TOT_SEC_32    = 0x20;   // u32
+let is i64 as BPB_FAT_SZ_32     = 0x24;   // u32
+let is i64 as BPB_EXT_FLAGS     = 0x28;   // u16
+let is i64 as BPB_FS_VER        = 0x2A;   // u16 (must be 0)
+let is i64 as BPB_ROOT_CLUS     = 0x2C;   // u32
+let is i64 as BPB_FS_INFO       = 0x30;   // u16
+let is i64 as BPB_BK_BOOT       = 0x32;   // u16
+let is i64 as BPB_VOL_ID        = 0x43;   // u32
+let is i64 as BPB_VOL_LAB       = 0x47;   // 11 bytes
+let is i64 as BPB_FS_TYPE       = 0x52;   // 8 bytes, "FAT32   "
+let is i64 as BPB_SIG           = 0x1FE;  // u16, must be 0xAA55
+
+struct Fat32Volume {
+    dev as *storage.StorageDevice;
+
+    // Raw BPB values (as i64 for consistent arithmetic).
+    bytes_per_sector  as i64;
+    sectors_per_clus  as i64;
+    reserved_sectors  as i64;
+    num_fats          as i64;
+    fat_size_sectors  as i64;   // BPB_FAT_SZ_32
+    total_sectors     as i64;   // BPB_TOT_SEC_32
+    root_cluster      as i64;
+    fs_info_sector    as i64;
+    volume_id         as i64;
+    volume_label      as [12]u8;   // zero-terminated copy of BPB_VOL_LAB
+
+    // Derived.
+    cluster_size_bytes as i64;
+    fat_start_lba      as i64;   // reserved_sectors
+    data_start_lba     as i64;   // reserved + num_fats * fat_size
+    cluster_count      as i64;   // (total - data_start) / sectors_per_clus
+    // Allocation state, kept by cluster_alloc/cluster_free.
+    alloc_next         as i64;   // where the next free-cluster search starts
+    free_clusters      as i64;   // FAT entries == 0; -1 until first counted
+    // BPB_EXT_FLAGS: which FAT is read, and whether writes go to every copy.
+    fat_active_lba     as i64;   // first sector of the FAT that is read
+    fat_mirror         as i64;   // 1 = every FAT copy is written (the usual case)
+    is_mounted         as i32;   // 1 if valid, 0 otherwise
+}
+
+// Single static mount slot (V1).
+let is Fat32Volume as vol;
+
+// Scratch buffer for sector reads. AHCI requires DMA-safe memory in the
+// HHDM region (not kernel .bss), so we lazily allocate a page via pmm
+// on first use. One 4KB page fits a max-size sector (4096B).
+// Two dedicated scratch pages: one for FAT sector reads, one for the
+// data cluster currently being consumed. Separating them means FAT
+// lookups during a file read don't clobber the payload buffer.
+let is i64 as scratch_virt     with mut = 0;
+let is i64 as clus_scratch_virt with mut = 0;
+
+// Single-sector FAT cache. fat_read hit the disk on EVERY chain step, so a
+// 1000-cluster file walk was 1000 disk reads — and chain walks re-run per
+// write flush. One FAT sector holds 128 entries (= 128 consecutive clusters),
+// so caching it serves a sequential walk almost entirely from RAM (~128x fewer
+// FAT reads).
+//
+// The cached sector is the truth: fat_write changes the entry in it and
+// writes the sector out to every FAT copy from there. It used to read and
+// rewrite each copy's sector for every entry and then drop the cache, so the
+// next fat_read missed — ten disk operations to append one cluster to a file.
+// Inside a batch (fat_batch_begin/end) a changed sector is written out once,
+// when the cache moves to another sector or the batch ends, instead of once
+// per entry. See fat_batch_begin for when that is safe.
+let is i64 as fat_cache_virt  with mut = 0;
+let is i64 as fat_cache_sec   with mut = 0 - 1;   // sector index within a FAT; -1 = empty
+let is i64 as fat_cache_dirty with mut = 0;       // changed since it was last written out
+let is i64 as fat_batch       with mut = 0;       // open fat_batch_begin()s
+
+fn alloc_dma_page() as i64 {
+    let is i32 as pfn = pmm.alloc_pages(
+        pmm.ALLOC_BELOW_4G | pmm.ALLOC_ZERO,
+        cast(i32, 0),
+        pmm.USAGE_KERNEL,
+        cast(i32, 0));
+    if (pfn == pmm.PFN_NONE) { return 0; }
+    return pmm.pfn_to_phys(pfn) + pmm.hhdm;
+}
+
+// Bytes of resident FAT32 driver scratch/cache RAM: the FAT-sector read buffer,
+// the data-cluster buffer, and the single-sector FAT cache — three 4 KiB DMA
+// pages, allocated lazily and held for the life of the mount. (Per-op transient
+// DMA pages in mount/readdir are freed before return and don't count.) Reported
+// in the kernel breakdown so the FAT cache's footprint is named, not hidden.
+fn dma_cache_bytes() as i64 {
+    let is i64 as n with mut = 0;
+    if (scratch_virt != 0)      { n = n + 1; }
+    if (clus_scratch_virt != 0) { n = n + 1; }
+    if (fat_cache_virt != 0)    { n = n + 1; }
+    return n * pmm.PAGE_SIZE;
+}
+
+fn ensure_scratch() as i32 {
+    if (scratch_virt == 0) {
+        scratch_virt = alloc_dma_page();
+        if (scratch_virt == 0) { return cast(i32, 0 - 1); }
+    }
+    if (clus_scratch_virt == 0) {
+        clus_scratch_virt = alloc_dma_page();
+        if (clus_scratch_virt == 0) { return cast(i32, 0 - 1); }
+    }
+    if (fat_cache_virt == 0) {
+        fat_cache_virt = alloc_dma_page();
+        if (fat_cache_virt == 0) { return cast(i32, 0 - 1); }
+        fat_cache_sec = 0 - 1;
+        fat_cache_dirty = 0;
+    }
+    return 0;
+}
+
+// ============================================================
+// Little-endian readers from a byte buffer. FAT32 is defined LE.
+// ============================================================
+
+fn read_u16(buf as *u8, off as i64) as i64 {
+    return cast(i64, buf[off]) | (cast(i64, buf[off + 1]) << 8);
+}
+
+fn read_u32(buf as *u8, off as i64) as i64 {
+    return cast(i64, buf[off])
+         | (cast(i64, buf[off + 1]) << 8)
+         | (cast(i64, buf[off + 2]) << 16)
+         | (cast(i64, buf[off + 3]) << 24);
+}
+
+// Validate bytes_per_sector is one of {512, 1024, 2048, 4096} (spec).
+fn is_valid_sector_size(n as i64) as i32 {
+    if (n == 512)  { return 1; }
+    if (n == 1024) { return 1; }
+    if (n == 2048) { return 1; }
+    if (n == 4096) { return 1; }
+    return 0;
+}
+
+// Validate sectors_per_cluster is a power of two in [1, 128].
+fn is_valid_spc(n as i64) as i32 {
+    if (n < 1)   { return 0; }
+    if (n > 128) { return 0; }
+    if ((n & (n - 1)) != 0) { return 0; }
+    return 1;
+}
+
+// ============================================================
+// mount — read BPB, validate, derive layout, publish volume.
+// Returns null on any validation failure; logs the reason.
+// ============================================================
+
+fn mount(dev as *storage.StorageDevice) as *Fat32Volume {
+    if (cast(i64, dev) == 0) {
+        serial.println("fat32: mount null dev", 21);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Read sector 0. dev.sector_size may be >512, so we read one sector
+    // into the 4KB scratch (always big enough).
+    let is i64 as ss = storage.sector_size(dev);
+    if (ss < 512 || ss > 4096) {
+        serial.print("fat32: bad dev sector_size=", 27);
+        util.print_num(ss);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    if (ensure_scratch() != 0) {
+        serial.println("fat32: scratch alloc failed", 27);
+        return cast(*Fat32Volume, 0);
+    }
+    let is *u8 as buf = cast(*u8, scratch_virt);
+    let is i32 as rc = storage.read_lba(dev, 0, 1, buf);
+    if (rc != 0) {
+        serial.print("fat32: read sector 0 failed rc=", 31);
+        util.print_num(cast(i64, rc));
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Signature check first — cheapest rejection.
+    let is i64 as sig = read_u16(buf, BPB_SIG);
+    if (sig != 0xAA55) {
+        serial.print("fat32: bad signature 0x", 23);
+        util.print_hex(sig);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // fs_type string must match "FAT32   " (8 bytes).
+    let is i64 as fs0 = cast(i64, buf[BPB_FS_TYPE + 0]);
+    let is i64 as fs1 = cast(i64, buf[BPB_FS_TYPE + 1]);
+    let is i64 as fs2 = cast(i64, buf[BPB_FS_TYPE + 2]);
+    let is i64 as fs3 = cast(i64, buf[BPB_FS_TYPE + 3]);
+    let is i64 as fs4 = cast(i64, buf[BPB_FS_TYPE + 4]);
+    if (fs0 != 70 || fs1 != 65 || fs2 != 84 || fs3 != 51 || fs4 != 50) {
+        serial.println("fat32: fs_type not FAT32", 24);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Pull raw BPB fields.
+    let is i64 as bps   = read_u16(buf, BPB_BYTES_PER_SEC);
+    let is i64 as spc   = cast(i64, buf[BPB_SEC_PER_CLUS]);
+    let is i64 as rsvd  = read_u16(buf, BPB_RSVD_SEC_CNT);
+    let is i64 as nfats = cast(i64, buf[BPB_NUM_FATS]);
+    let is i64 as re16  = read_u16(buf, BPB_ROOT_ENT_CNT);
+    let is i64 as ts16  = read_u16(buf, BPB_TOT_SEC_16);
+    let is i64 as fs16  = read_u16(buf, BPB_FAT_SZ_16);
+    let is i64 as ts32  = read_u32(buf, BPB_TOT_SEC_32);
+    let is i64 as fs32  = read_u32(buf, BPB_FAT_SZ_32);
+    let is i64 as rclus = read_u32(buf, BPB_ROOT_CLUS);
+    let is i64 as fsver = read_u16(buf, BPB_FS_VER);
+    let is i64 as fsi   = read_u16(buf, BPB_FS_INFO);
+
+    // Validations per FAT32 spec.
+    if (is_valid_sector_size(bps) == 0) {
+        serial.print("fat32: bad bytes_per_sector=", 28);
+        util.print_num(bps); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    if (bps != ss) {
+        // BPB must agree with the physical device sector size.
+        serial.print("fat32: BPB bps=", 15);
+        util.print_num(bps);
+        serial.print(" != dev ss=", 11);
+        util.print_num(ss);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    if (is_valid_spc(spc) == 0) {
+        serial.print("fat32: bad sectors_per_clus=", 28);
+        util.print_num(spc); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    if (rsvd < 1) {
+        serial.println("fat32: reserved_sectors<1", 25);
+        return cast(*Fat32Volume, 0);
+    }
+    if (nfats < 1 || nfats > 2) {
+        serial.print("fat32: bad num_fats=", 20);
+        util.print_num(nfats); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+    // FAT32 requires these to be zero.
+    if (re16 != 0) { serial.println("fat32: root_ent_cnt!=0", 22); return cast(*Fat32Volume, 0); }
+    if (ts16 != 0) { serial.println("fat32: tot_sec_16!=0",   20); return cast(*Fat32Volume, 0); }
+    if (fs16 != 0) { serial.println("fat32: fat_sz_16!=0",    19); return cast(*Fat32Volume, 0); }
+    if (fsver != 0) { serial.println("fat32: fs_ver!=0",      16); return cast(*Fat32Volume, 0); }
+    if (fs32 < 1) { serial.println("fat32: fat_sz_32<1",      18); return cast(*Fat32Volume, 0); }
+    if (ts32 < 1) { serial.println("fat32: tot_sec_32<1",     19); return cast(*Fat32Volume, 0); }
+    if (rclus < 2) {
+        serial.print("fat32: root_clus<2 =", 20);
+        util.print_num(rclus); serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Derived layout.
+    let is i64 as fat_lba   = rsvd;
+    let is i64 as data_lba  = rsvd + nfats * fs32;
+    if (data_lba >= ts32) {
+        serial.println("fat32: data_lba past end", 24);
+        return cast(*Fat32Volume, 0);
+    }
+    let is i64 as data_secs = ts32 - data_lba;
+    let is i64 as ccount    = data_secs / spc;
+    // FAT32 spec: cluster_count must be >= 65525 to be a valid FAT32.
+    if (ccount < 65525) {
+        serial.print("fat32: cluster_count=", 21);
+        util.print_num(ccount);
+        serial.println(" < 65525 (not FAT32)", 20);
+        return cast(*Fat32Volume, 0);
+    }
+    if (rclus >= ccount + 2) {
+        serial.println("fat32: root_clus out of range", 29);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // Cross-check device has enough sectors for the volume.
+    let is i64 as devsecs = storage.sector_count(dev);
+    if (devsecs > 0 && ts32 > devsecs) {
+        serial.print("fat32: BPB tot_sec=", 19);
+        util.print_num(ts32);
+        serial.print(" > dev=", 7);
+        util.print_num(devsecs);
+        serial.println("", 0);
+        return cast(*Fat32Volume, 0);
+    }
+
+    // BPB_EXT_FLAGS bit 7 set: the FATs are not mirrored, and only the one in
+    // bits 0-3 is in use — read it, and write only it.
+    let is i64 as extf = read_u16(buf, BPB_EXT_FLAGS);
+    let is i64 as active_fat with mut = 0;
+    let is i64 as mirror with mut = 1;
+    if ((extf & 0x80) != 0) {
+        mirror = 0;
+        active_fat = extf & 0x0F;
+        if (active_fat >= nfats) {
+            serial.print("fat32: active FAT ", 18);
+            util.print_num(active_fat);
+            serial.println(" out of range", 13);
+            return cast(*Fat32Volume, 0);
+        }
+    }
+
+    // Commit to volume struct.
+    vol.dev                = dev;
+    vol.bytes_per_sector   = bps;
+    vol.sectors_per_clus   = spc;
+    vol.reserved_sectors   = rsvd;
+    vol.num_fats           = nfats;
+    vol.fat_size_sectors   = fs32;
+    vol.total_sectors      = ts32;
+    vol.root_cluster       = rclus;
+    vol.fs_info_sector     = fsi;
+    vol.volume_id          = read_u32(buf, BPB_VOL_ID);
+    vol.cluster_size_bytes = bps * spc;
+    vol.fat_start_lba      = fat_lba;
+    vol.data_start_lba     = data_lba;
+    vol.cluster_count      = ccount;
+    vol.fat_active_lba     = fat_lba + active_fat * fs32;
+    vol.fat_mirror         = mirror;
+    fat_cache_sec = 0 - 1;      // whatever it held belongs to no mounted volume
+    fat_cache_dirty = 0;
+
+    // Copy volume label (11 bytes, space-padded in BPB).
+    let is i64 as i with mut = 0;
+    while (i < 11) {
+        vol.volume_label[i] = buf[BPB_VOL_LAB + i];
+        i = i + 1;
+    }
+    vol.volume_label[11] = cast(u8, 0);
+    vol.alloc_next = 3;
+    vol.free_clusters = count_free(&vol);     // -1 if the FAT could not be read
+    vol.is_mounted = 1;
+
+    // Log concise summary.
+    serial.print("fat32: mounted ", 15);
+    let is i64 as j with mut = 0;
+    while (j < 11) {
+        let is u8 as c = vol.volume_label[j];
+        if (c == cast(u8, 0)) { j = 11; }
+        else { serial.putc(cast(i64, c)); j = j + 1; }
+    }
+    serial.print(" bps=", 5);   util.print_num(bps);
+    serial.print(" spc=", 5);   util.print_num(spc);
+    serial.print(" rsvd=", 6);  util.print_num(rsvd);
+    serial.print(" fatsz=", 7); util.print_num(fs32);
+    serial.print(" clusters=", 10); util.print_num(ccount);
+    serial.print(" root=", 6);  util.print_num(rclus);
+    serial.println("", 0);
+
+    return &vol;
+}
+
+// ============================================================
+// Accessors / helpers for later phases.
+// ============================================================
+
+fn head() as *Fat32Volume {
+    if (vol.is_mounted == 0) { return cast(*Fat32Volume, 0); }
+    return &vol;
+}
+
+// Convert a cluster number (>=2) to its absolute LBA on the device.
+// Returns -1 if cluster is out of range.
+fn cluster_to_lba(v as *Fat32Volume, cluster as i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (cluster < 2) { return 0 - 1; }
+    if (cluster >= v.cluster_count + 2) { return 0 - 1; }
+    return v.data_start_lba + (cluster - 2) * v.sectors_per_clus;
+}
+
+// ============================================================
+// FAT entry walk — read next-cluster value for `cluster`.
+// Returns the raw 28-bit entry value. Callers interpret:
+//   0             -> free (unexpected during walk)
+//   2..0x0FFFFFEF -> next cluster
+//   0x0FFFFFF7    -> bad cluster
+//   0x0FFFFFF8..  -> EOF
+// Returns -1 on I/O failure.
+// ============================================================
+
+fn fat_read(v as *Fat32Volume, cluster as i64) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    if (cluster < 2) { return 0 - 1; }
+    if (cluster >= v.cluster_count + 2) { return 0 - 1; }
+    let is i64 as byte_off = cluster * 4;
+    if (fat_cache_load(v, byte_off / v.bytes_per_sector) != 0) { return 0 - 1; }
+    return read_u32(cast(*u8, fat_cache_virt), byte_off % v.bytes_per_sector) & 0x0FFFFFFF;
+}
+
+// Bring FAT sector `sec` (an index within the FAT) into the cache, writing
+// the sector it holds out first if that one has changed. 0, or -1 on I/O.
+fn fat_cache_load(v as *Fat32Volume, sec as i64) as i32 {
+    if (sec == fat_cache_sec) { return 0; }
+    if (fat_cache_writeback(v) != 0) { return cast(i32, 0 - 1); }
+    if (storage.read_lba(v.dev, v.fat_active_lba + sec, 1, cast(*u8, fat_cache_virt)) != 0) {
+        fat_cache_sec = 0 - 1;
+        return cast(i32, 0 - 1);
+    }
+    fat_cache_sec = sec;
+    return 0;
+}
+
+// The cached sector to the FAT — to every copy when they are mirrored. It
+// stays dirty if a write fails, so a later write-out tries again.
+fn fat_cache_writeback(v as *Fat32Volume) as i32 {
+    if (fat_cache_dirty == 0) { return 0; }
+    let is *u8 as buf = cast(*u8, fat_cache_virt);
+    if (v.fat_mirror == 0) {
+        if (storage.write_lba(v.dev, v.fat_active_lba + fat_cache_sec, 1, buf) != 0) {
+            return cast(i32, 0 - 1);
+        }
+    } else {
+        let is i64 as fi with mut = 0;
+        while (fi < v.num_fats) {
+            let is i64 as lba = v.fat_start_lba + fi * v.fat_size_sectors + fat_cache_sec;
+            if (storage.write_lba(v.dev, lba, 1, buf) != 0) { return cast(i32, 0 - 1); }
+            fi = fi + 1;
+        }
+    }
+    fat_cache_dirty = 0;
+    return 0;
+}
+
+// A batch defers FAT write-out to its end. Only for a path that writes no
+// directory entry until the batch is over: a FAT change must be on disk
+// before any directory entry that depends on it, or a crash leaves an entry
+// naming clusters the disk still calls free. The data paths qualify —
+// file_write_at, file_truncate, chain_free change chains, and their callers
+// update the directory entry after they return. Batches nest. Caller holds
+// fs_lock, as for everything here.
+fn fat_batch_begin() as void {
+    fat_batch = fat_batch + 1;
+}
+
+// 0, or -1 if the write-out failed.
+fn fat_batch_end(v as *Fat32Volume) as i32 {
+    fat_batch = fat_batch - 1;
+    if (fat_batch > 0) { return 0; }
+    fat_batch = 0;
+    return fat_cache_writeback(v);
+}
+
+fn cluster_is_eof(entry as i64) as i32 {
+    if (entry >= 0x0FFFFFF8 && entry <= 0x0FFFFFFF) { return 1; }
+    return 0;
+}
+
+// Read one full cluster into the provided HHDM-resident buffer.
+// buf must hold at least cluster_size_bytes. Returns 0 on success.
+fn cluster_read(v as *Fat32Volume, cluster as i64, buf as *u8) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as lba = cluster_to_lba(v, cluster);
+    if (lba < 0) { return cast(i32, 0 - 2); }
+    return storage.read_lba(v.dev, lba, v.sectors_per_clus, buf);
+}
+
+// ============================================================
+// FAT write side — update a single 28-bit FAT entry, preserving the upper 4
+// reserved bits, in the cached sector; written out to the FAT(s) now, or at
+// the end of the batch it is part of.
+// ============================================================
+
+fn fat_write(v as *Fat32Volume, cluster as i64, value as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    if (cluster < 0) { return cast(i32, 0 - 1); }
+    if (cluster >= v.cluster_count + 2) { return cast(i32, 0 - 1); }
+
+    let is i64 as byte_off = cluster * 4;
+    if (fat_cache_load(v, byte_off / v.bytes_per_sector) != 0) { return cast(i32, 0 - 2); }
+    let is *u8 as buf = cast(*u8, fat_cache_virt);
+    let is i64 as b_in_sec = byte_off % v.bytes_per_sector;
+    let is i64 as old = read_u32(buf, b_in_sec);
+    let is i64 as new_val = (old & 0xF0000000) | (value & 0x0FFFFFFF);
+    buf[b_in_sec]     = cast(u8, new_val & 0xFF);
+    buf[b_in_sec + 1] = cast(u8, (new_val >> 8) & 0xFF);
+    buf[b_in_sec + 2] = cast(u8, (new_val >> 16) & 0xFF);
+    buf[b_in_sec + 3] = cast(u8, (new_val >> 24) & 0xFF);
+    fat_cache_dirty = 1;
+    if (fat_batch == 0) {
+        if (fat_cache_writeback(v) != 0) { return cast(i32, 0 - 3); }
+    }
+    return 0;
+}
+
+// A free FAT entry, marked end-of-chain so a second alloc cannot pick it
+// before the caller links it. Returns the cluster number, -1 on ENOSPC.
+//
+// The search resumes where the last one stopped (wrapping once), the way
+// FAT's own FSInfo "next free" hint works. It used to start at cluster 3
+// every time, so allocation cost grew with every cluster in use: a file
+// growing a cluster at a time scanned past everything before it, again, for
+// each cluster — quadratic in the size of the disk's contents.
+fn cluster_alloc(v as *Fat32Volume) as i64 {
+    if (cast(i64, v) == 0) { return 0 - 1; }
+    let is i64 as max_c = v.cluster_count + 2;
+    let is i64 as c with mut = v.alloc_next;
+    if (c < 3 || c >= max_c) { c = 3; }
+    let is i64 as looked with mut = 0;
+    while (looked < max_c - 3) {
+        let is i64 as entry = fat_read(v, c);
+        if (entry == 0) {
+            if (fat_write(v, c, 0x0FFFFFFF) != 0) { return 0 - 2; }
+            v.alloc_next = c + 1;
+            if (v.free_clusters > 0) { v.free_clusters = v.free_clusters - 1; }
+            fsinfo_dirty = 1;
+            return c;
+        }
+        if (entry < 0) { return 0 - 2; }   // I/O
+        c = c + 1;
+        if (c >= max_c) { c = 3; }
+        looked = looked + 1;
+    }
+    return 0 - 1;
+}
+
+// Freeing a cluster can make any open file's chain cursor (FileHint) point
+// at a cluster that is no longer that file's, so it bumps chain_gen and every
+// cursor taken before it is ignored.
+fn cluster_free(v as *Fat32Volume, cluster as i64) as i32 {
+    let is i32 as rc = fat_write(v, cluster, 0);
+    if (rc == 0) {
+        if (v.free_clusters >= 0) { v.free_clusters = v.free_clusters + 1; }
+        chain_gen = chain_gen + 1;
+        fsinfo_dirty = 1;
+    }
+    return rc;
+}
+
+// The free clusters, counted from the FAT itself a page at a time (the single
+// cached sector would make it one read per sector). At mount, so the count
+// statfs reports and FSInfo records is always known: 66 reads for a 34 MB
+// volume, about two thousand for a FAT of 8 MB. -1 on a read error.
+fn count_free(v as *Fat32Volume) as i64 {
+    if (ensure_scratch() != 0) { return 0 - 1; }
+    let is *u8 as buf = cast(*u8, scratch_virt);
+    let is i64 as per with mut = pmm.PAGE_SIZE / v.bytes_per_sector;   // sectors per read
+    if (per < 1) { per = 1; }
+    let is i64 as epb = v.bytes_per_sector / 4;                          // entries per sector
+    let is i64 as max_c = v.cluster_count + 2;
+    let is i64 as freec with mut = 0;
+    let is i64 as sec with mut = 0;
+    while (sec < v.fat_size_sectors && sec * epb < max_c) {
+        let is i64 as n with mut = per;
+        if (sec + n > v.fat_size_sectors) { n = v.fat_size_sectors - sec; }
+        if (storage.read_lba(v.dev, v.fat_active_lba + sec, n, buf) != 0) { return 0 - 1; }
+        let is i64 as e with mut = 0;
+        while (e < n * epb) {
+            let is i64 as cl = sec * epb + e;
+            if (cl >= 2 && cl < max_c && (read_u32(buf, e * 4) & 0x0FFFFFFF) == 0) { freec = freec + 1; }
+            e = e + 1;
+        }
+        sec = sec + n;
+    }
+    return freec;
+}
+
+// ============================================================
+// Chain cursors
+// ============================================================
+//
+// Finding a byte in a FAT file means following the chain from its first
+// cluster: one FAT read per cluster. Every read and write did that from the
+// head, so writing a file in small pieces cost O(size) per write, O(size^2)
+// in all — `seq 1 9999999 > f` wrote at about 90 KB/s and slowed as it went.
+//
+// The VFS keeps four words per open file (VfsFile.hint0..3) and hands them in;
+// only this module reads or writes them:
+//   [0] a cluster index in the file    [1] that index's cluster
+//   [2] the first cluster of the chain they belong to
+//   [3] chain_gen when they were taken
+// A cursor for another chain, or older than the last freed cluster, is
+// ignored: the walk starts from the head as before.
+let is i64 as chain_gen with mut = 1;
+
+fn hint_usable(h as *i64, first as i64, idx as i64) as i64 {
+    if (cast(i64, h) == 0) { return 0; }
+    if (h[2] != first || h[3] != chain_gen || h[1] < 2) { return 0; }
+    if (h[0] > idx) { return 0; }
+    return 1;
+}
+
+fn hint_set(h as *i64, first as i64, idx as i64, cluster as i64) as void {
+    if (cast(i64, h) == 0) { return; }
+    h[0] = idx;
+    h[1] = cluster;
+    h[2] = first;
+    h[3] = chain_gen;
+}
+
+// The cluster at index `idx` of the chain starting at `first`, from the cursor
+// when it is at or before idx. With extend=1 a chain that ends early is
+// lengthened (new clusters linked, contents left as they are — callers write
+// them or never expose them). Negative on I/O error, or past the end with
+// extend=0.
+fn walk_to(v as *Fat32Volume, first as i64, idx as i64, h as *i64, extend as i64) as i64 {
+    if (first < 2) { return 0 - 1; }
+    let is i64 as c with mut = first;
+    let is i64 as i with mut = 0;
+    if (hint_usable(h, first, idx) == 1) {
+        c = h[1];
+        i = h[0];
+    }
+    while (i < idx) {
+        let is i64 as nxt with mut = fat_read(v, c);
+        if (nxt < 0) { return 0 - 2; }
+        if (cluster_is_eof(nxt) == 1) {
+            if (extend == 0) { return 0 - 3; }
+            nxt = cluster_alloc(v);
+            if (nxt < 0) { return 0 - 4; }
+            if (fat_write(v, c, nxt) != 0) { return 0 - 5; }
+        }
+        c = nxt;
+        i = i + 1;
+    }
+    hint_set(h, first, idx, c);
+    return c;
+}
+
+// statfs_fill: write [total_bytes, free_bytes, cluster_size_bytes, flags]
+// for the mounted volume into out[0..3]. Free space is the count of FAT entries == 0
+// (the same "free" test cluster_alloc uses), times the cluster size; the FAT
+// sector cache keeps the scan cheap. Returns 0, or -1 if nothing is mounted.
+//
+// MUST hold the VFS fs_lock for the whole FAT walk: the scan calls fat_read in
+// a tight loop, which rewrites the shared single-sector FAT cache (fat_cache_
+// virt/sec) on every miss. Every other FAT-touching path runs under fs_lock
+// (the VfsFile ops wrap acquire/inner/release); statfs reaches the FAT directly
+// via this syscall, so it has to take the SAME lock or it corrupts a concurrent
+// dir_find's cached FAT sector mid-walk — making an existing file resolve as
+// "not found" the instant something (a btop polling SYS_STATFS) runs the scan on
+// another cpu. This is the single FS-wide mutex; no fat32 buffer is safe without
+// it under SMP.
+fn statfs_fill(out as *i64) as i64 {
+    let is *Fat32Volume as v = &vol;
+    if (v.is_mounted == 0) { return 0 - 1; }
+    vfs.fs_lock_acquire();
+    // Counted once, by walking the FAT; from then on cluster_alloc and
+    // cluster_free keep the count, so a monitor polling statfs every second
+    // costs nothing instead of a full FAT walk each time.
+    if (v.free_clusters < 0) { v.free_clusters = count_free(v); }
+    if (v.free_clusters < 0) { vfs.fs_lock_release(); return 0 - 2; }
+    out[0] = v.cluster_count * v.cluster_size_bytes;
+    out[1] = v.free_clusters * v.cluster_size_bytes;
+    out[2] = v.cluster_size_bytes;
+    out[3] = 0;
+    if (v.dev.is_volatile == 1) { out[3] = abi.STATFS_VOLATILE; }
+    vfs.fs_lock_release();
+    return 0;
+}
+
+// Free an entire cluster chain starting at `first`. Handy for unlink
+// and truncate-to-zero.
+fn chain_free(v as *Fat32Volume, first as i64) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    fat_batch_begin();
+    let is i32 as rc = chain_free_entries(v, first);
+    let is i32 as wb = fat_batch_end(v);
+    if (rc != 0) { return rc; }
+    if (wb != 0) { return cast(i32, 0 - 5); }
+    return 0;
+}
+
+fn chain_free_entries(v as *Fat32Volume, first as i64) as i32 {
+    let is i64 as cur with mut = first;
+    let is i64 as guard with mut = 0;
+    let is i64 as max_steps = v.cluster_count + 2;
+    while (cur >= 2 && cur < v.cluster_count + 2) {
+        if (guard > max_steps) { return cast(i32, 0 - 3); }
+        guard = guard + 1;
+        let is i64 as nxt = fat_read(v, cur);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_free(v, cur) != 0) { return cast(i32, 0 - 4); }
+        if (cluster_is_eof(nxt) == 1) { return 0; }
+        cur = nxt;
+    }
+    return 0;
+}
+
+// ============================================================
+// Cluster write — whole-cluster helper matching cluster_read. Writes
+// sectors_per_clus sectors at cluster_to_lba(cluster). buf must be in
+// HHDM-resident memory (DMA-safe) and at least cluster_size_bytes.
+// ============================================================
+fn cluster_write(v as *Fat32Volume, cluster as i64, buf as *u8) as i32 {
+    if (cast(i64, v) == 0) { return cast(i32, 0 - 1); }
+    let is i64 as lba = cluster_to_lba(v, cluster);
+    if (lba < 0) { return cast(i32, 0 - 2); }
+    return storage.write_lba(v.dev, lba, v.sectors_per_clus, buf);
+}
+
+// Zero-fill a cluster. Used when extending a directory or materialising
+// a fresh allocation where stale data would leak.
+fn cluster_zero(v as *Fat32Volume, cluster as i64) as i32 {
+    if (ensure_scratch() != 0) { return cast(i32, 0 - 1); }
+    let is *u8 as buf = cast(*u8, clus_scratch_virt);
+    let is i64 as i with mut = 0;
+    while (i < v.cluster_size_bytes) { buf[i] = cast(u8, 0); i = i + 1; }
+    return cluster_write(v, cluster, buf);
+}
+
+// Walk `first_cluster` chain forward by `skip` clusters, returning the
+// landed cluster or negative on error. skip=0 returns first_cluster.
+fn chain_advance(v as *Fat32Volume, first_cluster as i64,
+                 skip as i64) as i64 {
+    if (first_cluster < 2) { return 0 - 1; }
+    let is i64 as c with mut = first_cluster;
+    let is i64 as left with mut = skip;
+    while (left > 0) {
+        let is i64 as nxt = fat_read(v, c);
+        if (nxt < 0) { return 0 - 2; }
+        if (cluster_is_eof(nxt) == 1) { return 0 - 3; }
+        c = nxt;
+        left = left - 1;
+    }
+    return c;
+}
+
+// Ensure the chain starting at `first_cluster` has at least `want`
+// clusters; allocate and link new clusters as needed. If first_cluster
+// is 0 (empty file), allocates fresh chain and returns the new head
+// via *out_first_cluster. Returns 0 on success.
+fn chain_ensure_length(v as *Fat32Volume, first_cluster as i64,
+                       want as i64, out_first_cluster as *i64) as i32 {
+    if (want <= 0) { *out_first_cluster = first_cluster; return 0; }
+
+    let is i64 as head_c with mut = first_cluster;
+    if (head_c == 0) {
+        let is i64 as c = cluster_alloc(v);
+        if (c < 0) { return cast(i32, 0 - 1); }
+        head_c = c;
+    }
+
+    let is i64 as c with mut = head_c;
+    let is i64 as have with mut = 1;
+    while (have < want) {
+        let is i64 as nxt = fat_read(v, c);
+        if (nxt < 0) { return cast(i32, 0 - 2); }
+        if (cluster_is_eof(nxt) == 1) {
+            let is i64 as new_c = cluster_alloc(v);
+            if (new_c < 0) { return cast(i32, 0 - 3); }
+            if (fat_write(v, c, new_c) != 0) { return cast(i32, 0 - 4); }
+            c = new_c;
+        } else {
+            c = nxt;
+        }
+        have = have + 1;
+    }
+    *out_first_cluster = head_c;
+    return 0;
+}
+
+// ============================================================
+// FSInfo — the volume's own record of its free-cluster count and where to
+// look for the next free cluster. Advisory, but a checker compares it with
+// the FAT: it was never written, so every volume this kernel had allocated on
+// came back from fsck.fat with "Free cluster summary wrong". Written when a
+// file is closed, if allocation changed since the last write: the count
+// cluster_alloc/cluster_free keep (0xFFFFFFFF, "unknown", until statfs has
+// counted), and alloc_next. A sector without FSInfo's three signatures is
+// left alone — that is a volume this kernel did not format the way it thinks.
+// ============================================================
+let is i64 as fsinfo_dirty with mut = 0;
+let is i64 as FSI_LEAD_SIG   = 0x41615252;
+let is i64 as FSI_STRUC_SIG  = 0x61417272;
+let is i64 as FSI_TRAIL_SIG  = 0xAA550000;
+
+fn put_u32(buf as *u8, off as i64, v as i64) as void {
+    buf[off]     = cast(u8, v & 0xFF);
+    buf[off + 1] = cast(u8, (v >> 8) & 0xFF);
+    buf[off + 2] = cast(u8, (v >> 16) & 0xFF);
+    buf[off + 3] = cast(u8, (v >> 24) & 0xFF);
+}
+
+fn fsinfo_write(v as *Fat32Volume) as void {
+    if (fsinfo_dirty == 0) { return; }
+    if (v.fs_info_sector < 1 || v.fs_info_sector >= v.reserved_sectors) { return; }
+    if (ensure_scratch() != 0) { return; }
+    let is *u8 as buf = cast(*u8, scratch_virt);
+    if (storage.read_lba(v.dev, v.fs_info_sector, 1, buf) != 0) { return; }
+    if (read_u32(buf, 0) != FSI_LEAD_SIG || read_u32(buf, 484) != FSI_STRUC_SIG
+        || read_u32(buf, 508) != FSI_TRAIL_SIG) { return; }
+    let is i64 as freec with mut = 0xFFFFFFFF;
+    if (v.free_clusters >= 0) { freec = v.free_clusters; }
+    put_u32(buf, 488, freec);
+    put_u32(buf, 492, v.alloc_next);
+    if (storage.write_lba(v.dev, v.fs_info_sector, 1, buf) == 0) { fsinfo_dirty = 0; }
+}

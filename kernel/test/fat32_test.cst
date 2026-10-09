@@ -1,0 +1,505 @@
+// fat32_test.cst — the FAT32 self-tests a `selftest` boot runs on the root
+// volume before it is published: read back the seeded HELLO.TXT and
+// BIGFILE.BIN, a create / read-back / unlink round trip, then mkdir, rename
+// and rmdir. They write to the volume, which is why they are opt-in.
+
+use "serial.cst"  as serial;
+use "util.cst"    as util;
+use "rtc.cst"     as rtc;
+use "fat32_vol.cst" as fatvol;
+use "fat32_dir.cst" as fatdir;
+use "fat32_file.cst" as fatfile;
+use "fat32_ent.cst" as fatent;
+
+// ============================================================
+// self_test_read — look up HELLO.TXT and BIGFILE.BIN (seeded by
+// scripts/fat32_add_file.py), read their contents, and validate the
+// payloads match expectations. Exercises dir_find, fat_read, and
+// file_read end-to-end.
+// ============================================================
+
+let is i64 as HELLO_EXPECTED_SIZE = 27;
+let is i64 as BIGFILE_EXPECTED_SIZE = 1200;
+
+fn self_test_read(v as *fatvol.Fat32Volume) as void {
+    let is i64 as clus with mut = 0;
+    let is i64 as size with mut = 0;
+    let is i32 as attr with mut = 0;
+
+    let is i32 as r1 = fatdir.dir_find(v, v.root_cluster,
+                                cast(*u8, "hello.txt"), 9,
+                                &clus, &size, &attr);
+    // A FIXTURE THAT IS NOT THERE MEANS THE TEST DID NOT RUN, not that it
+    // failed. Every disk this boots from except the verify fixture is seeded
+    // with only what a particular test needs, so this printed FAIL on a
+    // perfectly healthy boot — twelve times per suite run. A FAIL that is
+    // always there is a FAIL everyone learns to scroll past, which is worse
+    // than no marker at all: the next one, the real one, gets scrolled past
+    // too.
+    //
+    // dir_find says -1 for "end of directory" and -2/-3 for a volume that is
+    // actually broken. Only the second kind is a failure.
+    if (cast(i64, r1) == 0 - 1) {
+        serial.println("fat32.test: no read fixtures on this disk, write path only", 58);
+        self_test_write(v);
+        return;
+    }
+    if (r1 != 0) {
+        serial.print("fat32.test: find hello.txt FAIL rc=", 35);
+        util.print_num(cast(i64, r1));
+        serial.println("", 0);
+        return;
+    }
+    serial.print("fat32.test: hello.txt cluster=", 30);
+    util.print_num(clus);
+    serial.print(" size=", 6);
+    util.print_num(size);
+    serial.println("", 0);
+
+    if (size != HELLO_EXPECTED_SIZE) {
+        serial.println("fat32.test: hello.txt size mismatch", 35);
+        return;
+    }
+
+    let is i64 as rbuf_virt = fatvol.alloc_dma_page();
+    if (rbuf_virt == 0) {
+        serial.println("fat32.test: rbuf alloc fail", 27);
+        return;
+    }
+    let is *u8 as rbuf = cast(*u8, rbuf_virt);
+    let is i64 as n = fatfile.file_read(v, clus, size, rbuf, 4096);
+    if (n != size) {
+        serial.print("fat32.test: file_read short n=", 30);
+        util.print_num(n);
+        serial.println("", 0);
+        return;
+    }
+    // Print the content (zero-term for safety since we know size < 4096).
+    rbuf[size] = cast(u8, 0);
+    serial.print("fat32.test: hello.txt='", 23);
+    let is i64 as k with mut = 0;
+    while (k < size) {
+        serial.putc(cast(i64, rbuf[k]));
+        k = k + 1;
+    }
+    serial.println("'", 1);
+
+    // Bigfile: 600 'A' + 600 'B'. Read and byte-verify.
+    let is i32 as r2 = fatdir.dir_find(v, v.root_cluster,
+                                cast(*u8, "bigfile.bin"), 11,
+                                &clus, &size, &attr);
+    if (r2 != 0) {
+        serial.print("fat32.test: find bigfile.bin FAIL rc=", 37);
+        util.print_num(cast(i64, r2));
+        serial.println("", 0);
+        return;
+    }
+    if (size != BIGFILE_EXPECTED_SIZE) {
+        serial.print("fat32.test: bigfile size mismatch size=", 39);
+        util.print_num(size);
+        serial.println("", 0);
+        return;
+    }
+    // Need a bigger buffer for 1200 bytes; alloc 1 extra page.
+    let is i64 as big_virt = fatvol.alloc_dma_page();
+    if (big_virt == 0) {
+        serial.println("fat32.test: big rbuf alloc fail", 31);
+        return;
+    }
+    let is *u8 as big = cast(*u8, big_virt);
+    let is i64 as nb = fatfile.file_read(v, clus, size, big, 4096);
+    if (nb != size) {
+        serial.print("fat32.test: bigfile read short nb=", 34);
+        util.print_num(nb);
+        serial.println("", 0);
+        return;
+    }
+    let is i64 as mis with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 600) {
+        if (big[i] != cast(u8, 65)) { mis = mis + 1; }   // 'A'
+        i = i + 1;
+    }
+    while (i < 1200) {
+        if (big[i] != cast(u8, 66)) { mis = mis + 1; }   // 'B'
+        i = i + 1;
+    }
+    if (mis == 0) {
+        serial.println("fat32.test: bigfile verify OK (1200B across 3 clusters)", 55);
+    } else {
+        serial.print("fat32.test: bigfile mismatch=", 29);
+        util.print_num(mis);
+        serial.println("", 0);
+    }
+
+    // Long-file-name lookup: "long-name-with-spaces and mixed case.txt"
+    // stores 4 LFN entries + a mangled 8.3 short name. Query must
+    // match via LFN, case-insensitive.
+    let is i32 as r3 = fatdir.path_lookup(v,
+        cast(*u8, "/long-name-with-spaces and mixed case.txt"), 41,
+        &clus, &size, &attr);
+    if (r3 != 0) {
+        serial.print("fat32.test: LFN lookup FAIL rc=", 31);
+        util.print_num(cast(i64, r3));
+        serial.println("", 0);
+    } else {
+        let is i64 as lfn_virt = fatvol.alloc_dma_page();
+        let is *u8 as lb = cast(*u8, lfn_virt);
+        let is i64 as ln = fatfile.file_read(v, clus, size, lb, 4096);
+        lb[size] = cast(u8, 0);
+        serial.print("fat32.test: LFN='", 17);
+        let is i64 as kk with mut = 0;
+        while (kk < ln) { serial.putc(cast(i64, lb[kk])); kk = kk + 1; }
+        serial.println("'", 1);
+    }
+
+    // Subdirectory traversal: /docs/readme.md was placed inside the
+    // docs/ subdir (created via mkdir). Tests both path parsing and
+    // walking into a non-root cluster.
+    let is i32 as r4 = fatdir.path_lookup(v,
+        cast(*u8, "/docs/readme.md"), 15,
+        &clus, &size, &attr);
+    if (r4 != 0) {
+        serial.print("fat32.test: subdir lookup FAIL rc=", 34);
+        util.print_num(cast(i64, r4));
+        serial.println("", 0);
+    } else {
+        let is i64 as sub_virt = fatvol.alloc_dma_page();
+        let is *u8 as sb = cast(*u8, sub_virt);
+        let is i64 as sn = fatfile.file_read(v, clus, size, sb, 4096);
+        sb[size] = cast(u8, 0);
+        serial.print("fat32.test: /docs/readme.md='", 29);
+        let is i64 as mm with mut = 0;
+        while (mm < sn) { serial.putc(cast(i64, sb[mm])); mm = mm + 1; }
+        serial.println("'", 1);
+    }
+
+    self_test_write(v);
+}
+
+// ============================================================
+// self_test_write — create, read-back, unlink round-trip. Covers the
+// Phase 5 write path end-to-end:
+//   1. Create /roundtrip.txt with ASCII payload → read back, compare
+//   2. Create /long round-trip name with spaces.md (LFN+mangle) →
+//      read back via both long-name and short-name queries, compare
+//   3. Create /large.bin spanning 5 clusters with deterministic
+//      pattern → read back, byte-verify
+//   4. Unlink each, verify dir_find returns not-found
+// ============================================================
+
+let is [2600]u8 as large_payload with mut;
+
+fn self_test_write(v as *fatvol.Fat32Volume) as void {
+    serial.println("fat32.test: write-path start", 28);
+
+    // IDEMPOTENT, because a disk gets booted more than once. Everything below
+    // creates files and then checks they were created, so a leftover from the
+    // previous boot comes back as EEXIST and reads as a failure — on a real
+    // machine, every boot after the first. Clearing the artifacts first is
+    // what makes "runs on every boot" and "passes on every boot" the same
+    // sentence. Results are not checked: absent is exactly as good as removed.
+    fatent.file_unlink(v, cast(*u8, "/roundtrip.txt"), 14);
+    fatent.file_unlink(v, cast(*u8, "/long round-trip name with spaces.md"), 36);
+    fatent.file_unlink(v, cast(*u8, "/large.bin"), 10);
+    fatent.file_unlink(v, cast(*u8, "/data/notes.txt"), 15);
+    fatent.file_unlink(v, cast(*u8, "/docs/notebook.md"), 17);
+    fatent.file_unlink(v, cast(*u8, "/docs/incoming.txt"), 18);
+    fatent.file_unlink(v, cast(*u8, "/docs/target.txt"), 16);
+    fatent.dir_remove(v, cast(*u8, "/data"), 5);
+
+    // The cross-parent rename below moves a file into /docs. That directory
+    // used to have to be seeded, which quietly made the whole write suite a
+    // test that only ran on one particular disk image — so on every other
+    // boot the write path, the part most likely to corrupt a filesystem, was
+    // never exercised at all. It creates its own now.
+    fatent.dir_create(v, cast(*u8, "/docs"), 5);
+
+    // --- Test 1: simple ASCII file ---
+    let is *u8 as payload1 = cast(*u8, "causticos FAT32 write-path works");
+    let is i64 as create_date with mut = 0;
+    let is i64 as create_time with mut = 0;
+    rtc.now_dos(&create_date, &create_time);
+    let is i64 as create_before = rtc.epoch_seconds(create_date, create_time);
+    let is i32 as c1 = fatent.file_create(v,
+        cast(*u8, "/roundtrip.txt"), 14,
+        payload1, 32);
+    if (c1 != 0) {
+        serial.print("fat32.test: create roundtrip.txt FAIL rc=", 41);
+        util.print_num(cast(i64, c1)); serial.println("", 0);
+        return;
+    }
+    let is i64 as back_virt = fatvol.alloc_dma_page();
+    let is *u8 as back = cast(*u8, back_virt);
+    let is i64 as cc with mut = 0;
+    let is i64 as ss with mut = 0;
+    let is i32 as aa with mut = 0;
+    if (fatdir.path_lookup(v, cast(*u8, "/roundtrip.txt"), 14,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: roundtrip lookup FAIL", 33);
+        return;
+    }
+    if (ss != 32) {
+        serial.print("fat32.test: roundtrip size=", 27);
+        util.print_num(ss); serial.println(" expected 32", 12);
+        return;
+    }
+    // Decode the actual SFN found by path_lookup. Its birth timestamp must
+    // fall inside the create interval, including valid midnight time == 0.
+    let is *u8 as created_entry = cast(*u8, fatvol.clus_scratch_virt);
+    let is i64 as created_epoch = rtc.epoch_seconds(
+        fatvol.read_u16(created_entry, fatdir.found_ent_off + 16),
+        fatvol.read_u16(created_entry, fatdir.found_ent_off + 14));
+    rtc.now_dos(&create_date, &create_time);
+    if (created_epoch < create_before ||
+        created_epoch > rtc.epoch_seconds(create_date, create_time)) {
+        serial.println("fat32.test: creation timestamp FAIL", 35);
+        return;
+    }
+    serial.println("fat32.test: creation timestamp OK", 33);
+    if (fatfile.file_read(v, cc, ss, back, 4096) != 32) {
+        serial.println("fat32.test: roundtrip read short", 32);
+        return;
+    }
+    let is i64 as mm with mut = 0;
+    let is i64 as mis1 with mut = 0;
+    while (mm < 32) {
+        if (back[mm] != payload1[mm]) { mis1 = mis1 + 1; }
+        mm = mm + 1;
+    }
+    if (mis1 != 0) {
+        serial.print("fat32.test: roundtrip mismatch=", 31);
+        util.print_num(mis1); serial.println("", 0);
+        return;
+    }
+    serial.println("fat32.test: roundtrip.txt OK", 28);
+
+    // --- Test 2: long-name file requiring LFN + 8.3 mangle ---
+    let is *u8 as payload2 = cast(*u8, "write-path LFN works");
+    let is i32 as c2 = fatent.file_create(v,
+        cast(*u8, "/long round-trip name with spaces.md"), 36,
+        payload2, 20);
+    if (c2 != 0) {
+        serial.print("fat32.test: create LFN FAIL rc=", 31);
+        util.print_num(cast(i64, c2)); serial.println("", 0);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/long round-trip name with spaces.md"), 36,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: LFN lookup-after-create FAIL", 40);
+        return;
+    }
+    if (fatfile.file_read(v, cc, ss, back, 4096) != 20) {
+        serial.println("fat32.test: LFN read-back size mismatch", 39);
+        return;
+    }
+    let is i64 as p with mut = 0;
+    let is i64 as mis2 with mut = 0;
+    while (p < 20) {
+        if (back[p] != payload2[p]) { mis2 = mis2 + 1; }
+        p = p + 1;
+    }
+    if (mis2 == 0) { serial.println("fat32.test: LFN round-trip OK", 29); }
+    else {
+        serial.print("fat32.test: LFN payload mismatch=", 33);
+        util.print_num(mis2); serial.println("", 0);
+    }
+
+    // --- Test 3: multi-cluster file (2600 bytes = 6 clusters of 512B) ---
+    let is i64 as fill with mut = 0;
+    while (fill < 2600) {
+        large_payload[fill] = cast(u8, (fill * 31 + 7) & 0xFF);
+        fill = fill + 1;
+    }
+    let is i32 as c3 = fatent.file_create(v,
+        cast(*u8, "/large.bin"), 10,
+        cast(*u8, &large_payload[0]), 2600);
+    if (c3 != 0) {
+        serial.print("fat32.test: create large FAIL rc=", 33);
+        util.print_num(cast(i64, c3)); serial.println("", 0);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/large.bin"), 10, &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: large lookup FAIL", 29);
+        return;
+    }
+    // Reuse clus_scratch via a fresh page to avoid colliding with FAT walks.
+    let is i64 as big_virt = fatvol.alloc_dma_page();
+    let is *u8 as big = cast(*u8, big_virt);
+    if (fatfile.file_read(v, cc, ss, big, 4096) != 2600) {
+        serial.println("fat32.test: large read-back size mismatch", 41);
+        return;
+    }
+    let is i64 as bi with mut = 0;
+    let is i64 as mis3 with mut = 0;
+    while (bi < 2600) {
+        if (big[bi] != cast(u8, (bi * 31 + 7) & 0xFF)) { mis3 = mis3 + 1; }
+        bi = bi + 1;
+    }
+    if (mis3 == 0) { serial.println("fat32.test: large.bin 2600B round-trip OK", 41); }
+    else {
+        serial.print("fat32.test: large mismatch=", 27);
+        util.print_num(mis3); serial.println("", 0);
+    }
+
+    // --- Test 4: unlink + verify gone ---
+    if (fatent.file_unlink(v, cast(*u8, "/roundtrip.txt"), 14) != 0) {
+        serial.println("fat32.test: unlink roundtrip FAIL", 33);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/roundtrip.txt"), 14,
+                    &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: unlinked file still visible!", 40);
+        return;
+    }
+    serial.println("fat32.test: unlink+verify OK", 28);
+
+    self_test_dirs(v);
+}
+
+// ============================================================
+// Phase 6 self-tests: mkdir, rename, rmdir round-trips.
+// ============================================================
+
+fn self_test_dirs(v as *fatvol.Fat32Volume) as void {
+    serial.println("fat32.test: dir-path start", 26);
+    let is i64 as cc with mut = 0;
+    let is i64 as ss with mut = 0;
+    let is i32 as aa with mut = 0;
+
+    // mkdir /data
+    if (fatent.dir_create(v, cast(*u8, "/data"), 5) != 0) {
+        serial.println("fat32.test: mkdir /data FAIL", 28);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/data"), 5, &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: /data lookup FAIL", 29);
+        return;
+    }
+    if ((aa & 0x10) == 0) {
+        serial.println("fat32.test: /data not DIR", 25);
+        return;
+    }
+    serial.println("fat32.test: mkdir /data OK", 26);
+
+    // Create file inside /data
+    if (fatent.file_create(v, cast(*u8, "/data/notes.txt"), 15,
+                    cast(*u8, "inside data"), 11) != 0) {
+        serial.println("fat32.test: create /data/notes FAIL", 35);
+        return;
+    }
+    let is i64 as rb_virt = fatvol.alloc_dma_page();
+    let is *u8 as rb = cast(*u8, rb_virt);
+    if (fatdir.path_lookup(v, cast(*u8, "/data/notes.txt"), 15,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: /data/notes lookup FAIL", 35);
+        return;
+    }
+    if (fatfile.file_read(v, cc, ss, rb, 4096) != 11) {
+        serial.println("fat32.test: /data/notes read short", 34);
+        return;
+    }
+    rb[11] = cast(u8, 0);
+    serial.print("fat32.test: /data/notes.txt='", 29);
+    let is i64 as k0 with mut = 0;
+    while (k0 < 11) { serial.putc(cast(i64, rb[k0])); k0 = k0 + 1; }
+    serial.println("'", 1);
+
+    // rmdir on non-empty /data must be refused.
+    let is i32 as rm_busy = fatent.dir_remove(v, cast(*u8, "/data"), 5);
+    if (rm_busy == 0) {
+        serial.println("fat32.test: rmdir accepted non-empty!", 37);
+        return;
+    }
+    serial.println("fat32.test: rmdir refuses non-empty OK", 38);
+
+    // rename /data/notes.txt -> /data/notebook.md (same parent)
+    if (fatent.path_rename(v,
+                    cast(*u8, "/data/notes.txt"), 15,
+                    cast(*u8, "/data/notebook.md"), 17) != 0) {
+        serial.println("fat32.test: rename (same-parent) FAIL", 37);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/data/notes.txt"), 15,
+                    &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: old name still present after rename", 47);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/data/notebook.md"), 17,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: new name missing after rename", 41);
+        return;
+    }
+    if (fatfile.file_read(v, cc, ss, rb, 4096) != 11) {
+        serial.println("fat32.test: renamed read short", 30);
+        return;
+    }
+    rb[11] = cast(u8, 0);
+    serial.print("fat32.test: rename same-parent OK '", 35);
+    let is i64 as k1 with mut = 0;
+    while (k1 < 11) { serial.putc(cast(i64, rb[k1])); k1 = k1 + 1; }
+    serial.println("'", 1);
+
+    // rename /data/notebook.md -> /docs/notebook.md (cross-parent)
+    if (fatent.path_rename(v,
+                    cast(*u8, "/data/notebook.md"), 17,
+                    cast(*u8, "/docs/notebook.md"), 17) != 0) {
+        serial.println("fat32.test: rename cross-parent FAIL", 36);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/docs/notebook.md"), 17,
+                    &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: moved file not in /docs", 35);
+        return;
+    }
+    serial.println("fat32.test: rename cross-parent OK", 34);
+
+    // rename OVER an existing file — the atomic-update primitive. Userspace
+    // writes <name>.tmp and renames it onto <name>; if that is refused, every
+    // save silently keeps the first version it ever wrote.
+    if (fatent.file_create(v, cast(*u8, "/docs/target.txt"), 16,
+                    cast(*u8, "OLD"), 3) != 0) {
+        serial.println("fat32.test: replace fixture create FAIL", 39);
+        return;
+    }
+    if (fatent.file_create(v, cast(*u8, "/docs/incoming.txt"), 18,
+                    cast(*u8, "NEWDATA"), 7) != 0) {
+        serial.println("fat32.test: replace fixture2 create FAIL", 40);
+        return;
+    }
+    if (fatent.path_rename(v,
+                    cast(*u8, "/docs/incoming.txt"), 18,
+                    cast(*u8, "/docs/target.txt"), 16) != 0) {
+        serial.println("fat32.test: rename over existing FAIL", 37);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/docs/incoming.txt"), 18, &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: source survived a replace", 37);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/docs/target.txt"), 16, &cc, &ss, &aa) != 0) {
+        serial.println("fat32.test: target gone after replace", 37);
+        return;
+    }
+    if (fatfile.file_read(v, cc, ss, rb, 4096) != 7) {
+        serial.println("fat32.test: replaced file has the old length", 44);
+        return;
+    }
+    if (rb[0] != cast(u8, 78) || rb[3] != cast(u8, 68)) {      // "NEW...D"
+        serial.println("fat32.test: replaced file has the old bytes", 43);
+        return;
+    }
+    serial.println("fat32.test: rename over existing OK", 35);
+
+    // Now /data is empty — rmdir should succeed.
+    if (fatent.dir_remove(v, cast(*u8, "/data"), 5) != 0) {
+        serial.println("fat32.test: rmdir empty /data FAIL", 34);
+        return;
+    }
+    if (fatdir.path_lookup(v, cast(*u8, "/data"), 5, &cc, &ss, &aa) == 0) {
+        serial.println("fat32.test: /data still visible after rmdir", 43);
+        return;
+    }
+    serial.println("fat32.test: rmdir empty OK", 26);
+    serial.println("fat32.test: ALL PHASE-6 TESTS PASS", 34);
+}

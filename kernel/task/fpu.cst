@@ -1,0 +1,100 @@
+// fpu.cst — lazy FPU state: CR0.TS is set on every switch, so the first FPU
+// instruction a thread runs after one traps (#NM); handle_nm_fault then saves
+// the last owner's state and restores this thread's. Threads that never touch
+// the FPU never pay for it.
+
+use "thread.cst" as thread;
+use "runq.cst" as runq;
+
+// ============================================================
+// FPU lazy save (§14.2)
+// ============================================================
+
+// Set TS bit in CR0 (causes #NM on FPU use)
+fn cr0_set_ts() as void {
+    // mov rax, cr0 = 0x0F 0x20 0xC0
+    asm(".byte 0x0F, 0x20, 0xC0\n");
+    asm("or rax, 8\n");           // bit 3 = TS
+    // mov cr0, rax = 0x0F 0x22 0xC0
+    asm(".byte 0x0F, 0x22, 0xC0\n");
+}
+
+// Clear TS bit in CR0
+fn cr0_clear_ts() as void {
+    // clts = 0x0F 0x06
+    asm(".byte 0x0F, 0x06\n");
+}
+
+// Save FPU state (fxsave [rdi])
+fn fpu_save(addr as i64) as void {
+    // fxsave [rdi] = 0x0F 0xAE 0x07
+    asm(".byte 0x0F, 0xAE, 0x07\n");
+}
+
+// Restore FPU state (fxrstor [rdi])
+fn fpu_restore(addr as i64) as void {
+    // fxrstor [rdi] = 0x0F 0xAE, 0x0F
+    asm(".byte 0x0F, 0xAE, 0x0F\n");
+}
+
+// SSE on, for the calling cpu. Run once per cpu (per_cpu_init) before it can
+// schedule a user thread.
+//
+// The FPU and SSE state was already switched lazily (CR0.TS + #NM + fxsave), but
+// the cpu only EXECUTES SSE instructions with CR4.OSFXSR set, and nothing set
+// it: every SSE instruction in a program was #UD, and the compiler died on the
+// first int-to-double conversion it reached (cvtsi2sd) while building itself.
+// OSXMMEXCPT makes an unmasked SIMD floating-point exception #XM (vector 19)
+// instead of #UD. CR0: EM off (no x87 emulation trap), MP on (WAIT honours TS),
+// NE on (x87 errors as #MF, not the legacy FERR# line).
+fn fpu_cpu_init() as void {
+    asm(".byte 0x0F, 0x20, 0xC0\n");    // mov rax, cr0
+    asm("or rax, 4\n");
+    asm("xor rax, 4\n");                // EM (bit 2) off
+    asm("or rax, 34\n");                // MP (bit 1) | NE (bit 5)
+    asm(".byte 0x0F, 0x22, 0xC0\n");    // mov cr0, rax
+    asm(".byte 0x0F, 0x20, 0xE0\n");    // mov rax, cr4
+    asm("or rax, 1536\n");              // OSFXSR (bit 9) | OSXMMEXCPT (bit 10)
+    asm(".byte 0x0F, 0x22, 0xE0\n");    // mov cr4, rax
+    asm(".byte 0x0F, 0x06\n");          // clts — fninit below must not #NM
+    asm(".byte 0xDB, 0xE3\n");          // fninit
+}
+
+// A thread's FPU image before it has run: what the cpu holds after FNINIT,
+// with MXCSR at its power-on value. An all-zero area is NOT that — FCW 0 and
+// MXCSR 0 unmask every floating-point exception, so the first inexact result
+// (1.0/3.0) would fault the program.
+fn fpu_area_init(addr as i64) as void {
+    let is *u8 as fz = cast(*u8, addr);
+    let is i64 as fzi with mut = 0;
+    while (fzi < thread.FPU_STATE_SIZE) { fz[fzi] = 0; fzi = fzi + 1; }   // kpool reuses slots unzeroed
+    fz[0] = cast(u8, 0x7F); fz[1] = cast(u8, 0x03);    // FCW = 0x037F: x87 exceptions masked
+    fz[24] = cast(u8, 0x80); fz[25] = cast(u8, 0x1F);  // MXCSR = 0x1F80: SIMD exceptions masked
+}
+
+// Called by #NM exception handler when a thread uses FPU for first time
+fn handle_nm_fault() as void {
+    cr0_clear_ts();
+
+    let is i64 as cur = runq.current_tid();
+    if (cur < 0) { return; }
+
+    // Save previous owner's FPU state
+    if (runq.fpu_owner_tid() >= 0) {
+        if (runq.fpu_owner_tid() != cur) {
+            let is i64 as prev_fpu_addr = thread.thr_get(runq.fpu_owner_tid(), 240);
+            if (prev_fpu_addr != 0) {
+                fpu_save(prev_fpu_addr);
+            }
+        }
+    }
+
+    // Restore current thread's FPU state
+    let is i64 as cur_fpu_addr = thread.thr_get(cur, 240);
+    if (cur_fpu_addr != 0) {
+        fpu_restore(cur_fpu_addr);
+    }
+
+    runq.set_fpu_owner_tid(cur);
+    thread.thr_set(cur, 232, 1);  // fpu_dirty = 1
+}
