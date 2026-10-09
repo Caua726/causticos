@@ -14,9 +14,11 @@
 # without this side noticing, so it was reading a body offset out of the middle
 # of a shell script and loading whatever was there.
 #
-# A format with three shapes needs three tests. This runs the same trivial
-# program in each form, typed at the real prompt, and each one has to print its
-# own name.
+# A format with three shapes needs three tests. This runs the same program in
+# each form, typed at the real prompt with its output sent to a file, and each
+# one has to exit with the code it returns AND write the exact line it prints —
+# a number it computes on the way, so an image that loads but runs the wrong
+# code, or prints from the wrong place, does not pass on its exit status alone.
 #
 #   scripts/test-cse-forms.sh
 set -e
@@ -34,19 +36,23 @@ CAUSTIC_PATH=$(command -v "$CAUSTIC" 2>/dev/null) \
 WORK=build/cse-forms
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-# One source, three builds. It uses NOTHING — no imports, no syscalls — and
-# reports by its exit code, which the kernel prints on the serial line when the
-# process is reaped.
-#
-# That is forced, not a preference: a polyglot is compiled for Windows and
-# Linux as well, so a program that reaches for a CausticOS syscall cannot be
-# built in that form at all ("must be portable — no raw syscall()"). The exit
-# code costs nothing and is observed by the kernel rather than the program,
-# which makes it a better witness anyway: it proves the image was loaded AND
-# ran to completion, not merely that something printed.
+# One source, three builds. A polyglot is compiled for Windows and Linux as
+# well, so the program uses only the portable std/io — a raw CausticOS syscall
+# cannot be built in that form at all ("must be portable — no raw syscall()").
+# Two witnesses: the exit code, which the kernel prints on the serial line when
+# it reaps the process, and the line the program writes, which says it computed
+# what it should and that its stdout reached the file the shell opened.
 cat > "$WORK/form.cst" <<'EOF'
-fn main() as i32 { return cast(i32, 77); }
+use "std/io.cst" as io;
+fn main() as i32 {
+    let is i64 as s with mut = 0;
+    let is i64 as i with mut = 1;
+    while (i <= 1000) { s = s + i * i; i = i + 1; }
+    io.printf("cse form: sum of squares 1..1000 = %ld\n", s);
+    return cast(i32, 77);
+}
 EOF
+WANT="cse form: sum of squares 1..1000 = 333833500"
 
 # Prints the built file's path on stdout; everything a person reads goes to
 # stderr, so the caller can capture one without the other.
@@ -68,12 +74,6 @@ build_form() {
         "$(head -c4 "$out" | tr -c '[:print:]' '.')" >&2
     echo "$out"
 }
-
-# The polyglot orchestrator spawns sub-builds whose debug files land in the
-# CURRENT directory, not next to -o. Left alone they show up as untracked
-# junk in the repo root, which is how build artefacts end up committed.
-cleanup_pdb() { rm -f ./*.cse.exe.__cse_*.pdb ./*.__cse_*.pdb; }
-trap cleanup_pdb EXIT
 
 echo "=== building the three forms ==="
 PURE=$(build_form pure   --extension=cse)
@@ -116,7 +116,6 @@ mon() { printf '%s\n' "$1" | socat - "unix-connect:$MON" >/dev/null 2>&1 || true
 cleanup() {
     kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
     rm -f "$MON"
-    cleanup_pdb
 }
 trap cleanup EXIT
 
@@ -131,6 +130,7 @@ key_of() {
         [a-z0-9]) printf '%s' "$1" ;;
         ' ') printf 'spc' ;; '-') printf 'minus' ;;
         '/') printf 'slash' ;; '.') printf 'dot' ;;
+        '>') printf 'shift-dot' ;;
         *) echo "no key name for '$1'" >&2; exit 1 ;;
     esac
 }
@@ -146,8 +146,8 @@ for form in pure compat bundle; do
     ERRB=$(tr -d '\000' < "$LOG" | grep -c "^cse: " || true)
     # The shell appends ".cse" itself — it resolves a bare name to
     # /<name>.cse — so typing the suffix would ask for "fpure.cse.cse".
-    echo "typing: f$form"
-    type_line "f$form"
+    echo "typing: f$form > /o$form.txt"
+    type_line "f$form > /o$form.txt"
     OK=0
     for _ in $(seq 1 150); do
         NOW=$(tr -d '\000' < "$LOG" | grep -c "sys.proc_exit: code=77" || true)
@@ -165,8 +165,26 @@ for form in pure compat bundle; do
     fi
 done
 
+# What each one wrote, read off the disk with the machine stopped — the
+# guest may still be flushing otherwise.
+mon "quit"
+for _ in $(seq 1 50); do kill -0 $QPID 2>/dev/null || break; sleep 0.1; done
+kill -9 $QPID 2>/dev/null || true; wait $QPID 2>/dev/null || true
+for form in pure compat bundle; do
+    GOT_OUT=""
+    if "$PY" scripts/fat32.py "$DISK" get "/o$form.txt" "$WORK/o$form.txt" >/dev/null 2>&1; then
+        GOT_OUT=$(cat "$WORK/o$form.txt")
+    fi
+    if [ -f "$WORK/o$form.txt" ] && printf '%s\n' "$WANT" | cmp -s - "$WORK/o$form.txt"; then
+        echo "  ok   $form printed: $GOT_OUT"
+    else
+        echo "  FAIL $form printed: ${GOT_OUT:-<nothing>} (wanted: $WANT)"
+        FAILED=1
+    fi
+done
+
 if [ "$FAILED" != 0 ]; then
     echo "=== cse-forms: FAIL (log: $LOG) ==="
     exit 1
 fi
-echo "=== cse-forms: PASS (pure, compat and bundle all load) ==="
+echo "=== cse-forms: PASS (pure, compat and bundle all load, run and print) ==="

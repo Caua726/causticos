@@ -143,7 +143,7 @@ fi
 DRIVEN=(
     "linkt|scripts/test-link.sh|host pulled the cable"
     "httpd|scripts/test-httpd.sh|host fetched from the guest"
-    "cseforms|scripts/test-cse-forms.sh|pure, compat and bundle"
+    "cseforms|scripts/test-cse-forms.sh|pure, compat and bundle run and print"
     "shellnet|scripts/test-shell-net.sh|wget typed at the prompt"
     "runallwait|scripts/test-runall.sh|delayed nonzero verdict"
 )
