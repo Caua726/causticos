@@ -252,7 +252,7 @@ fn run_line(t as *term.Term, line as *u8, len as i64) as void {
     // job ends.
     let is i64 as n = sx.list_begin(line, len);
     if (n == 0 - 1) { err(t, "syntax: ; && || or & with no command on one side\n"); sx.set_status(2); return; }
-    if (n == 0 - 2) { err(t, "line has too many commands\n"); sx.set_status(2); return; }
+    if (n == 0 - 2) { err_room(t); sx.set_status(2); return; }
     list_run(t);
 }
 
@@ -269,12 +269,30 @@ fn list_run(t as *term.Term) as void {
 }
 
 // One part of the list: a builtin, a function, or a pipeline (bg = 1: not
-// waited for).
+// waited for). Its words for the builtins are on shexec's args stack, given
+// back when the part is done whatever way it ends.
 fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
-    let is [16]i64 as argv_ptr;
-    let is [16]i64 as argv_len;
-    let is i64 as argc with mut = repl.parse(line, len, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]));
+    let is i64 as mark = sx.args_mark();
+    run_part_words(t, line, len, bg);
+    sx.args_release(mark);
+    return;
+}
+
+// Why a line could not be held whole, in the shell's error style.
+fn err_room(t as *term.Term) as void {
+    err(t, sx.room_text(sx.room_error()));
+    err(t, "\n");
+    return;
+}
+
+fn run_part_words(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
+    let is i64 as pp with mut = 0;
+    let is i64 as pl with mut = 0;
+    let is i64 as argc with mut = sx.args_split(line, len, &pp, &pl);
+    if (argc < 0) { err(t, sx.room_text(argc)); err(t, "\n"); sx.set_status(2); return; }
     if (argc == 0) { return; }
+    let is *i64 as argv_ptr = cast(*i64, pp);
+    let is *i64 as argv_len = cast(*i64, pl);
     let is i64 as len2 = len;
 
     let is *u8 as cmd = cast(*u8, argv_ptr[0]);
@@ -337,7 +355,7 @@ fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
     // The shared builtins (cd, export, set, unset, type, history, help) come
     // from one table both shells read, so `help` cannot drift out of date.
     let is i64 as bst with mut = 0;
-    if (bi.dispatch(t, cast(*i64, &argv_ptr[0]), cast(*i64, &argv_len[0]), argc, &bst) == 1) {
+    if (bi.dispatch(t, argv_ptr, argv_len, argc, &bst) == 1) {
         sx.set_status(bst);
         return;
     }
@@ -353,11 +371,11 @@ fn run_part(t as *term.Term, line as *u8, len as i64, bg as i64) as void {
     // are shexec's job, and it hands back one job slot for the whole chain.
     let is i64 as nc = sx.prepare(line, len2);
     sx.cap_err_show(t);      // what a $(...) in it said on stderr
-    // A line that had to be shortened is a DIFFERENT line; running it
-    // would do something other than what was typed.
-    if (sx.truncated() == 1) { err(t, "line too long after expansion\n"); sx.set_status(2); return; }
+    // A line that could not be held whole is a DIFFERENT line; running what
+    // fitted would do something other than what was typed.
+    if (sx.room_error() != 0) { err_room(t); sx.set_status(2); return; }
     if (nc == 0 - 2) { err(t, "syntax: redirect with no target\n"); return; }
-    if (nc <= 0) { err(t, "too many pipeline stages\n"); return; }
+    if (nc <= 0) { return; }
     let is i64 as slot = sx.exec(bg, line, len2, 0 - 1, cast(*i64, 0), 1);
     if (slot < 0) {
         let is [192]u8 as m;
@@ -588,7 +606,30 @@ fn _edit(t as *term.Term, what as i64) as void {
     return;
 }
 
+// A key for the line editor, then whatever the editor could not do with it
+// said in words (note_refusal).
 fn key_to_line(t as *term.Term, sym as i64, mods as i64) as void {
+    key_to_line_edit(t, sym, mods);
+    note_refusal(t);
+    return;
+}
+
+// Keys the line could not take — past its limit, or out of memory — said
+// once, on a line of their own above a fresh prompt, the way background output
+// is shown. They were dropped without a sign.
+fn note_refusal(t as *term.Term) as void {
+    let is i64 as e = repl.take_refusal(&rl);
+    if (e == 0) { return; }
+    repl.finish(&rl, t);
+    err(t, repl.refusal_text(e));
+    err(t, "\n");
+    prompt(t);
+    repl.reprint(&rl, t);
+    show(t);
+    return;
+}
+
+fn key_to_line_edit(t as *term.Term, sym as i64, mods as i64) as void {
     let is i64 as ctrl = mods & ks.MOD_CTRL;
     let is i64 as ck = ks.chord_key(sym);
     // A Ctrl+R search takes the keys while it runs (repl.cst explains which
@@ -659,7 +700,9 @@ fn key_to_line(t as *term.Term, sym as i64, mods as i64) as void {
 fn line_char(t as *term.Term, c as i64) as void {
     if (c == 0x0A) {
         repl.finish(&rl, t); term.flush(t);
-        repl.hist_push(&rl, repl.line_ptr(&rl), repl.line_len(&rl));
+        if (repl.hist_push(&rl, repl.line_ptr(&rl), repl.line_len(&rl)) != 0) {
+            err(t, "history: not enough memory to keep this line\n");
+        }
         // Handed to the history thread before running, and nothing here waits
         // for the disk: the thread writes it while the command starts. This
         // shell is /init and has no exit path; what ends it is the power,
@@ -678,6 +721,7 @@ fn line_char(t as *term.Term, c as i64) as void {
         if (repl.line_backspace(&rl) == 1) { repl.redraw(&rl, t); show(t); }
     } else if (c != 0) {
         if (repl.line_push(&rl, c) == 1) { repl.redraw(&rl, t); show(t); }
+        else { note_refusal(t); }
     }
     return;
 }
@@ -723,7 +767,12 @@ fn main() as i32 {
     keymap_check();
     set_leds();
 
-    repl.init(&rl);
+    if (repl.init(&rl) != 0) {
+        sys.write_serial("shell: no memory for the line editor\n", 37);
+        err(&t, "shell: no memory for the line editor\n");
+        show(&t);
+        sys.exit(cast(i32, 1));
+    }
     // /var may not exist on a fresh disk; an "already exists" here is exactly
     // as good as having created it.
     sys.mkdir("/var");

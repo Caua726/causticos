@@ -26,10 +26,19 @@ use "../sndproto/sndproto.cst" as sp;
 use "../ttyproto/ttyproto.cst" as tty;
 use "../glob/glob.cst" as glob;
 use "std/causticos/prog.cst" as prog;
+use "../grow/grow.cst" as grow;
 
-let is i64 as MAX_CMDS with imut = 8;       // pipeline stages
-let is i64 as MAX_WORDS with imut = 64;
-let is i64 as BUF_CAP  with imut = 4096;    // expanded + globbed bytes
+// Every table in this file grows instead of having a size picked for it
+// (lib/grow): reserved once as address space, backed with memory only as far
+// as a line reaches. They were 8 stages, 64 words and 4096 bytes of them, and
+// what did not fit was cut without a word — a glob past 64 names lost the
+// rest, so `rm *` in a big directory removed part of it and said nothing. The
+// reservations are far past what one command can carry (spawn takes ARGV_MAX,
+// 256 KiB, of arguments); reaching one, or running out of memory first, makes
+// the line fail with the reason (room_error), never run shorter.
+let is i64 as BYTES_LIMIT with imut = 67108864;   // a line, its expansion, its words
+let is i64 as WORDS_LIMIT with imut = 4194304;    // words in one line
+let is i64 as CMDS_LIMIT  with imut = 1048576;    // stages in one pipeline
 
 // A pipeline stage: a slice of the word table plus where its ends are wired.
 struct Cmd {
@@ -41,20 +50,121 @@ struct Cmd {
     err_to_out as i64;  // 1 when '2>&1' was seen
 }
 
-let is [8]Cmd as cmds with mut;
+let is grow.Grow as cmd_g with mut;
 let is i64 as ncmd with mut = 0;
 let is i64 as prepared_program with mut = 0; // one literal image path, not shell source
 
 // The word table. Words point INTO wbuf, which holds everything expansion and
 // globbing produced; the original line is never referenced past tokenising.
-let is [64]i64 as w_off with mut;
-let is [64]i64 as w_len with mut;
-let is [64]i64 as w_quoted with mut;        // 1 = came from quotes, never globbed
+// The tables never move once made, so these pointers stay good as they grow.
+let is grow.Grow as woff_g with mut;
+let is grow.Grow as wlen_g with mut;
+let is grow.Grow as wq_g with mut;
+let is grow.Grow as wbuf_g with mut;
+let is *i64 as w_off with mut = cast(*i64, 0);
+let is *i64 as w_len with mut = cast(*i64, 0);
+let is *i64 as w_quoted with mut = cast(*i64, 0);   // 1 = came from quotes, never globbed
 let is i64 as nword with mut = 0;
-let is [4096]u8 as wbuf with mut;
+let is *u8 as wbuf with mut = cast(*u8, 0);
 let is i64 as wfill with mut = 0;
+let is i64 as wbase with mut = 0;            // where tokenise starts in wbuf (see capture)
 
-let is [4096]u8 as expbuf with mut;         // the line after pass 1
+let is grow.Grow as exp_g with mut;
+let is *u8 as expbuf with mut = cast(*u8, 0); // the line after pass 1
+
+// glob_words builds the new word table here, then copies it back.
+let is grow.Grow as goff_g with mut;
+let is grow.Grow as glen_g with mut;
+let is grow.Grow as gq_g with mut;
+
+// exec's argv for one stage: {pointer, length} pairs.
+let is grow.Grow as av_g with mut;
+
+// args_split's words for builtins: {pointer, length} pairs, a stack (see there).
+let is grow.Grow as args_g with mut;
+let is i64 as args_top with mut = 0;          // words in use on it
+
+// list_begin's own copy of the line and its parts (see "lists").
+let is grow.Grow as list_g with mut;
+let is grow.Grow as loff_g with mut;
+let is grow.Grow as llen_g with mut;
+let is grow.Grow as lop_g with mut;
+let is *u8 as l_line with mut = cast(*u8, 0);
+let is *i64 as l_off with mut = cast(*i64, 0);
+let is *i64 as l_len with mut = cast(*i64, 0);
+let is *i64 as l_op with mut = cast(*i64, 0);  // the operator after each part
+
+// The variables (see "environment").
+let is grow.Grow as envt_g with mut;
+let is grow.Grow as env_g with mut;
+let is *i64 as env_tab with mut = cast(*i64, 0);
+let is *u8 as envbuf with mut = cast(*u8, 0);
+
+// resolve works here, which can be longer than a path for a moment: a long
+// name followed by ".." is folded back below PATH_MAX before it is judged.
+let is grow.Grow as res_g with mut;
+
+let is i64 as ready with mut = 0;              // 1 = the tables are reserved
+
+// Why the line cannot go on: 0, or E_2BIG (past a reservation) or E_NOMEM.
+// Set by whatever ran out first; the shells print room_text and run nothing,
+// because a line that had to be shortened is a DIFFERENT line.
+let is i64 as room_err with mut = 0;
+fn room_error() as i64 { return room_err; }
+fn room_text(e as i64) as *u8 {
+    if (e == sys.E_2BIG) { return cast(*u8, "line too long: more than the shell can hold"); }
+    return cast(*u8, "not enough memory for this line");
+}
+
+// Reserve every table, once. 0, or E_NOMEM.
+fn _ready() as i64 {
+    if (ready == 1) { return 0; }
+    if (grow.init(&cmd_g, CMDS_LIMIT * sizeof(Cmd)) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&woff_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&wlen_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&wq_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&goff_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&glen_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&gq_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&av_g, WORDS_LIMIT * 16) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&wbuf_g, BYTES_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&exp_g, BYTES_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&list_g, BYTES_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&loff_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&llen_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&lop_g, WORDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&args_g, WORDS_LIMIT * 16) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&env_g, BYTES_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&envt_g, WORDS_LIMIT * 32) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&res_g, BYTES_LIMIT) != 0) { return sys.E_NOMEM; }
+    w_off = grow.words(&woff_g);
+    w_len = grow.words(&wlen_g);
+    w_quoted = grow.words(&wq_g);
+    wbuf = grow.bytes(&wbuf_g);
+    expbuf = grow.bytes(&exp_g);
+    l_line = grow.bytes(&list_g);
+    l_off = grow.words(&loff_g);
+    l_len = grow.words(&llen_g);
+    l_op = grow.words(&lop_g);
+    envbuf = grow.bytes(&env_g);
+    env_tab = grow.words(&envt_g);
+    ready = 1;
+    return 0;
+}
+
+// Room for `n` bytes or words of `g` from its start. 1, or 0 with room_err
+// saying why not.
+fn _room(g as *grow.Grow, n as i64) as i64 {
+    let is i64 as rc = grow.need(g, n);
+    if (rc == 0) { return 1; }
+    if (room_err == 0) { room_err = rc; }
+    return 0;
+}
+
+// Room for `more` bytes past wfill.
+fn _wroom(more as i64) as i64 { return _room(&wbuf_g, wfill + more); }
+
+fn cmd_at(i as i64) as *Cmd { return cast(*Cmd, cmd_g.base + i * sizeof(Cmd)); }
 
 // Status of the last foreground command, for '$?'.
 let is i64 as last_status with mut = 0;
@@ -80,17 +190,21 @@ fn cwd_init() as void {
 fn cwd_ptr() as *u8 { return cast(*u8, &cwd[0]); }
 fn cwd_size() as i64 { return cwd_len; }
 
-let is [256]u8 as resbuf with mut;
-
 // resolve — make `path` absolute against the cwd, folding "." and ".." as it
-// goes. Returns a NUL-terminated pointer valid until the next call.
+// goes. Returns a NUL-terminated pointer valid until the next call, or 0 when
+// the result is longer than a path can be (prog.PATH_MAX) or there is no
+// memory to work in. It used to stop copying at 250 bytes and hand back the
+// shortened path — a redirect into a long path wrote to a different file.
 fn resolve(path as *u8, len as i64) as *u8 {
+    if (_ready() != 0) { return cast(*u8, 0); }
+    if (grow.need(&res_g, cwd_len + len + 3) != 0) { return cast(*u8, 0); }
+    let is *u8 as rb = grow.bytes(&res_g);
     let is i64 as n with mut = 0;
-    if (len > 0 && path[0] == cast(u8, 47)) { resbuf[0] = cast(u8, 47); n = 1; }
+    if (len > 0 && path[0] == cast(u8, 47)) { rb[0] = cast(u8, 47); n = 1; }
     else {
         let is i64 as i with mut = 0;
-        while (i < cwd_len && n < 250) { resbuf[n] = cwd[i]; n = n + 1; i = i + 1; }
-        if (n == 0 || resbuf[n - 1] != cast(u8, 47)) { resbuf[n] = cast(u8, 47); n = n + 1; }
+        while (i < cwd_len) { rb[n] = cwd[i]; n = n + 1; i = i + 1; }
+        if (n == 0 || rb[n - 1] != cast(u8, 47)) { rb[n] = cast(u8, 47); n = n + 1; }
     }
     let is i64 as p with mut = 0;
     while (p < len) {
@@ -104,24 +218,27 @@ fn resolve(path as *u8, len as i64) as *u8 {
             // ".." — walk back over the previous component, never past the root.
             if (n > 1) {
                 n = n - 1;                                            // drop the trailing '/'
-                while (n > 1 && resbuf[n - 1] != cast(u8, 47)) { n = n - 1; }
+                while (n > 1 && rb[n - 1] != cast(u8, 47)) { n = n - 1; }
             }
         } else {
             let is i64 as k with mut = 0;
-            while (k < cl && n < 250) { resbuf[n] = path[st + k]; n = n + 1; k = k + 1; }
-            if (n < 250) { resbuf[n] = cast(u8, 47); n = n + 1; }
+            while (k < cl) { rb[n] = path[st + k]; n = n + 1; k = k + 1; }
+            rb[n] = cast(u8, 47); n = n + 1;
         }
     }
-    if (n > 1 && resbuf[n - 1] == cast(u8, 47)) { n = n - 1; }        // no trailing slash
-    if (n == 0) { resbuf[0] = cast(u8, 47); n = 1; }
-    resbuf[n] = cast(u8, 0);
-    return cast(*u8, &resbuf[0]);
+    if (n > 1 && rb[n - 1] == cast(u8, 47)) { n = n - 1; }        // no trailing slash
+    if (n == 0) { rb[0] = cast(u8, 47); n = 1; }
+    if (n > prog.PATH_MAX) { return cast(*u8, 0); }
+    rb[n] = cast(u8, 0);
+    return rb;
 }
 
 // cd — the directory must exist AND be a directory; anything else leaves the
-// shell where it was rather than silently moving somewhere unusable.
+// shell where it was rather than silently moving somewhere unusable. 0; -1 no
+// such directory; -2 not a directory; -3 a path longer than one can be.
 fn cd(path as *u8, len as i64) as i64 {
     let is *u8 as abs = resolve(path, len);
+    if (cast(i64, abs) == 0) { return 0 - 3; }
     let is i64 as fd = sys.open_read(abs);
     if (fd < 0) { return 0 - 1; }
     // A readdir on a plain file fails, which is how a non-directory is caught
@@ -131,7 +248,7 @@ fn cd(path as *u8, len as i64) as i64 {
     sys.close(fd);
     if (rc < 0) { return 0 - 2; }
     let is i64 as n with mut = 0;
-    while (abs[n] != cast(u8, 0) && n < 254) { cwd[n] = abs[n]; n = n + 1; }
+    while (abs[n] != cast(u8, 0)) { cwd[n] = abs[n]; n = n + 1; }
     cwd_len = n;
     // $PWD is how a relative name reaches a CHILD: the child has no directory
     // of its own, so `cat $PWD/note.txt` is the explicit form of what other
@@ -145,14 +262,17 @@ fn cd(path as *u8, len as i64) as i64 {
 // The shell's own table, not something the kernel knows: causticos has no
 // ambient environment, and a child receives argv only. `export` therefore means
 // "remember this for expansion", which is the honest scope of it here.
-let is i64 as MAX_ENV with imut = 32;
-let is [32]i64 as env_noff with mut;
-let is [32]i64 as env_nlen with mut;
-let is [32]i64 as env_voff with mut;
-let is [32]i64 as env_vlen with mut;
+//
+// Four words an entry in env_tab — name offset, name length, value offset,
+// value length — and the bytes in envbuf (both declared at the top). Both
+// grow (lib/grow): they were 32 variables and 2048 bytes, and `export` said
+// "no room" past them. A value replaced by a longer one is appended and its
+// old bytes are dead; once the dead bytes outweigh the live ones the arena is
+// packed, so a loop setting a variable a million times does not keep a
+// million copies of it.
 let is i64 as nenv with mut = 0;
-let is [2048]u8 as envbuf with mut;
 let is i64 as envfill with mut = 0;
+let is i64 as envdead with mut = 0;          // bytes of envbuf no entry points at
 
 fn _eq(a as *u8, alen as i64, b as *u8, blen as i64) as i64 {
     if (alen != blen) { return 0; }
@@ -164,40 +284,111 @@ fn _eq(a as *u8, alen as i64, b as *u8, blen as i64) as i64 {
 fn env_find(name as *u8, len as i64) as i64 {
     let is i64 as i with mut = 0;
     while (i < nenv) {
-        if (_eq(cast(*u8, &envbuf[env_noff[i]]), env_nlen[i], name, len) == 1) { return i; }
+        if (_eq(env_name(i), env_name_len(i), name, len) == 1) { return i; }
         i = i + 1;
     }
     return 0 - 1;
 }
 
-// env_set — append name and value to the arena. An overwrite appends a fresh
-// value and repoints the slot: the arena only grows, which is fine for a table
-// this small and keeps every live pointer valid.
-fn env_set(name as *u8, nlen as i64, val as *u8, vlen as i64) as i64 {
-    if (envfill + nlen + vlen > 2048) { return 0 - 1; }
-    let is i64 as slot with mut = env_find(name, nlen);
-    if (slot < 0) {
-        if (nenv >= MAX_ENV) { return 0 - 1; }
-        slot = nenv; nenv = nenv + 1;
-        env_noff[slot] = envfill;
-        env_nlen[slot] = nlen;
+// Copy n bytes to envbuf[at..]. src may itself be in envbuf (a value set from
+// another variable's): ranges that overlap are copied in the safe direction.
+fn _env_copy(at as i64, src as *u8, n as i64) as void {
+    let is *u8 as d = cast(*u8, cast(i64, envbuf) + at);
+    if (cast(i64, d) <= cast(i64, src)) {
         let is i64 as i with mut = 0;
-        while (i < nlen) { envbuf[envfill] = name[i]; envfill = envfill + 1; i = i + 1; }
+        while (i < n) { d[i] = src[i]; i = i + 1; }
+    } else {
+        let is i64 as j with mut = n;
+        while (j > 0) { j = j - 1; d[j] = src[j]; }
     }
-    env_voff[slot] = envfill;
-    env_vlen[slot] = vlen;
-    let is i64 as j with mut = 0;
-    while (j < vlen) { envbuf[envfill] = val[j]; envfill = envfill + 1; j = j + 1; }
+    return;
+}
+
+// Lay every live name and value end to end from the start of envbuf, through
+// a scratch mapping. Packing is only economy: when the scratch cannot be had
+// the arena simply stays as it is.
+fn _env_pack() as void {
+    let is i64 as live = envfill - envdead;
+    if (live <= 0) { envfill = 0; envdead = 0; return; }
+    let is i64 as sz = ((live + 4095) / 4096) * 4096;
+    let is i64 as tmp = sys.mmap(0, sz, sys.PROT_READ | sys.PROT_WRITE);
+    if (tmp < 0) { return; }
+    let is *u8 as tp = cast(*u8, tmp);
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nenv) {
+        let is *u8 as nm = env_name(i);
+        let is i64 as k with mut = 0;
+        while (k < env_tab[i * 4 + 1]) { tp[n + k] = nm[k]; k = k + 1; }
+        env_tab[i * 4] = n;
+        n = n + env_tab[i * 4 + 1];
+        let is *u8 as v = env_val(i);
+        k = 0;
+        while (k < env_tab[i * 4 + 3]) { tp[n + k] = v[k]; k = k + 1; }
+        env_tab[i * 4 + 2] = n;
+        n = n + env_tab[i * 4 + 3];
+        i = i + 1;
+    }
+    let is i64 as c with mut = 0;
+    while (c < n) { envbuf[c] = tp[c]; c = c + 1; }
+    envfill = n;
+    envdead = 0;
+    sys.munmap(tmp, sz);
+    return;
+}
+
+// env_set — set name to val. The slot, or E_NOMEM / E_2BIG when the table or
+// its bytes cannot grow (env_err_text says it in words).
+fn env_set(name as *u8, nlen as i64, val as *u8, vlen as i64) as i64 {
+    let is i64 as rd = _ready();
+    if (rd != 0) { return rd; }
+    let is i64 as slot with mut = env_find(name, nlen);
+    if (slot >= 0 && vlen <= env_tab[slot * 4 + 3]) {
+        // It fits where the old value is.
+        _env_copy(env_tab[slot * 4 + 2], val, vlen);
+        envdead = envdead + env_tab[slot * 4 + 3] - vlen;
+        env_tab[slot * 4 + 3] = vlen;
+        return slot;
+    }
+    let is i64 as add with mut = vlen;
+    if (slot < 0) { add = add + nlen; }
+    let is i64 as rc with mut = grow.need(&env_g, envfill + add);
+    if (rc != 0) { return rc; }
+    if (slot < 0) {
+        rc = grow.need(&envt_g, (nenv + 1) * 32);
+        if (rc != 0) { return rc; }
+        slot = nenv;
+        nenv = nenv + 1;
+        _env_copy(envfill, name, nlen);
+        env_tab[slot * 4] = envfill;
+        env_tab[slot * 4 + 1] = nlen;
+        envfill = envfill + nlen;
+    } else {
+        envdead = envdead + env_tab[slot * 4 + 3];
+    }
+    _env_copy(envfill, val, vlen);
+    env_tab[slot * 4 + 2] = envfill;
+    env_tab[slot * 4 + 3] = vlen;
+    envfill = envfill + vlen;
+    if (envdead > 4096 && envdead > envfill - envdead) { _env_pack(); }
     return slot;
+}
+
+fn env_err_text(e as i64) as *u8 {
+    if (e == sys.E_2BIG) { return cast(*u8, "the variables take more than the shell can hold"); }
+    return cast(*u8, "not enough memory for another variable");
 }
 
 fn env_unset(name as *u8, nlen as i64) as void {
     let is i64 as slot = env_find(name, nlen);
     if (slot < 0) { return; }
+    envdead = envdead + env_tab[slot * 4 + 1] + env_tab[slot * 4 + 3];
     let is i64 as i with mut = slot;
     while (i + 1 < nenv) {
-        env_noff[i] = env_noff[i+1]; env_nlen[i] = env_nlen[i+1];
-        env_voff[i] = env_voff[i+1]; env_vlen[i] = env_vlen[i+1];
+        env_tab[i * 4] = env_tab[(i + 1) * 4];
+        env_tab[i * 4 + 1] = env_tab[(i + 1) * 4 + 1];
+        env_tab[i * 4 + 2] = env_tab[(i + 1) * 4 + 2];
+        env_tab[i * 4 + 3] = env_tab[(i + 1) * 4 + 3];
         i = i + 1;
     }
     nenv = nenv - 1;
@@ -205,10 +396,10 @@ fn env_unset(name as *u8, nlen as i64) as void {
 }
 
 fn env_count() as i64 { return nenv; }
-fn env_name(i as i64) as *u8 { return cast(*u8, &envbuf[env_noff[i]]); }
-fn env_name_len(i as i64) as i64 { return env_nlen[i]; }
-fn env_val(i as i64) as *u8 { return cast(*u8, &envbuf[env_voff[i]]); }
-fn env_val_len(i as i64) as i64 { return env_vlen[i]; }
+fn env_name(i as i64) as *u8 { return cast(*u8, cast(i64, envbuf) + env_tab[i * 4]); }
+fn env_name_len(i as i64) as i64 { return env_tab[i * 4 + 1]; }
+fn env_val(i as i64) as *u8 { return cast(*u8, cast(i64, envbuf) + env_tab[i * 4 + 2]); }
+fn env_val_len(i as i64) as i64 { return env_tab[i * 4 + 3]; }
 
 // ---- pass 1: expansion -----------------------------------------------------
 
@@ -220,15 +411,11 @@ fn _is_name(c as i64) as i64 {
     return 0;
 }
 
-// Set when expansion had to drop bytes. A command substitution or a variable
-// that overflows must not be silently shortened: a truncated command line is a
-// DIFFERENT command, and the caller reports it rather than running it.
-let is i64 as trunc with mut = 0;
-fn truncated() as i64 { return trunc; }
-
+// Expansion writes into expbuf through _put, which grows it; what cannot be
+// written (room_err) fails the line. A command substitution or a variable must
+// never be silently shortened: a truncated command line is a DIFFERENT command.
 fn _put(buf as *u8, n as *i64, c as i64) as void {
-    if (n[0] < BUF_CAP - 1) { buf[n[0]] = cast(u8, c); n[0] = n[0] + 1; }
-    else { trunc = 1; }
+    if (_room(&exp_g, n[0] + 1) == 1) { buf[n[0]] = cast(u8, c); n[0] = n[0] + 1; }
     return;
 }
 
@@ -243,17 +430,16 @@ fn _put_num(buf as *u8, n as *i64, v as i64) as void {
     return;
 }
 
-// capture — run `line` as a command and return its stdout as text appended to
-// buf. This is $(...): a whole sub-shell, so it recurses into run_capture.
-// Declared here and defined after the executor it needs.
-let is i64 as capture_depth with mut = 0;
-
 // expand_line — pass 1. Writes the rewritten line to expbuf and returns its
-// length. Single quotes suppress expansion entirely; double quotes do not.
+// length, or -1 when it could not be written whole (room_error says why).
+// Single quotes suppress expansion entirely; double quotes do not. A $(...) is
+// run by capture, defined after the executor it needs.
 fn expand_line(src as *u8, len as i64) as i64 {
-    trunc = 0;
+    room_err = 0;
+    let is i64 as rd = _ready();
+    if (rd != 0) { room_err = rd; return 0 - 1; }
     let is i64 as n with mut = 0;
-    let is *u8 as out = cast(*u8, &expbuf[0]);
+    let is *u8 as out = expbuf;
     let is i64 as i with mut = 0;
     let is i64 as sq with mut = 0;
     while (i < len) {
@@ -285,8 +471,9 @@ fn expand_line(src as *u8, len as i64) as i64 {
                 let is i64 as slot = env_find(cast(*u8, cast(i64, src) + st), k - st);
                 if (slot >= 0) {
                     let is i64 as v with mut = 0;
-                    while (v < env_vlen[slot]) {
-                        _put(out, &n, cast(i64, envbuf[env_voff[slot] + v]));
+                    let is *u8 as vp = env_val(slot);
+                    while (v < env_val_len(slot)) {
+                        _put(out, &n, cast(i64, vp[v]));
                         v = v + 1;
                     }
                 }
@@ -297,6 +484,7 @@ fn expand_line(src as *u8, len as i64) as i64 {
         }
         else { _put(out, &n, c); i = i + 1; }
     }
+    if (room_err != 0) { return 0 - 1; }
     return n;
 }
 
@@ -322,13 +510,8 @@ let is i64 as OP_SEMI with imut = 1;
 let is i64 as OP_AND  with imut = 2;
 let is i64 as OP_OR   with imut = 3;
 let is i64 as OP_BG   with imut = 4;
-let is i64 as LIST_MAX with imut = 32;
-let is i64 as LIST_CAP with imut = 1024;
-
-let is [1024]u8 as l_line with mut;
-let is [32]i64 as l_off with mut;
-let is [32]i64 as l_len with mut;
-let is [32]i64 as l_op with mut;           // the operator after each part
+// The line and its parts grow like every other table here; they were 1024
+// bytes and 32 parts, and a longer line was refused as "too many commands".
 let is i64 as l_n with mut = 0;
 let is i64 as l_next with mut = 0;          // the next part to consider
 
@@ -339,12 +522,15 @@ fn _blank(c as u8) as i64 {
 
 // Split line into the list. Returns the number of parts (0 for a blank line);
 // -1 for a separator with no command before it ("; a", "a && && b") or a
-// trailing && / || with none after; -2 for more than LIST_MAX parts or a line
-// longer than LIST_CAP.
+// trailing && / || with none after; -2 when the line could not be kept
+// (room_error says why).
 fn list_begin(line as *u8, len as i64) as i64 {
     l_n = 0;
     l_next = 0;
-    if (len > LIST_CAP) { return 0 - 2; }
+    room_err = 0;
+    let is i64 as rd = _ready();
+    if (rd != 0) { room_err = rd; return 0 - 2; }
+    if (_room(&list_g, len + 1) == 0) { return 0 - 2; }
     let is i64 as k with mut = 0;
     while (k < len) { l_line[k] = line[k]; k = k + 1; }
     let is i64 as start with mut = 0;
@@ -384,7 +570,8 @@ fn list_begin(line as *u8, len as i64) as i64 {
                 if (l_n > 0 && (l_op[l_n - 1] == OP_AND || l_op[l_n - 1] == OP_OR)) { l_n = 0; return 0 - 1; }
                 return l_n;
             }
-            if (l_n >= LIST_MAX) { l_n = 0; return 0 - 2; }
+            if (_room(&loff_g, (l_n + 1) * 8) == 0 || _room(&llen_g, (l_n + 1) * 8) == 0
+                || _room(&lop_g, (l_n + 1) * 8) == 0) { l_n = 0; return 0 - 2; }
             l_off[l_n] = a; l_len[l_n] = b - a; l_op[l_n] = op;
             l_n = l_n + 1;
             if (op == OP_END) { return l_n; }
@@ -409,7 +596,7 @@ fn list_next(p as *i64, n as *i64, bg as *i64) as i64 {
             if (l_op[i - 1] == OP_OR && last_status == 0) { run = 0; }
         }
         if (run == 1) {
-            p[0] = cast(i64, &l_line[l_off[i]]);
+            p[0] = cast(i64, l_line) + l_off[i];
             n[0] = l_len[i];
             bg[0] = 0;
             if (l_op[i] == OP_BG) { bg[0] = 1; }
@@ -431,22 +618,29 @@ fn list_cancel() as void { l_n = 0; l_next = 0; return; }
 
 // ---- pass 2: tokenise ------------------------------------------------------
 
+// Append a word to the table, growing it. 0 with room_err set when it cannot.
 fn _wpush(off as i64, len as i64, quoted as i64) as void {
-    if (nword >= MAX_WORDS) { return; }
+    let is i64 as at = (nword + 1) * 8;
+    if (_room(&woff_g, at) == 0 || _room(&wlen_g, at) == 0 || _room(&wq_g, at) == 0) { return; }
     w_off[nword] = off; w_len[nword] = len; w_quoted[nword] = quoted;
     nword = nword + 1;
     return;
 }
 
-fn word_ptr(i as i64) as *u8 { return cast(*u8, &wbuf[w_off[i]]); }
+fn word_ptr(i as i64) as *u8 { return cast(*u8, cast(i64, wbuf) + w_off[i]); }
 fn word_len(i as i64) as i64 { return w_len[i]; }
 
 // tokenise — pass 2. Splits on unquoted spaces and keeps '|' '<' '>' '>>' as
 // their own words so pass 3 and 4 can see them. Quotes are removed here and
-// remembered per word so globbing can skip them.
+// remembered per word so globbing can skip them. The words never take more
+// bytes than the line they came from, so room for them is made once, here.
 fn tokenise(src as *u8, len as i64) as i64 {
     prepared_program = 0;
-    nword = 0; wfill = 0;
+    nword = 0; wfill = wbase;
+    if (_ready() != 0 || _wroom(len + 8) == 0) {
+        if (room_err == 0) { room_err = sys.E_NOMEM; }
+        return 0;
+    }
     let is i64 as i with mut = 0;
     while (i < len) {
         while (i < len && (src[i] == cast(u8, 32) || src[i] == cast(u8, 9))) { i = i + 1; }
@@ -495,14 +689,14 @@ fn tokenise(src as *u8, len as i64) as i64 {
                         q = 1;
                         i = i + 1;
                         while (i < len && cast(i64, src[i]) != close) {
-                            if (wfill < BUF_CAP - 1) { wbuf[wfill] = src[i]; wfill = wfill + 1; }
+                            wbuf[wfill] = src[i]; wfill = wfill + 1;
                             i = i + 1;
                         }
                         if (i < len) { i = i + 1; }            // skip the closer
                     } else if (ch == 32 || ch == 9 || ch == 124 || ch == 60 || ch == 62) {
                         done = 1;
                     } else {
-                        if (wfill < BUF_CAP - 1) { wbuf[wfill] = src[i]; wfill = wfill + 1; }
+                        wbuf[wfill] = src[i]; wfill = wfill + 1;
                         i = i + 1;
                     }
                 }
@@ -524,7 +718,7 @@ fn fnmatch(pat as *u8, plen as i64, nm as *u8, nlen as i64) as i64 {
 
 fn has_meta(w as i64) as i64 {
     if (w_quoted[w] == 1) { return 0; }
-    let is *u8 as p = cast(*u8, &wbuf[w_off[w]]);
+    let is *u8 as p = word_ptr(w);
     let is i64 as i with mut = 0;
     while (i < w_len[w]) {
         let is i64 as c = cast(i64, p[i]);
@@ -537,78 +731,93 @@ fn has_meta(w as i64) as i64 {
 // glob_words — pass 5. Rebuilds the word table with every pattern replaced by
 // the names it matched, sorted the way readdir returns them. A pattern that
 // matches nothing is kept verbatim: that is what a user typing a literal '?'
-// means, and it is what every shell does by default.
+// means, and it is what every shell does by default. Every match is kept —
+// the new table grows with them (room_err when it cannot, and the line fails
+// rather than run with part of a directory).
+fn _gpush(nn as i64, off as i64, len as i64, q as i64) as i64 {
+    let is i64 as at = (nn + 1) * 8;
+    if (_room(&goff_g, at) == 0 || _room(&glen_g, at) == 0 || _room(&gq_g, at) == 0) { return nn; }
+    let is *i64 as go = grow.words(&goff_g);
+    let is *i64 as gl = grow.words(&glen_g);
+    let is *i64 as gq = grow.words(&gq_g);
+    go[nn] = off; gl[nn] = len; gq[nn] = q;
+    return nn + 1;
+}
+
 fn glob_words() as void {
-    let is [64]i64 as n_off;
-    let is [64]i64 as n_len;
-    let is [64]i64 as n_q;
     let is i64 as nn with mut = 0;
     let is i64 as w with mut = 0;
-    while (w < nword) {
+    while (w < nword && room_err == 0) {
         if (has_meta(w) == 0) {
-            if (nn < MAX_WORDS) { n_off[nn] = w_off[w]; n_len[nn] = w_len[w]; n_q[nn] = w_quoted[w]; nn = nn + 1; }
+            nn = _gpush(nn, w_off[w], w_len[w], w_quoted[w]);
         } else {
             // Split "dir/pat" so only the last component is matched; the
             // directory part is a literal prefix on every result.
-            let is *u8 as pw = cast(*u8, &wbuf[w_off[w]]);
+            let is *u8 as pw = word_ptr(w);
             let is i64 as slash with mut = 0 - 1;
             let is i64 as k with mut = 0;
             while (k < w_len[w]) { if (pw[k] == cast(u8, 47)) { slash = k; } k = k + 1; }
-            let is [128]u8 as dir;
+            // The prefix every match gets, and the directory to read. Without
+            // a directory part both are the shell's own directory; with one,
+            // the prefix is as typed and the directory is it resolved here —
+            // the VFS takes absolute paths only, so `docs/*.txt` opened "docs/"
+            // and never matched anything.
+            let is [256]u8 as dir;
             let is i64 as dlen with mut = 0;
-            if (slash < 0) {
-                // No directory part: the pattern matches in the shell's cwd.
-                while (dlen < 120 && dlen < cwd_len) { dir[dlen] = cwd[dlen]; dlen = dlen + 1; }
-                if (dlen == 0) { dir[0] = cast(u8, 47); dlen = 1; }
-            }
-            else {
-                dlen = slash + 1;
-                if (dlen > 120) { dlen = 120; }
-                let is i64 as d with mut = 0;
-                while (d < dlen) { dir[d] = pw[d]; d = d + 1; }
-                if (dlen == 0) { dir[0] = cast(u8, 47); dlen = 1; }
+            let is *u8 as prefix with mut = cast(*u8, &cwd[0]);
+            let is i64 as plen0 with mut = cwd_len;
+            if (slash >= 0) { prefix = pw; plen0 = slash + 1; }
+            let is *u8 as abs = resolve(prefix, plen0);
+            if (cast(i64, abs) != 0) {
+                while (abs[dlen] != cast(u8, 0)) { dir[dlen] = abs[dlen]; dlen = dlen + 1; }
             }
             dir[dlen] = cast(u8, 0);
             let is i64 as poff = w_off[w] + slash + 1;
             let is i64 as plen = w_len[w] - slash - 1;
 
             let is i64 as hits with mut = 0;
-            let is i64 as fd = sys.open_read(cast(*u8, &dir[0]));
+            let is i64 as fd with mut = 0 - 1;
+            if (dlen > 0) { fd = sys.open_read(cast(*u8, &dir[0])); }
             if (fd >= 0) {
                 let is [320]u8 as de;
-                while (sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+                while (room_err == 0 && sys.readdir(fd, cast(*u8, &de[0])) == 0) {
                     let is *u8 as nm = cast(*u8, &de[0]);
                     let is *i64 as nlp = cast(*i64, cast(i64, &de[0]) + 256);
                     let is i64 as nl = nlp[0];
-                    if (fnmatch(cast(*u8, &wbuf[poff]), plen, nm, nl) == 1) {
-                        if (nn < MAX_WORDS && wfill + dlen + nl + 1 < BUF_CAP) {
-                            let is i64 as o = wfill;
-                            // The directory is ALWAYS prefixed, even when the
-                            // pattern carried none: the match reaches the child
-                            // as the absolute path it is, the same file in
-                            // whatever directory the child resolves against.
-                            let is i64 as d2 with mut = 0;
-                            while (d2 < dlen) { wbuf[wfill] = dir[d2]; wfill = wfill + 1; d2 = d2 + 1; }
-                            if (wfill > o && wbuf[wfill - 1] != cast(u8, 47)) {
-                                wbuf[wfill] = cast(u8, 47); wfill = wfill + 1;
-                            }
-                            let is i64 as m with mut = 0;
-                            while (m < nl) { wbuf[wfill] = nm[m]; wfill = wfill + 1; m = m + 1; }
-                            n_off[nn] = o; n_len[nn] = wfill - o; n_q[nn] = 1;
-                            nn = nn + 1; hits = hits + 1;
+                    if (fnmatch(cast(*u8, cast(i64, wbuf) + poff), plen, nm, nl) == 1
+                        && _wroom(plen0 + nl + 1) == 1) {
+                        let is i64 as o = wfill;
+                        // The directory is ALWAYS prefixed, even when the
+                        // pattern carried none: the match reaches the child
+                        // as the path it is, the same file in whatever
+                        // directory the child resolves against.
+                        let is i64 as d2 with mut = 0;
+                        while (d2 < plen0) { wbuf[wfill] = prefix[d2]; wfill = wfill + 1; d2 = d2 + 1; }
+                        if (wfill > o && wbuf[wfill - 1] != cast(u8, 47)) {
+                            wbuf[wfill] = cast(u8, 47); wfill = wfill + 1;
                         }
+                        let is i64 as m with mut = 0;
+                        while (m < nl) { wbuf[wfill] = nm[m]; wfill = wfill + 1; m = m + 1; }
+                        nn = _gpush(nn, o, wfill - o, 1);
+                        hits = hits + 1;
                     }
                 }
                 sys.close(fd);
             }
-            if (hits == 0) {
-                if (nn < MAX_WORDS) { n_off[nn] = w_off[w]; n_len[nn] = w_len[w]; n_q[nn] = w_quoted[w]; nn = nn + 1; }
-            }
+            if (hits == 0) { nn = _gpush(nn, w_off[w], w_len[w], w_quoted[w]); }
         }
         w = w + 1;
     }
+    if (room_err != 0) { return; }
+    // The new table back into the word table, which has room for it: every
+    // word it holds is either one of the old ones or a match pushed past them.
+    let is *i64 as go = grow.words(&goff_g);
+    let is *i64 as gl = grow.words(&glen_g);
+    let is *i64 as gq = grow.words(&gq_g);
+    let is i64 as at = (nn + 1) * 8;
+    if (_room(&woff_g, at) == 0 || _room(&wlen_g, at) == 0 || _room(&wq_g, at) == 0) { return; }
     let is i64 as c with mut = 0;
-    while (c < nn) { w_off[c] = n_off[c]; w_len[c] = n_len[c]; w_quoted[c] = n_q[c]; c = c + 1; }
+    while (c < nn) { w_off[c] = go[c]; w_len[c] = gl[c]; w_quoted[c] = gq[c]; c = c + 1; }
     nword = nn;
     return;
 }
@@ -622,21 +831,23 @@ fn _is_op(w as i64, lit as i64) as i64 {
 }
 
 // build_cmds — cut the word list into stages on '|', then lift each stage's
-// redirects out of its argv. Returns the stage count, or -1 on a syntax error
-// (message written through `t`).
+// redirects out of its argv. Returns the stage count; -2 for a redirect with
+// no target; -1 when the stage table cannot grow (room_error says why).
 fn build_cmds() as i64 {
     ncmd = 0;
+    if (room_err != 0) { return 0 - 1; }
     let is i64 as w with mut = 0;
     let is i64 as start with mut = 0;
     while (w <= nword) {
         if (w == nword || _is_op(w, 124) == 1) {
-            if (ncmd >= MAX_CMDS) { return 0 - 1; }
-            cmds[ncmd].w0 = start;
-            cmds[ncmd].wn = w - start;
-            cmds[ncmd].in_w = 0 - 1;
-            cmds[ncmd].out_w = 0 - 1;
-            cmds[ncmd].append = 0;
-            cmds[ncmd].err_to_out = 0;
+            if (_room(&cmd_g, (ncmd + 1) * sizeof(Cmd)) == 0) { ncmd = 0; return 0 - 1; }
+            let is *Cmd as cm = cmd_at(ncmd);
+            cm.w0 = start;
+            cm.wn = w - start;
+            cm.in_w = 0 - 1;
+            cm.out_w = 0 - 1;
+            cm.append = 0;
+            cm.err_to_out = 0;
             ncmd = ncmd + 1;
             start = w + 1;
         }
@@ -646,52 +857,50 @@ fn build_cmds() as i64 {
     // argv by compacting the remaining words down.
     let is i64 as c with mut = 0;
     while (c < ncmd) {
-        let is i64 as rd with mut = cmds[c].w0;
-        let is i64 as wr with mut = cmds[c].w0;
-        let is i64 as end = cmds[c].w0 + cmds[c].wn;
+        let is *Cmd as cc = cmd_at(c);
+        let is i64 as rd with mut = cc.w0;
+        let is i64 as wr with mut = cc.w0;
+        let is i64 as end = cc.w0 + cc.wn;
         while (rd < end) {
+            let is *u8 as rp = word_ptr(rd);
             if (_is_op(rd, 60) == 1) {                          // '<'
                 if (rd + 1 >= end) { return 0 - 2; }
-                cmds[c].in_w = rd + 1; rd = rd + 2;
-            } else if (w_len[rd] == 1 && cast(i64, wbuf[w_off[rd]]) == 62) {   // '>'
+                cc.in_w = rd + 1; rd = rd + 2;
+            } else if (w_len[rd] == 1 && cast(i64, rp[0]) == 62) {   // '>'
                 if (rd + 1 >= end) { return 0 - 2; }
-                cmds[c].out_w = rd + 1; cmds[c].append = 0; rd = rd + 2;
-            } else if (w_len[rd] == 2 && cast(i64, wbuf[w_off[rd]]) == 62
-                                      && cast(i64, wbuf[w_off[rd] + 1]) == 62) { // '>>'
+                cc.out_w = rd + 1; cc.append = 0; rd = rd + 2;
+            } else if (w_len[rd] == 2 && cast(i64, rp[0]) == 62
+                                      && cast(i64, rp[1]) == 62) { // '>>'
                 if (rd + 1 >= end) { return 0 - 2; }
-                cmds[c].out_w = rd + 1; cmds[c].append = 1; rd = rd + 2;
-            } else if (w_len[rd] == 4 && cast(i64, wbuf[w_off[rd]]) == 50
-                       && cast(i64, wbuf[w_off[rd]+1]) == 62
-                       && cast(i64, wbuf[w_off[rd]+2]) == 38
-                       && cast(i64, wbuf[w_off[rd]+3]) == 49) {  // "2>&1"
-                cmds[c].err_to_out = 1; rd = rd + 1;
+                cc.out_w = rd + 1; cc.append = 1; rd = rd + 2;
+            } else if (w_len[rd] == 4 && cast(i64, rp[0]) == 50
+                       && cast(i64, rp[1]) == 62
+                       && cast(i64, rp[2]) == 38
+                       && cast(i64, rp[3]) == 49) {  // "2>&1"
+                cc.err_to_out = 1; rd = rd + 1;
             } else {
                 w_off[wr] = w_off[rd]; w_len[wr] = w_len[rd]; w_quoted[wr] = w_quoted[rd];
                 // A redirect target moved down with the words; keep the index
                 // pointing at the same word after compaction.
-                if (cmds[c].in_w == rd)  { cmds[c].in_w = wr; }
-                if (cmds[c].out_w == rd) { cmds[c].out_w = wr; }
+                if (cc.in_w == rd)  { cc.in_w = wr; }
+                if (cc.out_w == rd) { cc.out_w = wr; }
                 wr = wr + 1; rd = rd + 1;
             }
         }
-        cmds[c].wn = wr - cmds[c].w0;
+        cc.wn = wr - cc.w0;
         c = c + 1;
     }
     return ncmd;
 }
 
 fn cmd_count() as i64 { return ncmd; }
-fn cmd_at(i as i64) as *Cmd { return &cmds[i]; }
 
 // ---- execution -------------------------------------------------------------
 
-// A NUL-terminated copy of a word, for the syscalls that take a C string.
-let is [256]u8 as pathtmp with mut;
-fn _cpath(w as i64) as *u8 {
-    // Redirect targets are FILES, so they resolve against the shell's cwd —
-    // unlike a command name, which is looked up where the programs live.
-    return resolve(cast(*u8, &wbuf[w_off[w]]), w_len[w]);
-}
+// A redirect's file as an absolute path, or 0 when it is longer than a path
+// can be. Redirect targets are FILES, so they resolve against the shell's cwd
+// — unlike a command name, which is looked up where the programs live.
+fn _cpath(w as i64) as *u8 { return resolve(word_ptr(w), w_len[w]); }
 
 // prog_path — the file a command word names, into `out` (NUL-terminated, 256
 // bytes), and whether a program is there. 1 = found, 0 = no such command.
@@ -717,7 +926,7 @@ fn prog_path(w as i64, out as *u8) as i64 {
     while (i < wl) { if (wp[i] == cast(u8, 47)) { slash = 1; } i = i + 1; }
 
     if (slash == 0) {
-        if (wl > 110) { return 0; }
+        if (wl + 5 > prog.PATH_MAX) { return 0; }          // "/" + name + ".cse"
         out[0] = cast(u8, 47);
         i = 0;
         while (i < wl) { out[1 + i] = wp[i]; i = i + 1; }
@@ -729,9 +938,11 @@ fn prog_path(w as i64, out as *u8) as i64 {
     }
 
     let is *u8 as abs = resolve(wp, wl);
+    if (cast(i64, abs) == 0) { return 0; }                  // longer than any path
     let is i64 as n with mut = 0;
-    while (abs[n] != cast(u8, 0) && n < 250) { out[n] = abs[n]; n = n + 1; }
+    while (abs[n] != cast(u8, 0)) { out[n] = abs[n]; n = n + 1; }
     out[n] = cast(u8, 0);
+    if (n + 4 > prog.PATH_MAX) { return _is_prog(out); }   // no room to try ".cse"
     if (_is_prog(out) == 1) { return 1; }
     if (n >= 4 && out[n - 4] == cast(u8, 46) && out[n - 3] == cast(u8, 99)
         && out[n - 2] == cast(u8, 115) && out[n - 1] == cast(u8, 101)) {
@@ -798,7 +1009,7 @@ fn failure_text(code as i64, out as *u8) as i64 {
     let is *u8 as what with mut = cast(*u8, "");
     let is i64 as named with mut = 1;
     if (code == EXEC_NOT_FOUND) { what = cast(*u8, ": not found"); }
-    else if (code == EXEC_NO_FILE) { what = cast(*u8, ": cannot open (redirect)"); }
+    else if (code == EXEC_NO_FILE) { what = _redirect_words(fail_errno); }
     else if (code == EXEC_SPAWN && fail_spawned == 1) { what = _spawn_words(fail_errno); }
     else if (code == EXEC_SPAWN) {
         what = cast(*u8, "could not start the command: no channel for its input or output");
@@ -834,7 +1045,30 @@ fn _spawn_words(e as i64) as *u8 {
     if (e == sys.E_MFILE) { return cast(*u8, ": too many different programs are loaded"); }
     if (e == sys.E_NOENT) { return cast(*u8, ": not found"); }
     if (e == sys.E_ISDIR) { return cast(*u8, ": is a directory"); }
+    if (e == sys.E_2BIG)  { return cast(*u8, ": argument list too long (spawn takes 256 KiB of arguments)"); }
     return cast(*u8, ": could not be started");
+}
+
+// Why a redirect's file would not open, after its name. E_RANGE is the shell's
+// own: a path longer than any path can be, which it does not hand the VFS.
+fn _redirect_words(e as i64) as *u8 {
+    if (e == sys.E_RANGE)  { return cast(*u8, ": cannot open (redirect): the path is longer than 255 bytes"); }
+    if (e == sys.E_NOENT)  { return cast(*u8, ": cannot open (redirect): no such file or directory"); }
+    if (e == sys.E_ISDIR)  { return cast(*u8, ": cannot open (redirect): is a directory"); }
+    if (e == sys.E_NOTDIR) { return cast(*u8, ": cannot open (redirect): a part of the path is not a directory"); }
+    if (e == sys.E_NOSPC)  { return cast(*u8, ": cannot open (redirect): no space left on the volume"); }
+    if (e == sys.E_TXTBSY) { return cast(*u8, ": cannot open (redirect): a running program was loaded from it"); }
+    return cast(*u8, ": cannot open (redirect)");
+}
+
+// Open a redirect's file: `mode` 0 read, 1 write, 2 append. The fd, or the
+// errno — E_RANGE for a path too long to be one.
+fn _open_redirect(w as i64, mode as i64) as i64 {
+    let is *u8 as p = _cpath(w);
+    if (cast(i64, p) == 0) { return sys.E_RANGE; }
+    if (mode == 0) { return sys.open_read(p); }
+    if (mode == 2) { return sys.open_append(p); }
+    return sys.open_write(p);
 }
 
 // crash_line — if job `slot` crashed, say so on t, on a line of its own, in
@@ -892,16 +1126,17 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
     else { failed = 3; }
 
     while (c < ncmd && failed == 0) {
-        if (cmds[c].wn <= 0) { failed = 4; }
+        let is *Cmd as cc = cmd_at(c);
+        if (cc.wn <= 0) { failed = 4; }
         else {
             let is [256]u8 as ipath;
             let is *u8 as image_path with mut = cast(*u8, &ipath[0]);
             let is i64 as found with mut = 1;
-            if (prepared_program == 1) { image_path = word_ptr(cmds[c].w0); }
-            else { found = prog_path(cmds[c].w0, image_path); }
+            if (prepared_program == 1) { image_path = word_ptr(cc.w0); }
+            else { found = prog_path(cc.w0, image_path); }
             if (found == 0) {
                 failed = 1;
-                _set_fail_word(word_ptr(cmds[c].w0), word_len(cmds[c].w0));
+                _set_fail_word(word_ptr(cc.w0), word_len(cc.w0));
             }
             else {
                 // stdin: the previous stage's output, an explicit '<' file, or
@@ -909,9 +1144,12 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                 let is i64 as child_in with mut = 0 - 1;
                 let is i64 as keep_in with mut = 0 - 1;
                 if (prev_read >= 0) { child_in = prev_read; }
-                else if (cmds[c].in_w >= 0) {
-                    child_in = sys.open_read(_cpath(cmds[c].in_w));
-                    if (child_in < 0) { failed = 2; _set_fail_word(word_ptr(cmds[c].in_w), word_len(cmds[c].in_w)); }
+                else if (cc.in_w >= 0) {
+                    child_in = _open_redirect(cc.in_w, 0);
+                    if (child_in < 0) {
+                        failed = 2; fail_errno = child_in;
+                        _set_fail_word(word_ptr(cc.in_w), word_len(cc.in_w));
+                    }
                 } else {
                     let is [2]i64 as ich;
                     fail_errno = sys.channel_create(&ich[0]);
@@ -925,10 +1163,13 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                 let is i64 as tty_keep with mut = 0 - 1;    // the terminal's end of TTY_FD
                 let is i64 as tty_child with mut = 0 - 1;
                 if (failed == 0) {
-                    if (cmds[c].out_w >= 0) {
-                        if (cmds[c].append == 1) { child_out = sys.open_append(_cpath(cmds[c].out_w)); }
-                        else { child_out = sys.open_write(_cpath(cmds[c].out_w)); }
-                        if (child_out < 0) { failed = 2; _set_fail_word(word_ptr(cmds[c].out_w), word_len(cmds[c].out_w)); }
+                    if (cc.out_w >= 0) {
+                        if (cc.append == 1) { child_out = _open_redirect(cc.out_w, 2); }
+                        else { child_out = _open_redirect(cc.out_w, 1); }
+                        if (child_out < 0) {
+                            failed = 2; fail_errno = child_out;
+                            _set_fail_word(word_ptr(cc.out_w), word_len(cc.out_w));
+                        }
                     } else if (c + 1 == ncmd && want_tty == 1) {
                         // The terminal: the job's channel, shared with every
                         // stage's stderr and closed once they all have it. This
@@ -949,6 +1190,14 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     }
                 }
 
+                // argv: {pointer, length} for every word of the stage, in a
+                // table that grows with them. The kernel takes ARGV_MAX bytes
+                // of arguments and says E_2BIG past it, which is reported.
+                if (failed == 0 && grow.need(&av_g, cc.wn * 16) != 0) {
+                    failed = 3; fail_errno = sys.E_NOMEM; fail_spawned = 1;
+                    _set_fail_word(word_ptr(cc.w0), word_len(cc.w0));
+                }
+
                 if (failed == 0) {
                     // Nine pairs at most: stdin/stdout/stderr, aux, network,
                     // audio, TTY control, the stderr-terminal marker and the
@@ -963,9 +1212,9 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     fdacts[4] = 2; fdacts[5] = term_w; nact = 3;
                     let is i64 as err_tty with mut = 0;
                     if (want_tty == 1) {
-                        if (cmds[c].err_to_out == 0 || child_out == term_w) { err_tty = 1; }
+                        if (cc.err_to_out == 0 || child_out == term_w) { err_tty = 1; }
                     }
-                    if (cmds[c].err_to_out == 1) { fdacts[5] = child_out; }
+                    if (cc.err_to_out == 1) { fdacts[5] = child_out; }
                     if (aux_fd_slot >= 0 && aux_out[0] >= 0) {
                         fdacts[nact*2] = aux_fd_slot; fdacts[nact*2+1] = aux_out[1];
                         nact = nact + 1;
@@ -1005,34 +1254,41 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         fdacts[nact*2] = sys.DIR_FD; fdacts[nact*2+1] = dir_fd;
                         nact = nact + 1;
                     }
-                    let is [128]i64 as av;              // MAX_WORDS pairs
+                    let is *i64 as av = grow.words(&av_g);
                     let is i64 as k with mut = 0;
-                    while (k < cmds[c].wn && k < MAX_WORDS) {
-                        av[2 * k] = cast(i64, &wbuf[w_off[cmds[c].w0 + k]]);
-                        av[2 * k + 1] = w_len[cmds[c].w0 + k];
+                    while (k < cc.wn) {
+                        av[2 * k] = cast(i64, word_ptr(cc.w0 + k));
+                        av[2 * k + 1] = w_len[cc.w0 + k];
                         k = k + 1;
                     }
                     let is i64 as pid = sys.spawn_path(image_path,
                                                        cast(*u8, &fdacts[0]), nact,
-                                                       cast(*u8, &av[0]), k);
+                                                       cast(*u8, av), k);
                     // The child owns its ends now; the shell must let go of them
                     // or the next stage never sees end-of-stream.
-                    if (child_in >= 0 && prev_read < 0 && cmds[c].in_w < 0) { sys.close(child_in); }
-                    else if (child_in >= 0) { sys.close(child_in); }
+                    if (child_in >= 0) { sys.close(child_in); }
                     if (child_out >= 0 && child_out != term_w) { sys.close(child_out); }
                     if (tty_child >= 0) { sys.close(tty_child); tty_child = 0 - 1; }
                     if (dir_fd >= 0) { sys.close(dir_fd); }
-                    if (pid < 0) {
+                    let is i64 as added with mut = 0;
+                    if (pid >= 0) {
+                        added = jobs.add_pid(slot, pid);
+                        // A stage the job cannot hold could never be reaped:
+                        // it is ended now, and the line fails for want of
+                        // memory like a spawn that never happened.
+                        if (added != 0) { sys.kill(pid); }
+                    }
+                    if (pid < 0 || added != 0) {
                         failed = 3;
                         fail_errno = pid;
+                        if (pid >= 0) { fail_errno = added; }
                         fail_spawned = 1;
-                        _set_fail_word(word_ptr(cmds[c].w0), word_len(cmds[c].w0));
+                        _set_fail_word(word_ptr(cc.w0), word_len(cc.w0));
                         if (keep_in >= 0) { sys.close(keep_in); }
                         if (keep_out >= 0) { sys.close(keep_out); }
                         if (next_read >= 0) { sys.close(next_read); }
                         if (tty_keep >= 0) { sys.close(tty_keep); }
                     } else {
-                        jobs.add_pid(slot, pid);
                         if (keep_in >= 0)  { jb.in_fd = keep_in; }
                         if (keep_out >= 0) { jb.out_fd = keep_out; }
                         if (tty_keep >= 0) { jb.tty_fd = tty_keep; jb.tty_fill = 0; }
@@ -1070,13 +1326,15 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
     return slot;
 }
 
-// capture — $(cmd): run a line and append its stdout to `out`. Trailing
-// newlines are stripped, the way command substitution is expected to behave.
-// Recursion is capped: $(echo $(echo ...)) is fine, a self-referential alias
-// would otherwise not terminate.
+// capture — $(cmd): run a line and append its stdout to `out`, all of it.
+// Trailing newlines are stripped, the way command substitution is expected to
+// behave. It kept 1024 bytes of the output and refused the line past them,
+// and copied the command into 4096 bytes. It does not recurse — what it runs
+// is tokenised, not expanded — so there is no depth to cap.
+//
 // What the commands of $(...) wrote to stderr, held until the shell that is
 // expanding the line can put it on its terminal (cap_err_show). Past the
-// buffer, the rest is counted, not kept.
+// buffer, the rest is counted and the count shown.
 let is [2048]u8 as cap_err with mut;
 let is i64 as cap_err_len with mut = 0;
 let is i64 as cap_err_lost with mut = 0;
@@ -1123,47 +1381,52 @@ fn cap_err_show(t as *term.Term) as void {
 }
 
 fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
-    if (capture_depth >= 4) { return; }
-    capture_depth = capture_depth + 1;
-
-    // The word table is global and we are in the middle of using it, so save
-    // and restore it around the nested parse.
-    let is [64]i64 as s_off; let is [64]i64 as s_len; let is [64]i64 as s_q;
+    // The word and stage tables are global and the caller may be in the middle
+    // of using them, so they are saved around the nested parse, and the
+    // nested words go into wbuf past the caller's (wbase).
     let is i64 as s_nword = nword;
     let is i64 as s_wfill = wfill;
+    let is i64 as s_wbase = wbase;
     let is i64 as s_ncmd = ncmd;
+    let is i64 as save_words = s_nword * 3 + s_ncmd * 6;
+    let is i64 as save_sz = ((save_words * 8 + 4095) / 4096) * 4096;
+    let is *i64 as sv with mut = cast(*i64, 0);
+    if (save_words > 0) {
+        let is i64 as va = sys.mmap(0, save_sz, sys.PROT_READ | sys.PROT_WRITE);
+        if (va < 0) { if (room_err == 0) { room_err = sys.E_NOMEM; } return; }
+        sv = cast(*i64, va);
+    }
     let is i64 as i with mut = 0;
-    while (i < s_nword) { s_off[i] = w_off[i]; s_len[i] = w_len[i]; s_q[i] = w_quoted[i]; i = i + 1; }
+    while (i < s_nword) {
+        sv[i * 3] = w_off[i]; sv[i * 3 + 1] = w_len[i]; sv[i * 3 + 2] = w_quoted[i];
+        i = i + 1;
+    }
     // Field by field: a whole-struct assignment would depend on the compiler
     // emitting a copy, and this is the one place a silent aliasing bug would
     // corrupt the caller's half-parsed line rather than fail loudly.
-    let is [48]i64 as s_cmds;
+    let is i64 as cb = s_nword * 3;
     i = 0;
     while (i < s_ncmd) {
-        s_cmds[i*6+0] = cmds[i].w0;    s_cmds[i*6+1] = cmds[i].wn;
-        s_cmds[i*6+2] = cmds[i].in_w;  s_cmds[i*6+3] = cmds[i].out_w;
-        s_cmds[i*6+4] = cmds[i].append; s_cmds[i*6+5] = cmds[i].err_to_out;
+        let is *Cmd as sc = cmd_at(i);
+        sv[cb + i*6+0] = sc.w0;     sv[cb + i*6+1] = sc.wn;
+        sv[cb + i*6+2] = sc.in_w;   sv[cb + i*6+3] = sc.out_w;
+        sv[cb + i*6+4] = sc.append; sv[cb + i*6+5] = sc.err_to_out;
         i = i + 1;
     }
 
-    let is [4096]u8 as sub;
-    let is i64 as j with mut = 0;
-    while (j < len && j < 4095) { sub[j] = src[j]; j = j + 1; }
-
-    tokenise(cast(*u8, &sub[0]), j);
+    wbase = s_wfill;
+    tokenise(src, len);
     glob_words();
     let is i64 as nc = build_cmds();
     let is i64 as slot with mut = 0 - 1;
-    if (nc > 0) { slot = exec(0, cast(*u8, &sub[0]), j, 0 - 1, cast(*i64, 0), 0); }
+    if (nc > 0) { slot = exec(0, src, len, 0 - 1, cast(*i64, 0), 0); }
 
     if (slot >= 0) {
         let is *jobs.Job as jb = jobs.get(slot);
         let is [256]u8 as buf;
-        let is i64 as tmpn with mut = 0;
-        let is [1024]u8 as acc;
-        let is i64 as guard with mut = 0;
+        let is i64 as start = n[0];
         let is i64 as reading with mut = 1;
-        while (reading == 1 && guard < 65536) {
+        while (reading == 1) {
             let is [6]i64 as pe;
             pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
             let is i64 as np with mut = 1;
@@ -1180,21 +1443,14 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
                 if (got <= 0) { reading = 0; }
                 else {
                     let is i64 as k with mut = 0;
-                    while (k < got) {
-                        if (tmpn < 1024) { acc[tmpn] = buf[k]; tmpn = tmpn + 1; }
-                        else { trunc = 1; }
-                        k = k + 1;
-                    }
+                    while (k < got) { _put(out, n, cast(i64, buf[k])); k = k + 1; }
                 }
             } else if ((pe[2] & sys.POLL_CLOSED) != 0) { reading = 0; }
             else if (jobs.get(slot).status != jobs.JOB_RUN) { reading = 0; }
-            guard = guard + 1;
         }
-        while (tmpn > 0 && (acc[tmpn - 1] == cast(u8, 10) || acc[tmpn - 1] == cast(u8, 13))) {
-            tmpn = tmpn - 1;
+        while (n[0] > start && (out[n[0] - 1] == cast(u8, 10) || out[n[0] - 1] == cast(u8, 13))) {
+            n[0] = n[0] - 1;
         }
-        let is i64 as m with mut = 0;
-        while (m < tmpn) { _put(out, n, cast(i64, acc[m])); m = m + 1; }
         // Whatever it said on its way out, up to the end of the channel.
         let is i64 as eg with mut = 0;
         while (jb.err_fd >= 0 && eg < 64) {
@@ -1212,16 +1468,20 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
 
     // Restore the caller's parse state.
     i = 0;
-    while (i < s_nword) { w_off[i] = s_off[i]; w_len[i] = s_len[i]; w_quoted[i] = s_q[i]; i = i + 1; }
-    nword = s_nword; wfill = s_wfill; ncmd = s_ncmd;
-    i = 0;
-    while (i < s_ncmd) {
-        cmds[i].w0 = s_cmds[i*6+0];    cmds[i].wn = s_cmds[i*6+1];
-        cmds[i].in_w = s_cmds[i*6+2];  cmds[i].out_w = s_cmds[i*6+3];
-        cmds[i].append = s_cmds[i*6+4]; cmds[i].err_to_out = s_cmds[i*6+5];
+    while (i < s_nword) {
+        w_off[i] = sv[i * 3]; w_len[i] = sv[i * 3 + 1]; w_quoted[i] = sv[i * 3 + 2];
         i = i + 1;
     }
-    capture_depth = capture_depth - 1;
+    nword = s_nword; wfill = s_wfill; wbase = s_wbase; ncmd = s_ncmd;
+    i = 0;
+    while (i < s_ncmd) {
+        let is *Cmd as dc = cmd_at(i);
+        dc.w0 = sv[cb + i*6+0];     dc.wn = sv[cb + i*6+1];
+        dc.in_w = sv[cb + i*6+2];   dc.out_w = sv[cb + i*6+3];
+        dc.append = sv[cb + i*6+4]; dc.err_to_out = sv[cb + i*6+5];
+        i = i + 1;
+    }
+    if (save_words > 0) { sys.munmap(cast(i64, sv), save_sz); }
     return;
 }
 
@@ -1320,17 +1580,20 @@ fn run_sync(t as *term.Term, line as *u8, len as i64) as i64 {
 // `cd docs` while `echo note.txt` still prints what was typed.
 fn anchor_dots() as void {
     let is i64 as w with mut = 0;
-    while (w < nword) {
-        let is *u8 as p = cast(*u8, &wbuf[w_off[w]]);
+    while (w < nword && room_err == 0) {
+        let is *u8 as p = word_ptr(w);
         let is i64 as l = w_len[w];
         let is i64 as is_dot with mut = 0;
         if (l >= 2 && p[0] == cast(u8, 46) && p[1] == cast(u8, 47)) { is_dot = 1; }
         if (l >= 3 && p[0] == cast(u8, 46) && p[1] == cast(u8, 46) && p[2] == cast(u8, 47)) { is_dot = 1; }
-        if (is_dot == 1) {
-            let is *u8 as abs = resolve(p, l);
+        // A path too long to be one stays as typed: the child gets the same
+        // word and the same answer from the VFS it would get anyway.
+        let is *u8 as abs with mut = cast(*u8, 0);
+        if (is_dot == 1) { abs = resolve(p, l); }
+        if (cast(i64, abs) != 0) {
             let is i64 as al with mut = 0;
             while (abs[al] != cast(u8, 0)) { al = al + 1; }
-            if (wfill + al < BUF_CAP) {
+            if (_wroom(al) == 1) {
                 let is i64 as o = wfill;
                 let is i64 as k with mut = 0;
                 while (k < al) { wbuf[wfill] = abs[k]; wfill = wfill + 1; k = k + 1; }
@@ -1345,27 +1608,86 @@ fn anchor_dots() as void {
 // The desktop has already selected a concrete file. Keep it as one argv word,
 // with no expansion, globbing, command lookup, or line-editor round trip.
 fn prepare_program(path as *u8, len as i64) as i64 {
-    ncmd = 0; nword = 0; wfill = 0;
-    prepared_program = 0; trunc = 0;
-    if (len <= 0 || len >= BUF_CAP) { return sys.E_INVAL; }
+    ncmd = 0; nword = 0; wfill = 0; wbase = 0;
+    prepared_program = 0; room_err = 0;
+    if (len <= 0 || len > prog.PATH_MAX) { return sys.E_INVAL; }
+    let is i64 as rd = _ready();
+    if (rd != 0) { return rd; }
+    if (_wroom(len + 1) == 0 || _room(&woff_g, 8) == 0 || _room(&wlen_g, 8) == 0
+        || _room(&wq_g, 8) == 0 || _room(&cmd_g, sizeof(Cmd)) == 0) { return room_err; }
     let is i64 as k with mut = 0;
     while (k < len) { wbuf[k] = path[k]; k = k + 1; }
     wbuf[len] = cast(u8, 0);
     w_off[0] = 0; w_len[0] = len; w_quoted[0] = 1;
     nword = 1; wfill = len + 1;
-    cmds[0].w0 = 0; cmds[0].wn = 1;
-    cmds[0].in_w = 0 - 1; cmds[0].out_w = 0 - 1;
-    cmds[0].append = 0; cmds[0].err_to_out = 0;
+    let is *Cmd as c0 = cmd_at(0);
+    c0.w0 = 0; c0.wn = 1;
+    c0.in_w = 0 - 1; c0.out_w = 0 - 1;
+    c0.append = 0; c0.err_to_out = 0;
     ncmd = 1; prepared_program = 1;
     return 1;
 }
 
-// prepare — passes 1..5 for one line. Returns the stage count, or negative on
-// a syntax error the caller reports.
+// prepare — passes 1..5 for one line. Returns the stage count, -2 for a
+// redirect with no target, or -1 when the line could not be held whole
+// (room_error says why; nothing of it may run).
 fn prepare(line as *u8, len as i64) as i64 {
+    wbase = 0;
     let is i64 as elen = expand_line(line, len);
-    tokenise(cast(*u8, &expbuf[0]), elen);
+    if (elen < 0) { ncmd = 0; return 0 - 1; }
+    tokenise(expbuf, elen);
     glob_words();
     anchor_dots();
     return build_cmds();
+}
+
+// ---- words for builtins ----------------------------------------------------
+//
+// args_split — the words of `line` split on runs of blanks, in place: pointer
+// and length pairs INTO the line, no copy. *pp gets the pointers, *pl the
+// lengths. The count, or room_err's errno when they cannot be held. They were
+// 16 words on the caller's stack, and a builtin given more (`kill` with twenty
+// pids) quietly saw the first sixteen.
+//
+// The pairs live on a stack in args_g, because a builtin can run a function
+// whose lines are split while the builtin's own words are still in use. A
+// caller takes args_mark() first and gives it back to args_release() when it
+// is done with the words.
+fn args_mark() as i64 { return args_top; }
+fn args_release(m as i64) as void { args_top = m; return; }
+
+fn args_split(line as *u8, len as i64, pp as *i64, pl as *i64) as i64 {
+    let is i64 as rd = _ready();
+    if (rd != 0) { return rd; }
+    // Count first: the table is two runs, pointers then lengths.
+    let is i64 as argc with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        while (i < len && (line[i] == cast(u8, 32) || line[i] == cast(u8, 9))) { i = i + 1; }
+        if (i < len) {
+            argc = argc + 1;
+            while (i < len && line[i] != cast(u8, 32) && line[i] != cast(u8, 9)) { i = i + 1; }
+        }
+    }
+    let is i64 as base = args_top;
+    let is i64 as rc = grow.need(&args_g, (base + 2 * argc + 2) * 8);
+    if (rc != 0) { return rc; }
+    let is *i64 as ptrs = cast(*i64, args_g.base + base * 8);
+    let is *i64 as lens = cast(*i64, args_g.base + (base + argc + 1) * 8);
+    let is i64 as n with mut = 0;
+    i = 0;
+    while (i < len) {
+        while (i < len && (line[i] == cast(u8, 32) || line[i] == cast(u8, 9))) { i = i + 1; }
+        if (i < len) {
+            let is i64 as start = i;
+            while (i < len && line[i] != cast(u8, 32) && line[i] != cast(u8, 9)) { i = i + 1; }
+            ptrs[n] = cast(i64, line) + start;
+            lens[n] = i - start;
+            n = n + 1;
+        }
+    }
+    args_top = base + 2 * argc + 2;
+    pp[0] = cast(i64, ptrs);
+    pl[0] = cast(i64, lens);
+    return argc;
 }

@@ -1,0 +1,70 @@
+// grow.cst — a buffer that never moves and never has a size picked for it.
+//
+// The shell and its line editor kept every line, word and table in arrays
+// sized by a guess — a 256-byte line, 64 words, 4096 bytes of them — and cut
+// what did not fit without a word: a long line stopped taking keys, a glob
+// past 64 names lost the rest, and `rm *` in a big directory removed some of
+// it. A Grow is the alternative they share: the range is RESERVED once, as
+// address space, and memory is committed only as far as the contents reach.
+// It never moves, so a pointer into it stays good while it grows, and it
+// costs a page of memory per page of contents, not per page of reservation.
+//
+// The reservation is address space, not memory. It is still a ceiling, so
+// every owner sizes it far past anything it holds in practice, and running
+// into it — or into the end of memory, which comes first — is an error the
+// owner reports in words (E_2BIG, E_NOMEM), never a silent cut.
+use "std/os/causticos.cst" as sys;
+
+struct Grow {
+    base as i64;     // start of the reservation; 0 before init
+    have as i64;     // bytes committed from base
+    limit as i64;    // bytes reserved
+}
+
+fn _pages(n as i64) as i64 { return ((n + 4095) / 4096) * 4096; }
+
+// Reserve `limit` bytes, nothing committed. 0, or E_NOMEM when the address
+// space could not be had.
+fn init(g as *Grow, limit as i64) as i64 {
+    g.base = 0; g.have = 0; g.limit = 0;
+    let is i64 as lim = _pages(limit);
+    let is i64 as va = sys.reserve(0, lim, sys.PROT_READ | sys.PROT_WRITE);
+    if (va <= 0) { return sys.E_NOMEM; }
+    g.base = va;
+    g.limit = lim;
+    return 0;
+}
+
+// Make bytes [0, n) usable. Commits at least double what is committed, so a
+// buffer filled a byte at a time costs a handful of calls, not one a page.
+// 0; E_2BIG when n is past the reservation; E_NOMEM when memory ran out (what
+// was usable stays usable).
+fn need(g as *Grow, n as i64) as i64 {
+    if (n <= g.have) { return 0; }
+    if (g.base == 0) { return sys.E_NOMEM; }
+    if (n > g.limit) { return sys.E_2BIG; }
+    let is i64 as want with mut = _pages(n);
+    let is i64 as dbl = g.have * 2;
+    if (dbl > want) { want = dbl; }
+    if (want > g.limit) { want = g.limit; }
+    if (sys.commit(g.base + g.have, want - g.have, sys.PROT_READ | sys.PROT_WRITE) != 0) {
+        // Doubling may ask for more than is left; what n needs may still fit.
+        let is i64 as just = _pages(n);
+        if (just >= want || sys.commit(g.base + g.have, just - g.have, sys.PROT_READ | sys.PROT_WRITE) != 0) {
+            return sys.E_NOMEM;
+        }
+        want = just;
+    }
+    g.have = want;
+    return 0;
+}
+
+fn bytes(g as *Grow) as *u8 { return cast(*u8, g.base); }
+fn words(g as *Grow) as *i64 { return cast(*i64, g.base); }
+
+// Give the whole reservation back. The Grow is empty and unusable until init.
+fn release(g as *Grow) as void {
+    if (g.base != 0) { sys.munmap(g.base, g.limit); }
+    g.base = 0; g.have = 0; g.limit = 0;
+    return;
+}

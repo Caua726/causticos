@@ -11,6 +11,7 @@
 // the same rule every shell uses.
 use "std/os/causticos.cst" as sys;
 use "../crash/crash.cst" as crash;
+use "../grow/grow.cst" as grow;
 
 // The table is reserved once for JOB_LIMIT jobs and committed JOB_CHUNK at a
 // time as it fills: a shell pays for the jobs it has had at once, and the
@@ -21,7 +22,10 @@ use "../crash/crash.cst" as crash;
 // is address space, not memory; descriptors and memory run out long before.
 let is i64 as JOB_LIMIT with imut = 1024;
 let is i64 as JOB_CHUNK with imut = 16;
-let is i64 as MAX_PIDS with imut = 8;      // pids per pipeline
+// A pipeline's pids are a list of their own that grows (lib/grow), reserved
+// the first time the slot runs one. It was eight, and the ninth stage's pid
+// was dropped: never reaped, never ended with the job.
+let is i64 as PIDS_LIMIT with imut = 65536;   // address space, not memory
 let is i64 as CMD_CAP  with imut = 64;     // command text kept for `jobs`
 // Poll entries a shell needs besides its jobs' (the keyboard or the WM, exit
 // events, a paste waiting to be read, the history thread's channel wanting
@@ -61,7 +65,7 @@ struct Job {
     crashed as i64;        // 1 = a pid of it crashed; `crash` holds the first
     err_fd as i64;         // a job with no terminal ($(...)): its stages' stderr,
                            // kept apart from the stdout being captured; or -1
-    pids as [8]i64;        // MAX_PIDS
+    pg as grow.Grow;       // the pids, npids of them (pid_at)
     cmd as [64]u8;         // CMD_CAP
     tty_acc as [32]u8;     // a ttyproto request being read
     crash as [8]i64;       // WAIT_INFO_WORDS: how it crashed
@@ -163,21 +167,29 @@ fn alloc() as i64 {
     return 0 - 1;
 }
 
-fn add_pid(j as i64, pid as i64) as void {
-    if (j < 0 || j >= cap) { return; }
+// Record a stage's pid. 0, or E_NOMEM when the list cannot hold it — the
+// caller then ends that process itself, since the job will never reap it.
+fn add_pid(j as i64, pid as i64) as i64 {
+    if (j < 0 || j >= cap) { return sys.E_INVAL; }
     let is *Job as jb = get(j);
-    if (jb.npids >= MAX_PIDS) { return; }
-    jb.pids[jb.npids] = pid;
+    if (jb.pg.base == 0 && grow.init(&jb.pg, PIDS_LIMIT * 8) != 0) { return sys.E_NOMEM; }
+    let is i64 as rc = grow.need(&jb.pg, (jb.npids + 1) * 8);
+    if (rc != 0) { return rc; }
+    let is *i64 as ps = grow.words(&jb.pg);
+    ps[jb.npids] = pid;
     jb.npids = jb.npids + 1;
     jb.nlive = jb.nlive + 1;
-    return;
+    return 0;
 }
 
-fn pid_at(j as i64, k as i64) as i64 { return get(j).pids[k]; }
+fn pid_at(j as i64, k as i64) as i64 {
+    let is *i64 as ps = grow.words(&get(j).pg);
+    return ps[k];
+}
 fn last_pid(j as i64) as i64 {
     let is *Job as jb = get(j);
     if (jb.npids <= 0) { return 0; }
-    return jb.pids[jb.npids - 1];
+    return pid_at(j, jb.npids - 1);
 }
 
 fn set_cmd(j as i64, src as *u8, len as i64) as void {
@@ -207,7 +219,7 @@ fn find(pid as i64) as i64 {
         if (get(j).status == JOB_RUN || get(j).status == JOB_DONE) {
             let is i64 as k with mut = 0;
             while (k < get(j).npids) {
-                if (get(j).pids[k] == pid) { return j; }
+                if (pid_at(j, k) == pid) { return j; }
                 k = k + 1;
             }
         }
@@ -327,7 +339,7 @@ fn state_word(j as i64, out as *u8) as i64 {
 fn kill_job(j as i64) as void {
     if (j < 0 || j >= cap || get(j).status != JOB_RUN) { return; }
     let is i64 as k with mut = 0;
-    while (k < get(j).npids) { sys.kill(get(j).pids[k]); k = k + 1; }
+    while (k < get(j).npids) { sys.kill(pid_at(j, k)); k = k + 1; }
     return;
 }
 

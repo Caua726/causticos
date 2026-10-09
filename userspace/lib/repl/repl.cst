@@ -19,59 +19,79 @@ use "std/causticos/term.cst" as term;
 use "std/os/causticos.cst" as sys;
 use "std/unicode/utf8.cst" as utf8;
 use "std/unicode/cpwidth.cst" as cpw;
+use "../grow/grow.cst" as grow;
 
-let is i64 as LINE_CAP with imut = 256;
-let is i64 as HIST_N   with imut = 16;
-let is i64 as MAX_ARGS with imut = 16;
+// The line, the history, the kill ring and the search are kept in buffers that
+// grow (lib/grow) instead of arrays sized by a guess. The line was 255 bytes:
+// a key past that was dropped without a sign, so a long command could not be
+// typed whole — 25 `aplay x &` became 17. LINE_LIMIT is address space, not
+// memory, and far past what one command can carry (spawn takes 256 KiB of
+// arguments); a key that would go past it, or past the end of memory, is
+// refused and the refusal reported (take_refusal), once a line.
+let is i64 as LINE_LIMIT with imut = 1048576;
+let is i64 as HIST_N   with imut = 16;     // lines Up/Down reach; the file keeps FILE_MAX
+let is i64 as KILL_N   with imut = 8;      // cuts Ctrl+Y can bring back
 
 struct Repl {
-    hhead as i64;              // next history slot to write
-    hsize as i64;              // slots filled, <= HIST_N
+    hsize as i64;              // history entries, <= HIST_N
     hnav as i64;               // 0 = editing fresh, 1..hsize = walking back
-    llen as i64;               // bytes in `line`
+    llen as i64;               // bytes in the line
     cur as i64;                // cursor, 0..llen, on a character's first byte — edits happen HERE
     npush as i64;              // total pushes, monotonic
     npush_load as i64;         // npush when the file was last read/written
-    khead as i64;              // kill ring: next slot to write
-    ksize as i64;              // kill ring: entries stored
+    ksize as i64;              // kill ring: entries stored, <= KILL_N
     knav as i64;               // how far back the last yank reached
     above as i64;              // cells of the line above the top row, past the cursor (see _goto)
     shown_len as i64;          // what is on screen from the line's start: the cells it covers...
     shown_cur as i64;          // ...and the cell the cursor is on
     srch as i64;               // 1 = a Ctrl+R search is running
-    sqlen as i64;              // bytes in `sq`
+    sqlen as i64;              // bytes of the search query
     shit as i64;               // history age (1 = newest) of the line found, 0 = none
     sfail as i64;              // 1 = the query is in no line from there back
     sllen as i64;              // the line as it was when the search began
     slcur as i64;
+    refused as i64;            // why the last insert did not happen (an errno), 0 = none
+    told as i64;               // 1 = that refusal was taken for this line
+    hfill as i64;              // bytes of hg in use
+    kfill as i64;              // bytes of kg in use
+    hoff as [16]i64;           // history entries in hg, oldest first (HIST_N)
     hlen as [16]i64;
-    hbuf as [4096]u8;          // HIST_N * LINE_CAP
-    line as [256]u8;
+    koff as [8]i64;            // kill ring entries in kg, oldest first (KILL_N)
     klen as [8]i64;
-    kbuf as [2048]u8;          // KILL_N * LINE_CAP
-    sq as [64]u8;              // the search query
-    sline as [256]u8;
+    lg as grow.Grow;           // the line
+    sg as grow.Grow;           // the line as it was when a search began
+    qg as grow.Grow;           // the search query
+    dg as grow.Grow;           // what a search shows: its prompt, the query, the line
+    hg as grow.Grow;           // the history's bytes, entries end to end
+    kg as grow.Grow;           // the kill ring's bytes, entries end to end
+    cg as grow.Grow;           // a completion list read from /etc/completions
+    ag as grow.Grow;           // completion's longest common prefix
 }
 
-let is i64 as SQ_CAP with imut = 64;
-
-let is i64 as KILL_N with imut = 8;
-
-fn init(r as *Repl) as void {
-    r.hhead = 0; r.hsize = 0; r.hnav = 0; r.llen = 0; r.cur = 0;
+// Reserve the buffers. 0, or E_NOMEM: without them there is no line to edit,
+// and the caller cannot go on.
+fn init(r as *Repl) as i64 {
+    r.hsize = 0; r.hnav = 0; r.llen = 0; r.cur = 0;
     r.npush = 0; r.npush_load = 0;
-    r.khead = 0; r.ksize = 0; r.knav = 0;
+    r.ksize = 0; r.knav = 0;
     r.above = 0;
     r.shown_len = 0; r.shown_cur = 0;
     r.srch = 0; r.sqlen = 0; r.shit = 0; r.sfail = 0; r.sllen = 0; r.slcur = 0;
-    let is i64 as i with mut = 0;
-    while (i < HIST_N) { r.hlen[i] = 0; i = i + 1; }
-    i = 0;
-    while (i < KILL_N) { r.klen[i] = 0; i = i + 1; }
-    return;
+    r.refused = 0; r.told = 0;
+    r.hfill = 0; r.kfill = 0;
+    if (grow.init(&r.lg, LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.sg, LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.qg, LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.dg, 2 * LINE_LIMIT + 64) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.hg, HIST_N * LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.kg, KILL_N * LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.cg, 16 * LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    if (grow.init(&r.ag, LINE_LIMIT) != 0) { return sys.E_NOMEM; }
+    return 0;
 }
 
-fn line_ptr(r as *Repl) as *u8 { return cast(*u8, &r.line[0]); }
+fn _ln(r as *Repl) as *u8 { return grow.bytes(&r.lg); }
+fn line_ptr(r as *Repl) as *u8 { return _ln(r); }
 fn line_len(r as *Repl) as i64 { return r.llen; }
 // A fresh line, after the caller has put up a new prompt: nothing of it is on
 // screen yet.
@@ -79,7 +99,30 @@ fn line_clear(r as *Repl) as void {
     r.llen = 0; r.cur = 0; r.hnav = 0; r.knav = 0; r.above = 0;
     r.shown_len = 0; r.shown_cur = 0;
     r.srch = 0;
+    r.refused = 0; r.told = 0;
     return;
+}
+
+// Room for a line of n bytes. 1, or 0 with the reason kept for take_refusal.
+fn _room(r as *Repl, n as i64) as i64 {
+    let is i64 as rc = grow.need(&r.lg, n);
+    if (rc == 0) { return 1; }
+    if (r.refused == 0) { r.refused = rc; }
+    return 0;
+}
+
+// Why keys were refused since the line began — E_2BIG past LINE_LIMIT, E_NOMEM
+// out of memory — the first time it is asked for this line; 0 otherwise. A
+// paste that runs past the limit is refused key after key, and said once.
+fn take_refusal(r as *Repl) as i64 {
+    if (r.refused == 0 || r.told == 1) { return 0; }
+    r.told = 1;
+    return r.refused;
+}
+
+fn refusal_text(e as i64) as *u8 {
+    if (e == sys.E_2BIG) { return cast(*u8, "the line cannot be longer than 1 MiB; the rest was not taken"); }
+    return cast(*u8, "not enough memory for a longer line; the rest was not taken");
 }
 
 // ---- editing ---------------------------------------------------------------
@@ -237,14 +280,6 @@ fn _prev(buf as *u8, i as i64) as i64 {
     return i - 1;
 }
 
-// How much of src[0..n] fits in cap bytes without cutting a character.
-fn _fit(src as *u8, n as i64, cap as i64) as i64 {
-    if (n <= cap) { return n; }
-    let is i64 as k with mut = cap;
-    while (k > 0 && (cast(i64, src[k]) & 0xC0) == 0x80) { k = k - 1; }
-    return k;
-}
-
 fn _mod(a as i64, m as i64) as i64 {
     let is i64 as x = a % m;
     if (x < 0) { return x + m; }
@@ -292,7 +327,7 @@ fn _paint(r as *Repl, t as *term.Term, buf as *u8, len as i64, cur as i64) as vo
 // to remember what the line was before they changed it.
 fn redraw(r as *Repl, t as *term.Term) as void {
     if (r.srch == 1) { _paint_search(r, t); return; }
-    _paint(r, t, cast(*u8, &r.line[0]), r.llen, r.cur);
+    _paint(r, t, _ln(r), r.llen, r.cur);
     return;
 }
 
@@ -327,7 +362,7 @@ fn _to_end(r as *Repl, t as *term.Term) as void {
     let is i64 as lw with mut = 1;
     let is i64 as i with mut = 0;
     while (i < r.llen) {
-        let is i64 as n = _place(cast(*u8, &r.line[0]), r.llen, i, 0, 0, 1 << 30,
+        let is i64 as n = _place(_ln(r), r.llen, i, 0, 0, 1 << 30,
                                  cast(*i64, &at[0]), cast(*i64, &w[0]));
         if (w[0] > 0) { last = i; lw = w[0]; }
         i = i + n;
@@ -341,7 +376,8 @@ fn _to_end(r as *Repl, t as *term.Term) as void {
     _goto(r, t, end - lw);
     _park(r, t, 0);
     i = last;
-    while (i < r.llen) { term.putc(t, cast(i64, r.line[i])); i = i + 1; }
+    let is *u8 as ln = _ln(r);
+    while (i < r.llen) { term.putc(t, cast(i64, ln[i])); i = i + 1; }
     return;
 }
 
@@ -350,7 +386,7 @@ fn _to_end(r as *Repl, t as *term.Term) as void {
 // resized, which re-lays rows out but does not re-wrap them; reprint puts it
 // back, wrapped to the new width.
 fn lift(r as *Repl, t as *term.Term) as void {
-    _paint(r, t, cast(*u8, &r.line[0]), 0, 0);
+    _paint(r, t, _ln(r), 0, 0);
     return;
 }
 
@@ -395,22 +431,24 @@ fn _find(r as *Repl, from as i64) as i64 {
     while (k <= r.hsize) {
         let is i64 as slot = slot_of(r, k);
         if (slot >= 0 && _index_of(hist_ptr(r, slot), r.hlen[slot],
-                                   cast(*u8, &r.sq[0]), r.sqlen) >= 0) { return k; }
+                                   grow.bytes(&r.qg), r.sqlen) >= 0) { return k; }
         k = k + 1;
     }
     return 0;
 }
 
-// The history line of age k becomes the line, the cursor on the match.
+// The history line of age k becomes the line, the cursor on the match. A
+// history line was a line once, so it fits where one does.
 fn _take(r as *Repl, k as i64) as void {
     let is i64 as slot = slot_of(r, k);
     if (slot < 0) { return; }
+    if (_room(r, r.hlen[slot]) == 0) { return; }
     let is *u8 as h = hist_ptr(r, slot);
-    let is i64 as n = _fit(h, r.hlen[slot], LINE_CAP - 1);
+    let is *u8 as ln = _ln(r);
     let is i64 as i with mut = 0;
-    while (i < n) { r.line[i] = h[i]; i = i + 1; }
+    while (i < r.hlen[slot]) { ln[i] = h[i]; i = i + 1; }
     r.llen = i;
-    r.cur = _index_of(cast(*u8, &r.line[0]), r.llen, cast(*u8, &r.sq[0]), r.sqlen);
+    r.cur = _index_of(ln, r.llen, grow.bytes(&r.qg), r.sqlen);
     if (r.cur < 0) { r.cur = r.llen; }
     r.shit = k;
     r.sfail = 0;
@@ -418,8 +456,10 @@ fn _take(r as *Repl, k as i64) as void {
 }
 
 fn _restore(r as *Repl) as void {
+    let is *u8 as ln = _ln(r);
+    let is *u8 as sl = grow.bytes(&r.sg);
     let is i64 as i with mut = 0;
-    while (i < r.sllen) { r.line[i] = r.sline[i]; i = i + 1; }
+    while (i < r.sllen) { ln[i] = sl[i]; i = i + 1; }
     r.llen = r.sllen;
     r.cur = r.slcur;
     return;
@@ -435,28 +475,37 @@ fn _research(r as *Repl, from as i64) as void {
 }
 
 fn _paint_search(r as *Repl, t as *term.Term) as void {
-    let is [400]u8 as d;
-    let is i64 as n with mut = 0;
     let is *u8 as pre with mut = "(reverse-i-search)`";
     if (r.sfail == 1) { pre = "(failed reverse-i-search)`"; }
+    let is i64 as pl with mut = 0;
+    while (pre[pl] != 0) { pl = pl + 1; }
+    if (grow.need(&r.dg, pl + r.sqlen + 3 + r.llen) != 0) { return; }
+    let is *u8 as d = grow.bytes(&r.dg);
+    let is *u8 as q = grow.bytes(&r.qg);
+    let is *u8 as ln = _ln(r);
+    let is i64 as n with mut = 0;
     let is i64 as i with mut = 0;
-    while (pre[i] != 0) { d[n] = pre[i]; n = n + 1; i = i + 1; }
+    while (i < pl) { d[n] = pre[i]; n = n + 1; i = i + 1; }
     i = 0;
-    while (i < r.sqlen) { d[n] = r.sq[i]; n = n + 1; i = i + 1; }
+    while (i < r.sqlen) { d[n] = q[i]; n = n + 1; i = i + 1; }
     d[n] = cast(u8, 39); d[n + 1] = cast(u8, 58); d[n + 2] = cast(u8, 32);   // "': "
     n = n + 3;
     let is i64 as at = n;
     i = 0;
-    while (i < r.llen) { d[n] = r.line[i]; n = n + 1; i = i + 1; }
-    _paint(r, t, cast(*u8, &d[0]), n, at + r.cur);
+    while (i < r.llen) { d[n] = ln[i]; n = n + 1; i = i + 1; }
+    _paint(r, t, d, n, at + r.cur);
     return;
 }
 
 // search_next — Ctrl+R: start a search, or look further back for the query.
 fn search_next(r as *Repl, t as *term.Term) as void {
     if (r.srch == 0) {
+        let is i64 as rc = grow.need(&r.sg, r.llen);
+        if (rc != 0) { if (r.refused == 0) { r.refused = rc; } return; }
+        let is *u8 as ln = _ln(r);
+        let is *u8 as sl = grow.bytes(&r.sg);
         let is i64 as i with mut = 0;
-        while (i < r.llen) { r.sline[i] = r.line[i]; i = i + 1; }
+        while (i < r.llen) { sl[i] = ln[i]; i = i + 1; }
         r.sllen = r.llen;
         r.slcur = r.cur;
         r.srch = 1;
@@ -478,9 +527,12 @@ fn search_next(r as *Repl, t as *term.Term) as void {
 fn search_key(r as *Repl, t as *term.Term, c as i64) as void {
     let is [4]u8 as e;
     let is i64 as n = _encode(c, cast(*u8, &e[0]));
-    if (n <= 0 || r.sqlen + n > SQ_CAP) { return; }
+    if (n <= 0) { return; }
+    let is i64 as rc = grow.need(&r.qg, r.sqlen + n);
+    if (rc != 0) { if (r.refused == 0) { r.refused = rc; } return; }
+    let is *u8 as q = grow.bytes(&r.qg);
     let is i64 as k with mut = 0;
-    while (k < n) { r.sq[r.sqlen + k] = e[k]; k = k + 1; }
+    while (k < n) { q[r.sqlen + k] = e[k]; k = k + 1; }
     r.sqlen = r.sqlen + n;
     _research(r, r.shit);
     redraw(r, t);
@@ -491,7 +543,7 @@ fn search_key(r as *Repl, t as *term.Term, c as i64) as void {
 // from the newest.
 fn search_back(r as *Repl, t as *term.Term) as void {
     if (r.sqlen == 0) { return; }
-    r.sqlen = _prev(cast(*u8, &r.sq[0]), r.sqlen);
+    r.sqlen = _prev(grow.bytes(&r.qg), r.sqlen);
     _research(r, 1);
     redraw(r, t);
     return;
@@ -520,47 +572,43 @@ fn _encode(c as i64, e as *u8) as i64 {
 
 // Remove line[from..to) and close the gap; the cursor is the caller's.
 fn _drop(r as *Repl, from as i64, to as i64) as void {
+    let is *u8 as ln = _ln(r);
     let is i64 as i with mut = to;
-    while (i < r.llen) { r.line[from + i - to] = r.line[i]; i = i + 1; }
+    while (i < r.llen) { ln[from + i - to] = ln[i]; i = i + 1; }
     r.llen = r.llen - (to - from);
     return;
 }
 
-// Insert one character (a code point) at the cursor. Returns 0 when it is not
-// text or the line is full.
-fn line_push(r as *Repl, c as i64) as i64 {
-    let is [4]u8 as e;
-    let is i64 as n = _encode(c, cast(*u8, &e[0]));
-    if (n == 0 || r.llen + n > LINE_CAP - 1) { return 0; }
+// Insert src[0..n] at the cursor. 1, or 0 when the line cannot grow by that
+// much (take_refusal says why) — then nothing of it is inserted.
+fn _insert(r as *Repl, src as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (_room(r, r.llen + n) == 0) { return 0; }
+    let is *u8 as ln = _ln(r);
     let is i64 as i with mut = r.llen;
-    while (i > r.cur) { r.line[i + n - 1] = r.line[i - 1]; i = i - 1; }
+    while (i > r.cur) { ln[i + n - 1] = ln[i - 1]; i = i - 1; }
     let is i64 as k with mut = 0;
-    while (k < n) { r.line[r.cur + k] = e[k]; k = k + 1; }
+    while (k < n) { ln[r.cur + k] = src[k]; k = k + 1; }
     r.llen = r.llen + n;
     r.cur = r.cur + n;
-    r.knav = 0;
     return 1;
 }
 
-// Insert src[0..n] at the cursor, as much of it as fits, never part of a
-// character.
-fn _insert(r as *Repl, src as *u8, n as i64) as void {
-    let is i64 as m = _fit(src, n, LINE_CAP - 1 - r.llen);
-    if (m <= 0) { return; }
-    let is i64 as i with mut = r.llen;
-    while (i > r.cur) { r.line[i + m - 1] = r.line[i - 1]; i = i - 1; }
-    let is i64 as k with mut = 0;
-    while (k < m) { r.line[r.cur + k] = src[k]; k = k + 1; }
-    r.llen = r.llen + m;
-    r.cur = r.cur + m;
+// Insert one character (a code point) at the cursor. Returns 0 when it is not
+// text or the line cannot grow (take_refusal).
+fn line_push(r as *Repl, c as i64) as i64 {
+    let is [4]u8 as e;
+    let is i64 as n = _encode(c, cast(*u8, &e[0]));
+    if (n == 0) { return 0; }
+    if (_insert(r, cast(*u8, &e[0]), n) == 0) { return 0; }
     r.knav = 0;
-    return;
+    return 1;
 }
 
 // Delete the character BEFORE the cursor.
 fn line_backspace(r as *Repl) as i64 {
     if (r.cur <= 0) { return 0; }
-    let is i64 as p = _prev(cast(*u8, &r.line[0]), r.cur);
+    let is i64 as p = _prev(_ln(r), r.cur);
     _drop(r, p, r.cur);
     r.cur = p;
     r.knav = 0;
@@ -570,7 +618,7 @@ fn line_backspace(r as *Repl) as i64 {
 // Delete the character AT the cursor (Del; Ctrl+D on a line that has text).
 fn line_delete(r as *Repl) as i64 {
     if (r.cur >= r.llen) { return 0; }
-    _drop(r, r.cur, _next(cast(*u8, &r.line[0]), r.llen, r.cur));
+    _drop(r, r.cur, _next(_ln(r), r.llen, r.cur));
     r.knav = 0;
     return 1;
 }
@@ -588,34 +636,59 @@ fn cancel(r as *Repl, t as *term.Term) as void {
 fn cursor(r as *Repl) as i64 { return r.cur; }
 fn move_left(r as *Repl) as i64 {
     if (r.cur <= 0) { return 0; }
-    r.cur = _prev(cast(*u8, &r.line[0]), r.cur);
+    r.cur = _prev(_ln(r), r.cur);
     return 1;
 }
 fn move_right(r as *Repl) as i64 {
     if (r.cur >= r.llen) { return 0; }
-    r.cur = _next(cast(*u8, &r.line[0]), r.llen, r.cur);
+    r.cur = _next(_ln(r), r.llen, r.cur);
     return 1;
 }
 fn move_home(r as *Repl) as i64 { if (r.cur == 0) { return 0; } r.cur = 0; return 1; }
 fn move_end(r as *Repl) as i64 { if (r.cur == r.llen) { return 0; } r.cur = r.llen; return 1; }
 
-// kill_push — remember a cut so it can be yanked back. Empty cuts are not
-// remembered: Ctrl+K at the end of a line must not push the ring's history out.
-fn kill_push(r as *Repl, from as i64, len as i64) as void {
-    if (len <= 0) { return; }
-    let is i64 as n = _fit(cast(*u8, cast(i64, &r.line[0]) + from), len, LINE_CAP - 1);
-    let is i64 as i with mut = 0;
-    while (i < n) { r.kbuf[r.khead * LINE_CAP + i] = r.line[from + i]; i = i + 1; }
-    r.klen[r.khead] = n;
-    r.khead = (r.khead + 1) % KILL_N;
-    if (r.ksize < KILL_N) { r.ksize = r.ksize + 1; }
-    r.knav = 0;
-    return;
+// The history and the kill ring are rings kept end to end in a Grow, oldest
+// first: entry i is offs[i], lens[i]. Dropping the oldest moves the rest down
+// over it. Returns the bytes still in use.
+fn _ring_drop(g as *grow.Grow, offs as *i64, lens as *i64, n as i64, fill as i64) as i64 {
+    if (n <= 0) { return fill; }
+    let is i64 as d = lens[0];
+    let is *u8 as b = grow.bytes(g);
+    let is i64 as i with mut = d;
+    while (i < fill) { b[i - d] = b[i]; i = i + 1; }
+    let is i64 as k with mut = 0;
+    while (k + 1 < n) { offs[k] = offs[k + 1] - d; lens[k] = lens[k + 1]; k = k + 1; }
+    return fill - d;
 }
 
+// kill_push — remember a cut so it can be yanked back. Empty cuts are not
+// remembered: Ctrl+K at the end of a line must not push the ring's history out.
+// 1, or 0 when there is no memory to remember it (take_refusal).
+fn kill_push(r as *Repl, from as i64, len as i64) as i64 {
+    if (len <= 0) { return 1; }
+    if (r.ksize == KILL_N) {
+        r.kfill = _ring_drop(&r.kg, cast(*i64, &r.koff[0]), cast(*i64, &r.klen[0]), r.ksize, r.kfill);
+        r.ksize = r.ksize - 1;
+    }
+    let is i64 as rc = grow.need(&r.kg, r.kfill + len);
+    if (rc != 0) { if (r.refused == 0) { r.refused = rc; } return 0; }
+    let is *u8 as kb = grow.bytes(&r.kg);
+    let is *u8 as ln = _ln(r);
+    let is i64 as i with mut = 0;
+    while (i < len) { kb[r.kfill + i] = ln[from + i]; i = i + 1; }
+    r.koff[r.ksize] = r.kfill;
+    r.klen[r.ksize] = len;
+    r.kfill = r.kfill + len;
+    r.ksize = r.ksize + 1;
+    r.knav = 0;
+    return 1;
+}
+
+// A cut that cannot be remembered is not made: the text would be gone with
+// no way to bring it back.
 fn _cut(r as *Repl, from as i64, to as i64) as i64 {
     if (to <= from) { return 0; }
-    kill_push(r, from, to - from);
+    if (kill_push(r, from, to - from) == 0) { return 0; }
     _drop(r, from, to);
     if (r.cur > from) { r.cur = from; }
     return 1;
@@ -623,23 +696,18 @@ fn _cut(r as *Repl, from as i64, to as i64) as i64 {
 
 fn kill_to_end(r as *Repl) as i64 { return _cut(r, r.cur, r.llen); }
 fn kill_to_start(r as *Repl) as i64 {
-    let is i64 as c = r.cur;
-    if (c <= 0) { return 0; }
-    kill_push(r, 0, c);
-    let is i64 as i with mut = c;
-    while (i < r.llen) { r.line[i - c] = r.line[i]; i = i + 1; }
-    r.llen = r.llen - c;
-    r.cur = 0;
-    return 1;
+    if (r.cur <= 0) { return 0; }
+    return _cut(r, 0, r.cur);
 }
 
 // Cut the word before the cursor: trailing blanks, then the run of non-blanks.
 fn kill_word(r as *Repl) as i64 {
     if (r.cur <= 0) { return 0; }
+    let is *u8 as ln = _ln(r);
     let is i64 as e with mut = r.cur;
     let is i64 as b with mut = e;
-    while (b > 0 && r.line[b - 1] == cast(u8, 32)) { b = b - 1; }
-    while (b > 0 && r.line[b - 1] != cast(u8, 32)) { b = b - 1; }
+    while (b > 0 && ln[b - 1] == cast(u8, 32)) { b = b - 1; }
+    while (b > 0 && ln[b - 1] != cast(u8, 32)) { b = b - 1; }
     return _cut(r, b, e);
 }
 
@@ -650,33 +718,26 @@ fn yank(r as *Repl) as i64 {
     if (r.ksize == 0) { return 0; }
     if (r.knav > 0) {
         // Undo the previous yank before inserting the older entry.
-        let is i64 as prev = (r.khead - r.knav + KILL_N) % KILL_N;
-        let is i64 as pl = r.klen[prev];
+        let is i64 as pl = r.klen[r.ksize - r.knav];
         if (r.cur >= pl) {
+            let is *u8 as ln = _ln(r);
             let is i64 as i with mut = r.cur;
-            while (i < r.llen) { r.line[i - pl] = r.line[i]; i = i + 1; }
+            while (i < r.llen) { ln[i - pl] = ln[i]; i = i + 1; }
             r.llen = r.llen - pl;
             r.cur = r.cur - pl;
         }
     }
     r.knav = r.knav + 1;
     if (r.knav > r.ksize) { r.knav = 1; }
-    let is i64 as slot = (r.khead - r.knav + KILL_N) % KILL_N;
-    let is i64 as n = r.klen[slot];
-    if (n <= 0 || r.llen + n >= LINE_CAP) { return 0; }
-    let is i64 as i with mut = r.llen;
-    while (i > r.cur) { r.line[i + n - 1] = r.line[i - 1]; i = i - 1; }
-    let is i64 as k with mut = 0;
-    while (k < n) { r.line[r.cur + k] = r.kbuf[slot * LINE_CAP + k]; k = k + 1; }
-    r.llen = r.llen + n;
-    r.cur = r.cur + n;
-    return 1;
+    let is i64 as slot = r.ksize - r.knav;
+    let is *u8 as kb = grow.bytes(&r.kg);
+    return _insert(r, cast(*u8, cast(i64, kb) + r.koff[slot]), r.klen[slot]);
 }
 
 // transpose — swap the two characters around the cursor and step past them, the
 // readline behaviour: at the end of the line it swaps the last two.
 fn transpose(r as *Repl) as i64 {
-    let is *u8 as ln = cast(*u8, &r.line[0]);
+    let is *u8 as ln = _ln(r);
     let is i64 as c with mut = r.cur;
     if (c >= r.llen) { c = _prev(ln, r.llen); }
     if (c <= 0) { return 0; }
@@ -684,13 +745,13 @@ fn transpose(r as *Repl) as i64 {
     let is i64 as e = _next(ln, r.llen, c);
     let is [8]u8 as tmp;
     let is i64 as k with mut = 0;
-    while (a + k < c) { tmp[k] = r.line[a + k]; k = k + 1; }
+    while (a + k < c) { tmp[k] = ln[a + k]; k = k + 1; }
     let is i64 as la = k;
     k = 0;
-    while (c + k < e) { r.line[a + k] = r.line[c + k]; k = k + 1; }
+    while (c + k < e) { ln[a + k] = ln[c + k]; k = k + 1; }
     let is i64 as lb = k;
     k = 0;
-    while (k < la) { r.line[a + lb + k] = tmp[k]; k = k + 1; }
+    while (k < la) { ln[a + lb + k] = tmp[k]; k = k + 1; }
     r.cur = e;
     r.knav = 0;
     return 1;
@@ -698,43 +759,55 @@ fn transpose(r as *Repl) as i64 {
 
 // ---- history ---------------------------------------------------------------
 
-// slot_of(idx) — idx 1 = most recent. Returns the ring slot, or -1 when idx is
-// outside what is stored.
+// slot_of(idx) — idx 1 = most recent. Returns the entry, or -1 when idx is
+// outside what is stored. Entries are kept oldest first.
 fn slot_of(r as *Repl, idx as i64) as i64 {
     if (idx < 1 || idx > r.hsize) { return 0 - 1; }
-    return (r.hhead - idx + HIST_N) % HIST_N;
+    return r.hsize - idx;
 }
 
-fn hist_ptr(r as *Repl, slot as i64) as *u8 { return cast(*u8, &r.hbuf[slot * LINE_CAP]); }
+fn hist_ptr(r as *Repl, slot as i64) as *u8 { return cast(*u8, r.hg.base + r.hoff[slot]); }
 fn hist_len(r as *Repl, slot as i64) as i64 { return r.hlen[slot]; }
 fn hist_count(r as *Repl) as i64 { return r.hsize; }
 
 // push — store a finished command. A blank line is not history, and neither is
 // an immediate repeat: walking back through five identical entries is noise.
-fn hist_push(r as *Repl, src as *u8, len as i64) as void {
-    if (len <= 0) { return; }
+// 0, or E_NOMEM when there was no memory to keep it (the caller says so).
+fn hist_push(r as *Repl, src as *u8, len as i64) as i64 {
+    if (len <= 0) { return 0; }
     let is i64 as prev = slot_of(r, 1);
     if (prev >= 0 && r.hlen[prev] == len) {
+        let is *u8 as pp = hist_ptr(r, prev);
         let is i64 as k with mut = 0;
-        while (k < len && r.hbuf[prev * LINE_CAP + k] == src[k]) { k = k + 1; }
-        if (k == len) { return; }
+        while (k < len && pp[k] == src[k]) { k = k + 1; }
+        if (k == len) { return 0; }
     }
-    let is i64 as n = _fit(src, len, LINE_CAP - 1);
+    if (r.hsize == HIST_N) {
+        r.hfill = _ring_drop(&r.hg, cast(*i64, &r.hoff[0]), cast(*i64, &r.hlen[0]), r.hsize, r.hfill);
+        r.hsize = r.hsize - 1;
+    }
+    let is i64 as rc = grow.need(&r.hg, r.hfill + len);
+    if (rc != 0) { return rc; }
+    let is *u8 as hb = grow.bytes(&r.hg);
     let is i64 as i with mut = 0;
-    while (i < n) { r.hbuf[r.hhead * LINE_CAP + i] = src[i]; i = i + 1; }
-    r.hlen[r.hhead] = n;
-    r.hhead = (r.hhead + 1) % HIST_N;
-    if (r.hsize < HIST_N) { r.hsize = r.hsize + 1; }
+    while (i < len) { hb[r.hfill + i] = src[i]; i = i + 1; }
+    r.hoff[r.hsize] = r.hfill;
+    r.hlen[r.hsize] = len;
+    r.hfill = r.hfill + len;
+    r.hsize = r.hsize + 1;
     r.npush = r.npush + 1;
-    return;
+    return 0;
 }
 
 // recall — replace what is on screen with src[0..srclen]: rub out the typed
-// characters, then echo the recalled ones. The caller flushes.
+// characters, then echo the recalled ones. The caller flushes. A recalled line
+// was a line once, so it fits where one does; without the memory for it the
+// line stays as it was (take_refusal says why).
 fn recall(r as *Repl, t as *term.Term, src as *u8, srclen as i64) as void {
-    let is i64 as n = _fit(src, srclen, LINE_CAP - 1);
+    if (_room(r, srclen) == 0) { return; }
+    let is *u8 as ln = _ln(r);
     let is i64 as i with mut = 0;
-    while (i < n) { r.line[i] = src[i]; i = i + 1; }
+    while (i < srclen) { ln[i] = src[i]; i = i + 1; }
     r.llen = i;
     r.cur = i;                       // a recalled line is ready to be extended
     redraw(r, t);
@@ -755,7 +828,7 @@ fn nav_up(r as *Repl, t as *term.Term) as i64 {
 fn nav_down(r as *Repl, t as *term.Term) as i64 {
     if (r.hnav <= 0) { return 0; }
     r.hnav = r.hnav - 1;
-    if (r.hnav == 0) { recall(r, t, cast(*u8, &r.line[0]), 0); return 1; }
+    if (r.hnav == 0) { recall(r, t, _ln(r), 0); return 1; }
     let is i64 as slot = slot_of(r, r.hnav);
     if (slot < 0) { return 0; }
     recall(r, t, hist_ptr(r, slot), r.hlen[slot]);
@@ -786,9 +859,9 @@ fn streq(a as *u8, alen as i64, lit as *u8) as i64 {
 // Writes go to <path>.tmp and are renamed over the target: a shell killed
 // mid-save leaves the previous history intact, never a half-written one.
 let is i64 as FILE_MAX with imut = 128;
-let is i64 as FILE_CAP with imut = 16384;
-
-let is [16384]u8 as fbuf with mut;
+// The most a history file can be: FILE_MAX records of a line and a length,
+// and the header. Address space for the buffer it is read into, not memory.
+let is i64 as FILE_LIMIT with imut = 128 * (1048576 + 4) + 8;   // FILE_MAX * (LINE_LIMIT + 4) + 8
 
 fn _u32le(b as *u8, off as i64) as i64 {
     return cast(i64, b[off]) | (cast(i64, b[off+1]) << 8)
@@ -819,7 +892,7 @@ fn _scan(b as *u8, n as i64, offs as *i64, lens as *i64, max as i64) as i64 {
         else {
             let is i64 as rlen = _u32le(b, p);
             p = p + 4;
-            if (rlen < 0 || rlen > LINE_CAP - 1 || p + rlen > n) { i = count; }
+            if (rlen < 0 || rlen > LINE_LIMIT || p + rlen > n) { i = count; }
             else {
                 offs[got] = p; lens[got] = rlen; got = got + 1;
                 p = p + rlen;
@@ -830,50 +903,69 @@ fn _scan(b as *u8, n as i64, offs as *i64, lens as *i64, max as i64) as i64 {
     return got;
 }
 
+// The whole file at `path` into g, from its start. Its length, or -1 when it
+// cannot be read — missing, unreadable, or no memory for it.
+fn _slurp(path as *u8, g as *grow.Grow) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n with mut = 0;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        if (grow.need(g, n + 65536) != 0) { sys.close(fd); return 0 - 1; }
+        let is i64 as got = sys.read(fd, cast(*u8, g.base + n), 65536);
+        if (got < 0) { sys.close(fd); return 0 - 1; }
+        if (got == 0) { more = 0; }
+        n = n + got;
+    }
+    sys.close(fd);
+    return n;
+}
+
 // file_load — seed the ring from disk. Missing or malformed file = empty
 // history, never an error the caller has to handle: a first boot has no file.
+// It read the first 16 KiB of the file and stopped there.
 fn file_load(r as *Repl, path as *u8) as i64 {
-    let is i64 as fd = sys.open_read(path);
-    if (fd < 0) { return 0; }
-    let is i64 as n = sys.read(fd, cast(*u8, &fbuf[0]), FILE_CAP);
-    sys.close(fd);
-    if (n <= 0) { return 0; }
-    let is [128]i64 as offs;
-    let is [128]i64 as lens;
-    let is i64 as got = _scan(cast(*u8, &fbuf[0]), n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
-    // Only the newest HIST_N reach the ring — pushing all of them would just
-    // overwrite the same slots and cost the loop.
-    let is i64 as first with mut = got - HIST_N;
-    if (first < 0) { first = 0; }
-    let is i64 as i with mut = first;
-    while (i < got) {
-        hist_push(r, cast(*u8, &fbuf[offs[i]]), lens[i]);
-        i = i + 1;
+    let is grow.Grow as fg;
+    if (grow.init(&fg, FILE_LIMIT) != 0) { return 0; }
+    let is i64 as n = _slurp(path, &fg);
+    let is i64 as got with mut = 0;
+    if (n > 0) {
+        let is [128]i64 as offs;
+        let is [128]i64 as lens;
+        got = _scan(grow.bytes(&fg), n, cast(*i64, &offs[0]), cast(*i64, &lens[0]), FILE_MAX);
+        // Only the newest HIST_N reach the ring — pushing all of them would
+        // just overwrite the same entries and cost the loop.
+        let is i64 as first with mut = got - HIST_N;
+        if (first < 0) { first = 0; }
+        let is i64 as i with mut = first;
+        while (i < got) {
+            hist_push(r, cast(*u8, fg.base + offs[i]), lens[i]);
+            i = i + 1;
+        }
     }
+    grow.release(&fg);
     r.npush_load = r.npush;
     return got;
 }
 
 // _save — rewrite the file at `path` as what is on it now plus the n lines at
 // ptrs/lens (oldest first), keeping the newest FILE_MAX: written to
-// <path>.tmp and renamed over it. `buf` (FILE_CAP bytes) holds the old file
-// while it is copied — the caller's, so two threads saving never share one.
-// The records written, or -1.
+// <path>.tmp and renamed over it. `g` holds the old file while it is copied —
+// the caller's, so two threads saving never share one. The records written,
+// or -1, with the file as it was: a write that fails (a full disk) leaves the
+// .tmp unrenamed and removed, where it used to be renamed over the history
+// half-written.
 //
 // Only lines new since the last save come in, so a session that loaded 40
 // entries does not write them back a second time. Several shells share one
 // file: the last writer wins the tail, which loses interleaving but never
 // corrupts — the rename is the whole transaction.
-fn _save(path as *u8, buf as *u8, ptrs as *i64, lens as *i64, n as i64) as i64 {
+fn _save(path as *u8, g as *grow.Grow, ptrs as *i64, lens as *i64, n as i64) as i64 {
     if (n <= 0) { return 0; }
     // Read the current file first: the new records are appended to it.
-    let is i64 as old_n with mut = 0;
-    let is i64 as fd = sys.open_read(path);
-    if (fd >= 0) {
-        old_n = sys.read(fd, buf, FILE_CAP);
-        sys.close(fd);
-        if (old_n < 0) { old_n = 0; }
-    }
+    let is i64 as old_n with mut = _slurp(path, g);
+    if (old_n < 0) { old_n = 0; }
+    let is *u8 as buf = grow.bytes(g);
     let is [128]i64 as offs;
     let is [128]i64 as olens;
     let is i64 as old_got = _scan(buf, old_n, cast(*i64, &offs[0]), cast(*i64, &olens[0]), FILE_MAX);
@@ -898,28 +990,29 @@ fn _save(path as *u8, buf as *u8, ptrs as *i64, lens as *i64, n as i64) as i64 {
 
     let is i64 as out = sys.open_write(cast(*u8, &tmp[0]));
     if (out < 0) { return 0 - 1; }
+    let is i64 as ok with mut = 1;
     let is [8]u8 as hdr;
     hdr[0] = cast(u8, 72); hdr[1] = cast(u8, 73); hdr[2] = cast(u8, 83); hdr[3] = cast(u8, 84);
     _put_u32le(cast(*u8, &hdr[0]), 4, keep + fresh);
-    if (sys.write(out, cast(*u8, &hdr[0]), 8) != 8) { sys.close(out); return 0 - 1; }
+    if (sys.write(out, cast(*u8, &hdr[0]), 8) != 8) { ok = 0; }
 
     let is [4]u8 as lb;
     let is i64 as i with mut = skip;
-    while (i < old_got) {
+    while (i < old_got && ok == 1) {
         _put_u32le(cast(*u8, &lb[0]), 0, olens[i]);
-        sys.write(out, cast(*u8, &lb[0]), 4);
-        sys.write(out, cast(*u8, cast(i64, buf) + offs[i]), olens[i]);
+        if (sys.write(out, cast(*u8, &lb[0]), 4) != 4) { ok = 0; }
+        else if (olens[i] > 0 && sys.write(out, cast(*u8, cast(i64, buf) + offs[i]), olens[i]) != olens[i]) { ok = 0; }
         i = i + 1;
     }
     i = first;
-    while (i < n) {
+    while (i < n && ok == 1) {
         _put_u32le(cast(*u8, &lb[0]), 0, lens[i]);
-        sys.write(out, cast(*u8, &lb[0]), 4);
-        sys.write(out, cast(*u8, ptrs[i]), lens[i]);
+        if (sys.write(out, cast(*u8, &lb[0]), 4) != 4) { ok = 0; }
+        else if (lens[i] > 0 && sys.write(out, cast(*u8, ptrs[i]), lens[i]) != lens[i]) { ok = 0; }
         i = i + 1;
     }
-    sys.close(out);
-    if (cast(i64, sys.rename(cast(*u8, &tmp[0]), path)) != 0) {
+    if (sys.close(out) != 0) { ok = 0; }
+    if (ok == 0 || cast(i64, sys.rename(cast(*u8, &tmp[0]), path)) != 0) {
         sys.unlink(cast(*u8, &tmp[0]));                      // no half-file left behind
         return 0 - 1;
     }
@@ -947,7 +1040,10 @@ fn file_save(r as *Repl, path as *u8) as i64 {
         }
         age = age - 1;
     }
-    let is i64 as rc = _save(path, cast(*u8, &fbuf[0]), cast(*i64, &ptrs[0]), cast(*i64, &lens[0]), n);
+    let is grow.Grow as fg;
+    if (grow.init(&fg, FILE_LIMIT) != 0) { return 0 - 1; }
+    let is i64 as rc = _save(path, &fg, cast(*i64, &ptrs[0]), cast(*i64, &lens[0]), n);
+    grow.release(&fg);
     if (rc >= 0) { r.npush_load = r.npush; }
     return rc;
 }
@@ -970,7 +1066,7 @@ fn file_save(r as *Repl, path as *u8) as i64 {
 //
 // The thread shares nothing with the shell but the channel and what it was
 // given before it started (the path, its end of the channel): its buffers are
-// on its own stack.
+// its own.
 
 let is i64 as SYNC_STOP with imut = 0xFFFFFFFF;   // a record length meaning "save what you have, answer, end"
 let is i64 as SYNC_PEND with imut = 16;           // lines the thread gathers before it saves regardless
@@ -986,6 +1082,9 @@ struct HistSync {
     tfd as i64;              // the thread's end
     sent as i64;             // r.npush up to which lines were handed over
     held as i64;             // 1 = a line is waiting for room in the channel
+    part as i64;             // bytes of the record in rg already written; 0 = none begun
+    rlen as i64;             // bytes of that record: its length word and its line
+    rg as grow.Grow;         // the record being handed over, copied out of the ring
     ts as sys.ThreadStack;
     path as [128]u8;
 }
@@ -994,18 +1093,24 @@ struct HistSync {
 // it has read is all there is for now, when it has gathered SYNC_PEND lines,
 // and when told to stop; on SYNC_STOP it answers one byte once the save is
 // done, and ends. EOF (the shell gone without stopping it) also ends it, after
-// a last save.
+// a last save. The lines it gathers and the old file it copies are in buffers
+// that grow; it kept 256 bytes a line and 16 KiB of file on its stack.
 fn _sync_thread(h as *HistSync) as i64 {
     let is [2048]u8 as rbuf;
-    let is [4096]u8 as pbuf;               // SYNC_PEND * LINE_CAP
-    let is [16]i64 as plen;
+    let is [16]i64 as plen;                // SYNC_PEND
+    let is [16]i64 as poff;
     let is [16]i64 as pptr;
-    let is [16384]u8 as fb;                // FILE_CAP: the old file while it is copied
+    let is grow.Grow as pg;                // the gathered lines, end to end
+    let is grow.Grow as fg;                // the old file while it is copied
+    let is i64 as have_bufs with mut = 1;
+    if (grow.init(&pg, SYNC_PEND * LINE_LIMIT) != 0 || grow.init(&fg, FILE_LIMIT) != 0) { have_bufs = 0; }
     let is [4]u8 as lenb;
     let is i64 as lfill with mut = 0;      // bytes of the length read so far
     let is i64 as want with mut = 0 - 1;   // the line's length once known
     let is i64 as got with mut = 0;        // bytes of the line read so far
+    let is i64 as keep with mut = 0;       // 1 = the line has a place to go
     let is i64 as pn with mut = 0;
+    let is i64 as pfill with mut = 0;
     let is i64 as stop with mut = 0;       // 1 = EOF, 2 = asked to stop
     let is [3]i64 as pe;
     while (stop == 0) {
@@ -1022,21 +1127,31 @@ fn _sync_thread(h as *HistSync) as i64 {
                     lfill = 0;
                     let is i64 as l = _u32le(cast(*u8, &lenb[0]), 0);
                     if (l == SYNC_STOP) { stop = 2; }
-                    else if (l > 0 && l < LINE_CAP) {
+                    else if (l > 0 && l <= LINE_LIMIT) {
                         if (pn == SYNC_PEND) {
-                            _save(cast(*u8, &h.path[0]), cast(*u8, &fb[0]), cast(*i64, &pptr[0]), cast(*i64, &plen[0]), pn);
-                            pn = 0;
+                            _save(cast(*u8, &h.path[0]), &fg, cast(*i64, &pptr[0]), cast(*i64, &plen[0]), pn);
+                            pn = 0; pfill = 0;
                         }
+                        // Without memory for it the line is still read, to
+                        // stay in step with the stream, and not kept.
+                        keep = 0;
+                        if (have_bufs == 1 && grow.need(&pg, pfill + l) == 0) { keep = 1; }
                         want = l; got = 0;
                     }
                 }
             } else {
-                pbuf[pn * LINE_CAP + got] = c;
+                if (keep == 1) {
+                    let is *u8 as pb = grow.bytes(&pg);
+                    pb[pfill + got] = c;
+                }
                 got = got + 1;
                 if (got == want) {
-                    pptr[pn] = cast(i64, &pbuf[pn * LINE_CAP]);
-                    plen[pn] = want;
-                    pn = pn + 1;
+                    if (keep == 1) {
+                        poff[pn] = pfill;
+                        plen[pn] = want;
+                        pfill = pfill + want;
+                        pn = pn + 1;
+                    }
                     want = 0 - 1;
                 }
             }
@@ -1048,8 +1163,10 @@ fn _sync_thread(h as *HistSync) as i64 {
             if ((pe[2] & sys.POLL_READABLE) != 0) { continue; }
         }
         if (pn > 0) {
-            _save(cast(*u8, &h.path[0]), cast(*u8, &fb[0]), cast(*i64, &pptr[0]), cast(*i64, &plen[0]), pn);
-            pn = 0;
+            let is i64 as k with mut = 0;
+            while (k < pn) { pptr[k] = pg.base + poff[k]; k = k + 1; }
+            _save(cast(*u8, &h.path[0]), &fg, cast(*i64, &pptr[0]), cast(*i64, &plen[0]), pn);
+            pn = 0; pfill = 0;
         }
     }
     if (stop == 2) {
@@ -1057,6 +1174,8 @@ fn _sync_thread(h as *HistSync) as i64 {
         ack[0] = cast(u8, 1);
         sys.write(h.tfd, cast(*u8, &ack[0]), 1);
     }
+    grow.release(&pg);
+    grow.release(&fg);
     sys.close(h.tfd);
     return 0;
 }
@@ -1065,7 +1184,7 @@ fn _sync_thread(h as *HistSync) as i64 {
 // lines. 0, or the errno with nothing started; then sync saves on the
 // caller's thread, as before (file_save).
 fn sync_start(h as *HistSync, r as *Repl, path as *u8) as i64 {
-    h.on = 0; h.held = 0;
+    h.on = 0; h.held = 0; h.part = 0; h.rlen = 0;
     h.fd = 0 - 1; h.tfd = 0 - 1;
     h.sent = r.npush;                      // what was loaded is on disk already
     h.path[0] = cast(u8, 0);
@@ -1073,15 +1192,17 @@ fn sync_start(h as *HistSync, r as *Repl, path as *u8) as i64 {
     if (pl > 120) { return sys.E_INVAL; }
     let is i64 as k with mut = 0;
     while (k <= pl) { h.path[k] = path[k]; k = k + 1; }
+    if (grow.init(&h.rg, LINE_LIMIT + 4) != 0) { return sys.E_NOMEM; }
     let is [2]i64 as ch;
     let is i64 as rc with mut = sys.channel_create(cast(*i64, &ch[0]));
-    if (rc != 0) { return rc; }
+    if (rc != 0) { grow.release(&h.rg); return rc; }
     h.fd = ch[0];
     h.tfd = ch[1];
     rc = sys.thread_start(&h.ts, cast(i64, fn_ptr(_sync_thread)), cast(i64, h), SYNC_STACK, SYNC_COMMIT);
     if (rc != 0) {
         sys.close(ch[0]); sys.close(ch[1]);
         h.fd = 0 - 1; h.tfd = 0 - 1;
+        grow.release(&h.rg);
         return rc;
     }
     h.on = 1;
@@ -1100,26 +1221,36 @@ fn sync(h as *HistSync, r as *Repl) as void {
 }
 
 // Every line not handed over yet, while the channel has room for it; h.held
-// says whether one is left waiting.
+// says whether one is left waiting. A line is copied out of the ring before
+// its first byte goes, and written in as many pieces as the channel's room
+// allows: one longer than the whole channel goes over several calls, and a
+// push that drops it from the ring meanwhile cannot cut it off half way.
 fn _send(h as *HistSync, r as *Repl) as void {
     h.held = 0;
     let is [4]i64 as ci;
-    let is [260]u8 as rec;                 // 4 + LINE_CAP
-    while (h.sent < r.npush) {
-        let is i64 as age = r.npush - h.sent;          // of the oldest not sent: 1 = newest
-        if (age > r.hsize) { h.sent = r.npush - r.hsize; }   // fell out of the ring
-        else {
+    while (h.part > 0 || h.sent < r.npush) {
+        if (h.part == 0) {
+            let is i64 as age = r.npush - h.sent;          // of the oldest not sent: 1 = newest
+            if (age > r.hsize) { h.sent = r.npush - r.hsize; continue; }   // fell out of the ring
             let is i64 as slot = slot_of(r, age);
             let is i64 as len = r.hlen[slot];
-            if (sys.chan_info(h.fd, cast(*i64, &ci[0])) != 0) { h.held = 0; return; }
-            if (ci[2] < 4 + len) { h.held = 1; return; }
-            _put_u32le(cast(*u8, &rec[0]), 0, len);
+            // No memory to copy it now: the next sync tries again.
+            if (grow.need(&h.rg, 4 + len) != 0) { return; }
+            let is *u8 as rec = grow.bytes(&h.rg);
+            _put_u32le(rec, 0, len);
             let is *u8 as src = hist_ptr(r, slot);
             let is i64 as k with mut = 0;
             while (k < len) { rec[4 + k] = src[k]; k = k + 1; }
-            if (sys.write(h.fd, cast(*u8, &rec[0]), 4 + len) != 4 + len) { h.held = 0; return; }
-            h.sent = h.sent + 1;
+            h.rlen = 4 + len;
         }
+        if (sys.chan_info(h.fd, cast(*i64, &ci[0])) != 0) { return; }
+        if (ci[2] <= 0) { h.held = 1; return; }
+        let is i64 as take with mut = h.rlen - h.part;
+        if (take > ci[2]) { take = ci[2]; }
+        let is i64 as w = sys.write(h.fd, cast(*u8, h.rg.base + h.part), take);
+        if (w <= 0) { return; }
+        h.part = h.part + w;
+        if (h.part == h.rlen) { h.part = 0; h.sent = h.sent + 1; }
     }
     return;
 }
@@ -1144,7 +1275,11 @@ fn sync_stop(h as *HistSync, r as *Repl, wait_ns as i64) as i64 {
         if (left <= 0) { phase = 3; }
         else if (phase == 0) {
             _send(h, r);
-            if (h.held == 0) { phase = 1; }
+            // The stop record may only follow a whole record: with one cut
+            // off half way (the channel failed), the thread would read the
+            // marker as the rest of a line.
+            if (h.held == 0 && h.part != 0) { phase = 3; }
+            else if (h.held == 0) { phase = 1; }
             else {
                 pe[0] = h.fd; pe[1] = sys.POLL_WRITABLE; pe[2] = 0;
                 sys.poll(cast(*i64, &pe[0]), 1, left);
@@ -1173,26 +1308,8 @@ fn sync_stop(h as *HistSync, r as *Repl, wait_ns as i64) as i64 {
     }
     sys.close(h.fd);
     h.fd = 0 - 1;
+    grow.release(&h.rg);
     return rc;
-}
-
-// ---- tokenising ------------------------------------------------------------
-
-// parse — split the line on runs of spaces, in place. argv_ptr[i] is a byte
-// pointer INTO the line (no copy), argv_len[i] its length. Returns argc.
-fn parse(line as *u8, len as i64, argv_ptr as *i64, argv_len as *i64) as i64 {
-    let is i64 as argc with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < len && argc < MAX_ARGS) {
-        while (i < len && line[i] == 32) { i = i + 1; }
-        if (i >= len) { break; }
-        let is i64 as start = i;
-        while (i < len && line[i] != 32) { i = i + 1; }
-        argv_ptr[argc] = cast(i64, line) + start;
-        argv_len[argc] = i - start;
-        argc = argc + 1;
-    }
-    return argc;
 }
 
 // ---- completion ------------------------------------------------------------
@@ -1204,19 +1321,24 @@ fn _cand_match(cand as *u8, cl as i64, line as *u8, ts as i64, plen as i64) as i
     return 1;
 }
 
-// Fold a match into the longest-common-prefix accumulator.
-fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
-    nmatch_ptr[0] = nmatch_ptr[0] + 1;
+// Fold a match into the longest-common-prefix accumulator, kept in g with
+// room for one byte past it (complete looks there for a split character).
+fn _acc_update(cand as *u8, cl as i64, g as *grow.Grow, acclen_ptr as *i64, nmatch_ptr as *i64) as void {
     if (acclen_ptr[0] < 0) {
+        if (grow.need(g, cl + 1) != 0) { return; }       // no memory: not a candidate
+        let is *u8 as acc = grow.bytes(g);
         let is i64 as i with mut = 0;
-        while (i < cl && i < LINE_CAP - 1) { acc[i] = cand[i]; i = i + 1; }
-        acclen_ptr[0] = i;
+        while (i < cl) { acc[i] = cand[i]; i = i + 1; }
+        acc[cl] = cast(u8, 0);
+        acclen_ptr[0] = cl;
     } else {
+        let is *u8 as acc2 = grow.bytes(g);
         let is i64 as i with mut = 0;
         let is i64 as al = acclen_ptr[0];
-        while (i < al && i < cl && acc[i] == cand[i]) { i = i + 1; }
+        while (i < al && i < cl && acc2[i] == cand[i]) { i = i + 1; }
         acclen_ptr[0] = i;
     }
+    nmatch_ptr[0] = nmatch_ptr[0] + 1;
     return;
 }
 
@@ -1228,7 +1350,7 @@ fn _acc_update(cand as *u8, cl as i64, acc as *u8, acclen_ptr as *i64, nmatch_pt
 // The builtin list is the caller's because the two shells do not have the same
 // one — the windowed shell can `exit`, the fullscreen one cannot.
 fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as void {
-    let is *u8 as line = cast(*u8, &r.line[0]);
+    let is *u8 as line = _ln(r);
     // Completion acts on the token the CURSOR is in, not on the end of the
     // line: with a movable cursor those are no longer the same place.
     let is i64 as llen = r.cur;
@@ -1238,7 +1360,6 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
     let is i64 as is_cmd with mut = 0;
     if (ts == 0) { is_cmd = 1; }
 
-    let is [256]u8 as acc;
     let is i64 as acclen with mut = 0 - 1;
     let is i64 as nmatch with mut = 0;
 
@@ -1248,7 +1369,7 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
             let is *u8 as bp = cast(*u8, builtins[bi * 2]);
             let is i64 as bl = builtins[bi * 2 + 1];
             if (_cand_match(bp, bl, line, ts, plen) == 1) {
-                _acc_update(bp, bl, cast(*u8, &acc[0]), &acclen, &nmatch);
+                _acc_update(bp, bl, &r.ag, &acclen, &nmatch);
             }
             bi = bi + 1;
         }
@@ -1261,29 +1382,28 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
     if (is_cmd == 0) {
         let is i64 as ce with mut = 0;
         while (ce < llen && line[ce] != 32) { ce = ce + 1; }
-        if (ce > 0 && ce < 64) {
-            let is [128]u8 as cpath;
-            let is *u8 as pre = "/etc/completions/";
-            let is i64 as pl with mut = 0;
-            while (pre[pl] != 0) { cpath[pl] = pre[pl]; pl = pl + 1; }
+        let is *u8 as pre = "/etc/completions/";
+        let is i64 as pl with mut = 0;
+        while (pre[pl] != 0) { pl = pl + 1; }
+        if (ce > 0 && pl + ce < 256) {                  // a path: at most 255 bytes
+            let is [256]u8 as cpath;
             let is i64 as q with mut = 0;
+            while (q < pl) { cpath[q] = pre[q]; q = q + 1; }
+            q = 0;
             while (q < ce) { cpath[pl + q] = line[q]; q = q + 1; }
             cpath[pl + ce] = cast(u8, 0);
-            let is i64 as cfd = sys.open_read(cast(*u8, &cpath[0]));
-            if (cfd >= 0) {
-                let is [1024]u8 as cbuf;
-                let is i64 as cn = sys.read(cfd, cast(*u8, &cbuf[0]), 1024);
-                sys.close(cfd);
-                let is i64 as p with mut = 0;
-                while (p < cn) {
-                    while (p < cn && (cbuf[p] == cast(u8, 10) || cbuf[p] == cast(u8, 13)
-                                      || cbuf[p] == cast(u8, 32))) { p = p + 1; }
-                    let is i64 as w0 = p;
-                    while (p < cn && cbuf[p] != cast(u8, 10) && cbuf[p] != cast(u8, 13)
-                           && cbuf[p] != cast(u8, 32)) { p = p + 1; }
-                    if (p > w0 && _cand_match(cast(*u8, &cbuf[w0]), p - w0, line, ts, plen) == 1) {
-                        _acc_update(cast(*u8, &cbuf[w0]), p - w0, cast(*u8, &acc[0]), &acclen, &nmatch);
-                    }
+            // The whole list: it was the first 1024 bytes of it.
+            let is i64 as cn = _slurp(cast(*u8, &cpath[0]), &r.cg);
+            let is *u8 as cbuf = grow.bytes(&r.cg);
+            let is i64 as p with mut = 0;
+            while (p < cn) {
+                while (p < cn && (cbuf[p] == cast(u8, 10) || cbuf[p] == cast(u8, 13)
+                                  || cbuf[p] == cast(u8, 32))) { p = p + 1; }
+                let is i64 as w0 = p;
+                while (p < cn && cbuf[p] != cast(u8, 10) && cbuf[p] != cast(u8, 13)
+                       && cbuf[p] != cast(u8, 32)) { p = p + 1; }
+                if (p > w0 && _cand_match(cast(*u8, cast(i64, cbuf) + w0), p - w0, line, ts, plen) == 1) {
+                    _acc_update(cast(*u8, cast(i64, cbuf) + w0), p - w0, &r.ag, &acclen, &nmatch);
                 }
             }
         }
@@ -1303,7 +1423,7 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
                 else { ok = 0; }
             }
             if (ok == 1 && _cand_match(nm, cl, line, ts, plen) == 1) {
-                _acc_update(nm, cl, cast(*u8, &acc[0]), &acclen, &nmatch);
+                _acc_update(nm, cl, &r.ag, &acclen, &nmatch);
             }
         }
         sys.close(fd);
@@ -1312,10 +1432,12 @@ fn complete(r as *Repl, t as *term.Term, builtins as *i64, nbuiltin as i64) as v
 
     // Two names can share the first bytes of different characters ("café",
     // "cafè"): the prefix they share stops before that character.
+    let is *u8 as acc = grow.bytes(&r.ag);
     while (acclen > plen && (cast(i64, acc[acclen]) & 0xC0) == 0x80) { acclen = acclen - 1; }
     if (acclen > plen) {
-        _insert(r, cast(*u8, cast(i64, &acc[0]) + plen), acclen - plen);
+        _insert(r, cast(*u8, cast(i64, acc) + plen), acclen - plen);
     }
+    r.knav = 0;
     if (nmatch == 1) { line_push(r, 32); }               // sole match -> trailing space
     redraw(r, t);
     return;
