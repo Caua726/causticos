@@ -25,7 +25,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "userspace", "tests", "cmdt.cases")
-GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head", "wc": "/usr/bin/wc", "tail": "/usr/bin/tail"}
+GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head", "wc": "/usr/bin/wc", "tail": "/usr/bin/tail", "echo": "/usr/bin/echo"}
 
 CASES = []
 
@@ -390,6 +390,22 @@ case("tail-classic-two-files", "tail", ["-3", "%D/a", "%D/b"], files={"%D/a": L5
 case("tail-classic-invalid-suffix", "tail", ["-3x"], L5)
 case("tail-classic-too-large", "tail", ["-99999999999999999999999"], L5)
 case("tail-n-zero", "tail", ["-n", "0"], L5)
+
+# echo's options are -n, -e and -E, only in leading arguments made of them.
+case("echo-plain", "echo", ["a", "b"])
+case("echo-empty", "echo", [])
+case("echo-n", "echo", ["-n", "x"])
+case("echo-n-alone", "echo", ["-n"])
+case("echo-e", "echo", ["-e", "a\\tb\\nc"])
+case("echo-no-escapes-by-default", "echo", ["a\\tb"])
+case("echo-e-then-E", "echo", ["-e", "-E", "a\\tb"])
+case("echo-combined", "echo", ["-ne", "x\\ty"])
+case("echo-not-an-option", "echo", ["-nx", "-", "--", "y"])
+case("echo-option-after-text", "echo", ["x", "-n"])
+case("echo-e-c", "echo", ["-e", "ab\\cde", "fg"])
+case("echo-e-octal-hex", "echo", ["-e", "\\0101\\102\\x41\\x4g\\0\\0777|"])
+case("echo-e-not-escapes", "echo", ["-e", "\\q\\xg\\\\end\\"])
+case("echo-e-controls", "echo", ["-e", "\\a\\b\\e\\f\\r\\v"])
 
 
 def run(c):

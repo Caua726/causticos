@@ -30,7 +30,8 @@ manifest before you get that far.
 
 ## 1. A terminal program
 
-The whole of `coreutils/echo.cst`:
+A whole program — `coreutils/echo.cst` as it started, before it took GNU's
+`-n`, `-e` and `-E`:
 
 ```caustic
 use "std/causticos/prog.cst" as prog;
