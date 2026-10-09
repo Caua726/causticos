@@ -276,7 +276,7 @@ case "$VIEWER" in
     console)
         # Attaching AFTER the start loses nothing: QEMU's pty holds the early
         # output until something reads it, and the first line off the wire
-        # ("causticos v0.0.2") is measurably still there. No sleep needed here,
+        # ("CausticOS v0.0.2") is measurably still there. No sleep needed here,
         # and a sleep would not be a fix if it were.
         echo "libvirt: serial console — Ctrl+] to detach (the guest keeps running)"
         exec virsh console "$NAME"
