@@ -21,6 +21,9 @@
 # the guest dials them one at a time, so one set serves the lot.
 #
 #   scripts/test-userspace.sh
+#   ONLINE=1 scripts/test-userspace.sh    also HTTPS against real sites (needs
+#                                         the internet; reported NOT RUN, with
+#                                         the reason, when the host is offline)
 set -e
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -107,7 +110,7 @@ wait $QPID 2>/dev/null || true
 RAW=$(tr -d '\000' < "$LOG")
 cp "$LOG" /tmp/ut-selftests.log
 
-PASS=0; FAIL=0; FAILED=""
+PASS=0; FAIL=0; FAILED=""; NOTRUN=0; NOTRAN=""
 # THE EXIT CODE IS THE VERDICT. Matching each test's printed marker meant the
 # harness had to know how every one of them spells success — and it guessed
 # wrong twice in a row, reporting a green kabi ("kabi: PASS", not "ALL PASS")
@@ -147,6 +150,11 @@ DRIVEN=(
     "shellnet|scripts/test-shell-net.sh|wget typed at the prompt"
     "runallwait|scripts/test-runall.sh|delayed nonzero verdict"
 )
+# The one that needs the internet, only when asked for: a default run has to
+# give the same answer on a machine with no route out.
+if [ "${ONLINE:-0}" = 1 ]; then
+    DRIVEN+=("httpsreal|scripts/test-https-real.sh|real sites, real roots, real refusals")
+fi
 
 # The ones that MEASURE TIME, run one at a time. Each of these records real
 # audio off the host and checks how long a tone lasted, to a ±25% tolerance —
@@ -198,7 +206,7 @@ done
 RES="$RES" xargs -P "$NJOBS" -L 1 bash -c '
     t0=$SECONDS
     rc=0
-    QEMU_HTTPD_PORT=$0 bash "$2" >/tmp/ut-$1.log 2>&1 || rc=1
+    QEMU_HTTPD_PORT=$0 bash "$2" >/tmp/ut-$1.log 2>&1 || rc=$?
     printf "%s|%s\n" "$rc" "$((SECONDS-t0))" > "$RES/$1"
 ' < "$PLAN"
 rm -f "$PLAN"
@@ -235,6 +243,11 @@ for entry in "${DRIVEN[@]}"; do
         esac
         echo "PASS ($label, ${secs}s)"
         PASS=$((PASS+1))
+    elif [ "$rc" = 2 ]; then
+        # Exit 2 is a test saying it could not run here — the host offline,
+        # say. Neither a pass nor a failure of the system, and said as such.
+        echo "NOT RUN ($(grep -m1 '^not run: ' /tmp/ut-$name.log | sed 's/^not run: //'))"
+        NOTRUN=$((NOTRUN+1)); NOTRAN="$NOTRAN $name"
     else
         echo "FAIL  (see /tmp/ut-$name.log)"
         grep -E "FAIL|panic:" /tmp/ut-$name.log | head -4 || true
@@ -244,7 +257,7 @@ done
 rm -rf "$RES"
 
 if [ -n "$FAILED" ]; then
-    echo "=== userspace: $PASS passed, $FAIL failed —$FAILED  ($((SECONDS-START))s) ==="
+    echo "=== userspace: $PASS passed, $FAIL failed —$FAILED${NOTRAN:+, $NOTRUN not run —$NOTRAN}  ($((SECONDS-START))s) ==="
     exit 1
 fi
-echo "=== userspace: $PASS passed, 0 failed  ($((SECONDS-START))s) ==="
+echo "=== userspace: $PASS passed, 0 failed${NOTRAN:+, $NOTRUN not run —$NOTRAN}  ($((SECONDS-START))s) ==="
