@@ -124,12 +124,25 @@ type_line() {
 }
 
 # Two voices at once, both in the background so the shell stays usable.
+JOINED0=$(tr -d '\000' < "$LOG" | grep -c "soundd: client [0-9]* joined" || true)
 type_line "aplay /mix.wav &"
 sleep 0.3
 type_line "aplay /mix2.wav &"
 
 # Let the mix establish itself, then take the device away from underneath it.
-sleep 1.5
+# "Established" is both players having joined soundd, and then a second of
+# both playing — not a fixed wait from the typing: each loads its file off the
+# disk first, and on a busy host that took past the 1.5 s that used to be
+# allowed, so the preempting player came first and the test reported a mixer
+# that never mixed.
+for _ in $(seq 1 200); do
+    N=$(tr -d '\000' < "$LOG" | grep -c "soundd: client [0-9]* joined" || true)
+    [ "$N" -ge $((JOINED0 + 2)) ] && break
+    kill -0 $QPID 2>/dev/null || break
+    sleep 0.1
+done
+[ "$N" -ge $((JOINED0 + 2)) ] || { echo "FAIL: the two players never both joined soundd"; tr -d '\000' < "$LOG" | grep -E "soundd|aplay" | tail -8; exit 1; }
+sleep 1.0
 type_line "aplay --direct /low.wav"
 
 # And wait for the whole thing to finish.
