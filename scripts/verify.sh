@@ -128,6 +128,7 @@ SMOKE_MARKERS=(
     'heap_smoke: PASS'
     'random_smoke: PASS'
     'surface_smoke: PASS'
+    'vfswatch_smoke: PASS'
     'dummy.dma: PASS'
     'dummy.portio: PASS'
     'dummy.memory: PASS'

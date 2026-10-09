@@ -280,7 +280,7 @@ chooses one (any capitalisation; kept in `/var/timezone`), and
 launcher lists it as "timezone".
 
 The taskbar clock shows `HH:MM:SS` and the zone's abbreviation (`UTC`, `-03`,
-`BST`) and follows a change within a second; the compositor's night light
+`BST`) and follows a change as soon as it is made; the compositor's night light
 follows the same local hour. `date` prints local time with the abbreviation,
 `date -u` prints UTC, and `+FORMAT` adds `%z` and `%Z`; `%s` stays the instant.
 `ls -l` shows write times in the chosen zone. Clicking the clock opens a
@@ -425,7 +425,7 @@ for personal bindings: it is loaded afterward, and a binding for the same
 modifier/key chord replaces the shipped one. `unbind <mods> <key>` removes a
 binding. For example, `bind alt+shift p spawn_term` adds a terminal shortcut;
 `unbind super space` removes the launcher shortcut. Both files are reloaded
-automatically when their modification time changes. Modifier names are
+automatically as soon as either is written. Modifier names are
 `super`, `alt`, `shift`, and `ctrl`; join combinations with `+`. Key names use
 physical key positions, independent of the active keymap.
 Invalid bind lines and invalid colour values also appear as a taskbar notice;

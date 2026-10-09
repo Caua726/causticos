@@ -1,0 +1,252 @@
+// vfswatch.cst — KOBJ_WATCH: an fd that becomes readable when a path changes.
+//
+// A program that keeps a file's contents in memory — the window manager its
+// config, its keymap and its time zone — has to learn that the file changed.
+// Asking the disk every second whether it did (statx, compare the time) is a
+// syscall and a directory walk per file per second forever, on a filesystem
+// whose times move in two-second steps; and nothing changes almost all the
+// time. SYS_WATCH turns the question around: the VFS says when a path it
+// changed is one somebody watches.
+//
+// What counts as a change, reported after it is complete: a file opened for
+// writing (or creating, or truncating) being closed; a path created, removed
+// or renamed — both names of a rename. A watch matches the path itself and,
+// when the watched path is a directory, every entry directly inside it.
+// Paths are compared after normalising them (one "/" between names, "." and
+// ".." resolved) and without regard to case, as the FAT volumes underneath
+// compare names; a path does not have to exist to be watched.
+//
+// The fd reads as one i64: how many changes since the last read, or nothing
+// (0 bytes) when there were none — never blocking; the holder polls it with
+// its other fds. Self-contained, like eventfd: a global list of live watches
+// under one lock. The traffic is a handful of watches and a few changes a
+// second at most, so a walk of the list per change costs nothing that matters.
+
+use "kobject.cst" as kobject;
+use "heap.cst" as heap;
+use "pmm.cst" as pmm;
+use "lock.cst" as lock;
+use "abi.cst" as abi;
+use "serial.cst" as serial;
+use "sched.cst" as sched;
+
+// The longest normalised path a watch holds: the syscalls' PATH_MAX.
+let is i64 as PATH_MAX_BYTES = 255;
+
+let is kobject.KObjectOps as WATCH_OPS with mut;
+let is i64 as g_head with mut = 0;       // *Watch (0 = none)
+let is lock.TicketLock as g_lock with mut;
+
+// All i64, the path last (as words, read through a byte pointer).
+struct Watch {
+    len as i64;          // bytes of the normalised path
+    changes as i64;      // since the last read
+    g_next as i64;
+    path as [32]i64;     // 256 bytes
+}
+
+fn init() as void {
+    WATCH_OPS.read  = fn_ptr(w_read);
+    WATCH_OPS.poll  = fn_ptr(w_poll);
+    WATCH_OPS.close = fn_ptr(w_close);
+    WATCH_OPS.wait_key = fn_ptr(kobject.key_is_priv);
+}
+
+fn _lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn _eq(a as *u8, alen as i64, b as *u8, blen as i64) as i64 {
+    if (alen != blen) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < alen) {
+        if (_lower(cast(i64, a[i])) != _lower(cast(i64, b[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The normal form of an absolute path, into dst (256 bytes): "/" alone or
+// "/a/b" — no repeated, trailing or "." names, ".." taken back. -1 for a
+// path that is not absolute or does not fit.
+fn canon(src as *u8, n as i64, dst as *u8) as i64 {
+    if (n <= 0 || src[0] != cast(u8, 47)) { return 0 - 1; }
+    dst[0] = cast(u8, 47);
+    let is i64 as o with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        while (i < n && src[i] == cast(u8, 47)) { i = i + 1; }
+        if (i >= n) { return o; }
+        let is i64 as s0 = i;
+        while (i < n && src[i] != cast(u8, 47)) { i = i + 1; }
+        let is i64 as sl = i - s0;
+        if (sl == 1 && src[s0] == cast(u8, 46)) {
+            // "." names nothing
+        } else if (sl == 2 && src[s0] == cast(u8, 46) && src[s0 + 1] == cast(u8, 46)) {
+            // ".." takes the last name back; at the root there is none
+            let is i64 as k with mut = o - 1;
+            while (k > 0 && dst[k] != cast(u8, 47)) { k = k - 1; }
+            if (k == 0) { o = 1; } else { o = k; }
+        } else {
+            if (o > 1) {
+                if (o >= PATH_MAX_BYTES) { return 0 - 1; }
+                dst[o] = cast(u8, 47);
+                o = o + 1;
+            }
+            if (o + sl > PATH_MAX_BYTES) { return 0 - 1; }
+            let is i64 as j with mut = 0;
+            while (j < sl) { dst[o + j] = src[s0 + j]; j = j + 1; }
+            o = o + sl;
+        }
+    }
+    return o;
+}
+
+// 1 when `path` is one a watch may be made for.
+fn valid(path as *u8, n as i64) as i64 {
+    let is [256]u8 as c;
+    if (canon(path, n, cast(*u8, &c[0])) < 0) { return 0; }
+    return 1;
+}
+
+// A KOBJ_WATCH for `path`, or 0 (no memory, or a path valid() refuses).
+fn watch_create(path as *u8, n as i64) as i64 {
+    let is i64 as w = heap.kmalloc(sizeof(Watch), pmm.ALLOC_ZERO);
+    if (w == 0) { return 0; }
+    let is *Watch as wp = cast(*Watch, w);
+    let is i64 as len = canon(path, n, cast(*u8, &wp.path[0]));
+    if (len < 0) { heap.kfree(w); return 0; }
+    wp.len = len;
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_WATCH, &WATCH_OPS, w);
+    if (ko == 0) { heap.kfree(w); return 0; }
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    wp.g_next = g_head;
+    g_head = w;
+    lock.release_irq(&g_lock, fl);
+    return ko;
+}
+
+// The VFS changed `path`: every watch on it, or on the directory holding it,
+// counts one change and wakes whoever polls it. Called with no filesystem
+// lock held.
+fn notify(path as *u8, n as i64) as void {
+    if (g_head == 0) { return; }
+    let is [256]u8 as c;
+    let is *u8 as cp = cast(*u8, &c[0]);
+    let is i64 as cl = canon(path, n, cp);
+    if (cl < 0) { return; }
+    let is i64 as pl with mut = cl - 1;          // the parent: up to the last "/"
+    while (pl > 0 && c[pl] != cast(u8, 47)) { pl = pl - 1; }
+    if (pl == 0) { pl = 1; }                    // a name in the root: its parent is "/"
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as cur with mut = g_head;
+    while (cur != 0) {
+        let is *Watch as wp = cast(*Watch, cur);
+        let is *u8 as wpath = cast(*u8, &wp.path[0]);
+        let is i64 as hit with mut = _eq(wpath, wp.len, cp, cl);
+        if (hit == 0 && cl > 1) { hit = _eq(wpath, wp.len, cp, pl); }
+        if (hit == 1) {
+            wp.changes = wp.changes + 1;
+            // Under g_lock, as eventfd posts: nothing takes g_lock while
+            // holding a sched_lock, so the nesting has one order.
+            sched.poll_wake_key(cur);
+        }
+        cur = wp.g_next;
+    }
+    lock.release_irq(&g_lock, fl);
+}
+
+// ============================================================
+// Ops. `buf` is a kernel staging address (sys_read staged the copy-out).
+// ============================================================
+
+// The change count since the last read, as one i64, and back to zero; 0 bytes
+// when nothing changed. Never blocks.
+fn w_read(priv as i64, buf as i64, n as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    if (n < 8) { return abi.E_INVAL; }
+    let is *Watch as wp = cast(*Watch, priv);
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as c = wp.changes;
+    wp.changes = 0;
+    lock.release_irq(&g_lock, fl);
+    if (c == 0) { return 0; }
+    let is *i64 as out = cast(*i64, buf);
+    out[0] = c;
+    return 8;
+}
+
+fn w_poll(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_BADF; }
+    let is *Watch as wp = cast(*Watch, priv);
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as c = wp.changes;
+    lock.release_irq(&g_lock, fl);
+    if (c > 0) { return abi.POLL_READABLE; }
+    return 0;
+}
+
+fn w_close(priv as i64) as i64 {
+    if (priv == 0) { return abi.E_OK; }
+    let is i64 as fl = lock.acquire_irq(&g_lock);
+    let is i64 as prev with mut = 0;
+    let is i64 as cur with mut = g_head;
+    while (cur != 0 && cur != priv) {
+        prev = cur;
+        let is *Watch as cw = cast(*Watch, cur);
+        cur = cw.g_next;
+    }
+    if (cur == priv) {
+        let is *Watch as me = cast(*Watch, cur);
+        if (prev == 0) { g_head = me.g_next; }
+        else {
+            let is *Watch as pw = cast(*Watch, prev);
+            pw.g_next = me.g_next;
+        }
+    }
+    lock.release_irq(&g_lock, fl);
+    heap.kfree(priv);
+    return abi.E_OK;
+}
+
+// ============================================================
+// Smoke: the matching rules, at boot under `smoke`. A failure panics so
+// verify.sh catches it.
+// ============================================================
+
+fn _pending(ko as i64) as i64 {
+    let is [1]i64 as got;
+    got[0] = 0;
+    let is i64 as r = w_read(kobject.ko_priv(ko), cast(i64, &got[0]), 8);
+    if (r == 8) { return got[0]; }
+    return 0;
+}
+
+fn smoke() as void {
+    serial.println("vfswatch_smoke: start", 21);
+    let is i64 as file = watch_create(cast(*u8, "/var//wm/./conf.cst"), 19);
+    let is i64 as dir = watch_create(cast(*u8, "/etc/keymaps/"), 13);
+    if (file == 0 || dir == 0) { pmm.panic("vfswatch_smoke: create FAIL", 27); }
+    let is i64 as ok with mut = 1;
+    if (valid(cast(*u8, "relative/path"), 13) != 0) { ok = 0; }
+    if (_pending(file) != 0) { ok = 0; }                       // nothing yet
+    notify(cast(*u8, "/var/wm/conf.cst"), 16);
+    notify(cast(*u8, "/VAR/WM/CONF.CST"), 16);                 // FAT: case does not matter
+    notify(cast(*u8, "/var/x/../wm/conf.cst"), 21);            // nor the spelling
+    if (_pending(file) != 3) { ok = 0; }
+    if (_pending(file) != 0) { ok = 0; }                       // the read cleared it
+    notify(cast(*u8, "/var/wm/conf.cst.tmp"), 20);             // a neighbour is not it
+    notify(cast(*u8, "/var/wm"), 7);                           // nor its directory
+    if (_pending(file) != 0) { ok = 0; }
+    notify(cast(*u8, "/etc/keymaps/pt.map"), 19);              // an entry of a watched directory
+    notify(cast(*u8, "/etc/keymaps"), 12);                     // the directory itself
+    notify(cast(*u8, "/etc/keymaps/sub/x.map"), 22);           // not directly inside
+    if (_pending(dir) != 2) { ok = 0; }
+    if ((w_poll(kobject.ko_priv(dir)) & abi.POLL_READABLE) != 0) { ok = 0; }
+    kobject.ko_unref(file);
+    kobject.ko_unref(dir);
+    if (g_head != 0) { ok = 0; }                               // both unlinked
+    if (ok == 1) { serial.println("vfswatch_smoke: PASS", 20); }
+    else { pmm.panic("vfswatch_smoke: FAIL", 20); }
+}

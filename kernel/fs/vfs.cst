@@ -28,6 +28,7 @@ use "timer.cst"  as timer;
 use "abi.cst"    as abi;
 use "kobject.cst" as kobject;
 use "lock.cst"    as lock;
+use "vfswatch.cst" as vfswatch;
 use "mutex.cst"   as mutex;
 use "heap.cst"    as heap;
 
@@ -233,6 +234,16 @@ fn mount_head() as *VfsMount { return mount_head_var; }
 fn set_mount_head(p as *VfsMount) as void { mount_head_var = p; }
 
 let is [64]VfsFile as file_pool with mut;
+
+// The path each file opened for writing was opened by, so closing it can tell
+// SYS_WATCH which path changed (vfswatch.cst). Indexed like file_pool; length
+// 0 for a file opened read-only. 256 bytes a slot: the syscalls' PATH_MAX.
+let is [16384]u8 as wpath with mut;
+let is [64]i64 as wpath_len with mut;
+
+fn _pool_index(f as *VfsFile) as i64 {
+    return (cast(i64, f) - cast(i64, &file_pool[0])) / sizeof(VfsFile);
+}
 
 // ============================================================
 // Init
@@ -870,13 +881,36 @@ fn open(path as *u8, path_len as i64, flags as i32) as *VfsFile {
     }
     wb_flush();
     let is *VfsFile as r = open_inner(path, path_len, flags);
+    if (cast(i64, r) != 0) {
+        let is i64 as k = _pool_index(r);
+        wpath_len[k] = 0;
+        let is i64 as writes with mut = 0;
+        if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0) { writes = 1; }
+        if (writes == 1 && path_len > 0 && path_len <= 256) {
+            let is i64 as i with mut = 0;
+            while (i < path_len) { wpath[k * 256 + i] = path[i]; i = i + 1; }
+            wpath_len[k] = path_len;
+        }
+    }
     mutex.release(&fs_lock);
     return r;
 }
 fn close(f as *VfsFile) as i32 {
     mutex.acquire(&fs_lock);
+    // The path a write open came from, kept until the close is done: the
+    // watchers hear of the change once the bytes are on the volume.
+    let is [256]u8 as cp;
+    let is i64 as cl with mut = 0;
+    if (cast(i64, f) != 0 && f.in_use != 0) {
+        let is i64 as k = _pool_index(f);
+        cl = wpath_len[k];
+        let is i64 as i with mut = 0;
+        while (i < cl) { cp[i] = wpath[k * 256 + i]; i = i + 1; }
+        wpath_len[k] = 0;
+    }
     let is i32 as r = close_inner(f);
     mutex.release(&fs_lock);
+    if (cl > 0) { vfswatch.notify(cast(*u8, &cp[0]), cl); }
     return r;
 }
 fn read(f as *VfsFile, buf as *u8, n as i64) as i64 {
@@ -931,6 +965,7 @@ fn unlink(path as *u8, path_len as i64) as i32 {
     wb_flush();
     let is i32 as r = unlink_inner(path, path_len);
     mutex.release(&fs_lock);
+    if (r == 0) { vfswatch.notify(path, path_len); }
     return r;
 }
 fn mkdir(path as *u8, path_len as i64) as i32 {
@@ -939,6 +974,7 @@ fn mkdir(path as *u8, path_len as i64) as i32 {
     wb_flush();
     let is i32 as r = mkdir_inner(path, path_len);
     mutex.release(&fs_lock);
+    if (r == 0) { vfswatch.notify(path, path_len); }
     return r;
 }
 fn rmdir(path as *u8, path_len as i64) as i32 {
@@ -947,6 +983,7 @@ fn rmdir(path as *u8, path_len as i64) as i32 {
     wb_flush();
     let is i32 as r = rmdir_inner(path, path_len);
     mutex.release(&fs_lock);
+    if (r == 0) { vfswatch.notify(path, path_len); }
     return r;
 }
 fn rename(src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
@@ -955,6 +992,10 @@ fn rename(src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
     wb_flush();
     let is i32 as r = rename_inner(src, src_len, dst, dst_len);
     mutex.release(&fs_lock);
+    if (r == 0) {
+        vfswatch.notify(src, src_len);
+        vfswatch.notify(dst, dst_len);
+    }
     return r;
 }
 fn readdir(f as *VfsFile, out as *VfsDirEntry) as i32 {

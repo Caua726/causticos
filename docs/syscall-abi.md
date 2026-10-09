@@ -66,7 +66,7 @@ Args are listed by register. "→" is the `rax` return.
 | 25 | `SURFACE_INFO` | fd | out | | | | 0; writes `{w,h,pitch,bpp,fmt}` (5×i64) \| errno |
 | 26 | `DEV_COUNT` | class | | | | | count (≥ 0) |
 
-### 2b. Syscalls 27–54
+### 2b. Syscalls 27–58
 
 Appended after the first table was written, and each is documented at its number
 in `kernel/abi.cst` — that comment is the source of truth for the exact layout of
@@ -105,6 +105,7 @@ whatever struct it fills.
 | 55 | `POWER_REQUEST` | kind | 0 \| `E_INVAL` — asks for `POWER_OFF`/`POWER_REBOOT` the way the power button does: a listening desktop closes its windows first; with none, or asked twice, the kernel acts at once |
 | 56 | `POWER_CANCEL` | | 0 — the pending request is dropped (a window would not close) |
 | 57 | `PROC_WAIT_INFO` | pid, out | as `WAIT` (15), and fills `[code, crashed, vector, error_code, rip, addr, name[16]]` — how the child ended, read as it is collected |
+| 58 | `WATCH` | path, len | fd \| `E_INVAL` (not absolute, or too long) — the fd polls READABLE once the path, or for a directory an entry directly in it, has changed: a file opened for writing closed, a name created, removed or renamed. A read takes one i64, the changes since the last read, and never blocks (0 bytes when none). The path need not exist; names compare normalised and without regard to case |
 
 **Pointers are user virtual addresses**; the kernel copies in/out and
 validates them (bad pointer → `E_FAULT`). All sizes/counts are bytes unless
