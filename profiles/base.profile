@@ -79,6 +79,13 @@ bin  sysinfo
 bin  nproc
 bin  lscpu
 bin  date
+# the time zone. The RTC is UTC; which zone the clocks show is lib/tz's to
+# say: /etc/timezone names the image's default, /var/timezone (written by
+# `timezone set`) the user's choice over it, and /etc/zoneinfo is IANA's
+# database as scripts/update-tzdata.sh compiled it.
+bin  timezone
+mirror userspace/lib/tz/zoneinfo /etc/zoneinfo
+text /etc/timezone UTC\n
 
 # network. netd is a daemon, not a command: the compositor starts it (it is
 # /init, so it is the one process that may), and everything else asks it for an

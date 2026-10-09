@@ -270,9 +270,27 @@ wrap to the available panel width; an ellipsis marks text that cannot fit.
 Unregistered applications are identified as such, and a catalogue read error
 is shown in words instead of leaving the panel silently empty.
 
-The taskbar clock explicitly displays `HH:MM:SS UTC`. The default `date` and
-`date -u` output also identifies UTC; an explicit `+FORMAT` keeps its requested
-format rather than receiving an implicit suffix.
+### Time zone
+
+The RTC and every file time on disk are UTC; the zone the clocks show is a
+userspace choice. `timezone` reports the zone in use, `timezone list [TEXT]`
+lists IANA's zones with their current offset, `timezone set America/Sao_Paulo`
+chooses one (any capitalisation; kept in `/var/timezone`), and
+`timezone reset` returns to the image default in `/etc/timezone` (UTC). The
+launcher lists it as "timezone".
+
+The taskbar clock shows `HH:MM:SS` and the zone's abbreviation (`UTC`, `-03`,
+`BST`) and follows a change within a second; the compositor's night light
+follows the same local hour. `date` prints local time with the abbreviation,
+`date -u` prints UTC, and `+FORMAT` adds `%z` and `%Z`; `%s` stays the instant.
+`ls -l` shows write times in the chosen zone.
+
+The database is IANA tzdata, compiled to TZif by `scripts/update-tzdata.sh`
+into `userspace/lib/tz/zoneinfo` and shipped as `/etc/zoneinfo`; daylight
+saving rules apply automatically, including the POSIX rule every zone carries
+for dates past its last listed transition. After refreshing it, run
+`scripts/gen-tzt.py` so the `tzt` self-test checks the new data against
+CPython's `zoneinfo`.
 
 ### Desktop keyboard shortcuts
 

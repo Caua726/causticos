@@ -1,0 +1,735 @@
+// tz.cst — local time: the IANA zone the user chose, and what an instant is on
+// that zone's wall clock.
+//
+// The kernel's clock is UTC and stays UTC: SYS_TIME_WALL is the raw RTC, and a
+// time zone is presentation, so it is userspace's. This is it, in the one place
+// every reader of the clock shares — `date`, the desktop's clock, the
+// compositor's night light, `ls -l`, and the `timezone` command that chooses.
+//
+// The database is IANA's, compiled to TZif (RFC 8536) by
+// scripts/update-tzdata.sh and shipped as /etc/zoneinfo/<Area/City>. The zone
+// in use is the name in /var/timezone (the user's choice; `timezone set` writes
+// it), else in /etc/timezone (the image's default), else UTC. UTC is compiled
+// in: a machine whose zone files are missing still tells the time.
+//
+// A TZif file lists the instants at which a zone's offset changed, and ends
+// with a POSIX TZ rule ("<-03>3", "EST5EDT,M3.2.0,M11.1.0") for every instant
+// after the last one listed. The files are built slim, so for most zones the
+// daylight-saving switches of this year and every later one are the rule, not
+// the list: both halves have to be right for today to come out right.
+use "std/os/causticos.cst" as sys;
+use "../futil/futil.cst" as fu;
+
+// Bounds that hold the whole of tzdata 2026e with room to spare (its largest
+// zone has 310 transitions, 11 types and 40 abbreviation bytes). A file past
+// one of them is refused by name, never truncated.
+let is i64 as TRANS_MAX with imut = 1024;
+let is i64 as TYPES_MAX with imut = 64;
+let is i64 as CHARS_MAX with imut = 128;
+let is i64 as FILE_MAX  with imut = 32768;
+let is i64 as NAME_MAX  with imut = 63;
+
+struct Zone {
+    name as [64]u8;            // "America/Sao_Paulo"
+    name_len as i64;
+    ntrans as i64;
+    trans as [1024]i64;        // UTC instants at which the offset changed, ascending
+    tidx as [1024]u8;          // the type in force from each one on
+    ntypes as i64;
+    utoff as [64]i64;          // seconds east of UTC
+    isdst as [64]i64;
+    abbr as [64]i64;           // offset of each type's abbreviation in chars
+    chars as [128]u8;
+    nchars as i64;
+    rule as i64;               // 1: the footer rule governs after the last transition
+    std_off as i64;            // seconds east of UTC, as utoff
+    std_abbr as [16]u8;
+    std_len as i64;
+    has_dst as i64;
+    dst_off as i64;
+    dst_abbr as [16]u8;
+    dst_len as i64;
+    r_kind as [2]i64;          // 0 Jn, 1 n, 2 Mm.w.d — start, then end
+    r_mon as [2]i64;
+    r_week as [2]i64;
+    r_day as [2]i64;
+    r_secs as [2]i64;          // local time of day of the switch, may be <0 or >24h
+    c_year as i64;             // the switches of c_year, cached: the clock asks
+    c_start as i64;            // once a frame, and the answer changes twice a year
+    c_end as i64;
+}
+
+// What an instant is in a zone.
+struct Local {
+    year as i64;
+    month as i64;              // 1..12
+    day as i64;                // 1..31
+    hour as i64;
+    min as i64;
+    sec as i64;
+    wday as i64;               // 0 = Sunday
+    yday as i64;               // 1..366
+    utoff as i64;              // seconds east of UTC
+    isdst as i64;
+    abbr as [16]u8;            // "-03", "BST", "UTC"
+    abbr_len as i64;
+}
+
+// Why the last load failed, for whoever chose the zone.
+let is [96]u8 as _why with mut;
+let is i64 as _why_len with mut = 0;
+
+fn _set_why(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != cast(u8, 0) && i < 95) { _why[i] = s[i]; i = i + 1; }
+    _why_len = i;
+}
+
+fn why_ptr() as *u8 { return cast(*u8, &_why[0]); }
+fn why_len() as i64 { return _why_len; }
+
+fn name_ptr(z as *Zone) as *u8 { return cast(*u8, &z.name[0]); }
+fn name_len(z as *Zone) as i64 { return z.name_len; }
+
+// ---- arithmetic -------------------------------------------------------------
+
+// Floor division and modulo for b > 0: instants before 1970 are negative, and
+// truncation would put them in the wrong day.
+fn _fdiv(a as i64, b as i64) as i64 {
+    let is i64 as q with mut = a / b;
+    if (a < 0 && q * b != a) { q = q - 1; }
+    return q;
+}
+
+fn _fmod(a as i64, b as i64) as i64 { return a - _fdiv(a, b) * b; }
+
+fn _leap(y as i64) as i64 {
+    if (_fmod(y, 4) == 0 && (_fmod(y, 100) != 0 || _fmod(y, 400) == 0)) { return 1; }
+    return 0;
+}
+
+fn _month_len(y as i64, m as i64) as i64 {
+    if (m == 2) { return 28 + _leap(y); }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+    return 31;
+}
+
+// Days since 1970-01-01 of a Gregorian date.
+fn _days(y as i64, m as i64, d as i64) as i64 {
+    return _fdiv(fu.civil_epoch(y, m, d, 0, 0, 0), 86400);
+}
+
+// ---- the compiled-in zone ---------------------------------------------------
+
+fn _set_name(z as *Zone, name as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n && i < NAME_MAX) { z.name[i] = name[i]; i = i + 1; }
+    z.name[i] = cast(u8, 0);
+    z.name_len = i;
+}
+
+// UTC: one type, no transitions, no rule.
+fn init(z as *Zone) as void {
+    _set_name(z, "UTC", 3);
+    z.ntrans = 0;
+    z.ntypes = 1;
+    z.utoff[0] = 0;
+    z.isdst[0] = 0;
+    z.abbr[0] = 0;
+    z.chars[0] = cast(u8, 85); z.chars[1] = cast(u8, 84); z.chars[2] = cast(u8, 67);
+    z.chars[3] = cast(u8, 0);
+    z.nchars = 4;
+    z.rule = 0;
+    z.has_dst = 0;
+    z.c_year = 0 - 1;
+}
+
+fn _is_utc(name as *u8, n as i64) as i64 {
+    if (n == 3 && name[0] == cast(u8, 85) && name[1] == cast(u8, 84) && name[2] == cast(u8, 67)) { return 1; }
+    return 0;
+}
+
+// ---- names ------------------------------------------------------------------
+
+// A zone name is a relative path under /etc/zoneinfo and never leaves it:
+// letters, digits, '_', '-', '+', separated by single '/', no '.' components.
+fn valid_name(name as *u8, n as i64) as i64 {
+    if (n <= 0 || n > NAME_MAX) { return 0; }
+    if (name[0] == cast(u8, 47) || name[n - 1] == cast(u8, 47)) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, name[i]) & 0xFF;
+        let is i64 as ok with mut = 0;
+        if (c >= 65 && c <= 90) { ok = 1; }
+        if (c >= 97 && c <= 122) { ok = 1; }
+        if (c >= 48 && c <= 57) { ok = 1; }
+        if (c == 95 || c == 45 || c == 43) { ok = 1; }
+        if (c == 47 && name[i + 1] != cast(u8, 47)) { ok = 1; }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// /etc/zoneinfo/<name>, NUL-terminated, into buf (room for 96 bytes).
+fn zone_path(name as *u8, n as i64, buf as *u8) as *u8 {
+    let is *u8 as pre = "/etc/zoneinfo/";
+    let is i64 as o with mut = 0;
+    while (pre[o] != cast(u8, 0)) { buf[o] = pre[o]; o = o + 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { buf[o] = name[i]; o = o + 1; i = i + 1; }
+    buf[o] = cast(u8, 0);
+    return buf;
+}
+
+// ---- TZif -------------------------------------------------------------------
+
+let is [32768]u8 as _fbuf with mut;
+let is Zone as _tmp with mut;
+
+fn _read(path as *u8) as i64 {
+    let is i64 as fd = sys.open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n with mut = 0;
+    while (n < FILE_MAX) {
+        let is i64 as r = sys.read(fd, cast(*u8, cast(i64, &_fbuf[0]) + n), FILE_MAX - n);
+        if (r <= 0) { break; }
+        n = n + r;
+    }
+    sys.close(fd);
+    return n;
+}
+
+fn _u8(p as *u8, o as i64) as i64 { return cast(i64, p[o]) & 0xFF; }
+
+fn _be32(p as *u8, o as i64) as i64 {
+    return (_u8(p, o) << 24) | (_u8(p, o + 1) << 16) | (_u8(p, o + 2) << 8) | _u8(p, o + 3);
+}
+
+fn _sbe32(p as *u8, o as i64) as i64 {
+    let is i64 as v = _be32(p, o);
+    if (v >= 0x80000000) { return v - 0x100000000; }
+    return v;
+}
+
+fn _be64(p as *u8, o as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 8) { v = (v << 8) | _u8(p, o + i); i = i + 1; }
+    return v;
+}
+
+fn _magic(p as *u8, o as i64) as i64 {
+    if (_u8(p, o) == 84 && _u8(p, o + 1) == 90 && _u8(p, o + 2) == 105 && _u8(p, o + 3) == 102) { return 1; }
+    return 0;
+}
+
+// Size of a header's data block: 32-bit (v1) times are 4 bytes, 64-bit 8.
+fn _block(p as *u8, h as i64, tsize as i64) as i64 {
+    return _be32(p, h + 32) * (tsize + 1)            // transition times + types
+         + _be32(p, h + 36) * 6                      // local time types
+         + _be32(p, h + 40)                          // abbreviation chars
+         + _be32(p, h + 28) * (tsize + 4)            // leap-second records
+         + _be32(p, h + 24)                          // standard/wall indicators
+         + _be32(p, h + 20);                         // UT/local indicators
+}
+
+// ---- the POSIX TZ footer ----------------------------------------------------
+
+let is i64 as _fp with mut = 0;        // parse position in the footer
+
+fn _digit(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+fn _alpha(c as i64) as i64 {
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { return 1; }
+    return 0;
+}
+
+// An abbreviation: three or more letters, or <...> of letters, digits, + and -.
+fn _abbr(s as *u8, n as i64, out as *u8, out_len as *i64) as i64 {
+    let is i64 as k with mut = 0;
+    if (_fp < n && _u8(s, _fp) == 60) {
+        _fp = _fp + 1;
+        while (_fp < n && _u8(s, _fp) != 62) {
+            let is i64 as c = _u8(s, _fp);
+            if (_alpha(c) == 0 && _digit(c) == 0 && c != 43 && c != 45) { return 0 - 1; }
+            if (k >= 15) { return 0 - 1; }
+            out[k] = s[_fp]; k = k + 1; _fp = _fp + 1;
+        }
+        if (_fp >= n) { return 0 - 1; }
+        _fp = _fp + 1;
+    } else {
+        while (_fp < n && _alpha(_u8(s, _fp)) == 1) {
+            if (k >= 15) { return 0 - 1; }
+            out[k] = s[_fp]; k = k + 1; _fp = _fp + 1;
+        }
+    }
+    if (k < 3) { return 0 - 1; }
+    out[k] = cast(u8, 0);
+    out_len[0] = k;
+    return 0;
+}
+
+// [+-]hh[:mm[:ss]] as signed seconds; hh up to 167 (RFC 8536 version 3).
+// Returns 0 and the value in v[0], or -1.
+fn _hms(s as *u8, n as i64, v as *i64) as i64 {
+    let is i64 as sign with mut = 1;
+    if (_fp < n && _u8(s, _fp) == 43) { _fp = _fp + 1; }
+    else if (_fp < n && _u8(s, _fp) == 45) { sign = 0 - 1; _fp = _fp + 1; }
+    let is [3]i64 as part;
+    part[0] = 0; part[1] = 0; part[2] = 0;
+    let is i64 as k with mut = 0;
+    while (k < 3) {
+        if (_fp >= n || _digit(_u8(s, _fp)) == 0) { return 0 - 1; }
+        let is i64 as x with mut = 0;
+        let is i64 as nd with mut = 0;
+        while (_fp < n && _digit(_u8(s, _fp)) == 1 && nd < 3) { x = x * 10 + _u8(s, _fp) - 48; _fp = _fp + 1; nd = nd + 1; }
+        if (k > 0 && (nd != 2 || x > 59)) { return 0 - 1; }
+        part[k] = x;
+        k = k + 1;
+        if (_fp < n && _u8(s, _fp) == 58) { _fp = _fp + 1; } else { break; }
+    }
+    if (part[0] > 167) { return 0 - 1; }
+    v[0] = sign * (part[0] * 3600 + part[1] * 60 + part[2]);
+    return 0;
+}
+
+fn _num(s as *u8, n as i64, lo as i64, hi as i64) as i64 {
+    if (_fp >= n || _digit(_u8(s, _fp)) == 0) { return 0 - 1; }
+    let is i64 as x with mut = 0;
+    while (_fp < n && _digit(_u8(s, _fp)) == 1) {
+        x = x * 10 + _u8(s, _fp) - 48;
+        if (x > hi) { return 0 - 1; }
+        _fp = _fp + 1;
+    }
+    if (x < lo) { return 0 - 1; }
+    return x;
+}
+
+// One switch: Jn | n | Mm.w.d, then an optional /time (default 02:00).
+fn _switch(z as *Zone, k as i64, s as *u8, n as i64) as i64 {
+    if (_fp < n && _u8(s, _fp) == 74) {
+        _fp = _fp + 1;
+        let is i64 as d = _num(s, n, 1, 365);
+        if (d < 0) { return 0 - 1; }
+        z.r_kind[k] = 0; z.r_day[k] = d;
+    } else if (_fp < n && _u8(s, _fp) == 77) {
+        _fp = _fp + 1;
+        let is i64 as m = _num(s, n, 1, 12);
+        if (m < 0 || _fp >= n || _u8(s, _fp) != 46) { return 0 - 1; }
+        _fp = _fp + 1;
+        let is i64 as w = _num(s, n, 1, 5);
+        if (w < 0 || _fp >= n || _u8(s, _fp) != 46) { return 0 - 1; }
+        _fp = _fp + 1;
+        let is i64 as d = _num(s, n, 0, 6);
+        if (d < 0) { return 0 - 1; }
+        z.r_kind[k] = 2; z.r_mon[k] = m; z.r_week[k] = w; z.r_day[k] = d;
+    } else {
+        let is i64 as d = _num(s, n, 0, 365);
+        if (d < 0) { return 0 - 1; }
+        z.r_kind[k] = 1; z.r_day[k] = d;
+    }
+    z.r_secs[k] = 7200;
+    if (_fp < n && _u8(s, _fp) == 47) {
+        _fp = _fp + 1;
+        let is [1]i64 as t;
+        if (_hms(s, n, cast(*i64, &t[0])) != 0) { return 0 - 1; }
+        z.r_secs[k] = t[0];
+    }
+    return 0;
+}
+
+// std offset [dst [offset] ,start[/time],end[/time]]. A POSIX offset is
+// seconds WEST of UTC; stored east, the way TZif types are.
+fn _footer(z as *Zone, s as *u8, n as i64) as i64 {
+    z.rule = 0;
+    z.has_dst = 0;
+    if (n == 0) { return 0; }
+    _fp = 0;
+    if (_abbr(s, n, cast(*u8, &z.std_abbr[0]), &z.std_len) != 0) { return 0 - 1; }
+    let is [1]i64 as v;
+    if (_hms(s, n, cast(*i64, &v[0])) != 0) { return 0 - 1; }
+    if (v[0] < 0 - 86400 || v[0] > 86400) { return 0 - 1; }
+    z.std_off = 0 - v[0];
+    z.rule = 1;
+    if (_fp == n) { return 0; }
+    if (_abbr(s, n, cast(*u8, &z.dst_abbr[0]), &z.dst_len) != 0) { return 0 - 1; }
+    z.has_dst = 1;
+    z.dst_off = z.std_off + 3600;
+    if (_fp < n && _u8(s, _fp) != 44) {
+        if (_hms(s, n, cast(*i64, &v[0])) != 0) { return 0 - 1; }
+        if (v[0] < 0 - 86400 || v[0] > 86400) { return 0 - 1; }
+        z.dst_off = 0 - v[0];
+    }
+    // A daylight time with no rule for when it starts is a zone this cannot
+    // place in time; guessing the US rule (as some libcs do) would be wrong
+    // everywhere else.
+    if (_fp >= n || _u8(s, _fp) != 44) { return 0 - 1; }
+    _fp = _fp + 1;
+    if (_switch(z, 0, s, n) != 0) { return 0 - 1; }
+    if (_fp >= n || _u8(s, _fp) != 44) { return 0 - 1; }
+    _fp = _fp + 1;
+    if (_switch(z, 1, s, n) != 0) { return 0 - 1; }
+    if (_fp != n) { return 0 - 1; }
+    return 0;
+}
+
+// Parse a TZif image into z. 0, or -1 with _why set.
+fn _parse(z as *Zone, p as *u8, len as i64) as i64 {
+    if (len < 44 || _magic(p, 0) == 0) { _set_why("not a TZif zone file"); return 0 - 1; }
+    let is i64 as ver = _u8(p, 4);
+    let is i64 as h with mut = 0;
+    let is i64 as tsize with mut = 4;
+    if (ver != 0) {
+        if (ver < 50) { _set_why("an unknown TZif version"); return 0 - 1; }
+        h = 44 + _block(p, 0, 4);
+        if (h + 44 > len || _magic(p, h) == 0) { _set_why("the zone file is cut short"); return 0 - 1; }
+        tsize = 8;
+    }
+    let is i64 as isut = _be32(p, h + 20);
+    let is i64 as isstd = _be32(p, h + 24);
+    let is i64 as leap = _be32(p, h + 28);
+    let is i64 as tc = _be32(p, h + 32);
+    let is i64 as ty = _be32(p, h + 36);
+    let is i64 as cc = _be32(p, h + 40);
+    if (leap != 0) { _set_why("the zone counts leap seconds, which this clock does not"); return 0 - 1; }
+    if (tc > TRANS_MAX) { _set_why("more transitions than this build can hold"); return 0 - 1; }
+    if (ty < 1 || ty > TYPES_MAX) { _set_why("a zone needs 1 to 64 local time types"); return 0 - 1; }
+    if (cc < 1 || cc > CHARS_MAX) { _set_why("more abbreviation text than this build can hold"); return 0 - 1; }
+    if ((isstd != 0 && isstd != ty) || (isut != 0 && isut != ty)) { _set_why("the zone's indicator counts are inconsistent"); return 0 - 1; }
+    let is i64 as d = h + 44;
+    let is i64 as end = d + _block(p, h, tsize);
+    if (end > len) { _set_why("the zone file is cut short"); return 0 - 1; }
+
+    let is i64 as i with mut = 0;
+    while (i < tc) {
+        let is i64 as t with mut = 0;
+        if (tsize == 8) { t = _be64(p, d + i * 8); } else { t = _sbe32(p, d + i * 4); }
+        if (i > 0 && t <= z.trans[i - 1]) { _set_why("the zone's transitions are out of order"); return 0 - 1; }
+        z.trans[i] = t;
+        let is i64 as k = _u8(p, d + tc * tsize + i);
+        if (k >= ty) { _set_why("a transition names a type that does not exist"); return 0 - 1; }
+        z.tidx[i] = cast(u8, k);
+        i = i + 1;
+    }
+    z.ntrans = tc;
+    let is i64 as tb = d + tc * (tsize + 1);
+    i = 0;
+    while (i < ty) {
+        let is i64 as off = _sbe32(p, tb + i * 6);
+        let is i64 as dst = _u8(p, tb + i * 6 + 4);
+        let is i64 as ai = _u8(p, tb + i * 6 + 5);
+        if (off < 0 - 89999 || off > 93599) { _set_why("an offset is more than a day from UTC"); return 0 - 1; }
+        if (dst > 1 || ai >= cc) { _set_why("a local time type is malformed"); return 0 - 1; }
+        z.utoff[i] = off; z.isdst[i] = dst; z.abbr[i] = ai;
+        i = i + 1;
+    }
+    z.ntypes = ty;
+    let is i64 as cb = tb + ty * 6;
+    i = 0;
+    while (i < cc) { z.chars[i] = p[cb + i]; i = i + 1; }
+    if (z.chars[cc - 1] != cast(u8, 0)) { _set_why("the abbreviations are not terminated"); return 0 - 1; }
+    z.nchars = cc;
+
+    z.rule = 0;
+    z.has_dst = 0;
+    if (tsize == 8) {
+        // The footer: "\n<TZ string>\n", the rule after the last transition.
+        if (end >= len || _u8(p, end) != 10) { _set_why("the zone file has no footer"); return 0 - 1; }
+        let is i64 as fe with mut = end + 1;
+        while (fe < len && _u8(p, fe) != 10) { fe = fe + 1; }
+        if (fe >= len) { _set_why("the zone's footer is not terminated"); return 0 - 1; }
+        if (_footer(z, cast(*u8, cast(i64, p) + end + 1), fe - end - 1) != 0) {
+            _set_why("the zone's POSIX TZ rule is malformed");
+            return 0 - 1;
+        }
+    }
+    z.c_year = 0 - 1;
+    return 0;
+}
+
+fn _copy(dst as *Zone, src as *Zone) as void {
+    let is i64 as i with mut = 0;
+    while (i <= src.name_len) { dst.name[i] = src.name[i]; i = i + 1; }
+    dst.name_len = src.name_len;
+    i = 0;
+    while (i < src.ntrans) { dst.trans[i] = src.trans[i]; dst.tidx[i] = src.tidx[i]; i = i + 1; }
+    dst.ntrans = src.ntrans;
+    i = 0;
+    while (i < src.ntypes) {
+        dst.utoff[i] = src.utoff[i]; dst.isdst[i] = src.isdst[i]; dst.abbr[i] = src.abbr[i];
+        i = i + 1;
+    }
+    dst.ntypes = src.ntypes;
+    i = 0;
+    while (i < src.nchars) { dst.chars[i] = src.chars[i]; i = i + 1; }
+    dst.nchars = src.nchars;
+    dst.rule = src.rule;
+    dst.std_off = src.std_off;
+    i = 0;
+    while (i < 16) { dst.std_abbr[i] = src.std_abbr[i]; dst.dst_abbr[i] = src.dst_abbr[i]; i = i + 1; }
+    dst.std_len = src.std_len;
+    dst.has_dst = src.has_dst;
+    dst.dst_off = src.dst_off;
+    dst.dst_len = src.dst_len;
+    i = 0;
+    while (i < 2) {
+        dst.r_kind[i] = src.r_kind[i]; dst.r_mon[i] = src.r_mon[i]; dst.r_week[i] = src.r_week[i];
+        dst.r_day[i] = src.r_day[i]; dst.r_secs[i] = src.r_secs[i];
+        i = i + 1;
+    }
+    dst.c_year = 0 - 1;
+}
+
+// Load zone `name`. 0 = loaded; -1 = it does not load, and why_ptr() says
+// why. z is untouched unless it loads.
+fn load(z as *Zone, name as *u8, n as i64) as i64 {
+    if (valid_name(name, n) == 0) {
+        _set_why("a zone name is Area/City: letters, digits, _ + - and /");
+        return 0 - 1;
+    }
+    let is [96]u8 as p;
+    let is i64 as len = _read(zone_path(name, n, cast(*u8, &p[0])));
+    if (len < 0) {
+        if (_is_utc(name, n) == 1) { init(z); return 0; }
+        _set_why("no such zone in /etc/zoneinfo");
+        return 0 - 1;
+    }
+    if (len >= FILE_MAX) { _set_why("the file is larger than any zone"); return 0 - 1; }
+    return load_image(z, name, n, cast(*u8, &_fbuf[0]), len);
+}
+
+// A zone from the bytes of a TZif file, named `name` — the same answers as
+// load(); z is untouched unless it loads.
+fn load_image(z as *Zone, name as *u8, n as i64, img as *u8, len as i64) as i64 {
+    if (_parse(&_tmp, img, len) != 0) { return 0 - 1; }
+    _set_name(&_tmp, name, n);
+    _copy(z, &_tmp);
+    return 0;
+}
+
+// ---- which zone -------------------------------------------------------------
+
+fn _is_space(c as u8) as i64 {
+    if (c == cast(u8, 32) || c == cast(u8, 9) || c == cast(u8, 13) || c == cast(u8, 10)) { return 1; }
+    return 0;
+}
+
+// The zone chosen: /var/timezone, else /etc/timezone — a name on the first
+// line. Written into buf (room for 64 bytes); returns its length, 3 ("UTC")
+// when neither names one. src[0] says which: 1 /var/timezone, 2 /etc/timezone,
+// 0 neither.
+fn chosen_src(buf as *u8, src as *i64) as i64 {
+    let is *u8 as path with mut = "/var/timezone";
+    let is i64 as round with mut = 0;
+    while (round < 2) {
+        if (round == 1) { path = "/etc/timezone"; }
+        let is i64 as len = _read(path);
+        if (len > 0) {
+            let is i64 as i with mut = 0;
+            while (i < len && _is_space(_fbuf[i]) == 1) { i = i + 1; }
+            let is i64 as n with mut = 0;
+            while (i + n < len && n < NAME_MAX && _is_space(_fbuf[i + n]) == 0) {
+                buf[n] = _fbuf[i + n];
+                n = n + 1;
+            }
+            if (n > 0) { buf[n] = cast(u8, 0); src[0] = round + 1; return n; }
+        }
+        round = round + 1;
+    }
+    buf[0] = cast(u8, 85); buf[1] = cast(u8, 84); buf[2] = cast(u8, 67); buf[3] = cast(u8, 0);
+    src[0] = 0;
+    return 3;
+}
+
+fn chosen(buf as *u8) as i64 {
+    let is [1]i64 as src;
+    return chosen_src(buf, cast(*i64, &src[0]));
+}
+
+// Load the chosen zone. On a failure z stays what it was (UTC when nothing
+// loaded yet) and the serial line says why. Returns load()'s answer.
+fn load_chosen(z as *Zone) as i64 {
+    let is [64]u8 as nm;
+    let is i64 as n = chosen(cast(*u8, &nm[0]));
+    let is i64 as rc = load(z, cast(*u8, &nm[0]), n);
+    if (rc != 0) {
+        sys.write_serial("tz: cannot load ", 16);
+        sys.write_serial(cast(*u8, &nm[0]), n);
+        sys.write_serial(": ", 2);
+        sys.write_serial(why_ptr(), why_len());
+        sys.write_serial("\n", 1);
+    }
+    return rc;
+}
+
+// A number that changes when the zone chosen does — its name, or its file
+// being replaced by a newer tzdata: compare it with the last one seen to know
+// when to load_chosen() again. The name is read rather than stat'ed, for the
+// reason lib/keymap gives: FAT times move in two-second steps.
+fn config_stamp() as i64 {
+    let is [64]u8 as nm;
+    let is i64 as n = chosen(cast(*u8, &nm[0]));
+    let is i64 as h with mut = 11;
+    let is i64 as i with mut = 0;
+    while (i < n) { h = h * 1000003 + cast(i64, nm[i]); i = i + 1; }
+    if (valid_name(cast(*u8, &nm[0]), n) == 0) { return h; }
+    let is [96]u8 as p;
+    let is [5]i64 as sx;
+    if (sys.statx(zone_path(cast(*u8, &nm[0]), n, cast(*u8, &p[0])), cast(*u8, &sx[0])) != 0) { return h * 31; }
+    h = h * 1000003 + sx[0];                                 // size
+    h = h * 1000003 + sx[1];                                 // first cluster
+    h = h * 1000003 + sx[4];                                 // write time
+    return h;
+}
+
+// ---- local time -------------------------------------------------------------
+
+// The local time of day of switch k in year y, in seconds since the epoch as
+// if that wall clock were UTC.
+fn _switch_local(z as *Zone, k as i64, y as i64) as i64 {
+    let is i64 as days with mut = 0;
+    if (z.r_kind[k] == 0) {
+        // Jn: 1..365, February 29 never counted.
+        let is i64 as n = z.r_day[k];
+        days = _days(y, 1, 1) + n - 1;
+        if (_leap(y) == 1 && n >= 60) { days = days + 1; }
+    } else if (z.r_kind[k] == 1) {
+        days = _days(y, 1, 1) + z.r_day[k];
+    } else {
+        // Mm.w.d: day d (0 = Sunday) of week w of month m; week 5 is the last.
+        let is i64 as m = z.r_mon[k];
+        let is i64 as first = _days(y, m, 1);
+        let is i64 as wd = _fmod(first + 4, 7);             // 1970-01-01 was a Thursday
+        let is i64 as md with mut = 1 + _fmod(z.r_day[k] - wd, 7) + (z.r_week[k] - 1) * 7;
+        let is i64 as ml = _month_len(y, m);
+        while (md > ml) { md = md - 7; }
+        days = first + md - 1;
+    }
+    return days * 86400 + z.r_secs[k];
+}
+
+// Whether the footer rule has daylight time in force at UTC instant t.
+fn _rule_dst(z as *Zone, t as i64) as i64 {
+    if (z.has_dst == 0) { return 0; }
+    let is i64 as day = _fdiv(t + z.std_off, 86400);
+    let is [3]i64 as c;
+    _civil(day, cast(*i64, &c[0]));
+    let is i64 as y = c[0];
+    if (y != z.c_year) {
+        // Start is given in standard time, end in daylight time.
+        z.c_start = _switch_local(z, 0, y) - z.std_off;
+        z.c_end = _switch_local(z, 1, y) - z.dst_off;
+        z.c_year = y;
+    }
+    if (z.c_start < z.c_end) {
+        if (t >= z.c_start && t < z.c_end) { return 1; }
+        return 0;
+    }
+    // Southern hemisphere: daylight time spans the new year.
+    if (t >= z.c_end && t < z.c_start) { return 0; }
+    return 1;
+}
+
+// Gregorian {year, month, day} of days since 1970-01-01 (Hinnant's
+// civil_from_days: exact for every date).
+fn _civil(days as i64, out as *i64) as void {
+    let is i64 as zd = days + 719468;
+    let is i64 as era = _fdiv(zd, 146097);
+    let is i64 as doe = zd - era * 146097;
+    let is i64 as yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let is i64 as doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let is i64 as mp = (5 * doy + 2) / 153;
+    let is i64 as d = doy - (153 * mp + 2) / 5 + 1;
+    let is i64 as m with mut = mp + 3;
+    if (mp >= 10) { m = mp - 9; }
+    let is i64 as y with mut = yoe + era * 400;
+    if (m <= 2) { y = y + 1; }
+    out[0] = y; out[1] = m; out[2] = d;
+}
+
+fn _put_abbr(out as *Local, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n && i < 15) { out.abbr[i] = s[i]; i = i + 1; }
+    out.abbr[i] = cast(u8, 0);
+    out.abbr_len = i;
+}
+
+// What UTC instant t (epoch seconds) is in zone z.
+fn at(z as *Zone, t as i64, out as *Local) as void {
+    let is i64 as ty with mut = 0 - 1;               // -1: the footer rule decides
+    if (z.ntrans == 0) {
+        if (z.rule == 0) { ty = 0; }
+    } else if (t < z.trans[0]) {
+        ty = 0;
+    } else if (t >= z.trans[z.ntrans - 1]) {
+        if (z.rule == 0) { ty = cast(i64, z.tidx[z.ntrans - 1]) & 0xFF; }
+    } else {
+        // The last transition at or before t.
+        let is i64 as lo with mut = 0;
+        let is i64 as hi with mut = z.ntrans - 1;
+        while (hi - lo > 1) {
+            let is i64 as mid = (lo + hi) / 2;
+            if (z.trans[mid] <= t) { lo = mid; } else { hi = mid; }
+        }
+        ty = cast(i64, z.tidx[lo]) & 0xFF;
+    }
+    if (ty >= 0) {
+        out.utoff = z.utoff[ty];
+        out.isdst = z.isdst[ty];
+        let is *u8 as a = cast(*u8, cast(i64, &z.chars[0]) + z.abbr[ty]);
+        let is i64 as n with mut = 0;
+        while (a[n] != cast(u8, 0)) { n = n + 1; }
+        _put_abbr(out, a, n);
+    } else if (_rule_dst(z, t) == 1) {
+        out.utoff = z.dst_off;
+        out.isdst = 1;
+        _put_abbr(out, cast(*u8, &z.dst_abbr[0]), z.dst_len);
+    } else {
+        out.utoff = z.std_off;
+        out.isdst = 0;
+        _put_abbr(out, cast(*u8, &z.std_abbr[0]), z.std_len);
+    }
+    let is i64 as local = t + out.utoff;
+    let is i64 as days = _fdiv(local, 86400);
+    let is i64 as sod = local - days * 86400;
+    let is [3]i64 as c;
+    _civil(days, cast(*i64, &c[0]));
+    out.year = c[0]; out.month = c[1]; out.day = c[2];
+    out.hour = sod / 3600;
+    out.min = (sod / 60) % 60;
+    out.sec = sod % 60;
+    out.wday = _fmod(days + 4, 7);
+    out.yday = days - _days(c[0], 1, 1) + 1;
+}
+
+// The RTC as epoch seconds, through the same conversion every clock reader
+// uses; -1 when the machine has no clock.
+fn now_epoch() as i64 {
+    let is [8]i64 as w;
+    if (sys.time_wall(cast(*i64, &w[0])) != 0) { return 0 - 1; }
+    return fu.civil_epoch(w[0], w[1], w[2], w[3], w[4], w[5]);
+}
+
+// "+hhmm" (colon = 0) or "+hh:mm" (colon = 1) for an offset east of UTC, with
+// ":ss" when it is not whole minutes. Returns the length written (≤ 9).
+fn fmt_offset(utoff as i64, colon as i64, buf as *u8) as i64 {
+    let is i64 as a with mut = utoff;
+    buf[0] = cast(u8, 43);
+    if (a < 0) { buf[0] = cast(u8, 45); a = 0 - a; }
+    let is i64 as h = a / 3600;
+    let is i64 as m = (a / 60) % 60;
+    let is i64 as s = a % 60;
+    let is i64 as o with mut = 1;
+    buf[o] = cast(u8, 48 + h / 10); buf[o + 1] = cast(u8, 48 + h % 10); o = o + 2;
+    if (colon == 1) { buf[o] = cast(u8, 58); o = o + 1; }
+    buf[o] = cast(u8, 48 + m / 10); buf[o + 1] = cast(u8, 48 + m % 10); o = o + 2;
+    if (s != 0) {
+        if (colon == 1) { buf[o] = cast(u8, 58); o = o + 1; }
+        buf[o] = cast(u8, 48 + s / 10); buf[o + 1] = cast(u8, 48 + s % 10); o = o + 2;
+    }
+    return o;
+}

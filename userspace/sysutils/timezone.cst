@@ -1,0 +1,369 @@
+// timezone — the time zone: which one is in use, which there are, and
+// choosing one.
+//
+//   timezone                the zone in use, its time and offset, and where the
+//                           choice comes from
+//   timezone list [TEXT]    every zone (* = the one in use), or those whose
+//                           name contains TEXT, with its offset now
+//   timezone set <zone>     use <zone> from now on (kept in /var/timezone);
+//                           any capitalisation, stored as the database spells it
+//   timezone reset          back to the image's default (/etc/timezone)
+//
+// The zones are IANA's, as /etc/zoneinfo ships them; reading them and turning
+// UTC into local time is lib/tz's (tz.cst says it all). This only reads and
+// writes the name: the desktop's clock picks a change up within a second,
+// `date` and `ls -l` the next time they run.
+use "std/causticos/prog.cst" as prog;
+use "std/os/causticos.cst" as sys;
+use "../lib/tz/tz.cst" as tz;
+
+let is tz.Zone as z with mut;
+let is tz.Local as L with mut;
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    if (a[i] == b[i]) { return 1; }
+    return 0;
+}
+
+fn lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn same_ci(a as *u8, an as i64, b as *u8, bn as i64) as i64 {
+    if (an != bn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < an) {
+        if (lower(cast(i64, a[i]) & 0xFF) != lower(cast(i64, b[i]) & 0xFF)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn pad(n as i64, width as i64) as void {
+    let is i64 as i with mut = n;
+    while (i < width) { prog.out(" ", 1); i = i + 1; }
+}
+
+fn pad2(v as i64) as void { if (v < 10) { prog.outs("0"); } prog.out_num(v); }
+
+fn usage() as i32 {
+    prog.errs("usage: timezone [list [TEXT] | set <zone> | reset]\n");
+    return cast(i32, 2);
+}
+
+// "UTC-03:00  -03" for zone z now.
+fn say_offset() as void {
+    let is [12]u8 as b;
+    prog.outs("UTC");
+    prog.out(cast(*u8, &b[0]), tz.fmt_offset(L.utoff, 1, cast(*u8, &b[0])));
+    prog.outs("  ");
+    prog.out(cast(*u8, &L.abbr[0]), L.abbr_len);
+    if (L.isdst == 1) { prog.outs(" (daylight time)"); }
+}
+
+fn say_now() as void {
+    prog.out_num(L.year); prog.outs("-"); pad2(L.month); prog.outs("-"); pad2(L.day);
+    prog.outs(" "); pad2(L.hour); prog.outs(":"); pad2(L.min); prog.outs(":"); pad2(L.sec);
+}
+
+fn version() as void {
+    let is i64 as fd = sys.open_read("/etc/zoneinfo/+VERSION");
+    if (fd < 0) { return; }
+    let is [16]u8 as v;
+    let is i64 as n with mut = sys.read(fd, cast(*u8, &v[0]), 16);
+    sys.close(fd);
+    while (n > 0 && (v[n - 1] == cast(u8, 10) || v[n - 1] == cast(u8, 13))) { n = n - 1; }
+    if (n > 0) { prog.outs("  IANA tzdata "); prog.out(cast(*u8, &v[0]), n); prog.outs("\n"); }
+}
+
+// The zone in use and where the choice comes from.
+fn current() as i32 {
+    let is [64]u8 as nm;
+    let is [1]i64 as src;
+    let is i64 as n = tz.chosen_src(cast(*u8, &nm[0]), cast(*i64, &src[0]));
+    let is i64 as rc = tz.load(&z, cast(*u8, &nm[0]), n);
+    let is i64 as t = tz.now_epoch();
+    prog.out(cast(*u8, &nm[0]), n);
+    if (rc == 0 && t >= 0) {
+        tz.at(&z, t, &L);
+        prog.outs("  "); say_offset(); prog.outs("  "); say_now();
+    }
+    prog.outs("\n");
+    if (src[0] == 1) { prog.outs("  (chosen with `timezone set`, kept in /var/timezone)\n"); }
+    else if (src[0] == 2) { prog.outs("  (the default, from /etc/timezone)\n"); }
+    else { prog.outs("  (nothing chosen: UTC)\n"); }
+    version();
+    if (rc != 0) {
+        prog.errs("timezone: but it does not load, so clocks show UTC: ");
+        prog.err(tz.why_ptr(), tz.why_len());
+        prog.errs("\n");
+        return cast(i32, 1);
+    }
+    if (t < 0) { prog.errs("timezone: the machine has no clock to convert\n"); return cast(i32, 1); }
+    return cast(i32, 0);
+}
+
+// ---- the database's names ---------------------------------------------------
+
+let is i64 as NAMES_MAX with imut = 2048;
+let is i64 as ARENA_MAX with imut = 65536;
+let is [65536]u8 as arena;
+let is [2048]i64 as noff;
+let is [2048]i64 as nlen;
+let is i64 as count with mut = 0;
+let is i64 as used with mut = 0;
+let is i64 as full with mut = 0;
+
+// Every zone under dir (a NUL-terminated path, dlen bytes), each named with
+// prefix (plen bytes) in front. The database is at most three levels deep;
+// deeper is not a zone.
+fn walk(dir as *u8, dlen as i64, prefix as *u8, plen as i64, depth as i64) as i64 {
+    if (depth > 4) { return 0; }
+    let is i64 as fd = sys.open_read(dir);
+    if (fd < 0) { return fd; }
+    let is [320]u8 as de;
+    let is i64 as rc with mut = 0;
+    while (1 == 1) {
+        let is i64 as r = sys.readdir(fd, cast(*u8, &de[0]));
+        if (r == sys.E_NOENT) { break; }
+        if (r != 0) { rc = r; break; }
+        let is *i64 as dw = cast(*i64, cast(i64, &de[0]) + 256);   // name_len, then .., is_dir at [4]
+        let is i64 as nl = dw[0];
+        let is i64 as is_dir = dw[4];
+        // ".", "..", and "+VERSION": not zones.
+        if (nl <= 0 || de[0] == cast(u8, 46) || de[0] == cast(u8, 43)) { continue; }
+        if (plen + nl + 1 > 63 || dlen + nl + 2 > 128) { continue; }
+        if (is_dir != 0) {
+            let is [128]u8 as sub;
+            let is [64]u8 as pre;
+            let is i64 as i with mut = 0;
+            while (i < dlen) { sub[i] = dir[i]; i = i + 1; }
+            sub[dlen] = cast(u8, 47);
+            i = 0;
+            while (i < nl) { sub[dlen + 1 + i] = de[i]; i = i + 1; }
+            sub[dlen + 1 + nl] = cast(u8, 0);
+            i = 0;
+            while (i < plen) { pre[i] = prefix[i]; i = i + 1; }
+            i = 0;
+            while (i < nl) { pre[plen + i] = de[i]; i = i + 1; }
+            pre[plen + nl] = cast(u8, 47);
+            let is i64 as w = walk(cast(*u8, &sub[0]), dlen + 1 + nl, cast(*u8, &pre[0]), plen + nl + 1, depth + 1);
+            if (w < 0) { rc = w; break; }
+        } else {
+            if (count >= NAMES_MAX || used + plen + nl > ARENA_MAX) { full = 1; continue; }
+            let is i64 as i with mut = 0;
+            while (i < plen) { arena[used + i] = prefix[i]; i = i + 1; }
+            i = 0;
+            while (i < nl) { arena[used + plen + i] = de[i]; i = i + 1; }
+            noff[count] = used;
+            nlen[count] = plen + nl;
+            used = used + plen + nl;
+            count = count + 1;
+        }
+    }
+    sys.close(fd);
+    return rc;
+}
+
+fn before(ao as i64, an as i64, bo as i64, bn as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < an && i < bn) {
+        if (arena[ao + i] < arena[bo + i]) { return 1; }
+        if (arena[ao + i] > arena[bo + i]) { return 0; }
+        i = i + 1;
+    }
+    if (an < bn) { return 1; }
+    return 0;
+}
+
+fn contains_ci(h as *u8, hn as i64, nd as *u8, nn as i64) as i64 {
+    if (nn == 0) { return 1; }
+    let is i64 as i with mut = 0;
+    while (i + nn <= hn) {
+        if (same_ci(cast(*u8, cast(i64, h) + i), nn, nd, nn) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn list(filter as *u8) as i32 {
+    let is i64 as rc = walk("/etc/zoneinfo", 13, "", 0, 0);
+    if (rc < 0) {
+        prog.errs("timezone: cannot read /etc/zoneinfo: "); prog.errs(sys.err_text(rc)); prog.errs("\n");
+        return cast(i32, 1);
+    }
+    if (full == 1) {
+        prog.errs("timezone: /etc/zoneinfo has more zones than this build can list\n");
+        return cast(i32, 1);
+    }
+    // Insertion sort: some hundreds of names, once.
+    let is i64 as a with mut = 1;
+    while (a < count) {
+        let is i64 as b with mut = a;
+        while (b > 0 && before(noff[b], nlen[b], noff[b - 1], nlen[b - 1]) == 1) {
+            let is i64 as to = noff[b]; noff[b] = noff[b - 1]; noff[b - 1] = to;
+            let is i64 as tl = nlen[b]; nlen[b] = nlen[b - 1]; nlen[b - 1] = tl;
+            b = b - 1;
+        }
+        a = a + 1;
+    }
+    let is [64]u8 as cur;
+    let is i64 as cn = tz.chosen(cast(*u8, &cur[0]));
+    let is i64 as t = tz.now_epoch();
+    let is i64 as flen = prog.slen(filter);
+    let is i64 as shown with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is *u8 as nm = cast(*u8, cast(i64, &arena[0]) + noff[i]);
+        let is i64 as n = nlen[i];
+        if (contains_ci(nm, n, filter, flen) == 1) {
+            if (same_ci(nm, n, cast(*u8, &cur[0]), cn) == 1) { prog.outs("* "); } else { prog.outs("  "); }
+            prog.out(nm, n);
+            pad(n, 34);
+            if (tz.load(&z, nm, n) != 0) {
+                prog.outs("(broken: "); prog.out(tz.why_ptr(), tz.why_len()); prog.outs(")");
+            } else if (t >= 0) {
+                tz.at(&z, t, &L);
+                say_offset();
+            }
+            prog.outs("\n");
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    if (shown == 0) {
+        prog.errs("timezone: no zone name contains "); prog.errs(filter); prog.errs("\n");
+        return cast(i32, 1);
+    }
+    return cast(i32, 0);
+}
+
+// The database's own spelling of name, matched one component at a time
+// without regard to case, into out (room for 64 bytes). Its length; -1 when
+// there is no such zone, -2 when it names a directory of zones.
+fn canonical(name as *u8, n as i64, out as *u8) as i64 {
+    let is [128]u8 as dir;
+    let is *u8 as root = "/etc/zoneinfo";
+    let is i64 as dlen with mut = 0;
+    while (root[dlen] != cast(u8, 0)) { dir[dlen] = root[dlen]; dlen = dlen + 1; }
+    dir[dlen] = cast(u8, 0);
+    let is i64 as olen with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < n) {
+        let is i64 as e with mut = s;
+        while (e < n && name[e] != cast(u8, 47)) { e = e + 1; }
+        let is i64 as fd = sys.open_read(cast(*u8, &dir[0]));
+        if (fd < 0) { return 0 - 1; }
+        let is [320]u8 as de;
+        let is i64 as found with mut = 0;
+        let is i64 as is_dir with mut = 0;
+        let is i64 as nl with mut = 0;
+        while (found == 0 && sys.readdir(fd, cast(*u8, &de[0])) == 0) {
+            let is *i64 as dw = cast(*i64, cast(i64, &de[0]) + 256);
+            nl = dw[0];
+            if (same_ci(cast(*u8, &de[0]), nl, cast(*u8, cast(i64, name) + s), e - s) == 1) {
+                found = 1;
+                is_dir = dw[4];
+            }
+        }
+        sys.close(fd);
+        if (found == 0) { return 0 - 1; }
+        if (olen + nl + 1 > 64 || dlen + nl + 2 > 128) { return 0 - 1; }
+        let is i64 as i with mut = 0;
+        if (olen > 0) { out[olen] = cast(u8, 47); olen = olen + 1; }
+        while (i < nl) { out[olen + i] = de[i]; dir[dlen + 1 + i] = de[i]; i = i + 1; }
+        dir[dlen] = cast(u8, 47);
+        olen = olen + nl;
+        dlen = dlen + 1 + nl;
+        dir[dlen] = cast(u8, 0);
+        s = e + 1;
+        if (e >= n && is_dir != 0) { return 0 - 2; }
+        if (e < n && is_dir == 0) { return 0 - 1; }
+    }
+    out[olen] = cast(u8, 0);
+    return olen;
+}
+
+fn set(arg as *u8) as i32 {
+    let is i64 as an = prog.slen(arg);
+    if (tz.valid_name(arg, an) == 0) {
+        prog.errs("timezone: a zone is named like America/Sao_Paulo (`timezone list` shows them)\n");
+        return cast(i32, 2);
+    }
+    let is [64]u8 as nm;
+    let is i64 as n = canonical(arg, an, cast(*u8, &nm[0]));
+    if (n == 0 - 2) {
+        prog.errs("timezone: "); prog.errs(arg); prog.errs(" is a region, not a zone (`timezone list "); prog.errs(arg); prog.errs("/` shows its zones)\n");
+        return cast(i32, 1);
+    }
+    if (n < 0) {
+        prog.errs("timezone: no zone called "); prog.errs(arg); prog.errs(" (`timezone list` shows them)\n");
+        return cast(i32, 1);
+    }
+    if (tz.load(&z, cast(*u8, &nm[0]), n) != 0) {
+        prog.errs("timezone: "); prog.err(cast(*u8, &nm[0]), n); prog.errs(": ");
+        prog.err(tz.why_ptr(), tz.why_len()); prog.errs("\n");
+        return cast(i32, 1);
+    }
+    // /var may not exist on a fresh disk; "already exists" is as good.
+    sys.mkdir("/var");
+    // Written whole and then renamed over: the desktop reads it once a second
+    // and must never see half a name.
+    let is i64 as fd = sys.open_write("/var/timezone.new");
+    if (fd < 0) { prog.errs("timezone: cannot write /var/timezone.new: "); prog.errs(sys.err_text(fd)); prog.errs("\n"); return cast(i32, 1); }
+    let is [65]u8 as line;
+    let is i64 as i with mut = 0;
+    while (i < n) { line[i] = nm[i]; i = i + 1; }
+    line[n] = cast(u8, 10);
+    let is i64 as w = sys.write(fd, cast(*u8, &line[0]), n + 1);
+    sys.close(fd);
+    if (w != n + 1) {
+        sys.unlink("/var/timezone.new");
+        prog.errs("timezone: cannot write /var/timezone.new");
+        if (w < 0) { prog.errs(": "); prog.errs(sys.err_text(w)); }
+        prog.errs("\n");
+        return cast(i32, 1);
+    }
+    let is i64 as rr = cast(i64, sys.rename("/var/timezone.new", "/var/timezone"));
+    if (rr != 0) {
+        sys.unlink("/var/timezone.new");
+        prog.errs("timezone: cannot replace /var/timezone: "); prog.errs(sys.err_text(rr)); prog.errs("\n");
+        return cast(i32, 1);
+    }
+    prog.outs("timezone: "); prog.out(cast(*u8, &nm[0]), n);
+    let is i64 as t = tz.now_epoch();
+    if (t >= 0) { tz.at(&z, t, &L); prog.outs("  "); say_offset(); prog.outs("  "); say_now(); }
+    prog.outs("\n");
+    return cast(i32, 0);
+}
+
+fn reset() as i32 {
+    let is i64 as rc = cast(i64, sys.unlink("/var/timezone"));
+    if (rc != 0 && rc != sys.E_NOENT) {
+        prog.errs("timezone: cannot remove /var/timezone: "); prog.errs(sys.err_text(rc)); prog.errs("\n");
+        return cast(i32, 1);
+    }
+    return current();
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    tz.init(&z);
+    if (argc <= 1) { return current(); }
+    let is *u8 as cmd = prog.arg(argv, 1);
+    if (streq(cmd, "--help") == 1 || streq(cmd, "-h") == 1) {
+        prog.outs("timezone                 the time zone in use\n");
+        prog.outs("timezone list [TEXT]     the zones there are (* = in use), or those containing TEXT\n");
+        prog.outs("timezone set <zone>      use <zone> from now on, e.g. America/Sao_Paulo\n");
+        prog.outs("timezone reset           back to the default zone\n");
+        prog.outs("Zones are IANA's, in /etc/zoneinfo. The desktop clock follows a change within a second.\n");
+        return cast(i32, 0);
+    }
+    if (streq(cmd, "list") == 1 && argc == 2) { return list(""); }
+    if (streq(cmd, "list") == 1 && argc == 3) { return list(prog.arg(argv, 2)); }
+    if (streq(cmd, "reset") == 1 && argc == 2) { return reset(); }
+    if (streq(cmd, "set") == 1 && argc == 3) { return set(prog.arg(argv, 2)); }
+    return usage();
+}
