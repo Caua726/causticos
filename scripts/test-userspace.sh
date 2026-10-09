@@ -159,7 +159,7 @@ TIMED=(
     "audio|scripts/test-audio.sh|@grep -oE 'ch0: [0-9.]+Hz'"
     "stream|scripts/test-stream.sh|@grep -oE '[0-9]+ KiB/s from the network'"
     "soundd|scripts/test-soundd.sh|mixed two, preempted, resumed"
-    "record|scripts/test-record.sh|@grep -oE '[0-9]+ frames'"
+    "record|scripts/test-record.sh|@grep -oE '[0-9]+ frames are the source, byte for byte'"
 )
 
 # AT THE SAME TIME. They are separate machines with separate disk images and

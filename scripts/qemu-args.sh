@@ -69,6 +69,9 @@ QEMU_ACCEL="${QEMU_ACCEL:-tcg}"
 QEMU_SMP="${QEMU_SMP:-}"
 QEMU_PCAP="${QEMU_PCAP:-}"
 QEMU_WAV="${QEMU_WAV:-}"
+# A raw PCM file (s16le, 2 channels, 48000 Hz) the guest's capture stream
+# records from — the one QEMU input a script can feed with known samples.
+QEMU_SND_SOURCE="${QEMU_SND_SOURCE:-}"
 QEMU_FIRMWARE="${QEMU_FIRMWARE:-bios}"
 
 # The audio backend, decided before the device line that references it and
@@ -88,6 +91,19 @@ if [ -n "$QEMU_WAV" ]; then
     # it: the guest would open it, wait for frames that can never arrive, and
     # the honest report would be a driver bug that is not one.
     QEMU_SND_STREAMS=1
+elif [ -n "$QEMU_SND_SOURCE" ]; then
+    # SDL's `disk` audio driver: capture reads the source file in order and
+    # playback is written to /dev/null, both at the wall-clock rate — the
+    # driver sleeps a buffer's worth between buffers, as a sound card's clock
+    # would. A source with no clock of its own (ALSA's file plugin over its
+    # null device) is read as fast as QEMU asks and overruns the guest's ring,
+    # which proves nothing about the path. Nothing of the host's own audio is
+    # opened or consulted; these variables reach this QEMU's environment only
+    # because the caller sourced this file.
+    export SDL_AUDIO_DRIVER=disk SDL_AUDIODRIVER=disk
+    export SDL_AUDIO_DISK_INPUT_FILE="$QEMU_SND_SOURCE" SDL_AUDIO_DISK_OUTPUT_FILE=/dev/null
+    QEMU_AUDIO_BACKEND=("sdl,id=snd0,in.frequency=48000,in.channels=2,in.format=s16,out.frequency=48000,out.channels=2,out.format=s16")
+    QEMU_SND_STREAMS=2
 else
     QEMU_AUDIO_BACKEND=("none,id=snd0")
     # `none` is a full-duplex backend: it consumes playback and produces
