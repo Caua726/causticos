@@ -137,7 +137,12 @@ Per-call notes:
 - **`SPAWN`** (14): takes ONE pointer, to a `SpawnParams` (§5). Only a Process
   may spawn (`E_PERM` otherwise). The child's fd table starts **empty**; `fdacts`
   (a `[{child_fd, src_fd}]` array, `n_acts ≤ 16`) is the *only* way it gets
-  keys — see §6.
+  keys — see §6. fds **0–9 are the key slots** (stdio, the WM's and the
+  compositor's channels, netd's gate at 6, soundd's at 7, the terminal's at 8,
+  the stderr-terminal marker at 9): only `fdacts` fills them. Every fd the
+  kernel hands out on its own — `OPEN`, `CHANNEL_CREATE`, `FD_RECV`, … — is 10
+  or above, so a program that looks for a key at its number finds the key or
+  nothing, never one of its own descriptors.
 
   A spawn **names its source**; it does not carry the image. `src_kind` selects
   either a path the kernel opens (`SPAWN_SRC_PATH`) or an fd you already hold
