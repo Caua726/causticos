@@ -348,6 +348,12 @@ silently treating it as an empty file.
 zero; later `-n` or `-c` options take precedence. File and piped input use the
 same streaming path as `head -n N`.
 
+`tail -N` and `tail +N` take GNU's classic form: one first argument
+`[-+][N][b|c|l][f]` (the last N, or from the Nth on; in lines, bytes or
+512-byte blocks; `f` follows), with at most one file after it. Next to another
+option or a second file, the digits are an option out of place, and `tail`
+refuses them, as GNU does.
+
 `wc` leaves a single selected stdin count unpadded (`echo pipe | wc -c` prints
 `5`). Multiple selected pipe counts retain aligned columns.
 

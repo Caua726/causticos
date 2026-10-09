@@ -25,7 +25,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "userspace", "tests", "cmdt.cases")
-GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head", "wc": "/usr/bin/wc"}
+GNU = {"sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "expr": "/usr/bin/expr", "ls": "/usr/bin/ls", "head": "/usr/bin/head", "wc": "/usr/bin/wc", "tail": "/usr/bin/tail"}
 
 CASES = []
 
@@ -368,6 +368,28 @@ case("wc-stdin-longest", "wc", ["-L"], "a\tb\n")
 case("wc-stdin-repeated-option", "wc", ["-cc"], "abc")
 case("wc-stdin-two-counts", "wc", ["-lc"], L5)
 case("wc-stdin-default-counts", "wc", [], L5)
+
+# Classic tail counts: [-+][N][b|c|l][f] alone, before at most one file.
+L12 = "".join("line %d\n" % i for i in range(1, 13))
+BLOCKS = "".join("%03d %s\n" % (i, "x" * 59) for i in range(12))   # 768 bytes
+case("tail-classic-count", "tail", ["-3"], L5)
+case("tail-classic-zero", "tail", ["-0"], L5)
+case("tail-classic-leading-zero", "tail", ["-005"], L5)
+case("tail-classic-file", "tail", ["-3", "%D/input"], files={"%D/input": L5})
+case("tail-classic-dashdash-file", "tail", ["-3", "--", "%D/input"], files={"%D/input": L5})
+case("tail-classic-bytes", "tail", ["-3c"], L5)
+case("tail-classic-lines-suffix", "tail", ["-3l"], L5)
+case("tail-classic-blocks", "tail", ["-1b"], BLOCKS)
+case("tail-classic-default", "tail", ["-l"], L12)
+case("tail-classic-from", "tail", ["+3"], L5)
+case("tail-classic-from-bytes", "tail", ["+3c"], L5)
+case("tail-classic-from-default", "tail", ["+"], L12)
+case("tail-classic-not-alone", "tail", ["-3", "-n", "2"], L5)
+case("tail-classic-after-option", "tail", ["-q", "-3"], L5)
+case("tail-classic-two-files", "tail", ["-3", "%D/a", "%D/b"], files={"%D/a": L5, "%D/b": L5})
+case("tail-classic-invalid-suffix", "tail", ["-3x"], L5)
+case("tail-classic-too-large", "tail", ["-99999999999999999999999"], L5)
+case("tail-n-zero", "tail", ["-n", "0"], L5)
 
 
 def run(c):
