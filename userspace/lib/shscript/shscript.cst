@@ -11,6 +11,14 @@
 // is true. There is no separate expression language, and there is no `[`
 // builtin pretending to be syntax: `if true`, `if grep -q x file`.
 //
+// A command ends at `;`, at a newline, at a block keyword — end, else, elsif,
+// case — or at && || &, so a whole construct fits on one line, nested ones
+// too: `for i in 1 2 begin for j in 0 1 begin echo $i$j end end`. The keyword
+// as a word is quoted: echo 'end'. A statement is a list as at the prompt —
+// a && b, a || b, a & b — whose parts are commands or whole blocks:
+// `make && for f in *.o begin ... end`. Only a command goes to the
+// background; a block runs in the shell itself.
+//
 // Simple commands are not re-parsed here. A statement holds the SPAN of its
 // source text and hands it to shexec, so a command inside a loop goes through
 // exactly the same expansion, globbing, redirection and piping as one typed at
@@ -49,6 +57,9 @@ let is i64 as T_SWITCH with imut = 9;
 let is i64 as T_CASE  with imut = 10;
 let is i64 as T_FUNC  with imut = 11;
 let is i64 as T_SEMI  with imut = 12;      // ';' or newline: a statement break
+let is i64 as T_AND   with imut = 13;      // '&&': run the next if this succeeded
+let is i64 as T_OR    with imut = 14;      // '||': run the next if this failed
+let is i64 as T_BG    with imut = 15;      // '&': this goes to the background
 
 // statement kinds
 let is i64 as S_CMD    with imut = 0;
@@ -57,6 +68,7 @@ let is i64 as S_WHILE  with imut = 2;
 let is i64 as S_FOR    with imut = 3;
 let is i64 as S_SWITCH with imut = 4;
 let is i64 as S_FUNC   with imut = 5;
+let is i64 as S_LIST   with imut = 6;      // statements joined by && || &
 
 let is grow.Grow as src_g with mut;
 let is *u8 as src with mut = cast(*u8, 0);
@@ -87,6 +99,7 @@ struct Stmt {
     cn as i64;
     d0 as i64;      // for: the variable's token; switch: first case; func: name token
     dn as i64;
+    link as i64;    // what joins it to the next of its list: T_AND, T_OR, T_BG; T_SEMI for none
 }
 let is grow.Grow as st_g with mut;
 let is *Stmt as st with mut = cast(*Stmt, 0);
@@ -211,11 +224,18 @@ fn _stk_to_kids(from as i64) as i64 {
 let is i64 as err_line with mut = 0;
 let is i64 as err_col with mut = 0;
 let is i64 as err_msg with mut = 0;
+// 1 when the error is that the source ran out — what is missing may still be
+// typed — and not that something in it is wrong. feed asks for more then.
+let is i64 as err_eof with mut = 0;
 
 fn _fail(tok as i64, msg as *u8) as i64 {
+    err_eof = 0;
     if (tok >= 0 && tok < ntok) { err_line = t_line[tok]; err_col = t_col[tok]; }
-    else if (ntok > 0) { err_line = t_line[ntok - 1]; err_col = t_col[ntok - 1]; }
-    else { err_line = 1; err_col = 1; }
+    else {
+        if (ntok > 0) { err_line = t_line[ntok - 1]; err_col = t_col[ntok - 1]; }
+        else { err_line = 1; err_col = 1; }
+        if (grow_err == 0) { err_eof = 1; }
+    }
     err_msg = cast(i64, msg);
     return 0 - 1;
 }
@@ -265,8 +285,48 @@ fn _kw(off as i64, len as i64) as i64 {
     return T_WORD;
 }
 
+// The list operator at src[i] — T_AND, T_OR or T_BG, its length in *n — or
+// T_WORD when there is none. A '&' right after '>' is the one of 2>&1, a
+// redirect. The same rule as shexec's list_scan, so a line splits the same
+// way at the prompt and in a block.
+fn _list_op(i as i64, n as *i64) as i64 {
+    let is i64 as c = cast(i64, src[i]);
+    if (c == 38) {
+        if (i + 1 < srclen && src[i + 1] == cast(u8, 38)) { n[0] = 2; return T_AND; }
+        if (i == 0 || src[i - 1] != cast(u8, 62)) { n[0] = 1; return T_BG; }
+    }
+    if (c == 124 && i + 1 < srclen && src[i + 1] == cast(u8, 124)) { n[0] = 2; return T_OR; }
+    n[0] = 0;
+    return T_WORD;
+}
+
+// Past the quoted text that opens at src[i]: the index after its closing
+// quote. The lines it spans are counted in *line / *bol.
+fn _skip_quote(i as i64, line as *i64, bol as *i64) as i64 {
+    let is u8 as close = src[i];
+    let is i64 as j with mut = i + 1;
+    while (j < srclen && src[j] != close) {
+        if (src[j] == cast(u8, 10)) { line[0] = line[0] + 1; bol[0] = j + 1; }
+        j = j + 1;
+    }
+    if (j < srclen) { j = j + 1; }
+    return j;
+}
+
+fn _tok_add(kind as i64, off as i64, len as i64, line as i64, col as i64) as void {
+    if (_tok_room() == 1) {
+        t_kind[ntok] = kind; t_off[ntok] = off; t_len[ntok] = len;
+        t_line[ntok] = line; t_col[ntok] = col;
+        ntok = ntok + 1;
+    }
+    return;
+}
+
 // tokenise — words, with quotes kept intact (shexec strips them later, and it
-// must see them to know what not to glob). Newlines and ';' are breaks.
+// must see them to know what not to glob). Newlines and ';' are breaks; &&,
+// || and & are tokens of their own. A $(...) is one word whatever it holds:
+// the ; and && of the command inside are that command's, and they used to
+// break the statement around it.
 fn tokenise() as void {
     ntok = 0;
     let is i64 as line with mut = 1;
@@ -274,21 +334,24 @@ fn tokenise() as void {
     let is i64 as i with mut = 0;
     while (i < srclen) {
         let is i64 as c = cast(i64, src[i]);
+        let is i64 as ol with mut = 0;
+        let is i64 as op = _list_op(i, &ol);
         if (c == 32 || c == 9) { i = i + 1; }
         else if (c == 10 || c == 59) {                          // newline or ';'
-            if (_tok_room() == 1) {
-                t_kind[ntok] = T_SEMI; t_off[ntok] = i; t_len[ntok] = 1;
-                t_line[ntok] = line; t_col[ntok] = i - bol + 1;
-                ntok = ntok + 1;
-            }
+            _tok_add(T_SEMI, i, 1, line, i - bol + 1);
             i = i + 1;
             if (c == 10) { line = line + 1; bol = i; }
         }
         else if (c == 35) {                                     // '#' to end of line
             while (i < srclen && src[i] != cast(u8, 10)) { i = i + 1; }
         }
+        else if (op != T_WORD) {
+            _tok_add(op, i, ol, line, i - bol + 1);
+            i = i + ol;
+        }
         else {
             let is i64 as o = i;
+            let is i64 as ln0 = line;
             let is i64 as col = i - bol + 1;
             // A separate flag ends the word, NOT a sentinel value of `i`: the
             // position where the word stops is the position the outer loop must
@@ -297,45 +360,37 @@ fn tokenise() as void {
             let is i64 as stop with mut = 0;
             while (i < srclen && stop == 0) {
                 let is i64 as ch = cast(i64, src[i]);
-                if (ch == 34 || ch == 39) {
-                    let is i64 as close = ch;
-                    i = i + 1;
-                    while (i < srclen && cast(i64, src[i]) != close) { i = i + 1; }
-                    if (i < srclen) { i = i + 1; }
-                } else if (ch == 32 || ch == 9 || ch == 10 || ch == 59) { stop = 1; }
+                let is i64 as wl with mut = 0;
+                if (ch == 34 || ch == 39) { i = _skip_quote(i, &line, &bol); }
+                else if (ch == 36 && i + 1 < srclen && src[i + 1] == cast(u8, 40)) {
+                    let is i64 as depth with mut = 1;
+                    i = i + 2;
+                    while (i < srclen && depth > 0) {
+                        let is i64 as d = cast(i64, src[i]);
+                        if (d == 34 || d == 39) { i = _skip_quote(i, &line, &bol); }
+                        else {
+                            if (d == 40) { depth = depth + 1; }
+                            else if (d == 41) { depth = depth - 1; }
+                            else if (d == 10) { line = line + 1; bol = i + 1; }
+                            i = i + 1;
+                        }
+                    }
+                }
+                else if (ch == 32 || ch == 9 || ch == 10 || ch == 59) { stop = 1; }
+                else if (_list_op(i, &wl) != T_WORD) { stop = 1; }
                 else { i = i + 1; }
             }
-            if (_tok_room() == 1) {
-                t_off[ntok] = o; t_len[ntok] = i - o;
-                t_kind[ntok] = _kw(o, i - o);
-                t_line[ntok] = line; t_col[ntok] = col;
-                ntok = ntok + 1;
-            }
+            _tok_add(_kw(o, i - o), o, i - o, ln0, col);
         }
     }
     return;
 }
 
-// depth — how many blocks are still open in what has been typed. The REPL asks
-// this to decide between running the line and asking for more.
-fn depth() as i64 {
-    let is i64 as d with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < ntok) {
-        let is i64 as k = t_kind[i];
-        if (k == T_IF || k == T_WHILE || k == T_FOR || k == T_SWITCH || k == T_FUNC) {
-            d = d + 1;
-        } else if (k == T_BEGIN) {
-            // The `begin` of a construct was already counted by its keyword,
-            // and `else begin` / `elsif ... begin` continue a construct rather
-            // than opening one — one `end` closes the whole chain. So only a
-            // bare grouping block, which starts a statement, adds a level.
-            if (i == 0 || t_kind[i - 1] == T_SEMI) { d = d + 1; }
-        } else if (k == T_END) { d = d - 1; }
-        i = i + 1;
-    }
-    return d;
-}
+// Whether a construct is complete is the parser's to say (feed): it is
+// complete when it parses, and still open when the parse ran out of source
+// (err_eof). A count of opening and closing keywords did it, and disagreed
+// with the parser — a `begin` right after another one was not counted, so
+// `begin begin echo x end end` was "unexpected 'end'" on a line of its own.
 
 // ---- parsing ---------------------------------------------------------------
 
@@ -352,7 +407,7 @@ fn _alloc_stmt() as i64 {
     nst = nst + 1;
     st[k].kind = S_CMD; st[k].a0 = 0; st[k].a1 = 0;
     st[k].b0 = 0; st[k].bn = 0; st[k].c0 = 0; st[k].cn = 0;
-    st[k].d0 = 0; st[k].dn = 0;
+    st[k].d0 = 0; st[k].dn = 0; st[k].link = T_SEMI;
     return k;
 }
 
@@ -362,16 +417,79 @@ fn _alloc_stmt() as i64 {
 let is i64 as PARSE_DEPTH_LIMIT with imut = 1000;
 let is i64 as parse_depth with mut = 0;
 
-// parse_stmt — one statement. Returns its index, or -1 with the error set.
+fn _is_link(k as i64) as i64 {
+    if (k == T_AND || k == T_OR || k == T_BG) { return 1; }
+    return 0;
+}
+
+// Whether token kind k ends a statement: a break, or a keyword that closes or
+// continues the block around it.
+fn _ends_stmt(k as i64) as i64 {
+    if (k == T_SEMI || k == T_END || k == T_ELSE || k == T_ELSIF || k == T_CASE) { return 1; }
+    return 0;
+}
+
+// parse_stmt — one statement: units joined by && || & — a list, as at the
+// prompt, where a unit is a plain command or a whole block, so
+// `make && for f in *.o begin ... end` and `for ... end || echo failed` mean
+// what they say. One unit is returned as itself (a trailing & is its link);
+// more become an S_LIST over them. Returns its index, or -1 with the error
+// set. A block cannot go to the background: it runs in the shell itself.
 fn parse_stmt() as i64 {
+    let is i64 as base = stk_top;
+    let is i64 as u with mut = parse_unit();
+    if (u < 0) { return 0 - 1; }
+    if (pos >= ntok || _is_link(t_kind[pos]) == 0) { return u; }
+    if (_stk_push(u) == 0) { stk_top = base; return _fail(pos, _room_text()); }
+    let is i64 as more with mut = 1;
+    while (more == 1 && pos < ntok && _is_link(t_kind[pos]) == 1) {
+        let is i64 as op = t_kind[pos];
+        if (op == T_BG && st[u].kind != S_CMD) {
+            stk_top = base;
+            return _fail(pos, "a block cannot go to the background: it runs in the shell itself");
+        }
+        st[u].link = op;
+        pos = pos + 1;
+        // The command after && or || may be on the next line.
+        if (op != T_BG) {
+            while (pos < ntok && t_kind[pos] == T_SEMI && src[t_off[pos]] == cast(u8, 10)) { pos = pos + 1; }
+        }
+        if (pos >= ntok || _ends_stmt(t_kind[pos]) == 1) {
+            // `a &` ends a statement; && and || need a command after them,
+            // and at the end of the source it may still be typed.
+            if (op != T_BG) { stk_top = base; return _fail(pos, "expected a command after '&&' or '||'"); }
+            more = 0;
+        } else if (_is_link(t_kind[pos]) == 1) {
+            stk_top = base;
+            return _fail(pos, "expected a command between two of && || &");
+        } else {
+            u = parse_unit();
+            if (u < 0) { stk_top = base; return 0 - 1; }
+            if (_stk_push(u) == 0) { stk_top = base; return _fail(pos, _room_text()); }
+        }
+    }
+    let is i64 as count = stk_top - base;
+    if (count == 1) { stk_top = base; return u; }
+    let is i64 as node = _alloc_stmt();
+    if (node < 0) { stk_top = base; return _fail(pos, _room_text()); }
+    st[node].kind = S_LIST;
+    let is i64 as kb = _stk_to_kids(base);
+    if (kb < 0) { return _fail(pos, _room_text()); }
+    st[node].b0 = kb; st[node].bn = count;
+    return node;
+}
+
+// parse_unit — one statement of a list: a block construct or a plain command.
+// Returns its index, or -1 with the error set.
+fn parse_unit() as i64 {
     if (parse_depth >= PARSE_DEPTH_LIMIT) { return _fail(pos, "blocks nested more than 1000 deep"); }
     parse_depth = parse_depth + 1;
-    let is i64 as r = _parse_stmt();
+    let is i64 as r = _parse_unit();
     parse_depth = parse_depth - 1;
     return r;
 }
 
-fn _parse_stmt() as i64 {
+fn _parse_unit() as i64 {
     _skip_semis();
     if (pos >= ntok) { return 0 - 1; }
     let is i64 as k = t_kind[pos];
@@ -406,7 +524,7 @@ fn _parse_stmt() as i64 {
             st[node].c0 = ef; st[node].cn = en;
         } else if (pos < ntok && t_kind[pos] == T_ELSIF) {
             t_kind[pos] = T_IF;                        // rewrite: elsif IS a nested if
-            let is i64 as inner = parse_stmt();
+            let is i64 as inner = parse_unit();
             if (inner < 0) { return 0 - 1; }
             if (_room(&kids_g, (nkids + 1) * 8) == 0) { return _fail(pos, _room_text()); }
             kids[nkids] = inner; st[node].c0 = nkids; st[node].cn = 1; nkids = nkids + 1;
@@ -528,13 +646,18 @@ fn _parse_stmt() as i64 {
     if (k == T_END || k == T_ELSE || k == T_ELSIF || k == T_CASE) {
         return _fail(pos, "unexpected keyword");
     }
+    if (_is_link(k) == 1) { return _fail(pos, "expected a command before && || or &"); }
 
-    // A plain command: everything up to the next break or block keyword.
+    // A plain command: everything up to the next break, block keyword or list
+    // operator. A block keyword ends it, so a block opens and closes on one
+    // line — `for i in 1 2 begin echo $i end` — the way it does across
+    // several. It ran to the next break only, and the `end` became the
+    // command's argument. A literal "end" for a command is quoted: echo 'end'.
     let is i64 as node = _alloc_stmt();
     if (node < 0) { return _fail(pos, _room_text()); }
     st[node].kind = S_CMD;
     st[node].a0 = pos;
-    while (pos < ntok && t_kind[pos] != T_SEMI) { pos = pos + 1; }
+    while (pos < ntok && _ends_stmt(t_kind[pos]) == 0 && _is_link(t_kind[pos]) == 0) { pos = pos + 1; }
     st[node].a1 = pos;
     return node;
 }
@@ -661,9 +784,20 @@ fn define_fn(t as *term.Term, s as i64) as i64 {
     return 0;
 }
 
-// run_one — a simple command: a builtin if it names one, a function call if it
-// names one of those, otherwise a program. Returns its exit status.
-fn run_one(t as *term.Term, a0 as i64, a1 as i64) as i64 {
+// Whether the statement after link `prev` is passed over, the previous one
+// having ended with `status`: && runs it on success only, || on failure only.
+// A statement passed over leaves the status as it was, so in
+// `false && a || b` it is b that runs.
+fn _passed_over(prev as i64, status as i64) as i64 {
+    if (prev == T_AND && status != 0) { return 1; }
+    if (prev == T_OR && status == 0) { return 1; }
+    return 0;
+}
+
+// run_one — a simple command, tokens [a0, a1): a builtin if it names one, a
+// function call if it names one of those, otherwise a program — in the
+// background with bg. Returns its exit status.
+fn run_one(t as *term.Term, a0 as i64, a1 as i64, bg as i64) as i64 {
     if (a1 <= a0) { return 0; }
     let is i64 as len with mut = 0;
     let is *u8 as text = span_text(a0, a1, &len);
@@ -672,14 +806,57 @@ fn run_one(t as *term.Term, a0 as i64, a1 as i64) as i64 {
         sx.set_status(2);
         return 2;
     }
+    return run_part(t, text, len, bg);
+}
 
+// run_span — the condition of an `if` or a `while`, tokens [a0, a1): a list
+// like any statement's — `if test -d x && cd x begin` — whose status is the
+// one it ends with.
+fn run_span(t as *term.Term, a0 as i64, a1 as i64) as i64 {
+    let is i64 as status with mut = 0;
+    let is i64 as prev with mut = T_SEMI;
+    let is i64 as p with mut = a0;
+    while (p < a1) {
+        let is i64 as q with mut = p;
+        while (q < a1 && _is_link(t_kind[q]) == 0) { q = q + 1; }
+        let is i64 as link with mut = T_SEMI;
+        if (q < a1) { link = t_kind[q]; }
+        if (q == p || (q + 1 == a1 && link != T_BG)) {
+            _puts(t, "shell: syntax: && || or & with no command on one side\n");
+            sx.set_status(2);
+            return 2;
+        }
+        if (_passed_over(prev, status) == 0) {
+            let is i64 as bg with mut = 0;
+            if (link == T_BG) { bg = 1; }
+            status = run_one(t, p, q, bg);
+        }
+        prev = link;
+        p = q + 1;
+    }
+    return status;
+}
+
+// run_part — one part of a script's command: a function if it names one, a
+// builtin if it names one, otherwise a program, in the background with bg.
+// A function or a builtin runs in the shell itself — `cd` inside a loop must
+// move the shell — so it runs where it is even after a `&`.
+fn run_part(t as *term.Term, text as *u8, len as i64, bg as i64) as i64 {
     // A defined function shadows a program of the same name, the way a builtin
     // does: it is the more specific thing the user just wrote.
-    let is i64 as f = find_fn(cast(*u8, &src[t_off[a0]]), t_len[a0]);
-    if (f >= 0) { return call_fn(t, f); }
+    let is i64 as w0 with mut = 0;
+    while (w0 < len && (text[w0] == cast(u8, 32) || text[w0] == cast(u8, 9))) { w0 = w0 + 1; }
+    let is i64 as w1 with mut = w0;
+    while (w1 < len && text[w1] != cast(u8, 32) && text[w1] != cast(u8, 9)) { w1 = w1 + 1; }
+    let is i64 as f = find_fn(cast(*u8, cast(i64, text) + w0), w1 - w0);
+    if (f >= 0) {
+        let is i64 as fst = call_fn(t, f);
+        sx.set_status(fst);
+        return fst;
+    }
 
-    // Builtins run in the shell itself; `cd` inside a loop must move the shell.
-    // Their words go on shexec's args stack, given back before returning.
+    // Builtins: their words go on shexec's args stack, given back before
+    // returning.
     let is i64 as mark = sx.args_mark();
     let is i64 as pp with mut = 0;
     let is i64 as pl with mut = 0;
@@ -697,6 +874,7 @@ fn run_one(t as *term.Term, a0 as i64, a1 as i64) as i64 {
         sx.set_status(bst);
         return bst;
     }
+    if (bg == 1) { return sx.run_bg(t, text, len); }
     return sx.run_sync(t, text, len);
 }
 
@@ -790,8 +968,25 @@ fn call_fn(t as *term.Term, f as i64) as i64 {
     return status;
 }
 
+// exec_list — an S_LIST: its statements in order, each passed over or not by
+// the link before it (_passed_over). The status is the last one that ran. It
+// is no level of nesting of its own: its statements are at the list's.
+fn exec_list(t as *term.Term, s as i64) as i64 {
+    let is i64 as status with mut = 0;
+    let is i64 as prev with mut = T_SEMI;
+    let is i64 as i with mut = 0;
+    while (i < st[s].bn) {
+        let is i64 as u = kids[st[s].b0 + i];
+        if (_passed_over(prev, status) == 0) { status = exec_stmt(t, u); }
+        prev = st[u].link;
+        i = i + 1;
+    }
+    return status;
+}
+
 fn exec_stmt(t as *term.Term, s as i64) as i64 {
     if (s < 0 || s >= nst) { return 0; }
+    if (st[s].kind == S_LIST) { return exec_list(t, s); }
     // It returned here without a word, and the statement simply did not run.
     if (run_depth >= MAX_DEPTH) {
         _puts(t, "shell: blocks nested more than 16 deep; this one was not run\n");
@@ -801,10 +996,14 @@ fn exec_stmt(t as *term.Term, s as i64) as i64 {
     let is i64 as status with mut = 0;
     let is i64 as k = st[s].kind;
 
-    if (k == S_CMD) { status = run_one(t, st[s].a0, st[s].a1); }
+    if (k == S_CMD) {
+        let is i64 as bg with mut = 0;
+        if (st[s].link == T_BG) { bg = 1; }
+        status = run_one(t, st[s].a0, st[s].a1, bg);
+    }
     else if (k == S_IF) {
         let is i64 as cond with mut = 0;
-        if (st[s].a0 >= 0) { cond = run_one(t, st[s].a0, st[s].a1); }
+        if (st[s].a0 >= 0) { cond = run_span(t, st[s].a0, st[s].a1); }
         if (cond == 0) { status = exec_block(t, st[s].b0, st[s].bn); }
         else if (st[s].cn > 0) { status = exec_block(t, st[s].c0, st[s].cn); }
     }
@@ -812,7 +1011,7 @@ fn exec_stmt(t as *term.Term, s as i64) as i64 {
         let is i64 as iter with mut = 0;
         let is i64 as go with mut = 1;
         while (go == 1) {
-            if (run_one(t, st[s].a0, st[s].a1) != 0) { go = 0; }
+            if (run_span(t, st[s].a0, st[s].a1) != 0) { go = 0; }
             else {
                 status = exec_block(t, st[s].b0, st[s].bn);
                 iter = iter + 1;
@@ -938,22 +1137,36 @@ fn call_named(t as *term.Term, name as *u8, len as i64) as i64 {
     return call_fn(t, f);
 }
 
-// is_block_start — does this line open a construct? The REPL asks before it
-// decides whether to run the line or collect more of it.
-fn is_block_start(line as *u8, len as i64) as i64 {
-    let is i64 as i with mut = 0;
-    while (i < len && (line[i] == cast(u8, 32) || line[i] == cast(u8, 9))) { i = i + 1; }
-    let is i64 as st0 = i;
-    while (i < len && line[i] != cast(u8, 32) && line[i] != cast(u8, 9)) { i = i + 1; }
-    let is i64 as wl = i - st0;
-    if (wl == 0) { return 0; }
-    let is *u8 as w = cast(*u8, cast(i64, line) + st0);
+// Whether w is a keyword that opens a construct.
+fn _opens(w as *u8, wl as i64) as i64 {
     if (repl.streq(w, wl, "if") == 1) { return 1; }
     if (repl.streq(w, wl, "while") == 1) { return 1; }
     if (repl.streq(w, wl, "for") == 1) { return 1; }
     if (repl.streq(w, wl, "switch") == 1) { return 1; }
     if (repl.streq(w, wl, "function") == 1) { return 1; }
     if (repl.streq(w, wl, "begin") == 1) { return 1; }
+    return 0;
+}
+
+// is_block_start — does this line open a construct? The REPL asks before it
+// decides whether to run the line or collect more of it. Any command of the
+// line's list may: in `cd src ; for f in * begin ... end` it is the second.
+// Only the first was looked at, and the rest went to the list as programs —
+// "for: not found", "end: not found".
+fn is_block_start(line as *u8, len as i64) as i64 {
+    let is i64 as start with mut = 0;
+    while (start <= len) {
+        let is i64 as at with mut = 0;
+        let is i64 as oplen with mut = 0;
+        let is i64 as op = sx.list_scan(line, len, start, &at, &oplen);
+        let is i64 as i with mut = start;
+        while (i < at && (line[i] == cast(u8, 32) || line[i] == cast(u8, 9))) { i = i + 1; }
+        let is i64 as w0 = i;
+        while (i < at && line[i] != cast(u8, 32) && line[i] != cast(u8, 9)) { i = i + 1; }
+        if (i > w0 && _opens(cast(*u8, cast(i64, line) + w0), i - w0) == 1) { return 1; }
+        if (op == sx.OP_END) { return 0; }
+        start = at + oplen;
+    }
     return 0;
 }
 
@@ -993,14 +1206,6 @@ fn feed(t as *term.Term, line as *u8, len as i64) as i64 {
     srclen = pendlen;
     tokenise();
     if (grow_err != 0) { return _drop_construct(t); }
-    let is i64 as d = depth();
-    if (d > 0) { return 1; }                       // still inside a block
-    if (d < 0) {
-        _fail(ntok - 1, cast(*u8, "unexpected 'end'"));
-        report_error(t);
-        pendlen = 0;
-        return 0 - 1;
-    }
 
     // The statement and child tables are rebuilt from scratch for every
     // construct. Nothing outlives a feed: a `function` definition keeps its
@@ -1014,18 +1219,19 @@ fn feed(t as *term.Term, line as *u8, len as i64) as i64 {
     pos = 0;
     let is i64 as f with mut = 0;
     let is i64 as n with mut = 0;
-    let is i64 as base_kids = nkids;
     if (parse_block(&f, &n) < 0) {
+        // Ran out of source before the construct closed: it is still open,
+        // and the shell asks for the next line.
+        if (err_eof == 1) { return 1; }
         report_error(t);
         pendlen = 0;
-        nkids = base_kids;
         return 0 - 1;
     }
     if (pos < ntok) {
-        _fail(pos, cast(*u8, "unexpected token after the end of the script"));
+        if (t_kind[pos] == T_END) { _fail(pos, cast(*u8, "unexpected 'end'")); }
+        else { _fail(pos, cast(*u8, "unexpected token after the end of the script")); }
         report_error(t);
         pendlen = 0;
-        nkids = base_kids;
         return 0 - 1;
     }
     pendlen = 0;
