@@ -319,7 +319,9 @@ CPython's `zoneinfo`.
 | `Super+Shift+Q` | Power off after pressing the chord twice within four seconds. |
 
 The taskbar's layout badge spells out `FLOAT`, `TILE`, or `MONOCLE`; click it
-to cycle.
+to cycle. Back in `FLOAT`, windows that tile or monocle arranged return to the
+position and size they had before; a window moved or resized by hand keeps
+where it was put.
 At the prompt, terminal windows are labelled `term#<pid>`; while a foreground
 command runs, its name replaces that label.
 
