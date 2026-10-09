@@ -12,11 +12,14 @@
 // mappings together. Existing low-level callers (`vmm.vmm_map_page`)
 // still work — they just bypass VMA tracking.
 //
-// VMA list is a simple doubly-linked sorted-by-start list. Number
-// of VMAs per process is small (text, data, bss, stack, a few
-// mmap'd regions), so O(N) insert/find is fine for now. Future
-// large workloads can swap in an rb-tree without changing the
-// public API.
+// The areas are kept twice over, by the same nodes: a list sorted by start
+// (next/prev — what every walk of the whole map uses) and a balanced search
+// tree on start (left/right/parent, AVL) for the questions asked on every
+// commit, mmap and munmap: which area holds this address, does this range
+// overlap one, where is the first gap this long. Each node also carries the
+// largest gap below any area in its subtree, which makes the first-fit search
+// a descent rather than a walk. They used to be answered by walking the list
+// — and commit asked "which area holds this page" once per page.
 
 use "serial.cst" as serial;
 use "util.cst" as util;
@@ -63,6 +66,13 @@ struct Vma {
     ko as i64;               // KObject this mapping holds a reference to, or 0
     next as *Vma;
     prev as *Vma;
+    // The search tree on start: children, parent, AVL height, and the
+    // largest gap below an area anywhere in this subtree (_gap).
+    left as *Vma;
+    right as *Vma;
+    parent as *Vma;
+    height as i64;
+    sub_gap as i64;
     // (A reserved `pager` field for a userspace-pager / AUTOFILL endpoint was
     // here; removed — demand paging is rejected by the strict design. The fault
     // policy is fixed in mem_handle_fault, not delegated per-VMA.)
@@ -127,6 +137,8 @@ struct Aspace {
     // this aspace's top stack page; that thread's fs base. 0 = none (an
     // aspace built by hand, not loaded). Appended last.
     main_block as i64;
+    // The root of the search tree over vma_head's list. Appended last.
+    vma_root as *Vma;
 }
 
 fn lk_ptr(a as *Aspace) as *lock.TicketLock {
@@ -156,6 +168,7 @@ fn aspace_create() as *Aspace {
         return cast(*Aspace, 0);
     }
     a.vma_head = cast(*Vma, 0);
+    a.vma_root = cast(*Vma, 0);
     a.vma_count = 0;
     return a;
 }
@@ -217,6 +230,7 @@ fn aspace_destroy(a as *Aspace) as void {
         v = next;
     }
     a.vma_head = cast(*Vma, 0);
+    a.vma_root = cast(*Vma, 0);
     a.vma_count = 0;
     lock.release(lk_ptr(a));
     vmm.as_destroy(a.pml4_phys);
@@ -237,7 +251,7 @@ fn aspace_destroy(a as *Aspace) as void {
 let is i64 as vma_pool with mut = 0;
 
 fn vma_alloc(start as i64, end as i64, prot as i64, flags as i64) as *Vma {
-    // No ALLOC_ZERO needed: all nine fields are set below.
+    // No ALLOC_ZERO needed: every field is set below.
     let is i64 as addr = heap.kpool_alloc_ensure(cast(i64, &vma_pool), sizeof(Vma), 1);
     if (addr == 0) { return cast(*Vma, 0); }
     let is *Vma as v = cast(*Vma, addr);
@@ -250,62 +264,207 @@ fn vma_alloc(start as i64, end as i64, prot as i64, flags as i64) as *Vma {
     v.ko = 0;
     v.next = cast(*Vma, 0);
     v.prev = cast(*Vma, 0);
+    v.left = cast(*Vma, 0);
+    v.right = cast(*Vma, 0);
+    v.parent = cast(*Vma, 0);
+    v.height = 1;
+    v.sub_gap = 0;
     return v;
 }
 
-// Insert v into a's list, keeping it sorted by start ascending.
-// Caller has already guaranteed v doesn't overlap any existing VMA.
-fn vma_insert_sorted(a as *Aspace, v as *Vma) as void {
-    let is *Vma as cur with mut = a.vma_head;
-    let is *Vma as prev with mut = cast(*Vma, 0);
-    while (cast(i64, cur) != 0) {
-        if (cur.start >= v.end) { cur = cast(*Vma, 0); }
-        else {
-            prev = cur;
-            cur = cur.next;
+// ---- the search tree -------------------------------------------------------
+
+fn _nil(v as *Vma) as i64 { if (cast(i64, v) == 0) { return 1; } return 0; }
+fn _ht(v as *Vma) as i64 { if (cast(i64, v) == 0) { return 0; } return v.height; }
+fn _sg(v as *Vma) as i64 { if (cast(i64, v) == 0) { return 0 - 1; } return v.sub_gap; }
+
+// The free space just below v: from the end of the area before it (or from
+// the lowest address a mapping may have) up to v's start.
+fn _gap(v as *Vma) as i64 {
+    let is i64 as lo with mut = pmm.PAGE_SIZE;
+    if (_nil(v.prev) == 0) { lo = v.prev.end; }
+    if (v.start <= lo) { return 0; }
+    return v.start - lo;
+}
+
+// v's height and subtree gap from its children's, which must be right.
+fn _pull(v as *Vma) as void {
+    let is i64 as hl = _ht(v.left);
+    let is i64 as hr = _ht(v.right);
+    if (hl > hr) { v.height = hl + 1; } else { v.height = hr + 1; }
+    let is i64 as g with mut = _gap(v);
+    if (_sg(v.left) > g) { g = _sg(v.left); }
+    if (_sg(v.right) > g) { g = _sg(v.right); }
+    v.sub_gap = g;
+}
+
+// Put `nw` where `old` hangs from `par` (the root when par is nil).
+fn _replace_child(a as *Aspace, par as *Vma, old as *Vma, nw as *Vma) as void {
+    if (_nil(par) == 1) { a.vma_root = nw; }
+    else if (par.left == old) { par.left = nw; }
+    else { par.right = nw; }
+    if (_nil(nw) == 0) { nw.parent = par; }
+}
+
+// Rotations: return the new root of the subtree.
+fn _rot_left(a as *Aspace, x as *Vma) as *Vma {
+    let is *Vma as y = x.right;
+    x.right = y.left;
+    if (_nil(y.left) == 0) { y.left.parent = x; }
+    _replace_child(a, x.parent, x, y);
+    y.left = x;
+    x.parent = y;
+    _pull(x);
+    _pull(y);
+    return y;
+}
+
+fn _rot_right(a as *Aspace, x as *Vma) as *Vma {
+    let is *Vma as y = x.left;
+    x.left = y.right;
+    if (_nil(y.right) == 0) { y.right.parent = x; }
+    _replace_child(a, x.parent, x, y);
+    y.right = x;
+    x.parent = y;
+    _pull(x);
+    _pull(y);
+    return y;
+}
+
+// From n up to the root: recompute each node and rebalance where a side has
+// grown two taller than the other. Every node whose gap or children changed
+// must be n or above it.
+fn _fix_up(a as *Aspace, start as *Vma) as void {
+    let is *Vma as n with mut = start;
+    while (_nil(n) == 0) {
+        _pull(n);
+        let is i64 as bal = _ht(n.left) - _ht(n.right);
+        if (bal > 1) {
+            if (_ht(n.left.left) < _ht(n.left.right)) { _rot_left(a, n.left); }
+            n = _rot_right(a, n);
+        } else if (bal < 0 - 1) {
+            if (_ht(n.right.right) < _ht(n.right.left)) { _rot_right(a, n.right); }
+            n = _rot_left(a, n);
         }
+        n = n.parent;
     }
-    // Insert v after prev (or at head if prev is null).
-    if (cast(i64, prev) == 0) {
-        v.next = a.vma_head;
+}
+
+// The area with the greatest start <= key, or nil.
+fn _floor(a as *Aspace, key as i64) as *Vma {
+    let is *Vma as n with mut = a.vma_root;
+    let is *Vma as best with mut = cast(*Vma, 0);
+    while (_nil(n) == 0) {
+        if (n.start <= key) { best = n; n = n.right; }
+        else { n = n.left; }
+    }
+    return best;
+}
+
+// The leftmost area in n's subtree that starts after `after` and has at least
+// `len` free below it, or nil. Subtrees whose largest gap is too small are
+// skipped whole, so this is a descent, not a walk.
+fn _leftmost_fit(n as *Vma, after as i64, len as i64) as *Vma {
+    if (_nil(n) == 1) { return cast(*Vma, 0); }
+    if (n.sub_gap < len) { return cast(*Vma, 0); }
+    if (n.start > after) {
+        let is *Vma as l = _leftmost_fit(n.left, after, len);
+        if (_nil(l) == 0) { return l; }
+        if (_gap(n) >= len) { return n; }
+    }
+    return _leftmost_fit(n.right, after, len);
+}
+
+// An area's start moved (trimmed at the front) or its end did (trimmed at the
+// back, which moves the gap below the next one): recompute what depends on it.
+fn vma_moved(a as *Aspace, v as *Vma) as void {
+    _fix_up(a, v);
+    if (_nil(v.next) == 0) { _fix_up(a, v.next); }
+}
+
+// Insert v, keeping list and tree sorted by start. Caller has already
+// guaranteed v doesn't overlap any existing VMA.
+fn vma_insert_sorted(a as *Aspace, v as *Vma) as void {
+    let is *Vma as par with mut = cast(*Vma, 0);
+    let is *Vma as n with mut = a.vma_root;
+    let is *Vma as prev with mut = cast(*Vma, 0);       // last node we went right of
+    let is i64 as go_left with mut = 0;
+    while (_nil(n) == 0) {
+        par = n;
+        if (v.start < n.start) { go_left = 1; n = n.left; }
+        else { go_left = 0; prev = n; n = n.right; }
+    }
+    v.left = cast(*Vma, 0);
+    v.right = cast(*Vma, 0);
+    v.parent = par;
+    v.height = 1;
+    if (_nil(par) == 1) { a.vma_root = v; }
+    else if (go_left == 1) { par.left = v; }
+    else { par.right = v; }
+    // The list: v goes right after its in-order predecessor.
+    if (_nil(prev) == 1) {
         v.prev = cast(*Vma, 0);
-        if (cast(i64, a.vma_head) != 0) { a.vma_head.prev = v; }
+        v.next = a.vma_head;
+        if (_nil(a.vma_head) == 0) { a.vma_head.prev = v; }
         a.vma_head = v;
     } else {
-        v.next = prev.next;
         v.prev = prev;
-        if (cast(i64, prev.next) != 0) { prev.next.prev = v; }
+        v.next = prev.next;
+        if (_nil(prev.next) == 0) { prev.next.prev = v; }
         prev.next = v;
     }
     a.vma_count = a.vma_count + 1;
+    // The gap below v's successor shrank; it is an ancestor of v.
+    _fix_up(a, v);
 }
 
 fn vma_unlink(a as *Aspace, v as *Vma) as void {
-    if (cast(i64, v.prev) == 0) { a.vma_head = v.next; }
-    else                         { v.prev.next = v.next; }
-    if (cast(i64, v.next) != 0) { v.next.prev = v.prev; }
+    let is *Vma as fix with mut = cast(*Vma, 0);
+    if (_nil(v.left) == 1 || _nil(v.right) == 1) {
+        let is *Vma as child with mut = v.left;
+        if (_nil(child) == 1) { child = v.right; }
+        _replace_child(a, v.parent, v, child);
+        fix = v.parent;
+    } else {
+        // Two children: v's successor (the leftmost of its right subtree,
+        // which has no left child) takes v's place in the tree.
+        let is *Vma as s with mut = v.right;
+        while (_nil(s.left) == 0) { s = s.left; }
+        if (s.parent != v) {
+            fix = s.parent;
+            _replace_child(a, s.parent, s, s.right);
+            s.right = v.right;
+            s.right.parent = s;
+        } else {
+            fix = s;
+        }
+        s.left = v.left;
+        s.left.parent = s;
+        _replace_child(a, v.parent, v, s);
+    }
+    let is *Vma as after = v.next;
+    if (_nil(v.prev) == 1) { a.vma_head = v.next; }
+    else                   { v.prev.next = v.next; }
+    if (_nil(v.next) == 0) { v.next.prev = v.prev; }
     a.vma_count = a.vma_count - 1;
+    _fix_up(a, fix);
+    // The gap below v's successor grew by v and the gap below it.
+    if (_nil(after) == 0) { _fix_up(a, after); }
 }
 
 // Returns the Vma covering `va`, or null if no Vma covers it.
 fn vma_find(a as *Aspace, va as i64) as *Vma {
-    let is *Vma as cur with mut = a.vma_head;
-    while (cast(i64, cur) != 0) {
-        if (va >= cur.start && va < cur.end) { return cur; }
-        if (cur.start > va) { return cast(*Vma, 0); }
-        cur = cur.next;
-    }
+    let is *Vma as f = _floor(a, va);
+    if (_nil(f) == 0 && va < f.end) { return f; }
     return cast(*Vma, 0);
 }
 
-// True iff the half-open range [start, end) overlaps any existing VMA.
+// True iff the half-open range [start, end) overlaps any existing VMA. Areas
+// are disjoint and sorted, so only the last one starting before `end` can.
 fn vma_range_overlaps(a as *Aspace, start as i64, end as i64) as i32 {
-    let is *Vma as cur with mut = a.vma_head;
-    while (cast(i64, cur) != 0) {
-        if (start < cur.end && cur.start < end) { return 1; }
-        if (cur.start >= end) { return 0; }
-        cur = cur.next;
-    }
+    if (end <= start) { return 0; }
+    let is *Vma as f = _floor(a, end - 1);
+    if (_nil(f) == 0 && f.end > start) { return 1; }
     return 0;
 }
 
@@ -314,14 +473,62 @@ fn vma_range_overlaps(a as *Aspace, start as i64, end as i64) as i32 {
 fn vma_find_free_va(a as *Aspace, hint as i64, len as i64) as i64 {
     let is i64 as start with mut = hint;
     if (start < pmm.PAGE_SIZE) { start = pmm.PAGE_SIZE; }   // never give va 0
-    let is *Vma as cur with mut = a.vma_head;
-    while (cast(i64, cur) != 0) {
-        if (start + len <= cur.start) { return start; }
-        if (cur.end > start) { start = cur.end; }
-        cur = cur.next;
+    // The gap `start` is in, or the one right after the area holding it.
+    let is *Vma as p = _floor(a, start);
+    let is *Vma as nx with mut = a.vma_head;
+    if (_nil(p) == 0) {
+        if (p.end > start) { start = p.end; }
+        nx = p.next;
     }
-    if (start + len <= USER_VA_MAX) { return start; }
+    if (_nil(nx) == 1) {
+        if (start + len <= USER_VA_MAX) { return start; }
+        return cast(i64, 0 - 1);
+    }
+    if (start + len <= nx.start) { return start; }
+    // Further up: the first area after nx with room below it, else past the last.
+    let is *Vma as y = _leftmost_fit(a.vma_root, nx.start, len);
+    if (_nil(y) == 0) { return y.prev.end; }
+    let is *Vma as last with mut = a.vma_root;
+    while (_nil(last.right) == 0) { last = last.right; }
+    if (last.end + len <= USER_VA_MAX) { return last.end; }
     return cast(i64, 0 - 1);
+}
+
+// The tree's own rules, for the smoke: 1 when every parent link, height,
+// balance, subtree gap and the list order agree. Recursion depth is the
+// tree's height.
+fn _check_node(n as *Vma, lo as i64, hi as i64) as i64 {
+    if (_nil(n) == 1) { return 1; }
+    if (n.start < lo || n.start > hi) { return 0; }
+    if (_nil(n.left) == 0 && n.left.parent != n) { return 0; }
+    if (_nil(n.right) == 0 && n.right.parent != n) { return 0; }
+    let is i64 as d = _ht(n.left) - _ht(n.right);
+    if (d > 1 || d < 0 - 1) { return 0; }
+    let is i64 as hl = _ht(n.left);
+    let is i64 as hr = _ht(n.right);
+    let is i64 as h with mut = hr + 1;
+    if (hl > hr) { h = hl + 1; }
+    if (n.height != h) { return 0; }
+    let is i64 as g with mut = _gap(n);
+    if (_sg(n.left) > g) { g = _sg(n.left); }
+    if (_sg(n.right) > g) { g = _sg(n.right); }
+    if (n.sub_gap != g) { return 0; }
+    if (_check_node(n.left, lo, n.start - 1) == 0) { return 0; }
+    return _check_node(n.right, n.start + 1, hi);
+}
+
+fn tree_ok(a as *Aspace) as i64 {
+    if (_nil(a.vma_root) == 0 && _nil(a.vma_root.parent) == 0) { return 0; }
+    if (_check_node(a.vma_root, 0, USER_VA_MAX) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    let is *Vma as c with mut = a.vma_head;
+    while (_nil(c) == 0) {
+        if (_nil(c.next) == 0 && (c.next.prev != c || c.next.start < c.end)) { return 0; }
+        k = k + 1;
+        c = c.next;
+    }
+    if (k != a.vma_count) { return 0; }
+    return 1;
 }
 
 // ============================================================
@@ -529,7 +736,11 @@ fn unmap_range_pages(pml4 as i64, os as i64, oe as i64, is_file as i64) as i64 {
 // contain the range (split in two). Only the overlapping pages are decommitted;
 // the surviving VMA halves keep their pages. Returns 1 if anything changed.
 fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
-    let is *Vma as cur with mut = a.vma_head;
+    // The first area that can touch the range: the one holding `start`, or
+    // the one after the gap `start` is in.
+    let is *Vma as cur with mut = _floor(a, start);
+    if (_nil(cur) == 1) { cur = a.vma_head; }
+    else if (cur.end <= start) { cur = cur.next; }
     let is i32 as changed with mut = 0;
     while (cast(i64, cur) != 0) {
         let is i64 as vs = cur.start;
@@ -561,10 +772,12 @@ fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
                         heap.kpool_free(vma_pool, cast(i64, cur));
                     } else {
                         cur.start = end;                // straddles the low end → trim head
+                        vma_moved(a, cur);
                     }
                 } else {
                     if (ve <= end) {
                         cur.end = start;                // straddles the high end → trim tail
+                        vma_moved(a, cur);
                     } else {
                         // range in the middle → split into [vs,start) and [end,ve)
                         let is *Vma as nv = vma_alloc(end, ve, cur.prot, cur.flags);
@@ -576,9 +789,11 @@ fn release_locked(a as *Aspace, start as i64, end as i64) as i32 {
                             if (nv.ko != 0) { kobject.ko_ref(nv.ko); }
                             cur.end = start;
                             vma_insert_sorted(a, nv);
+                            vma_moved(a, cur);
                             a.bookkeeping_bytes = a.bookkeeping_bytes + sizeof(Vma);
                         } else {
                             cur.end = start;            // OOM: keep the head; tail reservation lost
+                            vma_moved(a, cur);
                         }
                     }
                 }
@@ -680,8 +895,8 @@ fn decommit(a as *Aspace, vaddr as i64, len as i64) as i32 {
 fn attach_object(a as *Aspace, va as i64, ko as i64) as i32 {
     if (cast(i64, a) == 0 || ko == 0) { return cast(i32, 0 - 1); }
     lock.acquire(lk_ptr(a));
-    let is *Vma as v with mut = a.vma_head;
-    while (cast(i64, v) != 0) {
+    let is *Vma as v = _floor(a, va);
+    if (_nil(v) == 0) {
         if (v.start == va) {
             if (v.ko == 0) {
                 kobject.ko_ref(ko);
@@ -690,7 +905,6 @@ fn attach_object(a as *Aspace, va as i64, ko as i64) as i32 {
             lock.release(lk_ptr(a));
             return 0;
         }
-        v = v.next;
     }
     lock.release(lk_ptr(a));
     return cast(i32, 0 - 1);

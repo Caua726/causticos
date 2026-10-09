@@ -600,6 +600,127 @@ fn vma_split_smoke() as void {
     else { pmm.panic("split_smoke FAIL", 16); }
 }
 
+// The VMA index against the plain list it replaced. Reserves (no frames) 1500
+// one-page areas scattered over 24576 pages and some four-page ones, splits,
+// trims and removes a share of them, and after each phase checks the tree's
+// own rules (vma.tree_ok) and that find / overlap / first-fit answer exactly
+// what a walk of the sorted list answers, for addresses on and around every
+// boundary.
+fn _lin_find(a as *vma.Aspace, va as i64) as i64 {
+    let is *vma.Vma as c with mut = a.vma_head;
+    while (cast(i64, c) != 0) {
+        if (va >= c.start && va < c.end) { return cast(i64, c); }
+        c = c.next;
+    }
+    return 0;
+}
+
+fn _lin_overlaps(a as *vma.Aspace, s as i64, e as i64) as i64 {
+    let is *vma.Vma as c with mut = a.vma_head;
+    while (cast(i64, c) != 0) {
+        if (s < c.end && c.start < e) { return 1; }
+        c = c.next;
+    }
+    return 0;
+}
+
+fn _lin_free(a as *vma.Aspace, hint as i64, len as i64) as i64 {
+    let is i64 as start with mut = hint;
+    if (start < 4096) { start = 4096; }
+    let is *vma.Vma as c with mut = a.vma_head;
+    while (cast(i64, c) != 0) {
+        if (start + len <= c.start) { return start; }
+        if (c.end > start) { start = c.end; }
+        c = c.next;
+    }
+    if (start + len <= vma.USER_VA_MAX) { return start; }
+    return 0 - 1;
+}
+
+fn _vma_agree(a as *vma.Aspace) as i32 {
+    if (vma.tree_ok(a) != 1) { serial.println("userspace.vmatree_smoke: tree rules broken", 42); return cast(i32, 0); }
+    let is i64 as P = 4096;
+    let is i64 as va with mut = 0;
+    while (va < 25000 * P) {
+        if (cast(i64, vma.vma_find(a, va)) != _lin_find(a, va)) { return cast(i32, 0); }
+        if (cast(i64, vma.vma_find(a, va + P - 1)) != _lin_find(a, va + P - 1)) { return cast(i32, 0); }
+        let is i64 as span with mut = 1;
+        while (span <= 5) {
+            if (cast(i64, vma.vma_range_overlaps(a, va, va + span * P)) != _lin_overlaps(a, va, va + span * P)) {
+                return cast(i32, 0);
+            }
+            if (vma.vma_find_free_va(a, va, span * P) != _lin_free(a, va, span * P)) { return cast(i32, 0); }
+            span = span + 2;
+        }
+        va = va + 7 * P;
+    }
+    return cast(i32, 1);
+}
+
+fn _vt_fail(what as *u8, n as i64) as i32 {
+    serial.print("userspace.vmatree_smoke: FAIL ", 30);
+    serial.println(what, n);
+    return cast(i32, 0);
+}
+
+fn vma_tree_smoke() as void {
+    serial.println("userspace.vmatree_smoke: start", 30);
+    let is i32 as ok with mut = cast(i32, 1);
+    let is *vma.Aspace as a = vma.aspace_create();
+    if (cast(i64, a) == 0) { pmm.panic("vmatree_smoke: aspace FAIL", 26); }
+    let is i64 as P = 4096;
+    let is i64 as pr = vma.PROT_USER | vma.PROT_WRITE | vma.PROT_NX;
+    let is i64 as i with mut = 0;
+    while (i < 1500) {
+        // 7919 is odd, so i -> i*7919 mod 8192 never repeats: 1500 distinct
+        // slots three pages apart, inserted in no particular order.
+        let is i64 as at = P * (1 + ((i * 7919) % 8192) * 3);
+        if (vma.reserve(a, at, P, pr, vma.VMA_FIXED) != at) { ok = _vt_fail("fixed reserve", 13); }
+        i = i + 1;
+    }
+    // Four-page areas above, to split and trim.
+    i = 0;
+    while (i < 40) {
+        let is i64 as at = P * (24700 + i * 6);
+        if (vma.reserve(a, at, 4 * P, pr, vma.VMA_FIXED) != at) { ok = _vt_fail("fixed 4-page reserve", 20); }
+        i = i + 1;
+    }
+    if (a.vma_count != 1540) { ok = _vt_fail("count after reserves", 20); }
+    if (_vma_agree(a) != cast(i32, 1)) { ok = _vt_fail("answers after reserves", 22); }
+    // A fixed area over an existing one (i = 0's, at one page) is refused.
+    if (vma.reserve(a, P, P, pr, vma.VMA_FIXED) != 0 - 1) { ok = _vt_fail("overlap accepted", 16); }
+
+    // Remove every third one-page area, split, trim heads and tails.
+    i = 0;
+    while (i < 1500) {
+        if (i % 3 == 0) { vma.munmap(a, P * (1 + ((i * 7919) % 8192) * 3), P); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 40) {
+        let is i64 as at = P * (24700 + i * 6);
+        if (i % 4 == 0) { vma.munmap(a, at + P, P); }            // split in two
+        else if (i % 4 == 1) { vma.munmap(a, at, P); }           // trim the head
+        else if (i % 4 == 2) { vma.munmap(a, at + 3 * P, P); }   // trim the tail
+        else { vma.munmap(a, at, 4 * P); }                      // remove
+        i = i + 1;
+    }
+    if (_vma_agree(a) != cast(i32, 1)) { ok = _vt_fail("answers after unmaps", 20); }
+
+    // First fit fills the holes it finds, lowest first, and the tree keeps up.
+    i = 0;
+    while (i < 300) {
+        let is i64 as want = _lin_free(a, P, P);
+        if (vma.reserve(a, P, P, pr, 0) != want) { ok = _vt_fail("first fit", 9); }
+        i = i + 1;
+    }
+    if (_vma_agree(a) != cast(i32, 1)) { ok = _vt_fail("answers after first fits", 24); }
+
+    vma.aspace_destroy(a);
+    if (ok == cast(i32, 1)) { serial.println("userspace.vmatree_smoke: PASS", 29); }
+    else { pmm.panic("vmatree_smoke FAIL", 18); }
+}
+
 // A ring-3 child that attaches an INHERITED segment fd (fd 0, handed over via
 // the fdacts handoff at spawn) and exits with the byte it reads from the shared
 // memory. mmap_fd(fd=0) -> ko_mmap -> seg_attach; the kernel wrote a sentinel
@@ -4008,6 +4129,7 @@ fn smoke_init() as void {
     spawn_user_fault_smoke();
     vma_strict_smoke();
     vma_split_smoke();
+    vma_tree_smoke();
     spawn_user_reserve_fault_smoke();
     spawn_user_commit_chunk_smoke();
     fd_table_smoke();

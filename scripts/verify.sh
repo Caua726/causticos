@@ -129,6 +129,7 @@ SMOKE_MARKERS=(
     'random_smoke: PASS'
     'surface_smoke: PASS'
     'vfswatch_smoke: PASS'
+    'userspace.vmatree_smoke: PASS'
     'dummy.dma: PASS'
     'dummy.portio: PASS'
     'dummy.memory: PASS'
