@@ -14,6 +14,7 @@ use "../lib/wmproto/wmproto.cst" as wmp;
 use "../lib/compo_proto/compo_proto.cst" as cp;
 use "../lib/keymap/keysym.cst" as ks;
 use "std/os/causticos.cst" as sys;
+use "../lib/tz/tz.cst" as tz;
 
 let is i64 as MENU_COLS with imut = 22;
 let is i64 as MENU_ROWS_MAX with imut = 64;
@@ -93,6 +94,7 @@ fn _rows() as i64 {
         return limit;
     }
     if (s.context_kind == 1) { return 4; }
+    if (s.context_kind == 3) { return _cal_rows(); }
     return 2;
 }
 
@@ -111,6 +113,153 @@ fn _switcher_sync() as void {
     if (s.context_switch_offset < 0) { s.context_switch_offset = 0; }
     s.context_hover = index - s.context_switch_offset;
     if (s.context_hover < 0 || s.context_hover >= rows) { s.context_hover = 0; }
+    return;
+}
+
+// ---- the clock's calendar (kind 3) -----------------------------------------
+// The date and the zone the clock shows, this month with today marked, and a
+// row that opens `timezone` in a terminal to choose another zone.
+let is tz.Local as cal with mut;
+let is i64 as cal_ok with mut = 0;
+
+fn _cal_refresh() as void {
+    let is i64 as t = tz.now_epoch();
+    if (t < 0) { cal_ok = 0; return; }
+    tz.at(&dec.zone, t, &cal);
+    cal_ok = 1;
+    return;
+}
+
+fn _cal_mlen() as i64 {
+    let is i64 as m = cal.month;
+    let is i64 as y = cal.year;
+    if (m == 2) {
+        if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) { return 29; }
+        return 28;
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+    return 31;
+}
+
+// Weekday (0 = Sunday) of the first of this month.
+fn _cal_first() as i64 { return (cal.wday + 35 - (cal.day - 1) % 7) % 7; }
+
+fn _cal_weeks() as i64 { return (_cal_first() + _cal_mlen() + 6) / 7; }
+
+// Date, zone, offset, weekday names, the weeks, and the action row.
+fn _cal_rows() as i64 {
+    if (cal_ok == 0) { return 2; }
+    return 4 + _cal_weeks() + 1;
+}
+
+fn _wname(w as i64) as *u8 {
+    if (w == 0) { return "Sun"; } if (w == 1) { return "Mon"; } if (w == 2) { return "Tue"; }
+    if (w == 3) { return "Wed"; } if (w == 4) { return "Thu"; } if (w == 5) { return "Fri"; }
+    return "Sat";
+}
+
+fn _mname(m as i64) as *u8 {
+    if (m == 1) { return "Jan"; } if (m == 2) { return "Feb"; } if (m == 3) { return "Mar"; }
+    if (m == 4) { return "Apr"; } if (m == 5) { return "May"; } if (m == 6) { return "Jun"; }
+    if (m == 7) { return "Jul"; } if (m == 8) { return "Aug"; } if (m == 9) { return "Sep"; }
+    if (m == 10) { return "Oct"; } if (m == 11) { return "Nov"; }
+    return "Dec";
+}
+
+let is [32]u8 as cal_buf with mut;
+let is i64 as cal_n with mut = 0;
+
+fn _cal_s(t as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (t[i] != cast(u8, 0) && cal_n < 31) { cal_buf[cal_n] = t[i]; cal_n = cal_n + 1; i = i + 1; }
+}
+
+// v in decimal; at least `width` digits, padded with pad (48 '0', 32 ' ').
+fn _cal_num(v as i64, width as i64, pad as i64) as void {
+    let is [8]u8 as d;
+    let is i64 as k with mut = 0;
+    let is i64 as x with mut = v;
+    if (x == 0) { d[0] = cast(u8, 48); k = 1; }
+    while (x > 0 && k < 8) { d[k] = cast(u8, 48 + x % 10); x = x / 10; k = k + 1; }
+    while (k < width && k < 8) { d[k] = cast(u8, pad); k = k + 1; }
+    while (k > 0 && cal_n < 31) { k = k - 1; cal_buf[cal_n] = d[k]; cal_n = cal_n + 1; }
+}
+
+fn _cal_put(row as i64, col as i64, fg as i64, bg as i64) as void {
+    dec.cells_utf8(s.context_dec_base, row * MENU_COLS + col, MENU_COLS - col,
+                   cast(*u8, &cal_buf[0]), cal_n, fg, bg);
+    cal_n = 0;
+}
+
+fn _paint_calendar(rows as i64) as void {
+    let is i64 as last = rows - 1;
+    if (cal_ok == 0) {
+        _cal_s("No clock to read"); _cal_put(0, 1, s.COL_TEXT, s.COL_TITLE_U);
+    } else {
+        // "Fri 9 Oct 2026 14:16"
+        _cal_s(_wname(cal.wday)); _cal_s(" "); _cal_num(cal.day, 1, 32); _cal_s(" ");
+        _cal_s(_mname(cal.month)); _cal_s(" "); _cal_num(cal.year, 4, 48); _cal_s(" ");
+        _cal_num(cal.hour, 2, 48); _cal_s(":"); _cal_num(cal.min, 2, 48);
+        _cal_put(0, 1, s.COL_TEXT, s.COL_TITLE_U);
+        dec.cells_utf8(s.context_dec_base, MENU_COLS + 1, MENU_COLS - 2,
+                       tz.name_ptr(&dec.zone), tz.name_len(&dec.zone), s.COL_BAR_DIM, s.COL_TITLE_U);
+        // "UTC-03:00  -03"
+        let is [12]u8 as off;
+        let is i64 as on = tz.fmt_offset(cal.utoff, 1, cast(*u8, &off[0]));
+        _cal_s("UTC");
+        let is i64 as i with mut = 0;
+        while (i < on && cal_n < 31) { cal_buf[cal_n] = off[i]; cal_n = cal_n + 1; i = i + 1; }
+        _cal_s("  ");
+        i = 0;
+        while (i < cal.abbr_len && cal_n < 31) { cal_buf[cal_n] = cal.abbr[i]; cal_n = cal_n + 1; i = i + 1; }
+        _cal_put(2, 1, s.COL_BAR_DIM, s.COL_TITLE_U);
+        _cal_s("Su Mo Tu We Th Fr Sa"); _cal_put(3, 1, s.COL_BAR_DIM, s.COL_TITLE_U);
+        let is i64 as first = _cal_first();
+        let is i64 as n = _cal_mlen();
+        let is i64 as d with mut = 1;
+        while (d <= n) {
+            let is i64 as pos = first + d - 1;
+            let is i64 as fg with mut = s.COL_TEXT;
+            let is i64 as bg with mut = s.COL_TITLE_U;
+            if (d == cal.day) { fg = s.COL_BAR; bg = s.COL_BORDER_F; }
+            _cal_num(d, 2, 32);
+            dec.cells_utf8(s.context_dec_base, (4 + pos / 7) * MENU_COLS + 1 + (pos % 7) * 3, 2,
+                           cast(*u8, &cal_buf[0]), 2, fg, bg);
+            cal_n = 0;
+            d = d + 1;
+        }
+    }
+    let is i64 as abg with mut = s.COL_TITLE_U;
+    if (s.context_hover == last) { abg = s.COL_TITLE_F; }
+    _cal_s("Change time zone"); _cal_put(last, 2, s.COL_TEXT, abg);
+    return;
+}
+
+// Click on the clock: the calendar, above it. A second click anywhere outside
+// closes it, as any popup.
+fn clock_open() as void {
+    _cal_refresh();
+    s.context_kind = 3;
+    s.context_target = 0 - 1;
+    s.context_hover = 0 - 1;
+    s.context_press = 0 - 1;
+    s.context_capture = 0;
+    s.context_open = 1;
+    s.context_dirty = 1;
+    s.context_paint_dirty = 1;
+    _position(s.scr_w, s.scr_h);
+    s.deco_dirty = 1;
+    dmg.dmg_taskbar();
+    return;
+}
+
+// Once a second with the clock: the time on the first row moves, and so does
+// the month at midnight on the last day, with a different number of weeks.
+fn clock_tick() as void {
+    if (s.context_open == 0 || s.context_kind != 3) { return; }
+    _cal_refresh();
+    _position(s.scr_w, s.scr_h);
+    s.context_paint_dirty = 1;
     return;
 }
 
@@ -156,7 +305,7 @@ fn _paint() as void {
                 dec.cells_utf8(s.context_dec_base, r * MENU_COLS + text_col, text_width,
                                cast(*u8, &label[0]), len, fg, bg);
             }
-        } else {
+        } else if (s.context_kind != 3) {
             let is *u8 as label with mut = cast(*u8, "Open Apps");
             let is i64 as len with mut = 9;
             if (s.context_kind == 0) {
@@ -187,6 +336,7 @@ fn _paint() as void {
         }
         r = r + 1;
     }
+    if (s.context_kind == 3) { _paint_calendar(rows); }
     s.context_paint_dirty = 0;
     dmg.dmg_add(s.context_x, s.context_y, s.context_w, s.context_h);
     return;
@@ -312,6 +462,8 @@ fn close() as void {
     s.context_press = 0 - 1;
     s.context_capture = 0;
     s.context_dirty = 1;
+    // The clock is lit while its calendar is open.
+    if (s.context_kind == 3) { s.deco_dirty = 1; dmg.dmg_taskbar(); }
     return;
 }
 
@@ -324,7 +476,9 @@ fn _row_at(x as i64, y as i64) as i64 {
 }
 
 fn hover_at(x as i64, y as i64) as void {
-    let is i64 as row = _row_at(x, y);
+    let is i64 as row with mut = _row_at(x, y);
+    // In the calendar only the last row does anything.
+    if (s.context_kind == 3 && row != _rows() - 1) { row = 0 - 1; }
     if (row != s.context_hover) { s.context_hover = row; s.context_paint_dirty = 1; }
     return;
 }
@@ -339,6 +493,13 @@ fn pointer_press() as void {
 fn _activate(row as i64) as void {
     let is i64 as kind = s.context_kind;
     let is i64 as target = s.context_target;
+    if (kind == 3) {
+        // A day is not a button; only "Change time zone" acts.
+        if (row != _rows() - 1) { return; }
+        close();
+        cli.spawn_named(cast(*u8, "timezone.cse"), 12);
+        return;
+    }
     if (kind == 2) {
         let is i64 as candidate = _switcher_window_at(s.context_switch_offset + row);
         close();
@@ -380,6 +541,16 @@ fn pointer_release() as void {
 
 fn key_handle(keysym as i64, pressed as i64) as void {
     if (s.context_open == 0 || pressed != 1) { return; }
+    if (s.context_kind == 3) {
+        if (keysym == ks.KEY_ESC) { close(); return; }
+        if (keysym == ks.KEY_UP || keysym == ks.KEY_DOWN) {
+            s.context_hover = _rows() - 1;
+            s.context_paint_dirty = 1;
+            return;
+        }
+        if (keysym == ks.KEY_ENTER && s.context_hover == _rows() - 1) { _activate(s.context_hover); }
+        return;
+    }
     if (s.context_kind == 2) {
         if (keysym == ks.KEY_ESC || keysym == ks.KEY_ENTER) { close(); return; }
         if (keysym == ks.KEY_UP || keysym == ks.KEY_DOWN) {

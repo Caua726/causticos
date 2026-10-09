@@ -283,7 +283,10 @@ The taskbar clock shows `HH:MM:SS` and the zone's abbreviation (`UTC`, `-03`,
 `BST`) and follows a change within a second; the compositor's night light
 follows the same local hour. `date` prints local time with the abbreviation,
 `date -u` prints UTC, and `+FORMAT` adds `%z` and `%Z`; `%s` stays the instant.
-`ls -l` shows write times in the chosen zone.
+`ls -l` shows write times in the chosen zone. Clicking the clock opens a
+calendar of the current month with today marked, the zone and its offset;
+its "Change time zone" row opens `timezone` in a terminal. A click elsewhere
+or Esc closes it.
 
 The database is IANA tzdata, compiled to TZif by `scripts/update-tzdata.sh`
 into `userspace/lib/tz/zoneinfo` and shipped as `/etc/zoneinfo`; daylight
