@@ -16,6 +16,10 @@
 dir  /lib
 file userspace/build/libbase.csl   /lib/libbase.csl
 
+# /dev: where the kernel's device nodes are (kernel/fs/devfs.cst: null). The
+# kernel mounts them over this directory, which is here so `ls /` shows it.
+dir  /dev
+
 # text/file tools
 bin  cat
 bin  echo

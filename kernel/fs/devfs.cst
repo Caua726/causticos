@@ -1,0 +1,175 @@
+// devfs.cst — /dev: the device nodes every program may count on.
+//
+// One node today, null: it reads as empty and takes any write whole, so
+// `cmd > /dev/null` throws the output away and `cmd < /dev/null` gives a
+// program an input that ends at once. There was no /dev at all, and the
+// first was "/dev/null: cannot open (redirect): no such file or directory" —
+// the command did not run.
+//
+// The namespace is a VFS mount like any other (stat, readdir, cd and ls see
+// it), with every change refused: the nodes are the kernel's. Opening a node
+// is not a VfsFile: sys_open asks open_node first, and a node is a
+// KOBJ_DEVICE of its own, so writing to null takes neither the filesystem
+// lock nor the write-behind buffer a real file uses.
+use "vfs.cst"     as vfs;
+use "kobject.cst" as kobject;
+use "abi.cst"     as abi;
+use "serial.cst"  as serial;
+
+// What resolve hands the VFS as a node's "first cluster": an id, nothing on
+// any disk.
+let is i64 as ID_ROOT with imut = 1;
+let is i64 as ID_NULL with imut = 2;
+
+// The node `path` names (FS-relative: "/" or "/null"), or 0.
+fn _node(path as *u8, path_len as i64) as i64 {
+    if (path_len == 1 && path[0] == cast(u8, 47)) { return ID_ROOT; }
+    if (path_len == 5 && path[0] == cast(u8, 47) && path[1] == cast(u8, 110) && path[2] == cast(u8, 117)
+        && path[3] == cast(u8, 108) && path[4] == cast(u8, 108)) { return ID_NULL; }
+    return 0;
+}
+
+fn _attr(id as i64) as i32 {
+    if (id == ID_ROOT) { return vfs.ATTR_DIR; }
+    return vfs.ATTR_FILE;
+}
+
+fn op_resolve(priv as *u8, path as *u8, path_len as i64,
+              out_parent as *i64, out_first as *i64, out_size as *i64, out_attr as *i32,
+              out_ent_cluster as *i64, out_ent_off as *i64) as i32 {
+    let is i64 as id = _node(path, path_len);
+    if (id == 0) { return vfs.VFS_ENOENT; }
+    *out_parent = ID_ROOT;
+    *out_first = id;
+    *out_size = 0;
+    *out_attr = _attr(id);
+    *out_ent_cluster = 0;
+    *out_ent_off = 0;
+    return 0;
+}
+
+fn op_stat(priv as *u8, path as *u8, path_len as i64, out as *vfs.VfsStat) as i32 {
+    let is i64 as id = _node(path, path_len);
+    if (id == 0) { return vfs.VFS_ENOENT; }
+    out.size = 0;
+    out.first_cluster = id;
+    out.attr = cast(i64, _attr(id));
+    out.is_dir = 0;
+    if (id == ID_ROOT) { out.is_dir = 1; }
+    return 0;
+}
+
+// No time is kept for a node: mtime 0, as for a mount root.
+fn op_statx(priv as *u8, path as *u8, path_len as i64, out as *abi.Statx) as i32 {
+    let is i64 as id = _node(path, path_len);
+    if (id == 0) { return vfs.VFS_ENOENT; }
+    out.size = 0;
+    out.first_cluster = id;
+    out.attr = cast(i64, _attr(id));
+    out.is_dir = 0;
+    if (id == ID_ROOT) { out.is_dir = 1; }
+    out.mtime = 0;
+    return 0;
+}
+
+// A node's bytes never go through the VFS (open_node), so nothing is ever
+// there to read or write by cluster.
+fn op_read(priv as *u8, first as i64, size as i64, off as i64, dst as *u8, n as i64, h as *i64) as i64 {
+    return 0;
+}
+
+fn op_write_at(priv as *u8, first as i64, size as i64, off as i64, src as *u8, n as i64,
+               out_first as *i64, h as *i64) as i64 {
+    return cast(i64, vfs.VFS_EACCES);
+}
+
+fn op_truncate(priv as *u8, first as i64, size as i64, new_size as i64, out_first as *i64) as i32 {
+    return vfs.VFS_EACCES;
+}
+
+fn op_update_entry(priv as *u8, ent_cluster as i64, ent_off as i64, first as i64, size as i64) as i32 {
+    return vfs.VFS_EACCES;
+}
+
+// The nodes are the kernel's: none is made, removed or renamed from outside.
+fn op_create(priv as *u8, path as *u8, path_len as i64) as i32 { return vfs.VFS_EACCES; }
+fn op_unlink(priv as *u8, path as *u8, path_len as i64) as i32 { return vfs.VFS_EACCES; }
+fn op_mkdir(priv as *u8, path as *u8, path_len as i64) as i32 { return vfs.VFS_EACCES; }
+fn op_rmdir(priv as *u8, path as *u8, path_len as i64) as i32 { return vfs.VFS_EACCES; }
+fn op_rename(priv as *u8, src as *u8, src_len as i64, dst as *u8, dst_len as i64) as i32 {
+    return vfs.VFS_EACCES;
+}
+
+// The root's entries: null, then the end.
+fn op_readdir(priv as *u8, dir as i64, idx as i64, name_buf as *u8, name_cap as i64,
+              out as *vfs.ReaddirOut) as i32 {
+    if (dir != ID_ROOT) { return vfs.VFS_ENOTDIR; }
+    if (idx != 0) { return vfs.VFS_ENOENT; }
+    if (name_cap < 5) { return vfs.VFS_EINVAL; }
+    name_buf[0] = cast(u8, 110); name_buf[1] = cast(u8, 117);
+    name_buf[2] = cast(u8, 108); name_buf[3] = cast(u8, 108);
+    name_buf[4] = cast(u8, 0);
+    out.name_len = 4;
+    out.attr = cast(i64, vfs.ATTR_FILE);
+    out.first_cluster = ID_NULL;
+    out.size = 0;
+    return 0;
+}
+
+let is vfs.FileSystemOps as OPS with mut;
+
+// ---- null ---------------------------------------------------------------
+// Reads end at once; a write takes all of it; seeking stays at 0. It never
+// blocks, so it has no poll op: always ready (kobject.ko_poll).
+
+fn null_read(priv as i64, buf as i64, n as i64) as i64 { return 0; }
+fn null_write(priv as i64, buf as i64, n as i64) as i64 { return n; }
+fn null_close(priv as i64) as i64 { return abi.E_OK; }
+fn null_lseek(priv as i64, off as i64, whence as i64) as i64 { return 0; }
+
+let is kobject.KObjectOps as NULL_OPS with mut;
+
+fn init() as void {
+    OPS.resolve      = fn_ptr(op_resolve);
+    OPS.stat         = fn_ptr(op_stat);
+    OPS.statx        = fn_ptr(op_statx);
+    OPS.read         = fn_ptr(op_read);
+    OPS.write_at     = fn_ptr(op_write_at);
+    OPS.truncate     = fn_ptr(op_truncate);
+    OPS.update_entry = fn_ptr(op_update_entry);
+    OPS.create       = fn_ptr(op_create);
+    OPS.unlink       = fn_ptr(op_unlink);
+    OPS.mkdir        = fn_ptr(op_mkdir);
+    OPS.rmdir        = fn_ptr(op_rmdir);
+    OPS.rename       = fn_ptr(op_rename);
+    OPS.readdir      = fn_ptr(op_readdir);
+    NULL_OPS.read  = fn_ptr(null_read);
+    NULL_OPS.write = fn_ptr(null_write);
+    NULL_OPS.close = fn_ptr(null_close);
+    NULL_OPS.lseek = fn_ptr(null_lseek);
+    let is i32 as rc = vfs.mount(cast(*u8, "/dev"), 4, &OPS, cast(*u8, 0));
+    if (rc != 0) { serial.println("devfs: /dev could not be mounted", 32); }
+    return;
+}
+
+// open_node — the object behind the device node an absolute `path` names, as
+// sys_open has it. 0 with *out_ko set to the KOBJ_DEVICE, or to 0 when the
+// path is no node — /dev itself included, a directory the VFS opens for
+// readdir — and the VFS is to open it. A negative errno on failure.
+//
+// The object comes back through out_ko and NOT as the return value: it is a
+// kernel pointer, so in the top half of the address space it is negative as
+// an i64, and a caller reading the sign would take a good object for an
+// error. (It did: /dev/null would not open.)
+fn open_node(path as *u8, path_len as i64, out_ko as *i64) as i64 {
+    *out_ko = 0;
+    let is i64 as off with mut = 0;
+    let is *vfs.VfsMount as m = vfs.resolve_mount(path, path_len, &off);
+    if (cast(i64, m) == 0 || cast(i64, m.ops) != cast(i64, &OPS)) { return 0; }
+    let is i64 as id = _node(cast(*u8, cast(i64, path) + off), path_len - off);
+    if (id != ID_NULL) { return 0; }
+    let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &NULL_OPS, ID_NULL);
+    if (ko == 0) { return abi.E_NOMEM; }
+    *out_ko = ko;
+    return 0;
+}

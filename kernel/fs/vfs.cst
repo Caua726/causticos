@@ -67,6 +67,10 @@ let is i32 as VFS_EXDEV     = cast(i32, 0 - 18);
 // A live process was loaded from this file. Same number Linux gives ETXTBSY,
 // and the same reason: its text is executing out of pages the kernel holds.
 let is i32 as VFS_ETXTBSY   = cast(i32, 0 - 26);
+// Not the caller's to change: a node of /dev (devfs.cst), which the kernel
+// owns. Linux's EACCES; -1 would collide with the legacy -1 fat32 adapters
+// still return for a volume that is not there.
+let is i32 as VFS_EACCES    = cast(i32, 0 - 13);
 
 // ============================================================
 // open() flags (POSIX-ish). Bitmask.
@@ -867,6 +871,7 @@ fn err_to_abi(rc as i64) as i64 {
     if (rc == cast(i64, VFS_EIO))       { return abi.E_IO; }
     if (rc == cast(i64, VFS_ENOMEM))    { return abi.E_NOMEM; }
     if (rc == cast(i64, VFS_ETXTBSY))   { return abi.E_TXTBSY; }
+    if (rc == cast(i64, VFS_EACCES))    { return abi.E_PERM; }
     return abi.E_INVAL;
 }
 
@@ -1396,15 +1401,26 @@ fn self_test() as void {
 // racing the AHCI bind for cpus (which stretched boot past the verify
 // window under smp 4). Pure tooling — production has no smoke thread.
 let is i64 as boot_selftest_done with mut = 0;
-// Boot readiness = the root filesystem is MOUNTED, not that the dev self-test
+// Boot readiness = the ROOT filesystem is MOUNTED, not that the dev self-test
 // finished. Gating the production boot on boot_selftest_done made init wait the
 // full 12 s timeout whenever the self-test was slow or failed (e.g. a hello.txt
 // size mismatch), even though the disk mounts in ~0.6 s. The self-test still
 // runs in parallel on its own thread — it just no longer holds up /init.
-fn boot_ready() as i64 {
-    if (cast(i64, mount_head()) != 0) { return 1; }
+//
+// It is the root SPECIFICALLY, not any mount: /dev is the kernel's own and is
+// mounted from the start (devfs), so "some mount exists" became true before the
+// disk was there — the boot ran with no root at all and said "/init.cse open
+// FAIL" on a machine whose disk was about to mount.
+fn root_mounted() as i64 {
+    let is *VfsMount as m with mut = mount_head();
+    while (cast(i64, m) != 0) {
+        if (m.path_len == 1 && m.path[0] == cast(u8, 47)) { return 1; }
+        m = m.next;
+    }
     return 0;
 }
+
+fn boot_ready() as i64 { return root_mounted(); }
 
 // Maximum wait for a VFS mount. Budget includes fat32.mount_thread's
 // own wait for storage (5 s) + the FS self-test matrix + the actual
@@ -1417,7 +1433,7 @@ let is i64 as VFS_MOUNT_WAIT_NS = 30000000000;
 // which in turn publishes the mount.
 fn self_test_thread() as void {
     let is i64 as deadline = timer.current_time_ns() + VFS_MOUNT_WAIT_NS;
-    while (cast(i64, mount_head()) == 0 && timer.current_time_ns() < deadline) {
+    while (root_mounted() == 0 && timer.current_time_ns() < deadline) {
         // sleep_for_ns instead of yield_cpu so QOS_NORMAL test threads
         // sharing this cpu (B in main.cst) get a chance to run while
         // the mount publishes. Yielding inside QOS_ACTIVE just re-picks
