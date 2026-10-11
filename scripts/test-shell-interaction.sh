@@ -76,6 +76,7 @@ key_of() {
         '/') printf 'slash' ;;
         '.') printf 'dot' ;;
         '>') printf 'shift-dot' ;;
+        '<') printf 'shift-comma' ;;
         '&') printf 'shift-7' ;;
         '|') printf 'shift-backslash' ;;
         *) echo "no QEMU key name for '$1'" >&2; return 1 ;;
@@ -271,6 +272,31 @@ wait_for_file_match cat-missing.out '^cat: /definitely-not-a-file: no such file 
 guest_file_is_exact 'cat: /definitely-not-a-file: no such file or directory\n' \
     || fail "redirected program error contained ANSI or extra output"
 echo "interaction: redirected program errors stay uncolored"
+
+# '2>' is stderr to a FILE, and the command is given no extra word. Split on
+# '>', "2" became an argument — the error message named it — and stdout, not
+# stderr, was the stream redirected.
+type_line 'ls /definitely-not-a-file 2> /stderr-only.out'
+wait_for_file_match stderr-only.out '^ls: cannot access' \
+    || fail "2> did not send stderr to the file"
+"$PY" -c 'import pathlib, sys; b = pathlib.Path(sys.argv[1]).read_bytes(); want = b"ls: cannot access \x27/definitely-not-a-file\x27: no such file or directory\n"; raise SystemExit(0 if b == want else 1)' "$GOT" \
+    || fail "2> gave the command an extra argument or wrote the wrong stream"
+echo "interaction: 2> redirects stderr and adds no argument"
+type_line 'echo kept-on-stdout 2> /stderr-empty.out'
+type_line 'wc -c < /stderr-empty.out > /stderr-empty-size.out'
+wait_for_file_match stderr-empty-size.out '^0$' \
+    || fail "2> took stdout with it, or created no file"
+type_line 'echo stdout-check > /stdout-check.out'
+wait_for_file_match stdout-check.out '^stdout-check' \
+    || fail "the shell stopped running commands after 2>"
+echo "interaction: 2> leaves stdout alone"
+type_line 'ls / 1> /one-out.out'
+wait_for_file_match one-out.out '^[a-z0-9]' \
+    || fail "1> did not redirect stdout"
+type_line 'cat 0< /hello.txt > /zero-in.out'
+wait_for_file_match zero-in.out '^ola do CausticOS' \
+    || fail "0< did not redirect stdin from the file"
+echo "interaction: 1> and 0< work as > and <"
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '^5$' \
     || fail "pipeline did not deliver an unpadded five-byte count to wc -c"

@@ -48,6 +48,9 @@ struct Cmd {
     out_w as i64;       // word index of a '>' / '>>' target, or -1
     append as i64;      // 1 when the redirect was '>>'
     err_to_out as i64;  // 1 when '2>&1' was seen
+    out_to_err as i64;  // 1 when '1>&2' was seen
+    err_w as i64;       // word index of a '2>' / '2>>' target, or -1
+    err_append as i64;  // 1 when the stderr redirect was '2>>'
 }
 
 let is grow.Grow as cmd_g with mut;
@@ -707,6 +710,44 @@ fn tokenise(src as *u8, len as i64) as i64 {
                 wfill = wfill + 4;
                 _wpush(o, 4, 1);
                 i = i + 4;
+            } else if (c == 50 && i + 1 < len && src[i+1] == cast(u8, 62)) {
+                // "2>" / "2>>": stderr to a file. Split on '>', it became the
+                // ARGUMENT "2" and a redirect of stdout — the command was given
+                // a word it never asked for, and its errors went to the screen
+                // while its output went to the file.
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 50); wbuf[wfill+1] = cast(u8, 62); wfill = wfill + 2;
+                let is i64 as wl with mut = 2;
+                if (i + 2 < len && src[i+2] == cast(u8, 62)) {
+                    wbuf[wfill] = cast(u8, 62); wfill = wfill + 1; wl = 3; i = i + 1;
+                }
+                _wpush(o, wl, 1);
+                i = i + 2;
+            } else if (c == 49 && i + 3 < len && src[i+1] == cast(u8, 62)
+                       && src[i+2] == cast(u8, 38) && src[i+3] == cast(u8, 50)) {
+                // "1>&2": stdout where stderr goes.
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 49); wbuf[wfill+1] = cast(u8, 62);
+                wbuf[wfill+2] = cast(u8, 38); wbuf[wfill+3] = cast(u8, 50);
+                wfill = wfill + 4;
+                _wpush(o, 4, 1);
+                i = i + 4;
+            } else if (c == 49 && i + 1 < len && src[i+1] == cast(u8, 62)) {
+                // "1>" / "1>>": the plain stdout redirect, said with its number.
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 62); wfill = wfill + 1;
+                let is i64 as wl with mut = 1;
+                if (i + 2 < len && src[i+2] == cast(u8, 62)) {
+                    wbuf[wfill] = cast(u8, 62); wfill = wfill + 1; wl = 2; i = i + 1;
+                }
+                _wpush(o, wl, 1);
+                i = i + 2;
+            } else if (c == 48 && i + 1 < len && src[i+1] == cast(u8, 60)) {
+                // "0<": the plain stdin redirect, said with its number.
+                let is i64 as o = wfill;
+                wbuf[wfill] = cast(u8, 60); wfill = wfill + 1;
+                _wpush(o, 1, 1);
+                i = i + 2;
             } else if (c == 62) {                              // '>' or '>>'
                 let is i64 as o = wfill;
                 wbuf[wfill] = cast(u8, 62); wfill = wfill + 1;
@@ -886,6 +927,9 @@ fn build_cmds() as i64 {
             cm.out_w = 0 - 1;
             cm.append = 0;
             cm.err_to_out = 0;
+            cm.out_to_err = 0;
+            cm.err_w = 0 - 1;
+            cm.err_append = 0;
             ncmd = ncmd + 1;
             start = w + 1;
         }
@@ -916,12 +960,27 @@ fn build_cmds() as i64 {
                        && cast(i64, rp[2]) == 38
                        && cast(i64, rp[3]) == 49) {  // "2>&1"
                 cc.err_to_out = 1; rd = rd + 1;
+            } else if (w_len[rd] == 4 && cast(i64, rp[0]) == 49
+                       && cast(i64, rp[1]) == 62
+                       && cast(i64, rp[2]) == 38
+                       && cast(i64, rp[3]) == 50) {  // "1>&2"
+                cc.out_to_err = 1; rd = rd + 1;
+            } else if (w_len[rd] == 2 && cast(i64, rp[0]) == 50
+                                      && cast(i64, rp[1]) == 62) { // "2>"
+                if (rd + 1 >= end) { return 0 - 2; }
+                cc.err_w = rd + 1; cc.err_append = 0; rd = rd + 2;
+            } else if (w_len[rd] == 3 && cast(i64, rp[0]) == 50
+                                      && cast(i64, rp[1]) == 62
+                                      && cast(i64, rp[2]) == 62) { // "2>>"
+                if (rd + 1 >= end) { return 0 - 2; }
+                cc.err_w = rd + 1; cc.err_append = 1; rd = rd + 2;
             } else {
                 w_off[wr] = w_off[rd]; w_len[wr] = w_len[rd]; w_quoted[wr] = w_quoted[rd];
                 // A redirect target moved down with the words; keep the index
                 // pointing at the same word after compaction.
                 if (cc.in_w == rd)  { cc.in_w = wr; }
                 if (cc.out_w == rd) { cc.out_w = wr; }
+                if (cc.err_w == rd) { cc.err_w = wr; }
                 wr = wr + 1; rd = rd + 1;
             }
         }
@@ -1228,6 +1287,19 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     }
                 }
 
+                // The stage's stderr, when the line named a file for it
+                // ('2> f'). Opened like any redirect, and given to fd 2 below
+                // instead of the job's error channel.
+                let is i64 as err_file with mut = 0 - 1;
+                if (failed == 0 && cc.err_w >= 0) {
+                    if (cc.err_append == 1) { err_file = _open_redirect(cc.err_w, 2); }
+                    else { err_file = _open_redirect(cc.err_w, 1); }
+                    if (err_file < 0) {
+                        failed = 2; fail_errno = err_file;
+                        _set_fail_word(word_ptr(cc.err_w), word_len(cc.err_w));
+                    }
+                }
+
                 // argv: {pointer, length} for every word of the stage, in a
                 // table that grows with them. The kernel takes ARGV_MAX bytes
                 // of arguments and says E_2BIG past it, which is reported.
@@ -1244,15 +1316,19 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     let is i64 as nact with mut = 2;
                     fdacts[0] = 0; fdacts[1] = child_in;
                     fdacts[2] = 1; fdacts[3] = child_out;
-                    // fd 2: the job's error channel, or with '2>&1' the SAME
-                    // endpoint as fd 1. There is no dup: handing one object to
-                    // two slots IS the duplication.
+                    // fd 2: the job's error channel, the file a '2>' named, or
+                    // with '2>&1' the SAME endpoint as fd 1. There is no dup:
+                    // handing one object to two slots IS the duplication.
                     fdacts[4] = 2; fdacts[5] = term_w; nact = 3;
                     let is i64 as err_tty with mut = 0;
                     if (want_tty == 1) {
-                        if (cc.err_to_out == 0 || child_out == term_w) { err_tty = 1; }
+                        if (cc.err_w < 0 && (cc.err_to_out == 0 || child_out == term_w)) { err_tty = 1; }
                     }
-                    if (cc.err_to_out == 1) { fdacts[5] = child_out; }
+                    if (cc.err_w >= 0) { fdacts[5] = err_file; }
+                    else if (cc.err_to_out == 1) { fdacts[5] = child_out; }
+                    // '1>&2': stdout where stderr goes, which is the job's
+                    // error channel — the same object, not a copy of it.
+                    if (cc.out_to_err == 1) { fdacts[3] = term_w; }
                     if (aux_fd_slot >= 0 && aux_out[0] >= 0) {
                         fdacts[nact*2] = aux_fd_slot; fdacts[nact*2+1] = aux_out[1];
                         nact = nact + 1;
@@ -1306,6 +1382,7 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     // or the next stage never sees end-of-stream.
                     if (child_in >= 0) { sys.close(child_in); }
                     if (child_out >= 0 && child_out != term_w) { sys.close(child_out); }
+                    if (err_file >= 0) { sys.close(err_file); err_file = 0 - 1; }
                     if (tty_child >= 0) { sys.close(tty_child); tty_child = 0 - 1; }
                     if (dir_fd >= 0) { sys.close(dir_fd); }
                     let is i64 as added with mut = 0;
@@ -1326,6 +1403,7 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                         if (keep_out >= 0) { sys.close(keep_out); }
                         if (next_read >= 0) { sys.close(next_read); }
                         if (tty_keep >= 0) { sys.close(tty_keep); }
+                        if (err_file >= 0) { sys.close(err_file); err_file = 0 - 1; }
                     } else {
                         if (keep_in >= 0)  { jb.in_fd = keep_in; }
                         if (keep_out >= 0) { jb.out_fd = keep_out; }
@@ -1340,6 +1418,7 @@ fn exec(bg as i64, cmdline as *u8, cmdlen as i64,
                     if (next_read >= 0) { sys.close(next_read); }
                     if (tty_keep >= 0) { sys.close(tty_keep); }
                     if (tty_child >= 0) { sys.close(tty_child); }
+                    if (err_file >= 0) { sys.close(err_file); err_file = 0 - 1; }
                 }
             }
         }
@@ -1546,7 +1625,7 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
     let is i64 as s_wfill = wfill;
     let is i64 as s_wbase = wbase;
     let is i64 as s_ncmd = ncmd;
-    let is i64 as save_words = s_nword * 3 + s_ncmd * 6;
+    let is i64 as save_words = s_nword * 3 + s_ncmd * 9;
     let is i64 as save_sz = ((save_words * 8 + 4095) / 4096) * 4096;
     let is *i64 as sv with mut = cast(*i64, 0);
     if (save_words > 0) {
@@ -1566,9 +1645,11 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
     i = 0;
     while (i < s_ncmd) {
         let is *Cmd as sc = cmd_at(i);
-        sv[cb + i*6+0] = sc.w0;     sv[cb + i*6+1] = sc.wn;
-        sv[cb + i*6+2] = sc.in_w;   sv[cb + i*6+3] = sc.out_w;
-        sv[cb + i*6+4] = sc.append; sv[cb + i*6+5] = sc.err_to_out;
+        sv[cb + i*9+0] = sc.w0;       sv[cb + i*9+1] = sc.wn;
+        sv[cb + i*9+2] = sc.in_w;     sv[cb + i*9+3] = sc.out_w;
+        sv[cb + i*9+4] = sc.append;   sv[cb + i*9+5] = sc.err_to_out;
+        sv[cb + i*9+6] = sc.out_to_err;
+        sv[cb + i*9+7] = sc.err_w;    sv[cb + i*9+8] = sc.err_append;
         i = i + 1;
     }
 
@@ -1617,9 +1698,11 @@ fn capture(src as *u8, len as i64, out as *u8, n as *i64) as void {
     i = 0;
     while (i < s_ncmd) {
         let is *Cmd as dc = cmd_at(i);
-        dc.w0 = sv[cb + i*6+0];     dc.wn = sv[cb + i*6+1];
-        dc.in_w = sv[cb + i*6+2];   dc.out_w = sv[cb + i*6+3];
-        dc.append = sv[cb + i*6+4]; dc.err_to_out = sv[cb + i*6+5];
+        dc.w0 = sv[cb + i*9+0];       dc.wn = sv[cb + i*9+1];
+        dc.in_w = sv[cb + i*9+2];     dc.out_w = sv[cb + i*9+3];
+        dc.append = sv[cb + i*9+4];   dc.err_to_out = sv[cb + i*9+5];
+        dc.out_to_err = sv[cb + i*9+6];
+        dc.err_w = sv[cb + i*9+7];    dc.err_append = sv[cb + i*9+8];
         i = i + 1;
     }
     if (save_words > 0) { sys.munmap(cast(i64, sv), save_sz); }
@@ -1850,6 +1933,7 @@ fn prepare_program(path as *u8, len as i64) as i64 {
     c0.w0 = 0; c0.wn = 1;
     c0.in_w = 0 - 1; c0.out_w = 0 - 1;
     c0.append = 0; c0.err_to_out = 0;
+    c0.out_to_err = 0; c0.err_w = 0 - 1; c0.err_append = 0;
     ncmd = 1; prepared_program = 1;
     return 1;
 }
