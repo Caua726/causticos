@@ -1463,28 +1463,55 @@ fn _capture_one(src as *u8, len as i64, out as *u8, n as *i64) as i64 {
     }
     let is *jobs.Job as jb = jobs.get(slot);
     let is [256]u8 as buf;
+    let is i64 as ev = jobs.event_fd();
     let is i64 as reading with mut = 1;
     while (reading == 1) {
-        let is [6]i64 as pe;
-        pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0;
-        let is i64 as np with mut = 1;
-        if (jb.err_fd >= 0) { pe[3] = jb.err_fd; pe[4] = sys.POLL_READABLE; pe[5] = 0; np = 2; }
-        sys.poll(&pe[0], np, 1000000000);
-        // Its complaints, kept for the shell to show (cap_err_show): a stage
-        // blocked on a full error channel would otherwise never finish the
-        // output this is waiting for.
-        if (np == 2 && (pe[5] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
-            if (_cap_err_take(jb.err_fd) == 0) { sys.close(jb.err_fd); jb.err_fd = 0 - 1; }
+        // A command whose stdout goes to a file or a device (`> /dev/null`)
+        // has no channel for the shell to read, so nothing says it is done —
+        // its exit event does. The loop polled the missing channel forever
+        // (fd -1) and the shell stopped answering.
+        let is [9]i64 as pe;
+        let is i64 as np with mut = 0;
+        let is i64 as oe with mut = 0 - 1;
+        let is i64 as ee with mut = 0 - 1;
+        let is i64 as ve with mut = 0 - 1;
+        if (jb.out_fd >= 0) { pe[0] = jb.out_fd; pe[1] = sys.POLL_READABLE; pe[2] = 0; oe = 0; np = 1; }
+        if (jb.err_fd >= 0) {
+            pe[np*3+0] = jb.err_fd; pe[np*3+1] = sys.POLL_READABLE; pe[np*3+2] = 0;
+            ee = np; np = np + 1;
         }
-        if ((pe[2] & sys.POLL_READABLE) != 0) {
-            let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
-            if (got <= 0) { reading = 0; }
-            else {
-                let is i64 as k with mut = 0;
-                while (k < got) { _put(out, n, cast(i64, buf[k])); k = k + 1; }
+        if (ev >= 0) {
+            pe[np*3+0] = ev; pe[np*3+1] = sys.POLL_READABLE; pe[np*3+2] = 0;
+            ve = np; np = np + 1;
+        }
+        if (np == 0) {
+            // No channel, no error channel and no exit events: the process is
+            // all there is to wait for.
+            sys.wait_exit(jobs.last_pid(slot), cast(*i64, 0));
+            reading = 0;
+        } else {
+            sys.poll(&pe[0], np, 1000000000);
+            // Its complaints, kept for the shell to show (cap_err_show): a stage
+            // blocked on a full error channel would otherwise never finish the
+            // output this is waiting for.
+            if (ee >= 0 && (pe[ee*3+2] & (sys.POLL_READABLE | sys.POLL_CLOSED)) != 0) {
+                if (_cap_err_take(jb.err_fd) == 0) { sys.close(jb.err_fd); jb.err_fd = 0 - 1; }
             }
-        } else if ((pe[2] & sys.POLL_CLOSED) != 0) { reading = 0; }
-        else if (jobs.get(slot).status != jobs.JOB_RUN) { reading = 0; }
+            if (oe >= 0 && (pe[oe*3+2] & sys.POLL_READABLE) != 0) {
+                let is i64 as got = sys.read(jb.out_fd, cast(*u8, &buf[0]), 256);
+                if (got <= 0) { reading = 0; }
+                else {
+                    let is i64 as k with mut = 0;
+                    while (k < got) { _put(out, n, cast(i64, buf[k])); k = k + 1; }
+                }
+            }
+            if (reading == 1 && oe >= 0 && (pe[oe*3+2] & sys.POLL_READABLE) == 0
+                && (pe[oe*3+2] & sys.POLL_CLOSED) != 0) { reading = 0; }
+            if (ve >= 0 && (pe[ve*3+2] & sys.POLL_READABLE) != 0) { jobs.poll_events(); }
+            // With no channel, its exit is the end; with one, the channel's
+            // end-of-stream is, and the drain below has the rest.
+            if (reading == 1 && jb.out_fd < 0 && jobs.get(slot).status != jobs.JOB_RUN) { reading = 0; }
+        }
     }
     // Whatever it said on its way out, up to the end of the channel.
     let is i64 as eg with mut = 0;
@@ -1500,7 +1527,13 @@ fn _capture_one(src as *u8, len as i64, out as *u8, n as *i64) as i64 {
     // ended, so it has exited or is about to; the stages before it may still
     // be writing to a reader that is gone, and end_job stops those.
     let is i64 as code with mut = 0;
-    sys.wait_exit(jobs.last_pid(slot), &code);
+    if (jobs.get(slot).status == jobs.JOB_DONE) {
+        // The exit event already reaped it, and its wait would be answered
+        // "no such child"; the code came with the event.
+        code = jobs.get(slot).exit_code;
+    } else {
+        sys.wait_exit(jobs.last_pid(slot), &code);
+    }
     jobs.end_job(slot);
     return code;
 }
