@@ -67,8 +67,9 @@ it saw.
   cannot rebuild the compiler.
 - **`-smp 2`.** The compile is single-threaded; the driver needs a cpu of its
   own to copy the compiler's output to the serial line while it runs.
-- **`--no-asm-cache`.** No multi-megabyte `.s` cache written beside the source;
-  a single compile gains nothing from it.
+- **No `.s` beside the source.** A normal build no longer writes the generated
+  assembly next to the source; `--emit-asm` asks for it when the code the
+  compiler generated is what is being read.
 - **A fresh disk each round**, built by `mkroot.py --profile dev --init
   bootstrap`, so no round can read what another left behind.
 
