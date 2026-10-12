@@ -212,17 +212,23 @@ fn kbd_ring_clear() as void {
     return;
 }
 
-// Device read op: drain raw-event bytes from the ring. Blocks (polling, like
-// the channel) until at least one byte is available — there is no EOF for a
-// keyboard. A holder that is not the grab-stack TOP is quiet: its read
-// keeps blocking until ownership returns (architecture.md §6).
+// Device read op: drain raw-event bytes from the ring. Blocks until at least
+// one byte is available — there is no EOF for a keyboard — by PARKING on the
+// key its IRQ wakes (sched.wait_wake), not by asking again every 2 ms. A
+// holder that is not the grab-stack TOP is quiet: its read keeps blocking
+// until ownership returns (architecture.md §6), and nothing wakes this key on
+// a grab change, so that case waits out the park's own cap (50 ms) and asks
+// again.
 fn kbd_read(priv as i64, buf as i64, n as i64) as i64 {
     if (n <= 0) { return 0; }
     let is i64 as done with mut = 0;
     let is i64 as result with mut = 0;
     while (done == 0) {
+        // Before looking at the ring: an IRQ that pushes a byte between this
+        // and the park bumps the counter, and the park then returns at once.
+        let is i64 as seq = sched.poll_seq_read();
         if (grab.top(&kbd_gs) != priv) {
-            if (sched.sleep_interruptible(2000000) != 0) { return abi.E_INTR; }
+            if (sched.wait_wake(seq, cast(i64, &kbd_gs)) != 0) { return abi.E_INTR; }
         } else {
             let is i64 as fl = lock.acquire_irq(&kbd_lk);
             let is i64 as avail = kbd_count;
@@ -245,7 +251,7 @@ fn kbd_read(priv as i64, buf as i64, n as i64) as i64 {
                 serial.println(" key events lost: the ring was full (the reader fell behind)", 60);
             }
             if (take > 0) { result = take; done = 1; }
-            else { if (sched.sleep_interruptible(2000000) != 0) { return abi.E_INTR; } }      // 2 ms, no events yet
+            else { if (sched.wait_wake(seq, cast(i64, &kbd_gs)) != 0) { return abi.E_INTR; } }
         }
     }
     return result;
@@ -328,6 +334,8 @@ fn kbd_write(priv as i64, buf as i64, n as i64) as i64 {
 
 fn kbd_close(priv as i64) as i64 {
     let is i64 as newtop = grab.remove(&kbd_gs, priv);
+    // A reader parked waiting for ownership comes back at once.
+    sched.poll_wake_key(cast(i64, &kbd_gs));
     // hand the device back clean: the restored holder starts from silence
     if (newtop != 0) { kbd_ring_clear(); }
     return abi.E_OK;
@@ -341,7 +349,8 @@ fn kbd_close(priv as i64) as i64 {
 fn kbd_acquire(ctx as i64) as i64 {
     kbd_next_token = kbd_next_token + 1;
     let is i64 as token = kbd_next_token;
-    if (grab.push(&kbd_gs, token) != 0) { return 0; }   // stack full → open fails
+    if (grab.push(&kbd_gs, token) != 0) { return 0; }
+    sched.poll_wake_key(cast(i64, &kbd_gs));   // a parked reader sees the new owner   // stack full → open fails
     kbd_ring_clear();                                   // new owner starts clean
     let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &KBD_OPS, token);
     if (ko == 0) { grab.remove(&kbd_gs, token); return 0; }

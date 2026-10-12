@@ -328,17 +328,19 @@ fn decode_self_test() as i64 {
     return ok;
 }
 
-// Device read op: drain whole 4-byte records from the ring. Blocks (polling,
-// like the keyboard) until at least one record is available — there is no
-// EOF for a mouse. A buffer smaller than one record is a caller bug.
+// Device read op: drain whole 4-byte records from the ring. Blocks until at
+// least one record is available — there is no EOF for a mouse — by PARKING on
+// the key its IRQ wakes (sched.wait_wake), not by asking again every 2 ms. A
+// buffer smaller than one record is a caller bug.
 fn mouse_read(priv as i64, buf as i64, n as i64) as i64 {
     if (n < MOUSE_REC) { return abi.E_INVAL; }
     let is i64 as want = n - (n & 3);              // whole records only
     let is i64 as done with mut = 0;
     let is i64 as result with mut = 0;
     while (done == 0) {
+        let is i64 as seq = sched.poll_seq_read();
         if (grab.top(&mouse_gs) != priv) {          // preempted: quiet
-            if (sched.sleep_interruptible(2000000) != 0) { return abi.E_INTR; }
+            if (sched.wait_wake(seq, cast(i64, &mouse_gs)) != 0) { return abi.E_INTR; }
         } else {
             let is i64 as fl = lock.acquire_irq(&mouse_lk);
             let is i64 as avail = mouse_count;          // always a multiple of 4
@@ -354,7 +356,7 @@ fn mouse_read(priv as i64, buf as i64, n as i64) as i64 {
             mouse_count = mouse_count - take;
             lock.release_irq(&mouse_lk, fl);
             if (take > 0) { result = take; done = 1; }
-            else { if (sched.sleep_interruptible(2000000) != 0) { return abi.E_INTR; } }       // 2 ms, no events yet
+            else { if (sched.wait_wake(seq, cast(i64, &mouse_gs)) != 0) { return abi.E_INTR; } }
         }
     }
     return result;
@@ -362,6 +364,8 @@ fn mouse_read(priv as i64, buf as i64, n as i64) as i64 {
 
 fn mouse_close(priv as i64) as i64 {
     let is i64 as newtop = grab.remove(&mouse_gs, priv);
+    // A reader parked waiting for ownership comes back at once.
+    sched.poll_wake_key(cast(i64, &mouse_gs));
     if (newtop != 0) { mouse_ring_clear(); }        // restored holder starts clean
     return abi.E_OK;
 }
@@ -372,6 +376,7 @@ fn mouse_acquire(ctx as i64) as i64 {
     mouse_next_token = mouse_next_token + 1;
     let is i64 as token = mouse_next_token;
     if (grab.push(&mouse_gs, token) != 0) { return 0; }
+    sched.poll_wake_key(cast(i64, &mouse_gs));   // a parked reader sees the new owner
     mouse_ring_clear();
     let is i64 as ko = kobject.ko_alloc(kobject.KOBJ_DEVICE, &MOUSE_OPS, token);
     if (ko == 0) { grab.remove(&mouse_gs, token); return 0; }
