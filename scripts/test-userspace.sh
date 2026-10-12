@@ -29,7 +29,13 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 source "$(dirname "$0")/portable.sh"
 
-TOUT="${TOUT:-120}"
+# The in-guest phase ends at a VERDICT, not at a clock: a run that is still
+# printing is still working. STALL is how long the log may be silent before the
+# guest counts as hung, and CEILING is the backstop for the whole phase. A flat
+# 120 s deadline used to cut a suite that had merely grown past it, and the
+# tests whose verdict never came were then reported as failures.
+STALL="${STALL:-120}"
+CEILING="${CEILING:-300}"
 START=$SECONDS
 ISO=build/selftests.iso
 LOG=$(mktemp)
@@ -68,9 +74,9 @@ ADD+=(--add userspace/tests/tzt.cases:/tzt/cases)
 
 # One set of peers for the whole boot. Different ports, so they coexist; the
 # guest dials them one at a time.
-"$PY" scripts/echo-server.py 17777 "$TOUT" >/dev/null 2>&1 & E1=$!
-"$PY" scripts/http-server.py 17780 "$TOUT" >/dev/null 2>&1 & E2=$!
-"$PY" scripts/http-server.py 17782 "$TOUT" \
+"$PY" scripts/echo-server.py 17777 "$CEILING" >/dev/null 2>&1 & E1=$!
+"$PY" scripts/http-server.py 17780 "$CEILING" >/dev/null 2>&1 & E2=$!
+"$PY" scripts/http-server.py 17782 "$CEILING" \
     build/certs/srvchain.pem build/certs/srv.key >/dev/null 2>&1 & E3=$!
 sleep 0.4
 
@@ -101,13 +107,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Stop at the verdict, not at the timeout: the deadline is for a HANG, not for
-# the running time of a success.
-DEADLINE=$((SECONDS + TOUT))
+# Stop at the verdict, not at the clock: the deadline is for a HANG, not for
+# the running time of a success. The clock that matters is how long the log has
+# been silent — a run that is still printing is still working.
+LAST_SIZE=-1; LAST_CHANGE=$SECONDS
 while kill -0 $QPID 2>/dev/null; do
     OUT=$(tr -d '\000' < "$LOG")
     if echo "$OUT" | grep -qE "runall: DONE|EXCEPTION|panic:|kernel halted"; then break; fi
-    [ $SECONDS -ge $DEADLINE ] && break
+    SIZE=$(wc -c < "$LOG")
+    if [ "$SIZE" != "$LAST_SIZE" ]; then LAST_SIZE=$SIZE; LAST_CHANGE=$SECONDS; fi
+    if [ $((SECONDS - LAST_CHANGE)) -ge "$STALL" ]; then HUNG=1; break; fi
+    if [ $((SECONDS - START)) -ge "$CEILING" ]; then HUNG=1; break; fi
     sleep 0.1
 done
 kill -9 $QPID 2>/dev/null || true
@@ -116,32 +126,53 @@ wait $QPID 2>/dev/null || true
 RAW=$(tr -d '\000' < "$LOG")
 cp "$LOG" /tmp/ut-selftests.log
 
-PASS=0; FAIL=0; FAILED=""; NOTRUN=0; NOTRAN=""
+PASS=0; FAIL=0; FAILED=""; NOVERDICT=0; NOVERDICTS=""; NOTRUN=0; NOTRAN=""
+
+# The lines the runner printed for ONE test: from its `<<< name` line to the
+# next one. The detail under a failure used to be grepped out of the WHOLE log,
+# which is how a test with no verdict at all got reported with another test's
+# failure line printed under it.
+section() {
+    awk -v t="$1" '
+        $0 ~ "^runall: <<< " t "($| )" { inside = 1; print; next }
+        /^runall: <<< / { inside = 0 }
+        inside { print }
+    ' <<< "$RAW"
+}
+
 # THE EXIT CODE IS THE VERDICT. Matching each test's printed marker meant the
 # harness had to know how every one of them spells success — and it guessed
 # wrong twice in a row, reporting a green kabi ("kabi: PASS", not "ALL PASS")
 # and a green appt as failures. A process that returns 0 succeeded; that is
 # uniform, it is what runall already reports, and it cannot drift from what the
 # test actually decided. The printed line is kept as detail, not as evidence.
+#
+# Three outcomes, and the third one is the point: a test the runner never
+# reached has NO VERDICT, which is not the same as a test that ran and failed,
+# and is not reported as one.
 for t in u64t kabi nett tcpt cryptot x509t appt pingt netdt httpt tlst kmapt tzt globt regext pagert cmdt imgt; do
     printf '%-9s ' "$t"
     if echo "$RAW" | grep -q "^runall: <<< $t MISSING"; then
         echo "SKIP  (not built)"
         continue
     fi
-    n=$(echo "$RAW" | grep -oE "^$t: [0-9]+ checks" | head -1 | grep -oE '[0-9]+' || true)
+    SEC=$(section "$t")
+    n=$(echo "$SEC" | grep -oE "^$t: [0-9]+ checks" | head -1 | grep -oE '[0-9]+' || true)
     if echo "$RAW" | grep -q "^runall: <<< $t exit=0"; then
         if [ -n "$n" ]; then echo "PASS ($n checks)"; else echo "PASS"; fi
         PASS=$((PASS+1))
-    else
+    elif echo "$RAW" | grep -q "^runall: <<< $t exit="; then
         echo "FAIL"
-        echo "$RAW" | grep -E "^$t: |  FAIL |^runall: <<< $t" | head -4 || true
+        echo "$SEC" | grep -E "^$t: |  FAIL " | head -4 || true
         FAIL=$((FAIL+1)); FAILED="$FAILED $t"
+    else
+        echo "NO VERDICT  (the runner stopped before it)"
+        NOVERDICT=$((NOVERDICT+1)); NOVERDICTS="$NOVERDICTS $t"
     fi
 done
 
 if ! echo "$RAW" | grep -q "runall: DONE"; then
-    echo "=== selftests: the runner never finished (log: /tmp/ut-selftests.log) ==="
+    echo "=== selftests: the runner never finished${HUNG:+ — the guest was silent for ${STALL}s}: $PASS passed, $NOVERDICT with no verdict${FAILED:+, $FAIL failed —$FAILED} (log: /tmp/ut-selftests.log) ==="
     exit 1
 fi
 
@@ -262,8 +293,8 @@ for entry in "${DRIVEN[@]}"; do
 done
 rm -rf "$RES"
 
-if [ -n "$FAILED" ]; then
-    echo "=== userspace: $PASS passed, $FAIL failed —$FAILED${NOTRAN:+, $NOTRUN not run —$NOTRAN}  ($((SECONDS-START))s) ==="
+if [ -n "$FAILED" ] || [ -n "$NOVERDICTS" ]; then
+    echo "=== userspace: $PASS passed, $FAIL failed —$FAILED${NOVERDICT:+, $NOVERDICT with no verdict —$NOVERDICTS}${NOTRAN:+, $NOTRUN not run —$NOTRAN}  ($((SECONDS-START))s) ==="
     exit 1
 fi
 echo "=== userspace: $PASS passed, 0 failed${NOTRAN:+, $NOTRUN not run —$NOTRAN}  ($((SECONDS-START))s) ==="
