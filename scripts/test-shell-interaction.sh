@@ -297,6 +297,16 @@ type_line 'cat 0< /hello.txt > /zero-in.out'
 wait_for_file_match zero-in.out '^ola do CausticOS' \
     || fail "0< did not redirect stdin from the file"
 echo "interaction: 1> and 0< work as > and <"
+
+# A pager whose input has ended must write the file out and exit, as less and
+# more do. Foreground, with its output to a file, so nothing is typed while it
+# runs (a key typed then would go to its redirected stdin and be lost): if it
+# never exits, the dump never appears. It used to sit there spinning, and no
+# key could reach it, so the terminal was lost until Ctrl+C.
+type_line 'pager /hello.txt < /dev/null > /pager-dump.out'
+wait_for_file_match pager-dump.out 'ola do CausticOS' \
+    || fail "the pager did not write the file out and exit with its input at end-of-file"
+echo "interaction: pager with no input left dumps the file and exits"
 type_line 'echo pipe | wc -c > /pipe.out'
 wait_for_file_match pipe.out '^5$' \
     || fail "pipeline did not deliver an unpadded five-byte count to wc -c"

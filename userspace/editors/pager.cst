@@ -6,6 +6,11 @@
 // It writes text + ANSI to stdout and reads keys from stdin: the TERMINAL
 // renders it (wterm in the WM, or the shell), never the framebuffer. Learns
 // its size in-band via CSI 18t -> ESC[8;rows;cols t.
+//
+// With no keys left — stdin at end-of-file, a redirect or a pipe — it writes
+// the file out plainly and exits, as `less` and `more` do when their input is
+// not a terminal. It used to stay on screen and spin: the poll answered
+// "readable" at once and the read gave 0, so the loop ran hot forever.
 use "std/causticos/prog.cst" as prog;
 use "std/os/causticos.cst" as sys;
 use "../lib/futil/futil.cst" as fu;
@@ -24,6 +29,11 @@ let is [96]u8 as g_msg; let is i64 as g_msglen with mut = 0;
 let is [4096]i64 as g_hlmask;
 let is i64 as g_rows with mut = 24; let is i64 as g_cols with mut = 80;
 let is i64 as g_view with mut = 0; let is i64 as g_quit with mut = 0;
+// The input ended (stdin at end-of-file): there are no keys left to read, so
+// the file is written out plainly and the program exits — what `less` and
+// `more` do when their input is not a terminal. Polling a stream that will
+// never have another byte spun a core forever.
+let is i64 as g_eof with mut = 0;
 let is i64 as g_searching with mut = 0;          // 1 while typing a /search term
 let is i64 as in_esc with mut = 0; let is [8]i64 as in_p; let is i64 as in_np with mut = 0;
 
@@ -216,18 +226,38 @@ fn feed(c as i64) as void {
     else if (c == 78) { find(g_view - 1, 0 - 1); }
 }
 fn drain_input(timeout as i64) as void {
+    if (g_eof == 1) { return; }
     let is [3]i64 as pe; pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0;
     sys.poll(cast(*i64, &pe[0]), 1, timeout);
     while ((pe[2] & sys.POLL_READABLE) != 0) {
         let is [128]u8 as buf;
         let is i64 as r = syscall(10, 0, cast(i64, &buf[0]), 128);
-        if (r <= 0) { return; }
+        if (r <= 0) { g_eof = 1; return; }
         let is i64 as i with mut = 0; while (i < r) { feed(cast(i64, buf[i])); i = i + 1; }
         // Allow an ESC prefix to cross a read boundary without cancelling a search.
         let is i64 as grace with mut = 0; if (in_esc == 1) { grace = 50000000; }
         pe[0] = 0; pe[1] = sys.POLL_READABLE; pe[2] = 0; sys.poll(cast(*i64, &pe[0]), 1, grace);
     }
     if (in_esc == 1) { in_esc = 0; escape_key(); }
+}
+
+// The file, written out plainly: what is left to do when the input ended.
+// Writes in pieces and waits for room, like flush_ob; a channel nobody is
+// reading returns an error and this gives up rather than spinning.
+fn dump_file() as void {
+    let is i64 as off with mut = 0;
+    let is i64 as guard with mut = 0;
+    while (off < g_len && guard < 1000000) {
+        let is i64 as w = syscall(11, 1, g_base + off, g_len - off);
+        if (w > 0) { off = off + w; }
+        else {
+            let is [3]i64 as pe; pe[0] = 1; pe[1] = sys.POLL_WRITABLE; pe[2] = 0;
+            sys.poll(cast(*i64, &pe[0]), 1, 2000000000);
+            if ((pe[2] & sys.POLL_WRITABLE) == 0) { return; }
+        }
+        guard = guard + 1;
+    }
+    return;
 }
 
 fn main(argc as i64, argv as *u8) as i32 {
@@ -253,11 +283,13 @@ fn main(argc as i64, argv as *u8) as i32 {
     alt_on(); mouse_on(); hidec(); clr(); flush_ob();
     esc(); obn(18); ob(116); flush_ob();           // CSI 18t size query
     drain_input(300000000);
-    while (g_quit == 0) {
+    while (g_quit == 0 && g_eof == 0) {
         render();
         flush_ob();
         drain_input(0 - 1);                        // block until a key (no periodic redraw needed)
     }
     mouse_off(); sgr0(); showc(); alt_off(); flush_ob();
+    // No keys left: the file, plainly, so `pager f < /dev/null` still shows it.
+    if (g_eof == 1) { dump_file(); }
     return cast(i32, 0);
 }
