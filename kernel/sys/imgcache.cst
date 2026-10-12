@@ -159,18 +159,22 @@ let is i64 as IMP_MAX_NAMES = 512;
 let is i64 as IMG_KIND_CSE = 1;
 let is i64 as IMG_KIND_CSL = 2;
 
-// Entries. This is not a cache-size preference — it is a CEILING, and running
-// into it fails a spawn. So it is derived from the real one: a process needs at
-// least one thread, thread.MAX_THREADS is 64, so at most 64 distinct programs
-// can be live at once; the libraries they import need room on top. Keep this
-// above thread.MAX_THREADS + a handful, or a system with many distinct programs running
-// will start refusing to launch anything new.
+// Entries, on the kernel heap and GROWING: ENT_CHUNK at a time, doubling as
+// the table fills. This is not a cache-size preference — running out of
+// entries fails a spawn — so the ceiling is memory, not a number picked for
+// it. It was a fixed 96, justified by a thread limit that no longer exists
+// (the thread table grows now), and a system with more than 96 distinct images
+// live at once began refusing to launch anything new.
 //
-// It was 32, which is half of what the scheduler allows, so a busy system could
-// have reached it. ~256 bytes an entry, so the headroom costs ~24 KiB of BSS.
-// (The array literal below must be edited in lockstep — Caustic takes a literal
-// length there, so the constant cannot size it.)
-let is i64 as ENT_MAX     = 96;
+// The table only ever grows, and the old one is NOT given back: is_live,
+// mark_stale and the entry accessors read it WITHOUT the cache lock (see the
+// lock-order note on is_live), so a reader may still be walking the table a
+// grow just replaced. Keeping it is bounded — the doubling means at most one
+// more table's worth — and a wrong free here would be a use-after-free on
+// every spawn.
+let is i64 as ENT_CHUNK   = 96;         // the first table, and the growth unit
+let is i64 as ENT_LIMIT   = 1048576;    // address space, not memory: an entry is
+                                        // ~240 bytes, so memory runs out first
 let is i64 as ENT_LIB_MAX = 8;      // libraries one image may import from
 
 // All scalars i64 (the mixed-width struct rule). The page lists are heap
@@ -212,7 +216,8 @@ struct ImgEntry {
     libs        as [8]i64;   // slots of the libraries this image imports from
 }
 
-let is [96]ImgEntry as _ent with mut;   // == ENT_MAX
+let is *ImgEntry as _ent with mut = cast(*ImgEntry, 0);
+let is i64 as _cap with mut = 0;        // entries the table holds now
 
 // A plain ticket lock, NOT the IRQ-saving variant. This lock is held across
 // vfs.open/vfs.read — real disk I/O that waits on an AHCI completion — and
@@ -224,9 +229,40 @@ let is [96]ImgEntry as _ent with mut;   // == ENT_MAX
 let is mutex.Mutex as _lk with mut;
 
 fn init() as void {
-    let is i64 as i with mut = 0;
-    while (i < ENT_MAX) { _ent[i].in_use = 0; i = i + 1; }
     mutex.name(&_lk, "imgcache", 8);
+    _ent = cast(*ImgEntry, 0);
+    _cap = 0;
+    // Without an entry table nothing can be spawned at all, so this failing is
+    // fatal and says so.
+    if (_grow(ENT_CHUNK - 1) != 0) {
+        pmm.panic("imgcache: no memory for the entry table", 39);
+    }
+    return;
+}
+
+// _grow — make the table hold entry index `need`: double it onto the kernel
+// heap, copy the entries across, swap it in. Called with the cache lock held
+// (every caller holds it), so two grows never run at once. The copy is
+// word-for-word because every field of an entry — the libs array included — is
+// an i64 (the mixed-width struct rule), and a whole-struct assignment would
+// depend on the compiler emitting a copy. 0, or E_NOMEM.
+fn _grow(need as i64) as i64 {
+    if (need < _cap) { return 0; }
+    if (need >= ENT_LIMIT) { return abi.E_NOMEM; }
+    let is i64 as ncap with mut = _cap * 2;
+    if (ncap < ENT_CHUNK) { ncap = ENT_CHUNK; }
+    while (ncap <= need) { ncap = ncap * 2; }
+    if (ncap > ENT_LIMIT) { ncap = ENT_LIMIT; }
+    let is i64 as nt = heap.kmalloc(ncap * sizeof(ImgEntry), pmm.ALLOC_ZERO);
+    if (nt == 0) { return abi.E_NOMEM; }
+    let is *i64 as d = cast(*i64, nt);
+    let is *i64 as s = cast(*i64, _ent);
+    let is i64 as words = sizeof(ImgEntry) / 8;
+    let is i64 as i with mut = 0;
+    while (i < _cap * words) { d[i] = s[i]; i = i + 1; }
+    _ent = cast(*ImgEntry, nt);
+    _cap = ncap;
+    return 0;
 }
 
 // ============================================================
@@ -314,7 +350,7 @@ fn locate_cst(buf as *u8, size as i64, out_off as *i64, out_size as *i64) as i32
 fn _slot_find(cluster as i64, size as i64) as i64 {
     if (cluster == 0) { return 0 - 1; }        // anonymous images are never reused
     let is i64 as i with mut = 0;
-    while (i < ENT_MAX) {
+    while (i < _cap) {
         if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster
             && _ent[i].key_size == size && _ent[i].stale == 0) { return i; }
         i = i + 1;
@@ -324,7 +360,7 @@ fn _slot_find(cluster as i64, size as i64) as i64 {
 
 fn _slot_alloc() as i64 {
     let is i64 as i with mut = 0;
-    while (i < ENT_MAX) {
+    while (i < _cap) {
         if (_ent[i].in_use == 0) { return i; }
         i = i + 1;
     }
@@ -332,16 +368,25 @@ fn _slot_alloc() as i64 {
     // fills up and then refuses to load anything is worse than one that forgets.
     _reclaim_locked();
     i = 0;
-    while (i < ENT_MAX) {
+    while (i < _cap) {
         if (_ent[i].in_use == 0) { return i; }
         i = i + 1;
     }
-    // Still nothing: every entry has a live user, so this many DISTINCT programs
-    // are running at once. The spawn is about to fail, and it would otherwise
-    // fail as a bare E_NOMEM with nothing to point at.
-    serial.print("imgcache: no free entry - ", 26);
-    util.print_num(ENT_MAX);
-    serial.println(" distinct images are live; raise ENT_MAX", 40);
+    // Still nothing free: the table itself is the limit, and it is not a number
+    // picked for it. Grow it and look once more.
+    if (_grow(_cap) != 0) {
+        // Out of memory, or past ENT_LIMIT (which memory reaches first).
+        serial.print("imgcache: no entry free and no memory for another: ", 51);
+        util.print_num(_cap);
+        serial.println(" images live", 12);
+        return 0 - 1;
+    }
+    i = 0;
+    while (i < _cap) {
+        if (_ent[i].in_use == 0) { return i; }
+        i = i + 1;
+    }
+    serial.println("imgcache: the table grew and is still full", 42);
     return 0 - 1;
 }
 
@@ -380,7 +425,7 @@ fn _free_locked(s as i64) as i64 {
     i = 0;
     while (i < _ent[s].lib_n) {
         let is i64 as ls = _ent[s].libs[i];
-        if (ls >= 0 && ls < ENT_MAX && _ent[ls].in_use != 0) {
+        if (ls >= 0 && ls < _cap && _ent[ls].in_use != 0) {
             _ent[ls].refcount = _ent[ls].refcount - 1;
         }
         i = i + 1;
@@ -402,7 +447,7 @@ fn _reclaim_locked() as i64 {
     while (again == 1) {
         again = 0;
         let is i64 as i with mut = 0;
-        while (i < ENT_MAX) {
+        while (i < _cap) {
             if (_ent[i].in_use != 0 && _ent[i].refcount <= 0) {
                 freed = freed + _free_locked(i);
                 again = 1;
@@ -445,7 +490,7 @@ fn reclaim() as i64 {
 fn is_live(cluster as i64) as i32 {
     if (cluster == 0) { return 0; }
     let is i64 as i with mut = 0;
-    while (i < ENT_MAX) {
+    while (i < _cap) {
         // refcount, not mere presence: an entry with no users is CACHE, and a
         // cache must never make a file permanently unwritable. Only a process
         // actually executing out of those frames makes the bytes untouchable.
@@ -467,7 +512,7 @@ fn is_live(cluster as i64) as i32 {
 fn mark_stale(cluster as i64) as void {
     if (cluster == 0) { return; }
     let is i64 as i with mut = 0;
-    while (i < ENT_MAX) {
+    while (i < _cap) {
         if (_ent[i].in_use != 0 && _ent[i].key_cluster == cluster
             && _ent[i].refcount <= 0) {
             _ent[i].stale = 1;
@@ -479,7 +524,7 @@ fn mark_stale(cluster as i64) as void {
 fn mark_stale_ptr() as i64 { return cast(i64, fn_ptr(mark_stale)); }
 
 fn release(slot as i64) as void {
-    if (slot < 0 || slot >= ENT_MAX) { return; }
+    if (slot < 0 || slot >= _cap) { return; }
     mutex.acquire(&_lk);
     if (_ent[slot].in_use != 0 && _ent[slot].refcount > 0) {
         _ent[slot].refcount = _ent[slot].refcount - 1;
@@ -1245,7 +1290,7 @@ fn _map_private(s as i64, a as *vma.Aspace) as i32 {
 
 // Map an image, and everything it imports from, into a fresh address space.
 fn map(slot as i64, a as *vma.Aspace) as i32 {
-    if (slot < 0 || slot >= ENT_MAX) { return cast(i32, 0 - 1); }
+    if (slot < 0 || slot >= _cap) { return cast(i32, 0 - 1); }
     mutex.acquire(&_lk);
     if (_ent[slot].in_use == 0) { mutex.release(&_lk); return cast(i32, 0 - 1); }
 
@@ -1297,7 +1342,7 @@ fn stats(out as *i64) as void {
     let is i64 as res with mut = 0;
     let is i64 as sh with mut = 0;
     let is i64 as i with mut = 0;
-    while (i < ENT_MAX) {
+    while (i < _cap) {
         if (_ent[i].in_use != 0) {
             n = n + 1;
             res = res + _ent[i].ro_n + _ent[i].rw_n;

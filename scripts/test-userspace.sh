@@ -84,6 +84,12 @@ bash scripts/mkiso.sh --profile base "${ADD[@]}" --out "$ISO" >/dev/null
 QEMU_ISO="$ISO"
 QEMU_KVM=1
 QEMU_HTTPD_PORT="${QEMU_HTTPD_PORT:-18081}"
+# 18 test programs run in one guest. At the 64M default the image cache is
+# squeezed during imgt, whose method is to read free memory around a spawn: the
+# reclaim it triggers then looks like the spawn giving memory back ("spawn 0
+# cost -3668 KiB"). The cache yielding under pressure is by design; the
+# measurement just needs room, so the suite gives the guest 256M.
+QEMU_MEM="${QEMU_MEM:-256M}"
 source scripts/qemu-args.sh
 
 qemu-system-x86_64 "${QEMU_ARGS[@]}" -serial stdio -display none > "$LOG" 2>&1 &

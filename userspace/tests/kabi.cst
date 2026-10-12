@@ -277,6 +277,72 @@ fn test_devnull() as void {
     return;
 }
 
+// ---- the image cache has no fixed ceiling ----
+// A spawn used to fail with "too many different programs are loaded" once 96
+// distinct images were live at once: the entry table was a fixed array, and the
+// 96 came from a thread limit that no longer exists (the thread table grows).
+// Spawning from a SEGMENT is the cheapest way to hold many images at once: an
+// anonymous image is never looked up or reused, so every spawn makes its own
+// entry. Verified by hand in the VM first — with the table capped at 96 the
+// 91st spawn failed and even `ps` would not start; uncapped, 120 of them ran.
+let is i64 as IMG_KIDS with imut = 110;
+fn test_image_table_grows() as void {
+    say("image table:\n");
+    let is [4]i64 as st;
+    if (sys.stat(cast(*u8, "/kabi.cse"), cast(*u8, &st[0])) != 0) {
+        check(cast(*u8, "image table: stat own image"), 0, 1, 0);
+        return;
+    }
+    let is i64 as sz = st[0];
+    if (sz <= 0) { check(cast(*u8, "image table: own image has a size"), 0, sz, 1); return; }
+    let is i64 as bv = sys.mmap(0, sz, sys.PROT_READ | sys.PROT_WRITE);
+    if (bv < 0) { check(cast(*u8, "image table: room for the image"), 0, bv, 0); return; }
+    let is *u8 as bytes = cast(*u8, bv);
+    let is i64 as f = sys.open_read(cast(*u8, "/kabi.cse"));
+    if (f < 0) { check(cast(*u8, "image table: open own image"), 0, f, 0); return; }
+    let is i64 as got with mut = 0;
+    while (got < sz) {
+        let is i64 as r = sys.read(f, cast(*u8, cast(i64, bytes) + got), sz - got);
+        if (r <= 0) { got = sz + 1; }
+        else { got = got + r; }
+    }
+    sys.close(f);
+    if (got != sz) { check(cast(*u8, "image table: read own image whole"), 0, got, sz); return; }
+
+    let is i64 as pages = (sz + 4095) / 4096;
+    let is i64 as seg = sys.seg_create(pages, 0);
+    if (seg < 0) { check(cast(*u8, "image table: mint a segment"), 0, seg, 0); return; }
+    let is i64 as wr = sys.seg_write(seg, 0, bytes, sz);
+    if (wr != 0) {                                   // 0 is E_OK, not a byte count
+        check(cast(*u8, "image table: the image fits the segment"), 0, wr, 0);
+        return;
+    }
+    let is [4]i64 as av;
+    av[0] = cast(i64, "kabi"); av[1] = 4;
+    av[2] = cast(i64, "--sleep"); av[3] = 7;
+
+    let is i64 as pv = sys.mmap(0, IMG_KIDS * 8, sys.PROT_READ | sys.PROT_WRITE);
+    let is *i64 as pids = cast(*i64, pv);
+    let is i64 as started with mut = 0;
+    while (started < IMG_KIDS) {
+        let is i64 as p = sys.spawn_fd(seg, cast(*u8, 0), 0, cast(*u8, &av[0]), 2);
+        if (p < 0) { started = IMG_KIDS + 1; }        // record the failure and stop
+        else { pids[started] = p; started = started + 1; }
+    }
+    let is i64 as ok with mut = 0;
+    if (started > IMG_KIDS) { ok = started - 1; } else { ok = started; }
+    // The old ceiling was 96, and a few entries are already held by the shell
+    // and the daemons, so this many distinct images at once could not exist.
+    check(cast(*u8, "image table: many distinct images live at once"), ok >= 100, ok, 100);
+    sys.sleep_ns(200000000);                          // they start and block
+    let is i64 as k with mut = 0;
+    while (k < ok) { sys.kill(pids[k]); sys.wait_exit(pids[k], cast(*i64, 0)); k = k + 1; }
+    sys.close(seg);
+    sys.munmap(bv, sz);
+    sys.munmap(pv, IMG_KIDS * 8);
+    return;
+}
+
 fn test_devs() as void {
     let is [32]i64 as devs;
     let is i64 as total = sys.query_devs(cast(*i64, &devs[0]), 16);
@@ -933,6 +999,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     test_argv();
     test_wait_nothing();
     test_devnull();
+    test_image_table_grows();
     test_fs_errno();
     test_proc_list();
     test_syscall_regs();
